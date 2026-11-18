@@ -126,6 +126,7 @@ where
                 .map_err(|_| IggyError::InvalidCommand)?;
             // A producer counts its sequence per partition, so its batch must
             // name one. Refused before `Balanced` moves its cursor.
+            refuse_shadow_stream(shard, &header.stream_id)?;
             if !matches!(header.partitioning, WirePartitioning::PartitionId(_))
                 && body
                     .get(4 + metadata_length + BATCH_PRODUCER_OFFSET)
@@ -162,6 +163,7 @@ where
         Operation::DeleteSegments => {
             let request =
                 DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            refuse_shadow_stream(shard, &request.stream_id)?;
             resolve_partition_namespace(
                 shard,
                 &request.stream_id,
@@ -172,6 +174,31 @@ where
         _ => return Err(IggyError::FeatureUnavailable),
     };
     Ok(namespace.inner())
+}
+
+/// Refuse a client write to a shadow stream, whose partitions read another
+/// cluster's log and take no messages or trims of their own.
+pub fn refuse_shadow_stream<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    stream_id: &WireIdentifier,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .is_shadow_stream(stream_id)
+    {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
 }
 
 /// Whether this node stores `namespace`: true for one every node stores, and

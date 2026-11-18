@@ -52,7 +52,10 @@ pub fn sample(
         // Not targeted (absent from `OUTCOMES`): the sim client sends no options
         // block, and the slab ceiling needs `MAX_STREAMS` surviving creates in
         // one run, far past any workload length.
-        Outcome::InvalidOptionValue | Outcome::TooManyStreams => None,
+        Outcome::InvalidOptionValue
+        | Outcome::TooManyStreams
+        // The sim client names no stream with the shadow prefix.
+        | Outcome::InvalidStreamName => None,
     }
 }
 
@@ -76,8 +79,9 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::AddStream {
             name: input.name.clone(),
         },
-        Outcome::NameAlreadyExists | Outcome::InvalidOptionValue | Outcome::TooManyStreams => {
-            Effect::None
-        }
+        Outcome::NameAlreadyExists
+        | Outcome::InvalidOptionValue
+        | Outcome::TooManyStreams
+        | Outcome::InvalidStreamName => Effect::None,
     }
 }

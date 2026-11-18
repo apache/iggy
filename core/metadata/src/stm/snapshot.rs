@@ -71,7 +71,11 @@ use crate::stm::user::UsersSnapshot;
 /// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op`,
 /// and each pending lifecycle target `retired_members`, as trailing, defaulted
 /// fields.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 15;
+///
+/// Version 16: `StreamSnapshot` and `TopicSnapshot` gained `shadow`, the peer
+/// stream or topic incarnation that a shadow stream or topic serves, as
+/// trailing, defaulted fields.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 16;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -627,6 +631,7 @@ macro_rules! impl_fill_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::consumer_group::ConsumerGroupSnapshot;
     use crate::stm::stream::{
         PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
     };
@@ -659,7 +664,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 15;
+        const PINNED_VERSION: u32 = 16;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -682,8 +687,8 @@ mod tests {
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 10;
-        const STREAM_FIELD_COUNT: u32 = 7;
+        const TOPIC_FIELD_COUNT: u32 = 11;
+        const STREAM_FIELD_COUNT: u32 = 8;
         const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
@@ -722,6 +727,7 @@ mod tests {
             options: ResourceOptions::new(),
             consumer_group_catalog_op: 0,
             created_op: 0,
+            shadow: None,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -759,6 +765,7 @@ mod tests {
             topics: Vec::new(),
             options: ResourceOptions::new(),
             created_op: 0,
+            shadow: None,
         };
         let encoded = rmp_serde::to_vec(&stream).unwrap();
         assert_eq!(
@@ -915,6 +922,69 @@ mod tests {
     }
 
     #[test]
+    fn given_format_fifteen_stream_and_topic_when_decoding_should_read_them_as_this_clusters_own() {
+        #[derive(Serialize)]
+        struct FormatFifteenTopic {
+            id: usize,
+            name: String,
+            created_at: IggyTimestamp,
+            stats: StatsSnapshot,
+            partitions: Vec<PartitionSnapshot>,
+            consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
+            next_consumer_group_id: u64,
+            options: ResourceOptions,
+            consumer_group_catalog_op: u64,
+            created_op: u64,
+        }
+        #[derive(Serialize)]
+        struct FormatFifteenStream {
+            id: usize,
+            name: String,
+            created_at: IggyTimestamp,
+            stats: StatsSnapshot,
+            topics: Vec<(usize, FormatFifteenTopic)>,
+            options: ResourceOptions,
+            created_op: u64,
+        }
+        let stats = || StatsSnapshot {
+            size_bytes: 0,
+            messages_count: 0,
+            segments_count: 0,
+        };
+        let encoded = rmp_serde::to_vec(&FormatFifteenStream {
+            id: 1,
+            name: "orders".to_owned(),
+            created_at: IggyTimestamp::from(2),
+            stats: stats(),
+            topics: vec![(
+                0,
+                FormatFifteenTopic {
+                    id: 0,
+                    name: "payments".to_owned(),
+                    created_at: IggyTimestamp::from(3),
+                    stats: stats(),
+                    partitions: Vec::new(),
+                    consumer_groups: Vec::new(),
+                    next_consumer_group_id: 0,
+                    options: ResourceOptions::new(),
+                    consumer_group_catalog_op: 4,
+                    created_op: 5,
+                },
+            )],
+            options: ResourceOptions::new(),
+            created_op: 6,
+        })
+        .unwrap();
+
+        let decoded: StreamSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.created_op, 6);
+        assert_eq!(decoded.shadow, None);
+        assert_eq!(decoded.topics[0].1.created_op, 5);
+        assert_eq!(decoded.topics[0].1.shadow, None);
+    }
+
+    #[test]
     fn given_format_fourteen_snapshot_when_restoring_should_preserve_options_and_created_op() {
         const PREVIOUS_FORMAT: u32 = 13;
         let mut options = ResourceOptions::new();
@@ -1058,10 +1128,12 @@ mod tests {
                             options: ResourceOptions::default(),
                             consumer_group_catalog_op: 7,
                             created_op: 8,
+                            shadow: None,
                         },
                     )],
                     options: ResourceOptions::default(),
                     created_op: 9,
+                    shadow: None,
                 },
             )],
         });
@@ -1116,6 +1188,7 @@ mod tests {
             topics: vec![],
             options: ResourceOptions::default(),
             created_op: 0,
+            shadow: None,
         }
     }
 

@@ -450,6 +450,7 @@ pub(crate) fn authorize(
         | Operation::DeleteConsumerOffset
         | Operation::CompleteLifecycle
         | Operation::RewrapStreamKeys
+        | Operation::ShadowTopic
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
         | Operation::RetireConsumerGroupOwners

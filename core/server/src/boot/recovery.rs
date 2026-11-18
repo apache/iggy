@@ -67,6 +67,8 @@ struct OwnedPartition {
     stats: Arc<PartitionStats>,
     metadata: Partition,
     runtime: TopicRuntimeOptions,
+    /// The peer's log that a partition of a shadow topic follows.
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
     identity: StreamKeyIdentity,
     encryption: StreamEncryption,
 }
@@ -233,6 +235,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                             stats,
                             metadata: partition.clone(),
                             runtime: TopicRuntimeOptions::from_resource_options(&topic.options),
+                            peer_log: crate::shadow_topics::peer_log_of(stream, topic, namespace),
                             identity,
                             encryption: encryption
                                 .get_or_insert_with(|| StreamEncryption::from(&stream.options))
@@ -265,6 +268,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         stats: partition_stats,
         metadata: partition_metadata,
         runtime: topic_runtime,
+        peer_log,
         identity,
         encryption,
     } in owned
@@ -320,6 +324,21 @@ pub(in crate::boot) async fn build_shard_for_thread(
         };
         let mut partition = partition;
         partition.set_encryptor(encryptor);
+        // A shadow partition holds none of its peer's messages on disk, so
+        // it follows the peer's log again after every start.
+        if let Some((origin, prefix)) = peer_log
+            && let Err(error) = partition.follow_peer_log(origin, prefix)
+        {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id = partition_metadata.id,
+                %error,
+                "skipping this partition at boot; a partition of a shadow topic cannot follow its peer's log"
+            );
+            unbuilt.push(namespace);
+            continue;
+        }
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,

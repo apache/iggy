@@ -1163,6 +1163,17 @@ func (e TooManyStreams) Is(target error) bool {
 	return ok
 }
 
+type ShadowStreamReadOnly struct{}
+
+func (e ShadowStreamReadOnly) Error() string {
+	return "the stream is a shadow of another cluster's stream and takes no writes"
+}
+func (e ShadowStreamReadOnly) Code() Code { return 1021 }
+func (e ShadowStreamReadOnly) Is(target error) bool {
+	_, ok := target.(ShadowStreamReadOnly)
+	return ok
+}
+
 type CannotCreateTopicsDirectory struct {
 	ID   uint32
 	Path string
@@ -3029,6 +3040,7 @@ var (
 	ErrCannotReadStreams                          = CannotReadStreams{}
 	ErrInvalidTopicSize                           = InvalidTopicSize{}
 	ErrTooManyStreams                             = TooManyStreams{}
+	ErrShadowStreamReadOnly                       = ShadowStreamReadOnly{}
 	ErrCannotCreateTopicsDirectory                = CannotCreateTopicsDirectory{}
 	ErrCannotCreateTopicDirectory                 = CannotCreateTopicDirectory{}
 	ErrCannotCreateTopicInfo                      = CannotCreateTopicInfo{}
@@ -3296,6 +3308,7 @@ const (
 	CannotReadStreamsCode                          Code = 1015
 	InvalidTopicSizeCode                           Code = 1019
 	TooManyStreamsCode                             Code = 1020
+	ShadowStreamReadOnlyCode                       Code = 1021
 	CannotCreateTopicsDirectoryCode                Code = 2000
 	CannotCreateTopicDirectoryCode                 Code = 2001
 	CannotCreateTopicInfoCode                      Code = 2002
@@ -3670,6 +3683,8 @@ func (c Code) String() string {
 		return "InvalidTopicSize"
 	case TooManyStreamsCode:
 		return "TooManyStreams"
+	case ShadowStreamReadOnlyCode:
+		return "ShadowStreamReadOnly"
 	case CannotCreateTopicsDirectoryCode:
 		return "CannotCreateTopicsDirectory"
 	case CannotCreateTopicDirectoryCode:
@@ -4201,6 +4216,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidTopicSize
 	case TooManyStreamsCode:
 		return ErrTooManyStreams
+	case ShadowStreamReadOnlyCode:
+		return ErrShadowStreamReadOnly
 	case CannotCreateTopicsDirectoryCode:
 		return ErrCannotCreateTopicsDirectory
 	case CannotCreateTopicDirectoryCode:

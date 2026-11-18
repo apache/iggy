@@ -149,6 +149,7 @@ public sealed class VsrOperationTests
     [InlineData((byte)VsrOperation.UpdateTopicResolved)]
     [InlineData((byte)VsrOperation.UpdateUserResolved)]
     [InlineData((byte)VsrOperation.RewrapStreamKeys)]
+    [InlineData((byte)VsrOperation.ShadowTopic)]
     public void IsMetadata_CoversTheWholeControlPlane(byte operation)
     {
         Assert.True(((VsrOperation)operation).IsMetadata());

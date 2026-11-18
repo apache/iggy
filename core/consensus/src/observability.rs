@@ -754,6 +754,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::RetireSession => "retire_session",
         Operation::CompleteLifecycle => "complete_lifecycle",
         Operation::RewrapStreamKeys => "rewrap_stream_keys",
+        Operation::ShadowTopic => "shadow_topic",
         Operation::TransitionPartitionHistory => "transition_partition_history",
         Operation::RetireConsumerGroupOwners => "retire_consumer_group_owners",
         Operation::InstallConsumerGroupOwner => "install_consumer_group_owner",

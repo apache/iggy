@@ -1322,6 +1322,7 @@ mod tests {
             next_consumer_group_id: 0,
             consumer_group_catalog_op: 0,
             created_op: 0,
+            shadow: None,
         });
         streams.items.insert(stream);
 

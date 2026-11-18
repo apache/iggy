@@ -305,6 +305,7 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::UpdateTopicResolved
         | Operation::UpdateUserResolved
         | Operation::RewrapStreamKeys
+        | Operation::ShadowTopic
         | Operation::CreatePartitionsWithAssignments
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation

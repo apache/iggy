@@ -159,7 +159,7 @@ struct CommandCodeTests {
         }
         for operation in [
             ConsensusOperation.finalizeSession, .completeLifecycle, .truncatePartition, .updateStreamResolved, .updateTopicResolved,
-            .updateUserResolved, .rewrapStreamKeys,
+            .updateUserResolved, .rewrapStreamKeys, .shadowTopic,
         ] {
             #expect(operation.isInternal)
             #expect(operation.isMetadata)

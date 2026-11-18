@@ -26,6 +26,7 @@ use crate::stm::authz::{
     PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
 };
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
+use crate::stm::shadow::ShadowTopicRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
 };
@@ -3766,6 +3767,130 @@ where
         }
     }
 
+    /// Submit a replicated `ShadowTopic` originated by the server (the shadow
+    /// pass of the metadata primary), not by a client.
+    ///
+    /// Same in-process path as [`Self::submit_truncate_partition_in_process`].
+    /// An `AdoptTopic` names the count of its partitions and its explicit
+    /// options only: this fills in what the admission of a topic create
+    /// resolves, the derived options with the node's default replication
+    /// factor and a consensus group, members and an initial view for each
+    /// partition. Returns the committed result code, `0` when the op applied,
+    /// or the code of the error that kept an adoption out of the pipeline.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
+    /// `PipelineFull` under pipeline pressure, `Canceled` if the prepare is
+    /// dropped before commit.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_shadow_topic_in_process(
+        &self,
+        mut request: ShadowTopicRequest,
+    ) -> Result<u32, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        if let ShadowTopicRequest::AdoptTopic { create, .. } = &mut request
+            && let Err(error) = self.assign_shadow_partitions(create)
+        {
+            return Ok(error.as_code());
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::ShadowTopic,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        // The partitions of an adoption count toward placement while the
+        // prepare waits in the pipeline, as those of a topic create do.
+        if let Err(error) = self
+            .placement
+            .borrow_mut()
+            .remember(&prepare, consensus.replica_count())
+        {
+            return Ok(error.as_code());
+        }
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(iggy_binary_protocol::result_code(reply.body()).unwrap_or(0)),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
+    /// Fill in the derived options and the partition assignments of an
+    /// adopted shadow topic, as the admission of a topic create does. Its
+    /// partitions count toward `[metadata] partitions_max` like any other.
+    fn assign_shadow_partitions(
+        &self,
+        create: &mut PersistedCreateTopicRequest,
+    ) -> Result<(), IggyError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(IggyError::TransientNotAccepted)?;
+        let partitions_max = self.partitions_max.get();
+        if partitions_max != 0 {
+            let committed =
+                u64::try_from(self.mux_stm.streams().partition_count()).unwrap_or(u64::MAX);
+            validate_partitions_limit(
+                partitions_max,
+                create.request.partitions_count,
+                committed.saturating_add(self.pending_partitions()?),
+            )?;
+        }
+        let explicit = resource_options_from_wire(&create.request.options, true)?;
+        let mut derived = derived_defaults(OptionsScope::Topic, &explicit)?;
+        let replication_factor = resolve_replication_factor(
+            None,
+            self.default_replication_factor(consensus.replica_count()),
+            consensus.replica_count(),
+            &mut derived,
+        )?;
+        create.derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
+        let mut counts = self.placement_counts()?;
+        create.partitions = self
+            .allocator
+            .allocate_many(create.request.partitions_count as usize)
+            .into_iter()
+            .enumerate()
+            .map(|(partition_id, consensus_group_id)| {
+                let (members, initial_view) = self.placement.borrow().select(
+                    &mut counts,
+                    consensus.view(),
+                    Some(replication_factor),
+                )?;
+                Ok(CreatedPartitionAssignment {
+                    partition_id: u32::try_from(partition_id)
+                        .map_err(|_| IggyError::InvalidCommand)?,
+                    consensus_group_id,
+                    initial_view,
+                    members,
+                })
+            })
+            .collect::<Result<Vec<_>, IggyError>>()?;
+        Ok(())
+    }
+
     /// Submit a replicated client request from in-process and await the
     /// committed reply.
     ///
@@ -5066,7 +5191,9 @@ where
         pending_headers(consensus, |header| {
             matches!(
                 header.operation,
-                Operation::CreateTopicWithAssignments | Operation::CreatePartitionsWithAssignments
+                Operation::CreateTopicWithAssignments
+                    | Operation::CreatePartitionsWithAssignments
+                    | Operation::ShadowTopic
             )
         })
     }
@@ -7574,6 +7701,48 @@ mod tests {
             .prepare_request(placement_request(2, "next", 1))
             .unwrap();
         assert_eq!(assigned_views(&second), [0]);
+    }
+
+    #[test]
+    fn given_a_shadow_adoption_when_assigning_its_partitions_should_mint_each_within_the_cap() {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        let adoption = |partitions_count| PersistedCreateTopicRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count,
+                name: WireName::new("payments").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: Vec::new(),
+        };
+
+        let mut create = adoption(2);
+        metadata.assign_shadow_partitions(&mut create).unwrap();
+        let ids: Vec<u32> = create
+            .partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect();
+        assert_eq!(ids, [0, 1]);
+        assert_ne!(
+            create.partitions[0].consensus_group_id,
+            create.partitions[1].consensus_group_id
+        );
+        assert!(
+            PersistedCreateTopicRequest::decode_from(&create.to_bytes()).is_ok(),
+            "the assigned create encodes as a topic create does"
+        );
+
+        metadata.set_partitions_max(2);
+        assert!(matches!(
+            metadata.assign_shadow_partitions(&mut adoption(2)),
+            Err(IggyError::PartitionsLimitReached)
+        ));
     }
 
     #[test]

@@ -90,7 +90,9 @@ pub fn sample(
         | Outcome::InvalidReplicationFactor
         | Outcome::TooManyTopics
         | Outcome::InvalidPartitionsCount
-        | Outcome::PartitionIdSpaceExhausted => None,
+        | Outcome::PartitionIdSpaceExhausted
+        // The sim cluster has no geo peers, so it holds no shadow stream.
+        | Outcome::ShadowStreamReadOnly => None,
     }
 }
 

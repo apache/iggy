@@ -42,6 +42,7 @@ const (
 	OperationUpdateTopicResolved             Operation = 73
 	OperationUpdateUserResolved              Operation = 74
 	OperationRewrapStreamKeys                Operation = 75
+	OperationShadowTopic                     Operation = 76
 
 	// 129, 133 and 142 were the per-resource updates. Never reuse them.
 	OperationCreateStream              Operation = 128
@@ -97,6 +98,7 @@ var allOperations = []Operation{
 	OperationUpdateTopicResolved,
 	OperationUpdateUserResolved,
 	OperationRewrapStreamKeys,
+	OperationShadowTopic,
 	OperationCreateStream,
 	OperationDeleteStream,
 	OperationCreateTopic,

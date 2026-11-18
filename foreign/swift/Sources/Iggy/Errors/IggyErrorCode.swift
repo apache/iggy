@@ -137,6 +137,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case cannotReadStreams = 1015
     case invalidTopicSize = 1019
     case tooManyStreams = 1020
+    case shadowStreamReadOnly = 1021
     case cannotCreateTopicsDirectory = 2000
     case cannotCreateTopicDirectory = 2001
     case cannotCreateTopicInfo = 2002
@@ -411,6 +412,7 @@ extension IggyErrorCode {
         case .cannotReadStreams: "cannot_read_streams"
         case .invalidTopicSize: "invalid_topic_size"
         case .tooManyStreams: "too_many_streams"
+        case .shadowStreamReadOnly: "shadow_stream_read_only"
         case .cannotCreateTopicsDirectory: "cannot_create_topics_directory"
         case .cannotCreateTopicDirectory: "cannot_create_topic_directory"
         case .cannotCreateTopicInfo: "cannot_create_topic_info"

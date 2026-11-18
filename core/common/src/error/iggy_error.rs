@@ -296,6 +296,8 @@ pub enum IggyError {
     InvalidTopicSize(MaxTopicSize, IggyByteSize) = 1019,
     #[error("Too many streams")]
     TooManyStreams = 1020,
+    #[error("The stream is a shadow of another cluster's stream and takes no writes")]
+    ShadowStreamReadOnly = 1021,
     #[error("Cannot create topics directory for stream with ID: {0}, Path: {1}")]
     CannotCreateTopicsDirectory(Identifier, String) = 2000,
     #[error("Failed to create directory for topic with ID: {0} for stream with ID: {1}, Path: {2}")]

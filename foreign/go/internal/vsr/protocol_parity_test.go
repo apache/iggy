@@ -67,6 +67,7 @@ var goOperations = map[string]Operation{
 	"UpdateTopicResolved":             OperationUpdateTopicResolved,
 	"UpdateUserResolved":              OperationUpdateUserResolved,
 	"RewrapStreamKeys":                OperationRewrapStreamKeys,
+	"ShadowTopic":                     OperationShadowTopic,
 	"CreateStream":                    OperationCreateStream,
 	"DeleteStream":                    OperationDeleteStream,
 	"CreateTopic":                     OperationCreateTopic,
