@@ -439,6 +439,7 @@ pub struct ShardMetrics {
     fresh_object_oldest_age_seconds: Gauge,
     fresh_objects_unnamed: Gauge,
     fresh_objects_due: Gauge,
+    fresh_objects_proving: Gauge,
     fresh_listings_truncated: Gauge,
     fresh_sweeps_held: Gauge,
     fresh_objects_deleted_total: Counter,
@@ -650,6 +651,7 @@ impl ShardMetrics {
             fresh_object_oldest_age_seconds: Gauge::default(),
             fresh_objects_unnamed: Gauge::default(),
             fresh_objects_due: Gauge::default(),
+            fresh_objects_proving: Gauge::default(),
             fresh_listings_truncated: Gauge::default(),
             fresh_sweeps_held: Gauge::default(),
             fresh_objects_deleted_total: Counter::default(),
@@ -1606,13 +1608,24 @@ impl ShardMetrics {
     }
 
     /// Republished at the end of every sweep of fresh objects: how many of
-    /// its listings stopped before the last key of their scope, and how many
-    /// objects past their grace period it left in the store.
-    pub fn set_fresh_sweep_backlog(&self, truncated: usize, due: usize) {
+    /// its listings stopped before the last key of their scope, how many
+    /// objects past their grace period it left in the store, and how many
+    /// it kept for the proof rows they hold.
+    pub fn set_fresh_sweep_backlog(&self, truncated: usize, due: usize, proving: usize) {
         self.fresh_listings_truncated
             .set(i64::try_from(truncated).unwrap_or(i64::MAX));
         self.fresh_objects_due
             .set(i64::try_from(due).unwrap_or(i64::MAX));
+        self.fresh_objects_proving
+            .set(i64::try_from(proving).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings: the objects past their grace
+    /// that the last sweep kept for their proof rows.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_proving_value(&self) -> i64 {
+        self.fresh_objects_proving.get()
     }
 
     /// Republished by every sweep of fresh objects that ends with the
@@ -2269,6 +2282,12 @@ impl ShardMetrics {
             "fresh objects of this replica past their grace period that its last sweep left \
              in the object store",
             self.fresh_objects_due.clone(),
+        );
+        registry.register(
+            "fresh_objects_proving",
+            "fresh objects of this replica past their grace period that its last sweep kept \
+             for the proof rows of batches no long-term segment holds yet",
+            self.fresh_objects_proving.clone(),
         );
         registry.register(
             "fresh_listings_truncated",

@@ -560,7 +560,7 @@ async fn given_committed_sends_when_nothing_stages_a_pass_should_store_and_publi
 /// The whole store of one test: the fresh objects, the long-term segments,
 /// and the sweeps, all through one executor.
 #[allow(clippy::future_not_send)]
-async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
+pub(super) async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
     with_swept_store(Box::pin(placing_owner(directory)).await)
 }
 
@@ -608,7 +608,7 @@ fn with_swept_store(owner: IoTestShard) -> (IoTestShard, super::object_deletes::
 }
 
 /// The ids of the fresh objects the store holds, ascending.
-fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
+pub(super) fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
     let mut objects: Vec<_> = store
         .keys()
         .iter()
@@ -621,7 +621,7 @@ fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
 /// Run one sweep at `now` to the answer of every shard, and let the delete
 /// it started end.
 #[allow(clippy::future_not_send)]
-async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
+pub(super) async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
     let settled = owner.fresh_sweeps_settled();
     owner.request_sweep_fresh_objects(now);
     until(owner, |owner| owner.fresh_sweeps_settled() > settled).await;
@@ -631,14 +631,14 @@ async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
 }
 
 /// A time one grace period and a second after `now`.
-fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
+pub(super) fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
     let grace = u64::try_from(partitions::FRESH_OBJECT_GRACE.as_micros()).unwrap();
     IggyTimestamp::from(now.as_micros() + grace + 1_000_000)
 }
 
 /// Rewrite the committed sends of the partition up to `floor`.
 #[allow(clippy::future_not_send)]
-async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
+pub(super) async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
     rewrite_partition_up_to(owner, namespace(), floor).await;
 }
 
@@ -2762,6 +2762,7 @@ fn answer_as_second_shard(owner: &IoTestShard, sweep: u64, in_use: Option<&[u128
         sweep,
         shard: 1,
         in_use: in_use.map(|objects| objects.iter().copied().collect()),
+        floors: partitions::ProofFloors::default(),
     });
     owner.senders[0]
         .try_send(ShardFrame::lifecycle(LifecycleFrame::FreshObjectsReported(
@@ -2997,24 +2998,28 @@ impl FreshObjectSweeper for FlakySweeper {
     fn delete(
         &self,
         objects: Vec<u128>,
+        floors: Rc<partitions::ProofFloors>,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshDeleteOutcome> {
         self.deletes.set(self.deletes.get() + 1);
         if self.refuses.get() {
-            return Box::pin(std::future::ready(Ok(objects)));
+            return Box::pin(std::future::ready(Ok(partitions::FreshDeleted {
+                failed: objects,
+                kept: Vec::new(),
+            })));
         }
         let keeps = std::mem::take(&mut *self.keeps.borrow_mut());
         let (kept, sent): (Vec<u128>, Vec<u128>) =
             objects.into_iter().partition(|id| keeps.contains(id));
-        let delete = self.sweeper.delete(sent, scope);
+        let delete = self.sweeper.delete(sent, floors, scope);
         let held = self.held_delete.borrow_mut().take();
         Box::pin(async move {
             if let Some(held) = held {
                 let _ = held.await;
             }
-            let mut failed = delete.await?;
-            failed.extend(kept);
-            Ok(failed)
+            let mut deleted = delete.await?;
+            deleted.failed.extend(kept);
+            Ok(deleted)
         })
     }
 }

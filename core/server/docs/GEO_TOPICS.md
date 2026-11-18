@@ -138,7 +138,8 @@ part yet: see the status note at the top.
    `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`, which lists the
    long-term segments. The message is **published**.
 6. Once every message of a fresh object is in long-term segments, no record names the object
-   any more. A sweep that runs every minute deletes it 10 minutes after it first finds it so.
+   any more. A sweep that runs every minute deletes it 10 minutes after it first finds it so, once
+   the long-term segments also hold every batch its proof rows name.
 
 The rest of the long-term work runs on the same primary: small segments are merged, the topic's
 retention trims the oldest segments, and the objects that the log no longer lists are deleted
@@ -587,6 +588,7 @@ The first shard of each node sweeps the fresh objects that this replica wrote.
 | `fresh_object_oldest_age_seconds` | gauge   | Age of the oldest one. It grows when publication stops.                                      |
 | `fresh_objects_unnamed`           | gauge   | Objects that no record names, which wait out their 10 minutes.                               |
 | `fresh_objects_due`               | gauge   | Objects past their 10 minutes that the last sweep left in the bucket.                        |
+| `fresh_objects_proving`           | gauge   | Objects past their 10 minutes kept for proof rows of batches not in long-term segments yet.  |
 | `fresh_listings_truncated`        | gauge   | Listings of the last sweep that stopped at their share of keys. `fresh_objects` is then low. |
 | `fresh_objects_deleted`           | counter | Fresh objects this replica deleted.                                                          |
 | `fresh_sweeps_held`               | gauge   | 1 while the last sweep deleted nothing because a shard could not tell what it reads.         |

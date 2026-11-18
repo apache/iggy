@@ -19,8 +19,9 @@
 //! the proof rows that bind the batches that committed to where they did.
 
 use super::fresh_writes::{
-    GatedUploader, LONG_INTERVAL, TestUploader, committed, committed_sends, layout,
-    place_partitions, placing_owner, stored_placed_batches, submit_send, submit_send_to,
+    GatedUploader, LONG_INTERVAL, TestUploader, committed, committed_sends, fresh_objects, layout,
+    past_grace, place_partitions, placing_owner, rewrite_up_to, stored_placed_batches, submit_send,
+    submit_send_to, sweep, swept_owner,
 };
 use super::segment_uploads::{namespace, pumped, until};
 use super::*;
@@ -486,4 +487,49 @@ async fn given_an_object_of_rows_alone_when_the_store_fails_it_once_should_store
     let (retries, ..) = owner.metrics().fresh_load_value();
     assert_eq!(retries, 1);
     assert_eq!(owner.metrics().fresh_confirmations_value(), 1);
+}
+
+/// The object of rows alone proves a batch that no long-term segment holds
+/// yet, and no placed batch names it. The sweeps keep it past its grace,
+/// and delete it once the long-term floor passes the batch it proves.
+#[compio::test]
+async fn given_an_object_that_proves_a_batch_above_the_floor_when_sweeps_run_past_the_grace_should_keep_it_until_the_floor_passes()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let (data, confirmation) = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        until(&owner, |_| fresh_objects(store).len() == 2).await;
+        let objects = fresh_objects(store);
+
+        sweep(&owner, now).await;
+        sweep(&owner, past_grace(now)).await;
+        assert_eq!(
+            fresh_objects(store),
+            objects,
+            "the data is named, and its proof is above the floor"
+        );
+        assert_eq!(owner.metrics().fresh_objects_proving_value(), 1);
+
+        rewrite_up_to(&owner, 0).await;
+        let unnamed_since = past_grace(now);
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[0]],
+            "the object of rows alone was due already, and the data waits out its grace"
+        );
+        sweep(&owner, past_grace(unnamed_since)).await;
+        (objects[0], objects[1])
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
+    assert_eq!(owner.metrics().fresh_objects_proving_value(), 0);
+    assert_ne!(data, confirmation);
 }

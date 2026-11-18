@@ -42,8 +42,16 @@
 //! deleted. A poll that planned a read of it before the floor passed it
 //! ends in that time, and so does a batch that other replicas hold and this
 //! one is still repairing.
+//!
+//! An object can also hold the proof rows of batches that other objects
+//! hold, and a reader of the store alone needs a row for as long as no
+//! long-term segment holds its batch. So before an object that is due goes,
+//! the delete reads its index, and keeps the object while one of its rows
+//! is of a batch above the long-term floor of its partition on this replica.
+//! A kept object is due again at the next sweep, which reads it again.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::{Duration, SystemTime};
 
 use consensus::Consensus;
@@ -51,8 +59,8 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    FreshObjectId, KeyLayout, ListRequest, ObjectStore, TierExecutor, TierJobCancelled,
-    TierJobClass, TierJobRequest, TierScopeToken,
+    ErrorClass, FreshIndex, FreshObjectError, FreshObjectId, KeyLayout, ListRequest, ObjectStore,
+    ObjectStoreError, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -74,6 +82,10 @@ pub const FRESH_OBJECTS_PER_SWEEP: usize = 65_536;
 /// Fresh objects one delete job takes. A sweep with more to delete runs one
 /// job after another.
 pub const FRESH_DELETES_PER_BATCH: usize = 4096;
+
+/// Bytes of an object that the delete reads first for its index. An index
+/// that is longer takes one more read, of the length its header names.
+const INDEX_READ_BYTES: u64 = 16 * 1024;
 
 /// A part of a replica's fresh objects that a sweep lists on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -184,9 +196,60 @@ impl FreshListing {
 /// finished.
 pub type FreshListOutcome = Result<FreshListing, TierJobCancelled>;
 
-/// What a delete ended as: the ids whose objects are still there, or a
-/// cancellation before it finished.
-pub type FreshDeleteOutcome = Result<Vec<u128>, TierJobCancelled>;
+/// The objects a delete left in the store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FreshDeleted {
+    /// Those the store failed to delete.
+    pub failed: Vec<u128>,
+    /// Those kept for their proof rows, or whose index could not be read.
+    pub kept: Vec<u128>,
+}
+
+/// What a delete ended as, or a cancellation before it finished.
+pub type FreshDeleteOutcome = Result<FreshDeleted, TierJobCancelled>;
+
+/// The long-term floor of each placing partition of a replica, by its
+/// namespace and its incarnation, as a sweep found them. A proof row of a
+/// batch above the floor of its partition keeps its object.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProofFloors(BTreeMap<(u64, u64), Option<u64>>);
+
+impl ProofFloors {
+    /// The partition of `namespace` and `created_revision` has its long-term
+    /// floor at `floor`, `None` before its first long-term segment.
+    pub fn insert(&mut self, namespace: IggyNamespace, created_revision: u64, floor: Option<u64>) {
+        self.0.insert((namespace.inner(), created_revision), floor);
+    }
+
+    /// Take the floors `other` found as well.
+    pub fn extend(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `index` holds a proof row of a batch that no long-term
+    /// segment of a partition here holds yet. A row of a partition this
+    /// replica does not hold, or of another incarnation of it, keeps
+    /// nothing.
+    #[must_use]
+    pub fn needs(&self, index: &FreshIndex) -> bool {
+        index.directory().iter().any(|row| {
+            self.0
+                .get(&(row.namespace, row.created_revision))
+                .is_some_and(|floor| {
+                    let held_below = floor.map_or(0, |floor| floor.saturating_add(1));
+                    index
+                        .proofs_of(row)
+                        .iter()
+                        .any(|proof| proof.end_offset().is_none_or(|end| end > held_below))
+                })
+        })
+    }
+}
 
 /// Lists and deletes the fresh objects of a replica, behind a pointer, so
 /// the shard does not carry the executor's type.
@@ -200,10 +263,12 @@ pub trait FreshObjectSweeper {
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshListOutcome>;
 
-    /// Delete the fresh objects `objects`.
+    /// Delete the fresh objects `objects`, but those whose proof rows
+    /// `floors` still needs.
     fn delete(
         &self,
         objects: Vec<u128>,
+        floors: Rc<ProofFloors>,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshDeleteOutcome>;
 }
@@ -250,6 +315,7 @@ impl<E: TierExecutor> FreshObjectSweeper for ExecutorFreshSweeper<E> {
     fn delete(
         &self,
         objects: Vec<u128>,
+        floors: Rc<ProofFloors>,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshDeleteOutcome> {
         let layout = self.layout.clone();
@@ -257,15 +323,59 @@ impl<E: TierExecutor> FreshObjectSweeper for ExecutorFreshSweeper<E> {
             .submit(
                 TierJobRequest::new(TierJobClass::Delete, scope),
                 move |store| async move {
-                    let keys: Vec<_> = objects.iter().map(|id| layout.fresh_key(*id)).collect();
-                    delete_objects(&*store, &keys)
+                    let mut kept = Vec::new();
+                    let mut keys = Vec::with_capacity(objects.len());
+                    for id in objects {
+                        match needs_proofs(&*store, &layout, id, &floors).await {
+                            Ok(false) => keys.push(layout.fresh_key(id)),
+                            Ok(true) | Err(_) => kept.push(id),
+                        }
+                    }
+                    let failed = delete_objects(&*store, &keys)
                         .await
                         .iter()
                         .filter_map(|key| layout.parse_fresh_key(key))
-                        .collect()
+                        .collect();
+                    FreshDeleted { failed, kept }
                 },
             )
             .boxed_local()
+    }
+}
+
+/// Whether the fresh object `id` holds a proof row that `floors` needs, from
+/// a read of its index. An object that is gone, or that holds no index this
+/// build reads, needs nothing.
+///
+/// # Errors
+/// A transient error of the store, after which the object is kept until a
+/// later sweep reads it.
+async fn needs_proofs<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    id: u128,
+    floors: &ProofFloors,
+) -> Result<bool, ObjectStoreError> {
+    if floors.is_empty() {
+        return Ok(false);
+    }
+    let key = layout.fresh_key(id);
+    let mut read = INDEX_READ_BYTES;
+    loop {
+        let prefix = match store.get_range(&key, 0..read).await {
+            Ok(range) => range.bytes,
+            Err(error) if error.class() == ErrorClass::Transient => return Err(error),
+            Err(_) => return Ok(false),
+        };
+        match FreshIndex::decode(&prefix, FreshObjectId::from_raw(id)) {
+            Ok(index) => return Ok(floors.needs(&index)),
+            // Read again once, for the length the header names, unless the
+            // object ends before it.
+            Err(FreshObjectError::Incomplete { have, need }) if have == read && need > read => {
+                read = need;
+            }
+            Err(_) => return Ok(false),
+        }
     }
 }
 
@@ -532,6 +642,23 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    /// The long-term floor of each placing partition of this shard, which
+    /// the proof rows of its fresh objects are checked against.
+    #[must_use]
+    pub fn proof_floors(&self) -> ProofFloors {
+        let mut floors = ProofFloors::default();
+        for (namespace, partition) in self.stored() {
+            if partition.places_batches() && !self.is_tombstoned(namespace) {
+                floors.insert(
+                    *namespace,
+                    partition.created_revision(),
+                    partition.long_term_floor(),
+                );
+            }
+        }
+        floors
+    }
+
     /// The reads of the fresh objects that the placing partitions of this
     /// shard name above their long-term floors. `None` when the shard cannot
     /// tell: a copy is fenced or misses placed batches of its group while
@@ -715,15 +842,16 @@ mod tests {
         );
         assert_eq!(listed.scopes[0].end, FreshListEnd::Complete);
 
-        let failed = sweeper
+        let deleted = sweeper
             .delete(
                 listed.objects().into_iter().collect(),
+                Rc::default(),
                 TierScope::new().token(),
             )
             .await
             .unwrap();
 
-        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(deleted, FreshDeleted::default());
         assert_eq!(store.keys(), Vec::<String>::new());
     }
 
@@ -831,15 +959,16 @@ mod tests {
         store_object(store, &layout().fresh_key(id(REPLICA, 1)), b"first").await;
         store_object(store, &layout().fresh_key(id(REPLICA, 2)), b"second").await;
 
-        let failed = sweeper
+        let deleted = sweeper
             .delete(
                 vec![id(REPLICA, 1), id(REPLICA, 9)],
+                Rc::default(),
                 TierScope::new().token(),
             )
             .await
             .unwrap();
 
-        assert!(failed.is_empty(), "{failed:?}");
+        assert_eq!(deleted, FreshDeleted::default());
         assert_eq!(store.keys(), vec![layout().fresh_key(id(REPLICA, 2))]);
     }
 
@@ -1117,5 +1246,134 @@ mod tests {
         assert!(copy.consensus().is_normal() && !copy.consensus().is_transferring());
 
         assert_eq!(planned_reads(&partitions), (None, Some(0)));
+    }
+
+    /// The partition whose proof rows the objects below carry.
+    fn proving() -> IggyNamespace {
+        IggyNamespace::new(1, 1, 0)
+    }
+
+    const REVISION: u64 = 11;
+
+    /// An object of proof rows alone, of `count` batches of one message of
+    /// [`proving`] from `first` on, which the object `source` holds.
+    fn proving_object(sequence: u64, source: u64, first: u64, count: u64) -> (u128, Bytes) {
+        use iggy_object_store::{
+            FreshObjectHeader, FreshPartition, FreshProofRow, SealedFreshObject,
+        };
+
+        let object_id = FreshObjectId::from_raw(id(REPLICA, sequence));
+        let proofs = (first..first + count)
+            .map(|offset| FreshProofRow {
+                object_id: FreshObjectId::from_raw(id(REPLICA, source)),
+                position: 1_000 + offset,
+                base_offset: offset,
+                base_timestamp: offset,
+                message_count: 1,
+                placed_checksum: offset,
+            })
+            .collect();
+        let sealed = SealedFreshObject::seal::<&[u8]>(
+            FreshObjectHeader {
+                object_id,
+                cluster_uid: 1,
+                sealed_at: 1,
+            },
+            &[FreshPartition {
+                namespace: proving().inner(),
+                created_revision: REVISION,
+                view: 0,
+                claimed_first_offset: 0,
+                proven_below: first,
+                batches: Vec::new(),
+                proofs,
+            }],
+        )
+        .unwrap();
+        (object_id.get(), sealed.bytes)
+    }
+
+    async fn store_bytes(store: &MemoryStore, id: u128, bytes: Bytes) {
+        store
+            .put(
+                &layout().fresh_key(id),
+                PutBody::from_bytes(bytes),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+    }
+
+    fn floors(floor: Option<u64>) -> Rc<ProofFloors> {
+        let mut floors = ProofFloors::default();
+        floors.insert(proving(), REVISION, floor);
+        Rc::new(floors)
+    }
+
+    /// An object that proves a batch above the long-term floor stays, and
+    /// goes once the floor passes the last batch it proves. One whose index
+    /// is longer than the first read is read again whole.
+    #[compio::test]
+    async fn given_objects_that_prove_batches_above_the_floor_when_deleting_should_keep_them_until_the_floor_passes()
+     {
+        let sweeper = sweeper();
+        let store = sweeper.executor().store();
+        let (small, small_bytes) = proving_object(5, 1, 10, 2);
+        let (large, large_bytes) = proving_object(6, 2, 100, 1_000);
+        assert!(large_bytes.len() as u64 > INDEX_READ_BYTES);
+        store_bytes(store, small, small_bytes).await;
+        store_bytes(store, large, large_bytes).await;
+        let delete =
+            |floor| sweeper.delete(vec![small, large], floors(floor), TierScope::new().token());
+
+        let deleted = delete(Some(9)).await.unwrap();
+        assert_eq!(deleted.kept, [small, large]);
+        assert_eq!(deleted.failed, NONE);
+        let deleted = delete(Some(11)).await.unwrap();
+        assert_eq!(
+            deleted.kept,
+            [large],
+            "the floor holds both batches of the first"
+        );
+        assert_eq!(store.keys(), vec![layout().fresh_key(large)]);
+        let deleted = delete(Some(1_098)).await.unwrap();
+        assert_eq!(deleted.kept, [large], "its last batch is above the floor");
+        let deleted = delete(Some(1_099)).await.unwrap();
+        assert_eq!(deleted, FreshDeleted::default());
+        assert_eq!(store.keys(), Vec::<String>::new());
+    }
+
+    /// Proof rows keep an object only for a partition this replica holds, in
+    /// the incarnation that wrote them.
+    #[compio::test]
+    async fn given_objects_whose_rows_no_partition_here_needs_when_deleting_should_delete_them() {
+        let sweeper = sweeper();
+        let store = sweeper.executor().store();
+        let (proof, proof_bytes) = proving_object(5, 1, 10, 2);
+        store_bytes(store, proof, proof_bytes.clone()).await;
+        store_object(
+            store,
+            &layout().fresh_key(id(REPLICA, 7)),
+            b"IGGYFRS1 of an earlier build",
+        )
+        .await;
+        let mut recreated = ProofFloors::default();
+        recreated.insert(proving(), REVISION + 1, None);
+        let mut elsewhere = ProofFloors::default();
+        elsewhere.insert(IggyNamespace::new(1, 1, 1), REVISION, None);
+
+        for floors in [recreated, elsewhere, ProofFloors::default()] {
+            store_bytes(store, proof, proof_bytes.clone()).await;
+            let deleted = sweeper
+                .delete(
+                    vec![proof, id(REPLICA, 7)],
+                    Rc::new(floors),
+                    TierScope::new().token(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(deleted, FreshDeleted::default());
+            assert_eq!(store.keys(), Vec::<String>::new());
+        }
     }
 }
