@@ -281,7 +281,9 @@ pub struct ClusterConfig {
     #[config_env(leaf)]
     pub view_change_retransmit_interval: IggyDuration,
     /// Backstop for a stalled view change: one that does not conclude within
-    /// this window escalates to a fresh cluster-wide election. Must span
+    /// this window escalates to a fresh cluster-wide election. The window
+    /// starts once the replica wrote the new view to disk, and each view
+    /// change in a row doubles it, up to 16 times. Must span
     /// several `view_change_retransmit_interval`s so a few dropped view-change
     /// messages retransmit rather than escalate: boot rejects
     /// `view_change_status_timeout < MIN_STATUS_TO_RETRANSMIT_RATIO *

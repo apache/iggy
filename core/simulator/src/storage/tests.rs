@@ -39,6 +39,7 @@ use server_common::{
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::io;
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::rc::Rc;
 use twox_hash::XxHash3_64;
@@ -1868,16 +1869,79 @@ fn persisted_offsets_wait_for_every_buffered_body_sync_and_fence_on_failure() {
                 PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
                     .await
                     .unwrap();
+            // Each roll synced the body before it, and the WAL barrier runs
+            // beside the body barriers, so the records before the last body
+            // are on stable storage whichever body sync failed.
             assert_eq!(
                 recovered.head(),
                 if failed_body.is_none() {
                     MESSAGES + 1
                 } else {
-                    0
+                    MESSAGES - 1
                 }
             );
             assert_eq!(recovered.contains(offset.header()), failed_body.is_none());
         }
+    });
+}
+
+#[test]
+fn given_a_writer_fenced_by_a_failed_writeback_when_a_restart_keeps_its_tail_should_survive_power_loss()
+ {
+    block_on(async {
+        const MESSAGES: u64 = 3;
+        let storage = storage_for_partition().await;
+        let (persistence, _) =
+            PartitionPersistence::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        persistence.enable_segment_storage(
+            SegmentPosition::default(),
+            OWNED_BATCH_BYTES as u64,
+            None,
+        );
+        assert!(persistence.start());
+        Rc::clone(&persistence).run().await;
+        let mut parent = 0;
+        for offset in 0..MESSAGES {
+            let prepare = owned_prepare(offset + 1, parent, offset);
+            parent = prepare.header().checksum;
+            persistence.append(prepare.into_frozen(), false).unwrap();
+            assert!(persistence.start());
+            Rc::clone(&persistence).run().await;
+        }
+        let offset = offset_prepare(MESSAGES + 1, parent);
+        persistence
+            .append(offset.clone().into_frozen(), true)
+            .unwrap();
+        storage.pause_file_syncs();
+        assert!(persistence.start());
+        let mut writer = Box::pin(Rc::clone(&persistence).run());
+        assert!(poll!(&mut writer).is_pending());
+        storage.fail_writeback_keeping_cache();
+        storage.resume();
+        writer.await;
+        assert!(persistence.failure().is_some());
+        assert!(!persistence.is_durable(offset.header()));
+        drop(persistence);
+
+        // The restarted process reads every record back from the cache.
+        storage.crash(Crash::Process);
+        let kept =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert_eq!(kept.head(), MESSAGES + 1);
+        drop(kept);
+
+        // That open published them, so they must be on the device. A sync
+        // through its new handles alone writes none of the clean pages.
+        storage.crash(Crash::PowerLoss);
+        let recovered = PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
+            .await
+            .unwrap();
+        assert_eq!(recovered.head(), MESSAGES + 1);
+        assert!(recovered.contains(offset.header()));
     });
 }
 
@@ -1925,8 +1989,20 @@ fn owned_segment_fault_sweep_preserves_acknowledged_bodies_and_checkpoint_bounds
                                 )
                                 .await
                                 .unwrap_or_else(|error| panic!("{context}: {error}"));
+                                // A buffered record is back with the cache,
+                                // and without it only if a barrier of the
+                                // interrupted mutation covered it. A rollback
+                                // issues one too, over the outgoing generation.
+                                let baseline_heads = match (buffered, crash, writeback) {
+                                    (true, Crash::PowerLoss, false) => 1..=2,
+                                    _ => 2..=2,
+                                };
                                 assert_owned_segments(
-                                    &recovered, mutation, buffered, completed, &context,
+                                    &recovered,
+                                    mutation,
+                                    baseline_heads,
+                                    completed,
+                                    &context,
                                 )
                                 .await;
                                 cases += 1;
@@ -1937,6 +2013,100 @@ fn owned_segment_fault_sweep_preserves_acknowledged_bodies_and_checkpoint_bounds
             }
         }
         println!("owned segment fault cases: {cases}");
+    });
+}
+
+/// What a process crash leaves of a journal with two buffered records, the
+/// second of them rolled into a segment of its own.
+async fn buffered_tail_after_process_crash() -> SimStorage {
+    let (storage, mut journal) = owned_segment_baseline(true).await;
+    let second = owned_prepare(2, owned_prepare(1, 0, 0).header().checksum, 1);
+    journal
+        .append_buffered(owned_prepare(3, second.header().checksum, 2).into_frozen())
+        .await
+        .unwrap();
+    drop(journal);
+    storage.crash(Crash::Process);
+    storage
+}
+
+#[test]
+fn given_a_kept_tail_when_the_recovering_open_crashes_at_any_io_boundary_should_recover_it_again() {
+    block_on(async {
+        let storage = buffered_tail_after_process_crash().await;
+        storage.clear_trace();
+        let journal =
+            PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage.clone())
+                .await
+                .unwrap();
+        assert_eq!(journal.head(), 3);
+        drop(journal);
+        let first = owned_prepare(1, 0, 0);
+        let second = owned_prepare(2, first.header().checksum, 1);
+        let third = owned_prepare(3, second.header().checksum, 2);
+        let expected = [first, second, third];
+        let mut cases = 0;
+        for (cut, operation) in storage.trace().iter().enumerate() {
+            for mode in [FaultMode::Before, FaultMode::After, FaultMode::TornWrite] {
+                for crash in [Crash::Process, Crash::PowerLoss] {
+                    for writeback in [false, true] {
+                        let storage = buffered_tail_after_process_crash().await;
+                        storage.fail_at(cut, mode);
+                        let completed = PartitionPrepareJournal::open_with_storage(
+                            Path::new(WAL),
+                            42,
+                            7,
+                            storage.clone(),
+                        )
+                        .await
+                        .is_ok();
+                        if writeback {
+                            storage.writeback();
+                        }
+                        storage.crash(crash);
+                        let context = format!(
+                            "cut {cut} {operation:?} {mode:?} {crash:?} writeback={writeback}"
+                        );
+                        let recovered = PartitionPrepareJournal::open_with_storage(
+                            Path::new(WAL),
+                            42,
+                            7,
+                            storage,
+                        )
+                        .await
+                        .unwrap_or_else(|error| panic!("{context}: {error}"));
+                        // The interrupted open cut nothing, so the cache still
+                        // holds the whole tail. Without the cache, what that
+                        // open published stays, and op 1 always.
+                        let lowest = if completed || crash == Crash::Process || writeback {
+                            3
+                        } else {
+                            1
+                        };
+                        assert!(
+                            (lowest..=3).contains(&recovered.head()),
+                            "{context}: head {}",
+                            recovered.head()
+                        );
+                        let prepares = recovered.prepares().await.unwrap();
+                        assert_eq!(
+                            prepares
+                                .iter()
+                                .map(|prepare| prepare.header().op)
+                                .collect::<Vec<_>>(),
+                            (recovered.checkpoint_op()..=recovered.head()).collect::<Vec<_>>(),
+                            "{context}"
+                        );
+                        for prepare in &prepares {
+                            let index = usize::try_from(prepare.header().op - 1).unwrap();
+                            assert_eq!(prepare.as_slice(), expected[index].as_slice(), "{context}");
+                        }
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        println!("recovering open fault cases: {cases}");
     });
 }
 
@@ -2097,37 +2267,30 @@ fn reopening_retained_segments_syncs_only_recovery_mutations() {
                 .iter()
                 .filter(|operation| **operation == StorageOperation::FileSync)
                 .count();
-            // A clean reopen under an intact frontier truncates nothing, so
-            // only the dropped buffered tail pays the file and directory
-            // barriers.
-            assert_eq!(file_syncs, 2 * usize::from(buffered_tail), "{trace:?}");
+            // A clean reopen under an intact frontier writes nothing. A kept
+            // buffered tail pays three file barriers, for its segment, its WAL
+            // records and the publication, and both directories for its names.
+            assert_eq!(file_syncs, 3 * usize::from(buffered_tail), "{trace:?}");
             assert_eq!(
                 trace
                     .iter()
                     .filter(|operation| **operation == StorageOperation::DirectorySync)
                     .count(),
-                1 + usize::from(buffered_tail),
+                1 + 2 * usize::from(buffered_tail),
                 "retained names need no new publication barrier: {trace:?}"
             );
-            let expected_head = if buffered_tail { 1 } else { 2 };
-            assert_eq!(recovered.head(), expected_head);
+            assert_eq!(recovered.head(), 2);
             drop(recovered);
             storage.crash(Crash::PowerLoss);
             let public = Path::new("/partition/00000000000000000000.log");
             let file = storage.open(public, OpenMode::Read).await.unwrap();
-            assert_eq!(
-                file.length().await.unwrap(),
-                expected_head * OWNED_BATCH_BYTES as u64
-            );
+            assert_eq!(file.length().await.unwrap(), 2 * OWNED_BATCH_BYTES as u64);
             let recovered =
                 PartitionPrepareJournal::open_with_storage(Path::new(WAL), 42, 7, storage)
                     .await
                     .unwrap();
-            assert_eq!(recovered.head(), expected_head);
-            assert_eq!(
-                recovered.prepares().await.unwrap().len() as u64,
-                expected_head
-            );
+            assert_eq!(recovered.head(), 2);
+            assert_eq!(recovered.prepares().await.unwrap().len(), 2);
         }
     });
 }
@@ -2543,7 +2706,7 @@ async fn mutate_owned_segments(
 async fn assert_owned_segments(
     journal: &PartitionPrepareJournal<SimStorage>,
     mutation: Mutation,
-    buffered: bool,
+    baseline_heads: RangeInclusive<u64>,
     completed: bool,
     context: &str,
 ) {
@@ -2575,9 +2738,8 @@ async fn assert_owned_segments(
     if completed {
         assert_eq!(journal.head(), expected_head, "{context}");
     }
-    let baseline_head = if buffered { 1 } else { 2 };
     assert!(
-        [baseline_head, expected_head].contains(&journal.head()),
+        baseline_heads.contains(&journal.head()) || journal.head() == expected_head,
         "{context}"
     );
     if completed && matches!(mutation, Mutation::Checkpoint) {

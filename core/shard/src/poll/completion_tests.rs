@@ -43,6 +43,7 @@ use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName,
     WireOptions,
 };
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy, UserStatus};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -52,7 +53,7 @@ use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
-use metadata::stm::user::Users;
+use metadata::stm::user::{ROOT_USER_CREATED_AT_MICROS, Users};
 use partitions::state_transfer::{PartitionTransferSession, TransferSlot};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer, RepairSession,
@@ -68,7 +69,7 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
 use super::test_support::{
     PollTestMetadata, delete_history, install_group_owner, partition_with_messages,
-    partition_with_messages_at_revision, partitions_config,
+    partition_with_messages_at_revision, partitions_config, primary_with_pending_view_write,
 };
 use crate::commit_batch::encode_commit_batch;
 use crate::metrics::ShardMetrics;
@@ -773,6 +774,104 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
             owner.validate_partition_attachment(&consumer_offset_store(namespace), &attachment),
             Err(expected),
             "transferring {transferring}: an attached offset write"
+        );
+    }
+}
+
+#[compio::test]
+async fn given_a_pending_view_write_when_read_on_primary_should_refuse_until_it_lands() {
+    const CREATED_REVISION: u64 = 1;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let mut topic = Topic::default();
+    topic.partitions.push(Partition::new(
+        0,
+        namespace.inner(),
+        IggyTimestamp::default(),
+        CREATED_REVISION,
+        0,
+    ));
+    let mut stream = Stream::default();
+    stream.topics.insert(topic);
+    let mut inner = StreamsInner::default();
+    inner.items.insert(stream);
+    let users = Users::default();
+    users.ensure_root_user("iggy", "password-hash");
+    let metadata = PollTestMetadata::new((users, (inner.into(), ())));
+    let (owner, _inbox) = owner_with_metadata(&bus, partitions_config(), namespace, metadata);
+    owner.shards_table.insert(
+        namespace,
+        PartitionLocation::new(ShardId::new(0), CREATED_REVISION),
+    );
+    owner.plane.partitions().insert(
+        namespace,
+        primary_with_pending_view_write(Rc::clone(&bus), namespace, CREATED_REVISION),
+    );
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, None, BOUND_CLIENT)
+        .expect("metadata names the partition");
+    let consumer = PollingConsumer::Consumer(1, 0);
+    let primary_reads = || {
+        [
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args: PollingArgs::new(PollingStrategy::first(), 1, false),
+                user_id: DEFAULT_ROOT_USER_ID,
+                user_created_at: ROOT_USER_CREATED_AT_MICROS,
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(consumer),
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group_id: 1,
+                metadata,
+            },
+            PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
+        ]
+    };
+
+    for landed in [false, true] {
+        if landed {
+            let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+            assert!(partition.persist_superblock_if_needed().await);
+        }
+        for read in primary_reads() {
+            let (reply, replies) = channel(1);
+            owner.on_partition_read(namespace, read, reply).await;
+            let reply = replies.try_recv().expect("the owner answers the read");
+            if landed {
+                assert!(
+                    !matches!(reply, PartitionReadReply::Rejected(_)),
+                    "a persisted view serves the read, got {reply:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    ),
+                    "a pending view write refuses the read, got {reply:?}"
+                );
+            }
+        }
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(namespace, PartitionRead::ConsumerOffset { consumer }, reply)
+            .await;
+        let reply = replies.try_recv().expect("the owner answers the read");
+        assert!(
+            !matches!(reply, PartitionReadReply::Rejected(_)),
+            "landed {landed}: a read that needs no primary is served, got {reply:?}"
         );
     }
 }

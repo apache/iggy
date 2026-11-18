@@ -2972,6 +2972,20 @@ where
         .await
     }
 
+    /// Whether the view state of this replica waits for a superblock write
+    /// that is queued, runs, or is due for a retry. Every view-scoped send of
+    /// the replica waits with it.
+    ///
+    /// Only the local superblock I/O counts. A persist that waits for anything
+    /// else, such as a proof from a peer, is not pending here.
+    #[must_use]
+    pub fn view_persist_pending(&self) -> bool {
+        self.consensus.needs_superblock_persist()
+            && (self.superblock_intent.get().is_some()
+                || self.superblock_running.get().is_some()
+                || self.superblock_write_is_backed_off())
+    }
+
     pub fn defer_wire_actions(&self, actions: Vec<consensus::VsrAction>) {
         if actions.is_empty() || !self.has_io_dispatcher() {
             return;
@@ -10902,7 +10916,7 @@ where
             .as_ref()
             .filter(|persistence| persistence.segment_checkpoint().is_some())
         {
-            // Recovery only keeps segment bytes covered by the published WAL frontier.
+            // A power loss can take segment bytes that the published WAL frontier does not cover.
             persistence.sync();
             self.start_persistence();
             // Shutdown and transfer must finish the flush, but never drain while

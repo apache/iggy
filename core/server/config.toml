@@ -554,8 +554,10 @@ prepare_retransmit_interval = "250ms"
 view_change_retransmit_interval = "500ms"
 
 # Backstop for a stalled view change (duration): one that does not conclude
-# within this window escalates to a fresh cluster-wide election. Must be nonzero
-# and at least 4x view_change_retransmit_interval, so a few dropped view-change
+# within this window escalates to a fresh cluster-wide election. The window
+# starts once the replica wrote the new view to disk, and each view change in a
+# row doubles it, up to 16x, until a view works again. Must be nonzero and at
+# least 4x view_change_retransmit_interval, so a few dropped view-change
 # messages retransmit rather than prematurely escalate.
 view_change_status_timeout = "5s"
 
@@ -1038,7 +1040,8 @@ change_log_activity_capacity = 16384
 # Persistence barriers can also persist co-batched messages.
 # Persisted prepares are limited to 64 MiB including the consensus header. Oversized operations are rejected permanently.
 # Both policies write data to storage. "replicated" waits for VSR commit and application without an additional stable-storage barrier.
-# After a crash, a "replicated" partition recovers up to the last WAL frontier it published: at checkpoints, durable operations and graceful shutdown.
+# A "replicated" partition publishes its WAL frontier at checkpoints, durable operations and graceful shutdown.
+# After a crash it recovers up to that frontier, and past it the writes that the OS still holds complete.
 # "persisted" also requires recoverable stable-storage copies at the replication quorum before explicit success.
 # A singleton quorum is one replica. Its persisted completion follows recoverable local persistence.
 # Poll auto-commit remains asynchronous. A successful poll does not confirm that its submitted offset operation committed or became durable.

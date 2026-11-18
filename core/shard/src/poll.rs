@@ -415,9 +415,13 @@ where
                     if consensus.is_normal_backup() {
                         return Some(IggyError::NotPrimary);
                     }
+                    // The quorum check of a primary waits for its view write, so
+                    // until the write lands nothing bounds how long a primary cut
+                    // off from a newer view serves.
                     if !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
+                        || consensus.needs_superblock_persist()
                     {
                         return Some(IggyError::TransientNotAccepted);
                     }
