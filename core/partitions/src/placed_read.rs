@@ -1059,7 +1059,7 @@ mod tests {
                 let blob = &object[object.len() - blob_len..];
                 let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob_len) as u64, 1);
                 header.base_offset = base_offset + batch;
-                PlacedBatch::new(header, Placement::of(object_id, position, blob))
+                PlacedBatch::new(header, Placement::of(object_id, position, blob, 0))
             })
             .collect();
         (Bytes::from(object), placed)
@@ -1305,7 +1305,7 @@ mod tests {
                 let mut header = BatchHeader::new(0, 0, BATCH_HEADER_SIZE as u64 + length, 1);
                 header.base_offset = offset;
                 let blob = vec![0; usize::try_from(length).unwrap()];
-                PlacedBatch::new(header, Placement::of(1, 0, &blob))
+                PlacedBatch::new(header, Placement::of(1, 0, &blob, 0))
             })
             .collect();
         let mut log = vec![0; 4 * PLACED_BATCH_SIZE];

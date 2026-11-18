@@ -28,7 +28,7 @@ fn placed_record(index: u64) -> (Vec<u8>, Placement) {
     let whole = build_segment_record(IggyNamespace::new(1, 1, 0), 0);
     let mut header = BatchHeader::decode(&whole).unwrap();
     header.batch_checksum = 0;
-    let placement = Placement::of(7, index * 4096, &whole[COMMAND_HEADER_SIZE..]);
+    let placement = Placement::of(7, index * 4096, &whole[COMMAND_HEADER_SIZE..], 0);
     let mut record = vec![0; PLACED_BATCH_SIZE];
     PlacedBatch::new(header, placement).encode_into(&mut record);
     (record, placement)
@@ -552,7 +552,7 @@ fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<Prepare
     let header_size = size_of::<PrepareHeader>();
     let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).unwrap();
     let blob = &whole.as_slice()[header_size + COMMAND_HEADER_SIZE..];
-    let placed = PlacedBatch::new(batch, Placement::of(7, op * 4096, blob));
+    let placed = PlacedBatch::new(batch, Placement::of(7, op * 4096, blob, 0));
     let total = header_size + PLACED_BATCH_SIZE;
     let mut prepare = Message::<PrepareHeader>::new(total);
     placed.encode_into(&mut prepare.as_mut_slice()[header_size..]);
@@ -750,7 +750,7 @@ fn placed_client_request(
             *next = header;
         },
     );
-    server_common::send_messages::place_request(&admitted, 7, request * 4096).unwrap()
+    server_common::send_messages::place_request(&admitted, 7, request * 4096, 0).unwrap()
 }
 
 /// A primary alone in its group, so a request commits without a backup.
@@ -844,6 +844,7 @@ async fn given_a_placing_primary_when_the_placed_entry_gets_another_body_should_
         ),
         7,
         0,
+        0,
     )
     .unwrap();
 
@@ -896,7 +897,7 @@ pub(super) fn whole_and_placed_in(
             let mut header = BatchHeader::decode(record).unwrap();
             header.batch_checksum = 0;
             let blob = &record[COMMAND_HEADER_SIZE..];
-            let placement = Placement::of(object_id, object.push(blob), blob);
+            let placement = Placement::of(object_id, object.push(blob), blob, 0);
             let mut placed = vec![0; PLACED_BATCH_SIZE];
             PlacedBatch::new(header, placement).encode_into(&mut placed);
             placed

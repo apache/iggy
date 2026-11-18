@@ -537,8 +537,9 @@ where
             return;
         };
         // The position is where the blob will start, so the request can be
-        // built before the blob is copied in.
-        let placed = match place_request(&admitted, window.id.get(), window.object.len()) {
+        // built before the blob is copied in. The shard keeps no proofs, so
+        // it claims none.
+        let placed = match place_request(&admitted, window.id.get(), window.object.len(), 0) {
             Ok(placed) => placed,
             Err(error) => {
                 deny(&error);

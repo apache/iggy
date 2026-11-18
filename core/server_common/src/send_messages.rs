@@ -758,7 +758,9 @@ pub fn admitted_blob(request: &Message<RoutedRequestHeader>) -> Result<&[u8], Ig
 
 /// The request that commits where the blob of `request` sits in the object
 /// store: the header of `request`, and the placed batch of its batch at
-/// `position` of the object `object_id`.
+/// `position` of the object `object_id`, which says that the partition's
+/// committed batches below `proven_below` are proven (see
+/// [`Placement::proven_below`]).
 ///
 /// `request` is an admitted `SendMessages` in its pipeline form. The result
 /// answers to the same client, session and request number, so its reply and
@@ -770,6 +772,7 @@ pub fn place_request(
     request: &Message<RoutedRequestHeader>,
     object_id: u128,
     position: u64,
+    proven_below: u64,
 ) -> Result<Message<RoutedRequestHeader>, IggyError> {
     let header_size = std::mem::size_of::<RoutedRequestHeader>();
     let body = request
@@ -785,7 +788,12 @@ pub fn place_request(
         .ok_or(IggyError::InvalidCommand)?;
     let placed = PlacedBatch::new(
         batch,
-        Placement::of(object_id, position, &body[COMMAND_HEADER_SIZE..]),
+        Placement::of(
+            object_id,
+            position,
+            &body[COMMAND_HEADER_SIZE..],
+            proven_below,
+        ),
     );
     let total = header_size + PLACED_BATCH_SIZE;
     let mut message = Message::<RoutedRequestHeader>::new(total);
@@ -1515,7 +1523,7 @@ mod tests {
         let header_size = std::mem::size_of::<PrepareHeader>();
         let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).expect("batch header");
         let blob = &whole.as_slice()[PREPARE_SPLIT_POINT..header_size + batch.total_size()];
-        let placed = placement::PlacedBatch::new(batch, placement::Placement::of(7, 4096, blob));
+        let placed = placement::PlacedBatch::new(batch, placement::Placement::of(7, 4096, blob, 0));
         let mut bytes = Owned::<MESSAGE_ALIGN>::zeroed(header_size + PLACED_BATCH_SIZE);
         bytes.as_mut_slice()[..header_size].copy_from_slice(&whole.as_slice()[..header_size]);
         placed.encode_into(&mut bytes.as_mut_slice()[header_size..]);
@@ -1650,7 +1658,7 @@ mod tests {
         let batch = BatchHeader::decode(&admitted.as_slice()[header_size..]).expect("batch");
         let blob = admitted_blob(&admitted).expect("blob").to_vec();
 
-        let placed = place_request(&admitted, 9, 4096).expect("placed request");
+        let placed = place_request(&admitted, 9, 4096, 12).expect("placed request");
 
         assert_eq!(
             placed.header().size as usize,
@@ -1663,7 +1671,7 @@ mod tests {
         assert_eq!(decoded.header.message_count, batch.message_count);
         assert_eq!(decoded.header.batch_length, batch.batch_length);
         assert_eq!(decoded.header.partition_id, 3);
-        assert_eq!(decoded.placement, Placement::of(9, 4096, &blob));
+        assert_eq!(decoded.placement, Placement::of(9, 4096, &blob, 12));
         assert!(decoded.placement.matches(&blob));
     }
 }

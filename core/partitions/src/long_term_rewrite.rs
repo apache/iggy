@@ -712,7 +712,7 @@ mod tests {
     fn batch(base_offset: u64, blob: &[u8]) -> PlacedBatch {
         let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, 1);
         header.base_offset = base_offset;
-        PlacedBatch::new(header, Placement::of(1, 0, blob))
+        PlacedBatch::new(header, Placement::of(1, 0, blob, 0))
     }
 
     #[test]
