@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::eviction::{reboot, tiered_partition_on_disk};
 use super::floor_eviction::{advance_over, apply};
 use super::remote_poll::layout;
 use super::segment_chain::{PREFIX, tiered_partition};
@@ -22,10 +23,11 @@ use super::*;
 use crate::tiered_floor::AdvanceTieredFloor;
 use crate::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
+    upload_segment,
 };
 use iggy_object_store::{
-    InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PartitionManifest,
-    TierJobCancelled,
+    InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PartitionManifest, SegmentKey,
+    SegmentObject, TierJobCancelled,
 };
 
 /// Sealed segments of a partition with [`RECEIVER_OPS`] one-message ops, as
@@ -80,7 +82,7 @@ fn listed(manifest: &PartitionManifest) -> Vec<(u64, u64)> {
 
 /// Make the replica the primary of a later view, as after primacy moved away
 /// and came back.
-fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
+pub(super) fn regain_primacy(partition: &mut IggyPartition<IggyMessageBus>) {
     loop {
         let view = partition.consensus.view() + 1;
         partition.consensus.set_view(view);
@@ -314,4 +316,79 @@ async fn given_a_manifest_when_publishing_through_an_executor_should_store_it_un
     let size = store.head(&key).await.unwrap().size;
     let object = store.get_range(&key, 0..size).await.unwrap();
     assert_eq!(PartitionManifest::decode(&object.bytes), Ok(manifest));
+}
+
+/// Store the oldest sealed segment above the floor through `publisher`'s
+/// store, and commit its advance as `op`.
+async fn upload_and_advance(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    publisher: &Publisher,
+    op: u64,
+) {
+    let upload = partition.next_segment_upload().unwrap();
+    upload_segment(publisher.executor().store(), &layout(), &upload)
+        .await
+        .unwrap();
+    let advance = partition.note_segment_uploaded(&upload.record).unwrap();
+    Box::pin(apply(partition, op, advance)).await;
+}
+
+/// One pass that `publisher` stores.
+async fn published_pass(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    publisher: &Publisher,
+    now: IggyTimestamp,
+) {
+    let (id, manifest, scope) = partition.begin_manifest_publish(now).unwrap();
+    let outcome = publisher.publish(manifest, scope).await;
+    partition.finish_manifest_publish(id, &outcome, now);
+    assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+}
+
+async fn manifest_in(store: &MemoryStore) -> PartitionManifest {
+    let key = layout().manifest_key(&PREFIX);
+    let size = store.head(&key).await.unwrap().size;
+    let object = store.get_range(&key, 0..size).await.unwrap();
+    PartitionManifest::decode(&object.bytes).unwrap()
+}
+
+/// The primary stores a segment and commits its advance, then crashes before
+/// the pass that would publish it. The manifest it left behind names only
+/// objects the store holds, and the restarted primary builds the next one
+/// from its chain file, not from the one it finds in the store.
+#[compio::test]
+async fn given_a_crash_between_a_segment_upload_and_its_manifest_when_the_primary_restarts_should_catch_the_manifest_up()
+ {
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut partition) = Box::pin(tiered_partition_on_disk(root.path())).await;
+    let publisher = publisher();
+    let store = publisher.executor().store();
+    let now = IggyTimestamp::now();
+    Box::pin(upload_and_advance(&mut partition, &publisher, 100)).await;
+    Box::pin(published_pass(&mut partition, &publisher, now)).await;
+
+    Box::pin(upload_and_advance(&mut partition, &publisher, 101)).await;
+    drop(partition);
+
+    let behind = manifest_in(store).await;
+    assert_eq!(listed(&behind), [SEALED[0]]);
+    assert_eq!(behind.floor, Some(SEALED[0].1));
+    for segment in &behind.segments {
+        for object in [SegmentObject::Log, SegmentObject::Index] {
+            let key = layout().segment_key(&SegmentKey {
+                prefix: PREFIX,
+                start_offset: segment.start_offset,
+                object,
+            });
+            assert!(store.head(&key).await.is_ok(), "{key} is not stored");
+        }
+    }
+
+    let mut rebooted = Box::pin(reboot(&config)).await;
+    Box::pin(published_pass(&mut rebooted, &publisher, now)).await;
+
+    let caught_up = manifest_in(store).await;
+    assert_eq!(listed(&caught_up), SEALED);
+    assert_eq!(caught_up.floor, Some(SEALED[1].1));
+    assert_eq!(caught_up.trim_point, None);
 }
