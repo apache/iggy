@@ -181,7 +181,7 @@ where
             return;
         }
         let partitions = self.plane.partitions();
-        if matches!(read, PartitionRead::SessionRetired { .. }) {
+        if matches!(read, PartitionRead::SessionsRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
                 partitions
                     .with_partition(&namespace, |partition| {
@@ -234,16 +234,19 @@ where
             read => (read, None),
         };
         let result = match read {
-            PartitionRead::SessionRetired {
-                identity,
+            PartitionRead::SessionsRetired {
+                ended,
+                retired_through,
                 created_revision,
             } => partitions
                 .with_partition(&namespace, |partition| {
-                    PartitionReadReply::SessionRetired(
-                        partition.created_revision() == created_revision
-                            && partition.session_retired(identity),
-                    )
+                    (partition.created_revision() == created_revision).then(|| {
+                        PartitionReadReply::SessionsRetired(
+                            partition.sessions_retired(&ended, retired_through),
+                        )
+                    })
                 })
+                .flatten()
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::RetirementDebt {
                 created_revision,
@@ -412,9 +415,13 @@ where
                     if consensus.is_normal_backup() {
                         return Some(IggyError::NotPrimary);
                     }
+                    // The quorum check of a primary waits for its view write, so
+                    // until the write lands nothing bounds how long a primary cut
+                    // off from a newer view serves.
                     if !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
+                        || consensus.needs_superblock_persist()
                     {
                         return Some(IggyError::TransientNotAccepted);
                     }

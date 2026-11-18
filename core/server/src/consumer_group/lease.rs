@@ -25,10 +25,10 @@ use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::{BufMut, BytesMut};
-use iggy_binary_protocol::requests::system::{RetirementDebt, SessionIdentity};
+use iggy_binary_protocol::requests::system::RetirementDebt;
 use iggy_binary_protocol::{
     Command, ConsumerSession, ConsumerSessionHeartbeatHeader, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
-    WireDecode, WireEncode,
+    WireDecode,
 };
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
@@ -69,21 +69,46 @@ pub(super) struct Withheld {
 /// A reporter's withheld vouches. `None` vouches for none of its partitions.
 pub(super) type Unprovable = Option<Rc<Withheld>>;
 
+/// One walk of this node over the partitions it stores. It proves retired
+/// every session that ended at or below `retired_through`.
 pub(super) struct RetirementProgress {
-    pub(super) identity: SessionIdentity,
-    pub(super) revision: u64,
+    pub(super) retired_through: u64,
+    /// The stored partitions when the walk started. The walk skips a partition
+    /// created above `retired_through`, because its frontier starts at its
+    /// create op.
+    pub(super) namespaces: RetirementNamespaces,
     pub(super) cursor: usize,
-    /// Swept namespaces not yet proven: created revision, first attempt, and
-    /// whether a retry followed it.
-    pub(super) pending: BTreeMap<IggyNamespace, (u64, Instant, bool)>,
+    /// Swept namespaces not yet proven: created revision, and whether an
+    /// attempt after the first one ran.
+    pub(super) pending: BTreeMap<IggyNamespace, (u64, bool)>,
     pub(super) unprovable: BTreeSet<RetirementDebt>,
+    /// When the walk last advanced its first round or proved a namespace. A
+    /// backup proves its copy only after the node of the partition primary
+    /// commits a barrier, so the walk gives up on a namespace only once the
+    /// whole walk stalls.
+    pub(super) last_progress: Instant,
     pub(super) reported: bool,
     last_report: Option<Instant>,
-    pub(super) reporters: BTreeMap<u8, Unprovable>,
-    pub(super) debt_settleable_since: Option<Instant>,
 }
 
 impl RetirementProgress {
+    pub(super) const fn new(
+        retired_through: u64,
+        namespaces: RetirementNamespaces,
+        now: Instant,
+    ) -> Self {
+        Self {
+            retired_through,
+            namespaces,
+            cursor: 0,
+            pending: BTreeMap::new(),
+            unprovable: BTreeSet::new(),
+            last_progress: now,
+            reported: false,
+            last_report: None,
+        }
+    }
+
     pub(super) fn report_due(&mut self, now: Instant, interval: Duration) -> bool {
         if self
             .last_report
@@ -96,7 +121,19 @@ impl RetirementProgress {
     }
 }
 
-type RetirementNamespaces = Rc<[(IggyNamespace, u64)]>;
+/// A partition that this node stores, as a walk lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct StoredPartition {
+    pub(super) namespace: IggyNamespace,
+    pub(super) created_revision: u64,
+    pub(super) created_op: u64,
+}
+
+pub(super) type RetirementNamespaces = Rc<[StoredPartition]>;
+
+/// A completed walk reported to the metadata primary: its watermark and the
+/// vouches the node withheld.
+pub(super) type RetirementReport = (u64, Unprovable);
 
 /// Committed partitions grouped by member set, for counting vouching reporters
 /// once per set instead of once per partition.
@@ -135,6 +172,10 @@ pub struct ConsumerGroupLiveness {
     pub(super) report_offset: usize,
     pub(super) report_incomplete: bool,
     pub(super) retirement: Option<RetirementProgress>,
+    /// The last completed walk of each node, kept by the metadata primary.
+    pub(super) retirement_reports: BTreeMap<u8, RetirementReport>,
+    /// When the reports first settled with debt but missed an expected node.
+    pub(super) retirement_settleable_since: Option<Instant>,
     pub(super) retirement_namespaces: Option<(u64, RetirementNamespaces)>,
     pub(super) retirement_fences: BTreeMap<IggyNamespace, u64>,
     /// Namespaces the last completed sweep could not prove: the next sweep
@@ -182,6 +223,8 @@ impl ConsumerGroupLiveness {
             self.last_incomplete = None;
             self.last_incomplete_warning = None;
             self.retirement = None;
+            self.retirement_reports.clear();
+            self.retirement_settleable_since = None;
             self.view = view;
         }
     }
@@ -217,35 +260,24 @@ impl ConsumerGroupLiveness {
         }
     }
 
-    pub(super) fn reconcile_retirement(
-        &mut self,
-        identity: Option<SessionIdentity>,
-        revision: u64,
-    ) {
-        if self.retirement.as_ref().map(|progress| progress.identity) != identity {
-            self.retirement = identity.map(|identity| RetirementProgress {
-                identity,
-                revision,
-                cursor: 0,
-                pending: BTreeMap::new(),
-                unprovable: BTreeSet::new(),
-                reported: false,
-                last_report: None,
-                reporters: BTreeMap::new(),
-                debt_settleable_since: None,
-            });
-        } else if let Some(progress) = &mut self.retirement
-            && progress.revision != revision
+    /// Drop what a finalization made moot, given the lowest end op among the
+    /// ended sessions, or `None` when none is left: a walk whose whole batch is
+    /// finalized, and every report at or below a finalized watermark.
+    pub(super) fn reconcile_retirement(&mut self, lowest_ended: Option<u64>) {
+        let Some(lowest_ended) = lowest_ended else {
+            self.retirement = None;
+            self.retirement_reports.clear();
+            return;
+        };
+        if self
+            .retirement
+            .as_ref()
+            .is_some_and(|progress| progress.retired_through < lowest_ended)
         {
-            progress.revision = revision;
-            progress.cursor = 0;
-            progress.pending.clear();
-            progress.unprovable.clear();
-            progress.reported = false;
-            progress.last_report = None;
-            progress.reporters.clear();
-            progress.debt_settleable_since = None;
+            self.retirement = None;
         }
+        self.retirement_reports
+            .retain(|_, (retired_through, _)| *retired_through >= lowest_ended);
     }
 
     pub(super) fn defer_expiry(&mut self, now: Instant, timeout: Duration, replica: u8) {
@@ -282,20 +314,15 @@ impl ConsumerGroupLiveness {
             if header.incomplete != 0 {
                 return;
             }
-            let Some((session, unprovable)) = decode_retirement_progress(message.body()) else {
+            let Some(unprovable) = decode_retirement_progress(message.body()) else {
                 debug!(
                     replica = header.replica,
                     "invalid session retirement progress body"
                 );
                 return;
             };
-            if let Some(progress) = &mut self.retirement
-                && header.namespace_revision == progress.revision
-                && session.client_id == progress.identity.client_id
-                && session.session == progress.identity.session
-            {
-                progress.reporters.insert(header.replica, unprovable);
-            }
+            self.retirement_reports
+                .insert(header.replica, (header.retired_through, unprovable));
             return;
         }
         // Validate the whole batch before refreshing anything.
@@ -352,24 +379,19 @@ const WITHHELD_PARTITION: u64 = 1;
 const WITHHELD_MEMBER_SET: u64 = 2;
 const WITHHELD_ALL: u64 = 3;
 
-/// A retirement progress body: the session, then one 24-byte record per
-/// withheld vouch, `namespace u64 | created_revision u64 | tag u64`, or
-/// `mask u64 | 0 | tag` for a member set. The records keep the body whole
-/// heartbeat sessions; a list that does not fit is sent as one record
-/// withholding every vouch.
-pub(super) fn encode_retirement_progress(
-    session: ConsumerSession,
-    withheld: Option<&Withheld>,
-    body_max: usize,
-) -> BytesMut {
+/// A retirement progress body: one 24-byte record per withheld vouch,
+/// `namespace u64 | created_revision u64 | tag u64`, or `mask u64 | 0 | tag`
+/// for a member set. The records keep the body whole heartbeat sessions; a
+/// list that does not fit is sent as one record withholding every vouch. The
+/// header carries the walk watermark.
+pub(super) fn encode_retirement_progress(withheld: Option<&Withheld>, body_max: usize) -> BytesMut {
     let records = withheld.map_or(1, |withheld| {
         withheld.masks.len() + withheld.partitions.len()
     });
     let fits = withheld.is_some()
-        && records < MAX_CONSUMER_SESSIONS_PER_HEARTBEAT
-        && (records + 1) * ConsumerSession::ENCODED_SIZE <= body_max;
-    let mut body = BytesMut::with_capacity((records + 1) * ConsumerSession::ENCODED_SIZE);
-    session.encode(&mut body);
+        && records <= MAX_CONSUMER_SESSIONS_PER_HEARTBEAT
+        && records * ConsumerSession::ENCODED_SIZE <= body_max;
+    let mut body = BytesMut::with_capacity(records.max(1) * ConsumerSession::ENCODED_SIZE);
     let mut record = |first: u64, second: u64, tag: u64| {
         body.put_u64_le(first);
         body.put_u64_le(second);
@@ -389,13 +411,11 @@ pub(super) fn encode_retirement_progress(
     body
 }
 
-fn decode_retirement_progress(body: &[u8]) -> Option<(ConsumerSession, Unprovable)> {
+fn decode_retirement_progress(body: &[u8]) -> Option<Unprovable> {
     let (records, remainder) = body.as_chunks::<{ ConsumerSession::ENCODED_SIZE }>();
-    let (session, records) = records.split_first()?;
     if !remainder.is_empty() {
         return None;
     }
-    let (session, _) = ConsumerSession::decode(session).ok()?;
     let mut withheld = Withheld::default();
     for record in records {
         let (first, rest) = record.split_first_chunk::<8>()?;
@@ -410,53 +430,76 @@ fn decode_retirement_progress(body: &[u8]) -> Option<(ConsumerSession, Unprovabl
                 withheld.masks.push(u32::try_from(first).ok()?);
             }
             WITHHELD_ALL if records.len() == 1 && first == 0 && second == 0 => {
-                return Some((session, None));
+                return Some(None);
             }
             _ => return None,
         }
     }
-    Some((session, Some(Rc::new(withheld))))
+    Some(Some(Rc::new(withheld)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsumerGroupLiveness, SessionActivity};
+    use super::{ConsumerGroupLiveness, RetirementProgress, SessionActivity};
     use iggy_binary_protocol::ConsumerSession;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
     #[test]
-    fn retirement_reports_are_paced_and_restart_after_view_or_revision_changes() {
+    fn given_a_walk_when_reconciling_should_pace_reports_and_drop_what_finalization_made_moot() {
         const INTERVAL: Duration = Duration::from_secs(5);
-        let identity = iggy_binary_protocol::requests::system::SessionIdentity {
-            client_id: 1,
-            session: 2,
-            metadata_watermark: 3,
-        };
+        const RETIRED_THROUGH: u64 = 30;
+        let walk = || RetirementProgress::new(RETIRED_THROUGH, Rc::from([]), Instant::now());
         let mut tracker = ConsumerGroupLiveness::default();
         tracker.observe_view(Some(1));
-        tracker.reconcile_retirement(Some(identity), 1);
+        tracker.retirement = Some(walk());
+        tracker
+            .retirement_reports
+            .insert(1, (RETIRED_THROUGH - 10, None));
+        tracker
+            .retirement_reports
+            .insert(2, (RETIRED_THROUGH, None));
         let now = Instant::now();
         let progress = tracker.retirement.as_mut().unwrap();
         assert!(progress.report_due(now, INTERVAL));
         assert!(!progress.report_due(now + Duration::from_millis(100), INTERVAL));
         assert!(progress.report_due(now + INTERVAL, INTERVAL));
-        tracker.reconcile_retirement(Some(identity), 2);
-        assert!(
-            tracker
-                .retirement
-                .as_mut()
-                .unwrap()
-                .report_due(now + INTERVAL, INTERVAL)
-        );
+
+        for lowest_ended in [RETIRED_THROUGH - 5, RETIRED_THROUGH] {
+            tracker.reconcile_retirement(Some(lowest_ended));
+            assert!(
+                tracker.retirement.is_some(),
+                "the walk still covers the sessions left in its batch"
+            );
+            assert_eq!(
+                tracker
+                    .retirement_reports
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                [2],
+                "a report at or below a finalized watermark is spent"
+            );
+        }
+        tracker.reconcile_retirement(Some(RETIRED_THROUGH + 1));
+        assert!(tracker.retirement.is_none(), "a walk ends with its batch");
+        assert!(tracker.retirement_reports.is_empty());
+
+        tracker.retirement = Some(walk());
+        tracker
+            .retirement_reports
+            .insert(2, (RETIRED_THROUGH, None));
+        tracker.reconcile_retirement(None);
+        assert!(tracker.retirement.is_none() && tracker.retirement_reports.is_empty());
+
+        tracker.retirement = Some(walk());
+        tracker
+            .retirement_reports
+            .insert(2, (RETIRED_THROUGH, None));
         tracker.observe_view(Some(2));
-        tracker.reconcile_retirement(Some(identity), 2);
         assert!(
-            tracker
-                .retirement
-                .as_mut()
-                .unwrap()
-                .report_due(now + INTERVAL, INTERVAL)
+            tracker.retirement.is_none() && tracker.retirement_reports.is_empty(),
+            "a new view starts the walk and the reports again"
         );
     }
 

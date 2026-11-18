@@ -69,6 +69,9 @@ const CONSUMER_ARGS: &[&str] = &[
     "--crash-primary",
 ];
 
+/// Makes every shard tick visit every partition, also the sleeping ones.
+const VISIT_EVERY_PARTITION: &str = "--visit-every-partition";
+
 macro_rules! fuzz_seeds {
     ($args:expr, $($name:ident => $seed:literal,)*) => {
         $(
@@ -106,7 +109,28 @@ fuzz_seeds! {
     given_seed_17_when_consumers_poll_should_pass_every_floor => 17,
 }
 
-fn run_seed(seed: u64, args: &[&str]) {
+/// A sleeping partition has nothing to do. So a run whose ticks visit every
+/// partition prints what the run that skips the sleeping ones prints, the
+/// executor schedule included. Both runs see crashes, restarts and swarm
+/// faults, so repairs, transfers and view changes are part of the comparison.
+#[test]
+fn given_a_lifecycle_run_when_ticks_visit_every_partition_should_match_ticks_that_skip_sleepers() {
+    assert_eq!(
+        run_seed(1, LIFECYCLE_ARGS),
+        run_seed(1, &[LIFECYCLE_ARGS, &[VISIT_EVERY_PARTITION]].concat()),
+    );
+}
+
+#[test]
+fn given_a_consumer_run_when_ticks_visit_every_partition_should_match_ticks_that_skip_sleepers() {
+    assert_eq!(
+        run_seed(1, CONSUMER_ARGS),
+        run_seed(1, &[CONSUMER_ARGS, &[VISIT_EVERY_PARTITION]].concat()),
+    );
+}
+
+/// Runs one seed, which must pass, and returns what it printed.
+fn run_seed(seed: u64, args: &[&str]) -> String {
     // A reused nextest build moves the binary from where it was compiled.
     let fuzzer = std::env::var_os("NEXTEST_BIN_EXE_workload-fuzz").map_or_else(
         || PathBuf::from(env!("CARGO_BIN_EXE_workload-fuzz")),
@@ -118,12 +142,13 @@ fn run_seed(seed: u64, args: &[&str]) {
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("cannot start {}: {error}", fuzzer.display()));
+    let printed = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
         output.status.success(),
         "workload-fuzz --seed {seed} exited with {} (3: vacuous run, 101: failed check)\n\
-         stdout:\n{}\nstderr:\n{}",
+         stdout:\n{printed}\nstderr:\n{}",
         output.status,
-        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    printed
 }
