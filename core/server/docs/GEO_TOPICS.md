@@ -462,6 +462,11 @@ segment holds yet.
 Committed and not yet published is the window that a destroyed cluster loses. Watch
 `partition_long_term_rewrite_lag_messages` to see its size.
 
+A cluster rebuilt on empty disks gets a new cluster id. Its store identity check then
+refuses the old bucket prefix, and its geo topics are refused with `FeatureUnavailable`.
+Give it another prefix, or empty the old one once nothing needs it. No partition is
+restored from the bucket in this version.
+
 ## Failover and failback
 
 A datacenter that takes over takes over the traffic, not the log. Nothing is promoted and
