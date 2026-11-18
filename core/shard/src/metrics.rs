@@ -370,6 +370,8 @@ pub struct ShardMetrics {
     partition_transfer_refusals_total: Counter,
     partition_applied_divergences_total: Counter,
     partitions_untrusted_log: Gauge,
+    partitions_in_view_change: Gauge,
+    partition_view_change_votes_held: Gauge,
     partitions_under_replicated: Gauge,
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
@@ -420,6 +422,7 @@ impl ShardMetrics {
     /// virtue of being constructed once per shard; the shard id does not
     /// appear in the label set (see [`FrameDropLabel`] doc).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn for_shard() -> Self {
         let frame_drops_total: Family<FrameDropLabel, Counter> = Family::default();
         let cached_counters = Arc::new(std::array::from_fn(|_| {
@@ -485,6 +488,8 @@ impl ShardMetrics {
             partition_transfer_refusals_total: Counter::default(),
             partition_applied_divergences_total: Counter::default(),
             partitions_untrusted_log: Gauge::default(),
+            partitions_in_view_change: Gauge::default(),
+            partition_view_change_votes_held: Gauge::default(),
             partitions_under_replicated: Gauge::default(),
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
@@ -1027,6 +1032,26 @@ impl ShardMetrics {
         self.partitions_untrusted_log.get()
     }
 
+    /// Republished by every partition sweep: the partitions of this shard in
+    /// view change, and the backups whose heartbeat vote the sweep held back.
+    pub fn set_partition_view_changes(&self, inflight: usize, votes_held: usize) {
+        self.partitions_in_view_change
+            .set(i64::try_from(inflight).unwrap_or(i64::MAX));
+        self.partition_view_change_votes_held
+            .set(i64::try_from(votes_held).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read of [`Self::set_partition_view_changes`]: the partitions in
+    /// view change, then the votes held.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_view_changes_value(&self) -> (i64, i64) {
+        (
+            self.partitions_in_view_change.get(),
+            self.partition_view_change_votes_held.get(),
+        )
+    }
+
     /// Republished by every partition sweep, over the partitions this shard
     /// leads: those with a member out of sync, and those with too few members
     /// in sync to commit. The metadata primary's first shard adds the
@@ -1435,6 +1460,17 @@ impl ShardMetrics {
             "partitions electing on a log that may lack acknowledged ops; a view starts only \
              once a trusted quorum or every replica reports",
             self.partitions_untrusted_log.clone(),
+        );
+        registry.register(
+            "partitions_in_view_change",
+            "partitions of this shard in view change, counted once per sweep",
+            self.partitions_in_view_change.clone(),
+        );
+        registry.register(
+            "partition_view_change_votes_held",
+            "backups whose heartbeat timer fired and whose vote waits for the per-shard view \
+             change limits; non-zero while a failover is paced",
+            self.partition_view_change_votes_held.clone(),
         );
         registry.register(
             "partitions_under_replicated",
