@@ -1040,6 +1040,7 @@ async fn shard_main(
 
     let store_identity_stop = crate::tiered_storage::start(
         &config.tiered_storage,
+        crate::origin_recovery::OriginRecovery::from_config(&config.geo),
         &bus,
         &shard,
         topology.self_replica_id,

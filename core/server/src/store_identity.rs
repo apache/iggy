@@ -42,6 +42,12 @@
 //! A store that stops answering after the check passed is an outage, and the
 //! node still passes: uploads retry. `object_store_unreachable` is 1 while
 //! the store does not answer the check.
+//!
+//! A root that another cluster claimed is refused, unless the operator named
+//! that cluster in `[geo] recover_cluster_uid`: replica 0, as the caught-up
+//! metadata primary, then recovers the geo topics of that cluster and claims
+//! the root, see [`crate::origin_recovery`]. Until then every node checks
+//! again every few seconds.
 
 use std::pin::pin;
 use std::rc::Rc;
@@ -49,6 +55,7 @@ use std::time::Duration;
 
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
+use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     ErrorClass, IdentityRead, KeyLayout, ObjectStore, ObjectStoreError, StoreIdentity,
 };
@@ -64,6 +71,7 @@ use shard::Receiver;
 use shard::metrics::ShardMetrics;
 use tracing::{debug, error, info, warn};
 
+use crate::origin_recovery::{OriginRecovery, may_recover};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 
 /// How long a node waits before it checks again, once its check passed or
@@ -93,6 +101,8 @@ pub struct IdentityChecker<S> {
     timeout: Duration,
     /// What the last check found, so that a log line marks each change.
     last: Option<Verdict>,
+    /// The recovery the operator asked for, `None` when it named no cluster.
+    recovery: Option<OriginRecovery>,
 }
 
 /// What one check of the store identity found.
@@ -171,13 +181,20 @@ pub async fn run<S: ObjectStore>(
 }
 
 impl<S: ObjectStore> IdentityChecker<S> {
-    pub const fn new(store: S, layout: KeyLayout, claimer: bool, timeout: Duration) -> Self {
+    pub const fn new(
+        store: S,
+        layout: KeyLayout,
+        claimer: bool,
+        timeout: Duration,
+        recovery: Option<OriginRecovery>,
+    ) -> Self {
         Self {
             store,
             layout,
             claimer,
             timeout,
             last: None,
+            recovery,
         }
     }
 
@@ -195,14 +212,73 @@ impl<S: ObjectStore> IdentityChecker<S> {
             metadata.is_caught_up_primary(),
             store_data,
         );
-        let check = self.check(cluster_uid, claim).await;
-        self.record(
+        let mut check = self.check(cluster_uid, claim).await;
+        let retired = self
+            .recovery
+            .as_ref()
+            .map(OriginRecovery::retired_cluster_uid);
+        let found = match check {
+            IdentityCheck::Foreign(found) => found,
+            _ => None,
+        };
+        if may_recover(
+            self.claimer,
+            retired,
+            found,
+            metadata.is_caught_up_primary(),
+        ) && self.recover(shard, cluster_uid).await
+        {
+            check = self.check(cluster_uid, false).await;
+        }
+        let awaits_recovery =
+            matches!(check, IdentityCheck::Foreign(found) if found.is_some() && found == retired);
+        let delay = self.record(
             check,
             cluster_uid,
             store_data,
             metadata.applied_frontier(),
             shard.metrics(),
-        )
+        );
+        if awaits_recovery {
+            delay.min(RETRY_INTERVAL)
+        } else {
+            delay
+        }
+    }
+
+    /// Run the recovery the operator asked for. Whether it finished: one
+    /// that failed runs again at the next check.
+    async fn recover(&self, shard: &ServerShard, cluster_uid: u128) -> bool {
+        let Some(recovery) = &self.recovery else {
+            return false;
+        };
+        let retired_cluster_uid = format!("{:032x}", recovery.retired_cluster_uid());
+        info!(
+            root = self.layout.root(),
+            retired_cluster_uid,
+            "the store names the cluster that recover_cluster_uid retires; recovering its geo              topics into this cluster"
+        );
+        match recovery
+            .run(
+                &self.store,
+                &self.layout,
+                shard,
+                cluster_uid,
+                IggyTimestamp::now(),
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                error!(
+                    root = self.layout.root(),
+                    retired_cluster_uid,
+                    %error,
+                    "the recovery of the retired cluster stopped; it runs again at the next check"
+                );
+                false
+            }
+        }
     }
 
     /// One attempt of [`IdentityCheck::run`] that waits at most the timeout.
@@ -584,7 +660,8 @@ mod tests {
 
     #[compio::test]
     async fn given_store_that_never_answers_when_checking_should_give_up_at_the_timeout() {
-        let checker = IdentityChecker::new(SilentStore, layout(), true, Duration::from_millis(10));
+        let checker =
+            IdentityChecker::new(SilentStore, layout(), true, Duration::from_millis(10), None);
 
         for claim in [false, true] {
             assert!(matches!(
@@ -759,8 +836,13 @@ mod tests {
     /// and the wait before the next check.
     #[test]
     fn given_checks_when_recording_should_track_the_check_and_both_gauges() {
-        let mut checker =
-            IdentityChecker::new(MemoryStore::new(), layout(), true, Duration::from_secs(5));
+        let mut checker = IdentityChecker::new(
+            MemoryStore::new(),
+            layout(),
+            true,
+            Duration::from_secs(5),
+            None,
+        );
         let frontier = AppliedFrontier::new(AppliedFrontier::DEFAULT_READ_BUDGET);
         let metrics = ShardMetrics::for_shard();
         let mut record = |check| {

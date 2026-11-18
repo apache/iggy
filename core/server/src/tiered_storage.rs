@@ -43,6 +43,7 @@ use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierService
 use shard::{Sender, channel};
 use tracing::{info, warn};
 
+use crate::origin_recovery::OriginRecovery;
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
 use crate::store_identity::{self, IdentityChecker, TierHandlers};
@@ -139,6 +140,7 @@ pub fn probe(
 /// Returns the stop signal of the check's task, or `None` without a backend.
 pub fn start(
     config: &TieredStorageConfig,
+    recovery: Option<OriginRecovery>,
     bus: &Rc<IggyMessageBus>,
     shard: &Rc<ServerShard>,
     replica_id: u8,
@@ -182,7 +184,13 @@ pub fn start(
     // job and no retry delays what it finds.
     let checker = if shard.id == 0 {
         store(config, credentials).ok().flatten().map(|store| {
-            IdentityChecker::new(store, layout, replica_id == 0, identity_timeout(config))
+            IdentityChecker::new(
+                store,
+                layout,
+                replica_id == 0,
+                identity_timeout(config),
+                recovery,
+            )
         })
     } else {
         None
