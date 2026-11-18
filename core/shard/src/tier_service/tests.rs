@@ -441,7 +441,12 @@ async fn given_fetches_and_housekeeping_that_wait_when_a_fresh_follow_comes_shou
     assert_eq!(probe.await, Ok("probe"));
     until(|| started.borrow().len() == 3).await;
     assert_eq!(*started.borrow(), ["fetch", "probe", "next probe"]);
-    for open in [open_fetch, open_waiting_fetch, open_listing, open_next_probe] {
+    for open in [
+        open_fetch,
+        open_waiting_fetch,
+        open_listing,
+        open_next_probe,
+    ] {
         open.send(()).unwrap();
     }
     assert!(
