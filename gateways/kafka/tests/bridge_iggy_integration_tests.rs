@@ -1177,6 +1177,61 @@ fn roster_at(address: &str) -> ClusterMetadata {
     }
 }
 
+/// Iggy can restart with another size: one node can come back as a cluster, whose replicas lag
+/// for a while. So the bridge forgets the node count while its client is cut off, and reads the
+/// roster again as soon as the client signs in again, before its next timed read.
+#[tokio::test]
+#[serial]
+async fn given_iggy_restarts_when_the_client_signs_in_again_should_read_the_roster_again() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let bridge = IggyBridge::connect(server.test_config())
+        .await
+        .expect("bridge");
+    assert_eq!(
+        bridge.iggy_node_count(),
+        Some(1),
+        "the connect read the roster"
+    );
+
+    let port = server.stop();
+    node_count_within(
+        &bridge,
+        None,
+        Duration::from_secs(10),
+        "the node count is unknown while the client is cut off",
+    )
+    .await;
+
+    let _server = TestServer::spawn_on(data_dir.path(), port).await;
+    node_count_within(
+        &bridge,
+        Some(1),
+        Duration::from_secs(30),
+        "the client signed in again and read the roster",
+    )
+    .await;
+    bridge.close().await.ok();
+}
+
+/// Waits until `bridge` knows `expected` nodes, or `limit` passes.
+async fn node_count_within(
+    bridge: &IggyBridge,
+    expected: Option<usize>,
+    limit: Duration,
+    what: &str,
+) {
+    let deadline = Instant::now() + limit;
+    while bridge.iggy_node_count() != expected {
+        assert!(
+            Instant::now() < deadline,
+            "{what}: {:?} after {limit:?}",
+            bridge.iggy_node_count()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Beside a stopped node, the configured address is down. A new client then dials the nodes of
 /// the last roster the bridge read, so the gateway still opens clients through the other nodes.
 #[tokio::test]

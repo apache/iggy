@@ -24,6 +24,7 @@ use iggy::prelude::{
     AutoLogin, Client, ClusterClient, Credentials, Identifier, IggyClient, IggyClientBuilder,
     IggyError, OptionKey, OptionSpec, OptionsScope, SystemClient, UserClient,
 };
+use iggy_common::DiagnosticEvent;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior, interval, timeout_at};
@@ -283,7 +284,7 @@ impl IggyBridge {
         if let Err(error) = learn_roster(&client, &config.nodes).await {
             warn!(%error, "could not read the Iggy roster; new clients dial only {}", config.address);
         }
-        refresh_roster_in_background(&client, config.nodes.clone());
+        refresh_roster_in_background(&client, config.nodes.clone()).await;
         let produce_pool = Arc::new(ProducePool::new(config.produce_sessions));
         produce_pool.sweep_in_background();
 
@@ -450,7 +451,9 @@ impl IggyBridge {
         &self.config.topic_defaults
     }
 
-    /// How many nodes the Iggy cluster had at the last roster read, or `None` before one.
+    /// How many nodes the Iggy cluster had at the last roster read. `None` before one, and while
+    /// the bridge's client is cut off from Iggy, until it reads the roster again: a restart can
+    /// change the size.
     #[must_use]
     pub fn iggy_node_count(&self) -> Option<usize> {
         self.config.nodes.node_count()
@@ -753,9 +756,15 @@ fn default_replication_factor(specs: &[OptionSpec]) -> Option<u32> {
     Some(u32::from_le_bytes(bytes))
 }
 
-/// Reads the roster through `client` every [`ROSTER_REFRESH`], until the bridge drops the client
-/// or shuts it down.
-fn refresh_roster_in_background(client: &Arc<IggyClient>, nodes: KnownNodes) {
+/// Reads the roster through `client` every [`ROSTER_REFRESH`], and again as soon as `client`
+/// signs in after it lost Iggy, until the bridge drops the client or shuts it down.
+///
+/// While `client` is cut off, the node count is unknown: Iggy can come back with another size,
+/// and a Fetch that still took it for one node would answer 1 for a replica that catches up.
+async fn refresh_roster_in_background(client: &Arc<IggyClient>, nodes: KnownNodes) {
+    // The subscription starts at the client's first event, so the sign-in of the connect itself
+    // reads the roster once more.
+    let mut events = client.subscribe_events().await;
     let client = Arc::downgrade(client);
     tokio::spawn(async move {
         let mut tick = interval(ROSTER_REFRESH);
@@ -763,7 +772,21 @@ fn refresh_roster_in_background(client: &Arc<IggyClient>, nodes: KnownNodes) {
         // The first tick fires at once, and the connect has just read the roster.
         tick.tick().await;
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {}
+                event = events.recv() => match event {
+                    Ok(DiagnosticEvent::Disconnected) => {
+                        nodes.forget_node_count();
+                        continue;
+                    }
+                    Ok(DiagnosticEvent::Connected | DiagnosticEvent::SignedOut) => continue,
+                    Ok(DiagnosticEvent::Shutdown) => return,
+                    Err(_) if events.is_closed() => return,
+                    // A sign-in after a cut, or events this task missed: either can hide a new
+                    // roster.
+                    Ok(DiagnosticEvent::SignedIn) | Err(_) => {}
+                },
+            }
             let Some(client) = client.upgrade() else {
                 return;
             };

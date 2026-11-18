@@ -45,7 +45,7 @@ struct Known {
     /// The TCP address of each node, in roster order.
     roster: Vec<String>,
     /// How many nodes the last roster listed, the ones without an address among them. 0 until
-    /// the bridge reads one.
+    /// the bridge reads one, and again while its client is cut off from Iggy.
     node_count: usize,
     /// The replication factor Iggy gives a topic that names none, from its last answer.
     default_replication_factor: Option<u32>,
@@ -71,6 +71,13 @@ impl KnownNodes {
     #[must_use]
     pub fn node_count(&self) -> Option<usize> {
         Some(self.known().node_count).filter(|count| *count > 0)
+    }
+
+    /// Forgets how many nodes the roster listed, until the bridge reads one again: its client
+    /// lost Iggy, and Iggy can come back with another size. The addresses stay, for the dials
+    /// that bring it back.
+    pub fn forget_node_count(&self) {
+        self.known().node_count = 0;
     }
 
     /// Records the replication factor Iggy gives a topic that names none.
@@ -226,6 +233,26 @@ mod tests {
     #[test]
     fn given_no_roster_yet_should_know_no_node_count() {
         assert_eq!(KnownNodes::default().node_count(), None);
+    }
+
+    #[test]
+    fn given_a_client_cut_off_from_iggy_when_forgetting_the_node_count_should_keep_the_roster() {
+        let known = KnownNodes::default();
+        known.learn(&roster(vec![node(0, "10.0.0.1", 8090)]));
+        assert_eq!(known.node_count(), Some(1));
+
+        known.forget_node_count();
+
+        assert_eq!(
+            known.node_count(),
+            None,
+            "Iggy can come back with another size"
+        );
+        assert_eq!(
+            known.dial_order("iggy:8090"),
+            ["iggy:8090", "10.0.0.1:8090"],
+            "the addresses stay for the dials that bring it back"
+        );
     }
 
     #[test]

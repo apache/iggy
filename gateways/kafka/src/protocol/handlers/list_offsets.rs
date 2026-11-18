@@ -40,7 +40,7 @@ use crate::protocol::api::{
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
 use crate::protocol::handlers::fetch::{
     Admit, POLL_DEADLINE, POLLS_AT_ONCE, PollKind, PollRecords, Spells, admit, recheck,
-    record_poll, sight_first, sight_loading,
+    record_poll, sight_first, sight_loading, unplaced_grace,
 };
 use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, respond_or_close};
 
@@ -196,6 +196,7 @@ async fn resolve_topic_lookups<'a>(
 
     let mut lookups: HashMap<&str, TopicLookup> = HashMap::new();
     let mut deadline_exceeded = false;
+    let grace = unplaced_grace(bridge.iggy_node_count());
     for &name in order {
         if !accepted.contains(name) {
             lookups.insert(name, TopicLookup::NotAttempted);
@@ -251,7 +252,7 @@ async fn resolve_topic_lookups<'a>(
         }
         for (partition, probe) in result.iter().flatten() {
             if matches!(probe, Err(BridgeError::PartitionLoading { .. })) {
-                sight_loading(loading, name, *partition, Instant::now());
+                sight_loading(loading, name, *partition, grace, Instant::now());
             }
         }
         lookups.insert(name, TopicLookup::Probed(result));

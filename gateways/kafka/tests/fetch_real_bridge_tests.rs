@@ -635,15 +635,18 @@ async fn given_zero_max_wait_when_fetching_should_answer_at_once() {
 
 #[tokio::test]
 #[serial]
-async fn given_offset_past_high_watermark_when_fetching_should_answer_6_within_the_grace() {
+async fn given_offset_past_high_watermark_on_one_node_when_fetching_should_answer_1_at_once() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = gateway_with_topic(&server, 1).await;
     store(&server, 0, &[keyed(b"a"), keyed(b"b")]).await;
+    let node_count = state.bridge.as_ref().map(|bridge| bridge.iggy_node_count());
+    assert_eq!(node_count, Some(Some(1)), "the bridge read the roster");
 
-    // An Iggy node that lags reads the same, so a 1 waits out the connection's 30 s grace.
+    // On a cluster a node that lags reads the same, so a 1 waits out the connection's 30 s grace.
+    // One node has no peer that could hold the offset, so Fetch answers 1 at once, as Kafka does.
     let past = fetch(&state, &request(TOPIC, &[(0, 3)]).with_max_wait_ms(0)).await;
-    assert_refused(only(&past), ERROR_NOT_LEADER_OR_FOLLOWER);
+    assert_refused(only(&past), ERROR_OFFSET_OUT_OF_RANGE);
 
     let negative = fetch(&state, &request(TOPIC, &[(0, -1)])).await;
     assert_refused(only(&negative), ERROR_OFFSET_OUT_OF_RANGE);

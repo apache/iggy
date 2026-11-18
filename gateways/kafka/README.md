@@ -503,7 +503,9 @@ cargo run -p iggy-gateway-kafka
   the bridge read. Beside a stopped node, new producers and SASL logins go on through the other
   nodes. The bridge itself needs that address at startup. To start while that node is down,
   point it at a load balancer in front of the cluster. A DNS name with one record per node can
-  bind a client's first link to the wrong node (not tested).
+  bind a client's first link to the wrong node (not tested). The bridge reads the roster again
+  every minute, and as soon as its own client signs in again after it lost Iggy, since Iggy can
+  come back with another size.
 - With `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` on every gateway (the default), an idempotent producer
   that moves to another gateway still writes each batch once.
 - With TLS to Iggy, the SDK dials each node at the address the roster advertises, so each
@@ -759,7 +761,7 @@ records, in request order. One uncompressed batch per partition.
 
 | Code | When | Java consumer |
 | ---- | ---- | ------------- |
-| `OFFSET_OUT_OF_RANGE` (1) | Offset below 0. Or an offset still past `high_watermark` after 30 s of 6 on the same connection, counted from its first 6 there. A read there in range starts the 30 s over. A node that lags clears within them. A partition with no offset past 0 never answers 1, because Iggy reports that while it loads, fences or rebuilds one. | Resets its offset (`auto.offset.reset`). |
+| `OFFSET_OUT_OF_RANGE` (1) | Offset below 0. Or an offset still past `high_watermark` after 30 s of 6 on the same connection, counted from its first 6 there. A read there in range starts the 30 s over. A node that lags clears within them. One Iggy node has none to wait for, so 1 comes on the first Fetch, unless the bridge lost Iggy. A partition with no offset past 0 never answers 1, because Iggy reports that while it loads, fences or rebuilds one. | Resets its offset (`auto.offset.reset`). |
 | `UNKNOWN_TOPIC_OR_PARTITION` (3) | Topic or partition not in Iggy, or a name Kafka refuses | Refreshes metadata, retries. |
 | `NOT_LEADER_OR_FOLLOWER` (6) | Iggy unreachable, not signed in, or loading the partition. A partition that stalls (see the limits below). Iggy returns no records where it reports some, or the offset is past the end (see 1). Alone, it goes out after `max_wait_ms`. | Refreshes metadata, retries. |
 | `TOPIC_AUTHORIZATION_FAILED` (29) | The bridge's Iggy user lacks permission. Fetch reads as that user, not as the client. | Fails. |
@@ -815,7 +817,8 @@ Limits:
 - A probe that fails with 6 or -1 leaves the last good probe in use for up to 30 s, and the polls
   decide. That probe never proves a consumer caught up, so an offset at its end gets a poll too.
 - A partition that Iggy reports as loading answers 6 for 30 s, counted for the whole gateway.
-  After that, Fetch polls it and the log warns once. Counters that drift read the same way.
+  After that, Fetch polls it and the log warns once. On one Iggy node, Fetch polls it at once
+  instead, and the log warns at the same 30 s. Counters that drift read the same way.
   `ListOffsets` answers 6 for it all along, and warns too.
 - A Produce through the gateway wakes a waiting Fetch of that topic at once. That includes a
   Produce that ends during the Fetch's first read. A native Iggy write wakes it at the next probe,

@@ -74,11 +74,26 @@ const PROBE_WAIT: Duration = Duration::from_secs(2);
 /// Most topics one request loads a new probe for, per round, so a request that names many costs
 /// Iggy this many `get_topic` calls per round at most.
 const MAX_ROUND_TOPICS: usize = 100;
-/// How long Fetch answers 6 for an offset it cannot place before it acts on what it sees: a
-/// partition that reads as loading is polled, and an offset still past the end answers 1.
+/// How long Fetch answers 6 for an offset it cannot place on an Iggy cluster before it acts on
+/// what it sees: a partition that reads as loading is polled, and an offset still past the end
+/// answers 1. [`unplaced_grace`] says when it applies.
 ///
 /// A lag between Iggy nodes clears well within it. A recreated topic does not.
 const UNPLACED_GRACE: Duration = Duration::from_secs(30);
+
+/// How long Fetch answers 6 for an offset it cannot place on an Iggy of `node_count` nodes.
+///
+/// A single node has no peer to lag behind: its probe and its poll read the one log, so what they
+/// show is final and Fetch acts on it at once, as Kafka does. A cluster gets [`UNPLACED_GRACE`],
+/// and so does a bridge that has not read the roster yet (`None`), since it may front one.
+pub(crate) const fn unplaced_grace(node_count: Option<usize>) -> Duration {
+    if matches!(node_count, Some(1)) {
+        Duration::ZERO
+    } else {
+        UNPLACED_GRACE
+    }
+}
+
 /// How long the last good probe of a topic stands in while its refreshes fail.
 const LAST_GOOD_TTL: Duration = Duration::from_secs(30);
 
@@ -385,6 +400,8 @@ struct Fetch<'a> {
     give_up_at: Instant,
     /// The request's wait, at most [`MAX_WAIT`].
     max_wait: Duration,
+    /// How long an offset this request cannot place answers 6. See [`unplaced_grace`].
+    grace: Duration,
 }
 
 impl<'a> Fetch<'a> {
@@ -405,6 +422,7 @@ impl<'a> Fetch<'a> {
             response_bytes: response_bytes(request.max_bytes, state.max_frame_size),
             give_up_at,
             max_wait: wait_time(request.max_wait_ms),
+            grace: unplaced_grace(bridge.iggy_node_count()),
         }
     }
 
@@ -461,7 +479,13 @@ impl<'a> Fetch<'a> {
     /// Whether `partition` of `topic` still answers 6 for reading as loading. See
     /// [`sight_loading`].
     fn loading(&self, topic: &str, partition: u32) -> bool {
-        sight_loading(&self.state.loading, topic, partition, Instant::now())
+        sight_loading(
+            &self.state.loading,
+            topic,
+            partition,
+            self.grace,
+            Instant::now(),
+        )
     }
 
     /// How long a poll of `partition` of `topic` that starts at `now` may take. `None` while the
@@ -888,8 +912,8 @@ impl<'a> Reader<'a> {
     }
 
     /// [`position`], refused when no poll may run: 6 for a partition that reads as loading, for
-    /// [`UNPLACED_GRACE`], and for one that stalls (see [`PollRecord`]). -1 while this connection
-    /// holds the partition at the offset.
+    /// its grace (see [`unplaced_grace`]), and for one that stalls (see [`PollRecord`]). -1 while
+    /// this connection holds the partition at the offset.
     ///
     /// Past the grace a poll decides a load, so counters that drifted cannot stall a consumer.
     fn place(&self, want: &Wanted<'_>, probes: &Probes) -> Position {
@@ -1195,12 +1219,20 @@ impl<'a> Reader<'a> {
             EmptyPoll::Unproven => return read.unproven(want.partition, after),
             // The poll found nothing, so 6 within the grace or past it.
             EmptyPoll::Loading => {
-                sight_loading(&fetch.state.loading, topic, index, now);
+                sight_loading(&fetch.state.loading, topic, index, fetch.grace, now);
                 ERROR_NOT_LEADER_OR_FOLLOWER
             }
             EmptyPoll::NotReady => {
                 let unplaced = &fetch.connection.unplaced;
-                let sighting = sight_unplaced(unplaced, topic, index, offset, Cause::NotReady, now);
+                let sighting = sight_unplaced(
+                    unplaced,
+                    topic,
+                    index,
+                    offset,
+                    Cause::NotReady,
+                    fetch.grace,
+                    now,
+                );
                 log_not_ready(sighting.is_new(), topic, index, offset);
                 ERROR_NOT_LEADER_OR_FOLLOWER
             }
@@ -1210,6 +1242,7 @@ impl<'a> Reader<'a> {
                 index,
                 offset,
                 high_watermark,
+                fetch.grace,
                 now,
             ),
         };
@@ -1668,12 +1701,14 @@ impl<T> PartitionMap<T> {
 }
 
 /// A run of sightings of one partition that Fetch cannot read as usual. It ends once
-/// [`UNPLACED_GRACE`] passes without one.
+/// [`UNPLACED_GRACE`] passes without one, and it warns once it lasts that long, whatever grace
+/// its sightings get: that grace says how long Fetch answers 6, and a load that lasts 30 s is as
+/// suspect on one node as on a cluster.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Spell {
     first: Instant,
     last: Instant,
-    /// A `warn!` went out when the spell passed the grace.
+    /// A `warn!` went out when the spell passed [`UNPLACED_GRACE`].
     warned: bool,
 }
 
@@ -1682,6 +1717,9 @@ pub(crate) struct Spell {
 struct Sighting {
     /// How long the spell has lasted. Zero for a new one.
     age: Duration,
+    /// The spell is younger than the grace this sighting got, so Fetch still answers 6. See
+    /// [`unplaced_grace`].
+    within_grace: bool,
     /// The spell passed [`UNPLACED_GRACE`] at this sighting, and no `warn!` went out yet.
     warn: bool,
 }
@@ -1689,10 +1727,6 @@ struct Sighting {
 impl Sighting {
     const fn is_new(&self) -> bool {
         self.age.is_zero()
-    }
-
-    fn within_grace(&self) -> bool {
-        self.age < UNPLACED_GRACE
     }
 }
 
@@ -1709,8 +1743,8 @@ impl Spell {
         now.saturating_duration_since(self.last) >= UNPLACED_GRACE
     }
 
-    /// Counts a sighting at `now`. One after the spell ended starts a new spell.
-    fn sight(&mut self, now: Instant) -> Sighting {
+    /// Counts a sighting at `now` that gets `grace`. One after the spell ended starts a new spell.
+    fn sight(&mut self, now: Instant, grace: Duration) -> Sighting {
         if self.ended(now) {
             *self = Self::new(now);
         }
@@ -1718,7 +1752,11 @@ impl Spell {
         let age = now.saturating_duration_since(self.first);
         let warn = age >= UNPLACED_GRACE && !self.warned;
         self.warned |= warn;
-        Sighting { age, warn }
+        Sighting {
+            age,
+            within_grace: age < grace,
+            warn,
+        }
     }
 }
 
@@ -1726,20 +1764,21 @@ impl Spell {
 pub(crate) type Spells = PartitionMap<Spell>;
 
 impl Spells {
-    /// Counts a sighting of `partition` of `topic`, in a new spell if it has none.
-    fn sight(&mut self, topic: &str, partition: u32, now: Instant) -> Sighting {
+    /// Counts a sighting of `partition` of `topic` that gets `grace`, in a new spell if it has none.
+    fn sight(&mut self, topic: &str, partition: u32, grace: Duration, now: Instant) -> Sighting {
         if let Some(spell) = self.get_mut(topic, partition) {
-            return spell.sight(now);
+            return spell.sight(now, grace);
         }
         let mut spell = Spell::new(now);
-        let sighting = spell.sight(now);
+        let sighting = spell.sight(now, grace);
         self.insert(topic, partition, spell, |spell| !spell.ended(now));
         sighting
     }
 }
 
 /// Counts a probe that read `partition` of `topic` as loading, and returns whether it still
-/// answers 6: until it has read so for [`UNPLACED_GRACE`]. Warns once when the grace passes.
+/// answers 6: until it has read so for `grace` (see [`unplaced_grace`]), so on a single node a
+/// poll decides at once. Warns once when [`UNPLACED_GRACE`] passes, whatever the grace.
 ///
 /// Gateway-wide, since every consumer sees the same probe. A read in range does not end it:
 /// counters that drifted keep reading as loading while records still serve.
@@ -1747,26 +1786,28 @@ pub(crate) fn sight_loading(
     spells: &Mutex<Spells>,
     topic: &str,
     partition: u32,
+    grace: Duration,
     now: Instant,
 ) -> bool {
     let sighting = spells
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .sight(topic, partition, now);
+        .sight(topic, partition, grace, now);
     if sighting.warn {
         tracing::warn!(
             kafka_topic = topic,
             partition,
             grace_secs = UNPLACED_GRACE.as_secs(),
             "Iggy reports the partition as loading for the whole grace, so its counters can be \
-             wrong. Fetch polls it now, and ListOffsets keeps answering 6"
+             wrong. Fetch polls it, and ListOffsets keeps answering 6"
         );
     }
-    sighting.within_grace()
+    sighting.within_grace
 }
 
 /// Counts a sighting of `partition` of `topic`, and returns whether it starts a new spell, so a
-/// caller can log the first sighting louder than the retries that follow.
+/// caller can log the first sighting louder than the retries that follow. No caller reads whether
+/// the sighting is within its grace, so the cluster's grace does.
 pub(crate) fn sight_first(
     spells: &Mutex<Spells>,
     topic: &str,
@@ -1776,7 +1817,7 @@ pub(crate) fn sight_first(
     spells
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .sight(topic, partition, now)
+        .sight(topic, partition, UNPLACED_GRACE, now)
         .is_new()
 }
 
@@ -2105,6 +2146,7 @@ fn sight_unplaced(
     partition: u32,
     offset: u64,
     cause: Cause,
+    grace: Duration,
     now: Instant,
 ) -> Sighting {
     let fresh = UnplacedOffset {
@@ -2117,10 +2159,10 @@ fn sight_unplaced(
         if entry.offset != offset || entry.cause != cause {
             *entry = fresh;
         }
-        return entry.spell.sight(now);
+        return entry.spell.sight(now, grace);
     }
     let mut entry = fresh;
-    let sighting = entry.spell.sight(now);
+    let sighting = entry.spell.sight(now, grace);
     unplaced.insert(topic, partition, entry, |entry| !entry.spell.ended(now));
     sighting
 }
@@ -2134,23 +2176,34 @@ fn forget_unplaced(unplaced: &Mutex<Unplaced>, topic: &str, partition: u32) {
 }
 
 /// The code for `offset`, past `high_watermark`, the end of `partition` of `topic` after a poll:
-/// 6 for the connection's first [`UNPLACED_GRACE`] at that offset, then 1.
+/// 6 for the connection's first `grace` at that offset, then 1. See [`unplaced_grace`].
 ///
 /// A plain Iggy poll reads the replica of the node it reaches, so a node that lags can put an
-/// offset in range past its end. That clears within the grace. A recreated topic does not.
+/// offset in range past its end. That clears within the grace. A recreated topic does not. A
+/// single node gets no grace: nothing it reaches can be ahead of the log it polled.
 ///
-/// With no offset past 0 it stays 6, and warns once past the grace: Iggy reports that while it
-/// loads, fences or rebuilds a partition, and a 1 there would replay the partition from 0.
+/// With no offset past 0 it stays 6, and warns once past [`UNPLACED_GRACE`], whatever the grace:
+/// Iggy reports that while it loads, fences or rebuilds a partition, and a 1 there would replay
+/// the partition from 0.
 fn past_end(
     unplaced: &Mutex<Unplaced>,
     topic: &str,
     partition: u32,
     offset: u64,
     high_watermark: u64,
+    grace: Duration,
     now: Instant,
 ) -> i16 {
-    let sighting = sight_unplaced(unplaced, topic, partition, offset, Cause::PastEnd, now);
-    if sighting.within_grace() {
+    let sighting = sight_unplaced(
+        unplaced,
+        topic,
+        partition,
+        offset,
+        Cause::PastEnd,
+        grace,
+        now,
+    );
+    if sighting.within_grace {
         return ERROR_NOT_LEADER_OR_FOLLOWER;
     }
     if high_watermark > 1 {
@@ -3137,20 +3190,26 @@ mod tests {
     fn given_a_spell_past_the_grace_when_sighted_again_should_warn_once() {
         let start = Instant::now();
         let mut spell = Spell::new(start);
-        assert!(spell.sight(start).is_new());
-        let within = spell.sight(start + Duration::from_secs(20));
+        assert!(spell.sight(start, UNPLACED_GRACE).is_new());
+        let within = spell.sight(start + Duration::from_secs(20), UNPLACED_GRACE);
         assert!(!within.warn);
-        assert!(within.within_grace());
-        let passed = spell.sight(start + UNPLACED_GRACE);
+        assert!(within.within_grace);
+        let passed = spell.sight(start + UNPLACED_GRACE, UNPLACED_GRACE);
         assert!(passed.warn);
-        assert!(!passed.within_grace());
-        let later = spell.sight(start + UNPLACED_GRACE + Duration::from_secs(1));
+        assert!(!passed.within_grace);
+        let later = spell.sight(
+            start + UNPLACED_GRACE + Duration::from_secs(1),
+            UNPLACED_GRACE,
+        );
         assert!(!later.warn, "once a spell");
         let quiet = start + UNPLACED_GRACE * 3;
-        assert!(spell.sight(quiet).is_new(), "a quiet grace ends the spell");
-        spell.sight(quiet + Duration::from_secs(20));
         assert!(
-            spell.sight(quiet + UNPLACED_GRACE).warn,
+            spell.sight(quiet, UNPLACED_GRACE).is_new(),
+            "a quiet grace ends the spell"
+        );
+        spell.sight(quiet + Duration::from_secs(20), UNPLACED_GRACE);
+        assert!(
+            spell.sight(quiet + UNPLACED_GRACE, UNPLACED_GRACE).warn,
             "a new spell warns again"
         );
     }
@@ -3160,21 +3219,106 @@ mod tests {
         let spells = Mutex::default();
         let start = Instant::now();
         let at = |seconds| start + Duration::from_secs(seconds);
-        assert!(sight_loading(&spells, "a", 0, at(0)), "a new spell");
-        assert!(sight_loading(&spells, "a", 0, at(20)));
-        assert!(sight_loading(&spells, "a", 1, at(20)), "per partition");
         assert!(
-            !sight_loading(&spells, "a", 0, at(30)),
+            sight_loading(&spells, "a", 0, UNPLACED_GRACE, at(0)),
+            "a new spell"
+        );
+        assert!(sight_loading(&spells, "a", 0, UNPLACED_GRACE, at(20)));
+        assert!(
+            sight_loading(&spells, "a", 1, UNPLACED_GRACE, at(20)),
+            "per partition"
+        );
+        assert!(
+            !sight_loading(&spells, "a", 0, UNPLACED_GRACE, at(30)),
             "past the grace, a poll decides"
         );
         assert!(
-            !sight_loading(&spells, "a", 0, at(55)),
+            !sight_loading(&spells, "a", 0, UNPLACED_GRACE, at(55)),
             "the spell goes on while probes read so"
         );
         assert!(
-            sight_loading(&spells, "a", 0, at(55) + UNPLACED_GRACE),
+            sight_loading(&spells, "a", 0, UNPLACED_GRACE, at(55) + UNPLACED_GRACE),
             "a quiet grace ends the spell"
         );
+    }
+
+    #[test]
+    fn given_an_iggy_of_one_node_when_asked_for_the_grace_should_give_none() {
+        assert_eq!(
+            unplaced_grace(Some(1)),
+            Duration::ZERO,
+            "nothing lags behind one node"
+        );
+        assert_eq!(unplaced_grace(Some(3)), UNPLACED_GRACE);
+        assert_eq!(
+            unplaced_grace(None),
+            UNPLACED_GRACE,
+            "a roster not read yet may be a cluster"
+        );
+    }
+
+    #[test]
+    fn given_no_grace_when_a_partition_reads_as_loading_should_let_a_poll_decide_at_once() {
+        let spells = Mutex::default();
+        let start = Instant::now();
+        assert!(
+            !sight_loading(&spells, "a", 0, Duration::ZERO, start),
+            "a poll decides at once"
+        );
+        assert!(!sight_loading(
+            &spells,
+            "a",
+            0,
+            Duration::ZERO,
+            start + Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn given_no_grace_when_a_spell_lasts_should_warn_once_past_the_cluster_grace() {
+        let start = Instant::now();
+        let mut spell = Spell::new(start);
+        let first = spell.sight(start, Duration::ZERO);
+        assert!(first.is_new());
+        assert!(!first.within_grace, "a poll decides at once");
+        assert!(!first.warn, "a load that just began is no news");
+        assert!(
+            !spell
+                .sight(start + Duration::from_secs(20), Duration::ZERO)
+                .warn,
+            "nor one shorter than the cluster's grace"
+        );
+        assert!(
+            spell.sight(start + UNPLACED_GRACE, Duration::ZERO).warn,
+            "a load that long is suspect on one node too"
+        );
+        assert!(
+            !spell
+                .sight(
+                    start + UNPLACED_GRACE + Duration::from_secs(1),
+                    Duration::ZERO
+                )
+                .warn,
+            "once a spell"
+        );
+    }
+
+    #[test]
+    fn given_no_grace_when_an_offset_is_past_the_end_should_answer_1_at_once() {
+        let unplaced = Mutex::default();
+        let start = Instant::now();
+        assert_eq!(
+            past_end(&unplaced, "a", 0, 50, 42, Duration::ZERO, start),
+            ERROR_OFFSET_OUT_OF_RANGE,
+            "one node: past its end is past the end"
+        );
+        for high_watermark in [0, 1] {
+            assert_eq!(
+                past_end(&unplaced, "a", 0, 50, high_watermark, Duration::ZERO, start),
+                ERROR_NOT_LEADER_OR_FOLLOWER,
+                "end {high_watermark}: a load, a fence or a stats miss reads so on one node too"
+            );
+        }
     }
 
     /// Records a `poll` of partition 0 of topic `a`.
@@ -3471,6 +3615,7 @@ mod tests {
                 0,
                 offset,
                 42,
+                UNPLACED_GRACE,
                 start + Duration::from_secs(seconds),
             )
         };
@@ -3500,7 +3645,7 @@ mod tests {
             let now = start + Duration::from_secs(seconds);
             for high_watermark in [0, 1] {
                 assert_eq!(
-                    past_end(&unplaced, "a", 0, 50, high_watermark, now),
+                    past_end(&unplaced, "a", 0, 50, high_watermark, UNPLACED_GRACE, now),
                     ERROR_NOT_LEADER_OR_FOLLOWER,
                     "end {high_watermark} at {seconds} s: a load, a fence or a stats miss reads so"
                 );
@@ -3513,14 +3658,22 @@ mod tests {
         let (first, second) = (Mutex::default(), Mutex::default());
         let start = Instant::now();
         let late = start + UNPLACED_GRACE;
-        past_end(&first, "a", 0, 50, 42, start);
-        past_end(&first, "a", 0, 50, 42, start + Duration::from_secs(20));
+        past_end(&first, "a", 0, 50, 42, UNPLACED_GRACE, start);
+        past_end(
+            &first,
+            "a",
+            0,
+            50,
+            42,
+            UNPLACED_GRACE,
+            start + Duration::from_secs(20),
+        );
         assert_eq!(
-            past_end(&first, "a", 0, 50, 42, late),
+            past_end(&first, "a", 0, 50, 42, UNPLACED_GRACE, late),
             ERROR_OFFSET_OUT_OF_RANGE
         );
         assert_eq!(
-            past_end(&second, "a", 0, 50, 42, late),
+            past_end(&second, "a", 0, 50, 42, UNPLACED_GRACE, late),
             ERROR_NOT_LEADER_OR_FOLLOWER,
             "its grace starts at its own first sighting"
         );
@@ -3531,19 +3684,35 @@ mod tests {
         let unplaced = Mutex::default();
         let start = Instant::now();
         let late = start + UNPLACED_GRACE;
-        past_end(&unplaced, "a", 0, 50, 42, start);
+        past_end(&unplaced, "a", 0, 50, 42, UNPLACED_GRACE, start);
         forget_unplaced(&unplaced, "a", 0);
         assert_eq!(
-            past_end(&unplaced, "a", 0, 50, 42, late),
+            past_end(&unplaced, "a", 0, 50, 42, UNPLACED_GRACE, late),
             ERROR_NOT_LEADER_OR_FOLLOWER,
             "a read in range ended the spell"
         );
 
         let not_ready = late + Duration::from_secs(1);
-        let sighting = sight_unplaced(&unplaced, "a", 0, 50, Cause::NotReady, not_ready);
+        let sighting = sight_unplaced(
+            &unplaced,
+            "a",
+            0,
+            50,
+            Cause::NotReady,
+            UNPLACED_GRACE,
+            not_ready,
+        );
         assert!(sighting.is_new(), "another cause starts a new spell");
         assert_eq!(
-            past_end(&unplaced, "a", 0, 50, 42, late + UNPLACED_GRACE),
+            past_end(
+                &unplaced,
+                "a",
+                0,
+                50,
+                42,
+                UNPLACED_GRACE,
+                late + UNPLACED_GRACE
+            ),
             ERROR_NOT_LEADER_OR_FOLLOWER,
             "and so does the past end that follows it"
         );
