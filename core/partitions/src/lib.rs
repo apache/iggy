@@ -32,6 +32,11 @@ mod messages_writer;
 mod offset_recovery;
 pub mod offset_storage;
 mod partition_storage;
+mod peer_fresh;
+pub use peer_fresh::{
+    PEER_FRESH_ROWS_MAX, PEER_FRESH_SOURCES_MAX, PeerFreshChange, PeerFreshLag, PeerFreshRows,
+    PeerFreshTail, ProofTrust,
+};
 mod peer_log;
 pub mod peer_manifests;
 pub use peer_log::{

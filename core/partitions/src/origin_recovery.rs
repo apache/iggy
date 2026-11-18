@@ -725,7 +725,9 @@ fn placed_batch(
     ))
 }
 
-fn namespace_of(prefix: &ObjectPrefix) -> u64 {
+/// The raw namespace of the partition that `prefix` names in the cluster
+/// that wrote it.
+pub fn namespace_of(prefix: &ObjectPrefix) -> u64 {
     let id = |value: u64| usize::try_from(value).unwrap_or(usize::MAX);
     IggyNamespace::new(
         id(prefix.stream_id),
