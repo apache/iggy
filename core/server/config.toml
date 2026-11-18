@@ -190,6 +190,13 @@ enabled = true
 # exported only to users with the read_servers or manage_servers permission.
 endpoint = "/metrics"
 
+# Export the per-topic series (`topic_size_bytes`, `topic_messages` and
+# `topic_max_size_bytes`). Each scrape walks every topic to build them, which
+# costs time and memory on a node with many topics.
+# `true` exports them to users who may read the server stats.
+# `false` exports only the node totals.
+topic_gauges = true
+
 # TLS (Transport Layer Security) configuration for HTTP.
 [http.tls]
 # Controls the use of TLS for encrypted HTTP connections.
