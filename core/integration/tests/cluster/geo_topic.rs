@@ -115,6 +115,9 @@ async fn given_a_geo_topic_past_the_repair_window_when_a_node_returns_without_it
 
 fn cluster_with_fs_store(store: &Path, extra: &[(&str, &str)]) -> TestHarness {
     let mut extra_envs = HashMap::from([
+        // A geo topic takes messages once the metadata primary stored its
+        // object, and a node without an origin stores none.
+        ("IGGY_GEO_ORIGIN".to_owned(), "dc-a".to_owned()),
         ("IGGY_TIERED_STORAGE_BACKEND".to_owned(), "fs".to_owned()),
         (
             "IGGY_TIERED_STORAGE_PATH".to_owned(),
