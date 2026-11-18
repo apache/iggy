@@ -1322,6 +1322,81 @@ async fn given_a_manifest_publisher_when_a_long_term_segment_commits_should_publ
     assert_eq!(manifest.segments, partition.long_term_segments());
 }
 
+/// Publishes into a memory store, which refuses the first `refused` puts.
+struct RefusingPublisher {
+    publisher: partitions::ExecutorManifestPublisher<InlineTierExecutor<MemoryStore>>,
+    refused: u32,
+    attempts: Cell<u32>,
+}
+
+impl partitions::ManifestPublisher for RefusingPublisher {
+    fn publish(
+        &self,
+        manifest: iggy_object_store::PartitionManifest,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, partitions::ManifestPublishOutcome> {
+        let attempt = self.attempts.get();
+        self.attempts.set(attempt + 1);
+        if attempt < self.refused {
+            Box::pin(std::future::ready(Ok(Err(ObjectStoreError::Unavailable(
+                "503".to_owned(),
+            )))))
+        } else {
+            self.publisher.publish(manifest, scope)
+        }
+    }
+}
+
+/// The rewrite of the partition never ends, so no long-term segment commits
+/// and nothing else asks for its manifest once the first put failed.
+#[compio::test]
+async fn given_a_placing_primary_whose_first_manifest_put_fails_when_nothing_commits_should_store_the_manifest_after_the_retry()
+ {
+    use iggy_object_store::PartitionManifest;
+    use partitions::{ExecutorManifestPublisher, MANIFEST_RETRY_AFTER};
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    owner.set_fresh_uploader(Some(TestUploader::new()));
+    owner.set_long_term_writer(Some(Rc::new(HeldWriter)));
+    let publisher = Rc::new(RefusingPublisher {
+        publisher: ExecutorManifestPublisher::new(
+            InlineTierExecutor::new(MemoryStore::new()),
+            layout(),
+        ),
+        refused: 1,
+        attempts: Cell::new(0),
+    });
+    owner.set_manifest_publisher(Some(publisher.clone()));
+    let store = publisher.publisher.executor().store();
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(
+        namespace(),
+        staged_revision(&owner),
+    ));
+
+    let stored_in = pumped(&owner, async {
+        let started = std::time::Instant::now();
+        let _answer = submit_send(&owner, 1, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 1 && paced(owner, namespace())
+        })
+        .await;
+        until(&owner, |_| store.keys().contains(&manifest_key)).await;
+        started.elapsed()
+    })
+    .await;
+
+    assert!(stored_in >= MANIFEST_RETRY_AFTER / 2, "{stored_in:?}");
+    assert_eq!(publisher.attempts.get(), 2, "the refused put and its retry");
+    let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
+    assert_eq!(partition.long_term_floor(), None, "nothing was rewritten");
+    let size = store.head(&manifest_key).await.unwrap().size;
+    let object = store.get_range(&manifest_key, 0..size).await.unwrap();
+    let manifest = PartitionManifest::decode(&object.bytes).unwrap();
+    assert_eq!(manifest.floor, None);
+    assert_eq!(manifest.segments, []);
+}
+
 /// The segment cleaner stages only the first pass over a partition. The
 /// sends that commit after it are rewritten when the partition's wait is
 /// over, which the pump's tick finds.
@@ -2518,6 +2593,10 @@ async fn given_a_shard_that_cannot_tell_when_a_sweep_runs_past_the_grace_should_
         }
         assert_eq!(owner.fresh_sweeps_settled(), 0);
         assert_eq!(fresh_objects(store), vec![object]);
+        until(&owner, |owner| {
+            owner.metrics().fresh_sweeps_held_value() == 1
+        })
+        .await;
 
         // Once it can tell, the grace starts from that sweep.
         let able = past_grace(past_grace(now));
@@ -2526,6 +2605,7 @@ async fn given_a_shard_that_cannot_tell_when_a_sweep_runs_past_the_grace_should_
         until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
         compio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fresh_objects(store), vec![object]);
+        assert_eq!(owner.metrics().fresh_sweeps_held_value(), 0);
     })
     .await;
 }
@@ -3007,6 +3087,10 @@ async fn given_a_placing_partition_fenced_for_a_rebuild_when_sweeps_run_past_the
         owner.plane.partitions().tombstone(namespace());
         sweep_that_cannot_settle(&owner, past_grace(now)).await;
         sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        until(&owner, |owner| {
+            owner.metrics().fresh_sweeps_held_value() == 1
+        })
+        .await;
         let kept = fresh_objects(store);
         // The pump does not stop while it holds a partition tombstoned
         // without a teardown.
@@ -3076,6 +3160,39 @@ async fn given_a_rebuilt_placing_partition_awaiting_a_state_transfer_when_sweeps
     assert_eq!(fresh_objects(store), vec![object]);
     assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
     assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// The sweeps that a rebuilt copy holds back show in a gauge, which the
+/// first sweep that settles once the copy is back in its group clears.
+#[compio::test]
+async fn given_sweeps_held_by_a_rebuilt_placing_partition_when_its_state_transfer_ends_should_report_them_held_until_one_settles()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+    let held = |owner: &IoTestShard| owner.metrics().fresh_sweeps_held_value();
+
+    pumped(&owner, async {
+        commit_a_named_object(&owner, store, now).await;
+        assert_eq!(held(&owner), 0);
+
+        drop_for_a_rebuild(&owner).await;
+        insert_copy_awaiting_a_state_transfer(&owner).await;
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        until(&owner, |owner| held(owner) == 1).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        assert_eq!(held(&owner), 1);
+        assert_eq!(owner.fresh_sweeps_settled(), 1);
+
+        let partitions = owner.plane.partitions();
+        let consensus = partitions.get_by_ns(&namespace()).unwrap().consensus();
+        consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        sweep(&owner, past_grace(past_grace(now))).await;
+        assert_eq!(owner.fresh_sweeps_settled(), 2);
+        assert_eq!(held(&owner), 0);
+    })
+    .await;
 }
 
 /// Fence the partition for a rebuild, as a replica does when its copy
