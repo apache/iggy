@@ -20,7 +20,7 @@
 
 use super::segment_uploads::{namespace, pumped, until};
 use super::*;
-use crate::fresh_writes::FRESH_UPLOAD_DEADLINE;
+use crate::fresh_writes::{FRESH_PARTITION_PENDING_BYTES_MAX, FRESH_UPLOAD_DEADLINE};
 use crate::{FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX};
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
@@ -109,14 +109,48 @@ async fn placing_owner(directory: &Path) -> IoTestShard {
 
 /// Make the partition beside [`namespace`] place its batches too.
 fn place_other_partition(owner: &IoTestShard) -> IggyNamespace {
-    let other = IggyNamespace::new(0, 0, 1);
-    let partition = owner.plane.partitions().get_mut_by_ns(&other).unwrap();
-    partition.set_runtime_options(TopicRuntimeOptions {
+    place_partition(owner, IggyNamespace::new(0, 0, 1))
+}
+
+/// Make `partition` place its batches.
+fn place_partition(owner: &IoTestShard, partition: IggyNamespace) -> IggyNamespace {
+    let placing = owner.plane.partitions().get_mut_by_ns(&partition).unwrap();
+    placing.set_runtime_options(TopicRuntimeOptions {
         places_batches: true,
         ..Default::default()
     });
-    partition.register_builtin_state_machines().unwrap();
-    other
+    placing.register_builtin_state_machines().unwrap();
+    partition
+}
+
+/// Make the last partition of the shard a primary in normal status that
+/// places its batches and commits nothing: the other replica of its group
+/// never answers. Once its pipeline is full, it has no room for a request.
+fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
+    const SILENT_REPLICA: u8 = 1;
+    let stuck = IggyNamespace::new(0, 0, 2);
+    owner.bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
+    connect_replica_on(&owner.bus, SILENT_REPLICA, 1);
+    let partitions = owner.plane.partitions();
+    partitions.remove(&stuck).unwrap();
+    let consensus = VsrConsensus::new(
+        1,
+        0,
+        2,
+        stuck.inner(),
+        Rc::clone(&owner.bus),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    partitions.insert(
+        stuck,
+        IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            IggyByteSize::from(SEGMENT_BYTES),
+        ),
+    );
+    place_partition(owner, stuck)
 }
 
 /// Submit one send of a message of `payload_len` bytes, as a producer does.
@@ -155,9 +189,20 @@ async fn submit_send_when_room(
     request: u64,
     payload_len: usize,
 ) -> Receiver<Option<Message<GenericHeader>>> {
+    submit_send_to_when_room(owner, namespace(), request, payload_len).await
+}
+
+/// [`submit_send_when_room`] to `partition`.
+#[allow(clippy::future_not_send)]
+async fn submit_send_to_when_room(
+    owner: &IoTestShard,
+    partition: IggyNamespace,
+    request: u64,
+    payload_len: usize,
+) -> Receiver<Option<Message<GenericHeader>>> {
     let (reply, answer) = channel(1);
     let mut frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
-        request: sized_send_request(namespace(), request, payload_len),
+        request: sized_send_request(partition, request, payload_len),
         reply,
         attachment: None,
     });
@@ -614,6 +659,8 @@ async fn given_more_sends_than_a_partition_has_room_for_when_their_object_is_sto
             owner.metrics().fresh_load_value().3 == i64::try_from(SENDS).unwrap()
         })
         .await;
+        let (held, pending) = owner.fresh_pending_bytes(namespace());
+        assert!(held > 0 && held == pending);
         uploader.settle(0, true);
         until(&owner, |_| uploader.started() == 2).await;
         uploader.settle(1, true);
@@ -627,6 +674,7 @@ async fn given_more_sends_than_a_partition_has_room_for_when_their_object_is_sto
     assert_eq!(uploader.keys().len(), 2);
     let (_, denied, _, staged) = owner.metrics().fresh_load_value();
     assert_eq!((denied, staged), (0, 0));
+    assert_eq!(owner.fresh_pending_bytes(namespace()), (0, 0));
     let placed = stored_placed_batches(directory.path());
     assert_eq!(
         placed
@@ -702,6 +750,10 @@ async fn given_an_object_the_store_fails_for_good_when_later_sends_wait_should_a
         uploader.settle(3, false);
         until(&owner, |_| !failed.is_empty() && !later.is_empty()).await;
         assert!(unrelated.is_empty());
+        let (failed_partition, pending) = owner.fresh_pending_bytes(namespace());
+        assert_eq!(failed_partition, 0);
+        assert!(pending > 0);
+        assert_eq!(owner.fresh_pending_bytes(other), (pending, pending));
 
         // The slot of the failed object goes to the window.
         until(&owner, |_| uploader.started() == 5).await;
@@ -717,6 +769,7 @@ async fn given_an_object_the_store_fails_for_good_when_later_sends_wait_should_a
     let (stored, refused, _) = owner.metrics().fresh_uploads_value();
     assert_eq!((stored, refused), (2, 1));
     assert_eq!(owner.metrics().fresh_load_value(), (2, 2, 0, 0));
+    assert_eq!(owner.fresh_pending_bytes(other), (0, 0));
 }
 
 /// The interval counts from the start of the last upload. A send that finds
@@ -816,41 +869,132 @@ async fn given_a_send_larger_than_an_object_when_the_window_holds_sends_should_s
 
 /// One cap holds the bytes of every send that has not reached its
 /// partition, whether its object is open, waits for an upload or uploads.
+/// It holds for a send that fits in the share of its own partition.
 #[compio::test]
 async fn given_fresh_bytes_at_the_cap_when_a_send_arrives_should_answer_it_and_keep_nothing_of_it()
 {
-    const OBJECTS: u64 = FRESH_PENDING_BYTES_MAX / FRESH_OBJECT_BYTES / 2;
-    let send_bytes = 2 * usize::try_from(FRESH_OBJECT_BYTES).unwrap() - 4096;
+    // Larger than the share of its partition, the first send gets in
+    // because nothing of its partition waits.
+    let first_bytes =
+        usize::try_from(FRESH_PENDING_BYTES_MAX - 3 * FRESH_PARTITION_PENDING_BYTES_MAX / 2)
+            .unwrap();
+    let send_bytes = usize::try_from(FRESH_PARTITION_PENDING_BYTES_MAX * 7 / 8).unwrap();
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(placing_owner(directory.path())).await;
+    let second = place_other_partition(&owner);
+    let third = place_partition(&owner, IggyNamespace::new(0, 0, 2));
     let uploader = GatedUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
     owner.set_fresh_upload_pace(Duration::ZERO, 1);
 
     pumped(&owner, async {
-        // One object uploads and the others wait for its slot, so the open
+        // One object uploads and the other waits for its slot, so the open
         // window is empty when the cap is reached.
-        let mut held = Vec::new();
-        for request in 1..=OBJECTS {
-            held.push(submit_send_when_room(&owner, request, send_bytes).await);
-        }
-        let staged = i64::try_from(OBJECTS).unwrap();
-        until(&owner, |owner| {
-            owner.metrics().fresh_load_value().3 == staged
-        })
-        .await;
-        let refused = submit_send(&owner, OBJECTS + 1, send_bytes);
+        let held = [
+            submit_send_when_room(&owner, 1, first_bytes).await,
+            submit_send_to_when_room(&owner, second, 2, send_bytes).await,
+        ];
+        until(&owner, |owner| owner.metrics().fresh_load_value().3 == 2).await;
+        let pending = owner.fresh_pending_bytes(third);
+        let refused = submit_send_to(&owner, third, 3, send_bytes);
         until(&owner, |_| !refused.is_empty()).await;
 
         assert!(refused.try_recv().unwrap().is_some());
         assert!(held.iter().all(|answer| answer.is_empty()));
-        let (_, denied, in_flight, staged_after) = owner.metrics().fresh_load_value();
-        assert_eq!((denied, in_flight, staged_after), (1, 1, staged));
+        let (_, denied, in_flight, staged) = owner.metrics().fresh_load_value();
+        assert_eq!((denied, in_flight, staged), (1, 1, 2));
+        assert_eq!(owner.metrics().fresh_cap_denials_value(), (0, 1));
+        assert_eq!(owner.fresh_pending_bytes(third), pending);
         assert_eq!(uploader.started(), 1);
     })
     .await;
 
     assert_eq!(committed_sends(&owner), 0);
+}
+
+/// A primary that commits nothing keeps the sends that wait for its room.
+/// They fill its share of the shard's bytes and no more, so the other
+/// partitions of the shard keep sending. The share is free again once the
+/// partition stops taking requests and its sends are answered.
+#[compio::test]
+async fn given_a_partition_without_room_when_its_sends_reach_its_share_should_deny_them_and_commit_the_sends_of_another()
+ {
+    const PIPELINE: u64 =
+        (consensus::PIPELINE_PREPARE_QUEUE_MAX + consensus::PIPELINE_REQUEST_QUEUE_MAX) as u64;
+    let send_bytes = usize::try_from(FRESH_PARTITION_PENDING_BYTES_MAX / 2).unwrap() - 64 * 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let other = place_other_partition(&owner);
+    let stuck = place_stuck_partition(&owner);
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    let has_room = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&stuck)
+            .unwrap()
+            .has_request_room()
+    };
+
+    let waiting = pumped(&owner, async {
+        let mut handed = Vec::new();
+        for request in 1..=PIPELINE {
+            handed.push(submit_send_to_when_room(&owner, stuck, request, 100).await);
+        }
+        until(&owner, |owner| {
+            !has_room(owner) && owner.metrics().fresh_load_value().3 == 0
+        })
+        .await;
+        assert!(handed.iter().all(|answer| answer.is_empty()));
+        assert_eq!(owner.fresh_pending_bytes(stuck), (0, 0));
+
+        let stored = owner.metrics().fresh_uploads_value().0;
+        let waiting = [
+            submit_send_to_when_room(&owner, stuck, PIPELINE + 1, send_bytes).await,
+            submit_send_to_when_room(&owner, stuck, PIPELINE + 2, send_bytes).await,
+        ];
+        until(&owner, |owner| {
+            owner.metrics().fresh_uploads_value().0 == stored + 2
+        })
+        .await;
+        let (held, pending) = owner.fresh_pending_bytes(stuck);
+        assert_eq!(held, pending);
+        assert!(held <= FRESH_PARTITION_PENDING_BYTES_MAX);
+
+        let refused = submit_send_to(&owner, stuck, PIPELINE + 3, send_bytes);
+        until(&owner, |_| !refused.is_empty()).await;
+        assert!(refused.try_recv().unwrap().is_some());
+        assert_eq!(owner.fresh_pending_bytes(stuck), (held, pending));
+        assert_eq!(owner.metrics().fresh_cap_denials_value(), (1, 0));
+
+        let accepted = submit_send_to(&owner, other, PIPELINE + 4, send_bytes);
+        until(&owner, |owner| committed(owner, other) == 1).await;
+        until(&owner, |_| !accepted.is_empty()).await;
+        assert!(accepted.try_recv().unwrap().is_some());
+        assert_eq!(owner.fresh_pending_bytes(other), (0, pending));
+        assert!(waiting.iter().all(|answer| answer.is_empty()));
+
+        owner
+            .plane
+            .partitions()
+            .get_mut_by_ns(&stuck)
+            .unwrap()
+            .begin_shutdown_io();
+        until(&owner, |owner| owner.fresh_pending_bytes(stuck) == (0, 0)).await;
+        until(&owner, |_| waiting.iter().all(|answer| !answer.is_empty())).await;
+        waiting
+    })
+    .await;
+
+    assert!(
+        waiting
+            .iter()
+            .all(|answer| answer.try_recv().unwrap().is_some())
+    );
+    let (_, denied, _, staged) = owner.metrics().fresh_load_value();
+    assert_eq!((denied, staged), (3, 0));
+    assert_eq!(owner.metrics().fresh_cap_denials_value(), (1, 0));
 }
 
 /// The partition would refuse the request after the upload, so the shard
@@ -906,6 +1050,7 @@ async fn given_a_partition_that_stops_taking_requests_when_its_sends_wait_for_an
         assert!(answer.try_recv().unwrap().is_some());
         let (_, denied, in_flight, staged) = owner.metrics().fresh_load_value();
         assert_eq!((denied, in_flight, staged), (1, 1, 0));
+        assert_eq!(owner.fresh_pending_bytes(namespace()), (0, 0));
     })
     .await;
 

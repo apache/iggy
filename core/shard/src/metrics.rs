@@ -440,6 +440,11 @@ pub struct ShardMetrics {
     /// Sends to partitions that place their batches that this shard answered
     /// as not accepted, before or after it stored their messages.
     fresh_sends_denied_total: Counter,
+    /// Of those, the sends turned away because the waiting sends of their
+    /// partition held its share of the bytes, and because the waiting sends
+    /// of the shard held all the bytes they may.
+    fresh_sends_denied_partition_share_total: Counter,
+    fresh_sends_denied_shard_cap_total: Counter,
     /// Fresh objects whose upload holds one of the shard's upload slots.
     fresh_uploads_in_flight: Gauge,
     /// Sends whose messages this shard holds or stored and whose request
@@ -597,6 +602,8 @@ impl ShardMetrics {
             fresh_upload_bytes_total: Counter::default(),
             fresh_upload_retries_total: Counter::default(),
             fresh_sends_denied_total: Counter::default(),
+            fresh_sends_denied_partition_share_total: Counter::default(),
+            fresh_sends_denied_shard_cap_total: Counter::default(),
             fresh_uploads_in_flight: Gauge::default(),
             fresh_staged_sends: Gauge::default(),
             fresh_window_wait: fresh_latency_histogram(),
@@ -650,6 +657,18 @@ impl ShardMetrics {
         self.fresh_sends_denied_total.inc();
     }
 
+    /// A send was turned away because the waiting sends of its partition
+    /// hold the partition's share of the bytes.
+    pub(crate) fn record_fresh_send_over_partition_share(&self) {
+        self.fresh_sends_denied_partition_share_total.inc();
+    }
+
+    /// A send was turned away because the waiting sends of the shard hold
+    /// all the bytes they may.
+    pub(crate) fn record_fresh_send_over_shard_cap(&self) {
+        self.fresh_sends_denied_shard_cap_total.inc();
+    }
+
     /// The shard has `in_flight` uploads of fresh objects and holds `staged`
     /// sends for them.
     pub(crate) fn set_fresh_load(&self, in_flight: usize, staged: usize) {
@@ -686,6 +705,17 @@ impl ShardMetrics {
             self.fresh_sends_denied_total.get(),
             self.fresh_uploads_in_flight.get(),
             self.fresh_staged_sends.get(),
+        )
+    }
+
+    /// Test-only read: sends turned away at their partition's share and at
+    /// the shard's cap.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_cap_denials_value(&self) -> (u64, u64) {
+        (
+            self.fresh_sends_denied_partition_share_total.get(),
+            self.fresh_sends_denied_shard_cap_total.get(),
         )
     }
 
@@ -1957,6 +1987,18 @@ impl ShardMetrics {
             "sends to partitions that place their batches that this shard answered as not \
              accepted",
             self.fresh_sends_denied_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied_partition_share",
+            "sends turned away because the waiting sends of their partition held its share of \
+             the bytes that may wait",
+            self.fresh_sends_denied_partition_share_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied_shard_cap",
+            "sends turned away because the waiting sends of the shard held all the bytes that \
+             may wait",
+            self.fresh_sends_denied_shard_cap_total.clone(),
         );
         registry.register(
             "fresh_uploads_in_flight",
