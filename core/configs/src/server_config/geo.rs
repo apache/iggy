@@ -82,6 +82,12 @@ pub struct GeoConfig {
     /// offsets their writer expected: at least once instead of at most once.
     #[serde(default = "default_recover_unproven")]
     pub recover_unproven: bool,
+    /// How often a node lists the manifests of each peer stream that a
+    /// shadow stream serves, so its shadow partitions follow the peer.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_manifest_poll_interval")]
+    #[config_env(leaf)]
+    pub manifest_poll_interval: IggyDuration,
 }
 
 impl Default for GeoConfig {
@@ -92,6 +98,7 @@ impl Default for GeoConfig {
             tombstone_grace: default_tombstone_grace(),
             recover_cluster_uid: String::new(),
             recover_unproven: default_recover_unproven(),
+            manifest_poll_interval: default_manifest_poll_interval(),
         }
     }
 }
@@ -190,8 +197,11 @@ impl Display for GeoConfig {
         }
         write!(
             f,
-            "], tombstone_grace: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
-            self.tombstone_grace, self.recover_cluster_uid, self.recover_unproven
+            "], tombstone_grace: {}, manifest_poll_interval: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
+            self.tombstone_grace,
+            self.manifest_poll_interval,
+            self.recover_cluster_uid,
+            self.recover_unproven
         )
     }
 }
@@ -240,6 +250,9 @@ impl Validatable<ConfigurationError> for GeoConfig {
             if self.origin.is_empty() {
                 return refuse("origin must be set when recover_cluster_uid is set");
             }
+        }
+        if self.manifest_poll_interval.is_zero() {
+            return refuse("manifest_poll_interval must be longer than zero");
         }
         if self.peers.is_empty() {
             return Ok(());
@@ -376,6 +389,12 @@ fn default_tombstone_grace() -> IggyDuration {
     IggyDuration::new_from_secs(24 * 3600)
 }
 
+/// Five seconds: a shadow partition stays a few seconds behind its peer, and
+/// a listing of each peer stream every few seconds costs little.
+fn default_manifest_poll_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,7 +443,9 @@ mod tests {
         assert_eq!(config.tombstone_grace.get_duration().as_secs(), 24 * 3600);
         assert_eq!(GeoConfig::default().tombstone_grace, config.tombstone_grace);
         assert!(
-            config.to_string().contains("tombstone_grace: 1day,"),
+            config
+                .to_string()
+                .contains("tombstone_grace: 1day, manifest_poll_interval: 5s,"),
             "{config}"
         );
     }

@@ -1577,6 +1577,11 @@ handshake_grace = "10 s"
 # reads peers also keeps a detached shadow topic this long after the peer wrote
 # its tombstone.
 #tombstone_grace = "24 h"
+# How often a node lists the manifests of each peer stream that a shadow
+# stream serves. A shadow partition then commits each changed manifest, so it
+# stays about this far behind its peer. One listing per peer stream and one
+# read per changed manifest go to the peer's store each time.
+#manifest_poll_interval = "5 s"
 # The cluster_uid of a cluster that lost every disk, as the store identity
 # object "<prefix>/meta/identity" names it, whose geo topics this cluster
 # takes back from that store. Only replica 0 reads it: set it there, in the

@@ -33,6 +33,7 @@ mod offset_recovery;
 pub mod offset_storage;
 mod partition_storage;
 mod peer_log;
+pub mod peer_manifests;
 pub use peer_log::{
     AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestContradiction,
     PeerManifestRefusal,

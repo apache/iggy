@@ -24,6 +24,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use iggy::prelude::*;
+use iggy_object_store::{
+    FsStore, KeyLayout, ListRequest, ObjectStore, PartitionManifest, PutBody, PutOptions,
+};
 use integration::harness::{TestBinary, TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
@@ -47,6 +50,12 @@ const REMOVE_DEADLINE: Duration = Duration::from_secs(180);
 /// How long the stale gauge may take to move: one listing.
 const STALE_DEADLINE: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a message sent to `dc-a` may take to reach `dc-b`: the rewrite
+/// of `dc-a` into a long-term segment waits up to 10 s, and `dc-b` lists
+/// the peer's manifests every 5 s.
+const FOLLOW_DEADLINE: Duration = Duration::from_secs(90);
+const FIRST_SENDS: u64 = 30;
+const SECOND_SENDS: u64 = 20;
 
 #[tokio::test]
 async fn given_a_geo_topic_in_a_peer_when_followed_should_adopt_it_refuse_writes_and_drop_it_after_its_delete()
@@ -171,6 +180,106 @@ async fn given_a_three_node_follower_when_restarted_and_its_primary_stops_should
         .stop()
         .expect("stop the metadata primary of dc-b");
     assert_every_node_holds(&dc_b, &[1, 2], adopted.id, geo_topic_id).await;
+}
+
+#[tokio::test]
+async fn given_messages_in_a_peer_geo_topic_when_followed_should_serve_each_once_at_the_peers_offsets_through_a_restart()
+ {
+    let store = tempfile::tempdir().expect("a directory for the store of dc-a");
+    let mut dc_a = origin_cluster(store.path());
+    dc_a.start().await.expect("dc-a boots");
+    let origin = dc_a.tcp_root_client().await.expect("a client of dc-a");
+    let topic_id = create_geo_topic(&origin, 1).await;
+    send_to_origin(&origin, 0..FIRST_SENDS).await;
+    let mut dc_b = follower_cluster(store.path(), 1);
+    dc_b.start().await.expect("dc-b boots");
+    let follower = dc_b.tcp_root_client().await.expect("a client of dc-b");
+    wait_for_shadow_topic(&follower, topic_id).await;
+    let consumer = Consumer::new(Identifier::numeric(1).expect("the consumer id"));
+
+    let mut seen = read_next(&follower, topic_id, &consumer, FIRST_SENDS).await;
+    send_to_origin(&origin, FIRST_SENDS..FIRST_SENDS + SECOND_SENDS).await;
+    seen.extend(read_next(&follower, topic_id, &consumer, SECOND_SENDS).await);
+
+    let expected: Vec<(u64, Vec<u8>)> = (0..FIRST_SENDS + SECOND_SENDS)
+        .map(|index| (index, payload(index)))
+        .collect();
+    assert_eq!(seen, expected, "each message once, in the origin's order");
+    assert_eq!(
+        read_from_start(&origin, &named(STREAM), &named(GEO_TOPIC)).await,
+        expected,
+        "the origin holds the same messages at the same offsets"
+    );
+    let http = HttpClient::login_root(&dc_b).await;
+    let metrics = scrape(&http).await;
+    assert!(
+        sum(
+            &metrics,
+            "geo_peer_manifest_requests_total",
+            "request=\"list\""
+        ) > 0
+    );
+    assert_eq!(sum(&metrics, "geo_peer_manifests_refused_total", ""), 0);
+
+    dc_b.restart_server().await.expect("dc-b restarts");
+    let follower = dc_b.tcp_root_client().await.expect("a client of dc-b");
+    let shadow_topic = Identifier::numeric(topic_id).expect("the topic id");
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    loop {
+        let read = read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await;
+        if read == expected {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dc-b serves {} of the messages after a restart",
+            read.len()
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+#[tokio::test]
+async fn given_a_followed_peer_when_its_store_holds_a_regressing_manifest_should_refuse_it_and_keep_serving()
+ {
+    let store = tempfile::tempdir().expect("a directory for the store of dc-a");
+    let mut dc_a = origin_cluster(store.path());
+    dc_a.start().await.expect("dc-a boots");
+    let origin = dc_a.tcp_root_client().await.expect("a client of dc-a");
+    let topic_id = create_geo_topic(&origin, 1).await;
+    send_to_origin(&origin, 0..FIRST_SENDS).await;
+    let mut dc_b = follower_cluster(store.path(), 1);
+    dc_b.start().await.expect("dc-b boots");
+    let follower = dc_b.tcp_root_client().await.expect("a client of dc-b");
+    wait_for_shadow_topic(&follower, topic_id).await;
+    let consumer = Consumer::new(Identifier::numeric(1).expect("the consumer id"));
+    let served = read_next(&follower, topic_id, &consumer, FIRST_SENDS).await;
+    let (key, original) = wait_for_manifest_with_segments(store.path()).await;
+
+    // Its floor is below the one that dc-b committed.
+    let regressing = PartitionManifest {
+        floor: original.trim_point,
+        segments: Vec::new(),
+        ..original.clone()
+    };
+    put_manifest(store.path(), &key, &regressing).await;
+    let http = HttpClient::login_root(&dc_b).await;
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    while sum(&scrape(&http).await, "geo_peer_manifests_refused_total", "") == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "dc-b never raised the alarm of a regressing manifest"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+
+    let shadow_topic = Identifier::numeric(topic_id).expect("the topic id");
+    assert_eq!(
+        read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await,
+        served,
+        "a refused manifest changes nothing"
+    );
+    put_manifest(store.path(), &key, &original).await;
 }
 
 /// The single node of `dc-a`, whose store is the `fs` root `store`.
@@ -407,7 +516,7 @@ async fn assert_reads_and_groups_work(follower: &IggyClient, topic_id: u32) {
         .expect("a poll of a shadow partition");
     assert!(
         polled.messages.is_empty(),
-        "no manifest is applied yet, so the partition serves nothing"
+        "dc-a sent nothing to the topic, so the partition serves nothing"
     );
 }
 
@@ -548,4 +657,220 @@ async fn serves_shadow_topic(client: &IggyClient, stream_id: u32, topic_id: u32)
         }
     }
     true
+}
+
+/// Creates the stream `orders` in `dc-a` with a geo topic of `partitions`
+/// partitions, and returns the topic's id.
+async fn create_geo_topic(origin: &IggyClient, partitions: u32) -> u32 {
+    origin
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create the stream of dc-a");
+    let options = TopicCreateOptions {
+        partitions_count: Some(partitions),
+        topic_type: Some(TopicType::Geo),
+        ..TopicCreateOptions::default()
+    };
+    let deadline = Instant::now() + READY_DEADLINE;
+    loop {
+        match origin
+            .create_topic(&named(STREAM), GEO_TOPIC, &options)
+            .await
+        {
+            Ok(topic) => return topic.id,
+            Err(IggyError::FeatureUnavailable | IggyError::TransientNotAccepted)
+                if Instant::now() < deadline =>
+            {
+                sleep(POLL_INTERVAL).await;
+            }
+            Err(error) => panic!("dc-a never accepted the geo topic: {error}"),
+        }
+    }
+}
+
+fn payload(index: u64) -> Vec<u8> {
+    format!("message-{index}").into_bytes()
+}
+
+/// Sends one message for each index to partition 0 of the geo topic.
+async fn send_to_origin(origin: &IggyClient, indexes: std::ops::Range<u64>) {
+    for index in indexes {
+        let mut messages = [IggyMessage::builder()
+            .payload(payload(index).into())
+            .build()
+            .expect("a message")];
+        origin
+            .send_messages(
+                &named(STREAM),
+                &named(GEO_TOPIC),
+                &Partitioning::partition_id(0),
+                &mut messages,
+            )
+            .await
+            .expect("send to the geo topic of dc-a");
+    }
+}
+
+/// Polls the next messages of `consumer` from partition 0 of the shadow
+/// topic, committing its offset, until `count` arrived.
+async fn read_next(
+    follower: &IggyClient,
+    topic_id: u32,
+    consumer: &Consumer,
+    count: u64,
+) -> Vec<(u64, Vec<u8>)> {
+    let topic = Identifier::numeric(topic_id).expect("the topic id");
+    let mut read = Vec::new();
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    while (read.len() as u64) < count {
+        let polled = follower
+            .poll_messages(
+                &named(SHADOW_STREAM),
+                &topic,
+                0,
+                consumer,
+                &PollingStrategy::next(),
+                PollOptions {
+                    count: 10,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .expect("a poll of the shadow partition");
+        read.extend(
+            polled
+                .messages
+                .into_iter()
+                .map(|message| (message.header.offset, message.payload.to_vec())),
+        );
+        if (read.len() as u64) < count {
+            assert!(
+                Instant::now() < deadline,
+                "dc-b served {} of {count} messages",
+                read.len()
+            );
+            sleep(POLL_INTERVAL).await;
+        }
+    }
+    read
+}
+
+/// Every message of partition 0 from its first offset.
+async fn read_from_start(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+) -> Vec<(u64, Vec<u8>)> {
+    let mut read = Vec::new();
+    loop {
+        let polled = match client
+            .poll_messages(
+                stream,
+                topic,
+                0,
+                &Consumer::default(),
+                &PollingStrategy::offset(read.len() as u64),
+                PollOptions {
+                    count: 100,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+        {
+            Ok(polled) => polled,
+            Err(_) => return read,
+        };
+        if polled.messages.is_empty() {
+            return read;
+        }
+        read.extend(
+            polled
+                .messages
+                .into_iter()
+                .map(|message| (message.header.offset, message.payload.to_vec())),
+        );
+    }
+}
+
+async fn scrape(http: &HttpClient) -> String {
+    let response = http.get("/metrics").await;
+    assert!(response.status().is_success(), "/metrics scrape failed");
+    response.text().await.expect("the metrics text")
+}
+
+/// The sum over every shard of the series `name` of `dc-a` whose labels hold
+/// `label`.
+fn sum(exposition: &str, name: &str, label: &str) -> u64 {
+    exposition
+        .lines()
+        .filter(|line| line.starts_with(&format!("{name}{{")))
+        .filter(|line| line.contains("origin=\"dc-a\"") && line.contains(label))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<u64>().ok())
+        .sum()
+}
+
+/// Waits until the store of `dc-a` holds a manifest that lists a segment,
+/// and returns its key and the manifest.
+async fn wait_for_manifest_with_segments(store: &Path) -> (String, PartitionManifest) {
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    loop {
+        if let Some(found) = read_manifest(store).await
+            && !found.1.segments.is_empty()
+        {
+            return found;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dc-a never published a manifest that lists a segment"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The key and the content of the one manifest of stream 0 in the `fs`
+/// store at `store`. The provider runs on compio, not on the harness's
+/// runtime.
+async fn read_manifest(store: &Path) -> Option<(String, PartitionManifest)> {
+    let path = store.to_owned();
+    tokio::task::spawn_blocking(move || {
+        compio::runtime::Runtime::new()
+            .expect("a compio runtime")
+            .block_on(async {
+                let store = FsStore::new(&path);
+                let layout = KeyLayout::new("iggy").expect("the default prefix");
+                let prefix = layout.stream_manifests_prefix(0);
+                let page = store.list(&ListRequest::new(&prefix)).await.ok()?;
+                let key = page
+                    .objects
+                    .into_iter()
+                    .map(|object| object.key)
+                    .find(|key| layout.parse_manifest_key(key).is_some())?;
+                let object = store.get_range(&key, 0..u64::MAX).await.ok()?;
+                let manifest = PartitionManifest::decode(&object.bytes).ok()?;
+                Some((key, manifest))
+            })
+    })
+    .await
+    .expect("the read task")
+}
+
+/// Puts `manifest` under `key` in the `fs` store at `store`, over what is
+/// there.
+async fn put_manifest(store: &Path, key: &str, manifest: &PartitionManifest) {
+    let path = store.to_owned();
+    let key = key.to_owned();
+    let bytes = manifest.encode();
+    tokio::task::spawn_blocking(move || {
+        compio::runtime::Runtime::new()
+            .expect("a compio runtime")
+            .block_on(async {
+                FsStore::new(&path)
+                    .put(&key, PutBody::from_bytes(bytes), &PutOptions::default())
+                    .await
+                    .expect("put the manifest");
+            });
+    })
+    .await
+    .expect("the put task");
 }

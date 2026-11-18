@@ -92,14 +92,23 @@ pub struct ExecutorObjects<E> {
     /// Never cancelled. A read belongs to a poll, and the poll's own deadline
     /// ends it, whoever is the primary by then.
     scope: TierScope,
+    class: TierJobClass,
 }
 
 impl<E> ExecutorObjects<E> {
+    /// Reads that a waiting poll needs, in [`TierJobClass::DemandFetch`].
     #[must_use]
     pub fn new(executor: E) -> Self {
+        Self::with_class(executor, TierJobClass::DemandFetch)
+    }
+
+    /// Reads in `class`, for work that no poll waits for.
+    #[must_use]
+    pub fn with_class(executor: E, class: TierJobClass) -> Self {
         Self {
             executor,
             scope: TierScope::new(),
+            class,
         }
     }
 }
@@ -110,7 +119,7 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        let request = TierJobRequest::new(TierJobClass::DemandFetch, self.scope.token())
+        let request = TierJobRequest::new(self.class, self.scope.token())
             .with_bytes(range.end.saturating_sub(range.start));
         let key = key.to_owned();
         let job = self.executor.submit(request, move |store| async move {

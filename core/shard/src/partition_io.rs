@@ -12402,6 +12402,7 @@ mod tests {
     mod fresh_writes;
     mod manifest_publishes;
     mod object_deletes;
+    mod peer_manifest_follows;
     mod segment_uploads;
     mod tier_service_uploads;
     mod topic_object_checks;

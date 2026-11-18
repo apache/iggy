@@ -377,7 +377,7 @@ impl fmt::Display for TrimDecodeError {
 
 impl std::error::Error for TrimDecodeError {}
 
-fn encode_segment(segment: &ManifestSegment, out: &mut [u8]) {
+pub(crate) fn encode_segment(segment: &ManifestSegment, out: &mut [u8]) {
     let (integers, rest) = out.split_at_mut(6 * size_of::<u64>());
     for (field, value) in integers
         .as_chunks_mut::<{ size_of::<u64>() }>()
@@ -401,7 +401,7 @@ fn encode_segment(segment: &ManifestSegment, out: &mut [u8]) {
     hash.copy_from_slice(&segment.hash);
 }
 
-fn decode_segment(bytes: &[u8]) -> Option<ManifestSegment> {
+pub(crate) fn decode_segment(bytes: &[u8]) -> Option<ManifestSegment> {
     if bytes.len() != SEGMENT_PAYLOAD_SIZE {
         return None;
     }

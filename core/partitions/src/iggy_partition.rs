@@ -188,6 +188,10 @@ where
     /// The other cluster's log that this partition serves in place of its
     /// own, `None` for a partition that holds its own messages.
     pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
+    /// Where the polls of the segments that committed peer manifests took
+    /// out of the log may have put a fetched `.index`, for the owner to
+    /// remove.
+    pub(crate) retired_peer_indexes: Vec<String>,
     /// The floor advances this replica applied that its chain does not record
     /// yet, oldest first. Recorded ones leave from the front.
     pub(crate) pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
@@ -1176,6 +1180,7 @@ where
             segment_chain: None,
             remote_segments: None,
             peer_log: None,
+            retired_peer_indexes: Vec::new(),
             pending_advances: VecDeque::new(),
             local_envelope: None,
             segment_upload: None,

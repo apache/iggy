@@ -717,9 +717,9 @@ A shadow stream is named `__shadow_<origin>_<stream>`, after the peer's origin
 and stream name. It holds the geo topics of that peer stream, with the peer's
 topic ids and partition ids. The normal topics of the peer stream do not
 appear. The partitions of a shadow topic keep none of the peer's messages on
-this node's disk. They read the peer's log from the peer's store. In this
-version a shadow partition does not follow the peer's manifests yet, so it
-holds no messages, and a poll of it returns none.
+this node's disk. They read the peer's log from the peer's store, as the
+manifests that they committed list it: see
+[Following peer manifests](#following-peer-manifests).
 
 Every 5 seconds, the caught-up metadata primary lists the topic objects of each
 peer. It reads each new object, and it reads a known object again every 30
@@ -758,6 +758,49 @@ shadow topics on the metadata primary.
 If the identity object of a peer names another cluster than the one that the
 shadow streams came from, the server logs it. It leaves those shadow streams
 as they are.
+
+### Following peer manifests
+
+The primary of each partition of a geo topic publishes a manifest of the
+partition's segments in its cluster's store, under
+`<prefix>/meta/<stream_id>/<topic_id>/<partition_id>/<created_revision>/manifest.bin`.
+A shadow partition serves the segments that the last manifest it committed
+lists, at the peer's offsets.
+
+Every `[geo] manifest_poll_interval` (5 seconds by default), shard 0 of each
+node lists `<prefix>/meta/<stream_id>/` of each peer stream that a shadow
+stream serves. It does so only for the shadow partitions whose primary this
+node is. The listing gives the etag of each manifest. When the etag of a
+manifest differs from the one that the shadow partition committed, the shard
+that owns the partition reads the manifest. The partition's primary checks the manifest
+against what the partition holds and commits it through the partition's
+consensus. A command lists only the segments that changed, and a large
+catch-up takes several commands. Every replica applies the same commands, so
+every replica serves the same range, and a restart does not go back.
+
+The listings and reads go to the peer's own tier service, in its
+housekeeping class. A slow or unreachable peer therefore takes no job slot of
+this cluster's store, and none that a poll of a shadow partition waits for.
+After a listing that fails, the node waits twice as long before the next
+one, up to a minute.
+
+The server refuses a manifest that goes back, names another partition
+incarnation or does not check. The shadow partition keeps what it holds. Once
+the etag of that manifest changes, the server reads it again. Each shard
+exports these metrics per peer, labelled with the peer's `origin`:
+
+- `geo_peer_manifest_requests_total` and `geo_peer_manifest_failures_total`,
+  with a `request` label of `list` or `get`, count the requests to the peer's
+  store and the ones that failed.
+- `geo_peer_manifests_refused_total` counts the refused manifests. Alert on
+  any increase.
+- `geo_peer_manifest_commands_total` counts the commands that committed
+  manifests.
+- `geo_peer_manifest_listed_seconds` is the Unix time of the last listing that
+  succeeded, on shard 0.
+- `geo_shadow_partitions_behind` counts the shadow partitions whose committed
+  manifest is behind the peer's. `geo_shadow_manifest_lag_seconds` is the
+  time since the furthest behind of them fell behind.
 
 ## Resource options
 

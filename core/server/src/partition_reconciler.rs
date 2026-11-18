@@ -186,6 +186,7 @@ use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
+use crate::peer_manifests::{NodePlace, PeerManifestLister};
 use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
@@ -357,6 +358,9 @@ pub struct ReconcilerCtx {
     /// The shadow streams of the geo peers' topics, which the metadata
     /// primary keeps in step with the peers' stores.
     shadow_topics: ShadowTopics,
+    /// The listings of the geo peers' manifests, which keep the shadow
+    /// partitions whose primary this node is up to date. Shard 0 only.
+    peer_manifests: PeerManifestLister,
     /// When the next pass over the partitions of geo topics may be staged,
     /// in microseconds since the Unix epoch.
     next_topic_object_check_at: Cell<u64>,
@@ -380,6 +384,7 @@ impl ReconcilerCtx {
             .read(|inner| Arc::clone(&inner.stats_registry));
         let geo_topics = GeoTopics::new(&config.geo);
         let shadow_topics = ShadowTopics::new(&config.geo);
+        let peer_manifests = PeerManifestLister::new(&config.geo);
         Self {
             shard,
             total_shards,
@@ -401,6 +406,7 @@ impl ReconcilerCtx {
             incarnation_deletes: IncarnationDeletes::default(),
             geo_topics,
             shadow_topics,
+            peer_manifests,
             next_topic_object_check_at: Cell::new(0),
         }
     }
@@ -583,6 +589,7 @@ pub async fn run_reconciler(
     ctx.incarnation_deletes.stop();
     ctx.geo_topics.stop();
     ctx.shadow_topics.stop(&ctx.shard);
+    ctx.peer_manifests.stop();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -673,6 +680,15 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     ctx.incarnation_deletes.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
     ctx.shadow_topics.pass(&ctx.shard, now);
+    ctx.peer_manifests.pass(
+        &ctx.shard,
+        now,
+        NodePlace {
+            self_replica_id: ctx.self_replica_id,
+            replica_count: ctx.replica_count,
+            total_shards: ctx.total_shards,
+        },
+    );
     stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {

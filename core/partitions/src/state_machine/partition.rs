@@ -34,6 +34,7 @@ use super::{
 };
 use crate::IggyPartition;
 use crate::long_term::LongTermLog;
+use crate::peer_manifests::{FOLLOW_PEER_MANIFEST, PeerManifests};
 use crate::tiered_floor::TieredFloor;
 use crate::types::FatalCommit;
 
@@ -70,7 +71,8 @@ where
     /// applied an op.
     pub fn register_builtin_state_machines(&mut self) -> Result<(), RegistrationError> {
         self.register_state_machine(Box::new(TieredFloor::default()))?;
-        self.register_state_machine(Box::new(LongTermLog::default()))
+        self.register_state_machine(Box::new(LongTermLog::default()))?;
+        self.register_state_machine(Box::new(PeerManifests::default()))
     }
 
     #[must_use]
@@ -248,6 +250,9 @@ where
                 self.note_long_term_registration(command.kind);
                 self.queue_dead_long_term_objects(&long_term_at_stake);
                 self.note_long_term_advance(long_term_floor);
+                if command.kind == FOLLOW_PEER_MANIFEST {
+                    self.follow_committed_peer_manifest();
+                }
                 true
             }
             Ok(Applied::Refused) => {
