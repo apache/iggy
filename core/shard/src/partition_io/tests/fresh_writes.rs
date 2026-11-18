@@ -608,6 +608,14 @@ async fn given_a_placing_backup_when_it_becomes_the_primary_should_start_its_pas
     assert!(paced(&candidate.owner, namespace()));
     compio::time::sleep(REWRITE_INTERVAL_START).await;
     candidate.owner.tick_long_term_rewrites().await;
+    let reported = candidate.owner.metrics().long_term_lags();
+    assert_eq!(
+        reported
+            .iter()
+            .map(|lag| (lag.namespace, lag.messages))
+            .collect::<Vec<_>>(),
+        [(namespace(), 1)]
+    );
     assert!(
         candidate.partition(namespace()).segment_rewrite_running(),
         "its first pass started a rewrite"
@@ -623,8 +631,16 @@ async fn given_a_placing_backup_when_it_becomes_the_primary_should_start_its_pas
     .await;
     backup.step(&mut scratch).await;
     assert!(!paced(&backup.owner, namespace()));
+    // The pass the segment cleaner stages gives a backup a wait too. It is
+    // not the one that reports the partition.
+    backup
+        .owner
+        .on_rewrite_segments(namespace(), staged_revision(&backup.owner))
+        .await;
+    assert!(paced(&backup.owner, namespace()));
     compio::time::sleep(REWRITE_INTERVAL_START).await;
     backup.owner.tick_long_term_rewrites().await;
+    assert_eq!(backup.owner.metrics().long_term_lags(), []);
     assert!(!backup.partition(namespace()).segment_rewrite_running());
 }
 
@@ -1591,6 +1607,56 @@ async fn given_a_backlog_past_the_limit_when_sends_arrive_should_delay_the_sends
         placed[1].placement.length < placed[2].placement.length,
         "the held send committed before the one behind it"
     );
+}
+
+/// An operator sees which partition lags: the shard leaves the messages and
+/// the bytes each placing partition it leads has yet to rewrite where a
+/// scrape reads them. A partition whose rewrites keep up reports zero.
+#[compio::test]
+async fn given_placing_partitions_this_shard_leads_when_the_tick_runs_should_report_the_lag_of_each()
+ {
+    use crate::metrics::LongTermLag;
+
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(backlog_owner(directory.path(), 0)).await;
+    let other = place_other_partition(&owner);
+    let other_revision = owner
+        .plane
+        .partitions()
+        .get_by_ns(&other)
+        .unwrap()
+        .created_revision();
+    let lags = |owner: &IoTestShard| {
+        let mut lags = owner.metrics().long_term_lags();
+        lags.sort_by_key(|lag| lag.namespace.inner());
+        lags
+    };
+    assert_eq!(lags(&owner), []);
+
+    let backlog = pumped(&owner, async {
+        let backlog = commit_and_count_a_backlog(&owner).await;
+        owner.request_rewrite_segments(other, other_revision);
+        until(&owner, |owner| backlog_of(owner, other) == Some(0)).await;
+        until(&owner, |owner| lags(owner).len() == 2).await;
+        let _second = submit_send(&owner, 2, 300);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+        until(&owner, |owner| lags(owner)[0].messages == 2).await;
+        backlog
+    })
+    .await;
+
+    let lags = lags(&owner);
+    assert_eq!(
+        lags[1],
+        LongTermLag {
+            namespace: other,
+            messages: 0,
+            bytes: Some(0),
+        }
+    );
+    assert_eq!((lags[0].namespace, lags[0].messages), (namespace(), 2));
+    assert!(lags[0].bytes > Some(backlog), "both sends: {lags:?}");
+    assert_eq!(lags[0].bytes, backlog_of(&owner, namespace()));
 }
 
 /// Below the limit, or with no limit, a send is taken at once, however

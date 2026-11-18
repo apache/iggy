@@ -46,6 +46,7 @@
 //! detached task whose count the tick hands back. The pass of a partition
 //! past its backlog limit does not wait out its interval.
 
+use crate::metrics::LongTermLag;
 use crate::rewrite_pacing::{BacklogCount, RewriteResult};
 use crate::shards_table::ShardsTable;
 use crate::{
@@ -188,7 +189,8 @@ where
     /// the partitions the backlogs their walks counted, act on the
     /// commands that committed outside a partition I/O step, make the pass
     /// of a partition past its backlog limit due, start the passes that are
-    /// due, and report how far the rewrites are behind.
+    /// due, and report how far the rewrites are behind, per partition and
+    /// at worst.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -222,6 +224,7 @@ where
         let mut changed = Vec::new();
         let mut past_limit = Vec::new();
         let mut largest_backlog = 0;
+        let mut lags = self.metrics.long_term_lags_to_fill();
         for key in self.rewrite_pacing.borrow().paced() {
             let Some(partition) = partitions
                 .get_by_ns(&key.0)
@@ -235,12 +238,18 @@ where
             if !partition.consensus().is_primary() {
                 continue;
             }
+            lags.push(LongTermLag {
+                namespace: key.0,
+                messages: partition.long_term_lag(),
+                bytes: partition.long_term_backlog(),
+            });
             let backlog = partition.long_term_backlog().unwrap_or(0);
             largest_backlog = largest_backlog.max(backlog);
             if limit > 0 && backlog > limit {
                 past_limit.push(*key);
             }
         }
+        self.metrics.set_long_term_lags(lags);
         for (namespace, created_revision) in changed {
             self.long_term_changed(namespace, created_revision);
         }
