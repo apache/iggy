@@ -84,7 +84,7 @@ dotnet run --project  examples/csharp/src/SinkDataProducer/Iggy_SDK.Examples.Sin
 
 Creates the stream and topic if they are missing, then sends 100 batches of 100 to 499 records each. Every record has `user_id`, `user_type`, `email`, `source`, `state`, `message` and `created_at`, the same fields the other SDKs' sink data producers write. The default stream is `qw` and the default topic is `records`. Change them in `appsettings.json`.
 
-Example sink configs live in [`core/connectors/runtime/example_config/connectors/`](../../core/connectors/runtime/example_config/connectors/). [`quickwit_sink.toml`](../../core/connectors/runtime/example_config/connectors/quickwit_sink.toml) already reads `qw`/`records`. See the [connectors README](../../core/connectors/README.md) for how to run the connectors runtime with them.
+Example sink configs live in [`runtime/example_config/connectors/`](https://github.com/apache/iggy-connectors/tree/master/runtime/example_config/connectors/). [`quickwit_sink.toml`](https://github.com/apache/iggy-connectors/blob/master/runtime/example_config/connectors/quickwit_sink.toml) already reads `qw`/`records`. See the [connectors runtime README](https://github.com/apache/iggy-connectors/blob/master/runtime/README.md) for how to run the connectors runtime with them.
 
 ## Security Examples
 

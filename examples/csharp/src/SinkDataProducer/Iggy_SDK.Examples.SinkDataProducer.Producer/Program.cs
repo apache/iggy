@@ -35,7 +35,7 @@ const string alphanumeric = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXY
 // sink connector config works for all of them.
 var jsonOptions = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower };
 
-var loggerFactory = LoggerFactory.Create(builder => { builder.AddConsole(); });
+using var loggerFactory = LoggerFactory.Create(builder => { builder.AddConsole(); });
 var logger = loggerFactory.CreateLogger<Program>();
 
 var configuration = new ConfigurationBuilder().AddJsonFile("appsettings.json").Build();
