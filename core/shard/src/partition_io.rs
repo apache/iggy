@@ -11029,6 +11029,24 @@ mod tests {
         repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
         repair_rings: Option<Rc<partitions::RepairRingBudget>>,
     ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_of_topic(
+            bus,
+            store,
+            repair_memory,
+            repair_rings,
+            TopicRuntimeOptions::default(),
+        )
+    }
+
+    /// [`test_owner_with_repair_budgets`] whose committed topic resolves to
+    /// the options `runtime`.
+    fn test_owner_of_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+        repair_rings: Option<Rc<partitions::RepairRingBudget>>,
+        runtime: TopicRuntimeOptions,
+    ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
             messages_required_to_save: 100,
@@ -11050,6 +11068,7 @@ mod tests {
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
+        topic.resolved.runtime = runtime;
         for partition_id in 0..TEST_PARTITIONS {
             let namespace = IggyNamespace::new(0, 0, partition_id);
             let consensus = VsrConsensus::new(

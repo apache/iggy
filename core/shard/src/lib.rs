@@ -10119,6 +10119,8 @@ where
             let quiet_until = partitions
                 .sent_report(namespace)
                 .and_then(|(partition, sent)| {
+                    self.pace_placing_primary(*namespace, partition);
+                    self.stage_manifest_of_new_primary(*namespace, partition);
                     self.partition_quiet_until(*namespace, partition, sent.get())
                 });
             partitions.settle(namespace, quiet_until);
