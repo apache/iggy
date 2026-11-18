@@ -26,8 +26,8 @@ use crate::{FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX};
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_object_store::{
-    FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore, ObjectStoreError,
-    TierScopeToken, is_fresh_object,
+    FreshIndex, FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore,
+    ObjectStoreError, TierScopeToken, is_fresh_object,
 };
 use partitions::{
     ExecutorFreshUploader, FRESH_DELETES_PER_BATCH, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
@@ -45,12 +45,16 @@ type MemoryUploader = ExecutorFreshUploader<InlineTierExecutor<MemoryStore>>;
 /// upload share one window.
 pub(super) const LONG_INTERVAL: Duration = Duration::from_millis(500);
 
+/// A wait for proof rows longer than any test, so that only the windows a
+/// test sends carry them and the store holds no object of rows alone.
+pub(super) const NO_CONFIRMATION: Duration = Duration::from_secs(3600);
+
 /// Uploads into a memory store, unless told to refuse.
 pub(super) struct TestUploader {
     uploader: MemoryUploader,
     pub(super) refuses: Cell<bool>,
     /// The first attempts that fail, in the order they come.
-    fails_first: Cell<u32>,
+    pub(super) fails_first: Cell<u32>,
     attempts: Cell<u32>,
 }
 
@@ -103,7 +107,8 @@ pub(super) async fn placing_owner(directory: &Path) -> IoTestShard {
 }
 
 /// [`placing_owner`] whose committed topic resolves to the options
-/// `committed`.
+/// `committed`. Proof rows wait for the windows of the test's sends, so
+/// that the store holds only the objects of those sends.
 #[allow(clippy::future_not_send)]
 async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions) -> IoTestShard {
     let bus = Rc::new(IggyMessageBus::new(0));
@@ -121,6 +126,7 @@ async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions
     });
     attach_segment_files(partition, directory, false).await;
     partition.register_builtin_state_machines().unwrap();
+    owner.set_fresh_confirm_after(NO_CONFIRMATION);
     owner
 }
 
@@ -233,6 +239,13 @@ async fn submit_send_to_when_room(
             Err(crossfire::TrySendError::Disconnected(_)) => panic!("the shard's inbox is gone"),
         }
     }
+}
+
+/// Objects with data this shard stored: every object it stored but those
+/// of proof rows alone.
+pub(super) fn data_objects_stored(owner: &IoTestShard) -> u64 {
+    let metrics = owner.metrics();
+    metrics.fresh_uploads_value().0 - metrics.fresh_confirmations_value()
 }
 
 /// Ops the partition `partition` committed.
@@ -522,10 +535,25 @@ async fn given_committed_sends_when_nothing_stages_a_pass_should_store_and_publi
         object: SegmentObject::Log,
     });
     assert_eq!(store.head(&log_key).await.unwrap().size, segments[0].size);
+    let mut fresh_with_data = 0;
+    for key in store.keys() {
+        if let Some(id) = layout().parse_fresh_key(&key) {
+            let size = store.head(&key).await.unwrap().size;
+            let bytes = store.get_range(&key, 0..size).await.unwrap().bytes;
+            let index = FreshIndex::decode(&bytes, FreshObjectId::from_raw(id)).unwrap();
+            fresh_with_data += usize::from(!index.is_confirmation());
+        }
+    }
+    assert_eq!(fresh_with_data, 2, "a fresh object per send");
     assert_eq!(
-        store.keys().len(),
-        4,
-        "a fresh object per send, the log and its index"
+        store.keys().len()
+            - store
+                .keys()
+                .iter()
+                .filter(|key| layout().parse_fresh_key(key).is_some())
+                .count(),
+        2,
+        "the log and its index"
     );
 }
 
@@ -2163,7 +2191,8 @@ async fn given_an_idle_shard_when_sends_arrive_should_upload_the_first_at_once_a
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
     owner.set_fresh_upload_pace(INTERVAL, 4);
-    let stored = |count: usize| uploader.store().keys().len() == count;
+    // Objects of proof rows alone go out beside the windows.
+    let stored = |count: u64| data_objects_stored(&owner) == count;
 
     pumped(&owner, async {
         assert_eq!(owner.fresh_uploads_deadline(), None);
@@ -2174,7 +2203,7 @@ async fn given_an_idle_shard_when_sends_arrive_should_upload_the_first_at_once_a
 
         let _second = submit_send(&owner, 2, 100);
         compio::time::sleep(INTERVAL / 4).await;
-        assert_eq!(uploader.store().keys().len(), 1);
+        assert_eq!(data_objects_stored(&owner), 1);
         let due_in = owner
             .fresh_uploads_deadline()
             .expect("the open window has a deadline of its own")

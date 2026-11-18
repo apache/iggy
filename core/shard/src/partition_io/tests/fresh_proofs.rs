@@ -106,12 +106,41 @@ fn rebuilt(
     bytes
 }
 
+/// Wait until the store holds a proof row of each of the first `batches`
+/// batches of every one of `partitions`.
+#[allow(clippy::future_not_send)]
+async fn until_proven(
+    owner: &IoTestShard,
+    store: &MemoryStore,
+    partitions: &[IggyNamespace],
+    batches: u64,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let objects = Box::pin(stored_objects(store)).await;
+        if partitions
+            .iter()
+            .all(|partition| proof_rows(&objects, *partition).len() as u64 >= batches)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the batches were not all proven, with {} objects stored and {} uploads",
+            objects.len(),
+            owner.metrics().fresh_uploads_value().0
+        );
+        compio::time::sleep(TASK_POLL_INTERVAL).await;
+    }
+}
+
 /// A shard that leads `PARTITIONS` placing partitions takes one send per
 /// partition in each round, and the next round starts once the last one
 /// committed. Every object decodes as a reader finds it. The row of each
-/// committed batch rides an object of its own round or of the next one, one
-/// distinct row per batch, and a reader rebuilds from them exactly the
-/// placed batches the partition committed.
+/// committed batch rides an object of its own round or of the next one, and
+/// those of the last round an object of rows alone. There is one distinct
+/// row per batch, and a reader rebuilds from them exactly the placed batches
+/// the partition committed.
 #[compio::test]
 async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_in_the_objects_of_the_next()
  {
@@ -122,6 +151,7 @@ async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_
     let placing = place_partitions(&owner, PARTITIONS);
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
     owner.set_fresh_cluster_uid(CLUSTER_UID);
     owner.set_fresh_upload_pace(Duration::from_millis(20), 2);
 
@@ -141,16 +171,15 @@ async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_
             .await;
             objects_after_round.push(uploader.store().keys().len());
         }
+        until_proven(&owner, uploader.store(), &placing, ROUNDS).await;
         objects_after_round
     })
     .await;
 
     let objects = Box::pin(stored_objects(uploader.store())).await;
-    assert_eq!(objects.len(), *objects_after_round.last().unwrap());
     for object in &objects {
         assert_eq!(object.index.header().object_id, object.id);
         assert_eq!(object.index.header().cluster_uid, CLUSTER_UID);
-        assert!(!object.index.is_confirmation());
         assert_eq!(object.index.object_len(), object.bytes.len() as u64);
     }
     let round_of = |object: FreshObjectId| {
@@ -161,15 +190,15 @@ async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_
         1 + objects_after_round
             .iter()
             .position(|after| position < *after)
-            .unwrap() as u64
+            .unwrap_or(objects_after_round.len()) as u64
     };
     for partition in &placing {
         let rows = proof_rows(&objects, *partition);
         let offsets: Vec<u64> = rows.keys().copied().collect();
         assert_eq!(
             offsets,
-            (0..ROUNDS - 1).collect::<Vec<_>>(),
-            "the batches of every round but the last are proven in {partition:?}"
+            (0..ROUNDS).collect::<Vec<_>>(),
+            "every batch of {partition:?} is proven"
         );
         for (offset, carried) in &rows {
             assert!(
@@ -198,6 +227,10 @@ async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_
             placement::checksum_of(&committed)
         );
     }
+    assert!(
+        objects.last().unwrap().index.is_confirmation(),
+        "the rows of the last round go out alone"
+    );
     let claims: Vec<u64> = objects
         .iter()
         .filter_map(|object| object.index.partition(namespace().inner()))
@@ -256,8 +289,7 @@ async fn given_an_object_that_carried_proof_rows_when_the_store_refuses_it_for_g
     );
 }
 
-/// The rows of the partitions this shard leads ride the same object, also
-/// that of a partition with no send in it.
+/// The rows of the partitions this shard leads ride the same object.
 #[compio::test]
 async fn given_two_partitions_when_both_commit_should_prove_both_in_one_object() {
     let directory = tempfile::tempdir().unwrap();
@@ -265,6 +297,7 @@ async fn given_two_partitions_when_both_commit_should_prove_both_in_one_object()
     let other = place_partitions(&owner, 2)[1];
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
     owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
 
     pumped(&owner, async {
@@ -277,28 +310,25 @@ async fn given_two_partitions_when_both_commit_should_prove_both_in_one_object()
             committed_sends(owner) == 2 && committed(owner, other) == 1
         })
         .await;
-        // The tick takes the rows of a partition with no send in the window.
-        until(&owner, |owner| {
-            owner.fresh_proofs_waiting().contains(&other)
-        })
-        .await;
-        let _third = submit_send(&owner, 4, 100);
-        until(&owner, |owner| committed_sends(owner) == 3).await;
+        until_proven(&owner, uploader.store(), &[namespace()], 2).await;
+        until_proven(&owner, uploader.store(), &[other], 1).await;
     })
     .await;
 
     let objects = Box::pin(stored_objects(uploader.store())).await;
-    assert_eq!(objects.len(), 3);
-    let last = objects.last().unwrap();
-    let proven: Vec<u64> = last
-        .index
-        .directory()
+    let both = objects
         .iter()
-        .filter(|row| row.proof_count > 0)
-        .map(|row| row.namespace)
-        .collect();
-    assert_eq!(proven, [namespace().inner(), other.inner()]);
-    let other_row = last.index.partition(other.inner()).unwrap();
+        .find(|object| {
+            let proven = |partition: IggyNamespace| {
+                object
+                    .index
+                    .partition(partition.inner())
+                    .is_some_and(|row| row.proof_count > 0)
+            };
+            proven(namespace()) && proven(other)
+        })
+        .expect("one object proves the batches of both");
+    let other_row = both.index.partition(other.inner()).unwrap();
     assert_eq!(
         other_row.batch_count, 0,
         "proof rows alone for the other partition"
@@ -342,4 +372,118 @@ async fn given_an_object_whose_proof_rows_still_upload_when_sealing_the_next_sho
         .map(|placed| placed.placement.proven_below)
         .collect();
     assert_eq!(claims, [0, 0, 0, 1]);
+}
+
+/// An idle shard stores the rows of the batch that committed last in an
+/// object of rows alone, once they waited for `FRESH_CONFIRM_AFTER`, and
+/// writes no other.
+#[compio::test]
+async fn given_an_idle_shard_when_a_batch_commits_should_store_one_object_of_its_proof_alone_after_the_wait()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+
+    let waited = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let committed_at = std::time::Instant::now();
+        until(&owner, |_| uploader.store().keys().len() == 2).await;
+        let waited = committed_at.elapsed();
+        compio::time::sleep(2 * crate::FRESH_CONFIRM_AFTER).await;
+        waited
+    })
+    .await;
+
+    assert!(
+        waited + TASK_POLL_INTERVAL >= crate::FRESH_CONFIRM_AFTER,
+        "the rows waited for an object with data first: {waited:?}"
+    );
+    assert!(
+        waited < crate::FRESH_CONFIRM_AFTER + Duration::from_millis(500),
+        "the rows went out within the wait and one upload: {waited:?}"
+    );
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    assert_eq!(objects.len(), 2, "one object of rows alone, and no more");
+    let confirmation = &objects[1];
+    assert!(confirmation.index.is_confirmation());
+    assert_eq!(confirmation.index.batches(), []);
+    assert_eq!(
+        confirmation.index.object_len(),
+        confirmation.index.index_len(),
+        "it holds no data"
+    );
+    let rows = proof_rows(&objects, namespace());
+    assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [0]);
+    assert_eq!(rows[&0][0].0.object_id, objects[0].id);
+    assert_eq!(owner.metrics().fresh_confirmations_value(), 1);
+    assert!(owner.metrics().fresh_proof_lag_value().abs() < f64::EPSILON);
+}
+
+/// Under steady load each window carries the rows of what committed before
+/// it, so no object of rows alone is stored until the load stops.
+#[compio::test]
+async fn given_steady_sends_when_windows_keep_closing_should_store_no_object_of_rows_alone_until_they_stop()
+ {
+    const SENDS: u64 = 30;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+
+    let during_load = pumped(&owner, async {
+        for request in 1..=SENDS {
+            let _answer = submit_send(&owner, request, 100);
+            compio::time::sleep(crate::FRESH_CONFIRM_AFTER / 10).await;
+        }
+        until(&owner, |owner| committed_sends(owner) == SENDS).await;
+        let during_load = owner.metrics().fresh_confirmations_value();
+        until_proven(&owner, uploader.store(), &[namespace()], SENDS).await;
+        during_load
+    })
+    .await;
+
+    assert_eq!(during_load, 0, "no object of rows alone under load");
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    let confirmations: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| object.index.is_confirmation())
+        .map(|(position, _)| position)
+        .collect();
+    assert_eq!(
+        confirmations,
+        [objects.len() - 1],
+        "one object of rows alone, after the last send"
+    );
+}
+
+/// An object of rows alone that the store fails once is tried again under
+/// the same id, as an object with data is.
+#[compio::test]
+async fn given_an_object_of_rows_alone_when_the_store_fails_it_once_should_store_it_on_the_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        // The upload of the data was the first attempt.
+        uploader.fails_first.set(2);
+        until_proven(&owner, uploader.store(), &[namespace()], 1).await;
+    })
+    .await;
+
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    assert_eq!(objects.len(), 2);
+    assert!(objects[1].index.is_confirmation());
+    let (retries, ..) = owner.metrics().fresh_load_value();
+    assert_eq!(retries, 1);
+    assert_eq!(owner.metrics().fresh_confirmations_value(), 1);
 }

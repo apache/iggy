@@ -133,6 +133,14 @@ const FRESH_UPLOAD_RETRY_DELAY: Duration = Duration::from_millis(50);
 /// stays well below the 30 s after which a client gives a request up.
 pub const FRESH_UPLOAD_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long the proof rows of a shard wait for an object that carries
+/// data before the shard stores them in an object of their own.
+///
+/// It is also the shortest time between two such objects, and the wait of
+/// a shard that was given no other. A shard whose windows close sooner
+/// writes none.
+pub const FRESH_CONFIRM_AFTER: Duration = Duration::from_millis(250);
+
 /// The submit channel a send arrived with.
 type SubmitReply = Sender<Option<Message<GenericHeader>>>;
 
@@ -309,6 +317,10 @@ pub struct FreshWrites {
     proofs_waiting: RefCell<BTreeMap<IggyNamespace, u64>>,
     /// `StoreIdentity::cluster_uid` of the store the objects go to.
     cluster_uid: Cell<u128>,
+    /// The bus's monotonic clock when the last object of proof rows alone
+    /// was sealed.
+    last_confirmation_at: Cell<Option<u64>>,
+    confirm_after_micros: Cell<u64>,
 }
 
 impl Default for FreshWrites {
@@ -334,6 +346,8 @@ impl Default for FreshWrites {
             cursors: RefCell::default(),
             proofs_waiting: RefCell::default(),
             cluster_uid: Cell::new(0),
+            last_confirmation_at: Cell::new(None),
+            confirm_after_micros: Cell::new(micros(FRESH_CONFIRM_AFTER)),
         }
     }
 }
@@ -457,6 +471,20 @@ impl FreshWrites {
             .or_insert(since);
     }
 
+    /// When the proof rows that wait are due in an object of their own, if
+    /// no window is sealed first, on the bus's monotonic clock.
+    fn confirmation_due(&self) -> Option<u64> {
+        let confirm_after = self.confirm_after_micros.get();
+        let oldest = self.proofs_waiting.borrow().values().copied().min()?;
+        self.uploader.borrow().as_ref()?;
+        let due = oldest.saturating_add(confirm_after);
+        Some(
+            self.last_confirmation_at
+                .get()
+                .map_or(due, |last| due.max(last.saturating_add(confirm_after))),
+        )
+    }
+
     /// The oldest proof row this shard has not stored yet began to wait at,
     /// on the bus's monotonic clock.
     fn oldest_unstored_proof(&self) -> Option<u64> {
@@ -472,7 +500,8 @@ impl FreshWrites {
 
     /// When the pump must look at the uploads again without an event: the
     /// open window comes due, an object is tried again, an attempt runs out
-    /// of time, or a delayed send is due. On the bus's monotonic clock.
+    /// of time, a delayed send is due, or proof rows waited long enough. On
+    /// the bus's monotonic clock.
     fn next_deadline(&self) -> Option<u64> {
         let window_due = (self.window.borrow().is_some() && self.has_free_upload())
             .then(|| self.last_upload_started_at.get())
@@ -492,7 +521,11 @@ impl FreshWrites {
         let delayed = delayed
             .values()
             .filter_map(|sends| sends.front().map(|send| send.due_at));
-        objects.chain(window_due).chain(delayed).min()
+        objects
+            .chain(window_due)
+            .chain(delayed)
+            .chain(self.confirmation_due())
+            .min()
     }
 }
 
@@ -549,6 +582,13 @@ where
     #[must_use]
     pub const fn fresh_cluster_uid(&self) -> u128 {
         self.fresh_writes.cluster_uid.get()
+    }
+
+    /// Set how long proof rows wait for a window to carry them before they
+    /// go out in an object of their own, and the shortest time between two
+    /// such objects.
+    pub fn set_fresh_confirm_after(&self, wait: Duration) {
+        self.fresh_writes.confirm_after_micros.set(micros(wait));
     }
 
     /// Set the shortest time between the starts of two uploads that no full
@@ -1134,6 +1174,10 @@ where
             // attempt reports, which an uploader may never do.
             self.fail_fresh_object(sequence);
         }
+        // Even beside an open window, which keeps to its interval.
+        if fresh.confirmation_due().is_some_and(|due| due <= now) {
+            self.seal_fresh_confirmation(now);
+        }
         let free = fresh
             .uploads_max
             .get()
@@ -1163,6 +1207,25 @@ where
                 .oldest_unstored_proof()
                 .map_or(0, |since| now.saturating_sub(since)),
         ));
+    }
+
+    /// Seal the proof rows that wait into an object of their own, which
+    /// waits for an upload slot as any other.
+    fn seal_fresh_confirmation(&self, now: u64) {
+        let fresh = &self.fresh_writes;
+        let sequence = fresh.sequence.get();
+        let Some(id) = FreshObjectId::new(
+            self.partition_consensus.self_replica_id,
+            self.id,
+            fresh.started_at,
+            sequence,
+        ) else {
+            return;
+        };
+        if self.seal_fresh_object(sequence, id, &BTreeSet::new(), now) {
+            fresh.sequence.set(sequence + 1);
+            fresh.last_confirmation_at.set(Some(now));
+        }
     }
 
     /// Start an attempt at storing the closed object `sequence`.
@@ -1310,6 +1373,9 @@ where
         }) else {
             return;
         };
+        if stored && object.partitions.is_empty() {
+            self.metrics.record_fresh_confirmation();
+        }
         // A consumer at the tail polls these batches next, and this shard
         // holds their messages already.
         if stored
@@ -1508,17 +1574,6 @@ where
             Some(send.reply),
             &IggyError::TransientNotAccepted,
         );
-    }
-
-    /// The partitions whose proof rows wait for an object.
-    #[cfg(test)]
-    pub(crate) fn fresh_proofs_waiting(&self) -> Vec<IggyNamespace> {
-        self.fresh_writes
-            .proofs_waiting
-            .borrow()
-            .keys()
-            .copied()
-            .collect()
     }
 
     /// Bytes of the messages of the waiting sends of `namespace`, and of

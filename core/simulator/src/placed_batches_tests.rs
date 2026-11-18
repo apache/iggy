@@ -34,6 +34,7 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, Sequencer};
@@ -138,10 +139,15 @@ fn placing_cluster_of(
     (sim, client, store)
 }
 
+/// A wait for proof rows longer than any scenario, so that the store holds
+/// only the objects that the sends of a scenario fill.
+const NO_CONFIRMATION: Duration = Duration::from_secs(3600);
+
 /// Give every shard of `replica` the store: for its uploads, its sweeps and
 /// the reads of its polls.
 fn wire_store(sim: &Simulator, replica: u8, store: &Shared) {
     for shard in &sim.replicas[usize::from(replica)].shards {
+        shard.set_fresh_confirm_after(NO_CONFIRMATION);
         shard.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
             store.clone(),
             layout(),

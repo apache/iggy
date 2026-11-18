@@ -125,7 +125,8 @@ part yet: see the status note at the top.
    slot and `fresh_upload_interval` has passed since the last upload started. The object starts
    with an index that names the partition of each batch. It also carries a **proof row** for each
    batch that committed since the shard's last object: where its messages sit, and the offset and
-   timestamp it committed at. So the bucket alone says which messages committed and where.
+   timestamp it committed at. So the bucket alone says which messages committed and where. Rows
+   that no window takes within 250 ms go out in an object of their own.
 3. Once the object is stored, the partition commits a placed batch through its consensus: the
    batch header and where its messages sit in the fresh object, 320 bytes in all. The replicas
    store this record on their disks. The messages themselves are only in the bucket.
@@ -528,6 +529,8 @@ Requests to a cluster's own bucket:
 
 - one put per fresh object: up to one object per `fresh_upload_interval` on each shard, plus one
   for each object that fills to 4 MiB first;
+- up to four puts a second on a shard whose sends are more than 250 ms apart, for the proof rows
+  that no object with messages carried in that time;
 - a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
   which read the messages back;
 - a put for each long-term segment and its index, and one for each manifest;
@@ -571,6 +574,7 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 | `fresh_commit_seconds`               | histogram | How long a send waited for its answer after its fresh object was stored.             |
 | `fresh_object_size_bytes`            | histogram | Size of each fresh object the shard stored, in bytes.                                |
 | `fresh_proof_lag_seconds`            | gauge     | How long the oldest proof row of a committed batch has waited for a stored object.   |
+| `fresh_confirmations`                | counter   | Fresh objects of proof rows alone, stored when no window closed within 250 ms.       |
 
 ### Fresh objects
 

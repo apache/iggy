@@ -511,6 +511,9 @@ pub struct ShardMetrics {
     /// for a stored object to carry it. Another cluster reads a batch only
     /// once its row is stored.
     fresh_proof_lag_seconds: Gauge<f64, AtomicU64>,
+    /// Fresh objects this shard stored that carry proof rows and no data,
+    /// because no window closed soon enough after their batches committed.
+    fresh_confirmations_total: Counter,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -697,6 +700,7 @@ impl ShardMetrics {
             fresh_commit: fresh_latency_histogram(),
             fresh_object_size: fresh_object_size_histogram(),
             fresh_proof_lag_seconds: Gauge::default(),
+            fresh_confirmations_total: Counter::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
@@ -736,6 +740,18 @@ impl ShardMetrics {
     #[must_use]
     pub fn fresh_proof_lag_value(&self) -> f64 {
         self.fresh_proof_lag_seconds.get()
+    }
+
+    /// The shard stored an object of proof rows alone.
+    pub(crate) fn record_fresh_confirmation(&self) {
+        self.fresh_confirmations_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_confirmations_value(&self) -> u64 {
+        self.fresh_confirmations_total.get()
     }
 
     /// The upload of a fresh object of `bytes` ended after `elapsed`, and
@@ -2528,6 +2544,11 @@ impl ShardMetrics {
             "fresh_object_size_bytes",
             "bytes of each fresh object this shard stored",
             self.fresh_object_size.clone(),
+        );
+        registry.register(
+            "fresh_confirmations",
+            "fresh objects this shard stored that carry proof rows and no data",
+            self.fresh_confirmations_total.clone(),
         );
         registry.register(
             "fresh_proof_lag_seconds",
