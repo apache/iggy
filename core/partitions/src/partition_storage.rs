@@ -568,6 +568,9 @@ async fn clamp_recovered_offset<S: DurableStorage, B: MessageBus>(
 /// With WAL-owned messages, restore the deterministic empty tail when the
 /// recovered last segment already reached its size limit.
 ///
+/// An empty chain starts at `wal_checkpoint_next_offset` when boot found a WAL
+/// checkpoint, and at the recovered frontier otherwise.
+///
 /// # Errors
 ///
 /// Returns [`PartitionRecoveryError::Iggy`] on segment-storage creation
@@ -577,6 +580,7 @@ pub async fn ensure_initial_segment<B: MessageBus>(
     config: &PartitionsConfig,
     namespace: IggyNamespace,
     wal_owned_messages: bool,
+    wal_checkpoint_next_offset: Option<u64>,
 ) -> Result<(), PartitionRecoveryError> {
     if partition.log.has_segments() {
         if wal_owned_messages
@@ -596,7 +600,13 @@ pub async fn ensure_initial_segment<B: MessageBus>(
     // `rposition(|s| s.start_offset <= offset)` routes every poll for `0..N-1`
     // into it, the next boot makes that shape durable, and this replica starts
     // offering peers a segment that claims `[0..N]`.
-    let start_offset = partition.mint_frontier();
+    //
+    // A WAL checkpoint cursor wins over the frontier. A reservation claim can
+    // record a frontier above the cursor, while the journal's replayed tail
+    // still starts at the cursor. When retention or `delete_segments` removed
+    // the segment that the cursor ends, a segment planted at the frontier
+    // would fail the first commit's prefix check.
+    let start_offset = wal_checkpoint_next_offset.unwrap_or_else(|| partition.mint_frontier());
     let messages_path = config.get_messages_path(stream_id, topic_id, partition_id, start_offset);
     let index_path = config.get_index_path(stream_id, topic_id, partition_id, start_offset);
     let runtime = partition.runtime_options();
