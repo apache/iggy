@@ -2518,6 +2518,10 @@ async fn given_a_shard_that_cannot_tell_when_a_sweep_runs_past_the_grace_should_
         }
         assert_eq!(owner.fresh_sweeps_settled(), 0);
         assert_eq!(fresh_objects(store), vec![object]);
+        until(&owner, |owner| {
+            owner.metrics().fresh_sweeps_held_value() == 1
+        })
+        .await;
 
         // Once it can tell, the grace starts from that sweep.
         let able = past_grace(past_grace(now));
@@ -2526,6 +2530,7 @@ async fn given_a_shard_that_cannot_tell_when_a_sweep_runs_past_the_grace_should_
         until(&owner, |owner| owner.fresh_sweeps_settled() == 1).await;
         compio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(fresh_objects(store), vec![object]);
+        assert_eq!(owner.metrics().fresh_sweeps_held_value(), 0);
     })
     .await;
 }
@@ -3007,6 +3012,10 @@ async fn given_a_placing_partition_fenced_for_a_rebuild_when_sweeps_run_past_the
         owner.plane.partitions().tombstone(namespace());
         sweep_that_cannot_settle(&owner, past_grace(now)).await;
         sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        until(&owner, |owner| {
+            owner.metrics().fresh_sweeps_held_value() == 1
+        })
+        .await;
         let kept = fresh_objects(store);
         // The pump does not stop while it holds a partition tombstoned
         // without a teardown.
@@ -3076,6 +3085,39 @@ async fn given_a_rebuilt_placing_partition_awaiting_a_state_transfer_when_sweeps
     assert_eq!(fresh_objects(store), vec![object]);
     assert_eq!(owner.metrics().fresh_objects_deleted_value(), 0);
     assert_eq!(owner.fresh_sweeps_settled(), 1);
+}
+
+/// The sweeps that a rebuilt copy holds back show in a gauge, which the
+/// first sweep that settles once the copy is back in its group clears.
+#[compio::test]
+async fn given_sweeps_held_by_a_rebuilt_placing_partition_when_its_state_transfer_ends_should_report_them_held_until_one_settles()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner_of_placing_topic(directory.path())).await;
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+    let held = |owner: &IoTestShard| owner.metrics().fresh_sweeps_held_value();
+
+    pumped(&owner, async {
+        commit_a_named_object(&owner, store, now).await;
+        assert_eq!(held(&owner), 0);
+
+        drop_for_a_rebuild(&owner).await;
+        insert_copy_awaiting_a_state_transfer(&owner).await;
+        sweep_that_cannot_settle(&owner, past_grace(now)).await;
+        until(&owner, |owner| held(owner) == 1).await;
+        sweep_that_cannot_settle(&owner, past_grace(past_grace(now))).await;
+        assert_eq!(held(&owner), 1);
+        assert_eq!(owner.fresh_sweeps_settled(), 1);
+
+        let partitions = owner.plane.partitions();
+        let consensus = partitions.get_by_ns(&namespace()).unwrap().consensus();
+        consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        sweep(&owner, past_grace(past_grace(now))).await;
+        assert_eq!(owner.fresh_sweeps_settled(), 2);
+        assert_eq!(held(&owner), 0);
+    })
+    .await;
 }
 
 /// Fence the partition for a rebuild, as a replica does when its copy
