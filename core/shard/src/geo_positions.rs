@@ -511,8 +511,10 @@ where
         )));
     }
 
-    /// Answer a round of shard 0 with the positions of the partitions here,
-    /// after the primaries here proposed to fold what their groups committed.
+    /// Answer a round of shard 0 with the positions of the partitions here.
+    /// When a primary here has commits to fold, the shard proposes the folds
+    /// first and answers once they ended, so the round stores what the
+    /// groups committed before it started.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_report_geo_positions(&self, round: u64)
     where
@@ -525,6 +527,48 @@ where
         let Some(settings) = self.geo_settings() else {
             return;
         };
+        let (reported, proposals) = self.collect_geo_positions(&settings);
+        if proposals.is_empty() {
+            self.send_geo_positions_report(round, reported);
+            return;
+        }
+        let folded = ShardFrame::lifecycle(LifecycleFrame::ReportGeoPositionsFolded { round });
+        self.propose_geo_commands(proposals, Some(folded)).await;
+    }
+
+    /// Answer a round once the folds this shard proposed for it ended.
+    pub(crate) fn on_report_geo_positions_folded(&self, round: u64)
+    where
+        M: RestorableMetadataStm,
+    {
+        let Some(settings) = self.geo_settings() else {
+            return;
+        };
+        let (reported, _) = self.collect_geo_positions(&settings);
+        self.send_geo_positions_report(round, reported);
+    }
+
+    fn send_geo_positions_report(&self, round: u64, partitions: Vec<PartitionPositions>) {
+        if let Some(sender) = self.senders.first() {
+            let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::GeoPositionsReported(
+                Box::new(GeoPositionsReport {
+                    round,
+                    shard: self.id,
+                    partitions,
+                }),
+            )));
+        }
+    }
+
+    /// The positions of every geo and shadow partition here, and the folds
+    /// that the primaries here owe.
+    fn collect_geo_positions(
+        &self,
+        settings: &GeoPositionSettings,
+    ) -> (Vec<PartitionPositions>, Vec<GeoProposal>)
+    where
+        M: RestorableMetadataStm,
+    {
         let (logs, groups) = self.plane.metadata().mux_stm.streams().read(|inner| {
             let logs = local_logs(inner, &settings.origin);
             let groups: BTreeMap<(usize, usize), Vec<LocalGroup>> = logs
@@ -542,59 +586,46 @@ where
         });
         let mut reported = Vec::new();
         let mut proposals = Vec::new();
-        {
-            let partitions = self.plane.partitions();
-            let in_flight = self.geo_positions.in_flight.borrow();
-            for local in &logs {
-                let local_groups = groups
-                    .get(&(local.stream_id, local.topic_id))
-                    .map_or(&[][..], Vec::as_slice);
-                for (partition_id, namespace, created_revision) in &local.partitions {
-                    let Some(partition) = partitions
-                        .get_by_ns(namespace)
-                        .filter(|partition| partition.created_revision() == *created_revision)
-                    else {
-                        continue;
-                    };
-                    let Some(positions) = partition.geo_positions() else {
-                        continue;
-                    };
-                    if partition.state_machines_current() && !in_flight.contains(namespace) {
-                        let notes = partition.geo_notes(local_groups);
-                        if !notes.is_empty() {
-                            proposals.push((*namespace, NOTE_GEO_POSITIONS, encode_notes(&notes)));
-                        }
+        let partitions = self.plane.partitions();
+        let in_flight = self.geo_positions.in_flight.borrow();
+        for local in &logs {
+            let local_groups = groups
+                .get(&(local.stream_id, local.topic_id))
+                .map_or(&[][..], Vec::as_slice);
+            for (partition_id, namespace, created_revision) in &local.partitions {
+                let Some(partition) = partitions
+                    .get_by_ns(namespace)
+                    .filter(|partition| partition.created_revision() == *created_revision)
+                else {
+                    continue;
+                };
+                let Some(positions) = partition.geo_positions() else {
+                    continue;
+                };
+                if partition.state_machines_current() && !in_flight.contains(namespace) {
+                    let notes = partition.geo_notes(local_groups);
+                    if !notes.is_empty() {
+                        proposals.push((*namespace, NOTE_GEO_POSITIONS, encode_notes(&notes)));
                     }
-                    let unfolded = local_groups
-                        .iter()
-                        .filter(|group| {
-                            !partition.geo_positions_folded(std::slice::from_ref(group))
-                        })
-                        .map(|group| group.name.clone())
-                        .collect();
-                    reported.push(PartitionPositions {
-                        log: local.log.clone(),
-                        partition_id: *partition_id,
-                        positions: positions
-                            .entries()
-                            .iter()
-                            .map(|(name, entry)| (name.clone(), entry.position))
-                            .collect(),
-                        unfolded,
-                    });
                 }
+                let unfolded = local_groups
+                    .iter()
+                    .filter(|group| !partition.geo_positions_folded(std::slice::from_ref(group)))
+                    .map(|group| group.name.clone())
+                    .collect();
+                reported.push(PartitionPositions {
+                    log: local.log.clone(),
+                    partition_id: *partition_id,
+                    positions: positions
+                        .entries()
+                        .iter()
+                        .map(|(name, entry)| (name.clone(), entry.position))
+                        .collect(),
+                    unfolded,
+                });
             }
         }
-        if let Some(sender) = self.senders.first() {
-            let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::GeoPositionsReported(
-                Box::new(GeoPositionsReport {
-                    round,
-                    shard: self.id,
-                    partitions: reported,
-                }),
-            )));
-        }
-        self.propose_geo_commands(proposals).await;
+        (reported, proposals)
     }
 
     /// Fold what the groups of the partition of `namespace` committed, now:
@@ -634,8 +665,11 @@ where
             partition.geo_notes(&groups)
         };
         if !notes.is_empty() {
-            self.propose_geo_commands(vec![(namespace, NOTE_GEO_POSITIONS, encode_notes(&notes))])
-                .await;
+            self.propose_geo_commands(
+                vec![(namespace, NOTE_GEO_POSITIONS, encode_notes(&notes))],
+                None,
+            )
+            .await;
         }
     }
 
@@ -733,7 +767,7 @@ where
                     .insert(found.origin.clone());
             }
         }
-        self.propose_geo_commands(proposals).await;
+        self.propose_geo_commands(proposals, None).await;
         let waiting = current
             .into_iter()
             .any(|namespace| self.geo_positions_resume_waiting(namespace));
@@ -743,21 +777,22 @@ where
     /// Propose the commands of each partition, one partition at a time, and
     /// keep each partition from another proposal, and its group polls from
     /// the end of their resume wait, until its replies come or time out.
+    ///
+    /// `then` goes to this shard's pump once every partition's replies came
+    /// or timed out, at once when there was nothing to propose.
     #[allow(clippy::future_not_send)]
-    async fn propose_geo_commands(
-        &self,
-        proposals: Vec<(
-            IggyNamespace,
-            partitions::state_machine::CommandKind,
-            Vec<Vec<u8>>,
-        )>,
-    ) where
+    async fn propose_geo_commands(&self, proposals: Vec<GeoProposal>, then: Option<ShardFrame>)
+    where
         B: Clone,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
+        let then = Rc::new(RefCell::new(then));
+        // One for this loop, released after it.
+        let remaining = Rc::new(Cell::new(1_usize));
+        let own = self.senders.get(self.id as usize).cloned();
         for (namespace, kind, payloads) in proposals {
             let requests = {
                 let partitions = self.plane.partitions();
@@ -796,6 +831,8 @@ where
             }
             let in_flight = Rc::clone(&self.geo_positions.in_flight);
             let bus = self.bus.clone();
+            remaining.set(remaining.get() + 1);
+            let (remaining, then, own) = (Rc::clone(&remaining), Rc::clone(&then), own.clone());
             // Through the bus, not the runtime directly: the simulator
             // supplies its own executor.
             self.bus.spawn(async move {
@@ -803,8 +840,10 @@ where
                     let _ = bus_timeout(&bus, COMMAND_REPLY_TIMEOUT, receiver.recv()).await;
                 }
                 in_flight.borrow_mut().remove(&namespace);
+                release(&remaining, &then, own.as_ref());
             });
         }
+        release(&remaining, &then, own.as_ref());
     }
 
     /// Take a shard's answer to a round. With the last one, store the
@@ -934,6 +973,28 @@ where
         if rerun {
             self.start_geo_positions_round(IggyTimestamp::from(self.bus.realtime_micros()));
         }
+    }
+}
+
+/// The commands of one partition: its namespace, their kind and payloads.
+type GeoProposal = (
+    IggyNamespace,
+    partitions::state_machine::CommandKind,
+    Vec<Vec<u8>>,
+);
+
+/// Count one proposal of a batch as ended, and send the batch's frame to the
+/// pump with the last one.
+fn release(
+    remaining: &Cell<usize>,
+    then: &RefCell<Option<ShardFrame>>,
+    own: Option<&TaggedSender>,
+) {
+    remaining.set(remaining.get().saturating_sub(1));
+    if remaining.get() == 0
+        && let (Some(frame), Some(sender)) = (then.borrow_mut().take(), own)
+    {
+        let _ = sender.try_send(frame);
     }
 }
 

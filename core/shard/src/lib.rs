@@ -1365,6 +1365,11 @@ pub enum LifecycleFrame {
     ReportGeoPositions {
         round: u64,
     },
+    /// The folds that a [`Self::ReportGeoPositions`] proposed ended: answer
+    /// the round with the partitions' positions now.
+    ReportGeoPositionsFolded {
+        round: u64,
+    },
     /// A shard's answer to [`Self::ReportGeoPositions`], sent to shard 0.
     GeoPositionsReported(Box<geo_positions::GeoPositionsReport>),
     /// What the store took of a round's objects, sent to shard 0 by the task

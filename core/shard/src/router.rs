@@ -1452,6 +1452,9 @@ where
             LifecycleFrame::ReportGeoPositions { round } => {
                 self.on_report_geo_positions(round).await;
             }
+            LifecycleFrame::ReportGeoPositionsFolded { round } => {
+                self.on_report_geo_positions_folded(round);
+            }
             LifecycleFrame::GeoPositionsReported(report) => {
                 self.on_geo_positions_reported(*report);
             }
