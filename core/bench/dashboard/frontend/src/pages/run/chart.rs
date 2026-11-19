@@ -26,22 +26,18 @@ use bench_dashboard_shared::series::{BenchmarkSeries, ChartSeries, SeriesMetric,
 use bench_report::add_latency_distributions;
 use bench_report::group_metrics_kind::GroupMetricsKind;
 use bench_report::plotting::chart::IggyChart;
+use charming::Chart;
 use charming::element::{AxisPointer, AxisPointerType, ItemStyle, Tooltip, Trigger};
 use charming::series::{Line, Scatter};
-use charming::theme::Theme;
-use charming::{Chart, WasmRenderer};
-use gloo::console::error;
 use uuid::Uuid;
-use web_sys::Element;
 use yew::prelude::*;
 
 use super::change::{metric_name, metric_value_text};
 use super::facts::P9999_LABEL;
 use super::history::{CURRENT_LABEL, HistoryChart, VersionPoint};
 use crate::api::fetch_benchmark_series;
-use crate::components::chart::{dispose_chart_at, reset_zoom_at};
+use crate::components::chart::{ChartCanvas, SharedChart};
 use crate::components::page::loadable;
-use crate::hooks::use_size;
 use crate::state::data::{Loadable, fetch_into};
 
 pub const LATENCY_CHART_NOTE: &str = "The average latency of the batches in each sampling window. \
@@ -61,7 +57,7 @@ const PERCENTILE_LABELS: [&str; 6] = [
     P9999_LABEL,
 ];
 const RUNS_NAME: &str = "Runs";
-const MEDIAN_NAME: &str = "Median of the version";
+pub const MEDIAN_NAME: &str = "Median of the version";
 /// The stylesheet's `--accent`, so this run stands out the way it does in the table.
 pub const CURRENT_COLOR: &str = "#ff9103";
 const RUN_SYMBOL_SIZE: f64 = 8.0;
@@ -80,6 +76,9 @@ pub struct SeriesChartProps {
 /// group in its theme color, so its actors and its average take that color too.
 const LIGHT_GROUP_COLORS: [&str; 2] = ["#5470c6", "#91cc75"];
 const DARK_GROUP_COLORS: [&str; 2] = ["#4992ff", "#7cffb2"];
+/// The stylesheet's names for the same two colors, so a card can mark the line it describes in
+/// either theme.
+pub const SERIES_COLOR_VARS: [&str; 2] = ["var(--series-1)", "var(--series-2)"];
 const ACTOR_LINE_WIDTH: f64 = 1.0;
 /// Light enough that the average stays readable over many actors, dark enough to show a peak.
 const ACTOR_LINE_OPACITY: f64 = 0.5;
@@ -225,81 +224,6 @@ pub fn percentile_chart(props: &PercentileChartProps) -> Html {
     });
     let id = format!("percentile-chart-{}", props.uuid);
     html! { <ChartCanvas {id} chart={Some((*chart).clone())} /> }
-}
-
-/// A chart that compares by its allocation, because it can hold thousands of points per line.
-/// Holding the `Rc` keeps the allocation alive, so a new chart never takes its address.
-#[derive(Clone)]
-pub struct SharedChart(Rc<Chart>);
-
-impl SharedChart {
-    pub fn new(chart: Chart) -> Self {
-        Self(Rc::new(chart))
-    }
-}
-
-impl PartialEq for SharedChart {
-    fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-#[derive(Properties, PartialEq)]
-pub struct ChartCanvasProps {
-    /// Unique on the page.
-    pub id: AttrValue,
-    /// Nothing is drawn while `None`, for example while the data loads.
-    pub chart: Option<SharedChart>,
-    /// Over the chart, for example the loading state.
-    #[prop_or_default]
-    pub children: Html,
-    /// Added to the frame, for example to change its height.
-    #[prop_or_default]
-    pub class: Classes,
-}
-
-/// Draws the chart at its frame's size and in the page's theme, and redraws on each change. A double
-/// click zooms a chart with a zoom slider out to the whole run.
-#[function_component(ChartCanvas)]
-pub fn chart_canvas(props: &ChartCanvasProps) -> Html {
-    let is_dark = use_context::<(bool, Callback<()>)>().is_some_and(|(is_dark, _)| is_dark);
-    let frame = use_node_ref();
-    let canvas = use_node_ref();
-    let size = use_size(frame.clone());
-    {
-        let (id, canvas) = (props.id.clone(), canvas.clone());
-        use_effect_with(
-            (props.chart.clone(), size, is_dark),
-            move |(chart, (width, height), is_dark)| {
-                let element = canvas.cast::<Element>();
-                if let (Some(SharedChart(chart)), Some(_)) = (chart, &element)
-                    && *width > 0
-                    && *height > 0
-                {
-                    render(&id, chart, (*width, *height), *is_dark);
-                }
-                move || {
-                    if let Some(element) = element {
-                        dispose_chart_at(&element);
-                    }
-                }
-            },
-        );
-    }
-    let ondblclick = {
-        let canvas = canvas.clone();
-        Callback::from(move |_: MouseEvent| {
-            if let Some(element) = canvas.cast::<Element>() {
-                reset_zoom_at(&element);
-            }
-        })
-    };
-    html! {
-        <div class={classes!("run-chart", props.class.clone())} ref={frame}>
-            <div id={props.id.clone()} class="run-chart-canvas" ref={canvas} {ondblclick}></div>
-            <div class="run-chart-status">{ props.children.clone() }</div>
-        </div>
-    }
 }
 
 pub const fn metric_label(metric: SeriesMetric) -> &'static str {
@@ -500,17 +424,5 @@ fn version_options(chart: &HistoryChart) -> Chart {
                 .data(vec![named(current, "")]),
         ),
         None => options,
-    }
-}
-
-fn render(canvas_id: &str, chart: &Chart, (width, height): (u32, u32), is_dark: bool) {
-    let theme = if is_dark { Theme::Dark } else { Theme::Default };
-    if let Err(render_error) = WasmRenderer::new(width, height)
-        .theme(theme)
-        .render(canvas_id, chart)
-    {
-        error!(format!(
-            "Couldn't draw the {canvas_id} chart: {render_error}"
-        ));
     }
 }

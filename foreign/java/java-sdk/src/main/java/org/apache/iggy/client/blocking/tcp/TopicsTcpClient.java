@@ -23,6 +23,8 @@ import org.apache.iggy.client.blocking.TopicsClient;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.message.HeaderValue;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicUpdate;
@@ -47,6 +49,11 @@ final class TopicsTcpClient implements TopicsClient {
     @Override
     public List<Topic> getTopics(StreamId streamId) {
         return FutureUtil.resolve(delegate.getTopics(streamId));
+    }
+
+    @Override
+    public Page<Topic> getTopicsPage(StreamId streamId, NamedPageQuery query) {
+        return FutureUtil.resolve(delegate.getTopicsPage(streamId, query));
     }
 
     @Override

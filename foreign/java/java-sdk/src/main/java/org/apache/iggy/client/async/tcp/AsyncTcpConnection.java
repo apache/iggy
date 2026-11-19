@@ -67,7 +67,6 @@ import org.slf4j.LoggerFactory;
 import javax.net.ssl.SSLException;
 import java.io.File;
 import java.time.Duration;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -375,6 +374,10 @@ public class AsyncTcpConnection {
         return consensusSession.owner();
     }
 
+    long operationDeadline() {
+        return System.nanoTime() + requestTimeoutNanos;
+    }
+
     long metadataWatermark() {
         return consensusSession.metadataWatermark();
     }
@@ -423,21 +426,6 @@ public class AsyncTcpConnection {
                     throw new IggyEmptyResponseException(commandCode.toString());
                 }
                 return func.apply(response);
-            } finally {
-                response.release();
-            }
-        });
-    }
-
-    public <T> CompletableFuture<List<T>> exchangeForList(
-            CommandCode commandCode, ByteBuf payload, Function<ByteBuf, T> func) {
-        return mapResponse(send(commandCode, payload), response -> {
-            try {
-                var result = new ArrayList<T>();
-                while (response.isReadable()) {
-                    result.add(func.apply(response));
-                }
-                return result;
             } finally {
                 response.release();
             }
@@ -511,7 +499,7 @@ public class AsyncTcpConnection {
             long requestDeadlineNanos,
             TransientFailoverState failoverState,
             long requiredSessionGeneration) {
-        long deadline = requestDeadlineNanos == 0 ? System.nanoTime() + requestTimeoutNanos : requestDeadlineNanos;
+        long deadline = requestDeadlineNanos == 0 ? operationDeadline() : requestDeadlineNanos;
         if (isLoginCode(commandCode) && authenticated) {
             return logoutThenLogin(commandCode, payload, deadline);
         }

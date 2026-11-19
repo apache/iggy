@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::args::common::ListMode;
+use crate::args::common::{ListMode, NamedPageArgs};
 use clap::{Args, Subcommand};
 use iggy::prelude::Identifier;
 
@@ -81,6 +81,7 @@ pub(crate) enum ConsumerGroupAction {
     ///  iggy consumer-group list stream 2 --list-mode table
     ///  iggy consumer-group list 3 topic -l table
     ///  iggy consumer-group list production sensor -l table
+    ///  iggy consumer-group list production sensor --desc --limit 20
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(ConsumerGroupListArgs),
 }
@@ -154,4 +155,6 @@ pub(crate) struct ConsumerGroupListArgs {
     /// List mode (table or list)
     #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
     pub(crate) list_mode: ListMode,
+    #[command(flatten)]
+    pub(crate) page: NamedPageArgs,
 }

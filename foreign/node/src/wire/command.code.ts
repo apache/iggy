@@ -67,6 +67,7 @@ export const COMMAND_CODE = {
   // 304 is retired and must never be reused.
   CreatePartitions: 402,
   DeletePartitions: 403,
+  GetPartitions: 404,
   DeleteSegments: 503,
   GetGroup: 600,
   GetGroups: 601,

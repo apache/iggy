@@ -16,6 +16,7 @@
 // under the License.
 
 use super::{BenchmarkCache, Runs, SeriesCache};
+use crate::embed_cache::FileStamp;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use std::path::PathBuf;
@@ -24,21 +25,32 @@ use uuid::Uuid;
 
 impl BenchmarkCache {
     pub fn get_benchmark_json_path(&self, uuid: &Uuid) -> Option<PathBuf> {
-        self.runs().reports.get(uuid).map(|(_, path)| path.clone())
+        self.runs()
+            .reports
+            .get(uuid)
+            .map(|loaded| loaded.path.clone())
+    }
+
+    /// The report file of a run, with the stamp of the bytes that the last load read from it.
+    pub fn get_report_file(&self, uuid: &Uuid) -> Option<(PathBuf, FileStamp)> {
+        self.runs()
+            .reports
+            .get(uuid)
+            .map(|loaded| (loaded.path.clone(), loaded.stamp))
     }
 
     pub fn get_benchmark_path(&self, uuid: &Uuid) -> Option<PathBuf> {
         self.runs()
             .reports
             .get(uuid)
-            .map(|(_, path)| path.parent().unwrap().to_path_buf())
+            .map(|loaded| loaded.path.parent().unwrap().to_path_buf())
     }
 
     pub fn get_benchmark_report_light(&self, uuid: &Uuid) -> Option<BenchmarkReportLight> {
         self.runs()
             .reports
             .get(uuid)
-            .map(|(report, _)| report.clone())
+            .map(|loaded| loaded.report.clone())
     }
 
     pub fn get_summaries(&self) -> Arc<Vec<BenchmarkSummary>> {

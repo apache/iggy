@@ -44,6 +44,49 @@ pub fn page_shell(scroll_ref: &NodeRef, content: Html) -> Html {
 /// `above` comes before the eyebrow, for example breadcrumbs. `aside` sits next to the text on
 /// a wide screen and below it on a narrow one.
 pub fn page_head(above: Html, eyebrow: Option<&str>, title: &str, lead: &str, aside: Html) -> Html {
+    page_head_with_banner(above, eyebrow, title, lead, Html::default(), aside)
+}
+
+/// [`page_head`] with `banner` below the lead, for example the framework banner of an OMB page.
+pub fn page_head_with_banner(
+    above: Html,
+    eyebrow: Option<&str>,
+    title: &str,
+    lead: &str,
+    banner: Html,
+    aside: Html,
+) -> Html {
+    let title = html! { <h1 class="page-title">{ title.to_owned() }</h1> };
+    head_layout(above, eyebrow, title, lead, banner, aside)
+}
+
+/// [`page_head`] with `tag` next to the title, for example what the version in the title is. The
+/// tag stays out of the heading, so the heading reads as the title alone.
+pub fn page_head_with_title_tag(eyebrow: Option<&str>, title: &str, tag: &str, lead: &str) -> Html {
+    let title = html! {
+        <div class="page-title-row">
+            <h1 class="page-title">{ title.to_owned() }</h1>
+            <span class="page-title-tag">{ tag.to_owned() }</span>
+        </div>
+    };
+    head_layout(
+        Html::default(),
+        eyebrow,
+        title,
+        lead,
+        Html::default(),
+        Html::default(),
+    )
+}
+
+fn head_layout(
+    above: Html,
+    eyebrow: Option<&str>,
+    title: Html,
+    lead: &str,
+    banner: Html,
+    aside: Html,
+) -> Html {
     html! {
         <header class="page-head">
             <div class="page-container page-head-layout">
@@ -52,8 +95,9 @@ pub fn page_head(above: Html, eyebrow: Option<&str>, title: &str, lead: &str, as
                     if let Some(eyebrow) = eyebrow {
                         <p class="eyebrow">{ eyebrow.to_owned() }</p>
                     }
-                    <h1 class="page-title">{ title.to_owned() }</h1>
+                    { title }
                     <p class="page-lead">{ lead.to_owned() }</p>
+                    { banner }
                 </div>
                 { aside }
             </div>

@@ -58,8 +58,7 @@ pub struct GroupMetrics {
     pub p95_latency_ms: f64,
     pub p99_latency_ms: f64,
     pub p999_latency_ms: f64,
-    /// (max - min) / mean of the actor run times. Actors without a run time are left out, as in
-    /// the cloud-bench suite summary.
+    /// (max - min) / mean of the actor run times. Actors without a run time are left out.
     pub time_spread_pct: f64,
 }
 
@@ -187,7 +186,7 @@ impl fmt::Display for Badge {
 }
 
 /// The actors that `iggy-bench` puts into a group of the report.
-const fn is_member(group: GroupMetricsKind, actor: ActorKind) -> bool {
+pub(crate) const fn is_member(group: GroupMetricsKind, actor: ActorKind) -> bool {
     match group {
         GroupMetricsKind::Producers => matches!(actor, ActorKind::Producer),
         GroupMetricsKind::Consumers => matches!(actor, ActorKind::Consumer),

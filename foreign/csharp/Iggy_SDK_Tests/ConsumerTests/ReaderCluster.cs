@@ -102,6 +102,11 @@ internal sealed class ReaderCluster : IDisposable
     internal ulong Limit { get; set; } = 2;
 
     /// <summary>
+    ///     Custom records for fetches only. Must return <see cref="GOLDEN_BATCH_MESSAGES" /> messages from the given offset.
+    /// </summary>
+    internal Func<ulong, byte[]>? FetchRecords { get; init; }
+
+    /// <summary>
     ///     The owner generation of every partition. A read or an offset write that names another one is refused as not
     ///     owned.
     /// </summary>
@@ -569,6 +574,10 @@ internal sealed class ReaderCluster : IDisposable
             served = true;
             held += GOLDEN_BATCH_MESSAGES;
             var section = GoldenSection(partition, start, ReadContext);
+            if (FetchRecords is { } records)
+            {
+                section = section with { Records = records(start) };
+            }
             section = ReportsHead ? section with { CurrentOffset = Limit - 1 } : section;
             sections.Add(Undecodable.Contains(start) ? section with { Records = [] } : section);
             if (fetch.AutoCommit)

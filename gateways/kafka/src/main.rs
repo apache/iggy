@@ -231,6 +231,7 @@ const KNOWN_KAFKA_ENV_VARS: &[&str] = &[
     "IGGY_KAFKA_BROKERS",
     "IGGY_KAFKA_COORDINATOR_LOG",
     "IGGY_KAFKA_OFFSETS_RETENTION_MINUTES",
+    "IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS",
     "IGGY_KAFKA_SASL_ENABLED",
     "IGGY_KAFKA_PRE_AUTH_TIMEOUT_SECS",
     "IGGY_KAFKA_MAX_CONCURRENT_AUTHENTICATIONS",
@@ -434,6 +435,13 @@ fn load_config() -> Result<GatewayConfig, String> {
     if let Some(raw) = env_var("IGGY_KAFKA_OFFSETS_RETENTION_MINUTES") {
         config.coordination.offsets_retention =
             Some(load_offsets_retention(&raw, config.coordinator_log)?);
+    }
+    // Not `parse_positive`: 0 is valid, as in Kafka, and completes the first join at once.
+    if let Some(raw) = env_var("IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS") {
+        let millis: u64 = raw.parse().map_err(|e| {
+            format!("invalid IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS `{raw}`: {e}")
+        })?;
+        config.group.initial_rebalance_delay = Duration::from_millis(millis);
     }
     config.auto_topic_creation = load_auto_topic_creation(bridge_enabled()?)?;
     if config.auto_topic_creation.enabled {
@@ -1141,6 +1149,49 @@ mod tests {
                 .err()
                 .unwrap_or_else(|| panic!("{vars:?} must be refused"));
             assert!(error.contains(named), "{vars:?}: {error}");
+        }
+    }
+
+    /// `0` must load: Kafka allows `group.initial.rebalance.delay.ms=0`, and the shared
+    /// `parse_positive` would refuse it.
+    #[test]
+    #[serial]
+    fn given_an_initial_rebalance_delay_when_loading_config_should_accept_zero_and_millis() {
+        let zero = load_with(&[("IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "0")])
+            .expect("delay 0 must load");
+        let short = load_with(&[("IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", "300")])
+            .expect("delay 300 must load");
+        let unset = load_with(&[]).expect("no delay var must load");
+
+        assert_eq!(zero.group.initial_rebalance_delay, Duration::ZERO);
+        assert_eq!(
+            short.group.initial_rebalance_delay,
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            unset.group.initial_rebalance_delay,
+            Duration::from_secs(3),
+            "the default stays Kafka's 3 s"
+        );
+    }
+
+    /// The variable is in milliseconds, so a unit suffix, a fraction or a negative delay must
+    /// fail startup naming the variable and the value, like the other `IGGY_KAFKA_*` variables.
+    #[test]
+    #[serial]
+    fn given_an_invalid_initial_rebalance_delay_when_loading_config_should_refuse_and_name_it() {
+        for raw in ["soon", "3s", "0.5", "-1", ""] {
+            let error = load_with(&[("IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS", raw)])
+                .err()
+                .unwrap_or_else(|| panic!("delay `{raw}` must be refused"));
+            assert!(
+                error.contains("IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS"),
+                "`{raw}` rejection must name the variable, got: {error}"
+            );
+            assert!(
+                error.contains(raw),
+                "`{raw}` rejection must quote the offending value, got: {error}"
+            );
         }
     }
 

@@ -82,10 +82,25 @@ impl Default for ClusterConfig {
         ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            heartbeat_timeout: SERVER_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
-            commit_broadcast_interval: SERVER_CONFIG
+            commit_heartbeat_grid: SERVER_CONFIG.cluster.commit_heartbeat_grid.parse().unwrap(),
+            commit_busy_heartbeat_interval: SERVER_CONFIG
                 .cluster
-                .commit_broadcast_interval
+                .commit_busy_heartbeat_interval
+                .parse()
+                .unwrap(),
+            commit_busy_heartbeat_timeout: SERVER_CONFIG
+                .cluster
+                .commit_busy_heartbeat_timeout
+                .parse()
+                .unwrap(),
+            commit_idle_heartbeat_interval: SERVER_CONFIG
+                .cluster
+                .commit_idle_heartbeat_interval
+                .parse()
+                .unwrap(),
+            commit_idle_heartbeat_timeout: SERVER_CONFIG
+                .cluster
+                .commit_idle_heartbeat_timeout
                 .parse()
                 .unwrap(),
             prepare_retransmit_interval: SERVER_CONFIG
@@ -229,6 +244,22 @@ impl Default for PartitionConfig {
                 .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
+            journal_memory_node_bytes_max: partition
+                .journal_memory_node_bytes_max
+                .parse()
+                .expect("embedded node-wide repair ring budget is valid"),
+            checkpoint_idle_delay: partition
+                .checkpoint_idle_delay
+                .parse()
+                .expect("embedded checkpoint idle delay is valid"),
+            checkpoint_max_delay: partition
+                .checkpoint_max_delay
+                .parse()
+                .expect("embedded checkpoint max delay is valid"),
+            wal_reload_node_bytes_max: partition
+                .wal_reload_node_bytes_max
+                .parse()
+                .expect("embedded node-wide WAL reload budget is valid"),
             transfer_served_cache_bytes_max: partition
                 .transfer_served_cache_bytes_max
                 .parse()

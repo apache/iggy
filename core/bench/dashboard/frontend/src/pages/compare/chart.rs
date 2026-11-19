@@ -25,8 +25,9 @@ use yew::prelude::*;
 
 use super::holds_every;
 use crate::api::fetch_benchmark_series;
+use crate::components::chart::{ChartCanvas, SharedChart};
 use crate::components::page::loadable;
-use crate::pages::run::chart::{ChartCanvas, LINE_OPACITY, SharedChart, metric_label};
+use crate::pages::run::chart::{LINE_OPACITY, metric_label};
 use crate::state::data::{Loadable, fetch_into};
 
 const NO_POINTS_NOTE: &str = "The reports for these runs have no time series.";

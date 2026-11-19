@@ -31,6 +31,7 @@ use std::collections::HashMap;
 use std::ops::RangeInclusive;
 #[cfg(test)]
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 /// Fixed synthetic epoch for [`SimClock`]: 2026-01-01T00:00:00Z in micros.
 ///
@@ -594,6 +595,11 @@ pub struct SimSuperblock {
     /// interleave with a persist and every schedule-sensitive bug behind one is
     /// invisible to the simulator. The yield restores the window.
     yield_writes: Cell<bool>,
+    /// Fault injection: when set, every [`SuperblockStore::write`] completes
+    /// that long after it starts, on the virtual clock. A store behind a busy
+    /// disk answers late while its replica keeps ticking, and the default write
+    /// hides every timeout that runs out in that wait.
+    write_delay: RefCell<Option<(TimerHandle, Duration)>>,
 }
 
 impl SimSuperblock {
@@ -615,6 +621,12 @@ impl SimSuperblock {
     pub fn set_yield_writes(&self) {
         self.yield_writes.set(true);
     }
+
+    /// Make every subsequent write take `delay` on the clock of `timer`. See
+    /// `Self::write_delay`.
+    pub fn set_write_delay(&self, timer: TimerHandle, delay: Duration) {
+        *self.write_delay.borrow_mut() = Some((timer, delay));
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -625,6 +637,10 @@ impl SuperblockStore for SimSuperblock {
         }
         if self.yield_writes.get() {
             yield_once().await;
+        }
+        let delay = self.write_delay.borrow().clone();
+        if let Some((timer, delay)) = delay {
+            timer.sleep(delay).await;
         }
         *self.latest.borrow_mut() = Some(payload.to_vec());
         Ok(())

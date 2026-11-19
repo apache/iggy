@@ -69,12 +69,13 @@ FROM debian:trixie-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies. The PNG renderer draws text only with a system font.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     openssl \
     curl \
     libssl3 \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the built binary and frontend files
@@ -84,19 +85,20 @@ COPY core/bench/dashboard/dashboard.toml /app/
 COPY --from=builder /usr/src/iggy-bench-dashboard/LICENSE-binary /usr/share/doc/iggy-bench-dashboard/LICENSE-binary
 COPY LICENSE NOTICE /usr/share/doc/iggy-bench-dashboard/
 
-# Create data directory and non-root user
+# Create data directories and non-root user
 RUN groupadd -r iggy && \
     useradd -r -g iggy -s /bin/false iggy && \
-    mkdir -p /data/performance_results && \
+    mkdir -p /data/performance_results /data/omb_results && \
     chown -R iggy:iggy /app /data && \
-    chmod -R 755 /data/performance_results
+    chmod -R 755 /data/performance_results /data/omb_results
 
 # Copy the entrypoint script
 COPY core/bench/dashboard/server/docker-entrypoint.sh /app/
 RUN chmod +x /app/docker-entrypoint.sh && \
     chown iggy:iggy /app/docker-entrypoint.sh
 
-# Set default environment variables for configuration
+# Set default environment variables for configuration. OMB_RESULTS_DIR has no default: set it,
+# for example to /data/omb_results, to show OpenMessaging Benchmark (OMB) results.
 ENV HOST=0.0.0.0 \
     PORT=80 \
     RESULTS_DIR=/data/performance_results \

@@ -41,3 +41,8 @@ pub const CONSUMER_SESSION_REPORT_TIMEOUT: std::time::Duration =
 
 pub const MIN_CONSUMER_SESSION_HEARTBEAT_SIZE: usize =
     iggy_binary_protocol::HEADER_SIZE + iggy_binary_protocol::ConsumerSession::ENCODED_SIZE;
+
+/// The smallest frame that holds one `Commit` batch entry. A `CommitReply`
+/// entry is smaller, so this frame also holds one reply.
+pub const MIN_COMMIT_BATCH_FRAME_SIZE: usize =
+    iggy_binary_protocol::HEADER_SIZE + size_of::<iggy_binary_protocol::CommitEntry>();

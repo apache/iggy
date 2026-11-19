@@ -18,7 +18,7 @@
 //! The facts that a run's page lists: its conditions, command, parameters, options, environment and
 //! latency percentiles, as text built from the typed fields of the summary and the report.
 
-use std::{fmt, iter};
+use std::iter;
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::delta::Metric;
@@ -34,6 +34,7 @@ use bench_report::server_stats::BenchmarkServerStats;
 use bench_report::transport::BenchmarkTransport;
 
 use super::change::metric_name;
+use crate::components::ladder::log_bar_pcts;
 use crate::components::run_labels::{
     CONDITION_SEPARATOR, DayLabel, MachineName, batch_size_text, data_volume_text, durability_text,
     memory_text, message_size_text, milliseconds, nodes_text, numeric_text, rate_limit_text,
@@ -68,9 +69,6 @@ pub const MIN_LABEL: &str = "Min";
 pub const MAX_LABEL: &str = "Max";
 pub const AVERAGE_LABEL: &str = "Average";
 pub const P9999_LABEL: &str = "P99.99";
-/// The ladder's shortest bar, so the smallest value stays visible.
-const MIN_BAR_PCT: f64 = 4.0;
-const FULL_BAR_PCT: f64 = 100.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Fact {
@@ -201,23 +199,17 @@ pub fn option_groups(params: &BenchmarkParams) -> Vec<FactGroup> {
         ],
     }];
     if let Some(consumer) = &options.consumer {
-        let mut facts = vec![
-            fact(
-                "Offset durability",
-                durability_text(consumer.consumer_offset_durability),
-            ),
-            fact("Max wait", duration_text(consumer.max_wait_us)),
-            fact("Min count", group_digits(consumer.min_count.into())),
-            fact("Max bytes", max_bytes_text(consumer.max_bytes)),
-        ];
-        facts.extend(
-            consumer
-                .read_amplification
-                .map(|factor| fact("Read amplification", amplification_text(factor))),
-        );
         groups.push(FactGroup {
             title: "Consumer",
-            facts,
+            facts: vec![
+                fact(
+                    "Offset durability",
+                    durability_text(consumer.consumer_offset_durability),
+                ),
+                fact("Max wait", duration_text(consumer.max_wait_us)),
+                fact("Min count", group_digits(consumer.min_count.into())),
+                fact("Max bytes", max_bytes_text(consumer.max_bytes)),
+            ],
         });
     }
     groups.push(FactGroup {
@@ -309,9 +301,6 @@ pub fn field_value(field: WorkloadField, key: &WorkloadKey) -> FieldValue {
             size: options.max_bytes.map(u64::from),
             text: max_bytes_text(options.max_bytes),
         }),
-        WorkloadField::ReadAmplification => poll
-            .and_then(|options| options.read_amplification.as_deref())
-            .map_or_else(not_polled, |factor| word(&amplification_text(factor))),
         WorkloadField::WarmupTime => amount(
             key.client.warmup_time_us,
             duration_text(key.client.warmup_time_us),
@@ -486,22 +475,15 @@ pub fn ladder(group: &BenchmarkGroupMetricsSummary) -> Vec<LadderRow> {
         ])
         .filter(|&(_, value_ms, metric)| metric.is_some() || is_recorded(value_ms))
         .collect();
-    let positive = || rungs.iter().map(|rung| rung.1).filter(|value| *value > 0.0);
-    let lowest = positive().fold(f64::INFINITY, f64::min);
-    let span = (positive().fold(0.0, f64::max) / lowest).ln();
+    let bars = log_bar_pcts(&rungs.iter().map(|rung| rung.1).collect::<Vec<_>>());
     rungs
         .iter()
-        .map(|&(label, value_ms, metric)| LadderRow {
+        .zip(bars)
+        .map(|(&(label, value_ms, metric), bar_pct)| LadderRow {
             label,
             value_ms,
             metric,
-            bar_pct: if value_ms <= 0.0 {
-                MIN_BAR_PCT
-            } else if span > 0.0 {
-                MIN_BAR_PCT + (FULL_BAR_PCT - MIN_BAR_PCT) * (value_ms / lowest).ln() / span
-            } else {
-                FULL_BAR_PCT
-            },
+            bar_pct,
         })
         .collect()
 }
@@ -613,11 +595,6 @@ fn max_bytes_text(bytes: Option<u32>) -> String {
     )
 }
 
-/// The report holds the factor as a number and the workload key as its exact text.
-fn amplification_text(factor: impl fmt::Display) -> String {
-    format!("{factor}x")
-}
-
 const fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
@@ -625,6 +602,7 @@ const fn yes_no(value: bool) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::ladder::{FULL_BAR_PCT, MIN_BAR_PCT};
     use crate::test_support::{
         RELEASE, consumer, group_summary, params, producer, rate_limited, run, summarize,
     };

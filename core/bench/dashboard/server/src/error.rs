@@ -17,6 +17,8 @@
 
 use actix_web::{HttpResponse, ResponseError};
 use bench_dashboard_shared::config::ConfigError;
+use bench_dashboard_shared::embed::{UnknownChartType, UnknownPngSize};
+use bench_dashboard_shared::omb::id::OmbRunIdError;
 use serde_json::json;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -33,6 +35,8 @@ pub enum IggyBenchDashboardServerError {
     InvalidJson(String),
     #[error("Invalid UUID format: {0}")]
     InvalidUuid(String),
+    #[error("Invalid OMB run id '{text}': {source}")]
+    InvalidOmbRunId { text: String, source: OmbRunIdError },
     #[error("Bad request: {0}")]
     BadRequest(String),
     #[error("Internal error: {0}")]
@@ -51,6 +55,18 @@ pub enum IggyBenchDashboardServerError {
     ConfigInvalid { path: PathBuf, source: ConfigError },
 }
 
+impl From<UnknownChartType> for IggyBenchDashboardServerError {
+    fn from(error: UnknownChartType) -> Self {
+        Self::BadRequest(error.to_string())
+    }
+}
+
+impl From<UnknownPngSize> for IggyBenchDashboardServerError {
+    fn from(error: UnknownPngSize) -> Self {
+        Self::BadRequest(error.to_string())
+    }
+}
+
 impl ResponseError for IggyBenchDashboardServerError {
     fn error_response(&self) -> HttpResponse {
         match self {
@@ -60,6 +76,9 @@ impl ResponseError for IggyBenchDashboardServerError {
             IggyBenchDashboardServerError::InvalidUuid(msg)
             | IggyBenchDashboardServerError::BadRequest(msg) => {
                 HttpResponse::BadRequest().json(json!({ "error": msg }))
+            }
+            IggyBenchDashboardServerError::InvalidOmbRunId { .. } => {
+                HttpResponse::BadRequest().json(json!({ "error": self.to_string() }))
             }
             _ => HttpResponse::InternalServerError().json(json!({ "error": self.to_string() })),
         }

@@ -15,12 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::embed_cache::DEFAULT_MAX_GIB;
 use crate::error::IggyBenchDashboardServerError;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use serde::Deserialize;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use thiserror::Error;
 
 const CACHE_DIR_NAME: &str = "iggy-bench-dashboard";
 
@@ -47,13 +49,74 @@ pub struct IggyBenchDashboardServerArgs {
     #[arg(long, default_value = "*")]
     pub cors_origins: String,
 
-    /// Directory for cached PNG files and artifact zips
+    /// Directory for cached PNG files, embed pages and artifact zips
     #[arg(long, default_value_os_t = default_cache_dir())]
     pub cache_dir: PathBuf,
+
+    /// Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the
+    /// files that readers used least recently
+    #[arg(
+        long,
+        value_name = "GIB",
+        default_value_t = DEFAULT_MAX_GIB,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub embed_cache_max_gib: u64,
 
     /// Dashboard configuration file: official suites, headline workloads, and thresholds
     #[arg(long, default_value = "dashboard.toml")]
     pub config: PathBuf,
+
+    /// Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
+    #[arg(long, value_name = "DIR")]
+    pub omb_results_dir: Option<PathBuf>,
+}
+
+/// An `--omb-results-dir` that the server can't use.
+#[derive(Debug, Error)]
+enum OmbResultsDirError {
+    #[error("OMB results directory does not exist: {}", .0.display())]
+    Missing(PathBuf),
+    #[error("OMB results path is not a directory: {}", .0.display())]
+    NotDirectory(PathBuf),
+    #[error("Can't resolve '{}': {source}", path.display())]
+    Resolve { path: PathBuf, source: io::Error },
+    #[error(
+        "--omb-results-dir '{}' is the same directory as --results-dir. Put the OMB results in \
+         their own directory",
+        .0.display()
+    )]
+    SameAsResults(PathBuf),
+    #[error(
+        "--omb-results-dir '{}' is inside --results-dir '{}'. Put the OMB results outside the \
+         results directory, so that each directory holds the runs of one framework",
+        omb_results_dir.display(),
+        results_dir.display()
+    )]
+    InsideResults {
+        omb_results_dir: PathBuf,
+        results_dir: PathBuf,
+    },
+    #[error(
+        "--results-dir '{}' is inside --omb-results-dir '{}'. Put the results directory outside \
+         the OMB results directory, so that each directory holds the runs of one framework",
+        results_dir.display(),
+        omb_results_dir.display()
+    )]
+    HoldsResults {
+        omb_results_dir: PathBuf,
+        results_dir: PathBuf,
+    },
+    #[error(
+        "--cache-dir '{}' is inside --omb-results-dir '{}'. Use a cache directory outside the \
+         OMB results directory, because the server must not write into it",
+        cache_dir.display(),
+        omb_results_dir.display()
+    )]
+    HoldsCache {
+        omb_results_dir: PathBuf,
+        cache_dir: PathBuf,
+    },
 }
 
 impl IggyBenchDashboardServerArgs {
@@ -82,6 +145,14 @@ impl IggyBenchDashboardServerArgs {
                 ),
             )
             .exit();
+        }
+        // Before the cache dir exists, so a rejected cache dir never adds a directory to the
+        // OMB results.
+        if let Some(omb_results_dir) = &self.omb_results_dir
+            && let Err(e) =
+                check_omb_results_dir(omb_results_dir, &self.results_dir, &self.cache_dir)
+        {
+            cmd.error(ErrorKind::InvalidValue, e.to_string()).exit();
         }
         if let Err(e) = prepare_cache_dir(&self.results_dir, &self.cache_dir) {
             cmd.error(ErrorKind::InvalidValue, e.to_string()).exit();
@@ -124,6 +195,58 @@ fn prepare_cache_dir(
         )));
     }
     fs::create_dir_all(cache_dir).map_err(|e| path_error(e, "create", cache_dir))?;
+    Ok(())
+}
+
+/// Checks that `omb_results_dir` is a directory of its own: not `results_dir`, not inside it, and
+/// not around it. The loaders read one run per direct subdirectory, so nested directories would
+/// mix the runs of both. It also checks that `cache_dir` is outside it.
+fn check_omb_results_dir(
+    omb_results_dir: &Path,
+    results_dir: &Path,
+    cache_dir: &Path,
+) -> Result<(), OmbResultsDirError> {
+    if !omb_results_dir.exists() {
+        return Err(OmbResultsDirError::Missing(omb_results_dir.to_path_buf()));
+    }
+    if !omb_results_dir.is_dir() {
+        return Err(OmbResultsDirError::NotDirectory(
+            omb_results_dir.to_path_buf(),
+        ));
+    }
+    let resolve_error = |path: &Path| {
+        let path = path.to_path_buf();
+        move |source| OmbResultsDirError::Resolve { path, source }
+    };
+    let omb_results_dir = omb_results_dir
+        .canonicalize()
+        .map_err(resolve_error(omb_results_dir))?;
+    let results_dir = results_dir
+        .canonicalize()
+        .map_err(resolve_error(results_dir))?;
+    let cache_dir = resolve_path(cache_dir).map_err(resolve_error(cache_dir))?;
+
+    if omb_results_dir == results_dir {
+        return Err(OmbResultsDirError::SameAsResults(omb_results_dir));
+    }
+    if omb_results_dir.starts_with(&results_dir) {
+        return Err(OmbResultsDirError::InsideResults {
+            omb_results_dir,
+            results_dir,
+        });
+    }
+    if results_dir.starts_with(&omb_results_dir) {
+        return Err(OmbResultsDirError::HoldsResults {
+            omb_results_dir,
+            results_dir,
+        });
+    }
+    if cache_dir.starts_with(&omb_results_dir) {
+        return Err(OmbResultsDirError::HoldsCache {
+            omb_results_dir,
+            cache_dir,
+        });
+    }
     Ok(())
 }
 
@@ -227,5 +350,143 @@ mod tests {
         assert!(is_inside_results_error(&result), "got {result:?}");
         assert!(!results_dir.join("cache").exists());
         assert!(!root.path().join("missing").exists());
+    }
+
+    /// A root with `results`, `omb` and the `cache` path, which doesn't exist yet.
+    struct OmbDirs {
+        root: TempDir,
+        results_dir: PathBuf,
+        omb_results_dir: PathBuf,
+        cache_dir: PathBuf,
+    }
+
+    fn omb_dirs() -> OmbDirs {
+        let (root, results_dir) = temp_results_dir();
+        let omb_results_dir = root.path().join("omb");
+        fs::create_dir(&omb_results_dir).expect("create OMB results dir");
+        let cache_dir = root.path().join("cache");
+        OmbDirs {
+            root,
+            results_dir,
+            omb_results_dir,
+            cache_dir,
+        }
+    }
+
+    #[test]
+    fn given_separate_omb_results_dir_when_checking_should_accept_it() {
+        let dirs = omb_dirs();
+
+        let result =
+            check_omb_results_dir(&dirs.omb_results_dir, &dirs.results_dir, &dirs.cache_dir);
+
+        assert!(result.is_ok(), "got {result:?}");
+    }
+
+    #[test]
+    fn given_missing_omb_results_dir_when_checking_should_fail() {
+        let dirs = omb_dirs();
+        let missing = dirs.root.path().join("missing");
+
+        let result = check_omb_results_dir(&missing, &dirs.results_dir, &dirs.cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::Missing(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_omb_results_path_that_is_a_file_when_checking_should_fail() {
+        let dirs = omb_dirs();
+        let file = dirs.root.path().join("omb.json");
+        fs::write(&file, "{}").expect("write file");
+
+        let result = check_omb_results_dir(&file, &dirs.results_dir, &dirs.cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::NotDirectory(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_omb_results_dir_equal_to_results_dir_when_checking_should_fail() {
+        let dirs = omb_dirs();
+        // The same directory, written another way.
+        let same = dirs.root.path().join("omb").join("..").join("results");
+
+        let result = check_omb_results_dir(&same, &dirs.results_dir, &dirs.cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::SameAsResults(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn given_symlink_to_results_dir_as_omb_results_dir_when_checking_should_fail() {
+        let dirs = omb_dirs();
+        let link = dirs.root.path().join("link");
+        std::os::unix::fs::symlink(&dirs.results_dir, &link).expect("create symlink");
+
+        let result = check_omb_results_dir(&link, &dirs.results_dir, &dirs.cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::SameAsResults(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_omb_results_dir_inside_results_dir_when_checking_should_fail() {
+        let dirs = omb_dirs();
+        let inside = dirs.results_dir.join("omb");
+        fs::create_dir(&inside).expect("create OMB results dir");
+
+        let result = check_omb_results_dir(&inside, &dirs.results_dir, &dirs.cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::InsideResults { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_results_dir_inside_omb_results_dir_when_checking_should_fail() {
+        let dirs = omb_dirs();
+        let inside = dirs.omb_results_dir.join("results");
+        fs::create_dir(&inside).expect("create results dir");
+
+        let result = check_omb_results_dir(&dirs.omb_results_dir, &inside, &dirs.cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::HoldsResults { .. })),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn given_cache_dir_inside_omb_results_dir_when_checking_should_fail_without_creating_it() {
+        let dirs = omb_dirs();
+        let cache_dir = dirs.omb_results_dir.join("cache");
+
+        let result = check_omb_results_dir(&dirs.omb_results_dir, &dirs.results_dir, &cache_dir);
+
+        assert!(
+            matches!(result, Err(OmbResultsDirError::HoldsCache { .. })),
+            "got {result:?}"
+        );
+        assert!(!cache_dir.exists());
+    }
+
+    #[test]
+    fn given_omb_results_dir_option_when_parsing_should_be_optional() {
+        let without = IggyBenchDashboardServerArgs::parse_from(["server"]);
+        let with = IggyBenchDashboardServerArgs::parse_from(["server", "--omb-results-dir", "omb"]);
+
+        assert_eq!(without.omb_results_dir, None);
+        assert_eq!(with.omb_results_dir, Some(PathBuf::from("omb")));
     }
 }
