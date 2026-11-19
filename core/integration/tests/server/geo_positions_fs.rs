@@ -19,7 +19,7 @@
 //! `dc-b`. The group reads the geo topic of `dc-a` there, and the shadow of
 //! that topic in `dc-b`. Its positions travel through the buckets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use iggy::prelude::*;
@@ -42,6 +42,82 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// reach the other cluster.
 const DEADLINE: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_millis(50);
+
+#[tokio::test]
+async fn given_a_group_committing_on_partitions_led_by_different_nodes_when_its_datacenter_is_killed_should_resume_each_partition_on_the_exact_next_message()
+ {
+    let mut pair = started_pair(NODES).await;
+    let ids = create_and_follow(&pair, PARTITIONS).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    for partition in 0..PARTITIONS {
+        send(&client_a, partition, 0..100).await;
+        wait_until_shadow_serves(&client_b, ids, partition, 100).await;
+    }
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    let consumed: BTreeMap<u32, u64> = (0..PARTITIONS)
+        .map(|partition| (partition, 30 + 7 * u64::from(partition)))
+        .collect();
+
+    for (partition, count) in &consumed {
+        let group = group_a.on(*partition);
+        let mut read = Vec::new();
+        while (read.len() as u64) < *count {
+            let left = u32::try_from(count - read.len() as u64).unwrap_or(u32::MAX);
+            let polled = group.poll_manual(&client_a, left.min(10)).await;
+            let Some(last) = polled.last().copied() else {
+                sleep(RETRY).await;
+                continue;
+            };
+            read.extend(polled);
+            group.commit(&client_a, last).await;
+            assert_eq!(
+                bucket_offset(pair.a(), *partition).await,
+                Some(last),
+                "the bucket holds a commit of partition {partition} once it is acknowledged"
+            );
+        }
+        assert_eq!(read, (0..*count).collect::<Vec<_>>());
+    }
+    let objects = pair
+        .a()
+        .bucket()
+        .positions_objects()
+        .await
+        .expect("dc-a's bucket reads");
+    let publishers: BTreeSet<u8> = objects.iter().map(|object| object.key.replica).collect();
+    assert!(
+        publishers.len() > 1,
+        "the leaders of the partitions spread over the nodes: {objects:?}"
+    );
+    for object in &objects {
+        assert!(
+            object.partitions.len() < PARTITIONS as usize,
+            "node {} publishes partitions it does not lead: {object:?}",
+            object.key.replica
+        );
+    }
+
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after the last commit");
+    for (partition, count) in &consumed {
+        group_b
+            .on(*partition)
+            .wait_for_offset(&client_b, Some(count - 1))
+            .await;
+    }
+    let group_b = group_b.joined(&client_b).await;
+    for (partition, count) in &consumed {
+        assert_eq!(
+            group_b.on(*partition).consume(&client_b, 10).await,
+            (*count..count + 10).collect::<Vec<_>>(),
+            "the group resumes partition {partition} on the next message"
+        );
+    }
+}
 
 #[tokio::test]
 async fn given_a_partition_whose_leader_fails_when_another_node_takes_it_over_should_publish_the_position_it_had()
@@ -129,7 +205,7 @@ async fn given_a_group_that_moved_back_in_one_datacenter_when_the_other_holds_a_
 }
 
 #[tokio::test]
-async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_should_resume_in_the_other_skipping_none_and_rereading_at_most_two_intervals()
+async fn given_a_group_committing_on_read_when_its_datacenter_fails_should_resume_in_the_other_skipping_none_and_rereading_at_most_two_intervals()
  {
     const MESSAGES: u64 = 600;
     const PACE: Duration = Duration::from_millis(20);
@@ -188,6 +264,104 @@ async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_sh
     eprintln!(
         "dc-a consumed through {last}; dc-b resumed at {first}, re-reading {} messages",
         reread.len()
+    );
+}
+
+#[tokio::test]
+async fn given_a_group_committing_its_offsets_when_its_datacenter_is_killed_right_after_an_acknowledged_commit_should_resume_in_the_other_on_the_exact_next_message()
+ {
+    const MESSAGES: u64 = 600;
+    const PACE: Duration = Duration::from_millis(20);
+    const CONSUME_FOR: Duration = Duration::from_secs(4);
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..MESSAGES).await;
+    wait_until_shadow_serves(&client_b, ids, 0, MESSAGES).await;
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+
+    let mut read = Vec::new();
+    let mut latencies = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < CONSUME_FOR {
+        let polled = group_a.poll_manual(&client_a, 5).await;
+        if let Some(last) = polled.last().copied() {
+            read.extend(polled);
+            let commit_started = Instant::now();
+            group_a.commit(&client_a, last).await;
+            latencies.push(commit_started.elapsed());
+        }
+        sleep(PACE).await;
+    }
+    let last = *read.last().expect("dc-a read");
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after an acknowledged commit");
+    assert_eq!(read, (0..=last).collect::<Vec<_>>());
+
+    group_b.wait_for_offset(&client_b, Some(last)).await;
+    let group_b = group_b.joined(&client_b).await;
+    let resumed = group_b.consume(&client_b, 20).await;
+    assert_eq!(
+        resumed,
+        (last + 1..last + 21).collect::<Vec<_>>(),
+        "dc-b reads none of the acknowledged commits again and skips none"
+    );
+    latencies.sort_unstable();
+    eprintln!(
+        "{} commits, the last at {last}; commit latency median {:?}, p90 {:?}, max {:?}",
+        latencies.len(),
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() * 9 / 10],
+        latencies[latencies.len() - 1]
+    );
+}
+
+#[tokio::test]
+async fn given_a_bucket_that_refuses_puts_when_a_group_commits_should_acknowledge_only_once_the_bucket_holds_the_position()
+ {
+    const REFUSING_FOR: Duration = Duration::from_secs(3);
+    let pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    send(&client_a, 0, 0..40).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    assert_eq!(group_a.poll_manual(&client_a, 10).await.len(), 10);
+    group_a.commit(&client_a, 9).await;
+    assert_eq!(bucket_offset(pair.a(), 0).await, Some(9));
+
+    let positions = pair
+        .a()
+        .bucket()
+        .path()
+        .join(pair.a().bucket().layout().positions_prefix())
+        .join(pair.a().origin());
+    std::fs::remove_dir_all(&positions).expect("the node's positions go");
+    std::fs::write(&positions, b"").expect("a file where the positions directory was");
+    let commit = tokio::spawn(async move {
+        assert_eq!(group_a.poll_manual(&client_a, 10).await.len(), 10);
+        group_a.commit(&client_a, 19).await;
+        Instant::now()
+    });
+    sleep(REFUSING_FOR).await;
+    assert!(
+        !commit.is_finished(),
+        "a commit whose position the bucket refuses is not acknowledged"
+    );
+
+    std::fs::remove_file(&positions).expect("the bucket takes puts again");
+    let acknowledged = tokio::time::timeout(DEADLINE, commit)
+        .await
+        .expect("the commit is acknowledged once the bucket takes it")
+        .expect("the committing task ends");
+    assert_eq!(
+        bucket_offset(pair.a(), 0).await,
+        Some(19),
+        "the bucket holds the position at the acknowledgement, {:?} after it",
+        acknowledged.elapsed()
     );
 }
 
@@ -332,6 +506,48 @@ impl Group {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// One poll of the next `count` messages that commits nothing. Empty
+    /// when the cluster refused the poll.
+    async fn poll_manual(&self, client: &IggyClient, count: u32) -> Vec<u64> {
+        client
+            .poll_messages(
+                &self.stream,
+                &self.topic,
+                self.partition,
+                &Consumer::group(named(GROUP)),
+                &PollingStrategy::next(),
+                PollOptions {
+                    count,
+                    commit: CommitPolicy::Manual,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .map(|polled| {
+                polled
+                    .messages
+                    .iter()
+                    .map(|message| message.header.offset)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Store `offset` as the group's offset, as an application commits a
+    /// checkpoint, and wait for the answer.
+    async fn commit(&self, client: &IggyClient, offset: u64) {
+        client
+            .store_consumer_offset(
+                &Consumer::group(named(GROUP)),
+                &self.stream,
+                &self.topic,
+                Some(self.partition),
+                offset,
+            )
+            .await
+            .expect("the cluster takes the commit");
     }
 
     /// Poll and commit until `count` messages arrived.
@@ -530,6 +746,24 @@ async fn wait_for_bucket_offset_on(cluster: &GeoCluster, partition: u32, offset:
         );
         sleep(RETRY).await;
     }
+}
+
+/// The group's offset on `partition` that the bucket of `cluster` holds, the
+/// highest across the objects of its nodes.
+async fn bucket_offset(cluster: &GeoCluster, partition: u32) -> Option<u64> {
+    cluster
+        .bucket()
+        .positions_objects()
+        .await
+        .expect("the bucket reads")
+        .iter()
+        .filter_map(
+            |object| match object.partitions.get(&partition)?.get(GROUP)?.value {
+                PositionValue::Offset(offset) => Some(offset),
+                PositionValue::Unset | PositionValue::Deleted => None,
+            },
+        )
+        .max()
 }
 
 /// Run `call` until it succeeds, as an SDK does for a retryable refusal.
