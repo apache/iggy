@@ -29,6 +29,9 @@
 //!   positions of a partition it leads changed since the last one it stored.
 //!   The backups commit the same positions after their primary, so only the
 //!   primary publishes them, as only the primary uploads the messages.
+//!   Between those rounds, shard 0 runs rounds of the topics whose groups
+//!   stored offsets themselves, whose replies wait for them, see
+//!   [`crate::geo_commits`].
 //! - **Adopt.** Shard 0 lists the positions that each geo peer publishes and
 //!   hands every shard those of the partitions it owns, see
 //!   [`PeerPositions`]. The primaries here commit the ones that win over
@@ -48,7 +51,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use consensus::{MetadataHandle, PartitionsHandle};
-use futures::channel::oneshot;
+use futures::future::join_all;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{IggyError, IggyTimestamp};
 use iggy_object_store::{
@@ -66,6 +69,7 @@ use partitions::{PollingConsumer, TopicObjects};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
+use crate::geo_commits::RoundPacing;
 use crate::shards_table::ShardsTable;
 use crate::{
     IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, TaggedSender, bus_timeout,
@@ -88,6 +92,10 @@ pub struct GeoPositionSettings {
     /// The origins of the peers whose positions this node reads.
     pub peers: Vec<String>,
     pub publish_interval: Duration,
+    /// The shortest time between two rounds of the topics whose groups
+    /// stored offsets themselves, `None` when such stores are answered at
+    /// their commit.
+    pub commit_interval: Option<Duration>,
     /// How long group polls wait for the peers' positions after a start.
     pub resume_timeout: Duration,
 }
@@ -108,10 +116,8 @@ pub struct LocalLog {
 pub struct PartitionPositions {
     pub log: GeoLog,
     pub partition_id: u32,
+    pub namespace: IggyNamespace,
     pub positions: BTreeMap<String, GeoPosition>,
-    /// The names of local groups whose committed offset the partition has
-    /// not folded yet.
-    pub unfolded: BTreeSet<String>,
 }
 
 /// A shard's answer to a round.
@@ -121,9 +127,9 @@ pub struct GeoPositionsReport {
     pub shard: u16,
     /// The partitions the shard leads.
     pub partitions: Vec<PartitionPositions>,
-    /// The partitions the shard holds a replica of without leading them, by
-    /// log and partition id.
-    pub not_led: Vec<(GeoLog, u32)>,
+    /// Whether the positions carry commits whose replies the shard holds
+    /// until the store takes them.
+    pub carries_held_commits: bool,
 }
 
 /// What the store took of a round.
@@ -141,22 +147,16 @@ pub struct FinishedPositionsStore {
 /// The positions of one log by partition id, then by group name.
 pub type LogPositions = BTreeMap<u32, BTreeMap<String, GeoPosition>>;
 
-/// What a round found and stored of one log.
+/// What a round found of one log: the partitions this node leads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct LogRound {
-    /// The partitions this node leads.
-    pub partitions: BTreeMap<u32, PartitionPositions>,
-    /// The partitions this node holds a replica of without leading them.
-    pub not_led: BTreeSet<u32>,
-    /// Whether the node's store holds what the round found of the partitions
-    /// it leads.
-    pub stored: bool,
+struct LogRound {
+    partitions: BTreeMap<u32, PartitionPositions>,
 }
 
-/// What a whole round found and stored, by log.
+/// What a whole round found, by log.
 #[derive(Debug, Clone, Default)]
-pub struct RoundSummary {
-    pub logs: BTreeMap<GeoLog, LogRound>,
+struct RoundSummary {
+    logs: BTreeMap<GeoLog, LogRound>,
 }
 
 /// The positions that a geo peer publishes, for the partitions of one shard.
@@ -201,11 +201,8 @@ struct ResumeGate {
 struct Publisher {
     rounds: u64,
     round: Option<Round>,
-    /// When the next periodic round may start, in microseconds since the Unix
-    /// epoch.
-    next_round_at: u64,
-    /// Callers that wait for a round that starts after they asked.
-    waiting: Vec<oneshot::Sender<RoundSummary>>,
+    /// When rounds start, in microseconds since the Unix epoch.
+    pacing: RoundPacing,
     /// What the node's store holds of each log, as this node stored it.
     stored: BTreeMap<PositionsKey, LogPositions>,
     /// The logs this node may have an object of, until it deletes it: those
@@ -219,8 +216,13 @@ struct Publisher {
 struct Round {
     id: u64,
     now: IggyTimestamp,
+    /// The topics the round covers, by stream and topic id, `None` for
+    /// every log.
+    scope: Option<Vec<(usize, usize)>>,
     reports: Vec<Option<GeoPositionsReport>>,
-    waiters: Vec<oneshot::Sender<RoundSummary>>,
+    /// The shards whose reports carry held commits, which learn what the
+    /// store took.
+    carrying: BTreeSet<u16>,
     /// What the shards reported, once all did and the store task runs.
     found: Option<RoundSummary>,
 }
@@ -323,7 +325,7 @@ where
         *state.settings.borrow_mut() = settings.map(Rc::new);
     }
 
-    fn geo_settings(&self) -> Option<Rc<GeoPositionSettings>> {
+    pub(crate) fn geo_settings(&self) -> Option<Rc<GeoPositionSettings>> {
         self.geo_positions.settings.borrow().clone()
     }
 
@@ -429,16 +431,26 @@ where
         })
     }
 
-    /// The pump's tick: start a round on shard 0 when one is due.
-    pub(crate) fn tick_geo_positions(&self) {
-        if self.id == 0 && self.geo_positions.settings.borrow().is_some() {
+    /// The pump's tick: start a round on shard 0 when one is due, and
+    /// answer the held commits that wait no longer.
+    pub(crate) fn tick_geo_positions(&self)
+    where
+        M: StreamsFrontend,
+    {
+        if self.geo_positions.settings.borrow().is_none() {
+            return;
+        }
+        if self.id == 0 {
             self.start_geo_positions_round(IggyTimestamp::from(self.bus.realtime_micros()));
         }
+        self.expire_geo_commits();
     }
 
-    /// Start a round on shard 0 when the publish interval passed since the
-    /// last one and none runs. A round that waited too long for the shards
-    /// is dropped, and its waiters see their channel close.
+    /// Start a round on shard 0 when one is due and none runs: one of every
+    /// log each publish interval, and one of the topics with held commits
+    /// in between, see [`RoundPacing`]. A round that waited too long for the
+    /// shards or the store is dropped, and the commits it carried go into a
+    /// later one.
     pub fn start_geo_positions_round(&self, now: IggyTimestamp) {
         if self.id != 0 {
             return;
@@ -448,26 +460,27 @@ where
         };
         let mut publisher = self.geo_positions.publisher.borrow_mut();
         if let Some(round) = &publisher.round {
-            let timeout = u64::try_from(ROUND_TIMEOUT.as_micros()).unwrap_or(u64::MAX);
-            if now.as_micros() < round.now.as_micros().saturating_add(timeout) {
+            if now.as_micros() < round.now.as_micros().saturating_add(micros(ROUND_TIMEOUT)) {
                 return;
             }
             publisher.round = None;
             publisher.scope = None;
         }
-        if now.as_micros() < publisher.next_round_at && publisher.waiting.is_empty() {
+        let Some(scope) = publisher.pacing.start(
+            now.as_micros(),
+            micros(settings.publish_interval),
+            settings.commit_interval.map(micros),
+        ) else {
             return;
-        }
-        let interval = u64::try_from(settings.publish_interval.as_micros()).unwrap_or(u64::MAX);
-        publisher.next_round_at = now.as_micros().saturating_add(interval);
+        };
         publisher.rounds += 1;
         let id = publisher.rounds;
-        let waiters = std::mem::take(&mut publisher.waiting);
         publisher.round = Some(Round {
             id,
             now,
+            scope: scope.clone(),
             reports: vec![None; self.senders.len()],
-            waiters,
+            carrying: BTreeSet::new(),
             found: None,
         });
         drop(publisher);
@@ -475,43 +488,39 @@ where
             if sender
                 .try_send(ShardFrame::lifecycle(LifecycleFrame::ReportGeoPositions {
                     round: id,
+                    scope: scope.clone(),
                 }))
                 .is_err()
             {
                 // A shard that was not asked never answers.
-                self.geo_positions.publisher.borrow_mut().round = None;
+                let mut publisher = self.geo_positions.publisher.borrow_mut();
+                publisher.round = None;
+                publisher.pacing.wait(scope.into_iter().flatten());
                 return;
             }
         }
     }
 
-    /// Wait for a round that starts after this call, on shard 0, and for the
-    /// store's answer to what it found. Starts the round at once when none
-    /// runs. `None` on another shard or one without settings.
-    pub fn geo_positions_round_now(
-        &self,
-        now: IggyTimestamp,
-    ) -> Option<oneshot::Receiver<RoundSummary>> {
-        if self.id != 0 || self.geo_settings().is_none() {
-            return None;
+    /// Shard 0 learns that `topics` have held commits, and starts their
+    /// round when it may.
+    pub(crate) fn on_geo_commits_waiting(&self, topics: Vec<(usize, usize)>) {
+        if self.id != 0 {
+            return;
         }
-        let (sender, receiver) = oneshot::channel();
         self.geo_positions
             .publisher
             .borrow_mut()
-            .waiting
-            .push(sender);
-        self.start_geo_positions_round(now);
-        Some(receiver)
+            .pacing
+            .wait(topics);
+        self.start_geo_positions_round(IggyTimestamp::from(self.bus.realtime_micros()));
     }
 
-    /// Stop the rounds of shard 0: drop the one in flight, its store task
-    /// and the callers that wait for a round.
+    /// Stop the rounds of shard 0: drop the one in flight and its store
+    /// task.
     pub fn stop_geo_positions(&self) {
         let mut publisher = self.geo_positions.publisher.borrow_mut();
         publisher.round = None;
         publisher.scope = None;
-        publisher.waiting.clear();
     }
 
     /// Hand shard `shard` the positions that the geo peer publishes for its
@@ -525,13 +534,17 @@ where
         )));
     }
 
-    /// Answer a round of shard 0 with the positions of the partitions here.
-    /// When a primary here has commits to fold, the shard proposes the folds
-    /// first and answers once they ended, so the round stores what the
-    /// groups committed before it started.
+    /// Answer a round of shard 0 with the positions of the partitions here,
+    /// of the topics in `scope` or of every log. When a primary here has
+    /// commits to fold, the shard proposes the folds first and answers once
+    /// they ended, so the round stores what the groups committed before it
+    /// started.
     #[allow(clippy::future_not_send)]
-    pub(crate) async fn on_report_geo_positions(&self, round: u64)
-    where
+    pub(crate) async fn on_report_geo_positions(
+        &self,
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    ) where
         B: Clone,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
@@ -541,56 +554,61 @@ where
         let Some(settings) = self.geo_settings() else {
             return;
         };
-        let (led, not_led, proposals) = self.collect_geo_positions(&settings);
+        let (led, proposals) = self.collect_geo_positions(&settings, scope.as_deref());
         if proposals.is_empty() {
-            self.send_geo_positions_report(round, led, not_led);
+            self.send_geo_positions_report(round, scope.as_deref(), led);
             return;
         }
-        let folded = ShardFrame::lifecycle(LifecycleFrame::ReportGeoPositionsFolded { round });
+        let folded =
+            ShardFrame::lifecycle(LifecycleFrame::ReportGeoPositionsFolded { round, scope });
         self.propose_geo_commands(proposals, Some(folded)).await;
     }
 
     /// Answer a round once the folds this shard proposed for it ended.
-    pub(crate) fn on_report_geo_positions_folded(&self, round: u64)
-    where
+    pub(crate) fn on_report_geo_positions_folded(
+        &self,
+        round: u64,
+        scope: Option<&[(usize, usize)]>,
+    ) where
         M: RestorableMetadataStm,
     {
         let Some(settings) = self.geo_settings() else {
             return;
         };
-        let (led, not_led, _) = self.collect_geo_positions(&settings);
-        self.send_geo_positions_report(round, led, not_led);
+        let (led, _) = self.collect_geo_positions(&settings, scope);
+        self.send_geo_positions_report(round, scope, led);
     }
 
+    /// Send shard 0 the positions that the shard read just now, and mark the
+    /// held commits they carry. Nothing runs between the read and the
+    /// marking, so a marked commit's position is in the report.
     fn send_geo_positions_report(
         &self,
         round: u64,
+        scope: Option<&[(usize, usize)]>,
         partitions: Vec<PartitionPositions>,
-        not_led: Vec<(GeoLog, u32)>,
     ) {
+        let carries_held_commits = self.cover_geo_commits(round, scope, &partitions);
         if let Some(sender) = self.senders.first() {
             let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::GeoPositionsReported(
                 Box::new(GeoPositionsReport {
                     round,
                     shard: self.id,
                     partitions,
-                    not_led,
+                    carries_held_commits,
                 }),
             )));
         }
     }
 
     /// The positions of the geo and shadow partitions that this shard leads
-    /// as a current primary, the other geo and shadow partitions it holds,
-    /// and the folds that its primaries owe.
+    /// as a current primary, of the topics in `scope` or of every log, and
+    /// the folds that its primaries owe.
     fn collect_geo_positions(
         &self,
         settings: &GeoPositionSettings,
-    ) -> (
-        Vec<PartitionPositions>,
-        Vec<(GeoLog, u32)>,
-        Vec<GeoProposal>,
-    )
+        scope: Option<&[(usize, usize)]>,
+    ) -> (Vec<PartitionPositions>, Vec<GeoProposal>)
     where
         M: RestorableMetadataStm,
     {
@@ -610,11 +628,13 @@ where
             (logs, groups)
         });
         let mut led = Vec::new();
-        let mut not_led = Vec::new();
         let mut proposals = Vec::new();
         let partitions = self.plane.partitions();
         let in_flight = self.geo_positions.in_flight.borrow();
         for local in &logs {
+            if scope.is_some_and(|topics| !topics.contains(&(local.stream_id, local.topic_id))) {
+                continue;
+            }
             let local_groups = groups
                 .get(&(local.stream_id, local.topic_id))
                 .map_or(&[][..], Vec::as_slice);
@@ -629,7 +649,6 @@ where
                     continue;
                 };
                 if !partition.state_machines_current() {
-                    not_led.push((local.log.clone(), *partition_id));
                     continue;
                 }
                 if !in_flight.contains(namespace) {
@@ -638,24 +657,19 @@ where
                         proposals.push((*namespace, NOTE_GEO_POSITIONS, encode_notes(&notes)));
                     }
                 }
-                let unfolded = local_groups
-                    .iter()
-                    .filter(|group| !partition.geo_positions_folded(std::slice::from_ref(group)))
-                    .map(|group| group.name.clone())
-                    .collect();
                 led.push(PartitionPositions {
                     log: local.log.clone(),
                     partition_id: *partition_id,
+                    namespace: *namespace,
                     positions: positions
                         .entries()
                         .iter()
                         .map(|(name, entry)| (name.clone(), entry.position))
                         .collect(),
-                    unfolded,
                 });
             }
         }
-        (led, not_led, proposals)
+        (led, proposals)
     }
 
     /// Fold what the groups of the partition of `namespace` committed, now:
@@ -893,6 +907,9 @@ where
         let Some(answer) = round.reports.get_mut(usize::from(report.shard)) else {
             return;
         };
+        if report.carries_held_commits {
+            round.carrying.insert(report.shard);
+        }
         *answer = Some(report);
         if round.reports.iter().any(Option::is_none) {
             return;
@@ -907,17 +924,10 @@ where
                     .partitions
                     .insert(partition.partition_id, partition);
             }
-            for (log, partition_id) in report.not_led {
-                summary
-                    .logs
-                    .entry(log)
-                    .or_default()
-                    .not_led
-                    .insert(partition_id);
-            }
         }
         let round_id = round.id;
         let now = round.now;
+        let every_log = round.scope.is_none();
         let replica = self.partition_consensus.self_replica_id;
         let held: BTreeSet<GeoLog> = self.geo_settings().map_or_else(BTreeSet::new, |settings| {
             self.plane.metadata().mux_stm.streams().read(|inner| {
@@ -928,8 +938,13 @@ where
             })
         });
         publisher.seen.extend(held.iter().cloned());
-        let (puts, deletes) =
+        let (puts, mut deletes) =
             store_plan(&publisher.stored, &publisher.seen, &summary, replica, &held);
+        // A round of the topics with held commits answers them sooner, and
+        // leaves the deletes to the rounds of every log.
+        if !every_log {
+            deletes.clear();
+        }
         let Some(round) = publisher.round.as_mut() else {
             return;
         };
@@ -941,7 +956,7 @@ where
             self.on_positions_stored(FinishedPositionsStore {
                 round: round_id,
                 stored: Vec::new(),
-                failed: Vec::new(),
+                failed: puts.into_iter().map(|(key, _)| key).collect(),
                 deleted: Vec::new(),
             });
             return;
@@ -965,7 +980,9 @@ where
         ));
     }
 
-    /// Take the store's answer to a round, and answer its waiters.
+    /// Take the store's answer to a round, tell the shards whose held
+    /// commits it carried which logs the store took, and start the next
+    /// round when one is due.
     pub(crate) fn on_positions_stored(&self, finished: FinishedPositionsStore) {
         let mut publisher = self.geo_positions.publisher.borrow_mut();
         if publisher
@@ -992,22 +1009,40 @@ where
             publisher.stored.remove(&key);
         }
         let replica = self.partition_consensus.self_replica_id;
-        let mut summary = round.found.unwrap_or_default();
-        for (log, found) in &mut summary.logs {
-            let key = PositionsKey {
-                log: log.clone(),
-                replica,
-            };
-            found.stored = holds(publisher.stored.get(&key), found);
-        }
-        let rerun = !publisher.waiting.is_empty();
+        let summary = round.found.unwrap_or_default();
+        let stored: Vec<GeoLog> = summary
+            .logs
+            .iter()
+            .filter(|(log, found)| {
+                let key = PositionsKey {
+                    log: (*log).clone(),
+                    replica,
+                };
+                holds(publisher.stored.get(&key), found)
+            })
+            .map(|(log, _)| log.clone())
+            .collect();
+        let now = IggyTimestamp::from(self.bus.realtime_micros());
+        let commit_interval = self
+            .geo_settings()
+            .and_then(|settings| settings.commit_interval.map(micros));
+        publisher.pacing.finished(
+            now.as_micros(),
+            !finished.failed.is_empty(),
+            commit_interval,
+        );
         drop(publisher);
-        for waiter in round.waiters {
-            let _ = waiter.send(summary.clone());
+        for shard in round.carrying {
+            if let Some(sender) = self.senders.get(usize::from(shard)) {
+                let _ = sender.try_send(ShardFrame::lifecycle(
+                    LifecycleFrame::GeoPositionsPublished {
+                        round: round.id,
+                        stored: stored.clone(),
+                    },
+                ));
+            }
         }
-        if rerun {
-            self.start_geo_positions_round(IggyTimestamp::from(self.bus.realtime_micros()));
-        }
+        self.start_geo_positions_round(now);
     }
 }
 
@@ -1105,14 +1140,19 @@ async fn store_positions(
         failed: Vec::new(),
         deleted: Vec::new(),
     };
+    let mut stores = Vec::with_capacity(puts.len());
+    let mut puts_in_flight = Vec::with_capacity(puts.len());
     for (key, positions) in puts {
         let object = PositionsObject {
             key: key.clone(),
             published_at: now.as_micros(),
             partitions: positions,
         };
-        let body = match object.encode() {
-            Ok(body) => body,
+        match object.encode() {
+            Ok(body) => {
+                puts_in_flight.push(objects.put_positions(key.clone(), body, token.clone()));
+                stores.push((key, object.partitions));
+            }
             Err(error) => {
                 tracing::warn!(
                     origin = key.log.origin,
@@ -1122,14 +1162,15 @@ async fn store_positions(
                     "cannot encode the consumer group positions of a log"
                 );
                 finished.failed.push(key);
-                continue;
             }
-        };
-        match objects
-            .put_positions(key.clone(), body, token.clone())
-            .await
-        {
-            Ok(Ok(())) => finished.stored.push((key, object.partitions)),
+        }
+    }
+    // At once, not one after another: a commit waits for the object of its
+    // log, whichever other logs the round stores.
+    let outcomes = join_all(puts_in_flight).await;
+    for ((key, positions), outcome) in stores.into_iter().zip(outcomes) {
+        match outcome {
+            Ok(Ok(())) => finished.stored.push((key, positions)),
             _ => finished.failed.push(key),
         }
     }
@@ -1144,6 +1185,10 @@ async fn store_positions(
     let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::GeoPositionsStored(
         Box::new(finished),
     )));
+}
+
+fn micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -1172,8 +1217,8 @@ mod tests {
     }
 
     /// A log of which the node leads the partitions of `led`, each with the
-    /// group at an offset, and holds those of `not_led`.
-    fn found_led(topic_id: u64, led: &[(u32, u64)], not_led: &[u32]) -> (GeoLog, LogRound) {
+    /// group at an offset.
+    fn found_led(topic_id: u64, led: &[(u32, u64)]) -> (GeoLog, LogRound) {
         let partitions = led
             .iter()
             .map(|(partition_id, offset)| {
@@ -1182,24 +1227,21 @@ mod tests {
                     PartitionPositions {
                         log: log(topic_id),
                         partition_id: *partition_id,
+                        namespace: IggyNamespace::new(
+                            1,
+                            usize::try_from(topic_id).expect("a topic id"),
+                            usize::try_from(*partition_id).expect("a partition id"),
+                        ),
                         positions: billing_at(*offset),
-                        unfolded: BTreeSet::new(),
                     },
                 )
             })
             .collect();
-        (
-            log(topic_id),
-            LogRound {
-                partitions,
-                not_led: not_led.iter().copied().collect(),
-                stored: false,
-            },
-        )
+        (log(topic_id), LogRound { partitions })
     }
 
     fn found(topic_id: u64, offset: u64) -> (GeoLog, LogRound) {
-        found_led(topic_id, &[(0, offset)], &[])
+        found_led(topic_id, &[(0, offset)])
     }
 
     fn key(topic_id: u64) -> PositionsKey {
@@ -1280,7 +1322,7 @@ mod tests {
      {
         let seen = BTreeSet::from([log(1), log(2)]);
         let summary = RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[], &[0])]),
+            logs: BTreeMap::from([found_led(1, &[])]),
         };
 
         let (puts, deletes) = store_plan(
@@ -1306,13 +1348,13 @@ mod tests {
     #[test]
     fn given_partitions_the_node_only_follows_when_planning_a_round_should_store_nothing() {
         let summary = RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[], &[0, 1])]),
+            logs: BTreeMap::from([found_led(1, &[])]),
         };
         let held = BTreeSet::from([log(1)]);
 
         let (fresh, _) = plan(&BTreeMap::new(), &summary, &held);
         let earlier = stored_of(&RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)], &[])]),
+            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)])]),
         });
         let (left, _) = plan(&earlier, &summary, &held);
 
@@ -1324,10 +1366,10 @@ mod tests {
     fn given_a_partition_the_node_stopped_leading_when_another_one_changes_should_keep_it_in_the_object()
      {
         let stored = stored_of(&RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)], &[])]),
+            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)])]),
         });
         let summary = RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[(1, 21)], &[0])]),
+            logs: BTreeMap::from([found_led(1, &[(1, 21)])]),
         };
 
         let (puts, _) = plan(&stored, &summary, &BTreeSet::from([log(1)]));
@@ -1345,10 +1387,10 @@ mod tests {
     fn given_a_partition_the_node_starts_leading_with_unchanged_positions_when_planning_a_round_should_store_it()
      {
         let stored = stored_of(&RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[(1, 20)], &[0])]),
+            logs: BTreeMap::from([found_led(1, &[(1, 20)])]),
         });
         let summary = RoundSummary {
-            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)], &[])]),
+            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)])]),
         };
         let held = BTreeSet::from([log(1)]);
 

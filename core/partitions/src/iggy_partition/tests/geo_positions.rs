@@ -111,7 +111,7 @@ fn given_a_group_when_its_commit_changes_should_note_it_once_and_nothing_once_fo
     commit(&partition, 100);
     let groups = [billing(false)];
 
-    assert!(!partition.geo_positions_folded(&groups), "no entry yet");
+    assert!(!partition.geo_group_folded(GROUP), "no entry yet");
     let notes = partition.geo_notes(&groups);
     assert_eq!(
         notes,
@@ -125,10 +125,10 @@ fn given_a_group_when_its_commit_changes_should_note_it_once_and_nothing_once_fo
     );
     apply_notes(&mut partition, 1, &notes);
     assert_eq!(partition.geo_notes(&groups), [], "folded");
-    assert!(partition.geo_positions_folded(&groups));
+    assert!(partition.geo_group_folded(GROUP));
 
     commit(&partition, 120);
-    assert!(!partition.geo_positions_folded(&groups));
+    assert!(!partition.geo_group_folded(GROUP));
     let notes = partition.geo_notes(&groups);
     apply_notes(&mut partition, 2, &notes);
     assert_eq!(

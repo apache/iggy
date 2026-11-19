@@ -632,20 +632,14 @@ where
         notes
     }
 
-    /// Whether every one of `groups` has an entry bound to it that folded
-    /// what it committed: the positions this partition publishes are what
-    /// those groups committed.
+    /// Whether the entry bound to the local group `group_id` folded what the
+    /// group committed: the position this partition publishes for it is
+    /// what it committed.
     #[must_use]
-    pub fn geo_positions_folded(&self, groups: &[LocalGroup]) -> bool {
-        let Some(positions) = self.geo_positions() else {
-            return true;
-        };
-        groups.iter().all(|group| {
-            positions.get(&group.name).is_some_and(|entry| {
-                entry.bound == Some(group.group_id)
-                    && entry.base == self.committed_group_offset(group.group_id)
-            })
-        })
+    pub fn geo_group_folded(&self, group_id: u32) -> bool {
+        self.geo_positions()
+            .and_then(|positions| positions.bound_to(group_id))
+            .is_some_and(|(_, entry)| entry.base == self.committed_group_offset(group_id))
     }
 
     /// The positions of `peer` that this partition takes: those higher than

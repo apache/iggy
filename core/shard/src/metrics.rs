@@ -36,6 +36,7 @@
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
 //! sub-registry per shard). Drop-site tracing supplements the counters.
 
+use crate::geo_commits::CommitAnswer;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -594,6 +595,12 @@ pub struct ShardMetrics {
     geo_positions_stored_total: Counter,
     /// The ones of those that the store refused.
     geo_positions_store_failures_total: Counter,
+    /// Offset stores of consumer groups on geo and shadow partitions that
+    /// were answered once the node's store held their positions.
+    geo_positions_commits_confirmed_total: Counter,
+    /// The ones answered `TransientNotCommitted` instead, as their positions
+    /// were not stored in time or their partitions stopped being led here.
+    geo_positions_commits_uncertain_total: Counter,
     /// 1 while the group polls of geo and shadow partitions on this shard
     /// wait for the first positions of every geo peer since the node started.
     geo_positions_resume_waiting: Gauge,
@@ -789,6 +796,8 @@ impl ShardMetrics {
             geo_peer_positions_adopted_total: Family::default(),
             geo_positions_stored_total: Counter::default(),
             geo_positions_store_failures_total: Counter::default(),
+            geo_positions_commits_confirmed_total: Counter::default(),
+            geo_positions_commits_uncertain_total: Counter::default(),
             geo_positions_resume_waiting: Gauge::default(),
         }
     }
@@ -1110,6 +1119,14 @@ impl ShardMetrics {
         } else {
             self.geo_positions_store_failures_total.inc();
         }
+    }
+
+    /// A group offset store whose reply waited for its position, answered.
+    pub fn record_geo_commit_answered(&self, answer: CommitAnswer) {
+        match answer {
+            CommitAnswer::Committed => self.geo_positions_commits_confirmed_total.inc(),
+            CommitAnswer::Uncertain => self.geo_positions_commits_uncertain_total.inc(),
+        };
     }
 
     /// Whether the group polls here wait for the positions of the geo peers.
@@ -2978,6 +2995,16 @@ impl ShardMetrics {
             "geo_positions_store_failures",
             "Objects of consumer group positions that the node's store refused",
             self.geo_positions_store_failures_total.clone(),
+        );
+        registry.register(
+            "geo_positions_commits_confirmed",
+            "Offset stores of consumer groups on geo and shadow partitions answered once the node's store held their positions",
+            self.geo_positions_commits_confirmed_total.clone(),
+        );
+        registry.register(
+            "geo_positions_commits_uncertain",
+            "Offset stores of consumer groups on geo and shadow partitions answered as uncertain, their positions not stored in time or their partitions no longer led here",
+            self.geo_positions_commits_uncertain_total.clone(),
         );
         registry.register(
             "geo_positions_resume_waiting",

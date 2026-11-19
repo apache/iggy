@@ -119,8 +119,9 @@ pub trait TopicObjects {
 /// The jobs on topic objects, through a tier executor.
 ///
 /// A read goes in the demand fetch class, because a produce waits for it. A
-/// put goes in the upload class, as a manifest does, because the partitions
-/// of a new topic wait for it. A listing goes in the housekeeping class, and
+/// put of a topic object goes in the upload class, as a manifest does,
+/// because the partitions of a new topic wait for it, and a put of positions
+/// in the fresh upload class. A listing goes in the housekeeping class, and
 /// the delete of a topic, its listings included, is one job of the delete
 /// class.
 pub struct ExecutorTopicObjects<E> {
@@ -215,8 +216,10 @@ impl<E: TierExecutor> TopicObjects for ExecutorTopicObjects<E> {
             .boxed_local()
     }
 
-    /// In the housekeeping class: positions follow commits by a second, and
-    /// nothing a client waits for queues behind them.
+    /// In the fresh upload class: a group's own offset store is answered
+    /// only once its position is stored, as a send is once its fresh object
+    /// is, so the put must not wait for the shard to be idle, as the
+    /// housekeeping class does, nor behind a segment upload.
     fn put_positions(
         &self,
         key: PositionsKey,
@@ -225,7 +228,7 @@ impl<E: TierExecutor> TopicObjects for ExecutorTopicObjects<E> {
     ) -> LocalBoxFuture<'static, TopicObjectOutcome<()>> {
         let layout = self.layout.clone();
         let request =
-            TierJobRequest::new(TierJobClass::Housekeeping, scope).with_bytes(body.len() as u64);
+            TierJobRequest::new(TierJobClass::FreshUpload, scope).with_bytes(body.len() as u64);
         self.executor
             .submit(request, move |store| async move {
                 PositionsObject::put_encoded(&*store, &layout, &key, body).await

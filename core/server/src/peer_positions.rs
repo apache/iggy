@@ -96,6 +96,8 @@ pub fn settings(config: &GeoConfig) -> Option<GeoPositionSettings> {
             .map(|peer| peer.origin.clone())
             .collect(),
         publish_interval: config.positions_publish_interval.get_duration(),
+        commit_interval: (!config.positions_commit_interval.is_zero())
+            .then(|| config.positions_commit_interval.get_duration()),
         resume_timeout: config.positions_resume_timeout.get_duration(),
     })
 }
