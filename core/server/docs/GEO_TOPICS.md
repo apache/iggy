@@ -449,6 +449,11 @@ node gets there; its position is never moved back.
   changed, and takes the positions that the other clusters store there when they are higher. A
   group that moves to another datacenter resumes from about where it stopped: see [Failover and
   failback](#failover-and-failback).
+- The node that leads a partition stores its positions, as it uploads its messages. Groups
+  commit at the leader, and the other replicas hold the same positions. A node that stops
+  leading a partition keeps its last positions of it in its object, and the new leader stores
+  the partition at its first round. The other clusters take the highest position across the
+  nodes, so the older ones do not win.
 - A position is a reset counter and an offset. Of two positions the one with the higher reset
   wins, and within one reset the higher offset. A group that stores an offset below the one it
   had, a seek backwards, or deletes its offset, counts one reset up, so the other datacenters
@@ -574,18 +579,22 @@ clusters already have the geo topic `orders/payments`.
 To move a group with no message read twice:
 
 1. Stop the group's consumers in `dc-a`.
-2. Drain the group on a node of `dc-a`, for each topic the group reads:
+2. Drain the group on every node of `dc-a`, for each topic the group reads:
 
    ```sh
    curl -s -X POST -H "Authorization: Bearer $IGGY_TOKEN" \
      "http://dc-a-node-1:3000/streams/orders/topics/payments/consumer-groups/billing/drain?timeout=30s"
    ```
 
-   The node waits until the group has no members in `dc-a`, folds its offsets, stores its
-   positions in the bucket at once, and answers once the bucket holds them, with the positions it
-   stored. A node holds every partition with the default replication factor, and the answer lists
-   under `not_held` any partition the node has no replica of, which a drain on another node
-   covers. A group that still has members after the timeout gets 409.
+   The node waits until the group has no members in `dc-a`, folds its offsets on the partitions
+   the node leads, stores their positions in the bucket at once, and answers once the bucket
+   holds them, with the positions it stored. A drain covers only the partitions its node leads:
+   a replica that does not lead a partition cannot tell that it applied the group's last commit.
+   The answer lists under `not_led` the partitions the node holds and another node leads, and
+   under `not_held` those it has no replica of. Every partition must appear under `positions` in
+   the answer of one node. When one does not, because its leader changed between the drains,
+   drain again on the node that leads it now. A group that still has members after the timeout
+   gets 409.
 3. Wait until `dc-b` shows the positions, `positions_poll_interval` later:
    `GET /streams/__shadow_dc-a_orders/topics/payments/consumer-offsets?consumer_kind=consumer_group&consumer_id=billing&partition_id=0`
    on a node of `dc-b`, or the SDK's `get_consumer_offset`.
@@ -744,7 +753,8 @@ per peer:
   and reads each known object again every 30 seconds;
 - every `[geo] positions_poll_interval`, shard 0 of each node that leads a partition of a geo or
   shadow topic lists the peer's consumer group positions, one page per 1,000 objects, and reads
-  each object that changed: one per node of the peer and log whose groups moved;
+  each object that changed: one per log and node of the peer that leads a partition of the log
+  whose groups moved;
 - every `[geo] manifest_poll_interval`, shard 0 of each node lists the manifests of each peer
   stream for which the node leads a shadow partition, and the shard that owns the partition reads
   each manifest that changed;
@@ -769,8 +779,8 @@ Requests to a cluster's own bucket:
 - a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
   which read the messages back;
 - a put for each long-term segment and its index, and one for each manifest;
-- up to one put a `positions_publish_interval` on each node for each log whose consumer groups
-  moved;
+- up to one put a `positions_publish_interval` on each node for each log in which a partition
+  that the node leads had its consumer groups move;
 - listings of the replica's fresh objects every minute, and the deletes of fresh and long-term
   objects.
 
@@ -900,7 +910,7 @@ Alert on these first:
 | `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer.                                                                                       |
 | `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 250 ms after its last. `0` turns this off. Otherwise at least `64 MiB`. |
 | `[tiered_storage.jobs] fresh_uploads`      | `4`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads.                                                                                                                                                                                                                                  |
-| `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the positions of its consumer groups in its bucket, when they changed. A group that fails over reads again at most this long, plus the poll interval of the other datacenter.                                                                                                                                                        |
+| `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that fails over reads again at most this long, plus the poll interval of the other datacenter.                                                                                                                                     |
 | `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                       |
 | `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer. A peer that does not answer delays them this long.                                                                                                                                                                                             |
 | `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                            |
@@ -923,14 +933,13 @@ before an unlisted long-term object is deleted.
   leads no shadow partition of a peer does not follow it, and a node that starts to follow it
   serves proven messages only once a manifest reaches the first ones it found. A message that is
   committed and not proven reaches the shadow topics only with the next manifest.
-- **A drain covers the partitions its node holds.** With a replication factor below the cluster
-  size, drain on enough nodes to cover every partition. The server cannot stop a client: stop the
+- **A drain covers the partitions its node leads.** Drain the group on every node, and again on
+  the leader of any partition that no answer stored. The server cannot stop a client: stop the
   consumers before the drain.
 - **A store of exactly the offset a group had when another datacenter's position arrived is not
   seen as a change.** The group keeps reading from the other datacenter's position.
-- **Deleted topics leave their positions objects behind** when every node that stored them was
-  down at the delete. A node deletes the objects of logs its cluster no longer holds while it
-  runs.
+- **Deleted topics leave a node's positions object behind** when the node was down at the
+  delete. A node deletes its object of a log its cluster no longer holds while it runs.
 - **No encrypted streams.** A geo topic in a stream with an encryption key is refused with
   `FeatureUnavailable` (5), because its sends reach the bucket before the stream's encryption
   runs.

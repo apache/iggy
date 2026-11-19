@@ -819,12 +819,17 @@ other datacenters still hold. The positions of each partition live in a
 state machine of the partition and commit through its consensus.
 
 Every `[geo] positions_publish_interval` (1 second by default), each node
-folds what its groups committed into the positions and stores, in its own
-bucket, one object for each log that a topic of the cluster holds:
+folds what its groups committed on the partitions it leads into their
+positions and stores, in its own bucket, one object for each log in which it
+leads a partition:
 `<prefix>/meta/positions/<origin>/<stream_id>-<topic_id>-<created_revision>-<replica>`,
-where the origin and the ids name the log as its origin does. A node stores
-an object only when its positions changed, and deletes the object of a log
-the cluster no longer holds.
+where the origin and the ids name the log as its origin does. Only the
+partition's primary publishes it, as only the primary uploads its messages:
+groups commit at the primary, and the backups commit the same positions. A
+node stores an object only when the positions of a partition it leads
+changed. It keeps in it the partitions it stopped leading as it last stored
+them, and a new primary stores the partition at its first round. A node
+deletes its object of a log the cluster no longer holds.
 
 Every `[geo] positions_poll_interval` (1 second by default), shard 0 of each
 node that leads a partition of a geo or shadow topic lists
@@ -847,11 +852,13 @@ other datacenters left it.
 `POST /streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}/drain`
 prepares a planned failover. Stop the group's consumers first: the server
 waits until the group has no members in this cluster (409 otherwise), has
-the partitions fold the group's offsets, stores the node's object at once,
-and answers after the store took it, with the stored positions and the
-partitions the node holds no replica of. An optional `timeout` query value,
-`30s` by default, bounds the wait. It takes the permission to store the
-topic's consumer offsets.
+the partitions this node leads fold the group's offsets, stores the node's
+object at once, and answers after the store took it, with the stored
+positions, the partitions another node leads (`not_led`) and those the node
+holds no replica of (`not_held`). A backup cannot tell that it applied the
+group's last commit, so drain the group on every node. An optional `timeout`
+query value, `30s` by default, bounds the wait. It takes the permission to
+store the topic's consumer offsets.
 
 Each shard exports:
 
