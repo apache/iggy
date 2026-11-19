@@ -551,11 +551,12 @@ internal static partial class BinaryMapper
         };
     }
 
-    internal static PolledMessagesRental ToRentedMessages(PolledMessages messages)
+    internal static PolledMessagesRental ToRentedMessages(PolledMessages messages, int startIndex = 0)
     {
-        var rentedMessages = new List<RentedMessageResponse>(messages.Messages.Count);
-        foreach (var message in messages.Messages)
+        var rentedMessages = new List<RentedMessageResponse>(messages.Messages.Count - startIndex);
+        for (var index = startIndex; index < messages.Messages.Count; index++)
         {
+            var message = messages.Messages[index];
             // Raw headers decode on first access, so only headers that came decoded are copied.
             rentedMessages.Add(message.RawUserHeaders is { } raw
                 ? new RentedMessageResponse

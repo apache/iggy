@@ -31,19 +31,20 @@ public partial class IggyConsumer
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages.</param>
     /// <exception cref="ConsumerNotInitializedException">Thrown when <see cref="InitAsync" /> has not been called.</exception>
+    /// <exception cref="InvalidOperationException">Another receive or handler loop is active.</exception>
     public async IAsyncEnumerable<ReceivedRentedMessage> ReceiveRentedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        ThrowIfNotReading();
+        using var loop = EnterLoop();
         CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            var checkpoints = Enumerable.Range(0, batch.Messages.Count).Select(batch.CheckpointAt).ToArray();
-            var handle = new RentedBatchHandle(BinaryMapper.ToRentedMessages(batch));
+            var firstIndex = _nextMessageIndex;
+            var handle = new RentedBatchHandle(BinaryMapper.ToRentedMessages(batch, firstIndex));
             try
             {
                 var rental = handle.Rental;
-                while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < rental.Messages.Count)
+                while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < batch.Messages.Count)
                 {
                     if (ct.IsCancellationRequested || IsDisposed)
                     {
@@ -51,8 +52,9 @@ public partial class IggyConsumer
                     }
 
                     var index = _nextMessageIndex++;
-                    var message = rental.Messages[index];
-                    Hand(checkpoints[index]!, index == rental.Messages.Count - 1);
+                    var message = rental.Messages[index - firstIndex];
+                    var checkpoint = batch.CheckpointAt(index)!;
+                    Hand(checkpoint, index == batch.Messages.Count - 1);
                     handle.Acquire();
                     yield return new ReceivedRentedMessage
                     {
@@ -61,7 +63,7 @@ public partial class IggyConsumer
                         CurrentOffset = message.Header.Offset,
                         PartitionId = batch.PartitionId,
                         Context = batch.Context,
-                        Checkpoint = checkpoints[index]
+                        Checkpoint = checkpoint
                     };
                     CountProcessed();
                 }

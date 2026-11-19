@@ -806,6 +806,15 @@ public sealed class PartitionReader : IAsyncDisposable
         }
     }
 
+    /// <summary>Whether a batch retained by a consumer still belongs to a generation the reader keeps.</summary>
+    internal bool Keeps(PolledMessages batch)
+    {
+        lock (_gate)
+        {
+            return batch.Stamp is { } stamp && stamp.Reader == _id && Keeps(batch.PartitionId, stamp.Generation);
+        }
+    }
+
     /// <summary>Counts <paramref name="messages" /> up to <paramref name="checkpoint" /> under an automatic policy.</summary>
     internal void CountDelivered(Checkpoint checkpoint, uint messages, bool endsBatch)
     {

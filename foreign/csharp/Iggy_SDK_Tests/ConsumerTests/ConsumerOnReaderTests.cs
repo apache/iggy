@@ -46,6 +46,142 @@ public sealed class ConsumerOnReaderTests
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
     [Theory]
+    [InlineData(CommitMode.Manual)]
+    [InlineData(CommitMode.Auto)]
+    [InlineData(CommitMode.OnRead)]
+    public async Task given_a_retained_batch_when_its_partition_is_revoked_should_follow_the_commit_policy(CommitMode mode)
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6, Assignment = [1] };
+        using var client = await cluster.ConnectAsync();
+        var commit = mode switch
+        {
+            CommitMode.OnRead => CommitPolicy.OnRead,
+            CommitMode.Auto => CommitPolicy.Auto(new AutoCommit
+            { Interval = TimeSpan.FromHours(1), After = CommitAfter.Delivery }),
+            _ => CommitPolicy.Manual
+        };
+        await using var consumer = new IggyConsumer(client, new IggyConsumerConfig
+        {
+            StreamId = Stream,
+            TopicId = Topic,
+            Consumer = Consumer.Group("readers"),
+            PollOptions = new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100), Commit = commit },
+            RetryInterval = RetryInterval
+        }, NullLoggerFactory.Instance);
+        await consumer.InitAsync(Token);
+        Assert.Equal(0ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+        cluster.Assignment = [2];
+        await UntilAsync(() => consumer.Partitions.SequenceEqual([2u]));
+
+        var next = (await ReceiveAsync(consumer, 1))[0];
+        Assert.Equal(mode == CommitMode.OnRead ? (1u, 1ul) : (2u, 0ul),
+            (next.PartitionId, next.CurrentOffset));
+    }
+
+    [Fact]
+    public async Task given_a_retained_batch_when_seeking_another_partition_should_keep_its_unread_messages()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1, 2);
+        var first = (await ReceiveAsync(consumer, 1))[0];
+        var sought = first.PartitionId == 1 ? 2u : 1u;
+        await consumer.SeekAsync(sought, PollingStrategy.Offset(4), Token);
+
+        var next = (await ReceiveAsync(consumer, 1))[0];
+        Assert.Equal((first.PartitionId, 1ul), (next.PartitionId, next.CurrentOffset));
+    }
+
+    [Theory]
+    [InlineData("receive")]
+    [InlineData("rented")]
+    [InlineData("handler")]
+    public async Task given_an_active_receive_loop_when_starting_another_loop_should_refuse_it(string loop)
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client,
+            CommitPolicy.Auto(new AutoCommit { Every = CommitEvery.Message, After = CommitAfter.Processing }), 1);
+        await using var active = consumer.ReceiveAsync(Token).GetAsyncEnumerator(Token);
+        Assert.True(await active.MoveNextAsync());
+
+        switch (loop)
+        {
+            case "receive":
+                await using (var rejected = consumer.ReceiveAsync(Token).GetAsyncEnumerator(Token))
+                {
+                    await Assert.ThrowsAsync<InvalidOperationException>(async () => await rejected.MoveNextAsync());
+                }
+                break;
+            case "rented":
+                await using (var rejected = consumer.ReceiveRentedAsync(Token).GetAsyncEnumerator(Token))
+                {
+                    await Assert.ThrowsAsync<InvalidOperationException>(async () => await rejected.MoveNextAsync());
+                }
+                break;
+            default:
+                await Assert.ThrowsAsync<InvalidOperationException>(() => consumer.ConsumeAsync(
+                    (_, _) => throw new ApplicationException("An overlapping handler must not run."), Token));
+                break;
+        }
+
+        Assert.False(cluster.Stored.ContainsKey(1));
+        await active.DisposeAsync();
+        Assert.Equal(1ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+    }
+
+    [Fact]
+    public async Task given_an_active_handler_when_starting_a_receive_loop_should_refuse_it()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var failure = new ApplicationException("Handler failed.");
+        var consuming = consumer.ConsumeAsync(async (_, _) =>
+        {
+            entered.SetResult();
+            await release.Task.WaitAsync(PromptLimit, Token);
+            throw failure;
+        }, Token);
+        await entered.Task.WaitAsync(PromptLimit, Token);
+        try
+        {
+            await using var rejected = consumer.ReceiveAsync(Token).GetAsyncEnumerator(Token);
+            await Assert.ThrowsAsync<InvalidOperationException>(async () => await rejected.MoveNextAsync());
+        }
+        finally
+        {
+            release.SetResult();
+            Assert.Same(failure, await Assert.ThrowsAsync<ApplicationException>(() => consuming));
+        }
+
+        Assert.Equal(1ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+    }
+
+    [Fact]
+    public async Task given_a_resumed_rented_iteration_when_mapping_should_exclude_delivered_messages()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        for (var offset = 0ul; offset < 2; offset++)
+        {
+            await foreach (var message in consumer.ReceiveRentedAsync(Token))
+            {
+                using (message)
+                {
+                    Assert.Equal(offset, message.CurrentOffset);
+                    Assert.Equal(Enumerable.Range((int)offset, 2 - (int)offset).Select(value => (ulong)value),
+                        message.Handle!.Rental.Messages.Select(value => value.Header.Offset));
+                }
+                break;
+            }
+        }
+    }
+
+    [Theory]
     [InlineData(CommitMode.Manual, false, 1)]
     [InlineData(CommitMode.OnRead, false, 1)]
     [InlineData(CommitMode.Auto, false, 1)]
