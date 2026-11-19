@@ -34,11 +34,11 @@ under the License.
         <PackageVersion Include="Shouldly" Version="4.3.0" />
         <PackageVersion Include="System.IO.Hashing" Version="10.0.0" />
         <PackageVersion Include="Testcontainers" Version="4.16.0" />
-        <PackageVersion Include="TUnit" Version="1.78.0" />
+        <PackageVersion Include="TUnit" Version="1.81.16" />
         <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1">
             <PrivateAssets>all</PrivateAssets>
             <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
         </PackageVersion>
-        <PackageVersion Include="xunit.v3.mtp-v2" Version="4.0.2" />
+        <PackageVersion Include="xunit.v3.mtp-v2" Version="4.0.3" />
     </ItemGroup>
 </Project>
