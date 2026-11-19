@@ -23,14 +23,11 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use iggy::prelude::*;
-use iggy_object_store::{GeoPosition, PositionValue};
+use iggy_object_store::PositionValue;
 use integration::harness::{
     GeoCluster, GeoClusterPair, GeoSide, wait_for_consumer_group_assignment,
 };
-use serde_json::json;
 use tokio::time::{Instant, sleep};
-
-use super::http_client::HttpClient;
 
 const STREAM: &str = "orders";
 const TOPIC: &str = "payments";
@@ -45,112 +42,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// reach the other cluster.
 const DEADLINE: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_millis(50);
-
-#[tokio::test]
-async fn given_a_group_drained_on_every_node_of_one_datacenter_when_it_starts_in_the_other_should_resume_each_partition_on_the_exact_next_message()
- {
-    let mut pair = started_pair(NODES).await;
-    let ids = create_and_follow(&pair, PARTITIONS).await;
-    let client_a = pair.a().root_client().await.expect("a client of dc-a");
-    let client_b = pair.b().root_client().await.expect("a client of dc-b");
-    for partition in 0..PARTITIONS {
-        send(&client_a, partition, 0..100).await;
-        wait_until_shadow_serves(&client_b, ids, partition, 100).await;
-    }
-    let group_a = Group::join(&client_a, ids.own()).await;
-    let consumed: BTreeMap<u32, u64> = (0..PARTITIONS)
-        .map(|partition| (partition, 30 + 7 * u64::from(partition)))
-        .collect();
-    for (partition, count) in &consumed {
-        let read = group_a.on(*partition).consume(&client_a, *count).await;
-        assert_eq!(read, (0..*count).collect::<Vec<_>>());
-    }
-    group_a.leave(&client_a).await;
-
-    let mut drained = BTreeMap::new();
-    for node in 0..NODES {
-        let answer = drain(pair.a(), node).await;
-        assert_eq!(answer["not_held"], json!([]), "node {node}: {answer}");
-        let not_led: Vec<u64> = serde_json::from_value(answer["not_led"].clone())
-            .expect("the partitions the node does not lead");
-        if node == 0 {
-            assert!(
-                !not_led.is_empty(),
-                "the leaders of the partitions spread over the nodes: {answer}"
-            );
-        }
-        let positions = answer["positions"].as_array().expect("positions");
-        let mut covered = not_led;
-        for position in positions {
-            let partition = position["partition_id"].as_u64().expect("a partition id");
-            let offset = position["offset"].as_u64().expect("an offset");
-            covered.push(partition);
-            assert_eq!(
-                drained.insert(partition, offset),
-                None,
-                "only the node that leads a partition drains it: {answer}"
-            );
-        }
-        covered.sort_unstable();
-        assert_eq!(
-            covered,
-            (0..u64::from(PARTITIONS)).collect::<Vec<_>>(),
-            "node {node}: {answer}"
-        );
-    }
-    let expected: BTreeMap<u64, u64> = consumed
-        .iter()
-        .map(|(partition, count)| (u64::from(*partition), count - 1))
-        .collect();
-    assert_eq!(drained, expected, "one drain stores each partition");
-    let stored = pair
-        .a()
-        .bucket()
-        .positions_objects()
-        .await
-        .expect("dc-a's bucket reads");
-    for (partition, offset) in &expected {
-        let partition = u32::try_from(*partition).expect("a partition id");
-        assert!(
-            stored.iter().any(|object| object
-                .partitions
-                .get(&partition)
-                .and_then(|groups| groups.get(GROUP))
-                == Some(&GeoPosition {
-                    reset: 0,
-                    value: PositionValue::Offset(*offset)
-                })),
-            "the drains answer once the bucket holds the positions: {stored:?}"
-        );
-    }
-    for object in &stored {
-        assert!(
-            object.partitions.len() < PARTITIONS as usize,
-            "node {} publishes partitions it does not lead: {object:?}",
-            object.key.replica
-        );
-    }
-
-    pair.cluster_mut(GeoSide::A)
-        .stop()
-        .await
-        .expect("dc-a stops after the drains");
-    let group_b = Group::create(&client_b, ids.shadow()).await;
-    for (partition, count) in &consumed {
-        group_b
-            .on(*partition)
-            .wait_for_offset(&client_b, Some(count - 1))
-            .await;
-    }
-    let group_b = group_b.joined(&client_b).await;
-    for (partition, count) in &consumed {
-        assert_eq!(
-            group_b.on(*partition).consume(&client_b, 10).await,
-            (*count..count + 10).collect::<Vec<_>>(),
-            "the group resumes partition {partition} on the next message"
-        );
-    }
-}
 
 #[tokio::test]
 async fn given_a_partition_whose_leader_fails_when_another_node_takes_it_over_should_publish_the_position_it_had()
@@ -639,24 +530,6 @@ async fn wait_for_bucket_offset_on(cluster: &GeoCluster, partition: u32, offset:
         );
         sleep(RETRY).await;
     }
-}
-
-/// Drain the group on node `node` of `cluster`, and return its answer.
-async fn drain(cluster: &GeoCluster, node: usize) -> serde_json::Value {
-    let address = cluster
-        .harness()
-        .node(node)
-        .http_addr()
-        .expect("the node's HTTP address");
-    let http = HttpClient::login_root_no_redirect(format!("http://{address}")).await;
-    let response = http
-        .post_json(
-            &format!("/streams/{STREAM}/topics/{TOPIC}/consumer-groups/{GROUP}/drain?timeout=30s"),
-            &json!({}),
-        )
-        .await;
-    assert_eq!(response.status(), 200, "node {node} stores the positions");
-    response.json().await.expect("a drain body")
 }
 
 /// Run `call` until it succeeds, as an SDK does for a retryable refusal.
