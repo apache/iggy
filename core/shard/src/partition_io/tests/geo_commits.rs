@@ -57,7 +57,7 @@ fn shadow_owner() -> IoTestShard {
         origin: "dc-b".to_owned(),
         peers: vec![ORIGIN.to_owned()],
         publish_interval: Duration::from_secs(1),
-        commit_interval: Some(Duration::from_millis(50)),
+        offset_upload_interval: Some(Duration::from_millis(50)),
         resume_timeout: Duration::from_secs(10),
     }));
     owner.set_topic_objects(Some(Rc::new(ExecutorTopicObjects::new(

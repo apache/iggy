@@ -95,7 +95,7 @@ pub struct GeoPositionSettings {
     /// The shortest time between two rounds of the topics whose groups
     /// stored offsets themselves, `None` when such stores are answered at
     /// their commit.
-    pub commit_interval: Option<Duration>,
+    pub offset_upload_interval: Option<Duration>,
     /// How long group polls wait for the peers' positions after a start.
     pub resume_timeout: Duration,
 }
@@ -506,7 +506,7 @@ where
         let Some(scope) = publisher.pacing.start(
             now.as_micros(),
             micros(settings.publish_interval),
-            settings.commit_interval.map(micros),
+            settings.offset_upload_interval.map(micros),
         ) else {
             return;
         };
@@ -1060,13 +1060,13 @@ where
             .map(|(log, _)| log.clone())
             .collect();
         let now = IggyTimestamp::from(self.bus.realtime_micros());
-        let commit_interval = self
+        let offset_upload_interval = self
             .geo_settings()
-            .and_then(|settings| settings.commit_interval.map(micros));
+            .and_then(|settings| settings.offset_upload_interval.map(micros));
         publisher.pacing.finished(
             now.as_micros(),
             !finished.failed.is_empty(),
-            commit_interval,
+            offset_upload_interval,
         );
         drop(publisher);
         for shard in round.carrying {

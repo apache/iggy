@@ -836,8 +836,8 @@ ack, on a geo or shadow partition, commits as any other and is answered only
 once the node's object of the log holds the position it stored. Shard 0 then
 runs a round of that topic between the periodic ones: the primary folds the
 commit, and the node stores the object. A store that finds no round running
-and none started in the last `[geo] positions_commit_interval` (50 ms by
-default) starts one at once, and the stores that arrive meanwhile share the
+and none started in the last `[geo] consumer_offset_upload_interval` (50 ms
+by default) starts one at once, and the stores that arrive meanwhile share the
 next one, so a busy log costs one put an interval and not one a store. The
 puts take the fresh upload slots of shard 0 (`[tiered_storage.jobs]
 fresh_uploads`), so they never wait for an idle shard. A put that fails is tried again in a later round, after a wait that doubles from

@@ -26,10 +26,11 @@
 //! the group's position, and shard 0 stores the node's object of the log.
 //! The reply goes out once the store took an object that holds the
 //! position. Only one round runs at a time, and a round of held commits
-//! starts at least `[geo] positions_commit_interval` after the last one
-//! started, so the commits that arrive during a round or within the interval
-//! go into the next one: a busy topic costs one put an interval, not one a
-//! commit. Only the replies wait. The partition and the shard go on.
+//! starts at least `[geo] consumer_offset_upload_interval` after the last
+//! one started, so the commits that arrive during a round or within the
+//! interval go into the next one: a busy topic costs one put an interval,
+//! not one a commit. Only the replies wait. The partition and the shard go
+//! on.
 //!
 //! A position that the store did not take is tried in a later round, which
 //! waits longer after each failed store. A commit that waited
@@ -284,8 +285,9 @@ impl<R> HeldCommits<R> {
 /// When shard 0 starts the rounds that store positions.
 ///
 /// One of every log each publish interval, and between those, one of the
-/// topics with held commits once no round runs, the commit interval passed
-/// since the last round started, and the wait after a failed store ended.
+/// topics with held commits once no round runs, the offset upload interval
+/// passed since the last round started, and the wait after a failed store
+/// ended.
 #[derive(Debug, Clone, Default)]
 pub struct RoundPacing {
     /// When the next round of every log is due.
@@ -308,13 +310,13 @@ impl RoundPacing {
 
     /// The round to start at `now`, while no round runs: `Some(None)` for
     /// every log, `Some(Some(topics))` for the topics with held commits.
-    /// Times are microseconds, `commit_interval` is `None` when commits are
-    /// not held.
+    /// Times are microseconds, `offset_upload_interval` is `None` when
+    /// commits are not held.
     pub fn start(
         &mut self,
         now: u64,
         publish_interval: u64,
-        commit_interval: Option<u64>,
+        offset_upload_interval: Option<u64>,
     ) -> Option<Option<Vec<(usize, usize)>>> {
         if now >= self.next_round_at {
             self.next_round_at = now.saturating_add(publish_interval);
@@ -322,10 +324,10 @@ impl RoundPacing {
             self.waiting.clear();
             return Some(None);
         }
-        let commit_interval = commit_interval?;
+        let offset_upload_interval = offset_upload_interval?;
         let spaced = self
             .last_started_at
-            .is_none_or(|started| now >= started.saturating_add(commit_interval));
+            .is_none_or(|started| now >= started.saturating_add(offset_upload_interval));
         if self.waiting.is_empty() || !spaced || now < self.retry_at {
             return None;
         }
@@ -337,16 +339,16 @@ impl RoundPacing {
 
     /// A round ended at `now`, `failed` when the store refused one of its
     /// objects. Each failed round in a row doubles the wait before the next
-    /// round of held commits, from twice the commit interval up to a
+    /// round of held commits, from twice the offset upload interval up to a
     /// second.
-    pub fn finished(&mut self, now: u64, failed: bool, commit_interval: Option<u64>) {
+    pub fn finished(&mut self, now: u64, failed: bool, offset_upload_interval: Option<u64>) {
         if !failed {
             self.failed_rounds = 0;
             self.retry_at = 0;
             return;
         }
         self.failed_rounds = self.failed_rounds.saturating_add(1);
-        let delay = commit_interval
+        let delay = offset_upload_interval
             .unwrap_or(0)
             .saturating_mul(1 << self.failed_rounds.min(16))
             .min(micros(COMMIT_RETRY_DELAY_MAX));
@@ -458,7 +460,7 @@ where
             return None;
         }
         let settings = self.geo_settings()?;
-        settings.commit_interval?;
+        settings.offset_upload_interval?;
         self.topic_objects()?;
         let store = StoreConsumerOffsetRequest::decode_from(request.body()).ok()?;
         if store.consumer.kind != KIND_CONSUMER_GROUP || store.ack != AckLevel::Quorum {
