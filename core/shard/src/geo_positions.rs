@@ -22,11 +22,13 @@
 //! [`partitions::geo_positions`]. This module moves them:
 //!
 //! - **Fold and publish.** Shard 0 starts a round every publish interval: it
-//!   asks every shard for the positions of the partitions it holds. Before
-//!   it answers, a shard has the primaries here fold what their groups
-//!   committed, see [`IggyPartition::geo_notes`]. Shard 0 then stores one
-//!   object per log in the node's store, [`PositionsObject`], when what it
-//!   holds changed since the last one it stored.
+//!   asks every shard for the positions of the partitions whose primary is
+//!   here. Before it answers, a shard has those primaries fold what their
+//!   groups committed, see [`IggyPartition::geo_notes`]. Shard 0 then stores
+//!   one object per log in the node's store, [`PositionsObject`], when the
+//!   positions of a partition it leads changed since the last one it stored.
+//!   The backups commit the same positions after their primary, so only the
+//!   primary publishes them, as only the primary uploads the messages.
 //! - **Adopt.** Shard 0 lists the positions that each geo peer publishes and
 //!   hands every shard those of the partitions it owns, see
 //!   [`PeerPositions`]. The primaries here commit the ones that win over
@@ -101,7 +103,7 @@ pub struct LocalLog {
     pub partitions: Vec<(u32, IggyNamespace, u64)>,
 }
 
-/// What one shard holds of the positions of one partition.
+/// The positions of one partition whose primary is on this node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartitionPositions {
     pub log: GeoLog,
@@ -113,11 +115,15 @@ pub struct PartitionPositions {
 }
 
 /// A shard's answer to a round.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GeoPositionsReport {
     pub round: u64,
     pub shard: u16,
+    /// The partitions the shard leads.
     pub partitions: Vec<PartitionPositions>,
+    /// The partitions the shard holds a replica of without leading them, by
+    /// log and partition id.
+    pub not_led: Vec<(GeoLog, u32)>,
 }
 
 /// What the store took of a round.
@@ -138,8 +144,12 @@ pub type LogPositions = BTreeMap<u32, BTreeMap<String, GeoPosition>>;
 /// What a round found and stored of one log.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LogRound {
+    /// The partitions this node leads.
     pub partitions: BTreeMap<u32, PartitionPositions>,
-    /// Whether the node's store holds what the round found.
+    /// The partitions this node holds a replica of without leading them.
+    pub not_led: BTreeSet<u32>,
+    /// Whether the node's store holds what the round found of the partitions
+    /// it leads.
     pub stored: bool,
 }
 
@@ -198,6 +208,10 @@ struct Publisher {
     waiting: Vec<oneshot::Sender<RoundSummary>>,
     /// What the node's store holds of each log, as this node stored it.
     stored: BTreeMap<PositionsKey, LogPositions>,
+    /// The logs this node may have an object of, until it deletes it: those
+    /// it stored and those a round found held, whose object an earlier run
+    /// may have stored.
+    seen: BTreeSet<GeoLog>,
     /// Cancels the store task in flight when dropped.
     scope: Option<TierScope>,
 }
@@ -205,7 +219,7 @@ struct Publisher {
 struct Round {
     id: u64,
     now: IggyTimestamp,
-    reports: Vec<Option<Vec<PartitionPositions>>>,
+    reports: Vec<Option<GeoPositionsReport>>,
     waiters: Vec<oneshot::Sender<RoundSummary>>,
     /// What the shards reported, once all did and the store task runs.
     found: Option<RoundSummary>,
@@ -491,8 +505,8 @@ where
         Some(receiver)
     }
 
-    /// Stop the rounds of shard 0: drop the one in flight and what the node
-    /// stored, so a later start stores every object again.
+    /// Stop the rounds of shard 0: drop the one in flight, its store task
+    /// and the callers that wait for a round.
     pub fn stop_geo_positions(&self) {
         let mut publisher = self.geo_positions.publisher.borrow_mut();
         publisher.round = None;
@@ -527,9 +541,9 @@ where
         let Some(settings) = self.geo_settings() else {
             return;
         };
-        let (reported, proposals) = self.collect_geo_positions(&settings);
+        let (led, not_led, proposals) = self.collect_geo_positions(&settings);
         if proposals.is_empty() {
-            self.send_geo_positions_report(round, reported);
+            self.send_geo_positions_report(round, led, not_led);
             return;
         }
         let folded = ShardFrame::lifecycle(LifecycleFrame::ReportGeoPositionsFolded { round });
@@ -544,28 +558,39 @@ where
         let Some(settings) = self.geo_settings() else {
             return;
         };
-        let (reported, _) = self.collect_geo_positions(&settings);
-        self.send_geo_positions_report(round, reported);
+        let (led, not_led, _) = self.collect_geo_positions(&settings);
+        self.send_geo_positions_report(round, led, not_led);
     }
 
-    fn send_geo_positions_report(&self, round: u64, partitions: Vec<PartitionPositions>) {
+    fn send_geo_positions_report(
+        &self,
+        round: u64,
+        partitions: Vec<PartitionPositions>,
+        not_led: Vec<(GeoLog, u32)>,
+    ) {
         if let Some(sender) = self.senders.first() {
             let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::GeoPositionsReported(
                 Box::new(GeoPositionsReport {
                     round,
                     shard: self.id,
                     partitions,
+                    not_led,
                 }),
             )));
         }
     }
 
-    /// The positions of every geo and shadow partition here, and the folds
-    /// that the primaries here owe.
+    /// The positions of the geo and shadow partitions that this shard leads
+    /// as a current primary, the other geo and shadow partitions it holds,
+    /// and the folds that its primaries owe.
     fn collect_geo_positions(
         &self,
         settings: &GeoPositionSettings,
-    ) -> (Vec<PartitionPositions>, Vec<GeoProposal>)
+    ) -> (
+        Vec<PartitionPositions>,
+        Vec<(GeoLog, u32)>,
+        Vec<GeoProposal>,
+    )
     where
         M: RestorableMetadataStm,
     {
@@ -584,7 +609,8 @@ where
                 .collect();
             (logs, groups)
         });
-        let mut reported = Vec::new();
+        let mut led = Vec::new();
+        let mut not_led = Vec::new();
         let mut proposals = Vec::new();
         let partitions = self.plane.partitions();
         let in_flight = self.geo_positions.in_flight.borrow();
@@ -602,7 +628,11 @@ where
                 let Some(positions) = partition.geo_positions() else {
                     continue;
                 };
-                if partition.state_machines_current() && !in_flight.contains(namespace) {
+                if !partition.state_machines_current() {
+                    not_led.push((local.log.clone(), *partition_id));
+                    continue;
+                }
+                if !in_flight.contains(namespace) {
                     let notes = partition.geo_notes(local_groups);
                     if !notes.is_empty() {
                         proposals.push((*namespace, NOTE_GEO_POSITIONS, encode_notes(&notes)));
@@ -613,7 +643,7 @@ where
                     .filter(|group| !partition.geo_positions_folded(std::slice::from_ref(group)))
                     .map(|group| group.name.clone())
                     .collect();
-                reported.push(PartitionPositions {
+                led.push(PartitionPositions {
                     log: local.log.clone(),
                     partition_id: *partition_id,
                     positions: positions
@@ -625,7 +655,7 @@ where
                 });
             }
         }
-        (reported, proposals)
+        (led, not_led, proposals)
     }
 
     /// Fold what the groups of the partition of `namespace` committed, now:
@@ -863,22 +893,28 @@ where
         let Some(answer) = round.reports.get_mut(usize::from(report.shard)) else {
             return;
         };
-        *answer = Some(report.partitions);
+        *answer = Some(report);
         if round.reports.iter().any(Option::is_none) {
             return;
         }
         let mut summary = RoundSummary::default();
-        for partition in round
-            .reports
-            .iter_mut()
-            .flat_map(|answer| answer.take().unwrap_or_default())
-        {
-            summary
-                .logs
-                .entry(partition.log.clone())
-                .or_default()
-                .partitions
-                .insert(partition.partition_id, partition);
+        for report in round.reports.iter_mut().filter_map(Option::take) {
+            for partition in report.partitions {
+                summary
+                    .logs
+                    .entry(partition.log.clone())
+                    .or_default()
+                    .partitions
+                    .insert(partition.partition_id, partition);
+            }
+            for (log, partition_id) in report.not_led {
+                summary
+                    .logs
+                    .entry(log)
+                    .or_default()
+                    .not_led
+                    .insert(partition_id);
+            }
         }
         let round_id = round.id;
         let now = round.now;
@@ -891,7 +927,9 @@ where
                     .collect()
             })
         });
-        let (puts, deletes) = store_plan(&publisher.stored, &summary, replica, &held);
+        publisher.seen.extend(held.iter().cloned());
+        let (puts, deletes) =
+            store_plan(&publisher.stored, &publisher.seen, &summary, replica, &held);
         let Some(round) = publisher.round.as_mut() else {
             return;
         };
@@ -943,12 +981,14 @@ where
         publisher.scope = None;
         for (key, positions) in finished.stored {
             self.metrics.record_positions_stored(true);
+            publisher.seen.insert(key.log.clone());
             publisher.stored.insert(key, positions);
         }
         for _ in &finished.failed {
             self.metrics.record_positions_stored(false);
         }
         for key in finished.deleted {
+            publisher.seen.remove(&key.log);
             publisher.stored.remove(&key);
         }
         let replica = self.partition_consensus.self_replica_id;
@@ -958,12 +998,7 @@ where
                 log: log.clone(),
                 replica,
             };
-            found.stored = publisher.stored.get(&key).is_some_and(|stored| {
-                stored.len() == found.partitions.len()
-                    && found.partitions.iter().all(|(partition_id, partition)| {
-                        stored.get(partition_id) == Some(&partition.positions)
-                    })
-            });
+            found.stored = holds(publisher.stored.get(&key), found);
         }
         let rerun = !publisher.waiting.is_empty();
         drop(publisher);
@@ -998,11 +1033,16 @@ fn release(
     }
 }
 
-/// What a round stores: the object of each log whose positions differ from
-/// what the node stored of it last, and the delete of each object of a log
-/// that no topic of this cluster holds any more.
+/// What a round stores: the object of each log in which a partition this
+/// node leads holds other positions than the node stored last, and the
+/// delete of the node's object of each log in `seen` the cluster no longer
+/// holds.
+///
+/// An object keeps the partitions the node stopped leading as it stored
+/// them: positions only rise, so the new primary's win at the peers.
 fn store_plan(
     stored: &BTreeMap<PositionsKey, LogPositions>,
+    seen: &BTreeSet<GeoLog>,
     summary: &RoundSummary,
     replica: u8,
     held: &BTreeSet<GeoLog>,
@@ -1013,21 +1053,36 @@ fn store_plan(
             log: log.clone(),
             replica,
         };
-        let positions: LogPositions = found
-            .partitions
-            .iter()
-            .map(|(partition_id, partition)| (*partition_id, partition.positions.clone()))
-            .collect();
-        if stored.get(&key) != Some(&positions) {
-            puts.push((key, positions));
+        let last = stored.get(&key);
+        if holds(last, found) {
+            continue;
         }
+        let mut positions = last.cloned().unwrap_or_default();
+        positions.extend(
+            found
+                .partitions
+                .iter()
+                .map(|(partition_id, partition)| (*partition_id, partition.positions.clone())),
+        );
+        puts.push((key, positions));
     }
-    let deletes = stored
-        .keys()
-        .filter(|key| !held.contains(&key.log))
-        .cloned()
+    let deletes = seen
+        .iter()
+        .filter(|log| !held.contains(*log))
+        .map(|log| PositionsKey {
+            log: log.clone(),
+            replica,
+        })
         .collect();
     (puts, deletes)
+}
+
+/// Whether `stored`, what the node's object of a log holds, holds what
+/// `found` found of the partitions the node leads.
+fn holds(stored: Option<&LogPositions>, found: &LogRound) -> bool {
+    found.partitions.iter().all(|(partition_id, partition)| {
+        stored.and_then(|stored| stored.get(partition_id)) == Some(&partition.positions)
+    })
 }
 
 /// Store the objects of a round whose positions changed and delete those of
@@ -1106,33 +1161,65 @@ mod tests {
         }
     }
 
-    fn found(topic_id: u64, offset: u64) -> (GeoLog, LogRound) {
-        let positions = BTreeMap::from([(
+    fn billing_at(offset: u64) -> BTreeMap<String, GeoPosition> {
+        BTreeMap::from([(
             "billing".to_owned(),
             GeoPosition {
                 reset: 0,
                 value: PositionValue::Offset(offset),
             },
-        )]);
+        )])
+    }
+
+    /// A log of which the node leads the partitions of `led`, each with the
+    /// group at an offset, and holds those of `not_led`.
+    fn found_led(topic_id: u64, led: &[(u32, u64)], not_led: &[u32]) -> (GeoLog, LogRound) {
+        let partitions = led
+            .iter()
+            .map(|(partition_id, offset)| {
+                (
+                    *partition_id,
+                    PartitionPositions {
+                        log: log(topic_id),
+                        partition_id: *partition_id,
+                        positions: billing_at(*offset),
+                        unfolded: BTreeSet::new(),
+                    },
+                )
+            })
+            .collect();
         (
             log(topic_id),
             LogRound {
-                partitions: BTreeMap::from([(
-                    0,
-                    PartitionPositions {
-                        log: log(topic_id),
-                        partition_id: 0,
-                        positions,
-                        unfolded: BTreeSet::new(),
-                    },
-                )]),
+                partitions,
+                not_led: not_led.iter().copied().collect(),
                 stored: false,
             },
         )
     }
 
+    fn found(topic_id: u64, offset: u64) -> (GeoLog, LogRound) {
+        found_led(topic_id, &[(0, offset)], &[])
+    }
+
+    fn key(topic_id: u64) -> PositionsKey {
+        PositionsKey {
+            log: log(topic_id),
+            replica: 0,
+        }
+    }
+
+    fn plan(
+        stored: &BTreeMap<PositionsKey, LogPositions>,
+        summary: &RoundSummary,
+        held: &BTreeSet<GeoLog>,
+    ) -> (Vec<(PositionsKey, LogPositions)>, Vec<PositionsKey>) {
+        let seen = stored.keys().map(|key| key.log.clone()).collect();
+        store_plan(stored, &seen, summary, 0, held)
+    }
+
     fn stored_of(summary: &RoundSummary) -> BTreeMap<PositionsKey, LogPositions> {
-        let (puts, _) = store_plan(&BTreeMap::new(), summary, 0, &BTreeSet::new());
+        let (puts, _) = plan(&BTreeMap::new(), summary, &BTreeSet::new());
         puts.into_iter().collect()
     }
 
@@ -1144,7 +1231,7 @@ mod tests {
         let stored = stored_of(&summary);
         let held = BTreeSet::from([log(1), log(2)]);
 
-        let (puts, deletes) = store_plan(&stored, &summary, 0, &held);
+        let (puts, deletes) = plan(&stored, &summary, &held);
 
         assert_eq!(puts, []);
         assert_eq!(deletes, []);
@@ -1160,7 +1247,7 @@ mod tests {
         };
         let held = BTreeSet::from([log(1), log(2)]);
 
-        let (puts, deletes) = store_plan(&stored, &summary, 0, &held);
+        let (puts, deletes) = plan(&stored, &summary, &held);
 
         assert_eq!(
             puts.iter()
@@ -1180,17 +1267,101 @@ mod tests {
             logs: BTreeMap::from([found(1, 10)]),
         };
 
-        let (puts, deletes) = store_plan(&stored, &summary, 0, &BTreeSet::from([log(1)]));
+        let (puts, deletes) = plan(&stored, &summary, &BTreeSet::from([log(1)]));
 
         assert_eq!(puts, []);
+        assert_eq!(deletes, [key(2)]);
+        let (_, kept) = plan(&stored, &summary, &BTreeSet::from([log(1), log(2)]));
+        assert_eq!(kept, [], "a log that still exists keeps its object");
+    }
+
+    #[test]
+    fn given_a_log_the_node_held_without_storing_when_the_cluster_drops_it_should_delete_the_nodes_object()
+     {
+        let seen = BTreeSet::from([log(1), log(2)]);
+        let summary = RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[], &[0])]),
+        };
+
+        let (puts, deletes) = store_plan(
+            &BTreeMap::new(),
+            &seen,
+            &summary,
+            0,
+            &BTreeSet::from([log(1)]),
+        );
+
+        assert_eq!(
+            puts,
+            [],
+            "a node that leads nothing of a log stores nothing"
+        );
         assert_eq!(
             deletes,
-            [PositionsKey {
-                log: log(2),
-                replica: 0
-            }]
+            [key(2)],
+            "an object of an earlier run goes with its log"
         );
-        let (_, kept) = store_plan(&stored, &summary, 0, &BTreeSet::from([log(1), log(2)]));
-        assert_eq!(kept, [], "a log that still exists keeps its object");
+    }
+
+    #[test]
+    fn given_partitions_the_node_only_follows_when_planning_a_round_should_store_nothing() {
+        let summary = RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[], &[0, 1])]),
+        };
+        let held = BTreeSet::from([log(1)]);
+
+        let (fresh, _) = plan(&BTreeMap::new(), &summary, &held);
+        let earlier = stored_of(&RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)], &[])]),
+        });
+        let (left, _) = plan(&earlier, &summary, &held);
+
+        assert_eq!(fresh, [], "no object for a log the node never led");
+        assert_eq!(left, [], "the object of a former leader stays as it was");
+    }
+
+    #[test]
+    fn given_a_partition_the_node_stopped_leading_when_another_one_changes_should_keep_it_in_the_object()
+     {
+        let stored = stored_of(&RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)], &[])]),
+        });
+        let summary = RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[(1, 21)], &[0])]),
+        };
+
+        let (puts, _) = plan(&stored, &summary, &BTreeSet::from([log(1)]));
+
+        assert_eq!(
+            puts,
+            [(
+                key(1),
+                BTreeMap::from([(0, billing_at(10)), (1, billing_at(21))])
+            )]
+        );
+    }
+
+    #[test]
+    fn given_a_partition_the_node_starts_leading_with_unchanged_positions_when_planning_a_round_should_store_it()
+     {
+        let stored = stored_of(&RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[(1, 20)], &[0])]),
+        });
+        let summary = RoundSummary {
+            logs: BTreeMap::from([found_led(1, &[(0, 10), (1, 20)], &[])]),
+        };
+        let held = BTreeSet::from([log(1)]);
+
+        let (puts, _) = plan(&stored, &summary, &held);
+        let (first, _) = plan(&BTreeMap::new(), &summary, &held);
+
+        assert_eq!(
+            puts,
+            [(
+                key(1),
+                BTreeMap::from([(0, billing_at(10)), (1, billing_at(20))])
+            )]
+        );
+        assert_eq!(first.len(), 1, "a node's first round stores what it leads");
     }
 }

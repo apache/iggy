@@ -21,14 +21,15 @@
 //! Every `[geo] positions_poll_interval`, shard 0 of a node that leads a
 //! partition of a geo or shadow topic lists `meta/positions/` in the store of
 //! each peer it reads. Each node of a peer stores one object there for each
-//! log that a topic of the peer holds, see [`PositionsObject`]. Shard 0 reads
-//! the objects whose etag changed since its last read, and keeps the last one
-//! of each key, so an unchanged object costs no read. It then takes, for each
-//! partition and group, the highest position across the peer's nodes, maps
-//! each log to the topic of this cluster that holds it, and hands every shard
-//! the positions of the partitions it owns, see
-//! [`shard::geo_positions::PeerPositions`]. A shard that owns none gets an
-//! empty hand-out, which still tells it that the peer was read.
+//! log in which it leads a partition, see [`PositionsObject`], so a partition
+//! may be in one object or in several. Shard 0 reads the objects whose etag
+//! changed since its last read, and keeps the last one of each key, so an
+//! unchanged object costs no read. It then takes, for each partition and
+//! group, the highest position across the peer's nodes, maps each log to the
+//! topic of this cluster that holds it, and hands every shard the positions
+//! of the partitions it owns, see [`shard::geo_positions::PeerPositions`]. A
+//! shard that owns none gets an empty hand-out, which still tells it that the
+//! peer was read.
 //!
 //! The listings and reads go to the peer's own tier service in its
 //! housekeeping class, as the listings of its manifests do, with the same
@@ -409,6 +410,12 @@ mod tests {
     use super::*;
 
     fn object(replica: u8, offset: u64, reset: u64) -> PositionsObject {
+        led_object(replica, &[(0, offset, reset)])
+    }
+
+    /// The object of node `replica`, which leads the partitions of `led`,
+    /// each with the group at `(partition id, offset, reset)`.
+    fn led_object(replica: u8, led: &[(u32, u64, u64)]) -> PositionsObject {
         PositionsObject {
             key: PositionsKey {
                 log: GeoLog {
@@ -420,16 +427,21 @@ mod tests {
                 replica,
             },
             published_at: 0,
-            partitions: BTreeMap::from([(
-                0,
-                BTreeMap::from([(
-                    "billing".to_owned(),
-                    GeoPosition {
-                        reset,
-                        value: PositionValue::Offset(offset),
-                    },
-                )]),
-            )]),
+            partitions: led
+                .iter()
+                .map(|(partition_id, offset, reset)| {
+                    (
+                        *partition_id,
+                        BTreeMap::from([(
+                            "billing".to_owned(),
+                            GeoPosition {
+                                reset: *reset,
+                                value: PositionValue::Offset(*offset),
+                            },
+                        )]),
+                    )
+                })
+                .collect(),
         }
     }
 
@@ -451,6 +463,37 @@ mod tests {
                 value: PositionValue::Offset(10)
             },
             "a seek backwards on one node wins over the higher offsets of the others"
+        );
+    }
+
+    #[test]
+    fn given_objects_that_each_hold_the_partitions_their_node_leads_when_merging_should_take_every_partition()
+     {
+        let objects = Objects::from([
+            (
+                "a".to_owned(),
+                ("1".to_owned(), led_object(0, &[(0, 40, 0)])),
+            ),
+            (
+                "b".to_owned(),
+                ("2".to_owned(), led_object(1, &[(1, 50, 0), (0, 30, 0)])),
+            ),
+        ]);
+
+        let merged = merged(&objects);
+
+        let log = &objects["a"].1.key.log;
+        let offsets: Vec<(u32, PositionValue)> = merged[log]
+            .iter()
+            .map(|(partition_id, groups)| (*partition_id, groups["billing"].value))
+            .collect();
+        assert_eq!(
+            offsets,
+            [
+                (0, PositionValue::Offset(40)),
+                (1, PositionValue::Offset(50))
+            ],
+            "a former leader's older position of partition 0 does not win, and partition 1 comes from its only object"
         );
     }
 }
