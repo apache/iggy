@@ -23,8 +23,10 @@
 //! consumers first. The drain waits until the group has no member left in
 //! this cluster, has the partitions fold what the group committed, stores
 //! the node's object of the topic's log and waits for the store to take it.
-//! It covers the partitions that this node holds a replica of: every one
-//! with the default replication factor.
+//!
+//! It covers the partitions that this node leads. A backup cannot tell that
+//! it applied the group's last commit and its fold, so the answer lists the
+//! partitions led elsewhere, and the operator drains the group on each node.
 
 use std::str::FromStr;
 use std::time::Duration;
@@ -42,7 +44,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use send_wrapper::SendWrapper;
 use serde::{Deserialize, Serialize};
 use shard::bus_timeout;
-use shard::geo_positions::local_logs;
+use shard::geo_positions::{LogRound, local_logs};
 
 use crate::http::error::{CustomError, ErrorResponse};
 use crate::http::extractor::Identity;
@@ -70,9 +72,12 @@ pub(in crate::http) struct DrainQuery {
 #[derive(Debug, Serialize)]
 pub(in crate::http) struct DrainedGroup {
     pub group: String,
-    /// The group's position on each partition this node holds, as the node's
+    /// The group's position on each partition this node leads, as the node's
     /// bucket now holds it.
     pub positions: Vec<DrainedPosition>,
+    /// The partitions of the topic that this node holds a replica of and
+    /// another node leads. Drain the group on the node that leads them.
+    pub not_led: Vec<u32>,
     /// The partitions of the topic that this node holds no replica of. Drain
     /// a node that holds them too.
     pub not_held: Vec<u32>,
@@ -87,9 +92,10 @@ pub(in crate::http) struct DrainedPosition {
 }
 
 /// `POST /streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}/drain`:
-/// store the group's final positions in this node's bucket at once, for a
-/// planned failover. 409 while the group still has members here after the
-/// timeout, 504 when the store did not take the positions in time.
+/// store the group's final positions on the partitions this node leads in
+/// its bucket at once, for a planned failover. 409 while the group still has
+/// members here after the timeout, 504 when the store did not take the
+/// positions in time.
 pub(in crate::http) async fn drain_cg(
     State(state): State<HttpState>,
     identity: Identity,
@@ -148,32 +154,14 @@ async fn drain(
             continue;
         };
         let Some(found) = summary.logs.get(&target.log) else {
-            return Json(target.drained(&[])).into_response();
+            return Json(target.drained(&LogRound::default())).into_response();
         };
         let folded = found
             .partitions
             .values()
             .all(|partition| !partition.unfolded.contains(&target.name));
         if folded && found.stored {
-            let positions: Vec<DrainedPosition> = found
-                .partitions
-                .iter()
-                .filter_map(|(partition_id, partition)| {
-                    let position = partition.positions.get(&target.name)?;
-                    Some(DrainedPosition {
-                        partition_id: *partition_id,
-                        reset: position.reset,
-                        offset: match position.value {
-                            PositionValue::Offset(offset) => Some(offset),
-                            PositionValue::Unset | PositionValue::Deleted => None,
-                        },
-                    })
-                })
-                .collect();
-            let held: Vec<u32> = found.partitions.keys().copied().collect();
-            let mut drained = target.drained(&held);
-            drained.positions = positions;
-            return Json(drained).into_response();
+            return Json(target.drained(found)).into_response();
         }
     }
 }
@@ -257,17 +245,33 @@ impl Target {
             })
     }
 
-    fn drained(&self, held: &[u32]) -> DrainedGroup {
-        DrainedGroup {
+    /// The answer from what a round found of the topic's log on this node.
+    fn drained(&self, found: &LogRound) -> DrainedGroup {
+        let mut drained = DrainedGroup {
             group: self.name.clone(),
             positions: Vec::new(),
-            not_held: self
-                .partitions
-                .iter()
-                .copied()
-                .filter(|partition_id| !held.contains(partition_id))
-                .collect(),
+            not_led: Vec::new(),
+            not_held: Vec::new(),
+        };
+        for partition_id in &self.partitions {
+            if let Some(partition) = found.partitions.get(partition_id) {
+                if let Some(position) = partition.positions.get(&self.name) {
+                    drained.positions.push(DrainedPosition {
+                        partition_id: *partition_id,
+                        reset: position.reset,
+                        offset: match position.value {
+                            PositionValue::Offset(offset) => Some(offset),
+                            PositionValue::Unset | PositionValue::Deleted => None,
+                        },
+                    });
+                }
+            } else if found.not_led.contains(partition_id) {
+                drained.not_led.push(*partition_id);
+            } else {
+                drained.not_held.push(*partition_id);
+            }
         }
+        drained
     }
 }
 
