@@ -127,6 +127,7 @@ use crate::http::state::{
 };
 use crate::http::wire::DeferredPollQuery;
 use crate::http::{HttpState, close_connection};
+use crate::namespace::PrimaryLookup;
 use crate::server_error::ServerError;
 
 /// Marker stamped on every forwarded request. Loop guard only: a node that is
@@ -1520,12 +1521,18 @@ fn partition_hop(
 /// The primary of the partition group in this replica's view. `None` while the
 /// group has no usable view here: view change, state transfer or a partition
 /// that is not materialized yet.
+///
+/// The owner must not hold this lookup. [`serve_partition`] tells a refusal
+/// from before the group had a primary by a lookup that returned `None`, and
+/// it tests the deadline of the request between two lookups.
 async fn partition_primary(
     state: &HttpInner,
     namespace: IggyNamespace,
 ) -> Option<PartitionPrimary> {
     state.metrics.partition_primary_probes.inc();
-    match crate::namespace::partition_primary(&state.shard, namespace).await? {
+    match crate::namespace::partition_primary(&state.shard, namespace, PrimaryLookup::AnswerNow)
+        .await?
+    {
         PartitionReadReply::Primary { view, primary } => Some(PartitionPrimary {
             view,
             replica: primary,

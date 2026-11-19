@@ -44,8 +44,9 @@ use crate::poll::test_support::{
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
 use crate::{
-    ConsumerOffsetRead, LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig,
-    PartitionRead, Receiver, ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel,
+    ConsumerOffsetRead, LifecycleFrame, OffsetReadDeadlines, PARTITION_READ_TIMEOUT,
+    PartitionConsensusConfig, PartitionRead, Receiver, ReplicaTopology, ShardFrame, ShardIdentity,
+    channel, shard_channel,
 };
 
 const DEADLINE: u64 = 100;
@@ -127,7 +128,7 @@ async fn shard_of(
     }
     topic.consumer_groups.insert(0, Box::new(group));
     stream.topics.insert(topic);
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let users = Users::default();
     users.ensure_root_user("iggy", "password-hash");
     let metadata = IggyMetadata::new(
@@ -2112,21 +2113,33 @@ async fn given_stored_offsets_of_this_shard_and_another_when_read_should_read_in
             namespace,
             read,
             reply,
+            hold_deadline,
         })) = remote_inbox.recv().await
         else {
             panic!("the other owner gets one frame");
         };
-        let PartitionRead::ConsumerOffsetsOnPrimary { reads } = &read else {
+        let PartitionRead::ConsumerOffsetsOnPrimary { reads, .. } = &read else {
             panic!("the frame reads the stored offsets of its partitions");
         };
         assert_eq!(
             reads.iter().map(|read| read.namespace).collect::<Vec<_>>(),
             [partition_namespace(1), partition_namespace(2)]
         );
-        owner.on_partition_read(namespace, read, reply).await;
+        owner
+            .on_partition_read(namespace, read, reply, hold_deadline)
+            .await;
     };
 
-    let (offsets, ()) = futures::join!(owner.consumer_offsets_on_primary(reads), remote_owner);
+    let (offsets, ()) = futures::join!(
+        owner.consumer_offsets_on_primary(
+            reads,
+            OffsetReadDeadlines {
+                hold_until: u64::MAX,
+                answer_by: u64::MAX,
+            },
+        ),
+        remote_owner
+    );
 
     let offsets: Vec<_> = offsets
         .into_iter()
@@ -2230,7 +2243,12 @@ async fn pump(shard: &TestShard, inbox: &Inbox) {
                 namespace,
                 read,
                 reply,
-            } => shard.on_partition_read(namespace, read, reply).await,
+                hold_deadline,
+            } => {
+                shard
+                    .on_partition_read(namespace, read, reply, hold_deadline)
+                    .await;
+            }
             _ => panic!("a readiness test sends readiness frames and reads only"),
         }
     }

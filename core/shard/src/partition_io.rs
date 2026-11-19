@@ -6528,6 +6528,158 @@ mod tests {
         );
     }
 
+    /// A repaired metadata prepare appends only under `journal_gate`, so a WAL
+    /// rewrite that holds the gate (a checkpoint trim, a view reconcile) cannot
+    /// lose it from the rewritten file.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_held_journal_writes_when_a_metadata_repair_arrives_should_append_after_release()
+    {
+        const REPLICAS: u8 = 3;
+        const PRIMARY: usize = 0;
+        const BACKUP: usize = 2;
+        const ROOT_OP: u64 = 1;
+        const STEP_LIMIT: usize = 10_000;
+        /// Runtime turns the held repair gets, each long enough for a WAL append.
+        const HELD_TURNS: usize = 20;
+        let root_slot = usize::try_from(ROOT_OP).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let frames: Vec<MetadataFrames> = (0..REPLICAS)
+            .map(|_| Rc::new(RefCell::new(Vec::new())))
+            .collect();
+        let mut owners = Vec::new();
+        for replica in 0..REPLICAS {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let captured = Rc::clone(&frames[usize::from(replica)]);
+            bus.set_replica_forward_fn(Box::new(move |target, _, frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                captured.borrow_mut().push((target, message));
+                Ok(())
+            }));
+            for peer in (0..REPLICAS).filter(|peer| *peer != replica) {
+                crate::test_support::connect_replica_on(&bus, peer, 1);
+            }
+            let (mut owner, inbox_owner) = test_owner(&bus, None);
+            let consensus = VsrConsensus::new(
+                1,
+                replica,
+                REPLICAS,
+                METADATA_GROUP,
+                Rc::clone(&bus),
+                LocalPipeline::new(),
+            );
+            consensus.set_incarnation(u128::from(replica) + 1);
+            consensus.init();
+            consensus.mark_superblock_durable(0, 0);
+            let journal =
+                PrepareJournal::open(&directory.path().join(format!("metadata-{replica}.wal")), 0)
+                    .await
+                    .unwrap();
+            owner.plane.inner_mut().0 = IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                IoTestMetadata::new((
+                    UsersInner::new().into(),
+                    (StreamsInner::default().into(), ()),
+                )),
+                None,
+            );
+            owners.push((owner, inbox_owner));
+        }
+        let (owners, _inbox_owners): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
+        let metadata = |replica: usize| &owners[replica].plane.inner().0;
+        let consensus = |replica| metadata(replica).consensus.as_ref().unwrap();
+        let journal = |replica| metadata(replica).journal.as_ref().unwrap();
+        let take = |source: usize, target: usize, command: Command| {
+            let mut pending = frames[source].borrow_mut();
+            let index = pending
+                .iter()
+                .position(|(replica, message)| {
+                    usize::from(*replica) == target && message.header().command == command
+                })
+                .unwrap_or_else(|| panic!("missing {command:?} from {source} to {target}"));
+            pending.remove(index).1
+        };
+
+        // The primary journals the root user, and no backup hears the prepare.
+        let root_request = CreateUserRequest {
+            username: WireName::new("root").unwrap(),
+            password: "hash".to_owned(),
+            status: iggy_common::UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let mut root = Box::pin(metadata(PRIMARY).submit_root_user_in_process(&root_request));
+        for _ in 0..STEP_LIMIT {
+            assert!(futures::poll!(&mut root).is_pending());
+            if journal(PRIMARY).header(root_slot).is_some() {
+                break;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        let root_header = *journal(PRIMARY).header(root_slot).unwrap();
+        frames[PRIMARY].borrow_mut().clear();
+
+        // The backup probes, adopts the primary's view and fetches the op.
+        consensus(BACKUP).init_as_backup();
+        consensus(BACKUP).begin_view_probe();
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if frames[BACKUP]
+                .borrow()
+                .iter()
+                .any(|(_, frame)| frame.header().command == Command::RequestStartView)
+            {
+                break;
+            }
+        }
+        let probe = take(BACKUP, PRIMARY, Command::RequestStartView);
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(probe).unwrap())
+            .await;
+        let announced = take(PRIMARY, BACKUP, Command::StartView);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(announced).unwrap())
+            .await;
+        let request = take(BACKUP, PRIMARY, Command::RequestPrepares);
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(request).unwrap())
+            .await;
+        let repaired = take(PRIMARY, BACKUP, Command::RepairPrepare);
+
+        let writes = metadata(BACKUP)
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        let mut ingest =
+            Box::pin(owners[BACKUP].on_message(MessageBag::try_from(repaired).unwrap()));
+        for _ in 0..HELD_TURNS {
+            assert!(
+                futures::poll!(&mut ingest).is_pending(),
+                "the repair ended while journal writes were held"
+            );
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            journal(BACKUP).header(root_slot).is_none(),
+            "the repaired prepare landed while journal writes were held"
+        );
+
+        drop(writes);
+        ingest.await;
+        assert_eq!(
+            journal(BACKUP)
+                .header(root_slot)
+                .map(|header| header.checksum),
+            Some(root_header.checksum),
+            "the repaired prepare must land once journal writes are released"
+        );
+    }
+
     type MetadataFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
 
     #[allow(clippy::future_not_send)]
@@ -11080,7 +11232,7 @@ mod tests {
             ));
         }
         stream.topics.insert(topic);
-        inner.items.insert(stream);
+        inner.items.insert(Arc::new(stream));
         let metadata = IoTestMetadata::new((Users::default(), (inner.into(), ())));
         let metadata = IggyMetadata::new(None, None, None, None, metadata, None);
         let (sender, inbox, replies) = shard_channel(0, 2, 1);
@@ -11098,6 +11250,7 @@ mod tests {
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            false,
             ShardMetrics::for_shard(),
         )
         .expect("valid shard wiring");

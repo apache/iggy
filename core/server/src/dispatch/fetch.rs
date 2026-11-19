@@ -58,8 +58,8 @@ use shard::metrics::FetchRecord;
 use shard::shards_table::ShardsTable;
 use shard::{
     ANY_MESSAGE, CommitGate, ConsumerOffsetRead, DeferredPollContext, DeferredPollRequest,
-    KNOWN_BYTES_SLACK, OversizedTurn, PartitionReadReply, PollQuotaIdentity, ReadinessTarget,
-    ReadyTarget,
+    KNOWN_BYTES_SLACK, OffsetReadDeadlines, OversizedTurn, PartitionReadReply, PollQuotaIdentity,
+    ReadinessTarget, ReadyTarget,
 };
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -79,13 +79,21 @@ type RefusedTargets = Vec<(u32, IggyError)>;
 
 type Section = (FetchMessagesSectionHeader, Vec<Frozen<MESSAGE_ALIGN>>);
 
+/// The answer of a stored-offset read: the start after the stored offset and
+/// the current offset of the partition.
+type NextStart = Result<(u64, u64), IggyError>;
+
 /// Answers a fetch in four steps: resolve the targets once (D9), resolve the
 /// start of each `Next` target from its stored offset (D4), wait until the
 /// targets hold `min_count` messages, unless those reads already showed them,
 /// then read the ready targets that the budgets allot (D3, D10, D22). When any
 /// message ends the wait of `Next` targets, the read of the first one goes out
 /// with the stored-offset reads, and one that returns messages answers the
-/// fetch (see [`early_read`]).
+/// fetch (see [`early_read`]). A partition that cannot serve yet never delays
+/// the messages of a target with a start, and it has no section in a reply
+/// that leaves before it can serve. A target whose partition starts to serve
+/// meanwhile can wait for it, at most until its hold ends (see
+/// [`wait_for_ready_and_starts`]).
 ///
 /// The request timeout `T` starts with this future. Each read must commit
 /// before `T - 2 x FETCH_REPLY_MARGIN_US`, and the reply leaves at the latest
@@ -122,8 +130,17 @@ where
     };
     let turn = OversizedTurn::default();
     let early = early_read(shard, sessions, &targets, wire, consumer_client_id);
+    let asked: Vec<usize> = (0..targets.len())
+        .filter(|index| targets[*index].next)
+        .collect();
+    let read_deadline = timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US);
+    // No owner holds these reads: `started` is not after its clock.
+    let unheld = OffsetReadDeadlines {
+        hold_until: started,
+        answer_by: read_deadline,
+    };
     let (starts, (mut replies, mut held_reads)) = join(
-        next_starts(shard, &targets),
+        next_starts(shard, &targets, &asked, unheld),
         read_allotted(
             shard,
             &targets,
@@ -136,7 +153,8 @@ where
     let first = replies.first_mut().and_then(Option::take);
     let first_served =
         matches!(&first, Some(PartitionReadReply::Poll { fragments, .. }) if !fragments.is_empty());
-    let (next_refused, first_kept) = apply_next_starts(&mut targets, starts, first_served)?;
+    let (next_refused, first_kept) =
+        apply_next_starts(&mut targets, (&asked, starts), first_served, true)?;
     refused.extend(next_refused);
     let (replies, budget_waits, fired) = if first_served {
         // The reply carries what that read found, and the next fetch reads the others first.
@@ -144,17 +162,27 @@ where
         replies[0] = first;
         (replies, 0, shard.bus.monotonic_micros())
     } else {
-        let (replies, held, budget_waits, fired) = wait_and_read(
+        // The refusal of a first target that still lacks its start stored
+        // nothing, and the target reads again once it has the start.
+        let first = first.filter(|reply| {
+            first_kept
+                && !(matches!(
+                    reply,
+                    PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                ) && targets.first().is_some_and(|target| !target.start_known()))
+        });
+        let (replies, held, budget_waits, fired, start_refused) = wait_and_read(
             shard,
             (sessions, consumer_client_id),
-            &targets,
+            &mut targets,
             wire,
             (caller, commit_gate),
             (started, timeout),
-            (turn, first.filter(|_| first_kept)),
+            (turn, first),
         )
         .await?;
         held_reads.extend(held);
+        refused.extend(start_refused);
         (replies, budget_waits, fired)
     };
     let served = targets.first().map_or(Ok(()), |target| {
@@ -196,12 +224,13 @@ where
 /// reply `first` keeps its target out of the wait and the reads, unless it
 /// found the target empty, which stored nothing. Returns the replies by
 /// target, the room they hold, the reads that the budgets left for a later
-/// fetch and when the wait ended.
+/// fetch, when the wait ended, and the targets that their held stored-offset
+/// read refused, which leave `targets`.
 #[allow(clippy::future_not_send, clippy::type_complexity)]
 async fn wait_and_read<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     (sessions, consumer_client_id): (&Rc<RefCell<SessionManager>>, u128),
-    targets: &[FetchTarget],
+    targets: &mut Vec<FetchTarget>,
     wire: &FetchMessagesRequest,
     (caller, commit_gate): (DeferredPollContext, Option<CommitGate>),
     (started, timeout): (u64, u64),
@@ -212,6 +241,7 @@ async fn wait_and_read<B, MJ, S, SB>(
         Vec<FetchReadGuard>,
         u64,
         u64,
+        RefusedTargets,
     ),
     IggyError,
 >
@@ -236,9 +266,10 @@ where
     let wait_end = started
         .saturating_add(shard.deferred_wait_us(wire.wait_us))
         .min(timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US));
-    let waiting = &targets[usize::from(first.is_some()).min(targets.len())..];
-    let (ready_targets, every_target) =
-        wait_for_ready(shard, &caller, waiting, wire, wait_end).await?;
+    let skip = usize::from(first.is_some()).min(targets.len());
+    let ((ready_targets, every_target), refused) =
+        wait_for_ready_and_starts(shard, &caller, (targets, skip), wire, (wait_end, timeout))
+            .await?;
     let fired = shard.bus.monotonic_micros();
     let (allotted, budget_waits) = allot(
         shard,
@@ -267,7 +298,114 @@ where
     if let (Some(first), Some(slot)) = (first, replies.first_mut()) {
         *slot = Some(first);
     }
-    Ok((replies, held_reads, budget_waits, fired))
+    Ok((replies, held_reads, budget_waits, fired, refused))
+}
+
+/// [`wait_for_ready`] of a fetch whose targets from `skip` on can lack their
+/// start, because their partition could not serve the stored-offset read yet.
+/// One more read for each of their owners, which the owner holds, runs beside
+/// the wait on the other targets:
+///
+/// - Messages of the other targets end the wait. The reply then leaves
+///   without a section for the targets that still lack their start, as for a
+///   target that the budgets left for a later fetch. So a partition that
+///   cannot serve yet never delays the messages of a target with a start, and
+///   its client sees no refusal right after a create.
+/// - A target whose partition starts to serve during the hold gets its start
+///   only when every held read answered. So it can wait for a held target of
+///   the fetch, at most until the hold ends: [`shard::PARTITION_BUILD_HOLD`]
+///   after the owner first held the read, and never past one margin before
+///   the read deadline.
+/// - When the held reads answer first, or the wait ends with nothing to
+///   return, the targets that got their start join, and the wait runs once
+///   more over every target. That wait ends half a margin before the read
+///   deadline at the latest, and every target is read then. After the wait
+///   of the request ended, any message of the other targets ends the hold.
+///
+/// Also returns the targets that their held read refused, which leave
+/// `targets`.
+#[allow(clippy::future_not_send)]
+async fn wait_for_ready_and_starts<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    caller: &DeferredPollContext,
+    (targets, skip): (&mut Vec<FetchTarget>, usize),
+    wire: &FetchMessagesRequest,
+    (wait_end, timeout): (u64, u64),
+) -> Result<((Vec<ReadyTarget>, bool), RefusedTargets), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let pending: Vec<usize> = (skip..targets.len())
+        .filter(|index| !targets[*index].start_known())
+        .collect();
+    if pending.is_empty() {
+        let waiting = &targets[skip..];
+        let ready = wait_for_ready(shard, caller, waiting, wire, wire.min_count, wait_end).await?;
+        return Ok((ready, Vec::new()));
+    }
+    let read_deadline = timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US);
+    // One margin before the read deadline. An owner ends a hold on its tick,
+    // which is far shorter, so its answer arrives before the wait for it
+    // ends, and the targets that got their start can still be read.
+    let hold_until = read_deadline.saturating_sub(FETCH_REPLY_MARGIN_US);
+    let starts = {
+        let known = &targets[skip..];
+        let mut held = pin!(next_starts(
+            shard,
+            targets,
+            &pending,
+            OffsetReadDeadlines {
+                hold_until,
+                answer_by: read_deadline,
+            },
+        ));
+        let mut starts = None;
+        for (end, min_count) in [(wait_end, wire.min_count), (hold_until, ANY_MESSAGE)] {
+            let wait = pin!(wait_for_ready(shard, caller, known, wire, min_count, end));
+            match select(held.as_mut(), wait).await {
+                Either::Left((answered, _)) => {
+                    starts = Some(answered);
+                    break;
+                }
+                Either::Right((ready, _)) => {
+                    let ready = ready?;
+                    if !ready.0.is_empty() {
+                        return Ok((ready, Vec::new()));
+                    }
+                }
+            }
+        }
+        match starts {
+            Some(starts) => starts,
+            None => held.await,
+        }
+    };
+    let (refused, _) = apply_next_starts(targets, (&pending, starts), false, false)?;
+    let waiting = &targets[skip..];
+    // An evaluator that does not answer the admission of this wait holds it
+    // for `PARTITION_READ_TIMEOUT`, and the held reads can end close to the
+    // read deadline. Half a margin before it leaves the reads time to commit.
+    let cutoff = read_deadline.saturating_sub(FETCH_REPLY_MARGIN_US / 2);
+    let timer = pin!(shard.bus.sleep(Duration::from_micros(
+        cutoff.saturating_sub(shard.bus.monotonic_micros())
+    )));
+    let wait = pin!(wait_for_ready(
+        shard,
+        caller,
+        waiting,
+        wire,
+        wire.min_count,
+        wait_end
+    ));
+    let ready = match select(timer, wait).await {
+        Either::Left(_) => every_target_reads(waiting, wire),
+        Either::Right((ready, _)) => ready?,
+    };
+    Ok((ready, refused))
 }
 
 /// The read of the first target of a fetch that goes out with its
@@ -314,19 +452,23 @@ where
         count: wire.count,
         max_bytes,
         covered: false,
+        // The stored-offset reads beside it wait for the partition.
+        holdable: false,
         reservation: Some(reservation),
     })
 }
 
 /// The ready targets of a fetch at the end of its wait, and whether each
 /// target reads a share because a condition of a target ended the wait, so
-/// that each read reports its own. Only a condition of the caller fails.
+/// that each read reports its own. Only a condition of the caller fails. A
+/// target that still lacks its start takes no part.
 #[allow(clippy::future_not_send)]
 async fn wait_for_ready<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     caller: &DeferredPollContext,
     targets: &[FetchTarget],
     wire: &FetchMessagesRequest,
+    min_count: u32,
     wait_end: u64,
 ) -> Result<(Vec<ReadyTarget>, bool), IggyError>
 where
@@ -336,35 +478,47 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    if targets.is_empty() {
+    let known = || targets.iter().filter(|target| target.start_known());
+    if known().next().is_none() {
         return Ok((Vec::new(), false));
     }
-    if let Some(ready) = next_backlog(targets, wire.min_count) {
+    if let Some(ready) = next_backlog(targets, min_count) {
         return Ok((ready, false));
     }
     match shard
         .wait_for_messages(
             caller.clone(),
-            targets.iter().map(FetchTarget::readiness).collect(),
+            known().map(FetchTarget::readiness).collect(),
             Duration::from_micros(wait_end.saturating_sub(shard.bus.monotonic_micros())),
-            wire.min_count,
+            min_count,
         )
         .await
     {
         Ok(ready) => Ok((ready, false)),
         Err(error) if is_caller_condition(&error) => Err(error),
-        Err(_) => Ok((
-            targets
-                .iter()
-                .map(|target| ReadyTarget {
-                    partition_id: target.partition_id,
-                    available: u64::from(wire.count),
-                    known_bytes: None,
-                })
-                .collect(),
-            true,
-        )),
+        Err(_) => Ok(every_target_reads(targets, wire)),
     }
+}
+
+/// What [`wait_for_ready`] returns when a wait ends without the answers it
+/// needs: every target with a start reads a share, so that each read reports
+/// its own condition.
+fn every_target_reads(
+    targets: &[FetchTarget],
+    wire: &FetchMessagesRequest,
+) -> (Vec<ReadyTarget>, bool) {
+    (
+        targets
+            .iter()
+            .filter(|target| target.start_known())
+            .map(|target| ReadyTarget {
+                partition_id: target.partition_id,
+                available: u64::from(wire.count),
+                known_bytes: None,
+            })
+            .collect(),
+        true,
+    )
 }
 
 /// The sections of a fetch whose caller check after the reads ended with
@@ -439,6 +593,7 @@ where
             poll.commit_gate.clone_from(&commit_gate);
             poll.stores_fenced_from = Some(started);
             poll.oversized_turn = Some(oversized_turn);
+            poll.holdable = read.holdable;
             async move {
                 let reply = shard
                     .deferred_read(target.namespace, poll, read_deadline)
@@ -591,6 +746,12 @@ struct FetchTarget {
 }
 
 impl FetchTarget {
+    /// Whether the fetch knows where the target starts. A `Next` target gets
+    /// its start from its stored-offset read.
+    const fn start_known(&self) -> bool {
+        !self.next || self.resolved.is_some()
+    }
+
     /// The read of `read` from this target. The owner resolves a `Next`
     /// start again when it admits the read and refuses a commit once another
     /// session stored an offset, as for a deferred poll.
@@ -687,6 +848,10 @@ struct Read {
     /// Whether `max_bytes` covers the known bytes of the target with their
     /// slack, so that the read cannot return a first record above it.
     covered: bool,
+    /// Whether the owner holds the read for a partition that cannot serve
+    /// yet. Only the read of the only target of a fetch: a held read keeps
+    /// back the replies of the reads beside it.
+    holdable: bool,
     /// `None` for a target that no shard owns, which `deferred_read` refuses.
     reservation: Option<FetchReadGuard>,
 }
@@ -813,14 +978,21 @@ where
     Ok((targets, refused))
 }
 
-/// The start after the stored offset of each `Next` target, in target
+/// The start after the stored offset of each target of `asked`, in that
 /// order, with the current offset of its partition (D4). One read for each
 /// owner shard, in place on this one.
+///
+/// An owner holds these reads until `deadlines.hold_until` for a partition
+/// that cannot serve yet. No read can commit after the read deadline of the
+/// fetch, so the wait for each owner ends there, at `deadlines.answer_by`, and
+/// a read beside them that stored its offset still reaches the client (D6).
 #[allow(clippy::future_not_send)]
 async fn next_starts<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     targets: &[FetchTarget],
-) -> Vec<Result<(u64, u64), IggyError>>
+    asked: &[usize],
+    deadlines: OffsetReadDeadlines,
+) -> Vec<NextStart>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -828,18 +1000,22 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    if asked.is_empty() {
+        return Vec::new();
+    }
+    let reads: Vec<ConsumerOffsetRead> = asked
+        .iter()
+        .map(|index| {
+            let target = &targets[*index];
+            ConsumerOffsetRead {
+                namespace: target.namespace,
+                consumer: Some(target.consumer),
+                metadata: target.metadata,
+            }
+        })
+        .collect();
     shard
-        .consumer_offsets_on_primary(
-            targets
-                .iter()
-                .filter(|target| target.next)
-                .map(|target| ConsumerOffsetRead {
-                    namespace: target.namespace,
-                    consumer: Some(target.consumer),
-                    metadata: target.metadata,
-                })
-                .collect(),
-        )
+        .consumer_offsets_on_primary(reads, deadlines)
         .await
         .into_iter()
         .map(|reply| match reply {
@@ -860,23 +1036,23 @@ where
         .collect()
 }
 
-/// Sets the start of each `Next` target from `starts`. A target whose read
-/// was refused leaves `targets` and comes back with its refusal, unless its
-/// read already returned messages (`first_served` for the first target), and
-/// a refusal of the caller fails the fetch only while no read stored. Also
-/// returns whether the first target stays.
+/// Sets the start of each target of `asked` from `starts`, the answers of
+/// their stored-offset reads. A target whose read was refused leaves
+/// `targets` and comes back with its refusal, unless its read already
+/// returned messages (`first_served` for the first target), and a refusal of
+/// the caller fails the fetch only while no read stored. With `may_wait`, a
+/// target whose partition cannot serve yet stays without a start, for
+/// [`wait_for_ready_and_starts`], and it has no section in a reply that
+/// leaves before it got one. Also returns whether the first target stays.
 fn apply_next_starts(
     targets: &mut Vec<FetchTarget>,
-    starts: Vec<Result<(u64, u64), IggyError>>,
+    (asked, starts): (&[usize], Vec<NextStart>),
     first_served: bool,
+    may_wait: bool,
 ) -> Result<(RefusedTargets, bool), IggyError> {
     let mut refused = Vec::new();
-    for ((index, target), start) in targets
-        .iter_mut()
-        .enumerate()
-        .filter(|(_, target)| target.next)
-        .zip(starts)
-    {
+    for (index, start) in asked.iter().copied().zip(starts) {
+        let target = &mut targets[index];
         match start {
             Ok((start, current_offset)) => {
                 target.start = start;
@@ -884,6 +1060,7 @@ fn apply_next_starts(
             }
             Err(_) if index == 0 && first_served => {}
             Err(error) if is_caller_condition(&error) && !first_served => return Err(error),
+            Err(IggyError::TransientNotAccepted) if may_wait => {}
             Err(error) => refused.push((target.partition_id, error)),
         }
     }
@@ -897,13 +1074,14 @@ fn apply_next_starts(
     Ok((refused, first_kept))
 }
 
-/// The ready targets of a fetch whose targets are all `Next` targets, when
-/// the current offsets that their stored-offset reads returned already hold
-/// `min_count` messages after their starts, so that a wait would end at once.
+/// The ready targets of a fetch whose targets with a start are all `Next`
+/// targets, when the current offsets that their stored-offset reads returned
+/// already hold `min_count` messages after their starts, so that a wait would
+/// end at once.
 fn next_backlog(targets: &[FetchTarget], min_count: u32) -> Option<Vec<ReadyTarget>> {
     let mut held: u64 = 0;
     let mut ready = Vec::with_capacity(targets.len());
-    for target in targets {
+    for target in targets.iter().filter(|target| target.start_known()) {
         let current = target.resolved.filter(|_| target.next)?;
         // An empty partition also reports the current offset 0.
         let available = if current == 0 {
@@ -980,19 +1158,19 @@ where
     let mut allotted = Vec::with_capacity(planned.len());
     for read in planned {
         let target = &targets[read.index];
-        let reservation =
-            shard
-                .shards_table()
-                .shard_for(target.namespace)
-                .map_or(Some(None), |owner| {
-                    SessionManager::reserve_fetch_read(
-                        sessions,
-                        (consumer_client_id, owner),
-                        read.max_bytes as usize,
-                        &limits,
-                    )
-                    .map(Some)
-                });
+        // The owner that `deferred_read` sends the read to, so that a read
+        // without a routing row is counted too.
+        let reservation = shard
+            .read_owner(target.namespace)
+            .map_or(Some(None), |owner| {
+                SessionManager::reserve_fetch_read(
+                    sessions,
+                    (consumer_client_id, owner),
+                    read.max_bytes as usize,
+                    &limits,
+                )
+                .map(Some)
+            });
         let Some(reservation) = reservation else {
             budget_waits += 1;
             continue;
@@ -1008,6 +1186,7 @@ where
             count: read.count,
             max_bytes: read.max_bytes,
             covered,
+            holdable: wire.targets.len() == 1,
             reservation,
         });
     }
@@ -1758,6 +1937,648 @@ mod tests {
         assert!(
             fixture.owner_frames().is_empty(),
             "the fetch neither waits nor reads again"
+        );
+    }
+
+    /// Two `Next` targets whose owner never answers the stored-offset reads,
+    /// with a read budget of [`UNANSWERED_READ_BUDGET_US`]. The fixture skips
+    /// the wire check of the timers, so the test waits milliseconds, not the
+    /// 600 ms that the shortest valid request leaves.
+    fn fetch_with_unanswered_stored_offsets(fixture: &Fixture) -> FetchMessagesRequest {
+        FetchMessagesRequest {
+            wait_us: 0,
+            request_timeout_us: 2 * FETCH_REPLY_MARGIN_US + UNANSWERED_READ_BUDGET_US,
+            min_count: 1,
+            auto_commit: true,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ])
+        }
+    }
+
+    const UNANSWERED_READ_BUDGET_US: u64 = 20_000;
+
+    #[compio::test]
+    async fn given_stored_offset_reads_unanswered_at_the_read_deadline_when_fetching_should_answer_with_the_first_read()
+     {
+        // An owner held the stored-offset reads for a partition that could
+        // not serve yet. The fetch waited for them past its timeout, after
+        // the first read had stored its offset, so the client lost messages.
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = fetch_with_unanswered_stored_offsets(&fixture);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let (_unanswered_offsets, mut reads) = fixture.offsets_and_reads();
+        reads
+            .remove(&0)
+            .expect("the first target is read")
+            .answer(served(fixture.context(0), whole(&record)));
+        assert!(
+            futures::poll!(fetch.as_mut()).is_pending(),
+            "the stored-offset reads have until the read deadline"
+        );
+
+        let reply = compio::time::timeout(Duration::from_micros(FETCH_REPLY_MARGIN_US), fetch)
+            .await
+            .expect("the fetch must not wait for stored offsets past its read deadline")
+            .expect("the fetch succeeds")
+            .into_contiguous();
+        let sections = sections(reply.as_slice());
+        assert_eq!(sections.len(), 2);
+        assert_eq!(
+            sections[0].header,
+            fixture.served_header(0, record.len()),
+            "the read that stored its offset reaches the client"
+        );
+        assert_eq!(
+            sections[1].header.status,
+            IggyError::ShardCommunicationError.as_code(),
+            "a target whose owner did not answer is refused"
+        );
+    }
+
+    #[compio::test]
+    async fn given_next_targets_when_fetching_should_bound_the_stored_offset_reads_by_the_read_deadline()
+     {
+        const STARTED: u64 = 1_000_000;
+        let fixture = Fixture::new(2);
+        fixture.bus.monotonic.set(Some(STARTED));
+        let wire = fetch_of(vec![
+            fixture.target(0, WirePollingStrategy::next()),
+            fixture.target(1, WirePollingStrategy::next()),
+        ]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let read_deadline = STARTED + REQUEST_TIMEOUT_US - 2 * FETCH_REPLY_MARGIN_US;
+        let mut work = fixture.owner_work();
+        let (first, hold_until) = work.offsets.pop().expect("the fetch reads stored offsets");
+        assert_eq!(
+            hold_until, STARTED,
+            "no owner holds the first stored-offset reads"
+        );
+        assert!(
+            fixture
+                .bus
+                .sleeps
+                .borrow()
+                .contains(&Duration::from_micros(read_deadline - STARTED)),
+            "the wait for the owner ends at the read deadline"
+        );
+        first.answer(BTreeMap::from([(0, cannot_serve()), (1, cannot_serve())]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let held_until: Vec<_> = fixture
+            .owner_work()
+            .offsets
+            .into_iter()
+            .map(|(_, hold_until)| hold_until)
+            .collect();
+        assert_eq!(
+            held_until,
+            [read_deadline - FETCH_REPLY_MARGIN_US],
+            "an owner ends its hold one margin before the read deadline"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_partition_that_cannot_serve_yet_beside_a_backlog_when_fetching_should_answer_the_backlog_at_once()
+     {
+        // An owner held the stored-offset reads of the whole fetch for the
+        // partition that could not serve yet, so the backlog of the other
+        // target waited for up to the whole hold.
+        const STORED: u64 = 3;
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = fetch_of(vec![
+            fixture.target(0, WirePollingStrategy::next()),
+            fixture.target(1, WirePollingStrategy::next()),
+        ]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_stored_offsets(BTreeMap::from([
+            (
+                0,
+                PartitionReadReply::ConsumerOffset {
+                    stored: Some(STORED),
+                    current_offset: CURRENT_OFFSET,
+                },
+            ),
+            (1, cannot_serve()),
+        ]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let mut work = fixture.owner_work();
+        let (held, _) = work
+            .offsets
+            .pop()
+            .expect("the owner gets the read of the other target again, to hold it");
+        assert_eq!(
+            held.reads
+                .iter()
+                .map(|read| read.namespace.partition_id())
+                .collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(work.waits.is_empty(), "the backlog needs no wait");
+        let read = work.reads.remove(&0).expect("the backlog is read at once");
+        assert!(
+            !read.request.holdable,
+            "no owner holds a read beside another target"
+        );
+        read.answer(served(fixture.context(0), whole(&record)));
+
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the reply must not wait for the hold of the other target");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let headers: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| section.header)
+            .collect();
+        assert_eq!(
+            headers,
+            [fixture.served_header(0, record.len())],
+            "the target that cannot serve yet has no section, so its client sees no refusal"
+        );
+        drop(held);
+    }
+
+    #[compio::test]
+    async fn given_no_messages_beside_a_partition_that_cannot_serve_yet_when_it_starts_to_serve_should_read_it()
+     {
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = fetch_of(vec![
+            fixture.target(0, WirePollingStrategy::next()),
+            fixture.target(1, WirePollingStrategy::next()),
+        ]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_stored_offsets(BTreeMap::from([(0, nothing_new()), (1, cannot_serve())]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let mut work = fixture.owner_work();
+        let (held, _) = work.offsets.pop().expect("the owner holds the other read");
+        let (wait, _unanswered) = work.waits.pop().expect("the fetch waits beside the hold");
+        assert_eq!(
+            wait.targets
+                .iter()
+                .map(|target| target.partition_id)
+                .collect::<Vec<_>>(),
+            [0],
+            "only a target with a start waits"
+        );
+        held.answer(BTreeMap::from([(
+            1,
+            PartitionReadReply::ConsumerOffset {
+                stored: None,
+                current_offset: CURRENT_OFFSET,
+            },
+        )]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let mut reads = fixture.owner_work().reads;
+        assert_eq!(
+            reads.keys().copied().collect::<Vec<_>>(),
+            [1],
+            "the partition that serves now joins with its backlog"
+        );
+        reads
+            .remove(&1)
+            .expect("the read of the joined target")
+            .answer(served(fixture.context(1), whole(&record)));
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the fetch answers once its read ended");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| {
+                (
+                    section.header.partition_id,
+                    section.header.status,
+                    section.header.messages_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [(0, STATUS_OK, 0), (1, STATUS_OK, STORED_BATCH_MESSAGES)],
+            "a partition that the owner held for is no transient miss"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_wait_that_ended_beside_a_partition_that_cannot_serve_yet_when_a_message_arrives_should_answer_it()
+     {
+        const STARTED: u64 = 1_000_000;
+        let fixture = Fixture::new(2);
+        fixture.bus.monotonic.set(Some(STARTED));
+        let record = stored_batch_record(None);
+        let wire = FetchMessagesRequest {
+            wait_us: 0,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ])
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_stored_offsets(BTreeMap::from([(0, nothing_new()), (1, cannot_serve())]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let mut work = fixture.owner_work();
+        let (_held, hold_until) = work.offsets.pop().expect("the owner holds the other read");
+        let (_, ended) = work.waits.pop().expect("the fetch asks for its zero wait");
+        ended
+            .try_send(PartitionReadReply::Ready {
+                shard: OWNER,
+                parked: None,
+                partitions: Vec::new(),
+            })
+            .expect("the fetch awaits its wait");
+        assert!(
+            futures::poll!(fetch.as_mut()).is_pending(),
+            "a fetch with nothing to return waits for the hold"
+        );
+
+        let (watch, arrived) = fixture
+            .owner_work()
+            .waits
+            .pop()
+            .expect("the target with a start stays watched during the hold");
+        assert_eq!(watch.deadline, hold_until);
+        arrived
+            .try_send(PartitionReadReply::Ready {
+                shard: OWNER,
+                parked: None,
+                partitions: vec![ready(0, 1)],
+            })
+            .expect("the fetch awaits its watch");
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture
+            .owner_work()
+            .reads
+            .remove(&0)
+            .expect("the message that arrived is read")
+            .answer(served(fixture.context(0), whole(&record)));
+
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the reply must not wait for the hold of the other target");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| (section.header.partition_id, section.header.status))
+            .collect();
+        assert_eq!(
+            statuses,
+            [(0, STATUS_OK)],
+            "the target that cannot serve yet has no section"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_wait_restarted_after_a_hold_when_its_owner_never_answers_should_read_every_target_before_the_read_deadline()
+     {
+        // The wait ran once more over every target after the held read
+        // answered, also after the wait of the request ended. An owner that
+        // did not answer that admission kept the wait for the whole read
+        // timeout, so no target was read before the read deadline.
+        const STARTED: u64 = 1_000_000;
+        const HOLD_ANSWERED_AFTER_WAIT_US: u64 = 200_000;
+        let fixture = Fixture::new(2);
+        fixture.bus.monotonic.set(Some(STARTED));
+        let record = stored_batch_record(None);
+        let wire = fetch_of(vec![
+            fixture.target(0, WirePollingStrategy::offset(0)),
+            fixture.target(1, WirePollingStrategy::next()),
+        ]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_stored_offsets(BTreeMap::from([(1, cannot_serve())]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let mut beside_hold = fixture.owner_work();
+        let (held, _) = beside_hold
+            .offsets
+            .pop()
+            .expect("the owner holds the read of the next target");
+        assert_eq!(
+            beside_hold.waits.len(),
+            1,
+            "the other target waits beside the hold"
+        );
+
+        let now = STARTED + WAIT_US + HOLD_ANSWERED_AFTER_WAIT_US;
+        fixture.bus.monotonic.set(Some(now));
+        held.answer(BTreeMap::from([(
+            1,
+            PartitionReadReply::ConsumerOffset {
+                stored: None,
+                current_offset: CURRENT_OFFSET,
+            },
+        )]));
+        let (fire, timer) = oneshot::channel();
+        *fixture.bus.held_timer.borrow_mut() = Some(timer);
+        let armed = fixture.bus.sleeps.borrow().len();
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let read_deadline = STARTED + REQUEST_TIMEOUT_US - 2 * FETCH_REPLY_MARGIN_US;
+        let cutoff = read_deadline - FETCH_REPLY_MARGIN_US / 2;
+        let bound = Duration::from_micros(cutoff - now);
+        let shortest = fixture.bus.sleeps.borrow()[armed..]
+            .iter()
+            .min()
+            .copied()
+            .expect("the restarted wait arms a timer");
+        assert!(
+            shortest <= bound,
+            "the restarted wait must end by {bound:?}, half a margin before the read deadline, not after {shortest:?}"
+        );
+        let restarted = fixture.owner_work();
+        assert_eq!(
+            restarted.waits.len(),
+            1,
+            "the wait runs again over every target"
+        );
+        assert!(
+            restarted.reads.is_empty(),
+            "no target is read before the timer fires"
+        );
+
+        fixture.bus.monotonic.set(Some(cutoff));
+        fire.send(()).expect("the restarted wait holds the timer");
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let mut reads = fixture.owner_work().reads;
+        reads
+            .remove(&0)
+            .expect("the timer starts the reads")
+            .answer(served(fixture.context(0), whole(&record)));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture
+            .owner_work()
+            .reads
+            .remove(&1)
+            .expect("every target is read")
+            .answer(served(fixture.context(1), whole(&record)));
+
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the fetch answers once its reads did");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| (section.header.partition_id, section.header.status))
+            .collect();
+        assert_eq!(statuses, [(0, STATUS_OK), (1, STATUS_OK)]);
+        drop((beside_hold, restarted));
+    }
+
+    #[compio::test]
+    async fn given_a_first_target_that_cannot_serve_yet_when_its_first_read_is_refused_should_read_it_once_it_serves()
+     {
+        // The read of the first target leaves with the stored-offset reads,
+        // before the fetch knows that the partition cannot serve yet. Its
+        // refusal stored nothing and must not become the section of a target
+        // that the owner then holds for.
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = FetchMessagesRequest {
+            min_count: 1,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ])
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let (offsets, mut reads) = fixture.offsets_and_reads();
+        let early = reads.remove(&0).expect("the first target is read early");
+        assert!(
+            !early.request.holdable,
+            "the stored-offset reads wait for the partition, not this read"
+        );
+        early.answer(cannot_serve());
+        offsets.answer(BTreeMap::from([(0, cannot_serve()), (1, nothing_new())]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let mut work = fixture.owner_work();
+        let (held, _) = work
+            .offsets
+            .pop()
+            .expect("the owner holds for the first target");
+        held.answer(BTreeMap::from([(
+            0,
+            PartitionReadReply::ConsumerOffset {
+                stored: None,
+                current_offset: CURRENT_OFFSET,
+            },
+        )]));
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture
+            .owner_work()
+            .reads
+            .remove(&0)
+            .expect("the first target is read once it serves")
+            .answer(served(fixture.context(0), whole(&record)));
+
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the fetch answers once its read ended");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| {
+                (
+                    section.header.partition_id,
+                    section.header.status,
+                    section.header.messages_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            statuses,
+            [(0, STATUS_OK, STORED_BATCH_MESSAGES), (1, STATUS_OK, 0)]
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_first_read_that_returns_messages_beside_a_partition_that_cannot_serve_yet_should_leave_it_out()
+     {
+        let fixture = Fixture::new(2);
+        let record = stored_batch_record(None);
+        let wire = FetchMessagesRequest {
+            min_count: 1,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::next()),
+                fixture.target(1, WirePollingStrategy::next()),
+            ])
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let (offsets, mut reads) = fixture.offsets_and_reads();
+        reads
+            .remove(&0)
+            .expect("the first target is read early")
+            .answer(served(fixture.context(0), whole(&record)));
+        offsets.answer(BTreeMap::from([(0, nothing_new()), (1, cannot_serve())]));
+
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("a read that returned messages answers the fetch");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let headers: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| section.header)
+            .collect();
+        assert_eq!(
+            headers,
+            [fixture.served_header(0, record.len())],
+            "the target that cannot serve yet has no section"
+        );
+        assert!(
+            fixture.owner_frames().is_empty(),
+            "a fetch that has messages asks no owner to hold"
+        );
+    }
+
+    #[compio::test]
+    async fn given_one_next_target_whose_partition_cannot_serve_yet_when_fetching_should_wait_for_its_owner()
+     {
+        const STARTED: u64 = 1_000_000;
+        let fixture = Fixture::new(1);
+        fixture.bus.monotonic.set(Some(STARTED));
+        let wire = fetch_of(vec![fixture.target(0, WirePollingStrategy::next())]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_stored_offsets(BTreeMap::from([(0, cannot_serve())]));
+        assert!(
+            futures::poll!(fetch.as_mut()).is_pending(),
+            "a fetch right after a create waits for the partition"
+        );
+
+        let mut work = fixture.owner_work();
+        let (held, hold_until) = work.offsets.pop().expect("the owner holds the read");
+        assert_eq!(
+            hold_until,
+            STARTED + REQUEST_TIMEOUT_US - 3 * FETCH_REPLY_MARGIN_US
+        );
+        assert!(work.waits.is_empty() && work.reads.is_empty());
+        held.answer(BTreeMap::from([(0, cannot_serve())]));
+
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("a hold that ended unserved answers the fetch");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| (section.header.partition_id, section.header.status))
+            .collect();
+        assert_eq!(statuses, [(0, IggyError::TransientNotAccepted.as_code())]);
+    }
+
+    #[compio::test]
+    async fn given_the_only_target_of_a_fetch_when_reading_should_let_its_owner_hold_the_read() {
+        for (targets, holdable) in [(1, true), (2, false)] {
+            let fixture = Fixture::new(targets);
+            let wire = fetch_of(
+                (0..targets)
+                    .map(|partition_id| {
+                        fixture.target(partition_id, WirePollingStrategy::offset(0))
+                    })
+                    .collect(),
+            );
+            let fetch = fixture.fetch(&wire);
+            let mut fetch = pin!(fetch);
+            assert!(futures::poll!(fetch.as_mut()).is_pending());
+            fixture.answer_wait(
+                (0..targets)
+                    .map(|partition_id| ready(partition_id, 1))
+                    .collect(),
+            );
+            assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+            let reads = fixture.reads();
+            assert!(!reads.is_empty());
+            assert!(
+                reads.values().all(|read| read.request.holdable == holdable),
+                "a held read keeps back the replies of the reads beside it"
+            );
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_target_without_a_routing_row_when_reading_should_count_the_read_against_the_session()
+     {
+        // The read went to the hash owner of the partition, and no session
+        // room was reserved for it.
+        let fixture = Fixture::new(1);
+        let limits = DeferredPollConfig {
+            max_pending_per_session: 1,
+            ..DeferredPollConfig::default()
+        };
+        fixture.shard.set_deferred_poll_config(limits);
+        let namespace = fixture.namespaces[0];
+        fixture.shard.shards_table().remove(&namespace);
+        let owner = fixture
+            .shard
+            .read_owner(namespace)
+            .expect("this node stores the partition");
+        let wire = fetch_of(vec![fixture.target(0, WirePollingStrategy::offset(0))]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        fixture.answer_wait(vec![ready(0, 1)]);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        assert!(
+            SessionManager::reserve_fetch_read(
+                &fixture.sessions,
+                (CLIENT, owner),
+                TARGET_MAX_BYTES as usize,
+                &limits
+            )
+            .is_none(),
+            "the running read holds the room"
+        );
+    }
+
+    #[compio::test]
+    async fn given_stored_offset_reads_and_a_first_read_unanswered_when_fetching_should_answer_by_the_request_timeout()
+     {
+        let fixture = Fixture::new(2);
+        let wire = fetch_with_unanswered_stored_offsets(&fixture);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        let _unanswered = fixture.owner_frames();
+
+        let reply = compio::time::timeout(Duration::from_micros(wire.request_timeout_us), fetch)
+            .await
+            .expect("the fetch answers before its request timeout")
+            .expect("a target that is not read is a section, not a failed fetch")
+            .into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| section.header.status)
+            .collect();
+        assert_eq!(
+            statuses,
+            [IggyError::ShardCommunicationError.as_code(); 2],
+            "each target whose owner did not answer is refused"
         );
     }
 
@@ -2815,16 +3636,17 @@ mod tests {
     {
         // One target that moved or vanished failed the whole fetch, so every
         // other partition of the group lost its turn too.
-        for (answer, expected) in [
+        let answers: [(fn() -> PartitionReadReply, IggyError); 2] = [
             (
-                PartitionReadReply::Rejected(IggyError::NotPrimary),
+                || PartitionReadReply::Rejected(IggyError::NotPrimary),
                 IggyError::NotPrimary,
             ),
             (
-                PartitionReadReply::NotFound,
+                || PartitionReadReply::NotFound,
                 IggyError::TransientNotAccepted,
             ),
-        ] {
+        ];
+        for (answer, expected) in answers {
             let fixture = Fixture::new(2);
             let wire = fetch_of(vec![
                 fixture.target(0, WirePollingStrategy::offset(0)),
@@ -2833,10 +3655,27 @@ mod tests {
             let fetch = fixture.fetch(&wire);
             let mut fetch = pin!(fetch);
             assert!(futures::poll!(fetch.as_mut()).is_pending());
-            fixture.answer_stored_offsets(BTreeMap::from([(1, answer)]));
+            fixture.answer_stored_offsets(BTreeMap::from([(1, answer())]));
             assert!(futures::poll!(fetch.as_mut()).is_pending());
+            let mut work = fixture.owner_work();
+            // An owner can hold for a partition that is not there yet, so it
+            // gets that read once more, and then its refusal stands.
+            if let Some((held, _)) = work.offsets.pop() {
+                held.answer(BTreeMap::from([(1, answer())]));
+                assert!(futures::poll!(fetch.as_mut()).is_pending());
+                work = fixture.owner_work();
+            }
 
-            let wait = fixture.answer_wait(Vec::new());
+            let (wait, ended) = work.waits.pop().expect("the other target still waits");
+            ended
+                .try_send(PartitionReadReply::Ready {
+                    shard: OWNER,
+                    parked: None,
+                    partitions: Vec::new(),
+                })
+                .expect("the fetch awaits its wait");
+            // An owner that parked nothing answers once.
+            drop(ended);
 
             assert_eq!(
                 wait.targets
@@ -2902,6 +3741,148 @@ mod tests {
                 (1, IggyError::TransientNotAccepted.as_code())
             ]
         );
+    }
+
+    /// The state right after a create on a shard that owns neither partition:
+    /// the owner built both, and this shard has not seeded their routing rows.
+    #[compio::test]
+    async fn given_two_targets_without_routing_rows_when_fetching_should_read_the_whole_count_of_the_one_that_holds_it()
+     {
+        let served = fetch_after_create(&[0, 1]).await;
+        assert_eq!(
+            served.first(),
+            Some(&(0, STATUS_OK, HELD_MESSAGES)),
+            "the first target holds {HELD_MESSAGES} messages and the fetch asks for \
+             {HELD_MESSAGES}, sections as (target, status, messages): {served:?}"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_second_target_without_a_routing_row_when_fetching_should_read_the_whole_count_of_the_first()
+     {
+        let served = fetch_after_create(&[1]).await;
+        assert_eq!(
+            served.first(),
+            Some(&(0, STATUS_OK, HELD_MESSAGES)),
+            "the first target holds {HELD_MESSAGES} messages and the fetch asks for \
+             {HELD_MESSAGES}, sections as (target, status, messages): {served:?}"
+        );
+    }
+
+    /// The messages of the one batch that the first target of
+    /// [`fetch_after_create`] holds, and the count of its fetch.
+    const HELD_MESSAGES: u32 = 3;
+
+    /// One fetch of two targets from offset 0, both on partitions that hash
+    /// to [`OWNER`], which built them and serves them: the first holds one
+    /// batch of [`HELD_MESSAGES`] messages and the second is empty. The shard
+    /// of the fetch has no routing row for the targets `rowless`. Returns each
+    /// section of the reply as (target, status, messages).
+    async fn fetch_after_create(rowless: &[usize]) -> Vec<(usize, u32, u32)> {
+        const PARTITIONS: u32 = 16;
+        let fixture = Fixture::new(PARTITIONS);
+        let placement = fixture.shard.partition_shards();
+        let partitions: Vec<u32> = (0..PARTITIONS)
+            .filter(|partition_id| {
+                placement.shard_for(&fixture.namespaces[*partition_id as usize]) == OWNER
+            })
+            .take(2)
+            .collect();
+        assert_eq!(partitions.len(), 2, "two partitions hash to the owner");
+        for target in rowless {
+            let namespace = fixture.namespaces[partitions[*target] as usize];
+            fixture.shard.shards_table().remove(&namespace);
+        }
+        let wire = FetchMessagesRequest {
+            min_count: 1,
+            count: HELD_MESSAGES,
+            ..fetch_of(
+                partitions
+                    .iter()
+                    .map(|partition_id| {
+                        fixture.target(*partition_id, WirePollingStrategy::offset(0))
+                    })
+                    .collect(),
+            )
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        let reply = loop {
+            if let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) {
+                break reply;
+            }
+            let frames = fixture.owner_frames();
+            assert!(!frames.is_empty(), "a pending fetch waits for the owner");
+            for frame in frames {
+                match frame {
+                    LifecycleFrame::ReadinessWait { reply, .. } => reply
+                        .try_send(PartitionReadReply::Ready {
+                            shard: OWNER,
+                            parked: None,
+                            partitions: vec![ready(partitions[0], u64::from(HELD_MESSAGES))],
+                        })
+                        .expect("the fetch awaits its wait"),
+                    LifecycleFrame::PartitionRead {
+                        namespace,
+                        read: PartitionRead::DeferredPoll(request),
+                        reply,
+                        ..
+                    } => {
+                        let partition_id =
+                            u32::try_from(namespace.partition_id()).expect("a partition id");
+                        // The owner returns at most the count of the read.
+                        let messages = if partition_id == partitions[0] {
+                            request.args.count.min(HELD_MESSAGES)
+                        } else {
+                            0
+                        };
+                        let fragments = if messages == 0 {
+                            PollFragments::new()
+                        } else {
+                            whole(&batch_record(namespace, messages))
+                        };
+                        reply
+                            .try_send(PartitionReadReply::Poll {
+                                context: fixture.context(partition_id),
+                                fragments,
+                                current_offset: u64::from(messages.saturating_sub(1)),
+                                encryptor: None,
+                                next_offset: Some(u64::from(messages)),
+                            })
+                            .expect("the fetch awaits its read");
+                    }
+                    _ => panic!("a fetch of offset targets waits and reads"),
+                }
+            }
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        sections(reply.as_slice())
+            .iter()
+            .map(|section| {
+                let target = partitions
+                    .iter()
+                    .position(|partition_id| *partition_id == section.header.partition_id)
+                    .expect("a section of a target");
+                (target, section.header.status, section.header.messages_count)
+            })
+            .collect()
+    }
+
+    /// A stored batch record of `messages` messages.
+    fn batch_record(namespace: IggyNamespace, messages: u32) -> Frozen<MESSAGE_ALIGN> {
+        let mut batch = IggyMessages::with_capacity(messages as usize);
+        for _ in 0..messages {
+            batch.push(IggyMessage {
+                header: IggyMessageHeader::default(),
+                payload: Bytes::from_static(b"payload"),
+                user_headers: None,
+            });
+        }
+        let batch = SendMessagesOwned::from_messages(namespace, &batch).unwrap();
+        let mut bytes = vec![0; batch.header.total_size()];
+        batch.header.encode_into(&mut bytes);
+        bytes[COMMAND_HEADER_SIZE..].copy_from_slice(&batch.blob);
+        Owned::copy_from_slice(&bytes).into()
     }
 
     #[compio::test]
@@ -3575,7 +4556,7 @@ mod tests {
                 "a fetch reads the stored offsets of one owner in one frame"
             );
             let Some(LifecycleFrame::PartitionRead {
-                read: PartitionRead::ConsumerOffsetsOnPrimary { reads },
+                read: PartitionRead::ConsumerOffsetsOnPrimary { reads, .. },
                 reply,
                 ..
             }) = frames.pop()
@@ -3613,7 +4594,7 @@ mod tests {
             for frame in self.owner_frames() {
                 match frame {
                     LifecycleFrame::PartitionRead {
-                        read: PartitionRead::ConsumerOffsetsOnPrimary { reads },
+                        read: PartitionRead::ConsumerOffsetsOnPrimary { reads, .. },
                         reply,
                         ..
                     } => offsets = Some(StoredOffsets { reads, reply }),
@@ -3621,6 +4602,7 @@ mod tests {
                         namespace,
                         read: PartitionRead::DeferredPoll(request),
                         reply,
+                        ..
                     } => {
                         reads.insert(namespace.partition_id(), OwnerRead { request, reply });
                     }
@@ -3631,6 +4613,37 @@ mod tests {
                 offsets.expect("a fetch of next targets reads their stored offsets"),
                 reads,
             )
+        }
+
+        /// What the shard sent to the owner at once, by kind.
+        fn owner_work(&self) -> OwnerWork {
+            let mut work = OwnerWork::default();
+            for frame in self.owner_frames() {
+                match frame {
+                    LifecycleFrame::PartitionRead {
+                        read: PartitionRead::ConsumerOffsetsOnPrimary { reads, hold_until },
+                        reply,
+                        ..
+                    } => work
+                        .offsets
+                        .push((StoredOffsets { reads, reply }, hold_until)),
+                    LifecycleFrame::PartitionRead {
+                        namespace,
+                        read: PartitionRead::DeferredPoll(request),
+                        reply,
+                        ..
+                    } => {
+                        work.reads
+                            .insert(namespace.partition_id(), OwnerRead { request, reply });
+                    }
+                    LifecycleFrame::ReadinessWait { wait, reply, .. } => {
+                        work.waits.push((*wait, reply));
+                    }
+                    LifecycleFrame::ReadinessCancel { .. } => {}
+                    _ => panic!("a fetch reads stored offsets, waits and reads messages"),
+                }
+            }
+            work
         }
 
         /// Answers the readiness wait of the fetch with `ready`, and returns
@@ -3689,11 +4702,21 @@ mod tests {
                         namespace,
                         read: PartitionRead::DeferredPoll(request),
                         reply,
+                        ..
                     } => (namespace.partition_id(), OwnerRead { request, reply }),
                     _ => panic!("after its wait a fetch sends reads only"),
                 })
                 .collect()
         }
+    }
+
+    /// The frames of a fetch that its owner received at once.
+    #[derive(Default)]
+    struct OwnerWork {
+        /// Each stored-offset read with the end of its hold.
+        offsets: Vec<(StoredOffsets, u64)>,
+        waits: Vec<(ReadinessWait, Sender<PartitionReadReply>)>,
+        reads: BTreeMap<usize, OwnerRead>,
     }
 
     /// One read of a fetch, as its owner receives it.
@@ -3778,6 +4801,19 @@ mod tests {
     fn offset_key(partition_id: usize) -> PollingConsumer {
         let consumer = usize::try_from(CONSUMER_ID).expect("the consumer id fits usize");
         PollingConsumer::Consumer(consumer, partition_id)
+    }
+
+    /// The answer of an owner whose partition cannot serve a read yet.
+    const fn cannot_serve() -> PartitionReadReply {
+        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+    }
+
+    /// The stored offset of a target that read every message of its partition.
+    const fn nothing_new() -> PartitionReadReply {
+        PartitionReadReply::ConsumerOffset {
+            stored: Some(CURRENT_OFFSET),
+            current_offset: CURRENT_OFFSET,
+        }
     }
 
     /// A ready target that holds `available` messages, without known bytes.

@@ -40,7 +40,7 @@ use crate::dispatch::metadata_changes::metadata_changes_reply;
 use crate::dispatch::partition::{
     handle_get_consumer_offset, handle_poll_messages, read_deferred_poll, resolve_deferred_poll,
 };
-use crate::namespace::resolve_partition_namespace;
+use crate::namespace::{PrimaryLookup, resolve_partition_namespace};
 use crate::reply_frame::{build_empty_reply, current_metadata_commit};
 use crate::responses::{
     build_get_me_response, build_get_personal_access_tokens_response,
@@ -166,6 +166,11 @@ async fn handle_get_me<B, MJ, S, SB>(
 /// the caller should retry elsewhere.
 const READ_FRONTIER_BROADCASTS: u32 = 6;
 
+/// Commit broadcasts a partition request ahead of the applied frontier waits
+/// out before it fails retryable. Fewer than a held read gets: the wait runs
+/// on the drain of its connection, and the frames behind it wait with it.
+const PARTITION_FRONTIER_BROADCASTS: u32 = 2;
+
 /// How long a held metadata read may wait for this node's applied frontier,
 /// sized from `[cluster] commit_busy_heartbeat_interval`: the thing the read is
 /// short of is a commit broadcast, so the budget has to move with the
@@ -177,12 +182,23 @@ const READ_FRONTIER_BROADCASTS: u32 = 6;
 /// shard's read gate has neither consensus nor the cluster config.
 #[must_use]
 pub fn read_frontier_budget(config: &ServerConfig) -> Duration {
+    commit_broadcasts(config, READ_FRONTIER_BROADCASTS)
+}
+
+/// How long a partition request ahead of this node's applied frontier may
+/// wait for it. Sized and minted as [`read_frontier_budget`] is.
+#[must_use]
+pub fn partition_frontier_budget(config: &ServerConfig) -> Duration {
+    commit_broadcasts(config, PARTITION_FRONTIER_BROADCASTS)
+}
+
+fn commit_broadcasts(config: &ServerConfig, count: u32) -> Duration {
     config
         .cluster
         .commit_busy_heartbeat_interval
         .get_duration()
         // No config ceiling on the interval, so plain `*` can overflow.
-        .saturating_mul(READ_FRONTIER_BROADCASTS)
+        .saturating_mul(count)
 }
 
 /// Whether `code`'s answer comes from the metadata state machine, and so must
@@ -981,7 +997,7 @@ where
     let partitions_count =
         u32::try_from(partitions_count).map_err(|_| IggyError::TransientNotAccepted)?;
     let Some(PartitionReadReply::Primary { view, primary }) =
-        crate::namespace::partition_primary(shard, namespace).await
+        crate::namespace::partition_primary(shard, namespace, PrimaryLookup::Hold).await
     else {
         return Err(IggyError::TransientNotAccepted);
     };
@@ -1327,7 +1343,8 @@ async fn handle_sync_consumer_group<B, MJ, S, SB>(
 mod tests {
     use super::{
         FrontierUnreached, FrontierWait, MIN_DEFERRED_POLL_REPLY_MARGIN_US, hold_for_frontier,
-        read_frontier_budget, read_needs_metadata_frontier, remaining_timers, reply_frame_fits,
+        partition_frontier_budget, read_frontier_budget, read_needs_metadata_frontier,
+        remaining_timers, reply_frame_fits,
     };
     use configs::server::ServerConfig;
     use iggy_binary_protocol::HEADER_SIZE;
@@ -1359,12 +1376,22 @@ mod tests {
             AppliedFrontier::DEFAULT_READ_BUDGET,
             "the config default must agree with the frontier's built-in fallback"
         );
+        assert_eq!(
+            partition_frontier_budget(&config),
+            AppliedFrontier::DEFAULT_PARTITION_REQUEST_BUDGET,
+            "the config default must agree with the frontier's built-in fallback"
+        );
 
         config.cluster.commit_busy_heartbeat_interval = IggyDuration::from(Duration::from_secs(2));
         assert_eq!(
             read_frontier_budget(&config),
             Duration::from_secs(12),
             "six broadcasts of the configured interval"
+        );
+        assert_eq!(
+            partition_frontier_budget(&config),
+            Duration::from_secs(4),
+            "two broadcasts of the configured interval"
         );
     }
 

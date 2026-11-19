@@ -66,6 +66,7 @@ use futures::FutureExt;
 use iggy_binary_protocol::primitives::partition_status::{
     PartitionStatusEntry, decode_status_entries,
 };
+use iggy_binary_protocol::requests::messages::FETCH_REPLY_MARGIN_US;
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
     CHECKSUM_UNSEALED, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
@@ -94,6 +95,7 @@ use message_bus::{BusMessage, ConnectionPermit, MessageBus, ReplicaLinkId, Share
 use metadata::IggyMetadata;
 use metadata::impls::metadata::{PartitionPlacementView, StreamsFrontend, metadata_wal_head};
 use metadata::stm::StateMachine;
+use metadata::stm::snapshot::SnapshotError;
 use metadata::{BoundSession, CommitWalkStop, MetadataSubmitError};
 use partitions::state_transfer::{PrefixSeed, TransferArtifact};
 use partitions::{
@@ -105,7 +107,7 @@ use server_common::sharding::{
     IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, PartitionLocation, ShardId,
 };
 use server_common::{MESSAGE_ALIGN, Message, MessageBag, iobuf::Frozen};
-use shards_table::ShardsTable;
+use shards_table::{PartitionShards, ShardsTable};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
@@ -461,6 +463,9 @@ pub struct GatheredClients<T = ConnectedClientInfo> {
 #[derive(Debug)]
 pub enum PartitionRead {
     Primary,
+    /// As `Primary`, but the owner never holds it. For a caller that waits in
+    /// a loop of its own, and must see that the group has no primary yet.
+    PrimaryNow,
     DeferredPoll(Box<DeferredPollRequest>),
     /// Whether the replica holds a whole retirement batch retired; see
     /// [`partitions::IggyPartition::sessions_retired`]. Shared because every
@@ -511,6 +516,9 @@ pub enum PartitionRead {
     /// [`IggyShard::consumer_offsets_on_primary`].
     ConsumerOffsetsOnPrimary {
         reads: Vec<ConsumerOffsetRead>,
+        /// The owner holds the frame for a partition that cannot serve yet,
+        /// and not past this moment. On the bus clock, in microseconds.
+        hold_until: u64,
     },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffsetOnPrimary {
@@ -557,6 +565,7 @@ impl PartitionRead {
             | Self::UnboundPollOnPrimary { .. }
             | Self::Poll { .. } => true,
             Self::Primary
+            | Self::PrimaryNow
             | Self::SessionsRetired { .. }
             | Self::RetirementDebt { .. }
             | Self::GroupOffsetState { .. }
@@ -573,6 +582,17 @@ pub struct ConsumerOffsetRead {
     /// None means the named group does not exist, so no offset can exist.
     pub consumer: Option<PollingConsumer>,
     pub metadata: metadata::stm::stream::PollMetadata,
+}
+
+/// When the reads of [`IggyShard::consumer_offsets_on_primary`] end, on the
+/// bus clock, in microseconds.
+#[derive(Debug, Clone, Copy)]
+pub struct OffsetReadDeadlines {
+    /// An owner holds its frame for a partition that cannot serve yet, and
+    /// not past this moment.
+    pub hold_until: u64,
+    /// The wait for each owner ends here, never before `hold_until`.
+    pub answer_by: u64,
 }
 
 /// Reply to a [`PartitionRead`].
@@ -695,6 +715,30 @@ const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// poll that reaches it returns the messages it has, or asks for a retry.
 const COLD_POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 const _: () = assert!(COLD_POLL_BUDGET.as_millis() * 2 <= PARTITION_READ_TIMEOUT.as_millis());
+
+/// How long the owner shard holds a read of a partition that cannot serve it
+/// yet: one that it has not built or builds again, or a primary that still
+/// starts.
+///
+/// A lookup of the primary is also held while an older incarnation is here.
+///
+/// It counts from the first hold of the read. A read that is held again, as
+/// a batch is for each of its partitions that cannot serve, keeps the end of
+/// that hold.
+///
+/// Below the read timeout, so the requester gets the answer of the owner and
+/// not an expired reply budget.
+pub const PARTITION_BUILD_HOLD: std::time::Duration = std::time::Duration::from_secs(3);
+const _: () = assert!(PARTITION_BUILD_HOLD.as_millis() < PARTITION_READ_TIMEOUT.as_millis());
+
+/// Held reads of one namespace. A held read stands for one waiting client
+/// request, so it takes the cap of parked client requests.
+const MAX_HELD_READS_PER_NAMESPACE: usize = MAX_PARKED_PER_NAMESPACE;
+
+/// Held reads of one shard: as many as the park budget admits header-only
+/// frames, several times the partitions that one create can add. A batch of
+/// offset reads counts each of its reads.
+const MAX_HELD_READS: usize = MAX_PARKED_BYTES / MESSAGE_ALIGN;
 
 /// Budget for a partition write's wait on its committed reply. Longer than a
 /// read: the wait spans replication quorum plus any park-and-promote the
@@ -1097,6 +1141,11 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
+        /// The end of a hold of the read. Its requester sets it from a
+        /// budget of its own, and an owner that hands a held read back to
+        /// its inbox sets it to the end of that hold. With `None` a hold
+        /// ends [`PARTITION_BUILD_HOLD`] after it starts.
+        hold_deadline: Option<u64>,
     },
     /// Evaluate a readiness wait on the shard that owns its targets, or on
     /// the shard of the wait for the targets that it mirrors. The evaluator
@@ -1987,10 +2036,9 @@ where
     /// therefore index by `target_shard` without re-checking.
     senders: Vec<TaggedSender>,
 
-    /// Total shard count, cached from `senders.len()` at construction.
-    /// `senders` is immutable post-ctor, so consensus routing reads this
-    /// rather than recomputing the `usize -> u32` conversion per frame.
-    shard_count: u32,
+    /// Shard count, from `senders.len()` at construction, and the partition
+    /// placement over it.
+    partition_shards: PartitionShards,
 
     /// Receiver end of this shard's inbox.  Peer shards (and self) send
     /// messages here via the corresponding sender.
@@ -2095,6 +2143,11 @@ where
     /// simulator's deny ordering unreproducible for a fixed seed -- the same
     /// hazard `router.rs` documents as its reason for `select_biased!`.
     pending_partition_frames: RefCell<BTreeMap<IggyNamespace, ParkEntry>>,
+
+    /// Reads whose partition cannot serve them yet: one that this shard has
+    /// not built, or a primary that still starts. Not part of [`ParkEntry`]:
+    /// the reconciler drops an entry that holds no frame.
+    held_reads: RefCell<poll::HeldReads>,
 
     /// Running sum of [`ParkEntry::bytes`], maintained at each mutation site.
     ///
@@ -2342,6 +2395,8 @@ where
     ///   `is_shard_zero`), `None` everywhere else. Immutable post-ctor:
     ///   the coordinator is injected at construction time so an
     ///   `IggyShard` cannot appear half-wired to a reader.
+    /// * `skip_shard_zero_for_partitions` - keep partitions off shard 0, see
+    ///   [`PartitionShards`].
     /// * `metrics` - per-shard observability handle; currently the
     ///   `frame_drops_total` counter.
     ///
@@ -2374,11 +2429,12 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coordinator: Option<Rc<crate::coordinator::ShardZeroCoordinator>>,
+        skip_shard_zero_for_partitions: bool,
         metrics: crate::metrics::ShardMetrics,
     ) -> Result<Self, ShardCtorError> {
         validate_sender_ordering(&senders)?;
         let shard_count =
-            u32::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
+            u16::try_from(senders.len()).map_err(|_| ShardCtorError::ShardCountOverflow {
                 count: senders.len(),
             })?;
         let nonce_seed = boot_nonce(metadata.consensus.as_ref());
@@ -2404,7 +2460,7 @@ where
             on_client_request: host::client_request_handler(&host),
             host,
             senders,
-            shard_count,
+            partition_shards: PartitionShards::new(shard_count, skip_shard_zero_for_partitions),
             inbox,
             reply_inbox,
             poll_completions,
@@ -2428,6 +2484,7 @@ where
             shutting_down: Cell::new(false),
             stop_checkpoint_window: Cell::new(Duration::ZERO),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
+            held_reads: RefCell::default(),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
             shard_park_shedding: Cell::new(false),
@@ -2704,7 +2761,7 @@ where
         mut gathered: Gathered,
         mut fold: impl FnMut(&mut Gathered, Reply),
     ) -> (Gathered, bool) {
-        let shard_count = self.shard_count as usize;
+        let shard_count = usize::from(self.partition_shards.shard_count());
         let (reply_tx, reply_rx) = channel::<Reply>(shard_count.max(1));
         let mut expected = 0usize;
         for sender in &self.senders {
@@ -2789,8 +2846,50 @@ where
     pub async fn partition_read(
         &self,
         namespace: IggyNamespace,
+        read: PartitionRead,
+    ) -> Option<PartitionReadReply>
+    where
+        M: StreamsFrontend,
+    {
+        self.partition_read_held(namespace, read, None).await
+    }
+
+    /// [`Self::partition_read`] of a requester that stops its own wait
+    /// `budget` from now, as the hop target of an HTTP relay does. An owner
+    /// that holds the read for a partition that cannot serve yet ends the
+    /// hold one reply margin before that, so its answer still reaches the
+    /// requester, and after [`PARTITION_BUILD_HOLD`] at the latest.
+    #[allow(clippy::future_not_send)]
+    pub async fn partition_read_budgeted(
+        &self,
+        namespace: IggyNamespace,
+        read: PartitionRead,
+        budget: std::time::Duration,
+    ) -> Option<PartitionReadReply>
+    where
+        M: StreamsFrontend,
+    {
+        let micros =
+            |duration: std::time::Duration| u64::try_from(duration.as_micros()).unwrap_or(u64::MAX);
+        let hold =
+            micros(PARTITION_BUILD_HOLD).min(micros(budget).saturating_sub(FETCH_REPLY_MARGIN_US));
+        let hold_deadline = self.bus.monotonic_micros().saturating_add(hold);
+        self.partition_read_held(namespace, read, Some(hold_deadline))
+            .await
+    }
+
+    /// [`Self::partition_read`] with the end of a hold of `read`, see
+    /// [`LifecycleFrame::PartitionRead`].
+    #[allow(clippy::future_not_send)]
+    async fn partition_read_held(
+        &self,
+        namespace: IggyNamespace,
         mut read: PartitionRead,
-    ) -> Option<PartitionReadReply> {
+        hold_deadline: Option<u64>,
+    ) -> Option<PartitionReadReply>
+    where
+        M: StreamsFrontend,
+    {
         let timeout = if let PartitionRead::DeferredPoll(request) = &mut read {
             let now = self.bus.monotonic_micros();
             let wait = self
@@ -2808,7 +2907,24 @@ where
         } else {
             PARTITION_READ_TIMEOUT
         };
-        let (target, reply_rx) = match self.send_partition_read(namespace, read) {
+        self.partition_read_within(namespace, read, timeout, hold_deadline)
+            .await
+    }
+
+    /// Sends `read` and waits for its reply for `timeout` at most. See
+    /// [`Self::partition_read`] for the reply.
+    #[allow(clippy::future_not_send)]
+    async fn partition_read_within(
+        &self,
+        namespace: IggyNamespace,
+        read: PartitionRead,
+        timeout: std::time::Duration,
+        hold_deadline: Option<u64>,
+    ) -> Option<PartitionReadReply>
+    where
+        M: StreamsFrontend,
+    {
+        let (target, reply_rx) = match self.send_partition_read(namespace, read, hold_deadline) {
             Ok(sent) => sent,
             Err(error) => return Some(PartitionReadReply::Rejected(error)),
         };
@@ -2834,9 +2950,18 @@ where
     }
 
     /// [`PartitionRead::ConsumerOffsetOnPrimary`] for each of `reads`, in
-    /// order. The partitions that this shard owns are read in place, and the
-    /// others in one frame for each owner shard, all at once. `None` where an
-    /// owner dropped the reply or did not answer within `PARTITION_READ_TIMEOUT`.
+    /// order. The partitions that this shard owns are read in place, unless
+    /// one cannot serve yet and `hold_until` leaves time to hold it. The others
+    /// go in one frame for each owner shard, all at once.
+    ///
+    /// An owner holds its frame for a partition that cannot serve yet, until
+    /// `hold_until` at the latest, and then answers each read alone. The wait
+    /// for each owner ends at `answer_by`, and after `PARTITION_READ_TIMEOUT`
+    /// at the latest, so the answers of the other owners are kept. Give
+    /// `hold_until` a margin before `answer_by`, or the answer of a hold that
+    /// ends unserved arrives too late.
+    ///
+    /// `None` where an owner dropped the reply or did not answer in time.
     /// A namespace that no shard owns, or an inbox that refuses the frame,
     /// returns [`PartitionReadReply::Rejected`] with
     /// [`IggyError::TransientNotAccepted`].
@@ -2844,16 +2969,31 @@ where
     pub async fn consumer_offsets_on_primary(
         &self,
         reads: Vec<ConsumerOffsetRead>,
+        OffsetReadDeadlines {
+            hold_until,
+            answer_by,
+        }: OffsetReadDeadlines,
     ) -> Vec<Option<PartitionReadReply>>
     where
         M: StreamsFrontend,
     {
+        debug_assert!(
+            hold_until <= answer_by,
+            "hold_until {hold_until} is after answer_by {answer_by}"
+        );
         let mut replies: Vec<Option<PartitionReadReply>> =
             std::iter::repeat_with(|| None).take(reads.len()).collect();
         let mut owners: BTreeMap<u16, (Vec<usize>, Vec<ConsumerOffsetRead>)> = BTreeMap::new();
+        // The first reads of a fetch leave no time for a hold. They are read
+        // in place, without the lookups that tell whether a partition can serve.
+        let holdable = hold_until > self.bus.monotonic_micros();
         for (index, read) in reads.into_iter().enumerate() {
-            match self.shards_table.shard_for(read.namespace) {
-                Some(owner) if owner == self.id => {
+            match self.read_owner(read.namespace) {
+                // A read whose partition cannot serve yet goes through the
+                // inbox, where it is held.
+                Some(owner)
+                    if owner == self.id && !(holdable && self.awaits_start(read.namespace)) =>
+                {
                     replies[index] = Some(self.consumer_offset_on_primary(read));
                 }
                 Some(owner) => {
@@ -2868,13 +3008,17 @@ where
                 }
             }
         }
+        let budget =
+            std::time::Duration::from_micros(answer_by.saturating_sub(self.bus.monotonic_micros()))
+                .min(PARTITION_READ_TIMEOUT);
         let answers =
             futures::future::join_all(owners.into_values().map(|(indexes, reads)| async {
                 let Some(namespace) = reads.first().map(|read| read.namespace) else {
                     return (indexes, None);
                 };
+                let read = PartitionRead::ConsumerOffsetsOnPrimary { reads, hold_until };
                 let reply = self
-                    .partition_read(namespace, PartitionRead::ConsumerOffsetsOnPrimary { reads })
+                    .partition_read_within(namespace, read, budget, None)
                     .await;
                 (indexes, reply)
             }))
@@ -2899,6 +3043,21 @@ where
         replies
     }
 
+    /// The shard that a read of messages or offsets of `namespace` goes to:
+    /// that of its routing row, and without a row the hash owner when this
+    /// node stores the partition, as `send_partition_read` routes it. A wait
+    /// for messages asks the same shard, so it refuses no target that a read
+    /// would serve.
+    #[must_use]
+    pub fn read_owner(&self, namespace: IggyNamespace) -> Option<u16>
+    where
+        M: StreamsFrontend,
+    {
+        self.shards_table
+            .shard_for(namespace)
+            .or_else(|| self.stored_partition_owner(namespace))
+    }
+
     /// One zero-wait read of a fetch on the owner of `namespace`. The owner
     /// tests `request_deadline` before it commits, so a late read commits
     /// nothing. This read has no timer: its caller drops the future at its
@@ -2915,7 +3074,10 @@ where
         namespace: IggyNamespace,
         mut request: DeferredPollRequest,
         request_deadline: u64,
-    ) -> Option<PartitionReadReply> {
+    ) -> Option<PartitionReadReply>
+    where
+        M: StreamsFrontend,
+    {
         let now = self.bus.monotonic_micros();
         let remaining = request_deadline
             .checked_sub(now)
@@ -2924,7 +3086,8 @@ where
         request.options.request_timeout = IggyDuration::from(remaining);
         request.deadline = now;
         request.request_deadline = request_deadline;
-        match self.send_partition_read(namespace, PartitionRead::DeferredPoll(Box::new(request))) {
+        let read = PartitionRead::DeferredPoll(Box::new(request));
+        match self.send_partition_read(namespace, read, None) {
             Ok((_, reply)) => reply.recv().await.ok(),
             Err(error) => Some(PartitionReadReply::Rejected(error)),
         }
@@ -2933,18 +3096,37 @@ where
     /// Sends `read` to the shard that owns `namespace`, and returns that shard
     /// and the receiver of its reply. A namespace that no shard owns, or an
     /// inbox that refuses the frame, gives `TransientNotAccepted`.
+    ///
+    /// A namespace without a routing row goes to its hash owner in two cases.
+    /// `Primary` and `SessionsRetired` always do, because their callers take
+    /// the `NotFound` of that owner as a transient miss. A read of messages or
+    /// offsets does when this node stores the partition: the owner can have
+    /// built it before this shard seeded its row, and it holds the read while
+    /// it has not. Every other read stays a miss here.
     fn send_partition_read(
         &self,
         namespace: IggyNamespace,
         read: PartitionRead,
-    ) -> Result<(u16, Receiver<PartitionReadReply>), IggyError> {
-        let target = self.shards_table.shard_for(namespace).or_else(|| {
-            matches!(read, PartitionRead::SessionsRetired { .. }).then(|| {
-                crate::shards_table::calculate_shard_assignment(&namespace, self.shard_count)
+        hold_deadline: Option<u64>,
+    ) -> Result<(u16, Receiver<PartitionReadReply>), IggyError>
+    where
+        M: StreamsFrontend,
+    {
+        let target = if read.reads_messages_or_offset() {
+            self.read_owner(namespace)
+        } else {
+            self.shards_table.shard_for(namespace).or_else(|| {
+                matches!(
+                    read,
+                    PartitionRead::Primary
+                        | PartitionRead::PrimaryNow
+                        | PartitionRead::SessionsRetired { .. }
+                )
+                .then(|| self.partition_shards.shard_for(&namespace))
             })
-        });
+        };
         let Some(target) = target else {
-            tracing::warn!(
+            tracing::debug!(
                 shard = self.id,
                 namespace_raw = namespace.inner(),
                 "partition_read: namespace not routable (not materialised yet or deleted)"
@@ -2956,6 +3138,7 @@ where
             namespace,
             read,
             reply: reply_tx,
+            hold_deadline,
         });
         let Some(sender) = self.senders.get(target as usize) else {
             return Err(IggyError::TransientNotAccepted);
@@ -3021,8 +3204,7 @@ where
         let mut snapshots = Vec::new();
         for target in targets {
             let owner = self
-                .shards_table
-                .shard_for(target.namespace)
+                .read_owner(target.namespace)
                 .ok_or(IggyError::TransientNotAccepted)?;
             let mirrorable =
                 mirrors && owner != self.id && target.strategy.kind == PollingKind::Offset;
@@ -3212,10 +3394,7 @@ where
         let target = self.shards_table.shard_for(namespace).unwrap_or_else(|| {
             // Same fallback as `route_typed`: a miss means "not seeded yet",
             // not "unroutable", and the owning shard parks what arrives early.
-            crate::shards_table::calculate_shard_from_consensus_ns(
-                namespace.inner(),
-                self.shard_count,
-            )
+            self.partition_shards.shard_for(&namespace)
         });
         let (reply_tx, reply_rx) = channel::<Option<Message<GenericHeader>>>(1);
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
@@ -3348,7 +3527,7 @@ where
         const POLL_COMPLETION_CAPACITY: usize = 1;
 
         // Placeholder lanes: the simulator delivers frames straight to
-        // `on_message` (see the `shard_count` note below), so nothing ever
+        // `on_message` (see the `partition_shards` note below), so nothing ever
         // sends here and capacity 1 exists only to satisfy the fields. The
         // real lanes are bounded on purpose (`inbox_capacity` /
         // `reply_inbox_capacity` are the shard's backpressure), so no
@@ -3374,11 +3553,11 @@ where
             senders: Vec::new(),
             // The simulator delivers inbound messages straight to
             // `on_message`, bypassing the inter-shard router. The router's
-            // `shard_count` should therefore never be read on this path,
-            // but `pub fn dispatch` is still reachable; pinning to 1 keeps
-            // `% shard_count` from panicking if a future caller slips
-            // through, while preserving single-shard routing semantics.
-            shard_count: 1,
+            // placement should therefore never be read on this path,
+            // but `pub fn dispatch` is still reachable; pinning one shard
+            // keeps the placement from dividing by zero if a future caller
+            // slips through, while preserving single-shard routing semantics.
+            partition_shards: PartitionShards::new(1, false),
             inbox,
             reply_inbox,
             deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
@@ -3408,6 +3587,7 @@ where
             shutting_down: Cell::new(false),
             stop_checkpoint_window: Cell::new(Duration::ZERO),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
+            held_reads: RefCell::default(),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
             shard_park_shedding: Cell::new(false),
@@ -3464,6 +3644,11 @@ where
     }
 
     #[must_use]
+    pub const fn partition_shards(&self) -> PartitionShards {
+        self.partition_shards
+    }
+
+    #[must_use]
     pub const fn metrics(&self) -> &crate::metrics::ShardMetrics {
         &self.metrics
     }
@@ -3479,8 +3664,8 @@ where
     ///
     /// Whole mesh, not one sender: consumers index by shard id and
     /// `forward_metadata_submit` indexes `senders[0]` unconditionally, so a
-    /// one-element vec is correct only for shard 0. `shard_count` tracks it, as
-    /// in both constructors.
+    /// one-element vec is correct only for shard 0. `partition_shards` counts it,
+    /// as in both constructors.
     ///
     /// # Panics
     /// If the mesh is not ordered `senders[i].shard_id() == i` or does not cover
@@ -3494,7 +3679,9 @@ where
             self.id
         );
         validate_sender_ordering(&senders).expect("attach_senders: mesh must be ordered by shard");
-        self.shard_count = u32::try_from(senders.len()).expect("shard count fits u32");
+        let count = u16::try_from(senders.len()).expect("shard count fits u16");
+        self.partition_shards =
+            PartitionShards::new(count, self.partition_shards.skip_shard_zero());
         self.senders = senders;
     }
 
@@ -3727,6 +3914,7 @@ where
     pub fn apply_reconcile_ops(&self)
     where
         B: MessageBus + 'static,
+        M: StreamsFrontend,
     {
         let staged: Vec<ReconcileOp<B, SB>> = {
             let mut q = self.reconcile_queue.borrow_mut();
@@ -4783,7 +4971,17 @@ where
     /// The one retirement path a prepare still travels. It is retained
     /// everywhere else (see `ParkedFrame::passes`); here the namespace itself
     /// is unreachable, so holding it buys nothing.
-    pub fn discard_parked_partition_frames(&self, namespace: IggyNamespace) {
+    ///
+    /// Also ends the holds of the namespace, unless its partition is due
+    /// here, as after the removal of an older incarnation (see
+    /// `release_settled_reads`).
+    pub fn discard_parked_partition_frames(&self, namespace: IggyNamespace)
+    where
+        B: 'static,
+        M: StreamsFrontend,
+        T: ShardsTable,
+    {
+        self.release_settled_reads(namespace);
         // Bound the borrow to this statement: the guard in an `if let`
         // scrutinee otherwise lives to the end of the then-block, holding a
         // shard-global map locked across the outbound sends below.
@@ -4902,7 +5100,16 @@ where
     /// [`MAX_PARKED_PASSES`] does not bound a staged frame: it has left the park
     /// buffer, and the pump selects the queue on the iteration after it was
     /// filled. Returns whether at least one frame was staged.
-    fn redispatch_parked_frames(&self, namespace: IggyNamespace, epoch: u64) -> bool {
+    ///
+    /// Every insert of a partition passes here, so this also answers the reads
+    /// held for the namespace, see [`Self::release_settled_reads`].
+    fn redispatch_parked_frames(&self, namespace: IggyNamespace, epoch: u64) -> bool
+    where
+        B: 'static,
+        M: StreamsFrontend,
+        T: ShardsTable,
+    {
+        self.release_settled_reads(namespace);
         let Some(frames) = self.take_parked_partition_frames(namespace) else {
             return false;
         };
@@ -4995,6 +5202,16 @@ where
             .borrow()
             .get(&namespace)
             .map_or(0, |entry| entry.frames.len())
+    }
+
+    /// How many reads are held for partitions that cannot serve them yet.
+    ///
+    /// Test/simulator accessor, gated for the same reason as
+    /// [`Self::parked_frame_count`].
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn held_read_count(&self) -> usize {
+        self.held_reads.borrow().count()
     }
 
     /// How many frames are staged for the pump to re-deliver.
@@ -5851,9 +6068,98 @@ where
         false
     }
 
+    /// Committed `created_revision` of a partition that this node stores and
+    /// this shard has not built. `None` for a tombstoned namespace: its
+    /// partition is torn down or rebuilt, not awaited.
+    fn unbuilt_partition_revision(&self, namespace: IggyNamespace) -> Option<u64>
+    where
+        M: StreamsFrontend,
+    {
+        let partitions = self.plane.partitions();
+        if partitions.contains(&namespace) || partitions.is_tombstoned(&namespace) {
+            return None;
+        }
+        self.stored_partition_revision(namespace)
+    }
+
+    /// The hash owner of `namespace` when this node stores its partition.
+    fn stored_partition_owner(&self, namespace: IggyNamespace) -> Option<u16>
+    where
+        M: StreamsFrontend,
+    {
+        self.stored_partition_revision(namespace)
+            .map(|_| self.partition_shards.shard_for(&namespace))
+    }
+
+    /// Committed `created_revision` of a partition that this node stores,
+    /// from local metadata alone.
+    fn stored_partition_revision(&self, namespace: IggyNamespace) -> Option<u64>
+    where
+        M: StreamsFrontend,
+    {
+        let node = self.partition_consensus.self_replica_id;
+        self.plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .with_committed_partition(namespace, |partition| {
+                partition
+                    .members
+                    .is_none_or(|members| members.member(node).is_some())
+                    .then_some(partition.created_revision)
+            })
+            .flatten()
+    }
+
+    /// Record a control frame that addresses no partition of this shard.
+    ///
+    /// Two cases are the ordinary gap between a create and its local build,
+    /// and they count without a warning. Local metadata holds the partition at
+    /// the incarnation of the frame, and the reconciler has not built it. Or
+    /// local metadata is behind the create: an incarnation is the streams
+    /// revision that its create set, every replica computes that revision
+    /// from the same applied ops, and it only grows.
+    fn note_unresolved_partition_frame(
+        &self,
+        namespace: IggyNamespace,
+        partition_incarnation: u64,
+        view: u32,
+        replica: u8,
+        frame: Command,
+    ) where
+        M: StreamsFrontend,
+    {
+        let streams = self.plane.metadata().mux_stm.streams();
+        let local_revision = streams.read(|inner| inner.revision);
+        let awaited = partition_incarnation > local_revision
+            || self.unbuilt_partition_revision(namespace) == Some(partition_incarnation);
+        if awaited {
+            self.metrics.record_partition_frame_dropped_unbuilt();
+            tracing::debug!(
+                shard = self.id,
+                namespace = namespace.inner(),
+                partition_incarnation,
+                view,
+                replica,
+                ?frame,
+                "dropping VSR control frame: its partition is not built here yet"
+            );
+        } else {
+            tracing::warn!(
+                shard = self.id,
+                namespace = namespace.inner(),
+                view,
+                replica,
+                ?frame,
+                "dropping VSR control frame: namespace matches neither metadata nor partition consensus"
+            );
+        }
+    }
+
     /// Resolve the single partition a VSR control frame addresses, keyed by
-    /// `header.group`. Warns and returns `None` when the namespace matches
-    /// neither metadata nor a live partition consensus. Returns `&mut` because
+    /// `header.group`. Returns `None` when the namespace matches neither
+    /// metadata nor a live partition consensus, which
+    /// [`Self::note_unresolved_partition_frame`] records. Returns `&mut` because
     /// `on_do_view_change` / `on_commit` need it for `commit_journal`; the read-
     /// only callers reborrow `&`. Pump-only (sole mutator), so the `&mut` formed
     /// here via interior mutability cannot alias a concurrent reconcile.
@@ -5869,15 +6175,15 @@ where
     ) -> Option<&'a mut IggyPartition<B, SB>>
     where
         B: MessageBus,
+        M: StreamsFrontend,
     {
         let Some(partition) = partitions.get_mut_by_ns(&IggyNamespace::from_raw(namespace)) else {
-            tracing::warn!(
-                shard = self.id,
-                namespace,
+            self.note_unresolved_partition_frame(
+                IggyNamespace::from_raw(namespace),
+                partition_incarnation,
                 view,
                 replica,
-                ?frame,
-                "dropping VSR control frame: namespace matches neither metadata nor partition consensus"
+                frame,
             );
             return None;
         };
@@ -5906,6 +6212,7 @@ where
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: StreamsFrontend,
     {
         let header = *msg.header();
         let planes = self.plane.inner();
@@ -6471,7 +6778,10 @@ where
 
     /// Count each valid entry of a reply batch. An invalid entry does not stop
     /// the other entries.
-    fn on_commit_reply(&self, msg: &Message<CommitReplyHeader>) {
+    fn on_commit_reply(&self, msg: &Message<CommitReplyHeader>)
+    where
+        M: StreamsFrontend,
+    {
         let Some(entries) =
             commit_batch::verified_entries::<_, CommitReplyEntry>(msg, msg.header().checksum_body)
         else {
@@ -7519,7 +7829,14 @@ where
             if !planes.0.persist_superblock_if_needed(consensus).await {
                 return;
             }
-            if let Err(error) = journal.append(msg).await {
+            // A WAL rewrite or checkpoint trim running under the append would drop
+            // it from the rewritten file. Released before the reconcile below, which
+            // takes the gate itself.
+            let appended = {
+                let _journal_writes = planes.0.hold_journal_writes().await;
+                journal.append(msg).await
+            };
+            if let Err(error) = appended {
                 tracing::warn!(
                     shard = self.id,
                     op = header.op,
@@ -9052,7 +9369,10 @@ where
                     header.group,
                     consensus.partition_incarnation(),
                     TransferDescriptor::unavailable(
-                        matches!(reason, metadata::impls::metadata::StateTransferUnavailable::CheckpointInProgress),
+                        matches!(
+                            reason,
+                            metadata::impls::metadata::StateTransferUnavailable::SnapshotReplaced
+                        ),
                         consensus.view(),
                         consensus.commit_max(),
                     ),
@@ -9202,6 +9522,25 @@ where
             );
             return;
         };
+        // The install refuses this tail, after the whole fetch. A manifest
+        // without a client table fails there too.
+        if let Some(table) = manifest
+            .iter()
+            .find(|entry| entry.kind == consensus::artifact_kind::CLIENT_TABLE)
+            && let Err(error) = planes
+                .0
+                .verify_state_transfer_tail(generation, table.frontier)
+        {
+            tracing::error!(
+                shard = self.id,
+                peer = header.replica,
+                snapshot_seq = generation,
+                table_frontier = table.frontier,
+                %error,
+                "state transfer descriptor has a tail this replica cannot journal; ignoring"
+            );
+            return;
+        }
         if self.decode_budget_exhausted(generation) {
             // Pulling this generation again cannot end differently; refuse the
             // descriptor so the failure costs one frame per stall round, not a
@@ -9227,6 +9566,13 @@ where
             };
             if session.target_accepted {
                 // Duplicate descriptor (stall retry crossed the original).
+                return;
+            }
+            if planes.0.checkpoint_running() {
+                // The install would wait on this pump for the rest of the
+                // checkpoint's write. The stall sweep asks for the descriptor
+                // again, and no stall budget is refilled.
+                session.idle_ticks = 0;
                 return;
             }
             session.target_accepted = true;
@@ -9859,6 +10205,18 @@ where
                     %error,
                     "state transfer install failed; falling back to journal repair"
                 );
+                // A failed write on this replica says nothing about the
+                // snapshot. Every other refusal repeats for the same
+                // generation, and the chunks of each fetch refill the stall
+                // budget.
+                if !matches!(
+                    error,
+                    SnapshotError::Io(_)
+                        | SnapshotError::Persist { .. }
+                        | SnapshotError::HistoryBindingNotDurable { .. }
+                ) {
+                    self.burn_decode_failure(generation);
+                }
                 consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
                 planes.0.commit_journal().await;
                 self.maybe_request_metadata_repair(consensus, peer).await;
@@ -15677,10 +16035,13 @@ async fn dispatch_vsr_actions<B, P, J>(
                     if !consensus.view_log_entry_proven(op) {
                         continue;
                     }
-                    let Some(prepare_header) = journal.handle().header(op as usize) else {
+                    // Copied out of its guard: the send below awaits, and a
+                    // WAL trim meanwhile borrows the index mutably.
+                    let Some(prepare_header) =
+                        journal.handle().header(op as usize).map(|header| *header)
+                    else {
                         continue;
                     };
-                    let prepare_header = *prepare_header;
                     let msg = Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>())
                         .transmute_header(|_, h: &mut PrepareOkHeader| {
                             h.command = Command::PrepareOk;
