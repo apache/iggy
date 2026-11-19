@@ -280,6 +280,12 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                    static_cast<void>(&iggy::StreamDetails::EncryptionKekFingerprints);
                    return true;
                }},
+              {"shadow_origin",
+               [] {
+                   static_cast<void>(&iggy::StreamDetails::ShadowOrigin);
+                   static_cast<void>(&iggy::Stream::ShadowOrigin);
+                   return true;
+               }},
           }}},
         {"user",
          {{},

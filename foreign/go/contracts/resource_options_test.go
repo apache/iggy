@@ -357,6 +357,7 @@ type streamResponseVector struct {
 		EncryptionKeySource       string                `json:"encryption_key_source"`
 		EncryptionKeyFingerprint  *string               `json:"encryption_key_fingerprint"`
 		EncryptionKekFingerprints []string              `json:"encryption_kek_fingerprints"`
+		ShadowOrigin              *string               `json:"shadow_origin"`
 	} `json:"expected"`
 }
 
@@ -473,6 +474,7 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.StreamOptionEncryptionKeySource),
 			string(iggcon.StreamOptionEncryptionKeyFingerprint),
 			string(iggcon.StreamOptionEncryptionKekFingerprint),
+			string(iggcon.StreamOptionShadowOrigin),
 		},
 		"topic": {
 			string(iggcon.TopicOptionName),
@@ -555,6 +557,7 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"encryption_key_source":      {accessor: "EncryptionKeySource"},
 			"encryption_key_fingerprint": {accessor: "EncryptionKeyFingerprint"},
 			"encryption_kek_fingerprint": {accessor: "EncryptionKekFingerprints"},
+			"shadow_origin":              {accessor: "ShadowOrigin"},
 		},
 		"topic": {
 			"name":                              {update: "Name"},
@@ -715,6 +718,13 @@ func checkStreamResponse(t *testing.T, constants fixtureConstants, vector stream
 	} else {
 		assert.Equal(t, expected.EncryptionKekFingerprints, stream.EncryptionKekFingerprints())
 	}
+	origin, ok := details.ShadowOrigin()
+	if expected.ShadowOrigin == nil {
+		assert.False(t, ok)
+	} else {
+		assert.True(t, ok)
+		assert.Equal(t, *expected.ShadowOrigin, origin)
+	}
 }
 
 func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicResponseVector) {
@@ -746,6 +756,15 @@ func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicRe
 	}
 	if localRetentionSize, ok := expected.Options[string(iggcon.TopicOptionLocalRetentionSize)]; ok {
 		assert.Equal(t, parseUint64(t, localRetentionSize.Value), topic.LocalRetentionSize)
+	}
+	if topicType, ok := expected.Options[string(iggcon.TopicOptionTopicType)]; ok {
+		assert.Equal(t, iggcon.TopicType(topicType.Value), topic.TopicType)
+	}
+	if geoMode, ok := expected.Options[string(iggcon.TopicOptionGeoMode)]; ok && topic.TopicType == iggcon.TopicTypeGeo {
+		require.NotNil(t, topic.GeoMode)
+		assert.Equal(t, iggcon.GeoMode(geoMode.Value), *topic.GeoMode)
+	} else if topic.TopicType == iggcon.TopicTypeNormal {
+		assert.Nil(t, topic.GeoMode)
 	}
 }
 

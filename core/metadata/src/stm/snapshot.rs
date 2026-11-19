@@ -86,7 +86,10 @@ use crate::stm::user::UsersSnapshot;
 /// Version 19: `StreamsSnapshot` gained `retired_origins`, the geo peers that
 /// never return, and the shadow record of a topic its peer's `retention`,
 /// both as trailing, defaulted fields.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 19;
+///
+/// Version 20: the shadow record of a topic gained the peer's `geo_mode`, as a
+/// trailing, defaulted field.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 20;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -675,7 +678,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 19;
+        const PINNED_VERSION: u32 = 20;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();

@@ -28,6 +28,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pyclass_complex_enum, gen
 use crate::duration::{iggy_duration_to_py_delta, py_delta_to_iggy_duration};
 use crate::options::options_by_provenance;
 use crate::receive_message::PartitionContext;
+use crate::resource_options::{GeoMode, TopicType};
 use crate::user_headers::UserHeaders;
 
 /// The expiry of the messages in a topic.
@@ -244,6 +245,19 @@ impl Topic {
         self.inner.resolved_options().max_topic_size.into()
     }
 
+    /// What the topic is, normal or geo, fixed at creation.
+    #[getter]
+    pub fn topic_type(&self) -> TopicType {
+        self.inner.resolved_options().topic_type.into()
+    }
+
+    /// How a geo topic writes its messages, fixed at creation. `None` on a
+    /// normal topic.
+    #[getter]
+    pub fn geo_mode(&self) -> Option<GeoMode> {
+        self.inner.resolved_options().geo_mode.map(GeoMode::from)
+    }
+
     /// Options the creating client set explicitly.
     ///
     /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
@@ -338,6 +352,19 @@ impl TopicDetails {
     #[getter]
     pub fn max_topic_size(&self) -> MaxTopicSize {
         self.inner.resolved_options().max_topic_size.into()
+    }
+
+    /// What the topic is, normal or geo, fixed at creation.
+    #[getter]
+    pub fn topic_type(&self) -> TopicType {
+        self.inner.resolved_options().topic_type.into()
+    }
+
+    /// How a geo topic writes its messages, fixed at creation. `None` on a
+    /// normal topic.
+    #[getter]
+    pub fn geo_mode(&self) -> Option<GeoMode> {
+        self.inner.resolved_options().geo_mode.map(GeoMode::from)
     }
 
     /// Options the creating client set explicitly.
@@ -458,7 +485,63 @@ fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyLis
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iggy::prelude::{IggyTimestamp, PartitionContext as RustPartitionContext};
+    use iggy::prelude::{
+        GeoMode as RustGeoMode, HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue,
+        PartitionContext as RustPartitionContext, ResourceOptions, TopicType as RustTopicType,
+    };
+
+    #[test]
+    fn given_geo_topic_options_when_reading_should_expose_topic_type_and_geo_mode() {
+        let geo_tiered = topic_options(&[
+            (OptionKey::TopicType, RustTopicType::Geo.as_ref()),
+            (OptionKey::GeoMode, RustGeoMode::GeoTiered.as_ref()),
+        ]);
+        let geo_without_mode =
+            topic_options(&[(OptionKey::TopicType, RustTopicType::Geo.as_ref())]);
+
+        for (options, topic_type, geo_mode) in [
+            (geo_tiered, TopicType::Geo, Some(GeoMode::GeoTiered)),
+            (geo_without_mode, TopicType::Geo, Some(GeoMode::Geo)),
+            (ResourceOptions::new(), TopicType::Normal, None),
+        ] {
+            let topic = Topic::from(RustTopic {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 1,
+                options: options.clone(),
+            });
+            let details = TopicDetails::from(RustTopicDetails {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 0,
+                partitions: Vec::new(),
+                options,
+            });
+
+            assert_eq!(topic.topic_type(), topic_type);
+            assert_eq!(topic.geo_mode(), geo_mode);
+            assert_eq!(details.topic_type(), topic_type);
+            assert_eq!(details.geo_mode(), geo_mode);
+        }
+    }
+
+    fn topic_options(entries: &[(OptionKey, &str)]) -> ResourceOptions {
+        entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    HeaderKey::from(*key),
+                    OptionValue::explicit(HeaderValue::try_from(*value).expect("header value")),
+                )
+            })
+            .collect()
+    }
 
     #[test]
     fn given_partition_with_members_when_converting_should_expose_node_ids_as_int_lists() {

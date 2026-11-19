@@ -782,6 +782,14 @@ cluster, one operation at a time, so every node holds the same shadow streams:
   shadow topic.
 - A shadow stream without topics and without live objects is removed.
 
+A read of a shadow stream, alone or in a listing, reports the read-only key
+`shadow_origin` with the peer's origin, and no other stream carries it. Every
+SDK has a typed getter for it, and `iggy stream list` shows it in the Origin
+column. A read of a shadow topic reports `topic_type` as `geo` and the
+`geo_mode` of the peer's topic, although the topic is stored as a normal one.
+`iggy topic get` shows the type, the mode and, in a shadow stream, the origin
+of a topic.
+
 Clients read a shadow stream like any other stream. Consumer groups, consumer
 offsets and permissions work on it, and its positions stay in this cluster. A
 client cannot write to a shadow stream or change it. The server refuses these

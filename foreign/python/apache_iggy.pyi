@@ -1313,6 +1313,30 @@ class IggyClient:
                 combined with another snapshot type, the 30-second binary
                 operation deadline expires, or the request fails.
         """
+    def retire_geo_origin(
+        self, origin: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Retire the geo origin of a datacenter that never returns.
+
+        The cluster then follows nothing more of the origin: its shadow topics
+        serve what they hold until their retention removes it, and a client
+        may delete them. Retiring an origin that is retired already changes
+        nothing. A datacenter that comes back needs another origin name.
+
+        Requires root or the global `manage_servers` permission.
+
+        Args:
+            origin: The origin name of the lost datacenter, such as `"dc-a"`.
+
+        Returns:
+            An awaitable that resolves to `None` once the cluster committed
+            the retirement.
+
+        Raises:
+            IggyError: If the user lacks the permission, the server refuses
+                the origin, or the request fails.
+        """
     def describe_options(
         self, scope: builtins.str
     ) -> collections.abc.Awaitable[list[OptionSpec]]:
@@ -4016,6 +4040,10 @@ class OptionKey:
     r"""
     How a geo topic writes its messages, fixed at creation.
     """
+    ShadowOrigin: typing.ClassVar[OptionKey]
+    r"""
+    The geo origin a shadow stream serves, computed by the server.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -5243,6 +5271,12 @@ class Stream:
         Fingerprints of the server keys that wrap the stream's key: one outside
         a key rotation, empty for a plaintext stream.
         """
+    @property
+    def shadow_origin(self) -> builtins.str | None:
+        r"""
+        The geo origin whose topics this shadow stream serves, such as
+        `"dc-a"`. `None` for any stream that is not a shadow stream.
+        """
 
 @typing.final
 class StreamDetails:
@@ -5305,6 +5339,12 @@ class StreamDetails:
         r"""
         Fingerprints of the server keys that wrap the stream's key: one outside
         a key rotation, empty for a plaintext stream.
+        """
+    @property
+    def shadow_origin(self) -> builtins.str | None:
+        r"""
+        The geo origin whose topics this shadow stream serves, such as
+        `"dc-a"`. `None` for any stream that is not a shadow stream.
         """
 
 @typing.final
@@ -5669,6 +5709,17 @@ class Topic:
         not set one.
         """
     @property
+    def topic_type(self) -> TopicType:
+        r"""
+        What the topic is, normal or geo, fixed at creation.
+        """
+    @property
+    def geo_mode(self) -> GeoMode | None:
+        r"""
+        How a geo topic writes its messages, fixed at creation. `None` on a
+        normal topic.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -5734,6 +5785,17 @@ class TopicDetails:
         r"""
         The maximum size of the topic, the server default when the topic does
         not set one.
+        """
+    @property
+    def topic_type(self) -> TopicType:
+        r"""
+        What the topic is, normal or geo, fixed at creation.
+        """
+    @property
+    def geo_mode(self) -> GeoMode | None:
+        r"""
+        How a geo topic writes its messages, fixed at creation. `None` on a
+        normal topic.
         """
     @property
     def options(self) -> UserHeaders:

@@ -93,6 +93,13 @@ impl StreamDetails {
     pub fn encryption_kek_fingerprint(&self) -> Option<String> {
         comma_separated(&self.inner.encryption_kek_fingerprints())
     }
+
+    /// The geo origin whose topics this shadow stream serves, such as `dc-a`. Null for any
+    /// stream that is not a shadow stream.
+    #[php(getter, change_case = "snake_case")]
+    pub fn shadow_origin(&self) -> Option<String> {
+        self.inner.shadow_origin()
+    }
 }
 
 /// One stream of a `StreamsPage`.
@@ -177,6 +184,13 @@ impl Stream {
     #[php(getter, change_case = "snake_case")]
     pub fn encryption_kek_fingerprint(&self) -> Option<String> {
         comma_separated(&self.inner.encryption_kek_fingerprints())
+    }
+
+    /// The geo origin whose topics this shadow stream serves, such as `dc-a`. Null for any
+    /// stream that is not a shadow stream.
+    #[php(getter, change_case = "snake_case")]
+    pub fn shadow_origin(&self) -> Option<String> {
+        self.inner.shadow_origin()
     }
 }
 

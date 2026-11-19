@@ -87,7 +87,14 @@ impl CliCommand for GetTopicCmd {
             return print_json(&topic);
         }
 
-        let table = topic_table(&topic);
+        // A topic in a shadow stream comes from the stream's geo origin.
+        let origin = client
+            .get_stream(&self.stream_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|stream| stream.shadow_origin());
+        let table = topic_table(&topic, origin.as_deref());
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");
 
@@ -95,7 +102,9 @@ impl CliCommand for GetTopicCmd {
     }
 }
 
-fn topic_table(topic: &TopicDetails) -> Table {
+/// The table of `topic`, with the geo `origin` of its stream when it is a
+/// shadow stream.
+fn topic_table(topic: &TopicDetails, origin: Option<&str>) -> Table {
     let mut table = Table::new();
 
     table.set_header(vec!["Property", "Value"]);
@@ -106,6 +115,13 @@ fn topic_table(topic: &TopicDetails) -> Table {
         topic.created_at.to_utc_string("%Y-%m-%d %H:%M:%S").as_str(),
     ]);
     table.add_row(vec!["Topic name", topic.name.as_str()]);
+    table.add_row(vec!["Topic type", resolved.topic_type.as_ref()]);
+    if let Some(geo_mode) = resolved.geo_mode {
+        table.add_row(vec!["Geo mode", geo_mode.as_ref()]);
+    }
+    if let Some(origin) = origin {
+        table.add_row(vec!["Origin", origin]);
+    }
     table.add_row(vec!["Topic size", format!("{}", topic.size).as_str()]);
     table.add_row(vec![
         "Compression",
@@ -184,7 +200,7 @@ mod tests {
 
     #[test]
     fn empty_collections_keep_topic_properties_without_nested_tables() {
-        let output = topic_table(&topic()).to_string();
+        let output = topic_table(&topic(), None).to_string();
         assert!(output.contains("Topic name          | test-topic"));
         assert!(output.contains("Partitions count    | 0"));
         assert!(!output.contains("Partition id"));
@@ -220,7 +236,7 @@ mod tests {
                 in_sync_members: Vec::new(),
             },
         ];
-        let output = topic_table(&topic).to_string();
+        let output = topic_table(&topic, None).to_string();
         let rows = output
             .lines()
             .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -255,7 +271,7 @@ mod tests {
                 OptionValue::explicit(HeaderValue::from(17_u32)),
             ),
         ]);
-        let output = topic_table(&topic).to_string();
+        let output = topic_table(&topic, None).to_string();
         let rows = output
             .lines()
             .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -287,6 +303,35 @@ mod tests {
     }
 
     #[test]
+    fn given_a_geo_topic_in_a_shadow_stream_should_show_its_type_mode_and_origin() {
+        let mut fixture = topic();
+        fixture.options = ResourceOptions::from([
+            (
+                HeaderKey::try_from("topic_type").unwrap(),
+                OptionValue::explicit(HeaderValue::try_from("geo").unwrap()),
+            ),
+            (
+                HeaderKey::try_from("geo_mode").unwrap(),
+                OptionValue::derived(HeaderValue::try_from("geo").unwrap()),
+            ),
+        ]);
+
+        let shadow = topic_table(&fixture, Some("dc-a")).to_string();
+        let normal = topic_table(&topic(), None).to_string();
+
+        for expected in [
+            "Topic type          | geo",
+            "Geo mode            | geo",
+            "Origin              | dc-a",
+        ] {
+            assert!(shadow.contains(expected), "{expected:?} in {shadow}");
+        }
+        assert!(normal.contains("Topic type          | normal"));
+        assert!(!normal.contains("Geo mode"));
+        assert!(!normal.contains("Origin"));
+    }
+
+    #[test]
     fn resolved_options_keep_full_width_values_and_sources() {
         let mut fixture = topic();
         fixture.options = ResourceOptions::from([
@@ -315,7 +360,7 @@ mod tests {
                 OptionValue::explicit(HeaderValue::try_from("replicated").unwrap()),
             ),
         ]);
-        let output = topic_table(&fixture).to_string();
+        let output = topic_table(&fixture, None).to_string();
         for expected in [
             "Option                            | Value",
             "preallocate_segments              | false                | explicit",

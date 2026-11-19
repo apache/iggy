@@ -17,7 +17,9 @@
 
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { deserializeBaseTopic, deserializePartition, deserializeTopic } from './topic.utils.js';
+import {
+  deserializeBaseTopic, deserializePartition, deserializeTopic, GeoMode, TopicType
+} from './topic.utils.js';
 import { serializeOptions } from '../options.utils.js';
 import { HeaderValue } from '../message/header.utils.js';
 import { DeserializeError } from '../error.utils.js';
@@ -119,6 +121,32 @@ describe('deserializeBaseTopic', () => {
     assert.equal(topic.tieredStorage, false);
     assert.equal(topic.localRetentionAge, 86_400_000_000n);
     assert.equal(topic.localRetentionSize, 0xffff_ffff_ffff_ffffn);
+    assert.equal(topic.topicType, TopicType.Normal);
+    assert.equal(topic.geoMode, null);
+  });
+
+  it('reads the topic type and the geo mode of a geo topic from either options block', () => {
+    const fixed = Buffer.alloc(34);
+    fixed.writeUInt32LE(4, 0);
+    fixed.writeUInt32LE(1, 12);
+    fixed.writeUInt8(1, 32);
+    fixed.write('g', 33);
+    const prefix = (block: Buffer) => {
+      const len = Buffer.alloc(4);
+      len.writeUInt32LE(block.length, 0);
+      return Buffer.concat([len, block]);
+    };
+    const explicit = serializeOptions([{ key: 'topic_type', value: HeaderValue.String('geo') }]);
+    const derived = serializeOptions([{ key: 'geo_mode', value: HeaderValue.String('geo_tiered') }]);
+    const data = Buffer.concat([fixed, prefix(explicit), prefix(derived)]);
+
+    const { bytesRead, data: topic } = deserializeBaseTopic(data);
+
+    assert.equal(bytesRead, data.length);
+    assert.equal(topic.topicType, TopicType.Geo);
+    assert.equal(topic.geoMode, GeoMode.GeoTiered);
+    assert.deepEqual(topic.options, { topic_type: 'geo' });
+    assert.deepEqual(topic.derivedOptions, { geo_mode: 'geo_tiered' });
   });
 });
 

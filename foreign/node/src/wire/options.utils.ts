@@ -50,7 +50,8 @@ export const StreamOptionKey = {
   EncryptionKey: 'encryption_key',
   EncryptionKeySource: 'encryption_key_source',
   EncryptionKeyFingerprint: 'encryption_key_fingerprint',
-  EncryptionKekFingerprint: 'encryption_kek_fingerprint'
+  EncryptionKekFingerprint: 'encryption_kek_fingerprint',
+  ShadowOrigin: 'shadow_origin'
 } as const;
 
 export type StreamOptionKey = typeof StreamOptionKey[keyof typeof StreamOptionKey];
@@ -131,6 +132,7 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['local_retention_size', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
   ['topic_type', { scopes: [Topic], flags: Critical, internal: false }],
   ['geo_mode', { scopes: [Topic], flags: Critical, internal: false }],
+  ['shadow_origin', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
 ]);
 

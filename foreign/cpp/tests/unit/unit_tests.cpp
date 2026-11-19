@@ -404,6 +404,7 @@ TEST(OptionKeyTest, ReturnsCatalogNames) {
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::Name), "name");
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKey), "encryption_key");
     EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::EncryptionKekFingerprint), "encryption_kek_fingerprint");
+    EXPECT_EQ(iggy::to_string(iggy::StreamOptionKey::ShadowOrigin), "shadow_origin");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SizeOfMessagesRequiredToSave), "size_of_messages_required_to_save");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::SegmentMaxAge), "segment_max_age");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TieredStorage), "tiered_storage");

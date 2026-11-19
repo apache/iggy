@@ -1376,6 +1376,42 @@ class PersonalAccessTokenInfo final {
 };
 
 /**
+ * @brief What a topic is, fixed at creation.
+ */
+enum class TopicType : std::uint8_t {
+    Normal,  ///< Its messages stay in this cluster.
+    Geo,     ///< Its messages also become readable in the other datacenters.
+};
+
+constexpr std::string_view to_string(const TopicType topic_type) {
+    switch (topic_type) {
+        case TopicType::Normal:
+            return "normal";
+        case TopicType::Geo:
+            return "geo";
+    }
+    throw std::invalid_argument("Unknown topic type");
+}
+
+/**
+ * @brief How a geo topic writes its messages, fixed at creation.
+ */
+enum class GeoMode : std::uint8_t {
+    Geo,        ///< A batch goes to the object store before it commits.
+    GeoTiered,  ///< A batch is replicated first, and sealed segments are uploaded later.
+};
+
+constexpr std::string_view to_string(const GeoMode geo_mode) {
+    switch (geo_mode) {
+        case GeoMode::Geo:
+            return "geo";
+        case GeoMode::GeoTiered:
+            return "geo_tiered";
+    }
+    throw std::invalid_argument("Unknown geo mode");
+}
+
+/**
  * @brief Snapshot of one topic's metadata and aggregate statistics.
  *
  * GetStream() returns one of these values for each observed topic. It owns its
@@ -1438,6 +1474,18 @@ class Topic final {
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
+     * @brief Returns what the topic is, fixed at creation.
+     * @return TopicType::Geo for a geo topic, TopicType::Normal otherwise.
+     */
+    [[nodiscard]] ::iggy::TopicType TopicType() const noexcept { return topic_type_; }
+
+    /**
+     * @brief Returns how a geo topic writes its messages, fixed at creation.
+     * @return Geo mode, or `std::nullopt` for a normal topic.
+     */
+    [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1463,6 +1511,8 @@ class Topic final {
           std::uint64_t message_expiry,
           std::string compression_algorithm,
           std::uint64_t max_topic_size,
+          ::iggy::TopicType topic_type,
+          std::optional<::iggy::GeoMode> geo_mode,
           std::uint64_t messages_count,
           std::uint32_t partitions_count,
           ResourceOptions options)
@@ -1473,6 +1523,8 @@ class Topic final {
           message_expiry_(message_expiry),
           compression_algorithm_(std::move(compression_algorithm)),
           max_topic_size_(max_topic_size),
+          topic_type_(topic_type),
+          geo_mode_(geo_mode),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           options_(std::move(options)) {}
@@ -1490,6 +1542,8 @@ class Topic final {
     std::uint64_t message_expiry_;
     std::string compression_algorithm_;
     std::uint64_t max_topic_size_;
+    ::iggy::TopicType topic_type_;
+    std::optional<::iggy::GeoMode> geo_mode_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     ResourceOptions options_;
@@ -1716,6 +1770,18 @@ class TopicDetails final {
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
+     * @brief Returns what the topic is, fixed at creation.
+     * @return TopicType::Geo for a geo topic, TopicType::Normal otherwise.
+     */
+    [[nodiscard]] ::iggy::TopicType TopicType() const noexcept { return topic_type_; }
+
+    /**
+     * @brief Returns how a geo topic writes its messages, fixed at creation.
+     * @return Geo mode, or `std::nullopt` for a normal topic.
+     */
+    [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1750,6 +1816,8 @@ class TopicDetails final {
                  std::uint64_t message_expiry,
                  std::string compression_algorithm,
                  std::uint64_t max_topic_size,
+                 ::iggy::TopicType topic_type,
+                 std::optional<::iggy::GeoMode> geo_mode,
                  std::uint64_t messages_count,
                  std::uint32_t partitions_count,
                  std::vector<Partition> partitions,
@@ -1761,6 +1829,8 @@ class TopicDetails final {
           message_expiry_(message_expiry),
           compression_algorithm_(std::move(compression_algorithm)),
           max_topic_size_(max_topic_size),
+          topic_type_(topic_type),
+          geo_mode_(geo_mode),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           partitions_(std::move(partitions)),
@@ -1777,6 +1847,8 @@ class TopicDetails final {
     std::uint64_t message_expiry_;
     std::string compression_algorithm_;
     std::uint64_t max_topic_size_;
+    ::iggy::TopicType topic_type_;
+    std::optional<::iggy::GeoMode> geo_mode_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     std::vector<Partition> partitions_;
@@ -1916,6 +1988,16 @@ class StreamDetails final {
         return encryption_kek_fingerprints_;
     }
 
+    /**
+     * @brief Returns the geo origin whose topics this shadow stream serves.
+     *
+     * A shadow stream holds the geo topics of another datacenter and takes no
+     * writes: a write to it fails with Kind() shadow_stream_read_only (1021).
+     * @return Origin name such as `dc-a`, or `std::nullopt` for any stream
+     *         that is not a shadow stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &ShadowOrigin() const noexcept { return shadow_origin_; }
+
   private:
     StreamDetails(std::uint32_t id,
                   std::uint64_t created_at,
@@ -1927,7 +2009,8 @@ class StreamDetails final {
                   ResourceOptions options,
                   std::optional<StreamEncryptionSource> encryption_key_source,
                   std::optional<std::string> encryption_key_fingerprint,
-                  std::vector<std::string> encryption_kek_fingerprints)
+                  std::vector<std::string> encryption_kek_fingerprints,
+                  std::optional<std::string> shadow_origin)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
@@ -1938,7 +2021,8 @@ class StreamDetails final {
           options_(std::move(options)),
           encryption_key_source_(encryption_key_source),
           encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
-          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)),
+          shadow_origin_(std::move(shadow_origin)) {}
 
     static StreamDetails FromFfi(ffi::StreamDetails stream);
 
@@ -1955,6 +2039,7 @@ class StreamDetails final {
     std::optional<StreamEncryptionSource> encryption_key_source_;
     std::optional<std::string> encryption_key_fingerprint_;
     std::vector<std::string> encryption_kek_fingerprints_;
+    std::optional<std::string> shadow_origin_;
 };
 
 /**
@@ -2048,6 +2133,16 @@ class Stream final {
         return encryption_kek_fingerprints_;
     }
 
+    /**
+     * @brief Returns the geo origin whose topics this shadow stream serves.
+     *
+     * A shadow stream holds the geo topics of another datacenter and takes no
+     * writes: a write to it fails with Kind() shadow_stream_read_only (1021).
+     * @return Origin name such as `dc-a`, or `std::nullopt` for any stream
+     *         that is not a shadow stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &ShadowOrigin() const noexcept { return shadow_origin_; }
+
   private:
     Stream(std::uint32_t id,
            std::uint64_t created_at,
@@ -2058,7 +2153,8 @@ class Stream final {
            ResourceOptions options,
            std::optional<StreamEncryptionSource> encryption_key_source,
            std::optional<std::string> encryption_key_fingerprint,
-           std::vector<std::string> encryption_kek_fingerprints)
+           std::vector<std::string> encryption_kek_fingerprints,
+           std::optional<std::string> shadow_origin)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
@@ -2068,7 +2164,8 @@ class Stream final {
           options_(std::move(options)),
           encryption_key_source_(encryption_key_source),
           encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
-          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)),
+          shadow_origin_(std::move(shadow_origin)) {}
 
     static Stream FromFfi(ffi::Stream stream);
 
@@ -2085,6 +2182,7 @@ class Stream final {
     std::optional<StreamEncryptionSource> encryption_key_source_;
     std::optional<std::string> encryption_key_fingerprint_;
     std::vector<std::string> encryption_kek_fingerprints_;
+    std::optional<std::string> shadow_origin_;
 };
 
 /**
@@ -3018,46 +3116,11 @@ constexpr std::string_view to_string(const PartitionResizePolicy policy) {
 }
 
 /**
- * @brief What a topic is, fixed at creation.
- */
-enum class TopicType : std::uint8_t {
-    Normal,  ///< Its messages stay in this cluster.
-    Geo,     ///< Its messages also become readable in the other datacenters.
-};
-
-constexpr std::string_view to_string(const TopicType topic_type) {
-    switch (topic_type) {
-        case TopicType::Normal:
-            return "normal";
-        case TopicType::Geo:
-            return "geo";
-    }
-    throw std::invalid_argument("Unknown topic type");
-}
-
-/**
- * @brief How a geo topic writes its messages, fixed at creation.
- */
-enum class GeoMode : std::uint8_t {
-    Geo,        ///< A batch goes to the object store before it commits.
-    GeoTiered,  ///< A batch is replicated first, and sealed segments are uploaded later.
-};
-
-constexpr std::string_view to_string(const GeoMode geo_mode) {
-    switch (geo_mode) {
-        case GeoMode::Geo:
-            return "geo";
-        case GeoMode::GeoTiered:
-            return "geo_tiered";
-    }
-    throw std::invalid_argument("Unknown geo mode");
-}
-
-/**
  * @brief Option keys of the stream scope, in catalog order.
  *
- * Name is updatable. EncryptionKey is a create-only secret. The fingerprint
- * and source keys are read-only projections. No stream key is resettable.
+ * Name is updatable. EncryptionKey is a create-only secret. The fingerprint,
+ * source, and shadow origin keys are read-only projections. No stream key is
+ * resettable.
  */
 enum class StreamOptionKey : std::uint8_t {
     Name,
@@ -3065,6 +3128,7 @@ enum class StreamOptionKey : std::uint8_t {
     EncryptionKeySource,
     EncryptionKeyFingerprint,
     EncryptionKekFingerprint,
+    ShadowOrigin,
 };
 
 constexpr std::string_view to_string(const StreamOptionKey key) {
@@ -3079,6 +3143,8 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
             return "encryption_key_fingerprint";
         case StreamOptionKey::EncryptionKekFingerprint:
             return "encryption_kek_fingerprint";
+        case StreamOptionKey::ShadowOrigin:
+            return "shadow_origin";
     }
     throw std::invalid_argument("Unknown stream option key");
 }
@@ -7015,7 +7081,7 @@ class IggyConsumer final {
  *   DeleteConsumerPosition().
  * - PollMessages(), Reader(), StandaloneConsumer(), GroupConsumer(),
  *   PendingPoll::Wait(), and the calls of PartitionReader and IggyConsumer.
- * - GetMetadataChanges().
+ * - GetMetadataChanges() and RetireGeoOrigin().
  * - GetStreamsPage(), GetTopicsPage(), GetPartitionsPage(),
  *   GetConsumerGroupsPage(), and GetUsersPage().
  *
@@ -8190,6 +8256,22 @@ class IggyBlockingClient final {
      *         the request fails.
      */
     Stats GetStats();
+
+    /**
+     * @brief Retires the geo origin of a datacenter that never returns.
+     *
+     * The cluster then follows nothing more of the origin: its shadow topics
+     * serve what they hold until their retention removes it, and a client can
+     * delete them. Retiring an origin that is retired already changes nothing.
+     * A datacenter that comes back needs another origin name.
+     *
+     * @param origin Origin name of the lost datacenter, such as `dc-a`.
+     * @throws IggyException with Kind() unauthorized when the caller is
+     *         neither root nor holds the global manage_servers permission;
+     *         with Kind() invalid_format when no cluster can take @p origin as
+     *         its name; or when the request fails.
+     */
+    void RetireGeoOrigin(const std::string &origin);
 
     /**
      * @brief Replays a retained operation with its original identity and bytes.

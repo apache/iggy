@@ -69,10 +69,10 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest,
 };
 use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
-use iggy_common::{CompressionAlgorithm, IggyTimestamp, TopicCreateOptions};
+use iggy_common::{CompressionAlgorithm, GeoMode, IggyTimestamp, TopicCreateOptions};
 use iggy_object_store::{
-    ObjectPrefix, TierJobCancelled, TierScope, TierScopeToken, TopicCompression, TopicKey,
-    TopicObject, TopicRead, TopicState,
+    ObjectPrefix, TierJobCancelled, TierScope, TierScopeToken, TopicCompression, TopicGeoMode,
+    TopicKey, TopicObject, TopicRead, TopicState,
 };
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -951,6 +951,10 @@ fn adopt(
                 },
                 create: Box::new(adoption(stream_id, object)?),
                 retention: retention_of(object),
+                geo_mode: match object.geo_mode {
+                    TopicGeoMode::Geo => GeoMode::Geo,
+                    TopicGeoMode::GeoTiered => GeoMode::GeoTiered,
+                },
             });
         }
     }

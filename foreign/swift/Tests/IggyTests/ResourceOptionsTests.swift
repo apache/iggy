@@ -241,6 +241,7 @@ struct ResourceOptionsTests {
             #expect(stream.encryptionKeySource?.rawValue == expected.encryptionKeySource, "\(vector.name)")
             #expect(stream.encryptionKeyFingerprint == expected.encryptionKeyFingerprint, "\(vector.name)")
             #expect(stream.encryptionKekFingerprints == expected.encryptionKekFingerprints, "\(vector.name)")
+            #expect(stream.shadowOrigin == expected.shadowOrigin, "\(vector.name)")
             #expect(neverReturned.isDisjoint(with: stream.options.keys), "\(vector.name)")
             var listReader = ByteReader([UInt8](hex: vector.responseHex))
             let listed = try Responses.stream(from: &listReader)
@@ -248,7 +249,9 @@ struct ResourceOptionsTests {
             #expect(listed.encryptionKeySource == stream.encryptionKeySource)
             #expect(listed.encryptionKeyFingerprint == stream.encryptionKeyFingerprint)
             #expect(listed.encryptionKekFingerprints == stream.encryptionKekFingerprints)
+            #expect(listed.shadowOrigin == stream.shadowOrigin)
         }
+        #expect(fixture.streamResponses.contains { $0.expected.shadowOrigin != nil }, "no stream vector is a shadow stream")
         for vector in fixture.topicResponses {
             let topic = try Responses.topicDetails([UInt8](hex: vector.responseHex)[...])
             let expected = vector.expected
@@ -266,6 +269,8 @@ struct ResourceOptionsTests {
             #expect(String(topic.tieredStorage) == expected.options["tiered_storage"]?.value)
             #expect(try topic.localRetentionAge.wireMicroseconds().map(String.init) == expected.options["local_retention_age"]?.value)
             #expect(String(topic.localRetentionSize.wireValue) == expected.options["local_retention_size"]?.value)
+            #expect(topic.topicType.rawValue == expected.options["topic_type"]?.value)
+            #expect(topic.geoMode?.rawValue == expected.options["geo_mode"]?.value)
             #expect(neverReturned.isDisjoint(with: topic.options.keys))
         }
         for vector in fixture.userResponses {
@@ -339,6 +344,7 @@ struct ResourceOptionsTests {
             StreamOptionKey.encryptionKeySource.rawValue: { $0.encryptionKeySource != nil },
             StreamOptionKey.encryptionKeyFingerprint.rawValue: { $0.encryptionKeyFingerprint != nil },
             StreamOptionKey.encryptionKekFingerprint.rawValue: { !$0.encryptionKekFingerprints.isEmpty },
+            StreamOptionKey.shadowOrigin.rawValue: { $0.shadowOrigin != nil },
         ]
         #expect(Set(streamAccessors.keys) == readOnly("stream"))
         #expect(readOnly("topic").isEmpty, "a read-only topic key needs an accessor on Topic and TopicDetails")
@@ -468,6 +474,39 @@ struct ResourceOptionsTests {
         #expect(future.encryptionKeySource == nil)
     }
 
+    /// A geo topic reports its type and mode. A topic that reports no type
+    /// is a normal one, and a normal topic has no mode even when one is
+    /// stored, as the Rust crate resolves them.
+    @Test func givenGeoTopicWhenDecodingShouldProjectItsTypeAndMode() throws {
+        let geo =
+            optionEntry("geo_mode", kind: HeaderKind.string.rawValue, value: Array("geo_tiered".utf8))
+            + optionEntry("topic_type", kind: HeaderKind.string.rawValue, value: Array("geo".utf8))
+        let details = try Responses.topicDetails(topicResponse(explicit: geo, derived: [])[...])
+        #expect(details.options[TopicOptionKey.topicType.rawValue] == .explicit("geo"))
+        #expect(details.topicType == .geo)
+        #expect(details.geoMode == .geoTiered)
+        var listReader = ByteReader(try topicResponse(explicit: geo, derived: []))
+        let listed = try Responses.topic(from: &listReader)
+        #expect(listed.topicType == .geo)
+        #expect(listed.geoMode == .geoTiered)
+
+        let geoType = optionEntry("topic_type", kind: HeaderKind.string.rawValue, value: Array("geo".utf8))
+        let defaultMode = try Responses.topicDetails(topicResponse(explicit: geoType, derived: [])[...])
+        #expect(defaultMode.geoMode == .geo)
+
+        let normal = optionEntry("topic_type", kind: HeaderKind.string.rawValue, value: Array("normal".utf8))
+        let normalTopic = try Responses.topicDetails(topicResponse(explicit: [], derived: normal)[...])
+        #expect(normalTopic.topicType == .normal)
+        #expect(normalTopic.geoMode == nil)
+        let strayMode =
+            optionEntry("geo_mode", kind: HeaderKind.string.rawValue, value: Array("geo".utf8))
+            + optionEntry("topic_type", kind: HeaderKind.string.rawValue, value: Array("normal".utf8))
+        #expect(try Responses.topicDetails(topicResponse(explicit: strayMode, derived: [])[...]).geoMode == nil)
+        let unreported = try Responses.topicDetails(topicResponse(explicit: [], derived: [])[...])
+        #expect(unreported.topicType == .normal)
+        #expect(unreported.geoMode == nil)
+    }
+
     // MARK: Helpers
 
     func fakeServerClient(_ server: FakeVSRServer) -> IggyClient {
@@ -585,6 +624,22 @@ struct ResourceOptionsTests {
         writer.write(kind)
         writer.write(UInt32(value.count))
         writer.write(value)
+        return writer.bytes
+    }
+
+    /// A `GetTopic` reply for a topic without partitions.
+    func topicResponse(explicit: [UInt8], derived: [UInt8]) throws -> [UInt8] {
+        var writer = ByteWriter()
+        writer.write(UInt32(5))
+        writer.write(UInt64(1_710_000_000_000_000))
+        writer.write(UInt32(0))
+        writer.write(UInt64(0))
+        writer.write(UInt64(0))
+        try writer.writeName("geo-orders")
+        writer.write(UInt32(explicit.count))
+        writer.write(explicit)
+        writer.write(UInt32(derived.count))
+        writer.write(derived)
         return writer.bytes
     }
 

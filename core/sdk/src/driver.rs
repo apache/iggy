@@ -3092,6 +3092,19 @@ mod tests {
         }
     }
 
+    /// A shadow stream takes no send, and a retry would only be refused
+    /// again.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_send_to_a_shadow_stream_when_1021_should_return_without_retry() {
+        let f = Fixture::new().await;
+        f.script_sends([Answer::Refuse(IggyError::ShadowStreamReadOnly)]);
+
+        let refused = f.send_messages().await;
+
+        assert_eq!(refused.unwrap_err(), IggyError::ShadowStreamReadOnly);
+        assert_eq!(f.sends().len(), 1);
+    }
+
     #[tokio::test(start_paused = true)]
     async fn given_a_store_without_position_when_5009_should_return_without_retry() {
         let f = Fixture::new().await;

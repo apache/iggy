@@ -919,6 +919,24 @@ impl From<RustStreamEncryptionSource> for ffi::StreamEncryptionSource {
     }
 }
 
+impl From<RustTopicType> for ffi::TopicType {
+    fn from(topic_type: RustTopicType) -> Self {
+        match topic_type {
+            RustTopicType::Normal => ffi::TopicType::Normal,
+            RustTopicType::Geo => ffi::TopicType::Geo,
+        }
+    }
+}
+
+impl From<RustGeoMode> for ffi::GeoMode {
+    fn from(geo_mode: RustGeoMode) -> Self {
+        match geo_mode {
+            RustGeoMode::Geo => ffi::GeoMode::Geo,
+            RustGeoMode::GeoTiered => ffi::GeoMode::GeoTiered,
+        }
+    }
+}
+
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
         let resolved = topic.resolved_options();
@@ -930,6 +948,9 @@ impl From<RustTopic> for ffi::Topic {
             message_expiry: u64::from(resolved.message_expiry),
             compression_algorithm: resolved.compression_algorithm.to_string(),
             max_topic_size: u64::from(resolved.max_topic_size),
+            topic_type: resolved.topic_type.into(),
+            has_geo_mode: resolved.geo_mode.is_some(),
+            geo_mode: resolved.geo_mode.unwrap_or_default().into(),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             options: resource_options_to_ffi(&topic.options, true),
@@ -949,6 +970,9 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
             message_expiry: u64::from(resolved.message_expiry),
             compression_algorithm: resolved.compression_algorithm.to_string(),
             max_topic_size: u64::from(resolved.max_topic_size),
+            topic_type: resolved.topic_type.into(),
+            has_geo_mode: resolved.geo_mode.is_some(),
+            geo_mode: resolved.geo_mode.unwrap_or_default().into(),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -967,6 +991,7 @@ impl From<RustStream> for ffi::Stream {
         let source = stream.encryption_key_source();
         let fingerprint = stream.encryption_key_fingerprint();
         let kek_fingerprints = stream.encryption_kek_fingerprints();
+        let shadow_origin = stream.shadow_origin();
         ffi::Stream {
             id: stream.id,
             created_at: stream.created_at.as_micros(),
@@ -981,6 +1006,8 @@ impl From<RustStream> for ffi::Stream {
             has_encryption_key_fingerprint: fingerprint.is_some(),
             encryption_key_fingerprint: fingerprint.unwrap_or_default(),
             encryption_kek_fingerprints: kek_fingerprints,
+            has_shadow_origin: shadow_origin.is_some(),
+            shadow_origin: shadow_origin.unwrap_or_default(),
         }
     }
 }
@@ -990,6 +1017,7 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
         let source = stream.encryption_key_source();
         let fingerprint = stream.encryption_key_fingerprint();
         let kek_fingerprints = stream.encryption_kek_fingerprints();
+        let shadow_origin = stream.shadow_origin();
         ffi::StreamDetails {
             id: stream.id,
             created_at: stream.created_at.as_micros(),
@@ -1005,6 +1033,8 @@ impl From<RustStreamDetails> for ffi::StreamDetails {
             has_encryption_key_fingerprint: fingerprint.is_some(),
             encryption_key_fingerprint: fingerprint.unwrap_or_default(),
             encryption_kek_fingerprints: kek_fingerprints,
+            has_shadow_origin: shadow_origin.is_some(),
+            shadow_origin: shadow_origin.unwrap_or_default(),
         }
     }
 }
@@ -2050,7 +2080,13 @@ mod tests {
         Checkpoint as RustCheckpoint, HeaderKey, HeaderValue, IggyTimestamp, OptionValue,
         ResourceOptions,
     };
+    use iggy_binary_protocol::WireDecode;
+    use iggy_binary_protocol::responses::streams::GetStreamResponse;
+    use iggy_binary_protocol::responses::topics::GetTopicResponse;
     use iggy_common::ReaderStamp as RustReaderStamp;
+    use serde_json::Value;
+
+    const RESOURCE_OPTIONS_FIXTURE: &str = include_str!("../tests/fixtures/resource_options.json");
 
     // Distinct values so a swapped field fails the comparison.
     const CONTEXT: RustPartitionContext = RustPartitionContext {
@@ -2337,6 +2373,122 @@ mod tests {
         assert!(stream.encryption_key_source == ffi::StreamEncryptionSource::None);
         assert!(!stream.has_encryption_key_fingerprint);
         assert!(stream.encryption_kek_fingerprints.is_empty());
+        assert!(!stream.has_shadow_origin);
+    }
+
+    #[test]
+    fn given_stream_response_vectors_when_bridging_should_carry_shadow_origin_only_on_a_shadow_stream()
+     {
+        for vector in fixture_vectors("stream_responses") {
+            let bytes = decode_hex(&vector["response_hex"]);
+            let (response, _) = GetStreamResponse::decode(&bytes).expect("stream decodes");
+            let details = RustStreamDetails::try_from(response).expect("stream converts");
+            let stream = ffi::StreamDetails::from(details);
+            let expected = vector["expected"]["shadow_origin"].as_str();
+
+            assert_eq!(
+                stream.has_shadow_origin,
+                expected.is_some(),
+                "{}",
+                vector["case"]
+            );
+            assert_eq!(stream.shadow_origin, expected.unwrap_or_default());
+        }
+    }
+
+    #[test]
+    fn given_shadow_stream_summary_when_bridging_should_carry_its_origin() {
+        let mut options = ResourceOptions::new();
+        options.insert(
+            HeaderKey::from(OptionKey::ShadowOrigin),
+            OptionValue::derived(HeaderValue::from_str("dc-a").expect("origin")),
+        );
+        let stream = ffi::Stream::from(RustStream {
+            id: 4,
+            created_at: IggyTimestamp::from(2),
+            name: "__shadow_dc-a_orders".to_owned(),
+            size: RustIggyByteSize::from(0),
+            messages_count: 0,
+            topics_count: 0,
+            options,
+        });
+
+        assert!(stream.has_shadow_origin);
+        assert_eq!(stream.shadow_origin, "dc-a");
+        assert_eq!(stream.derived_options.len(), 1);
+    }
+
+    #[test]
+    fn given_topic_response_vectors_when_bridging_should_report_a_normal_topic_without_geo_mode() {
+        for vector in fixture_vectors("topic_responses") {
+            let bytes = decode_hex(&vector["response_hex"]);
+            let (response, _) = GetTopicResponse::decode(&bytes).expect("topic decodes");
+            let details = RustTopicDetails::try_from(response).expect("topic converts");
+            let topic = ffi::TopicDetails::from(details);
+
+            assert_eq!(
+                vector["expected"]["options"]["topic_type"]["value"].as_str(),
+                Some("normal")
+            );
+            assert!(topic.topic_type == ffi::TopicType::Normal);
+            assert!(!topic.has_geo_mode);
+        }
+    }
+
+    #[test]
+    fn given_geo_topic_options_when_bridging_should_carry_topic_type_and_geo_mode() {
+        let geo_tiered: ResourceOptions = [
+            (OptionKey::TopicType, RustTopicType::Geo.as_ref()),
+            (OptionKey::GeoMode, RustGeoMode::GeoTiered.as_ref()),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            (
+                HeaderKey::from(key),
+                OptionValue::explicit(HeaderValue::from_str(value).expect("value")),
+            )
+        })
+        .collect();
+        let topic = ffi::Topic::from(RustTopic {
+            id: 1,
+            created_at: IggyTimestamp::from(2),
+            name: "orders".to_owned(),
+            size: RustIggyByteSize::from(0),
+            messages_count: 0,
+            partitions_count: 1,
+            options: geo_tiered.clone(),
+        });
+        let details = ffi::TopicDetails::from(RustTopicDetails {
+            id: 1,
+            created_at: IggyTimestamp::from(2),
+            name: "orders".to_owned(),
+            size: RustIggyByteSize::from(0),
+            messages_count: 0,
+            partitions_count: 0,
+            partitions: Vec::new(),
+            options: geo_tiered,
+        });
+
+        assert!(topic.topic_type == ffi::TopicType::Geo);
+        assert!(topic.has_geo_mode);
+        assert!(topic.geo_mode == ffi::GeoMode::GeoTiered);
+        assert!(details.topic_type == ffi::TopicType::Geo);
+        assert!(details.has_geo_mode);
+        assert!(details.geo_mode == ffi::GeoMode::GeoTiered);
+    }
+
+    fn fixture_vectors(section: &str) -> Vec<Value> {
+        let fixture: Value =
+            serde_json::from_str(RESOURCE_OPTIONS_FIXTURE).expect("fixture parses");
+        fixture[section].as_array().expect("vector list").clone()
+    }
+
+    fn decode_hex(text: &Value) -> Vec<u8> {
+        let text = text.as_str().expect("hex text");
+        (0..text.len())
+            .step_by(2)
+            .map(|index| u8::from_str_radix(&text[index..index + 2], 16).expect("hex byte"))
+            .collect()
     }
 
     #[test]

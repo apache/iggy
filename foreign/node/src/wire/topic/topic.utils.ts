@@ -63,6 +63,10 @@ export type BaseTopic = {
   localRetentionAge: bigint,
   /** Local cap on uploaded segments in bytes, read from the options (u64 max = unlimited) */
   localRetentionSize: bigint,
+  /** Whether the topic is normal or geo, read from the options */
+  topicType: TopicType,
+  /** How a geo topic writes its messages, read from the options, `null` on a normal topic */
+  geoMode: GeoMode | null,
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -197,6 +201,10 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
   const tieredStorage = setting('tiered_storage') === true;
   const localRetentionAge = limit('local_retention_age', DEFAULT_LOCAL_RETENTION_AGE);
   const localRetentionSize = limit('local_retention_size');
+  const topicType = setting('topic_type') === TopicType.Geo ? TopicType.Geo : TopicType.Normal;
+  // A normal topic refuses a mode at create, so a stored one is ignored.
+  const geoMode = topicType === TopicType.Normal ? null
+    : setting('geo_mode') === GeoMode.GeoTiered ? GeoMode.GeoTiered : GeoMode.Geo;
 
   return {
     bytesRead: pos - start,
@@ -212,6 +220,8 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       tieredStorage,
       localRetentionAge,
       localRetentionSize,
+      topicType,
+      geoMode,
       messagesCount,
       sizeBytes,
       options: explicit.options,

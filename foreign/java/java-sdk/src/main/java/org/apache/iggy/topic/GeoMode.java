@@ -19,6 +19,8 @@
 
 package org.apache.iggy.topic;
 
+import java.util.Optional;
+
 /** How a geo topic writes its messages. Only a geo topic has a mode. */
 public enum GeoMode {
     /** A batch goes to the object store before it commits. */
@@ -30,6 +32,16 @@ public enum GeoMode {
 
     GeoMode(String value) {
         this.value = value;
+    }
+
+    /** The mode named {@code value}, or empty for a mode this build does not know. */
+    public static Optional<GeoMode> fromValue(String value) {
+        for (GeoMode mode : values()) {
+            if (mode.value.equals(value)) {
+                return Optional.of(mode);
+            }
+        }
+        return Optional.empty();
     }
 
     public String value() {

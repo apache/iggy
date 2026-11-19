@@ -44,10 +44,12 @@ type Topic struct {
 	Name      string `json:"name"`
 	Size      uint64 `json:"size"`
 	// MessageExpiry, CompressionAlgorithm, MaxTopicSize, SegmentMaxAge,
-	// TieredStorage, LocalRetentionAge and LocalRetentionSize are read from
-	// the options, or are the catalog default when the server reported none or
-	// a value this build cannot read, such as an algorithm a newer server
-	// added. The server's own value stays in Options or DerivedOptions.
+	// TieredStorage, LocalRetentionAge, LocalRetentionSize and TopicType are
+	// read from the options, or are the catalog default when the server
+	// reported none or a value this build cannot read, such as an algorithm a
+	// newer server added. GeoMode is nil on a normal topic and GeoModeGeo on a
+	// geo topic that reported no mode this build can read. The server's own
+	// value stays in Options or DerivedOptions.
 	MessageExpiry        Duration               `json:"messageExpiry"`
 	CompressionAlgorithm uint8                  `json:"compressionAlgorithm"`
 	MaxTopicSize         uint64                 `json:"maxTopicSize"`
@@ -55,6 +57,8 @@ type Topic struct {
 	TieredStorage        bool                   `json:"tieredStorage"`
 	LocalRetentionAge    Duration               `json:"localRetentionAge"`
 	LocalRetentionSize   uint64                 `json:"localRetentionSize"`
+	TopicType            TopicType              `json:"topicType"`
+	GeoMode              *GeoMode               `json:"geoMode,omitempty"`
 	MessagesCount        uint64                 `json:"messagesCount"`
 	PartitionsCount      uint32                 `json:"partitionsCount"`
 	Options              map[string]HeaderValue `json:"options,omitempty"`

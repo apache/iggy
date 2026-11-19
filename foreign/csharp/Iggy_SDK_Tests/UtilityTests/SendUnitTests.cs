@@ -433,6 +433,44 @@ public class SendUnitTests
             It.IsAny<CancellationToken>()), Times.Never);
     }
 
+    [Theory]
+    [InlineData(VsrError.SHADOW_STREAM_READ_ONLY, 1)]
+    [InlineData(VsrError.TRANSIENT_NOT_ACCEPTED, 3)]
+    public async Task Processor_WhenTheServerRefusesASend_ShouldRetryOnlyARefusalThatCanChange(int status,
+        int expectedAttempts)
+    {
+        var refusal = VsrError.FromServer(status, "Server rejected the request.");
+        var failures = new List<MessageBatchFailedEventArgs>();
+        var client = new Mock<IIggyClient>();
+        client.Setup(value => value.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+                It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()))
+            .ThrowsAsync(refusal);
+        var config = BackgroundConfig(1);
+        config.EnableRetry = true;
+        config.MaxRetryAttempts = 3;
+        config.InitialRetryDelay = TimeSpan.FromMilliseconds(1);
+        await using var processor = new BackgroundMessageProcessor(client.Object, config, NullLoggerFactory.Instance);
+        processor.SubscribeOnMessageBatchFailed(failure =>
+        {
+            failures.Add(failure);
+            return Task.CompletedTask;
+        });
+        processor.Start();
+
+        await processor.EnqueueAsync(new ReadyUnit([new Message(Guid.NewGuid(), new byte[] { 1 })], null),
+            TestContext.Current.CancellationToken);
+        await processor.WaitForDrainAsync(TestContext.Current.CancellationToken).WaitAsync(TimeSpan.FromSeconds(5),
+            TestContext.Current.CancellationToken);
+        await WaitUntil(() => failures.Count == 1);
+
+        client.Verify(value => value.SendMessagesAsync(It.IsAny<Identifier>(), It.IsAny<Identifier>(),
+            It.IsAny<Partitioning>(), It.IsAny<IList<Message>>(), It.IsAny<CancellationToken>()),
+            Times.Exactly(expectedAttempts));
+        var failed = Assert.Single(failures);
+        Assert.Same(refusal, failed.Exception);
+        Assert.Equal(expectedAttempts, failed.AttemptedRetries);
+    }
+
     private static Mock<IIggyClient> MockClient(List<int> sentCounts)
     {
         var client = new Mock<IIggyClient>();

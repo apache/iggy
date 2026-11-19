@@ -89,6 +89,22 @@ async fn given_a_geo_topic_in_a_peer_when_followed_should_adopt_it_refuse_writes
         .expect("get the shadow topic")
         .expect("the shadow topic exists");
     assert_eq!(topic.name, GEO_TOPIC);
+    let resolved = topic.resolved_options();
+    assert_eq!(resolved.topic_type, TopicType::Geo);
+    assert_eq!(resolved.geo_mode, Some(GeoMode::Geo));
+    assert_eq!(shadow.shadow_origin().as_deref(), Some("dc-a"));
+    let origins: Vec<(String, Option<String>)> = follower
+        .get_streams()
+        .await
+        .expect("list the streams of dc-b")
+        .into_iter()
+        .map(|stream| (stream.name.clone(), stream.shadow_origin()))
+        .collect();
+    assert!(
+        origins.contains(&(SHADOW_STREAM.to_owned(), Some("dc-a".to_owned())))
+            && origins.contains(&("local".to_owned(), None)),
+        "a listing marks only the shadow stream: {origins:?}"
+    );
     let partition_ids: Vec<u32> = topic
         .partitions
         .iter()

@@ -42,7 +42,9 @@ use iggy_binary_protocol::primitives::metadata_changes::{
 };
 use iggy_binary_protocol::{PrepareHeader, WireName};
 use iggy_common::wire_conversions::{permissions_to_wire, resource_options_to_wire_split};
-use iggy_common::{OptionsScope, ResourceOptions, public_options};
+use iggy_common::{
+    OptionsScope, ResourceOptions, project_shadow_origin, project_shadow_topic, public_options,
+};
 
 /// One change a committed operation made to public metadata.
 ///
@@ -223,8 +225,22 @@ pub(crate) fn stream_body(stream: &Stream) -> Option<WireStreamBody> {
         key: WireStreamKey::from(stream),
         created_at: stream.created_at.as_micros(),
         name: WireName::new(stream.name.as_ref()).ok()?,
-        options: change_options(OptionsScope::Stream, &stream.options),
+        options: stream_change_options(stream),
     })
+}
+
+/// [`change_options`] of a stream, with the origin of a shadow stream.
+fn stream_change_options(stream: &Stream) -> WireChangeOptions {
+    public_options(OptionsScope::Stream, &stream.options)
+        .and_then(|mut public| {
+            if let Some(source) = &stream.shadow {
+                project_shadow_origin(&mut public, &source.origin)?;
+            }
+            resource_options_to_wire_split(&public)
+        })
+        .map_or(WireChangeOptions::Unreadable, |(explicit, derived)| {
+            WireChangeOptions::Readable { explicit, derived }
+        })
 }
 
 pub(crate) fn topic_body(stream: &Stream, topic: &Topic) -> Option<WireTopicBody> {
@@ -233,8 +249,23 @@ pub(crate) fn topic_body(stream: &Stream, topic: &Topic) -> Option<WireTopicBody
         created_at: topic.created_at.as_micros(),
         name: WireName::new(topic.name.as_ref()).ok()?,
         partitions_count: u32::try_from(topic.partitions.len()).ok()?,
-        options: change_options(OptionsScope::Topic, &topic.options),
+        options: topic_change_options(topic),
     })
+}
+
+/// [`change_options`] of a topic, which reports a shadow topic as the geo
+/// topic it shadows.
+fn topic_change_options(topic: &Topic) -> WireChangeOptions {
+    public_options(OptionsScope::Topic, &topic.options)
+        .and_then(|mut public| {
+            if let Some(shadow) = topic.shadow {
+                project_shadow_topic(&mut public, shadow.geo_mode)?;
+            }
+            resource_options_to_wire_split(&public)
+        })
+        .map_or(WireChangeOptions::Unreadable, |(explicit, derived)| {
+            WireChangeOptions::Readable { explicit, derived }
+        })
 }
 
 pub(crate) fn user_body(user: &User) -> Option<WireUserBody> {

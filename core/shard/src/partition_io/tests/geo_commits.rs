@@ -23,6 +23,7 @@ use super::segment_uploads::namespace;
 use super::*;
 use crate::geo_positions::GeoPositionSettings;
 use consensus::build_reply_message_with;
+use iggy_common::GeoMode;
 use iggy_object_store::{InlineTierExecutor, MemoryStore, ObjectPrefix};
 use metadata::stm::consumer_group::ConsumerGroup;
 use metadata::stm::shadow::{ShadowRetention, ShadowStream, ShadowTopic};
@@ -89,6 +90,7 @@ fn shadow_metadata(
             created_revision: PEER_PREFIX.created_revision,
             deleted_at,
             retention: ShadowRetention::default(),
+            geo_mode: GeoMode::Geo,
         }),
         ..Default::default()
     };

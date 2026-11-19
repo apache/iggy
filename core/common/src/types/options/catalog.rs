@@ -69,7 +69,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 26] = [
+pub static CATALOG: [OptionDescriptor; 27] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -485,6 +485,20 @@ pub static CATALOG: [OptionDescriptor; 26] = [
              before it commits, geo_tiered replicates it first and uploads sealed segments \
              later. Only on a geo topic, where it defaults to geo. Not available yet: \
              geo_tiered is refused"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::ShadowOrigin,
+        scopes: STREAM_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Computed,
+        mutability: OptionMutability::ReadOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::ReadOnly,
+        critical: false,
+        description: || {
+            "The geo origin of a shadow stream: the datacenter whose geo topics it serves,              read-only. Absent on every other stream"
                 .to_owned()
         },
     },
@@ -996,6 +1010,7 @@ pub fn canonical_value(
         | OptionKey::EncryptionKeySource
         | OptionKey::EncryptionKeyFingerprint
         | OptionKey::EncryptionKekFingerprint
+        | OptionKey::ShadowOrigin
         | OptionKey::CriticalKeys => return Err(invalid(key)),
     };
     Ok(Some(value))
@@ -1017,6 +1032,44 @@ pub fn stream_key_from_entry(
             .parse(),
         _ => Err(IggyError::InvalidEncryptionKey),
     }
+}
+
+/// Add the origin of a shadow stream to the options that a read of it
+/// returns, as a derived entry.
+///
+/// # Errors
+///
+/// `InvalidFormat` when `origin` is no header value, which no origin that
+/// the server accepts is.
+pub fn project_shadow_origin(public: &mut ResourceOptions, origin: &str) -> Result<(), IggyError> {
+    public.insert(
+        HeaderKey::from(OptionKey::ShadowOrigin),
+        OptionValue::derived(HeaderValue::try_from(origin)?),
+    );
+    Ok(())
+}
+
+/// Report a topic of a shadow stream as the geo topic it shadows, with the
+/// peer's `geo_mode`, as derived entries. The topic is stored as a normal
+/// topic, so this cluster runs none of a geo topic's write path for it.
+///
+/// # Errors
+///
+/// `InvalidFormat` when a value does not encode, which no topic type or mode
+/// does.
+pub fn project_shadow_topic(
+    public: &mut ResourceOptions,
+    geo_mode: GeoMode,
+) -> Result<(), IggyError> {
+    public.insert(
+        HeaderKey::from(OptionKey::TopicType),
+        OptionValue::derived(TopicType::Geo.encode()?),
+    );
+    public.insert(
+        HeaderKey::from(OptionKey::GeoMode),
+        OptionValue::derived(geo_mode.encode()?),
+    );
+    Ok(())
 }
 
 /// The options a read returns: public map keys by provenance, unknown keys

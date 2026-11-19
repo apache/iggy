@@ -57,6 +57,7 @@ constexpr iggy::StreamOptionKey kStreamOptionKeys[] = {
     iggy::StreamOptionKey::EncryptionKeySource,
     iggy::StreamOptionKey::EncryptionKeyFingerprint,
     iggy::StreamOptionKey::EncryptionKekFingerprint,
+    iggy::StreamOptionKey::ShadowOrigin,
 };
 
 constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
@@ -749,4 +750,6 @@ TEST_P(E2E_ResourceOptionsTransport, GivenPublicDescribeOptionsWhenCalledShouldR
     EXPECT_TRUE(!key.Updatable() && !key.Resettable() && key.Secret() && key.Critical() && !key.ReadOnly());
     const auto fingerprint = spec_of(iggy::StreamOptionKey::EncryptionKeyFingerprint);
     EXPECT_TRUE(fingerprint.ReadOnly() && !fingerprint.Updatable() && !fingerprint.Secret());
+    const auto shadow_origin = spec_of(iggy::StreamOptionKey::ShadowOrigin);
+    EXPECT_TRUE(shadow_origin.ReadOnly() && !shadow_origin.Updatable() && !shadow_origin.Critical());
 }

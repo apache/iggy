@@ -29,6 +29,8 @@ public enum StreamOptionKey: String, Sendable, Hashable, CaseIterable {
     case encryptionKeyFingerprint = "encryption_key_fingerprint"
     /// Fingerprints of the server keys that wrap the data key. Read-only.
     case encryptionKekFingerprint = "encryption_kek_fingerprint"
+    /// The geo origin a shadow stream serves. Read-only.
+    case shadowOrigin = "shadow_origin"
 }
 
 /// Where a stream's data key came from, as reads report it.
@@ -115,7 +117,7 @@ extension StreamOptionKey: CatalogOptionKey {
         switch self {
         case .name: .updatable
         case .encryptionKey: [.secret, .critical]
-        case .encryptionKeySource, .encryptionKeyFingerprint, .encryptionKekFingerprint: .readOnly
+        case .encryptionKeySource, .encryptionKeyFingerprint, .encryptionKekFingerprint, .shadowOrigin: .readOnly
         }
     }
 }
@@ -160,6 +162,13 @@ extension StreamInfo {
     public var encryptionKekFingerprints: [String] {
         kekFingerprints(options)
     }
+
+    /// The geo origin whose topics this shadow stream serves, nil for any
+    /// other stream. A write to a shadow stream fails with
+    /// ``IggyErrorCode/shadowStreamReadOnly``.
+    public var shadowOrigin: String? {
+        options[StreamOptionKey.shadowOrigin.rawValue]?.value.stringValue
+    }
 }
 
 extension StreamDetails {
@@ -179,6 +188,13 @@ extension StreamDetails {
     /// while the server's key is being rotated, none for a plaintext stream.
     public var encryptionKekFingerprints: [String] {
         kekFingerprints(options)
+    }
+
+    /// The geo origin whose topics this shadow stream serves, nil for any
+    /// other stream. A write to a shadow stream fails with
+    /// ``IggyErrorCode/shadowStreamReadOnly``.
+    public var shadowOrigin: String? {
+        options[StreamOptionKey.shadowOrigin.rawValue]?.value.stringValue
     }
 }
 

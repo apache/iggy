@@ -69,7 +69,8 @@ public sealed class ResourceOptionsTests
     {
         ["encryption_key_source"] = stream => stream.EncryptionKeySource,
         ["encryption_key_fingerprint"] = stream => stream.EncryptionKeyFingerprint,
-        ["encryption_kek_fingerprint"] = stream => stream.EncryptionKekFingerprints.SingleOrDefault()
+        ["encryption_kek_fingerprint"] = stream => stream.EncryptionKekFingerprints.SingleOrDefault(),
+        ["shadow_origin"] = stream => stream.ShadowOrigin
     };
 
     private static readonly byte[] RawKey = Enumerable.Range(1, EncryptionKeys.KEY_LENGTH).Select(value => (byte)value).ToArray();
@@ -816,6 +817,17 @@ public sealed class ResourceOptionsTests
                 stream.EncryptionKeyFingerprint);
             Assert.Equal(expected.GetProperty("encryption_kek_fingerprints").EnumerateArray()
                 .Select(entry => entry.GetString()!).ToList(), stream.EncryptionKekFingerprints);
+            var origin = expected.TryGetProperty("shadow_origin", out var shadowOrigin) ? shadowOrigin.GetString() : null;
+            Assert.Equal(origin, stream.ShadowOrigin);
+            Assert.Equal(origin, new MetadataStreamChange
+            {
+                StreamId = stream.Id,
+                StreamCreatedOp = 1,
+                CreatedAt = 0,
+                Name = stream.Name,
+                Options = stream.Options,
+                DerivedOptions = stream.DerivedOptions
+            }.ShadowOrigin);
             AssertNeverReturned(stream.Options, stream.DerivedOptions);
         }
 
@@ -848,10 +860,24 @@ public sealed class ResourceOptionsTests
                 DurationHelpers.ToDuration(topic.LocalRetentionAge));
             Assert.Equal(ParseU64(expected.GetProperty("options").GetProperty("local_retention_size"), "value"),
                 topic.LocalRetentionSize);
+            Assert.Equal(OptionText(expected, "topic_type") ?? "normal", SnakeCase(topic.TopicType));
+            Assert.Equal(OptionText(expected, "geo_mode"), topic.GeoMode is { } mode ? SnakeCase(mode) : null);
             AssertNeverReturned(topic.Options, topic.DerivedOptions);
         }
 
         Assert.Equal(MicrosSinceEpoch(binary.CreatedAt), expected.GetProperty("created_at").GetUInt64());
+    }
+
+    private static string? OptionText(JsonElement expected, string key)
+    {
+        return expected.GetProperty("options").TryGetProperty(key, out var option)
+            ? option.GetProperty("value").GetString()
+            : null;
+    }
+
+    private static string SnakeCase<TEnum>(TEnum value) where TEnum : struct, Enum
+    {
+        return JsonNamingPolicy.SnakeCaseLower.ConvertName(value.ToString());
     }
 
     private static void AssertUserResponse(JsonElement vector)

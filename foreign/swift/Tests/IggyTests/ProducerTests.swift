@@ -501,9 +501,36 @@ struct ProducerTests {
         for code: IggyErrorCode in [.transientNotAccepted, .notConnected, .cannotEstablishConnection] {
             #expect(!ProducerCore.stopsSendRetries(IggyError(code)))
         }
-        for code: IggyErrorCode in [.transientNotCommitted, .disconnected, .requestTooOld, .historyUnavailable, .tieredReadFailed, .invalidCommand] {
+        for code: IggyErrorCode in [
+            .transientNotCommitted, .disconnected, .requestTooOld, .historyUnavailable, .tieredReadFailed, .invalidCommand, .shadowStreamReadOnly,
+        ] {
             #expect(ProducerCore.stopsSendRetries(IggyError(code)))
         }
+    }
+
+    /// A shadow stream takes no writes, and no later attempt changes that,
+    /// so the refusal comes back after one attempt despite the retry budget.
+    @Test func aSendToAShadowStreamIsNotRetried() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            guard request.code == CommandCode.sendMessages.rawValue else { return FakeVSRServer.defaultReply(request, address: server.address) }
+            return .status(IggyErrorCode.shadowStreamReadOnly.rawValue)
+        }
+        let client = try await signedInClient(server)
+        let configuration = ProducerConfiguration(partitioning: .partition(1), sendRetries: 3, sendRetryInterval: .milliseconds(10))
+        let producer = try client.producer(streamID: 1, topicID: 2, configuration: configuration)
+        do {
+            try await producer.send(["refused"])
+            Issue.record("the send did not fail")
+        } catch let error as ProducerSendError {
+            #expect(error.cause.code == .shadowStreamReadOnly)
+            #expect(error.committed.isEmpty)
+            #expect(error.failed.map(\.payloadString) == ["refused"])
+        }
+        #expect(await sends(server).count == 1)
+        await producer.shutdown()
+        await client.shutdown()
     }
 
     /// While the client is signed out the producer waits for a sign-in, up

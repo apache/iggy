@@ -56,7 +56,8 @@ internal static class OptionKeys
         new("encryption_key", HeaderKind.Raw, OptionFlags.Secret | OptionFlags.Critical),
         new("encryption_key_source", HeaderKind.String, OptionFlags.ReadOnly),
         new("encryption_key_fingerprint", HeaderKind.String, OptionFlags.ReadOnly),
-        new("encryption_kek_fingerprint", HeaderKind.String, OptionFlags.ReadOnly)
+        new("encryption_kek_fingerprint", HeaderKind.String, OptionFlags.ReadOnly),
+        new("shadow_origin", HeaderKind.String, OptionFlags.ReadOnly)
     ];
 
     private static readonly OptionDescriptor[] TopicKeys =
@@ -107,6 +108,7 @@ internal static class OptionKeys
             StreamOptionKey.EncryptionKeySource => "encryption_key_source",
             StreamOptionKey.EncryptionKeyFingerprint => "encryption_key_fingerprint",
             StreamOptionKey.EncryptionKekFingerprint => "encryption_kek_fingerprint",
+            StreamOptionKey.ShadowOrigin => "shadow_origin",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown stream option key")
         });
     }
