@@ -532,29 +532,29 @@ deduplicate on an id of their own, such as the message id that the producer sets
 
 ## Delays
 
-| From                    | To                                   | How long                                                                                                                                                                                                                                  |
-| ----------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Send                    | Committed and acknowledged           | One upload of the fresh object and one commit. A busy shard adds up to `fresh_upload_interval`, 10 ms by default, or the wait for a free upload slot. A partition past `long_term_backlog_limit` adds 10 ms to 250 ms.                    |
-| Committed               | Readable in the origin cluster       | At once.                                                                                                                                                                                                                                  |
-| Committed               | Published                            | The partition's next rewrite, every 1 s to 10 s, plus the upload and the commit of the segment. The manifest is stored after the commit, at most once a second: the commits within a second share the next store.                         |
-| Published               | Readable in another datacenter       | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                                        |
-| Committed               | Readable in another datacenter       | The two rows above added up, seconds: the next rewrite and manifest, then the peer's next listing. Nothing else brings a message there.                                                                                                   |
-| Geo topic created       | Shadow topic in each peer            | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                                           |
-| Group offset store      | Acknowledged, position in the bucket | One commit of the store, one commit of the fold and one put of the node's object of the log. A put that runs, or one that started less than `[geo] consumer_offset_upload_interval` (50 ms by default) before, delays it to the next put. |
-| Poll with `auto_commit` | Position stored in the bucket        | Up to `[geo] positions_publish_interval`, 1 s by default, then a commit of the fold and the upload of the object.                                                                                                                         |
-| Position stored         | Taken by another datacenter          | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                                        |
-| Geo topic deleted       | Shadow topic detached in each peer   | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                                                                                                        |
-| Shadow topic detached   | Shadow topic removed                 | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                                                                                                    |
+| From                    | To                                   | How long                                                                                                                                                                                                                                                             |
+| ----------------------- | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Send                    | Committed and acknowledged           | One upload of the fresh object and one commit. A busy shard adds up to `fresh_upload_interval`, 10 ms by default, or the wait for a free upload slot. A partition past `long_term_backlog_limit` adds 10 ms to 250 ms.                                               |
+| Committed               | Readable in the origin cluster       | At once.                                                                                                                                                                                                                                                             |
+| Committed               | Published                            | The partition's next rewrite, every 1 s to `[geo] long_term_rewrite_max_interval`, 10 s by default, plus the upload and the commit of the segment. The manifest is stored after the commit, at most once a second: the commits within a second share the next store. |
+| Published               | Readable in another datacenter       | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                                                                   |
+| Committed               | Readable in another datacenter       | The two rows above added up, seconds: the next rewrite and manifest, then the peer's next listing. Nothing else brings a message there.                                                                                                                              |
+| Geo topic created       | Shadow topic in each peer            | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                                                                      |
+| Group offset store      | Acknowledged, position in the bucket | One commit of the store, one commit of the fold and one put of the node's object of the log. A put that runs, or one that started less than `[geo] consumer_offset_upload_interval` (50 ms by default) before, delays it to the next put.                            |
+| Poll with `auto_commit` | Position stored in the bucket        | Up to `[geo] positions_publish_interval`, 1 s by default, then a commit of the fold and the upload of the object.                                                                                                                                                    |
+| Position stored         | Taken by another datacenter          | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                                                                   |
+| Geo topic deleted       | Shadow topic detached in each peer   | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                                                                                                                                   |
+| Shadow topic detached   | Shadow topic removed                 | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                                                                                                                               |
 
-Each partition adjusts its rewrite interval between 1 s and 10 s, toward the interval at which a
-long-term segment comes out 80% of 64 MiB full. A segment cut at 64 MiB starts the next rewrite as
-soon as it commits, so a partition that commits more than 64 MiB a second rewrites back to back.
-Its manifest is still stored at most once a second, with what the long-term log holds then. A
-change that came within the second is stored once the second passed, also when nothing follows
-it. A long-term log that did not change is not stored again, but for one repeat 2 minutes after a
-new primary's first store. After a node starts, its partitions rewrite nothing until the first
-pass of the segment cleaner, one `[data_maintenance.messages] interval` after the start, 1 minute
-by default.
+Each partition adjusts its rewrite interval between 1 s and `[geo] long_term_rewrite_max_interval`,
+10 s by default, toward the interval at which a long-term segment comes out 80% of 64 MiB full. A
+segment cut at 64 MiB starts the next rewrite as soon as it commits, so a partition that commits
+more than 64 MiB a second rewrites back to back. Its manifest is still stored at most once a second,
+with what the long-term log holds then. A change that came within the second is stored once the
+second passed, also when nothing follows it. A long-term log that did not change is not stored
+again, but for one repeat 2 minutes after a new primary's first store. After a node starts, its
+partitions rewrite nothing until the first pass of the segment cleaner, one
+`[data_maintenance.messages] interval` after the start, 1 minute by default.
 
 `partition_long_term_rewrite_lag_messages` shows how far publication trails commits on the
 origin. It is the most committed messages that one partition of the shard holds and no long-term
@@ -562,11 +562,15 @@ segment holds yet.
 
 The manifest is the only source of a shadow partition: it never serves an offset past the end of
 the last long-term segment that the manifest it committed lists. The slowest step is the rewrite
-interval of a partition with little load.
+interval of a partition with little load. Such a partition waits the longest interval, so a shadow
+of it is about `[geo] long_term_rewrite_max_interval` plus `[geo] manifest_poll_interval` behind.
+A lower `long_term_rewrite_max_interval` brings messages to the shadow topics sooner. It also leaves
+more and smaller long-term segments on quiet partitions: more merge work and more manifest stores,
+still at most one store a second per partition. At `1 s` a partition rewrites every second.
 
 In a test with two single-node clusters on one host and an `fs` bucket, with one send every
 50 ms for a minute, a consumer of the shadow topic read each message this long after the origin
-acknowledged it. At that load each partition rewrites every 10 s, the longest interval.
+acknowledged it. At that load each partition rewrites every 10 s, the default longest interval.
 
 | `manifest_poll_interval` | Median | 95th percentile | Longest |
 | ------------------------ | ------ | --------------- | ------- |
@@ -980,6 +984,7 @@ Alert on these first:
 | `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                                                                       |
 | `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer that did not retire. A peer that does not answer delays them this long.                                                                                                                                                                                                                         |
 | `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                                                                            |
+| `[geo] long_term_rewrite_max_interval`     | `10 s`  | The longest wait between two rewrites of a geo partition into long-term segments, which a partition with little load waits. Its shadow topics are about this plus `manifest_poll_interval` behind. A lower value publishes sooner, and leaves more and smaller segments on quiet partitions: more merges and manifest stores, still at most one a second. At least `1 s`, which rewrites every second.       |
 | `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                                                            |
 | `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                                                                           |
 | `[geo] tombstone_grace`                    | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage.                                                                                                                                                                                                                     |

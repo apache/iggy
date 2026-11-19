@@ -4739,3 +4739,52 @@ async fn given_a_backlog_past_the_limit_when_the_partition_waits_out_its_interva
 
     assert!(rewritten_in < REWRITE_INTERVAL_MAX / 4, "{rewritten_in:?}");
 }
+
+/// The ceiling the shard was given bounds the wait that a small segment
+/// lengthens, as `[geo] long_term_rewrite_max_interval` sets it.
+#[compio::test]
+async fn given_a_rewrite_ceiling_of_two_seconds_when_a_small_segment_settles_should_wait_two_seconds()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(executor.clone())),
+            layout(),
+        )));
+    owner.set_long_term_rewrite_max_interval(Duration::from_secs(2));
+    let revision = staged_revision(&owner);
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+
+    let wait = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(0)).await;
+        owner
+            .rewrite_pacing
+            .borrow()
+            .interval(&(namespace(), revision))
+    })
+    .await;
+
+    assert_eq!(wait, Some(Duration::from_secs(2)));
+}
