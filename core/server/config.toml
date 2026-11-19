@@ -1582,6 +1582,27 @@ handshake_grace = "10 s"
 # stays about this far behind its peer. One listing per peer stream and one
 # read per changed manifest go to the peer's store each time.
 #manifest_poll_interval = "5 s"
+# How often a node stores the positions of the consumer groups of its geo and
+# shadow topics in its bucket, one object per log in which it leads a
+# partition, when they changed. It carries the commits of polls with
+# auto_commit: a group that fails over reads again at most this long, plus the
+# poll interval of the other datacenter.
+#positions_publish_interval = "1 s"
+# The shortest time between two stores of positions for the offsets that
+# consumer groups store themselves (StoreConsumerOffset). Such a store is
+# answered only once this node's bucket holds its position, so a group that
+# fails over reads none of it again. A store that finds no put running is
+# stored at once, and the stores that arrive during a put or within the
+# interval share the next one. Each put rewrites the node's whole object of
+# the log. "disabled" answers them at the local commit and leaves them to
+# positions_publish_interval. Up to 1 s.
+#positions_commit_interval = "50 ms"
+# How often a node lists the consumer group positions that each peer stores,
+# and takes the ones that win over its own.
+#positions_poll_interval = "1 s"
+# How long, after a node starts, the group polls of its geo and shadow
+# partitions wait for the positions of every peer.
+#positions_resume_timeout = "10 s"
 # The cluster_uid of a cluster that lost every disk, as the store identity
 # object "<prefix>/meta/identity" names it, whose geo topics this cluster
 # takes back from that store. Only replica 0 reads it: set it there, in the

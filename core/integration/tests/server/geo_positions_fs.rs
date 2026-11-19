@@ -19,18 +19,15 @@
 //! `dc-b`. The group reads the geo topic of `dc-a` there, and the shadow of
 //! that topic in `dc-b`. Its positions travel through the buckets.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use iggy::prelude::*;
-use iggy_object_store::{GeoPosition, PositionValue};
+use iggy_object_store::PositionValue;
 use integration::harness::{
     GeoCluster, GeoClusterPair, GeoSide, wait_for_consumer_group_assignment,
 };
-use serde_json::json;
 use tokio::time::{Instant, sleep};
-
-use super::http_client::HttpClient;
 
 const STREAM: &str = "orders";
 const TOPIC: &str = "payments";
@@ -47,7 +44,7 @@ const DEADLINE: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_millis(50);
 
 #[tokio::test]
-async fn given_a_group_drained_on_every_node_of_one_datacenter_when_it_starts_in_the_other_should_resume_each_partition_on_the_exact_next_message()
+async fn given_a_group_committing_on_partitions_led_by_different_nodes_when_its_datacenter_is_killed_should_resume_each_partition_on_the_exact_next_message()
  {
     let mut pair = started_pair(NODES).await;
     let ids = create_and_follow(&pair, PARTITIONS).await;
@@ -57,73 +54,44 @@ async fn given_a_group_drained_on_every_node_of_one_datacenter_when_it_starts_in
         send(&client_a, partition, 0..100).await;
         wait_until_shadow_serves(&client_b, ids, partition, 100).await;
     }
+    let group_b = Group::create(&client_b, ids.shadow()).await;
     let group_a = Group::join(&client_a, ids.own()).await;
     let consumed: BTreeMap<u32, u64> = (0..PARTITIONS)
         .map(|partition| (partition, 30 + 7 * u64::from(partition)))
         .collect();
+
     for (partition, count) in &consumed {
-        let read = group_a.on(*partition).consume(&client_a, *count).await;
+        let group = group_a.on(*partition);
+        let mut read = Vec::new();
+        while (read.len() as u64) < *count {
+            let left = u32::try_from(count - read.len() as u64).unwrap_or(u32::MAX);
+            let polled = group.poll_manual(&client_a, left.min(10)).await;
+            let Some(last) = polled.last().copied() else {
+                sleep(RETRY).await;
+                continue;
+            };
+            read.extend(polled);
+            group.commit(&client_a, last).await;
+            assert_eq!(
+                bucket_offset(pair.a(), *partition).await,
+                Some(last),
+                "the bucket holds a commit of partition {partition} once it is acknowledged"
+            );
+        }
         assert_eq!(read, (0..*count).collect::<Vec<_>>());
     }
-    group_a.leave(&client_a).await;
-
-    let mut drained = BTreeMap::new();
-    for node in 0..NODES {
-        let answer = drain(pair.a(), node).await;
-        assert_eq!(answer["not_held"], json!([]), "node {node}: {answer}");
-        let not_led: Vec<u64> = serde_json::from_value(answer["not_led"].clone())
-            .expect("the partitions the node does not lead");
-        if node == 0 {
-            assert!(
-                !not_led.is_empty(),
-                "the leaders of the partitions spread over the nodes: {answer}"
-            );
-        }
-        let positions = answer["positions"].as_array().expect("positions");
-        let mut covered = not_led;
-        for position in positions {
-            let partition = position["partition_id"].as_u64().expect("a partition id");
-            let offset = position["offset"].as_u64().expect("an offset");
-            covered.push(partition);
-            assert_eq!(
-                drained.insert(partition, offset),
-                None,
-                "only the node that leads a partition drains it: {answer}"
-            );
-        }
-        covered.sort_unstable();
-        assert_eq!(
-            covered,
-            (0..u64::from(PARTITIONS)).collect::<Vec<_>>(),
-            "node {node}: {answer}"
-        );
-    }
-    let expected: BTreeMap<u64, u64> = consumed
-        .iter()
-        .map(|(partition, count)| (u64::from(*partition), count - 1))
-        .collect();
-    assert_eq!(drained, expected, "one drain stores each partition");
-    let stored = pair
+    let objects = pair
         .a()
         .bucket()
         .positions_objects()
         .await
         .expect("dc-a's bucket reads");
-    for (partition, offset) in &expected {
-        let partition = u32::try_from(*partition).expect("a partition id");
-        assert!(
-            stored.iter().any(|object| object
-                .partitions
-                .get(&partition)
-                .and_then(|groups| groups.get(GROUP))
-                == Some(&GeoPosition {
-                    reset: 0,
-                    value: PositionValue::Offset(*offset)
-                })),
-            "the drains answer once the bucket holds the positions: {stored:?}"
-        );
-    }
-    for object in &stored {
+    let publishers: BTreeSet<u8> = objects.iter().map(|object| object.key.replica).collect();
+    assert!(
+        publishers.len() > 1,
+        "the leaders of the partitions spread over the nodes: {objects:?}"
+    );
+    for object in &objects {
         assert!(
             object.partitions.len() < PARTITIONS as usize,
             "node {} publishes partitions it does not lead: {object:?}",
@@ -132,10 +100,9 @@ async fn given_a_group_drained_on_every_node_of_one_datacenter_when_it_starts_in
     }
 
     pair.cluster_mut(GeoSide::A)
-        .stop()
-        .await
-        .expect("dc-a stops after the drains");
-    let group_b = Group::create(&client_b, ids.shadow()).await;
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after the last commit");
     for (partition, count) in &consumed {
         group_b
             .on(*partition)
@@ -238,7 +205,7 @@ async fn given_a_group_that_moved_back_in_one_datacenter_when_the_other_holds_a_
 }
 
 #[tokio::test]
-async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_should_resume_in_the_other_skipping_none_and_rereading_at_most_two_intervals()
+async fn given_a_group_committing_on_read_when_its_datacenter_fails_should_resume_in_the_other_skipping_none_and_rereading_at_most_two_intervals()
  {
     const MESSAGES: u64 = 600;
     const PACE: Duration = Duration::from_millis(20);
@@ -297,6 +264,104 @@ async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_sh
     eprintln!(
         "dc-a consumed through {last}; dc-b resumed at {first}, re-reading {} messages",
         reread.len()
+    );
+}
+
+#[tokio::test]
+async fn given_a_group_committing_its_offsets_when_its_datacenter_is_killed_right_after_an_acknowledged_commit_should_resume_in_the_other_on_the_exact_next_message()
+ {
+    const MESSAGES: u64 = 600;
+    const PACE: Duration = Duration::from_millis(20);
+    const CONSUME_FOR: Duration = Duration::from_secs(4);
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..MESSAGES).await;
+    wait_until_shadow_serves(&client_b, ids, 0, MESSAGES).await;
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+
+    let mut read = Vec::new();
+    let mut latencies = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < CONSUME_FOR {
+        let polled = group_a.poll_manual(&client_a, 5).await;
+        if let Some(last) = polled.last().copied() {
+            read.extend(polled);
+            let commit_started = Instant::now();
+            group_a.commit(&client_a, last).await;
+            latencies.push(commit_started.elapsed());
+        }
+        sleep(PACE).await;
+    }
+    let last = *read.last().expect("dc-a read");
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after an acknowledged commit");
+    assert_eq!(read, (0..=last).collect::<Vec<_>>());
+
+    group_b.wait_for_offset(&client_b, Some(last)).await;
+    let group_b = group_b.joined(&client_b).await;
+    let resumed = group_b.consume(&client_b, 20).await;
+    assert_eq!(
+        resumed,
+        (last + 1..last + 21).collect::<Vec<_>>(),
+        "dc-b reads none of the acknowledged commits again and skips none"
+    );
+    latencies.sort_unstable();
+    eprintln!(
+        "{} commits, the last at {last}; commit latency median {:?}, p90 {:?}, max {:?}",
+        latencies.len(),
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() * 9 / 10],
+        latencies[latencies.len() - 1]
+    );
+}
+
+#[tokio::test]
+async fn given_a_bucket_that_refuses_puts_when_a_group_commits_should_acknowledge_only_once_the_bucket_holds_the_position()
+ {
+    const REFUSING_FOR: Duration = Duration::from_secs(3);
+    let pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    send(&client_a, 0, 0..40).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    assert_eq!(group_a.poll_manual(&client_a, 10).await.len(), 10);
+    group_a.commit(&client_a, 9).await;
+    assert_eq!(bucket_offset(pair.a(), 0).await, Some(9));
+
+    let positions = pair
+        .a()
+        .bucket()
+        .path()
+        .join(pair.a().bucket().layout().positions_prefix())
+        .join(pair.a().origin());
+    std::fs::remove_dir_all(&positions).expect("the node's positions go");
+    std::fs::write(&positions, b"").expect("a file where the positions directory was");
+    let commit = tokio::spawn(async move {
+        assert_eq!(group_a.poll_manual(&client_a, 10).await.len(), 10);
+        group_a.commit(&client_a, 19).await;
+        Instant::now()
+    });
+    sleep(REFUSING_FOR).await;
+    assert!(
+        !commit.is_finished(),
+        "a commit whose position the bucket refuses is not acknowledged"
+    );
+
+    std::fs::remove_file(&positions).expect("the bucket takes puts again");
+    let acknowledged = tokio::time::timeout(DEADLINE, commit)
+        .await
+        .expect("the commit is acknowledged once the bucket takes it")
+        .expect("the committing task ends");
+    assert_eq!(
+        bucket_offset(pair.a(), 0).await,
+        Some(19),
+        "the bucket holds the position at the acknowledgement, {:?} after it",
+        acknowledged.elapsed()
     );
 }
 
@@ -441,6 +506,48 @@ impl Group {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// One poll of the next `count` messages that commits nothing. Empty
+    /// when the cluster refused the poll.
+    async fn poll_manual(&self, client: &IggyClient, count: u32) -> Vec<u64> {
+        client
+            .poll_messages(
+                &self.stream,
+                &self.topic,
+                self.partition,
+                &Consumer::group(named(GROUP)),
+                &PollingStrategy::next(),
+                PollOptions {
+                    count,
+                    commit: CommitPolicy::Manual,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .map(|polled| {
+                polled
+                    .messages
+                    .iter()
+                    .map(|message| message.header.offset)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Store `offset` as the group's offset, as an application commits a
+    /// checkpoint, and wait for the answer.
+    async fn commit(&self, client: &IggyClient, offset: u64) {
+        client
+            .store_consumer_offset(
+                &Consumer::group(named(GROUP)),
+                &self.stream,
+                &self.topic,
+                Some(self.partition),
+                offset,
+            )
+            .await
+            .expect("the cluster takes the commit");
     }
 
     /// Poll and commit until `count` messages arrived.
@@ -641,22 +748,22 @@ async fn wait_for_bucket_offset_on(cluster: &GeoCluster, partition: u32, offset:
     }
 }
 
-/// Drain the group on node `node` of `cluster`, and return its answer.
-async fn drain(cluster: &GeoCluster, node: usize) -> serde_json::Value {
-    let address = cluster
-        .harness()
-        .node(node)
-        .http_addr()
-        .expect("the node's HTTP address");
-    let http = HttpClient::login_root_no_redirect(format!("http://{address}")).await;
-    let response = http
-        .post_json(
-            &format!("/streams/{STREAM}/topics/{TOPIC}/consumer-groups/{GROUP}/drain?timeout=30s"),
-            &json!({}),
+/// The group's offset on `partition` that the bucket of `cluster` holds, the
+/// highest across the objects of its nodes.
+async fn bucket_offset(cluster: &GeoCluster, partition: u32) -> Option<u64> {
+    cluster
+        .bucket()
+        .positions_objects()
+        .await
+        .expect("the bucket reads")
+        .iter()
+        .filter_map(
+            |object| match object.partitions.get(&partition)?.get(GROUP)?.value {
+                PositionValue::Offset(offset) => Some(offset),
+                PositionValue::Unset | PositionValue::Deleted => None,
+            },
         )
-        .await;
-    assert_eq!(response.status(), 200, "node {node} stores the positions");
-    response.json().await.expect("a drain body")
+        .max()
 }
 
 /// Run `call` until it succeeds, as an SDK does for a retryable refusal.

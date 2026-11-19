@@ -842,6 +842,24 @@ changed. It keeps in it the partitions it stopped leading as it last stored
 them, and a new primary stores the partition at its first round. A node
 deletes its object of a log the cluster no longer holds.
 
+A `StoreConsumerOffset` that a consumer group sends itself, with a quorum
+ack, on a geo or shadow partition, commits as any other and is answered only
+once the node's object of the log holds the position it stored. Shard 0 then
+runs a round of that topic between the periodic ones: the primary folds the
+commit, and the node stores the object. A store that finds no round running
+and none started in the last `[geo] positions_commit_interval` (50 ms by
+default) starts one at once, and the stores that arrive meanwhile share the
+next one, so a busy log costs one put an interval and not one a store. The
+puts take the fresh upload slots of shard 0 (`[tiered_storage.jobs]
+fresh_uploads`), so they never wait for an idle shard. A put that fails is tried again in a later round, after a wait that doubles from
+twice the interval up to a second. A store whose position is not stored
+within 10 seconds, or whose partition stops being led here, is answered with
+`TransientNotCommitted` (57): its commit stands, and the SDK sends the same
+request again, which the partition answers from its dedup table and which
+waits again, on the current primary. `disabled` answers these stores at the
+commit, as a poll's `auto_commit` always is. The HTTP API refuses group
+offset stores, so they all come over the binary transports.
+
 Every `[geo] positions_poll_interval` (1 second by default), shard 0 of each
 node that leads a partition of a geo or shadow topic lists
 `<prefix>/meta/positions/` in the store of each peer, reads the objects whose
@@ -860,16 +878,12 @@ peer once, or until `[geo] positions_resume_timeout` (10 seconds by default)
 passed. A datacenter that returns therefore resumes a group from where the
 other datacenters left it.
 
-`POST /streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}/drain`
-prepares a planned failover. Stop the group's consumers first: the server
-waits until the group has no members in this cluster (409 otherwise), has
-the partitions this node leads fold the group's offsets, stores the node's
-object at once, and answers after the store took it, with the stored
-positions, the partitions another node leads (`not_led`) and those the node
-holds no replica of (`not_held`). A backup cannot tell that it applied the
-group's last commit, so drain the group on every node. An optional `timeout`
-query value, `30s` by default, bounds the wait. It takes the permission to
-store the topic's consumer offsets.
+A group moved to another datacenter needs no step to hand over its
+positions. Stop its consumers, wait `positions_poll_interval` until the
+other datacenter took the last position (plus `positions_publish_interval`
+for a group that commits on read), and start them there. A group whose
+consumers start sooner keeps the position its datacenter took before them,
+and reads again what came after it, skipping nothing.
 
 Each shard exports:
 
@@ -881,6 +895,9 @@ Each shard exports:
 - `geo_positions_stored_total` and `geo_positions_store_failures_total` count
   the objects of positions that the node stored and the ones its store
   refused.
+- `geo_positions_commits_confirmed_total` and
+  `geo_positions_commits_uncertain_total` count the group offset stores
+  answered once their positions were stored, and the ones answered with 57.
 - `geo_positions_resume_waiting` is 1 while group polls on the shard wait for
   the peers' positions after a start.
 

@@ -1465,11 +1465,11 @@ where
             LifecycleFrame::PeerFreshFound(found) => {
                 self.on_peer_fresh_found(*found);
             }
-            LifecycleFrame::ReportGeoPositions { round } => {
-                self.on_report_geo_positions(round).await;
+            LifecycleFrame::ReportGeoPositions { round, scope } => {
+                self.on_report_geo_positions(round, scope).await;
             }
-            LifecycleFrame::ReportGeoPositionsFolded { round } => {
-                self.on_report_geo_positions_folded(round);
+            LifecycleFrame::ReportGeoPositionsFolded { round, scope } => {
+                self.on_report_geo_positions_folded(round, scope.as_deref());
             }
             LifecycleFrame::GeoPositionsReported(report) => {
                 self.on_geo_positions_reported(*report);
@@ -1482,6 +1482,15 @@ where
             }
             LifecycleFrame::NoteGeoPositions { namespace } => {
                 self.on_note_geo_positions(namespace).await;
+            }
+            LifecycleFrame::GeoCommitHeld(commit) => {
+                self.on_geo_commit_held(*commit);
+            }
+            LifecycleFrame::GeoCommitsWaiting { topics } => {
+                self.on_geo_commits_waiting(topics);
+            }
+            LifecycleFrame::GeoPositionsPublished { round, stored } => {
+                self.on_geo_positions_published(round, stored);
             }
             LifecycleFrame::SegmentMergeFinished(finished) => {
                 self.on_segment_merge_finished(*finished).await;
