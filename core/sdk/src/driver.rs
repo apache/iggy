@@ -85,12 +85,15 @@ tokio::task_local! {
 
 #[cfg(test)]
 mod extractor_tests {
-    use super::{RequestErrorContext, enrich_error, extract_from_retained_frame};
+    use super::{
+        Call, PartitionTarget, RequestErrorContext, RequestTarget, enrich_error,
+        extract_from_retained_frame,
+    };
     use bytes::Bytes;
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::codes::{
         CREATE_TOPIC_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, GET_STREAM_CODE, GET_TOPIC_CODE,
-        GET_TOPICS_CODE,
+        GET_TOPICS_CODE, SEND_MESSAGES_CODE,
     };
     use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, GetStreamRequest};
     use iggy_binary_protocol::requests::topics::{
@@ -100,6 +103,7 @@ mod extractor_tests {
         WireIdentifier, WireName, WireOptions, primitives::page::WirePageQuery,
     };
     use iggy_common::{IdKind, Identifier, IggyError};
+    use tokio::time::Instant;
 
     const UNKNOWN_OPERATION_CODE: u32 = 255;
 
@@ -282,7 +286,7 @@ mod extractor_tests {
         let original = IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap());
 
         assert_eq!(
-            enrich_error(original, Some(&context())),
+            enrich_error(original, Some(&context()), None),
             IggyError::StreamIdNotFound(stream)
         );
     }
@@ -297,7 +301,7 @@ mod extractor_tests {
         );
 
         assert_eq!(
-            enrich_error(original, Some(&context())),
+            enrich_error(original, Some(&context()), None),
             IggyError::TopicIdNotFound(topic, stream)
         );
     }
@@ -313,7 +317,37 @@ mod extractor_tests {
             topic: None,
         };
 
-        assert_eq!(enrich_error(original.clone(), Some(&context)), original);
+        assert_eq!(
+            enrich_error(original.clone(), Some(&context), None),
+            original
+        );
+    }
+
+    #[test]
+    fn partition_call_uses_partition_key_for_error_context() {
+        let stream = Identifier::named("events").unwrap();
+        let topic = Identifier::named("orders").unwrap();
+        let call = Call::new(
+            SEND_MESSAGES_CODE,
+            Bytes::new(),
+            RequestTarget::Partition(PartitionTarget {
+                stream_id: &stream,
+                topic_id: &topic,
+                partition_id: 1,
+                context: None,
+            }),
+            Instant::now(),
+        );
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+
+        assert!(call.request_error_context.is_none());
+        assert_eq!(
+            call.enrich_error(original),
+            IggyError::TopicIdNotFound(topic, stream)
+        );
     }
 }
 
@@ -361,11 +395,22 @@ fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorCo
     Some(RequestErrorContext { stream, topic })
 }
 
-fn enrich_error(error: IggyError, context: Option<&RequestErrorContext>) -> IggyError {
-    match (error.as_code(), context) {
-        (1009, Some(context)) => IggyError::StreamIdNotFound(context.stream.clone()),
-        (2010, Some(context)) => match context.topic.as_ref() {
-            Some(topic) => IggyError::TopicIdNotFound(topic.clone(), context.stream.clone()),
+fn enrich_error(
+    error: IggyError,
+    context: Option<&RequestErrorContext>,
+    partition: Option<&PartitionKey>,
+) -> IggyError {
+    let (stream, topic) = match context {
+        Some(context) => (&context.stream, context.topic.as_ref()),
+        None => match partition {
+            Some(partition) => (&partition.stream_id, Some(&partition.topic_id)),
+            None => return error,
+        },
+    };
+    match error.as_code() {
+        1009 => IggyError::StreamIdNotFound(stream.clone()),
+        2010 => match topic {
+            Some(topic) => IggyError::TopicIdNotFound(topic.clone(), stream.clone()),
             None => error,
         },
         _ => error,
@@ -1167,7 +1212,10 @@ impl OperationDriver {
         };
         match self.route(&partition.key, lineage, call.deadline).await {
             Ok(route) => Ok(Some(route)),
-            Err(error) => Err(call.lookup_failed(error)),
+            Err(error) => {
+                let error = call.enrich_error(error);
+                Err(call.lookup_failed(error))
+            }
         }
     }
 
@@ -1200,7 +1248,10 @@ impl OperationDriver {
             .await;
         let routes = match routes {
             Ok(routes) => routes,
-            Err(error) => return Err(call.lookup_failed(error)),
+            Err(error) => {
+                let error = call.enrich_error(error);
+                return Err(call.lookup_failed(error));
+            }
         };
         for (target, route) in request
             .targets
@@ -1395,7 +1446,7 @@ impl OperationDriver {
             }
             Err(error) => error,
         };
-        let error = enrich_error(error, call.request_error_context.as_ref());
+        let error = call.enrich_error(error);
         if call.committing() && sent && fetch_error_is_uncertain(&error) {
             call.uncertain = true;
             return Err(Next::Fail(error));
@@ -1998,10 +2049,7 @@ impl Call {
             RequestTarget::Replica(replica) => (None, Some(replica)),
         };
         let request_error_context = match target {
-            RequestTarget::Partition(target) => Some(RequestErrorContext {
-                stream: target.stream_id.clone(),
-                topic: Some(target.topic_id.clone()),
-            }),
+            RequestTarget::Partition(_) => None,
             _ => extract_from_retained_frame(code, &payload),
         };
         Self {
@@ -2178,6 +2226,15 @@ impl Call {
         if let Some(ticket) = &mut self.ticket {
             *ticket.sent_flag() = uncertain;
         }
+    }
+
+    /// Adds the identifiers of this call to a binary namespace error.
+    fn enrich_error(&self, error: IggyError) -> IggyError {
+        enrich_error(
+            error,
+            self.request_error_context.as_ref(),
+            self.partition.as_ref().map(|partition| &partition.key),
+        )
     }
 
     /// The next step after a route lookup of the call failed with `error`.
@@ -2615,6 +2672,36 @@ mod tests {
         assert_eq!(sends[0].endpoint, endpoint(PRIMARY));
         assert_eq!(sends[0].body, payload);
         assert_eq!(sends[0].header.partition_incarnation, ROUTE.incarnation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_route_lookup_reports_missing_namespace_should_enrich_identifiers() {
+        for topic_missing in [false, true] {
+            let mut fixture = Fixture::new().await;
+            fixture.stream_id = Identifier::named("events").unwrap();
+            fixture.topic_id = Identifier::named("orders").unwrap();
+            let missing = if topic_missing {
+                IggyError::TopicIdNotFound(
+                    Identifier::numeric(1).unwrap(),
+                    Identifier::numeric(2).unwrap(),
+                )
+            } else {
+                IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap())
+            };
+            let expected = if topic_missing {
+                IggyError::TopicIdNotFound(fixture.topic_id.clone(), fixture.stream_id.clone())
+            } else {
+                IggyError::StreamIdNotFound(fixture.stream_id.clone())
+            };
+            fixture.cluster.script(
+                &endpoint(0),
+                GET_PARTITION_ROUTE_CODE,
+                [Answer::Refuse(missing)],
+            );
+
+            assert_eq!(fixture.send_messages().await.unwrap_err(), expected);
+            assert!(fixture.sends().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]
