@@ -53,12 +53,12 @@ use iggy_binary_protocol::responses::messages::{
 };
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
-    MAX_PARTITIONS_PER_REQUEST, STATUS_OK, WireDecode, WireEncode, WireOptions, WirePartitioning,
-    WirePollingStrategy,
+    MAX_PARTITIONS_PER_REQUEST, STATUS_OK, WireDecode, WireEncode, WireIdentifier, WireOptions,
+    WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
     BinaryOperationLineage, ClientState, CommitErrorScope, Credentials, DeferredPollOptions,
-    DiagnosticEvent, FetchedSection, HeaderKind, IdKind, Identifier, IggyError, OptionKey,
+    DiagnosticEvent, FetchedSection, HeaderKind, Identifier, IggyError, OptionKey,
 };
 use route_cache::RouteCache;
 use std::future::pending;
@@ -94,12 +94,15 @@ mod extractor_tests {
     use iggy_binary_protocol::codes::{
         CREATE_PARTITIONS_CODE, CREATE_TOPIC_CODE, DELETE_PARTITIONS_CODE, DELETE_STREAM_CODE,
         DELETE_TOPIC_CODE, GET_PARTITIONS_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
-        SEND_MESSAGES_CODE,
+        SEND_MESSAGES_CODE, UPDATE_RESOURCE_CODE,
     };
     use iggy_binary_protocol::requests::partitions::{
         CreatePartitionsRequest, DeletePartitionsRequest, GetPartitionsRequest,
     };
     use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, GetStreamRequest};
+    use iggy_binary_protocol::requests::system::{
+        ResourceTarget, UpdateResourceRequest, WireResetKeys,
+    };
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
     };
@@ -264,6 +267,50 @@ mod extractor_tests {
         let context = extract_from_retained_frame(DELETE_PARTITIONS_CODE, &body).unwrap();
         assert_eq!(context.stream, Identifier::named("events").unwrap());
         assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_resource_updates_keeps_identifiers() {
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::named("events").unwrap(),
+                topic_id: WireIdentifier::named("orders").unwrap(),
+            },
+            reset: WireResetKeys::try_from(vec![WireName::new("key").unwrap()]).unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(UPDATE_RESOURCE_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+        let call = Call::new(
+            UPDATE_RESOURCE_CODE,
+            body,
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+        assert_eq!(
+            call.enrich_error(IggyError::TopicIdNotFound(
+                Identifier::numeric(1).unwrap(),
+                Identifier::numeric(2).unwrap(),
+            )),
+            IggyError::TopicIdNotFound(
+                Identifier::named("orders").unwrap(),
+                Identifier::named("events").unwrap(),
+            )
+        );
+
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::Stream {
+                stream_id: WireIdentifier::named("events").unwrap(),
+            },
+            reset: WireResetKeys::try_from(vec![WireName::new("key").unwrap()]).unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(UPDATE_RESOURCE_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, None);
     }
 
     #[test]
@@ -441,17 +488,29 @@ struct RequestErrorContext {
 }
 
 fn decode_retained_identifier(raw: &[u8]) -> Option<(Identifier, usize)> {
-    let kind = *raw.first()?;
-    let length = usize::from(*raw.get(1)?);
-    let consumed = 2usize.checked_add(length)?;
-    let encoded = raw.get(..consumed)?;
-    if kind == IdKind::String.as_code() {
-        std::str::from_utf8(encoded.get(2..)?).ok()?;
-    }
-    Some((Identifier::from_raw_bytes(encoded).ok()?, consumed))
+    let (identifier, consumed) = WireIdentifier::decode(raw).ok()?;
+    Some((Identifier::try_from(&identifier).ok()?, consumed))
 }
 
 fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorContext> {
+    let raw = body.as_ref();
+    if code == UPDATE_RESOURCE_CODE {
+        let (target, _) = ResourceTarget::decode(raw).ok()?;
+        return match target {
+            ResourceTarget::Topic {
+                stream_id,
+                topic_id,
+            } => Some(RequestErrorContext {
+                stream: Identifier::try_from(&stream_id).ok()?,
+                topic: Some(Identifier::try_from(&topic_id).ok()?),
+            }),
+            ResourceTarget::Stream { stream_id } => Some(RequestErrorContext {
+                stream: Identifier::try_from(&stream_id).ok()?,
+                topic: None,
+            }),
+            ResourceTarget::User { .. } => None,
+        };
+    }
     let has_topic = match code {
         GET_TOPIC_CODE
         | DELETE_TOPIC_CODE
@@ -461,7 +520,6 @@ fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorCo
         GET_TOPICS_CODE | CREATE_TOPIC_CODE | GET_STREAM_CODE | DELETE_STREAM_CODE => false,
         _ => return None,
     };
-    let raw = body.as_ref();
     let (stream, consumed) = decode_retained_identifier(raw)?;
     let topic = if has_topic {
         let (topic, _) = decode_retained_identifier(raw.get(consumed..)?)?;
