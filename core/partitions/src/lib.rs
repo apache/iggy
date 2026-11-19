@@ -33,11 +33,6 @@ mod messages_writer;
 mod offset_recovery;
 pub mod offset_storage;
 mod partition_storage;
-mod peer_fresh;
-pub use peer_fresh::{
-    FRESH_INDEX_READ_MIN, FreshIndexRead, PEER_FRESH_ROWS_MAX, PEER_FRESH_SOURCES_MAX,
-    PeerFreshChange, PeerFreshLag, PeerFreshRows, PeerFreshTail, ProofTrust, read_fresh_index,
-};
 mod peer_log;
 pub mod peer_manifests;
 pub use peer_log::{
@@ -87,7 +82,7 @@ mod placed_read;
 mod proven_batch;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
-    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
+    MANIFEST_RETRY_AFTER_MAX, MANIFEST_STORE_INTERVAL, ManifestPublishOutcome, ManifestPublisher,
 };
 pub use origin_recovery::{
     DropReason, DroppedBatch, FRESH_INDEX_FIRST_READ, FreshScan, PartitionRecovery,

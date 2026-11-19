@@ -184,7 +184,7 @@ where
     /// The chain of a tiered partition, `None` until it opens one.
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
-    pub(crate) remote_segments: Option<Rc<crate::RemoteSegments>>,
+    remote_segments: Option<Rc<crate::RemoteSegments>>,
     /// The other cluster's log that this partition serves in place of its
     /// own, `None` for a partition that holds its own messages.
     pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
@@ -5006,15 +5006,13 @@ where
     /// The served history and what commits made visible in it. A change of
     /// either can make a parked poll ready.
     pub fn poll_visibility(&self) -> (PollHistoryId, PollVisibility) {
-        let committed = self
-            .offset_space
-            .committed_seeded
-            .then(|| self.offset.load(Ordering::Acquire));
-        let fresh = self.peer_fresh_served_end();
         (
             self.poll_history,
             PollVisibility {
-                offset: committed.max(fresh),
+                offset: self
+                    .offset_space
+                    .committed_seeded
+                    .then(|| self.offset.load(Ordering::Acquire)),
                 committed_bytes: self.committed_bytes,
             },
         )
@@ -6149,15 +6147,6 @@ where
         if kind == ConsumerKind::ExternalGroup {
             return None;
         }
-        // A partition that follows another cluster's log serves the fresh
-        // batches this node found above its floor, and a consumer stores
-        // offsets of those.
-        if self
-            .peer_fresh_served_end()
-            .is_some_and(|served| offset <= served)
-        {
-            return None;
-        }
         let current = self.stats.current_offset();
         (offset > current || (current == 0 && self.stats.messages_count_inconsistent() == 0))
             .then_some(IggyError::InvalidOffset(offset))
@@ -6431,11 +6420,7 @@ where
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
         // is fully synchronous, so the single load cannot drift mid-plan.
-        let floor_offset = self.offsets().commit_offset;
-        // A partition that follows another cluster's log also serves the
-        // batches this node found proven above its floor.
-        let fresh_end = self.peer_fresh_served_end();
-        let commit_offset = fresh_end.map_or(floor_offset, |end| end.max(floor_offset));
+        let commit_offset = self.offsets().commit_offset;
         let owner = match consumer {
             PollingConsumer::ConsumerGroup(group_id, _) => {
                 self.consumer_group_owner(group_id as u64)
@@ -6458,9 +6443,8 @@ where
             _group_poll: group_poll,
             peer_first_segment: None,
             peer_segments: None,
-            peer_fresh_from: None,
         };
-        if !(self.offset_space.committed_seeded || fresh_end.is_some()) || args.count == 0 {
+        if !self.offset_space.committed_seeded || args.count == 0 {
             return PollPlan {
                 commit_offset,
                 context,
@@ -6523,22 +6507,6 @@ where
                 },
             };
         }
-
-        if let Some(placed) = self.peer_fresh_read_plan(query) {
-            context.peer_fresh_from = placed.proven.first().map(|batch| batch.header.base_offset);
-            return PollPlan {
-                commit_offset,
-                context,
-                tier: PollTier::Placed { placed, query },
-            };
-        }
-        // The segments of a peer log end at its floor, and the batches above
-        // it are read by the plan above.
-        let query = if fresh_end.is_some() {
-            with_ceiling(query, floor_offset)
-        } else {
-            query
-        };
 
         let serve_journal_first = match query {
             MessageLookup::Offset { offset, .. } => self
@@ -6699,7 +6667,6 @@ where
             partition_dir: self.partition_dir_resolution(),
             segments,
             resident: self.log.journal().inner.resident_message_entries(),
-            proven: Vec::new(),
             remote: self.remote_segments.clone(),
             deadline: None,
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
@@ -16926,24 +16893,6 @@ fn segment_holding(segments: &[Segment], offset: u64) -> usize {
 /// cannot use a segment past the one that completes `count` messages or
 /// `byte_budget` bytes. The starting segment counts toward neither: how much
 /// of it sits before the poll's first match is unknown until it is read.
-/// `query` with no message above `ceiling`.
-const fn with_ceiling(query: MessageLookup, ceiling: u64) -> MessageLookup {
-    match query {
-        MessageLookup::Offset { offset, count, .. } => MessageLookup::Offset {
-            offset,
-            count,
-            ceiling,
-        },
-        MessageLookup::Timestamp {
-            timestamp, count, ..
-        } => MessageLookup::Timestamp {
-            timestamp,
-            count,
-            ceiling,
-        },
-    }
-}
-
 fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usize {
     let mut messages = 0_u64;
     let mut bytes = 0_u64;

@@ -50,7 +50,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 /// The shortest wait between two rewrites of one partition.
-pub const REWRITE_INTERVAL_MIN: Duration = Duration::from_millis(250);
+///
+/// It is the shortest time between two stores of the partition's manifest,
+/// through which another cluster finds each segment. A segment cut at its
+/// byte cap does not wait for it.
+pub const REWRITE_INTERVAL_MIN: Duration = partitions::MANIFEST_STORE_INTERVAL;
 
 /// The longest wait between two rewrites of one partition, and so how far
 /// behind its committed messages the long-term segments of a partition with
@@ -481,11 +485,13 @@ mod tests {
     #[test]
     fn given_a_full_segment_when_settling_should_move_nine_tenths_of_the_way_to_the_shorter_wait() {
         let mut pacing = RewritePacing::default();
+        pacing.settle(key(), RewriteResult::Idle, 0);
+        assert_eq!(pacing.interval(&key()), Some(Duration::from_millis(4600)));
 
         pacing.settle(key(), stored(CAP), 0);
 
-        // The ideal wait is 800 ms: 100 ms of the old wait, 720 ms of it.
-        assert_eq!(pacing.interval(&key()), Some(Duration::from_millis(820)));
+        // The ideal wait is 3.68 s: 460 ms of the old wait, 3.312 s of it.
+        assert_eq!(pacing.interval(&key()), Some(Duration::from_millis(3772)));
     }
 
     #[test]
@@ -522,8 +528,8 @@ mod tests {
 
     #[test]
     fn given_a_steady_load_when_the_wait_starts_above_its_target_should_converge_to_it() {
-        // The target fills in half a second.
-        let rate = TARGET * 2;
+        // The target fills in two seconds.
+        let rate = TARGET / 2;
         let mut pacing = RewritePacing::default();
         for _ in 0..20 {
             pacing.settle(key(), RewriteResult::Idle, 0);
@@ -532,7 +538,7 @@ mod tests {
 
         let wait = wait_at_a_steady_load(&mut pacing, rate, 40);
 
-        assert!((499_000..=501_000).contains(&wait), "{wait}");
+        assert!((1_999_000..=2_001_000).contains(&wait), "{wait}");
     }
 
     #[test]
@@ -587,8 +593,8 @@ mod tests {
     }
 
     #[test]
-    fn given_extreme_sizes_and_waits_when_pacing_should_stay_between_the_bounds() {
-        let (min, max) = (micros(REWRITE_INTERVAL_MIN), micros(REWRITE_INTERVAL_MAX));
+    fn given_extreme_sizes_and_waits_when_pacing_should_stay_between_one_and_ten_seconds() {
+        let (min, max) = (1_000_000, 10_000_000);
 
         for interval in [0, 1, min, max, u64::MAX] {
             for bytes in [0, 1, CAP, u64::MAX] {
@@ -809,6 +815,10 @@ mod tests {
         let other = (IggyNamespace::new(1, 1, 1), 7);
         let running = (IggyNamespace::new(1, 1, 2), 7);
         let mut pacing = RewritePacing::default();
+        // Waits long enough that a hurry would bring them forward.
+        for key in [key(), other] {
+            pacing.settle(key, stored(1), 0);
+        }
         pacing.settle(key(), RewriteResult::Unchanged, 0);
         pacing.settle(other, cut_at_the_cap(), 0);
         pacing.started(running, 10);

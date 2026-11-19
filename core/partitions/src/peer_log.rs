@@ -47,28 +47,19 @@
 //!
 //! Applying a manifest changes memory only, and the same manifests applied in
 //! the same order give the same log on every replica.
-//!
-//! Above the floor of the applied manifest, a node also serves the batches
-//! that the origin proved in its fresh objects, see [`PeerFreshTail`]. That
-//! tail is the node's own: each node finds it in the store, and a manifest
-//! takes over the batches it publishes.
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
 
 use iggy_common::IggyByteSize;
-use iggy_object_store::{FreshObjectId, ManifestSegment, ObjectPrefix, PartitionManifest};
+use iggy_object_store::{ManifestSegment, ObjectPrefix, PartitionManifest};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::SegmentStorage;
 
 use crate::iggy_partition::settle_cleaned_segment;
-use crate::journal::MessageLookup;
 use crate::long_term::concatenated;
-use crate::origin_recovery::namespace_of;
-use crate::peer_fresh::{PeerFreshChange, PeerFreshLag, PeerFreshRows, PeerFreshTail};
-use crate::placed_read::PlacedReadPlan;
-use crate::poll_plan::{PartitionDirResolution, PeerSegmentRun};
+use crate::poll_plan::PeerSegmentRun;
 use crate::remote_segments::index_file_name;
 use crate::segment::{Segment, SegmentLocation};
 use crate::{IggyPartition, PollReadResult};
@@ -86,8 +77,6 @@ pub struct PeerLog {
     /// The remote segments of the log, oldest first, as the manifests listed
     /// them. The log holds a [`Segment`] for each one, then its tail.
     segments: VecDeque<ManifestSegment>,
-    /// The proven batches above the applied floor that this node found.
-    fresh: PeerFreshTail,
 }
 
 /// What the last manifest that a partition applied said of the store.
@@ -237,14 +226,13 @@ struct Unseen {
 }
 
 impl PeerLog {
-    fn new(origin: String, prefix: ObjectPrefix) -> Self {
+    const fn new(origin: String, prefix: ObjectPrefix) -> Self {
         Self {
             origin,
             prefix,
             applied: None,
             keyed_by_both_offsets: false,
             segments: VecDeque::new(),
-            fresh: PeerFreshTail::new(namespace_of(&prefix), prefix.created_revision, None),
         }
     }
 
@@ -264,11 +252,6 @@ impl PeerLog {
             }),
             keyed_by_both_offsets: manifest.segments_keyed_by_both_offsets,
             segments: manifest.segments.iter().copied().collect(),
-            fresh: PeerFreshTail::new(
-                namespace_of(&prefix),
-                prefix.created_revision,
-                manifest.floor,
-            ),
         }
     }
 
@@ -293,13 +276,6 @@ impl PeerLog {
         self.prefix
     }
 
-    /// The partition's namespace in the origin's cluster, raw, as the
-    /// origin's fresh objects name it.
-    #[must_use]
-    pub fn origin_namespace(&self) -> u64 {
-        namespace_of(&self.prefix)
-    }
-
     /// What the last applied manifest said, `None` before the first.
     #[must_use]
     pub const fn applied(&self) -> Option<AppliedManifest> {
@@ -315,12 +291,6 @@ impl PeerLog {
 
     fn trim_point(&self) -> Option<u64> {
         self.applied.and_then(|applied| applied.trim_point)
-    }
-
-    /// The proven batches above the applied floor that this node found.
-    #[must_use]
-    pub const fn fresh(&self) -> &PeerFreshTail {
-        &self.fresh
     }
 
     /// Whether the log still holds every segment of `run` as a plan saw it.
@@ -656,11 +626,6 @@ where
     /// read may have failed on a missing object, or it holds a range that is
     /// gone now. The owner refuses such a read as one that no replica
     /// accepted, and the retry plans from the log as it is.
-    ///
-    /// A read of fresh batches that failed is refused the same way. The
-    /// origin deletes a fresh object once a floor it published holds the
-    /// batches, and that floor can be ahead of the one applied here, so the
-    /// retry plans again once a newer manifest moved the floor.
     #[must_use]
     pub fn peer_log_moved_under_read(&self, result: &PollReadResult) -> bool {
         let trimmed = result.context.peer_first_segment.is_some_and(|first| {
@@ -672,102 +637,7 @@ where
                 .as_deref()
                 .is_some_and(|peer| !peer.holds(&run))
         });
-        let fresh_failed =
-            result.context.peer_fresh_from.is_some() && result.tiered_read_failure().is_some();
-        trimmed || replaced || fresh_failed
-    }
-
-    /// Take what one fresh object of the origin holds of this partition.
-    pub fn offer_peer_fresh(&mut self, rows: &PeerFreshRows) -> PeerFreshChange {
-        let Some(peer) = self.peer_log.as_deref_mut() else {
-            return PeerFreshChange::default();
-        };
-        let change = peer.fresh.offer(rows);
-        if change.grew || change.conflict_at.is_some() {
-            self.publish_poll_visibility();
-        }
-        change
-    }
-
-    /// Serve no fresh batch again: the origin retired, so the tail would
-    /// grow no more, and each node found its own. Every replica then serves
-    /// what the committed manifests list, and nothing else.
-    pub fn drop_peer_fresh(&mut self) {
-        let Some(peer) = self.peer_log.as_deref_mut() else {
-            return;
-        };
-        if peer.fresh.clear() {
-            self.publish_poll_visibility();
-        }
-    }
-
-    /// The store no longer holds the fresh object `object_id`.
-    pub fn mark_peer_fresh_gone(&mut self, object_id: FreshObjectId) {
-        if let Some(peer) = self.peer_log.as_deref_mut() {
-            peer.fresh.mark_gone(object_id);
-        }
-    }
-
-    /// The fresh objects of the origin whose batch rows the proofs this
-    /// node holds wait for.
-    #[must_use]
-    pub fn peer_fresh_missing_sources(&self) -> Vec<FreshObjectId> {
-        self.peer_log
-            .as_deref()
-            .map_or_else(Vec::new, |peer| peer.fresh.missing_sources())
-    }
-
-    /// How far the fresh tail is behind the newest proof this node found,
-    /// `None` for a partition that follows no other cluster's log.
-    #[must_use]
-    pub fn peer_fresh_lag(&self) -> Option<PeerFreshLag> {
-        self.peer_log.as_deref().map(|peer| peer.fresh.lag())
-    }
-
-    /// The last offset of the fresh batches this node serves above the
-    /// floor, `None` while it serves none.
-    #[must_use]
-    pub fn peer_fresh_served_end(&self) -> Option<u64> {
-        self.peer_log
-            .as_deref()
-            .and_then(|peer| peer.fresh.served_end())
-    }
-
-    /// The read of the fresh batches that answer `query`, when it starts
-    /// above the floor. Offsets at or below it are the segments'.
-    pub(crate) fn peer_fresh_read_plan(&self, query: MessageLookup) -> Option<PlacedReadPlan> {
-        let peer = self.peer_log.as_deref()?;
-        let fresh = &peer.fresh;
-        fresh.served_end()?;
-        let count = usize::try_from(query.count()).unwrap_or(usize::MAX);
-        let proven = match query {
-            MessageLookup::Offset { offset, .. } if offset >= fresh.start() => {
-                fresh.batches_from_offset(offset, count)
-            }
-            MessageLookup::Timestamp { timestamp, .. }
-                if peer
-                    .segments
-                    .back()
-                    .is_none_or(|segment| segment.max_timestamp < timestamp) =>
-            {
-                fresh.batches_from_timestamp(timestamp, count.saturating_add(1))
-            }
-            MessageLookup::Offset { .. } | MessageLookup::Timestamp { .. } => return None,
-        };
-        if proven.is_empty() {
-            return None;
-        }
-        Some(PlacedReadPlan {
-            partition_dir: PartitionDirResolution::NoFiles,
-            segments: Vec::new(),
-            resident: Vec::new(),
-            proven,
-            remote: self.remote_segments.clone(),
-            deadline: None,
-            prefix: peer.prefix,
-            long_term: Vec::new(),
-            long_term_floor: None,
-        })
+        trimmed || replaced
     }
 
     /// Bring the log to what `manifest` lists: drop the segments it trimmed
@@ -868,7 +738,6 @@ where
             floor: manifest.floor,
             trim_point: manifest.trim_point,
         });
-        let _ = peer.fresh.apply_floor(manifest.floor);
         self.peer_log = Some(peer);
         if let Some(floor) = manifest.floor {
             self.offset.store(floor, Ordering::Release);

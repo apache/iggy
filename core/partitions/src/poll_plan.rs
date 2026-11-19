@@ -311,11 +311,6 @@ pub struct PollContext {
     /// merged into one, so the owner refuses the read once a manifest put
     /// one segment in the place of any of these.
     pub(crate) peer_segments: Option<PeerSegmentRun>,
-    /// The first offset of the fresh batches the read takes, on a partition
-    /// that follows another cluster's log and reads above its floor. The
-    /// origin deletes the objects of batches its newer floor holds, so the
-    /// owner refuses a read of them that failed, and the retry plans again.
-    pub(crate) peer_fresh_from: Option<u64>,
 }
 
 /// Consecutive segments of a peer log, as a poll plan saw them.
@@ -1996,7 +1991,6 @@ mod tests {
                         _group_poll: None,
                         peer_first_segment: None,
                         peer_segments: None,
-                        peer_fresh_from: None,
                     },
                     commit_offset: 99,
                     tier: PollTier::Resident {
@@ -2405,7 +2399,6 @@ mod tests {
                 _group_poll: None,
                 peer_first_segment: None,
                 peer_segments: None,
-                peer_fresh_from: None,
                 history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -2438,7 +2431,6 @@ mod tests {
                 _group_poll: None,
                 peer_first_segment: None,
                 peer_segments: None,
-                peer_fresh_from: None,
                 history: PollHistoryId::default(),
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -2473,7 +2465,6 @@ mod tests {
                     _group_poll: None,
                     peer_first_segment: None,
                     peer_segments: None,
-                    peer_fresh_from: None,
                 },
                 commit_offset: 9,
                 tier: PollTier::Disk {
@@ -2610,7 +2601,6 @@ mod tests {
                 _group_poll: None,
                 peer_first_segment: None,
                 peer_segments: None,
-                peer_fresh_from: None,
             },
             commit_offset: u64::from(BATCHES) - 1,
             tier: PollTier::Disk {
@@ -2838,7 +2828,6 @@ mod tests {
                 _group_poll: None,
                 peer_first_segment: None,
                 peer_segments: None,
-                peer_fresh_from: None,
             },
             commit_offset: u64::MAX,
             tier: PollTier::Disk {
@@ -2888,7 +2877,6 @@ mod tests {
                 _group_poll: None,
                 peer_first_segment: None,
                 peer_segments: None,
-                peer_fresh_from: None,
             },
             commit_offset: 0,
             tier: PollTier::Resident {

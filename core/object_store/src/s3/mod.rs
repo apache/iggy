@@ -528,8 +528,6 @@ impl ObjectStore for S3Store {
         }
         if let Some(token) = request.continuation {
             query.push(("continuation-token", token));
-        } else if let Some(key) = request.start_after {
-            query.push(("start-after", key));
         }
         let listing = S3Request {
             method: Method::GET,

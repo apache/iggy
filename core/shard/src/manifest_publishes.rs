@@ -21,6 +21,12 @@
 //! delete pass does. The task holds no partition reference: it sends its
 //! result back as a frame, and the pump, the single writer of partition
 //! state, settles it.
+//!
+//! A partition that places its batches stores its manifest at most once a
+//! [`partitions::MANIFEST_STORE_INTERVAL`]. A pass that the interval holds
+//! back leaves the partition among the held ones, and the pump's tick stages
+//! its pass once the interval passed, so the last change before a quiet
+//! spell is stored too.
 
 use crate::shards_table::ShardsTable;
 use crate::{FinishedManifestPublish, IggyShard, LifecycleFrame, ShardFrame};
@@ -144,6 +150,11 @@ where
             return;
         }
         let Some((id, manifest, scope)) = partition.begin_manifest_publish(now) else {
+            if partition.manifest_store_held(now) {
+                self.manifests_held
+                    .borrow_mut()
+                    .insert((namespace, created_revision));
+            }
             return;
         };
         let undelivered = Rc::clone(&self.undelivered_manifest_publishes);
@@ -168,6 +179,30 @@ where
                 undelivered.borrow_mut().push(*finished);
             }
         });
+    }
+
+    /// The pump's tick: stage the pass of each held partition whose
+    /// interval passed by `now`, and forget the ones that are gone.
+    pub(crate) fn stage_held_manifest_passes(&self, now: IggyTimestamp) {
+        if self.manifests_held.borrow().is_empty() {
+            return;
+        }
+        let partitions = self.plane.partitions();
+        let held: Vec<_> = self.manifests_held.borrow().iter().copied().collect();
+        for (namespace, created_revision) in held {
+            let partition = partitions
+                .get_by_ns(&namespace)
+                .filter(|partition| partition.created_revision() == created_revision);
+            if let Some(partition) = partition {
+                if partition.manifest_store_held(now) {
+                    continue;
+                }
+                self.stage_manifest_pass(namespace, partition, now);
+            }
+            self.manifests_held
+                .borrow_mut()
+                .remove(&(namespace, created_revision));
+        }
     }
 
     pub(crate) fn on_manifest_publish_finished(&self, finished: &FinishedManifestPublish) {

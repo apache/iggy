@@ -260,7 +260,7 @@ impl Objects {
     pub fn list(&self, request: &ListRequest<'_>) -> ListPage {
         // A continuation from another listing can sort before the prefix,
         // and the scan must still start inside it.
-        let start = match request.resumes_after() {
+        let start = match request.continuation {
             Some(after) if after >= request.prefix => Bound::Excluded(after),
             _ => Bound::Included(request.prefix),
         };

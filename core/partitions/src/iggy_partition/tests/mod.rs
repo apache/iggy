@@ -463,7 +463,6 @@ fn poll_read_result<B: MessageBus>(
             _group_poll: None,
             peer_first_segment: None,
             peer_segments: None,
-            peer_fresh_from: None,
         },
         fragments,
         commit_offset: partition.offsets().commit_offset,
@@ -2058,7 +2057,6 @@ mod offset_reservations;
 mod offset_storage;
 mod offsets;
 mod origin_recovery;
-mod peer_fresh;
 mod peer_log;
 mod peer_log_merges;
 mod peer_log_skips;

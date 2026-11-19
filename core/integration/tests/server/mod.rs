@@ -59,9 +59,10 @@ mod geo_two_clusters_fs;
 // Two clusters on fs: a retired origin's bucket takes only the reads of
 // polls, and its shadow topics expire by their own retention.
 mod geo_retire_origin_fs;
-// A consumer of a shadow topic reads what the peer proved in its fresh
-// objects about a second behind, and goes on once a manifest lists it.
-mod geo_fresh_follow_fs;
+// A consumer of a shadow topic reads a message once a manifest of the peer
+// lists it, seconds behind, and the peer's bucket gets only the listings and
+// reads of its manifests.
+mod geo_shadow_follow_fs;
 // A consumer group that moves between two clusters on fs resumes from about
 // where it stopped, exactly after a drain, and keeps a move backwards.
 mod geo_positions_fs;

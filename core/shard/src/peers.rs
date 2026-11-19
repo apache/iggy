@@ -368,19 +368,6 @@ where
         })
     }
 
-    /// Where a node that follows this peer's fresh objects reads them: the
-    /// peer's tier service, in the class of its own that a shadow
-    /// partition's lag waits for.
-    #[must_use]
-    pub fn follow_objects(&self) -> Rc<dyn RemoteObjects> {
-        Rc::new(PeerObjects {
-            origin: self.origin.clone(),
-            reads: ExecutorObjects::with_class(self.service.clone(), TierJobClass::FreshFollow),
-            status: self.status.clone(),
-            polls: false,
-        })
-    }
-
     fn objects(&self) -> PeerObjects<B> {
         PeerObjects {
             origin: self.origin.clone(),
@@ -447,18 +434,6 @@ where
             stores
                 .iter()
                 .map(|peer| (peer.origin().to_owned(), peer.manifest_objects()))
-                .collect(),
-        );
-        self.set_peer_fresh_objects(
-            stores
-                .iter()
-                .map(|peer| {
-                    (
-                        peer.origin().to_owned(),
-                        peer.follow_objects(),
-                        peer.layout().clone(),
-                    )
-                })
                 .collect(),
         );
         *self.peer_stores.borrow_mut() = Rc::new(stores);
@@ -805,7 +780,7 @@ mod tests {
     }
 
     /// Once its origin retired, a peer takes the reads of polls alone: no
-    /// job, no listing of its manifests and no follow of its fresh objects.
+    /// job and no listing of its manifests.
     #[compio::test]
     async fn given_a_retired_peer_when_reading_should_send_only_the_reads_of_polls() {
         let key = KeyLayout::new("iggy")
@@ -831,13 +806,11 @@ mod tests {
 
         assert!(peer.service().is_none());
         assert!(peer.retired());
-        for objects in [peer.manifest_objects(), peer.follow_objects()] {
-            let refused = objects.get_range(&key, 0..5).await;
-            assert!(
-                matches!(&refused, Err(ObjectStoreError::Unavailable(reason)) if reason.contains("retired")),
-                "{refused:?}"
-            );
-        }
+        let refused = peer.manifest_objects().get_range(&key, 0..5).await;
+        assert!(
+            matches!(&refused, Err(ObjectStoreError::Unavailable(reason)) if reason.contains("retired")),
+            "{refused:?}"
+        );
         assert_eq!(calls.all(), Vec::new());
 
         let polled = peer.objects().get_range(&key, 0..5).await.unwrap();

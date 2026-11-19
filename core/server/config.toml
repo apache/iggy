@@ -1541,7 +1541,7 @@ handshake_grace = "10 s"
 # producer that waits for each answer then sends less, and the rewrites catch
 # up. Sends to other partitions are not slowed. The next rewrite of a
 # partition past the limit does not wait out its usual interval, only the
-# shortest one, 250 ms after its last rewrite. "0" turns the delay off.
+# shortest one, 1 s after its last rewrite. "0" turns the delay off.
 # Otherwise at least 64 MiB, what one long-term segment holds.
 #long_term_backlog_limit = "1 GiB"
 # Per shard: how many jobs of each class run at once, and the bytes that
@@ -1556,7 +1556,7 @@ handshake_grace = "10 s"
 #demand_fetch_bytes = "64 MiB"
 #uploads = 2
 #upload_bytes = "2 GiB"
-#fresh_uploads = 4
+#fresh_uploads = 16
 #speculative_fetches = 4
 #speculative_fetch_bytes = "32 MiB"
 #deletes = 2

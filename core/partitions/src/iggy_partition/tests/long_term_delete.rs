@@ -35,6 +35,10 @@ fn delay() -> u64 {
     u64::try_from(LONG_TERM_DELETE_DELAY.as_micros()).unwrap()
 }
 
+fn store_interval() -> u64 {
+    u64::try_from(crate::MANIFEST_STORE_INTERVAL.as_micros()).unwrap()
+}
+
 /// Store both objects of the long-term segment with these offsets.
 async fn put_segment(store: &Faulty, start_offset: u64, end_offset: u64) {
     for object in SegmentObject::ALL {
@@ -138,14 +142,15 @@ async fn given_a_replace_on_the_primary_when_the_delay_after_its_manifest_ends_s
     );
     store_manifest(&mut partition, now);
     Box::pin(replace_first_two(&mut partition, &deleter, &first, &second)).await;
-    store_manifest(&mut partition, now);
+    let stored_at = after(now, store_interval());
+    store_manifest(&mut partition, stored_at);
 
     assert_eq!(
         Box::pin(pass(&mut partition, &deleter, after(now, delay() - 1))).await,
         None,
         "a reader of the manifest before may still read them"
     );
-    let due = after(now, delay());
+    let due = after(stored_at, delay());
     assert_eq!(
         Box::pin(pass(&mut partition, &deleter, due)).await,
         Some(sweep_of(&[(0, 1), (2, 3)])),
