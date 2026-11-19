@@ -146,6 +146,14 @@ impl Default for GeoClusterPairBuilder {
                     "IGGY_DATA_MAINTENANCE_MESSAGES_INTERVAL".to_owned(),
                     "100ms".to_owned(),
                 ),
+                // A listing of the peer's positions each second would leave
+                // no gap between the read passes that a watch of a stopped
+                // cluster's bucket counts. Tests of the positions set their
+                // own interval.
+                (
+                    "IGGY_GEO_POSITIONS_POLL_INTERVAL".to_owned(),
+                    "5s".to_owned(),
+                ),
             ]),
         }
     }
