@@ -33,7 +33,7 @@ use crate::dispatch::failure::{
     send_non_replicated_deny, send_result_rejection,
 };
 use crate::dispatch::submit::submit_client_request_on_owner;
-use crate::dispatch::{ConsumerProgress, InFlight, ProgressKeys};
+use crate::dispatch::{ClientDrain, ConsumerProgress, InFlight, ProgressKeys};
 use crate::namespace::{resolve_partition_namespace, resolve_partition_request_namespace};
 use crate::reply_frame::{
     build_consumer_offset_body, build_polled_messages_reply, current_metadata_commit,
@@ -78,7 +78,7 @@ use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
 use shard::{
     ConsumerAttachment, DeferredPollContext, DeferredPollRequest, ExternalGroupRead, PartitionRead,
-    PartitionReadReply, PollQuotaIdentity,
+    PartitionReadReply, PollQuotaIdentity, bus_timeout,
 };
 use std::rc::Rc;
 use tracing::{debug, warn};
@@ -138,40 +138,18 @@ where
 {
     let transport_client_id = origin.id;
     let header = *request.header();
-    if !shard
-        .plane
-        .metadata()
-        .applied_frontier()
-        .partition_requests_allowed(shard.bus.monotonic_now())
+    if let Err(error) = admit_partition_request(
+        shard,
+        header.minimum_metadata_op,
+        consumer_session.as_ref().map(|(_, attachment)| attachment),
+        in_flight.as_ref().map(|in_flight| &*in_flight.drain),
+    )
+    .await
     {
-        send_deny_reply(
-            shard,
-            origin,
-            &header,
-            IggyError::TransientNotAccepted.as_code(),
-        )
-        .await;
+        send_deny_reply(shard, origin, &header, error.as_code()).await;
         return PartitionAdmission::Denied;
     }
     let metadata_watermark = shard.plane.metadata().applied_frontier().get();
-    if consumer_session
-        .as_ref()
-        .is_some_and(|(_, attachment)| !attachment.is_valid_at(shard.bus.realtime_micros()))
-    {
-        send_deny_reply(shard, origin, &header, IggyError::StaleClient.as_code()).await;
-        return PartitionAdmission::Denied;
-    }
-    // A newer route can name group membership this replica has not applied yet.
-    if header.minimum_metadata_op > metadata_watermark {
-        send_deny_reply(
-            shard,
-            origin,
-            &header,
-            IggyError::TransientNotAccepted.as_code(),
-        )
-        .await;
-        return PartitionAdmission::Denied;
-    }
     let namespace = match resolved_namespace.map_or_else(
         || {
             resolve_partition_request_namespace(
@@ -258,14 +236,15 @@ where
         send_deny_reply(shard, origin, &header, IggyError::NotPrimary.as_code()).await;
         return PartitionAdmission::Denied;
     }
-    // Convergence wait: a CreateTopic commit returns to the client before the
-    // per-shard reconcilers seed routing rows and materialise the partition
-    // (next wake/periodic tick). An op arriving inside that window is not lost
-    // if it skips this wait -- `router::route_typed` falls back to the hash
-    // assignment, and the owning shard parks it -- so this is an admission
-    // courtesy that keeps the steady state off that park buffer, not a
-    // correctness gate. See `wait_for_partition_routable`, which spells out why
-    // there is no owner-readiness probe here any more.
+    // Convergence wait: a CreateTopic commit can return to the client before
+    // the reconcilers of this node seed routing rows and materialise the
+    // partition (next wake/periodic tick), because only the metadata primary
+    // that served the create waits for its own build. An op arriving inside
+    // that window is not lost if it skips this wait -- `router::route_typed`
+    // falls back to the hash assignment, and the owning shard parks it -- so
+    // this is an admission courtesy that keeps the steady state off that park
+    // buffer, not a correctness gate. See `wait_for_partition_routable`, which
+    // spells out why asking the owner there is no readiness gate either.
     if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
         // The op never reached the partition plane, so it is safe to re-issue
         // anywhere -- the same contract the plane itself answers for a
@@ -1201,8 +1180,74 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
     .await;
 }
 
-/// Wait (bounded) until this shard holds a routing row for `namespace`. Fast
-/// path: row already present -> no wait.
+/// Admits a partition request of the session `attachment` from a client that
+/// saw metadata op `minimum_metadata_op` commit.
+///
+/// A newer route can name group membership that this replica has not applied
+/// yet, so a request ahead of the local frontier waits for it, for at most
+/// the partition request budget of the frontier. The wait parks the drain of
+/// its connection. The session can end and admission can close during it, so
+/// both are tested again.
+///
+/// After a wait in vain, `drain` refuses the next requests ahead of the
+/// frontier at once, until the frontier moves, so the frames behind such a
+/// request do not wait one after the other. The mark is per connection:
+/// `minimum_metadata_op` comes from the client, so a mark of the node would
+/// let one client end the wait of all. A request without a drain always
+/// waits.
+///
+/// # Errors
+/// `StaleClient` for a session that ended. `TransientNotAccepted` while
+/// admission is closed, and for a frontier that stays behind the request.
+#[allow(clippy::future_not_send)]
+async fn admit_partition_request<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    minimum_metadata_op: u64,
+    attachment: Option<&SessionAttachment>,
+    drain: Option<&ClientDrain>,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let frontier = shard.plane.metadata().applied_frontier();
+    let session_and_admission = || {
+        if attachment.is_some_and(|attachment| !attachment.is_valid_at(shard.bus.realtime_micros()))
+        {
+            return Err(IggyError::StaleClient);
+        }
+        if !frontier.partition_requests_allowed(shard.bus.monotonic_now()) {
+            return Err(IggyError::TransientNotAccepted);
+        }
+        Ok(())
+    };
+    session_and_admission()?;
+    let applied = frontier.get();
+    if applied >= minimum_metadata_op {
+        return Ok(());
+    }
+    let expired_at = drain.map(|drain| &drain.frontier_wait_expired_at);
+    if expired_at.is_none_or(|expired_at| expired_at.get() != Some(applied)) {
+        let reached = frontier.reached(minimum_metadata_op);
+        if bus_timeout(&shard.bus, frontier.partition_request_budget(), reached)
+            .await
+            .is_some()
+        {
+            return session_and_admission();
+        }
+        if let Some(expired_at) = expired_at {
+            expired_at.set(Some(frontier.get()));
+        }
+    }
+    shard.metrics().record_partition_request_frontier_refusal();
+    Err(IggyError::TransientNotAccepted)
+}
+
+/// Wait (bounded) until the owning shard has built the partition of
+/// `namespace`. Fast path: this shard holds a routing row -> no wait.
 ///
 /// Covers the post-`CreateTopic` convergence window where the metadata commit
 /// has returned to the client but the per-shard reconcilers have not yet seeded
@@ -1216,11 +1261,19 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
 /// buffer, whose overflow is the one path that still sheds a request without
 /// replying (`frame_drops_total{variant=partition,reason=park_overflow}`).
 ///
-/// Deliberately no owner-readiness probe. One used to run here, on the theory
-/// that the table could not be trusted; it could not close the window either,
-/// because the fast path above skipped it in exactly the case it was meant to
-/// cover - a row seeded from the hash by a shard that owns nothing. Readiness
-/// belongs to the owner, which is where it is now enforced.
+/// Without a row, one [`PartitionRead::Primary`] goes to the hash owner. The
+/// owner holds it until the partition can serve, and answers from the
+/// partition itself, never from a row. `Primary` and `Rejected` both let the
+/// request go on to the owner, which serves or refuses it. `NotFound` or no
+/// answer means that the owner is not due to build the partition, or did not
+/// build it within its hold, and the request is refused here.
+///
+/// This is still no readiness gate. An earlier probe of the owner ran here, on
+/// the theory that the table could not be trusted; it could not close the
+/// window, because the fast path above skipped it in exactly the case it was
+/// meant to cover - a row seeded from the hash by a shard that owns nothing.
+/// The same holds for this read. Readiness belongs to the owner, which is
+/// where it is enforced.
 #[allow(clippy::future_not_send)]
 async fn wait_for_partition_routable<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -1233,21 +1286,15 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    const ATTEMPT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-    // 3s budget at 50ms per attempt. Counting attempts, not reading a
-    // wall-clock deadline, keeps the wait virtual under the simulator: the
-    // bus sleep advances virtual time, whereas `Instant::now` would not.
-    const MAX_ATTEMPTS: u32 = 60;
-
-    let mut attempts = 0u32;
-    while shard.shards_table().shard_for(namespace).is_none() {
-        if attempts >= MAX_ATTEMPTS {
-            return false;
-        }
-        attempts += 1;
-        shard.bus.sleep(ATTEMPT_DELAY).await;
+    if shard.shards_table().shard_for(namespace).is_some() {
+        return true;
     }
-    true
+    matches!(
+        shard
+            .partition_read(namespace, PartitionRead::Primary)
+            .await,
+        Some(PartitionReadReply::Primary { .. } | PartitionReadReply::Rejected(_))
+    )
 }
 
 /// A `PolledMessages` body with zero messages and a zero context: only the
@@ -1764,6 +1811,7 @@ mod tests {
     use consensus::PartitionsHandle;
     #[cfg(target_os = "linux")]
     use consensus::Sequencer;
+    use futures::FutureExt as _;
     use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_PRODUCER_OFFSET};
     use iggy_binary_protocol::codes::PING_CODE;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
@@ -1837,6 +1885,7 @@ mod tests {
                     namespace: resolved,
                     read: PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
                     reply,
+                    ..
                 }) = owner_inbox.recv().await.unwrap()
                 else {
                     panic!("segment deletion must read its owner");
@@ -2271,44 +2320,32 @@ mod tests {
         let namespace =
             resolve_partition_request_namespace(&shard, Operation::SendMessages, &body, CLIENT)
                 .unwrap();
-        let delayed_shard = Rc::clone(&shard);
-        let updater = compio::runtime::spawn(async move {
-            compio::time::sleep(std::time::Duration::from_millis(1)).await;
-            delayed_shard
-                .plane
-                .metadata()
-                .applied_frontier()
-                .advance(LATER_FRONTIER);
-            for partition_id in 0..2 {
-                let namespace = delayed_shard
-                    .plane
-                    .metadata()
-                    .mux_stm
-                    .streams()
-                    .namespace_from_partition(
-                        &WireIdentifier::numeric(0),
-                        &WireIdentifier::numeric(0),
-                        partition_id,
-                    )
-                    .unwrap();
-                delayed_shard
-                    .shards_table()
-                    .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
-            }
-        });
-        dispatch_partition_request(
-            &shard,
-            request_message(Operation::SendMessages, CLIENT, 1, 1, &body),
-            CLIENT,
-            1,
-            ClientOrigin::capture(&shard.bus, CLIENT),
-            Some(DEFAULT_ROOT_USER_ID),
-            None,
-            Some(namespace),
-            None,
-        )
-        .await;
-        let _ = updater.await;
+        // No route names the partition, so the dispatcher asks the owner and
+        // waits. The frontier moves during that wait.
+        let owner = async {
+            let (_, reply) = primary_read(&owner_inbox).await;
+            metadata.applied_frontier().advance(LATER_FRONTIER);
+            reply
+                .try_send(PartitionReadReply::Primary {
+                    view: 0,
+                    primary: 0,
+                })
+                .unwrap();
+        };
+        futures::join!(
+            dispatch_partition_request(
+                &shard,
+                request_message(Operation::SendMessages, CLIENT, 1, 1, &body),
+                CLIENT,
+                1,
+                ClientOrigin::capture(&shard.bus, CLIENT),
+                Some(DEFAULT_ROOT_USER_ID),
+                None,
+                Some(namespace),
+                None,
+            ),
+            owner,
+        );
         let ShardFrame::Lifecycle(LifecycleFrame::PartitionSubmit { request, .. }) =
             owner_inbox.try_recv().unwrap()
         else {
@@ -2974,27 +3011,17 @@ mod tests {
         }
     }
 
+    /// The owner can build a partition before this shard seeds its row.
     #[compio::test]
-    async fn given_unroutable_partition_when_polling_should_report_not_accepted() {
+    async fn given_committed_partition_without_a_row_when_polling_should_reach_the_hash_owner() {
         let bus = SpyBus::default();
         let mut shard = test_shard(&bus, 0, 1, 1);
         let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
         shard.attach_senders(vec![sender]);
         let shard = Rc::new(shard);
         let namespace = create_one_partition(&shard);
+        assert!(shard.shards_table().shard_for(namespace).is_none());
 
-        // The owner has a live inbox, but no route identifies it for this partition.
-        assert_eq!(
-            poll_and_expect_error(&shard, namespace).await,
-            IggyError::TransientNotAccepted
-        );
-        assert!(
-            owner_inbox.try_recv().is_err(),
-            "a poll rejected during routing must never reach the owner"
-        );
-        shard
-            .shards_table()
-            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
         assert_poll_reaches_owner(&shard, namespace, &owner_inbox).await;
     }
 
@@ -3502,6 +3529,8 @@ mod tests {
         const LOCAL_FRONTIER: u64 = 10;
         const UNKNOWN_GROUP: u32 = 1;
         let bus = SpyBus::default();
+        // A request ahead of the frontier waits out the frontier budget first.
+        bus.instant_timers.set(true);
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
         route_one_partition(&shard);
         shard
@@ -4071,12 +4100,12 @@ mod tests {
         })
     }
 
-    /// A partition write whose routable wait exhausts (namespace committed,
-    /// but no reconciler ever seeds this shard's routing row -- the state a
-    /// teardown/rematerialise churn leaves behind) must answer a nonzero
-    /// retriable status. A status-0 empty reply is a fabricated success: the
-    /// SDK grades the send as acknowledged while zero bytes reached any
-    /// partition.
+    /// A partition write whose routable wait fails (namespace committed, no
+    /// routing row on this shard, and an owner that does not build the
+    /// partition within its hold -- the state a teardown/rematerialise churn
+    /// leaves behind) must answer a nonzero retriable status. A status-0 empty
+    /// reply is a fabricated success: the SDK grades the send as acknowledged
+    /// while zero bytes reached any partition.
     #[compio::test]
     async fn unroutable_partition_send_must_reply_transient_error_not_success() {
         const VSR_CLIENT: u128 = 1;
@@ -4098,20 +4127,23 @@ mod tests {
                 path_layout: PartitionPathLayout::default(),
             },
         );
-        let shard = Rc::new(TestShard::without_inbox(
+        let mut shard = TestShard::without_inbox(
             ShardIdentity::new(0, "unroutable-send-test".to_string()),
             bus.clone(),
             metadata,
             partitions,
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
-        ));
+        );
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
         let md = shard.plane.metadata();
 
         // Committed stream 0 / topic 0 / partition 0, applied straight into
         // the STM: the namespace resolves and root authorizes, but no
         // reconciler runs, so the shards table never gains a routing row and
-        // the routable wait exhausts its budget.
+        // the owner ends its hold with `NotFound`.
         md.mux_stm.users().ensure_root_user("iggy", "hash");
         let create_stream = CreateStreamRequest {
             name: WireName::new("stream").unwrap(),
@@ -4158,7 +4190,7 @@ mod tests {
                 )
                 .is_some(),
             "seeded namespace must resolve, or the unresolved-namespace path \
-             would reply instead of the exhausted routable wait"
+             would reply instead of the failed routable wait"
         );
 
         let send_header = SendMessagesHeader {
@@ -4173,18 +4205,28 @@ mod tests {
         send_body.extend_from_slice(&send_metadata);
         let request = request_message(Operation::SendMessages, VSR_CLIENT, SESSION, 1, &send_body);
 
-        dispatch_partition_request(
-            &shard,
-            request,
-            VSR_CLIENT,
-            SESSION,
-            ClientOrigin::capture(&shard.bus, TRANSPORT),
-            Some(DEFAULT_ROOT_USER_ID),
-            None,
-            None,
-            None,
-        )
-        .await;
+        let owner = async {
+            let (_, reply) = primary_read(&owner_inbox).await;
+            reply.try_send(PartitionReadReply::NotFound).unwrap();
+        };
+        futures::join!(
+            dispatch_partition_request(
+                &shard,
+                request,
+                VSR_CLIENT,
+                SESSION,
+                ClientOrigin::capture(&shard.bus, TRANSPORT),
+                Some(DEFAULT_ROOT_USER_ID),
+                None,
+                None,
+                None,
+            ),
+            owner,
+        );
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "a write that is not routable must not reach the owner"
+        );
 
         let replies = bus.client_replies.borrow();
         assert_eq!(replies.len(), 1, "one reply frame for the failed send");
@@ -4199,6 +4241,305 @@ mod tests {
              transient status; status 0 with an empty body grades as a \
              successfully acknowledged send"
         );
+    }
+
+    /// The transport that [`dispatch_write`] answers.
+    const WRITE_TRANSPORT: u128 = 91;
+    /// The client of [`dispatch_write`] and its session.
+    const WRITE_CLIENT: u128 = 1;
+    const WRITE_SESSION: u64 = 1;
+
+    /// A root write to the pre-resolved `namespace`, from a client that saw
+    /// metadata op `minimum_metadata_op` commit.
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_write(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+        minimum_metadata_op: u64,
+    ) -> PartitionAdmission {
+        dispatch_write_on(shard, namespace, minimum_metadata_op, None, None).await
+    }
+
+    /// [`dispatch_write`] of the consumer session `session`, on the
+    /// connection that `drain` serves.
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_write_on(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+        minimum_metadata_op: u64,
+        session: Option<SessionAttachment>,
+        drain: Option<&Rc<ClientDrain>>,
+    ) -> PartitionAdmission {
+        let request = request_message(Operation::SendMessages, WRITE_CLIENT, WRITE_SESSION, 1, &[])
+            .transmute_header(|old, header: &mut RoutedRequestHeader| {
+                *header = old;
+                header.minimum_metadata_op = minimum_metadata_op;
+            });
+        let in_flight = match drain {
+            Some(drain) => Some(drain.admit(Admission::Cap).await),
+            None => None,
+        };
+        dispatch_partition_request(
+            shard,
+            request,
+            WRITE_CLIENT,
+            WRITE_SESSION,
+            ClientOrigin::capture(&shard.bus, WRITE_TRANSPORT),
+            Some(DEFAULT_ROOT_USER_ID),
+            session.map(|session| (WRITE_CLIENT, session)),
+            Some(namespace.inner()),
+            in_flight,
+        )
+        .await
+    }
+
+    /// The status of each frame that [`dispatch_write`] answered with.
+    fn write_statuses(bus: &SpyBus) -> Vec<u32> {
+        bus.client_replies
+            .borrow()
+            .iter()
+            .map(|(client, frame)| {
+                assert_eq!(*client, WRITE_TRANSPORT);
+                bytemuck::checked::try_pod_read_unaligned::<ReplyHeader>(
+                    &frame[..size_of::<ReplyHeader>()],
+                )
+                .unwrap()
+                .status
+            })
+            .collect()
+    }
+
+    /// Ends the session of [`dispatch_write`] at metadata op `ended_op`.
+    fn end_write_session(shard: &TestShard, ended_op: u64) {
+        assert!(
+            shard
+                .plane
+                .metadata()
+                .client_table
+                .borrow_mut()
+                .end_session(WRITE_CLIENT, DEFAULT_ROOT_USER_ID, WRITE_SESSION, ended_op),
+            "the session was live"
+        );
+    }
+
+    /// A shard whose only peer is the returned owner inbox, with one committed
+    /// partition that no route names.
+    fn shard_without_route(bus: &SpyBus) -> (Rc<TestShard>, Receiver<ShardFrame>, IggyNamespace) {
+        let mut shard = test_shard(bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let namespace = create_one_partition(&shard);
+        (Rc::new(shard), owner_inbox, namespace)
+    }
+
+    /// Without a routing row the dispatcher asks the owner, which holds the
+    /// read until it has built the partition. The dispatcher sends one read
+    /// and arms one timer, the reply budget of that read: no poll of the
+    /// routing table runs beside it.
+    #[compio::test]
+    async fn given_missing_row_when_waiting_for_routable_should_ask_the_owner_once() {
+        let bus = SpyBus::default();
+        // The answer of the owner ends the wait, never a timer.
+        bus.frozen_timers.set(true);
+        let (shard, owner_inbox, namespace) = shard_without_route(&bus);
+
+        let mut write = Box::pin(dispatch_write(&shard, namespace, 0));
+        assert!(
+            futures::poll!(write.as_mut()).is_pending(),
+            "the write waits for the owner"
+        );
+        let (asked, reply) = primary_read(&owner_inbox)
+            .now_or_never()
+            .expect("the dispatcher asks the owner before it waits");
+        assert_eq!(asked, namespace);
+        assert_eq!(bus.sleeps.borrow().len(), 1, "{:?}", bus.sleeps.borrow());
+        reply
+            .try_send(PartitionReadReply::Primary {
+                view: 0,
+                primary: 0,
+            })
+            .unwrap();
+
+        assert_eq!(write.await, PartitionAdmission::Admitted);
+        assert!(
+            matches!(
+                owner_inbox.try_recv(),
+                Ok(ShardFrame::Lifecycle(
+                    LifecycleFrame::PartitionSubmit { .. }
+                ))
+            ),
+            "the write follows the one read to the owner"
+        );
+    }
+
+    /// A route can name group membership that this node has not applied yet.
+    /// The request waits for the frontier, and is stamped with the frontier
+    /// that the wait reached.
+    #[compio::test]
+    async fn given_lagging_metadata_when_partition_request_arrives_should_wait_for_the_frontier() {
+        const LOCAL_FRONTIER: u64 = 10;
+        const ROUTE_FRONTIER: u64 = 11;
+        let bus = SpyBus::default();
+        // The frontier ends the wait, never its budget.
+        bus.frozen_timers.set(true);
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = route_one_partition(&shard);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(LOCAL_FRONTIER);
+
+        let mut write = Box::pin(dispatch_write(&shard, namespace, ROUTE_FRONTIER));
+        assert!(
+            futures::poll!(write.as_mut()).is_pending(),
+            "a request ahead of local metadata waits"
+        );
+        assert!(bus.client_replies.borrow().is_empty());
+        frontier.advance(ROUTE_FRONTIER);
+
+        assert_eq!(write.await, PartitionAdmission::Admitted);
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionSubmit { request, .. }) =
+            owner_inbox.try_recv().unwrap()
+        else {
+            panic!("the dispatcher must submit the write");
+        };
+        assert_eq!(request.header().metadata_watermark, ROUTE_FRONTIER);
+        assert!(bus.client_replies.borrow().is_empty());
+    }
+
+    /// A node that stays behind refuses the request with the same retryable
+    /// status as before, after one partition request budget, and counts the
+    /// refusal. A request without a connection drain, as one over HTTP, waits
+    /// each time.
+    #[compio::test]
+    async fn given_lagging_metadata_when_the_frontier_budget_ends_should_deny_as_before() {
+        const LOCAL_FRONTIER: u64 = 10;
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = route_one_partition(&shard);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(LOCAL_FRONTIER);
+        let budget = frontier.partition_request_budget();
+        let refused = IggyError::TransientNotAccepted.as_code();
+
+        let admission = dispatch_write(&shard, namespace, LOCAL_FRONTIER + 1).await;
+
+        assert_eq!(admission, PartitionAdmission::Denied);
+        assert_eq!(write_statuses(&bus), [refused]);
+        assert_eq!(*bus.sleeps.borrow(), [budget]);
+        assert_eq!(
+            shard.metrics().partition_request_frontier_refusals_value(),
+            1
+        );
+
+        dispatch_write(&shard, namespace, LOCAL_FRONTIER + 1).await;
+
+        assert_eq!(write_statuses(&bus), [refused, refused]);
+        assert_eq!(*bus.sleeps.borrow(), [budget, budget]);
+    }
+
+    /// The frames that a connection sent behind a request that waited in vain
+    /// do not wait one after the other. The mark is of the connection, and it
+    /// ends when the frontier moves.
+    #[compio::test]
+    async fn given_a_frontier_wait_in_vain_when_the_connection_sends_more_requests_should_refuse_them_at_once_until_the_frontier_moves()
+     {
+        const LOCAL_FRONTIER: u64 = 10;
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = route_one_partition(&shard);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(LOCAL_FRONTIER);
+        let budget = frontier.partition_request_budget();
+        let refused = IggyError::TransientNotAccepted.as_code();
+        let config = ServerConfig::default();
+        let drain = Rc::new(ClientDrain::new(&config));
+        let other = Rc::new(ClientDrain::new(&config));
+
+        dispatch_write_on(&shard, namespace, LOCAL_FRONTIER + 1, None, Some(&drain)).await;
+        assert_eq!(*bus.sleeps.borrow(), [budget]);
+
+        dispatch_write_on(&shard, namespace, LOCAL_FRONTIER + 2, None, Some(&drain)).await;
+        assert_eq!(
+            *bus.sleeps.borrow(),
+            [budget],
+            "the next request of the connection waits for nothing"
+        );
+        assert_eq!(write_statuses(&bus), [refused, refused]);
+        assert_eq!(
+            shard.metrics().partition_request_frontier_refusals_value(),
+            2
+        );
+
+        dispatch_write_on(&shard, namespace, LOCAL_FRONTIER + 1, None, Some(&other)).await;
+        assert_eq!(
+            *bus.sleeps.borrow(),
+            [budget, budget],
+            "another connection waits for itself"
+        );
+
+        frontier.advance(LOCAL_FRONTIER + 1);
+        dispatch_write_on(&shard, namespace, LOCAL_FRONTIER + 2, None, Some(&drain)).await;
+        assert_eq!(
+            *bus.sleeps.borrow(),
+            [budget, budget, budget],
+            "the connection waits again for a frontier that moved"
+        );
+        assert_eq!(write_statuses(&bus), [refused; 4]);
+    }
+
+    /// A session that ended is told so at once, whatever the frontier is.
+    #[compio::test]
+    async fn given_an_ended_session_ahead_of_the_frontier_when_a_partition_request_arrives_should_refuse_stale_client_without_a_wait()
+     {
+        const LOCAL_FRONTIER: u64 = 10;
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = route_one_partition(&shard);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(LOCAL_FRONTIER);
+        let session = attach_root_session(&shard, WRITE_CLIENT, WRITE_SESSION);
+        end_write_session(&shard, LOCAL_FRONTIER);
+
+        let admission =
+            dispatch_write_on(&shard, namespace, LOCAL_FRONTIER + 1, Some(session), None).await;
+
+        assert_eq!(admission, PartitionAdmission::Denied);
+        assert_eq!(write_statuses(&bus), [IggyError::StaleClient.as_code()]);
+        assert!(bus.sleeps.borrow().is_empty(), "{:?}", bus.sleeps.borrow());
+    }
+
+    /// The session can end while its request waits for the frontier.
+    #[compio::test]
+    async fn given_a_session_that_ends_during_the_frontier_wait_when_the_frontier_arrives_should_refuse_stale_client()
+     {
+        const LOCAL_FRONTIER: u64 = 10;
+        let bus = SpyBus::default();
+        // The frontier ends the wait, never its budget.
+        bus.frozen_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(LOCAL_FRONTIER);
+        let session = attach_root_session(&shard, WRITE_CLIENT, WRITE_SESSION);
+
+        let mut admission = Box::pin(admit_partition_request(
+            &shard,
+            LOCAL_FRONTIER + 1,
+            Some(&session),
+            None,
+        ));
+        assert!(
+            futures::poll!(admission.as_mut()).is_pending(),
+            "a request ahead of local metadata waits"
+        );
+        end_write_session(&shard, LOCAL_FRONTIER + 1);
+        frontier.advance(LOCAL_FRONTIER + 1);
+
+        assert!(matches!(admission.await, Err(IggyError::StaleClient)));
     }
 
     #[compio::test]
@@ -4389,6 +4730,7 @@ mod tests {
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            false,
             ShardMetrics::for_shard(),
         )
         .expect("single-sender ring is canonically ordered");
@@ -4432,17 +4774,27 @@ mod tests {
     }
 
     async fn answer_segment_delete_primary(inbox: &Receiver<ShardFrame>, primary: u8) {
+        let (_, reply) = primary_read(inbox).await;
+        reply
+            .try_send(PartitionReadReply::Primary { view: 0, primary })
+            .unwrap();
+    }
+
+    /// The next frame of the owner `inbox`, which must ask for the primary of
+    /// a partition. Returns the partition and the sender of the answer.
+    async fn primary_read(
+        inbox: &Receiver<ShardFrame>,
+    ) -> (IggyNamespace, shard::Sender<PartitionReadReply>) {
         let ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            namespace,
             read: PartitionRead::Primary,
             reply,
             ..
         }) = inbox.recv().await.unwrap()
         else {
-            panic!("segment resolution must locate the partition primary");
+            panic!("the owner must be asked for the partition primary");
         };
-        reply
-            .try_send(PartitionReadReply::Primary { view: 0, primary })
-            .unwrap();
+        (namespace, reply)
     }
 
     fn complete_segment_delete_lifecycle(shard: &TestShard) {
@@ -4840,6 +5192,7 @@ mod tests {
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), Rc::clone(&bus)),
             None,
+            false,
             ShardMetrics::for_shard(),
         )
         .expect("the two-sender ring is canonically ordered");

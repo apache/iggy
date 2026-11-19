@@ -511,6 +511,10 @@ pub(in crate::dispatch) struct ClientDrain {
     /// Whether a frame holds the metadata lane.
     metadata_write: Cell<bool>,
     progress: RefCell<AHashSet<ConsumerProgress>>,
+    /// The applied metadata frontier when a partition request of this
+    /// connection last waited for it in vain. While the frontier stays
+    /// there, the next requests ahead of it are refused without a wait.
+    frontier_wait_expired_at: Cell<Option<u64>>,
     /// The drain task, while it waits for a frame or for room to admit one.
     parked: Cell<Option<Waker>>,
 }
@@ -531,6 +535,7 @@ impl ClientDrain {
             in_flight: Cell::new(0),
             metadata_write: Cell::new(false),
             progress: RefCell::default(),
+            frontier_wait_expired_at: Cell::new(None),
             parked: Cell::new(None),
         }
     }
@@ -2756,14 +2761,22 @@ mod tests {
     #[compio::test]
     async fn given_deleted_user_when_id_reused_should_reject_retained_session() {
         for primary in [false, true] {
-            assert_revoked_user_cannot_resume(Operation::DeleteUser, primary).await;
+            Box::pin(assert_revoked_user_cannot_resume(
+                Operation::DeleteUser,
+                primary,
+            ))
+            .await;
         }
     }
 
     #[compio::test]
     async fn given_deactivated_user_when_reactivated_should_reject_retained_session() {
         for primary in [false, true] {
-            assert_revoked_user_cannot_resume(Operation::UpdateUserResolved, primary).await;
+            Box::pin(assert_revoked_user_cannot_resume(
+                Operation::UpdateUserResolved,
+                primary,
+            ))
+            .await;
         }
     }
 
@@ -2994,6 +3007,7 @@ mod tests {
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            false,
             ShardMetrics::for_shard(),
         )
         .expect("single-sender ring is canonically ordered");

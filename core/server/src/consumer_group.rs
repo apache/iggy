@@ -380,6 +380,7 @@ mod tests {
                 PapayaShardsTable::new(),
                 PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus),
                 None,
+                false,
                 ShardMetrics::for_shard(),
             )
             .unwrap(),

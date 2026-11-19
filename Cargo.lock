@@ -7051,6 +7051,7 @@ dependencies = [
  "server_common",
  "tempfile",
  "tracing",
+ "twox-hash",
 ]
 
 [[package]]

@@ -40,10 +40,9 @@ use integration::iggy_harness;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
-/// Committed ops before the restart. `journal_slots = 256` with the built-in
-/// checkpoint margin (64) forces a checkpoint at ~192 committed ops, so this
-/// guarantees at least one checkpoint+drain on every node, pushing the
-/// register (op 1) below every snapshot floor.
+/// Committed ops before the restart. `journal_slots = 256` starts a checkpoint
+/// at 128 committed ops, so this guarantees at least one checkpoint+drain on
+/// every node, pushing the register (op 1) below every snapshot floor.
 const OPS_BEFORE_RESTART: u64 = 220;
 
 /// How long the restarted follower gets to probe, fetch, and install.

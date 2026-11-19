@@ -309,11 +309,11 @@ pub struct PartitionConfig {
     /// Node-wide budget for the journal memory of all partitions: the
     /// resident ops that wait for their flush, the evicted rings, and the
     /// held state machine commands, each at its allocated size. Split evenly
-    /// across the shards, because a shard can shed only its own partitions
-    /// ([`Self::journal_memory_shard_bytes_max`]). Past its share a shard
-    /// releases ring batches to their segments, asks flushes through the
-    /// commit point, and for what no flush covers drops the oldest ring
-    /// entries and releases checkpointed commands. Every ring keeps its
+    /// across the shards that own partitions, because a shard can shed only
+    /// its own partitions ([`Self::journal_memory_shard_bytes_max`]). Past its
+    /// share a shard releases ring batches to their segments, asks flushes
+    /// through the commit point, and for what no flush covers drops the oldest
+    /// ring entries and releases checkpointed commands. Every ring keeps its
     /// newest entry. Must be > 0, and must leave each shard at least 1 byte.
     #[serde(default = "default_journal_memory_node_bytes_max")]
     #[config_env(leaf)]
@@ -337,10 +337,10 @@ pub struct PartitionConfig {
     pub checkpoint_max_delay: IggyDuration,
 
     /// Node-wide cap on the partition WAL bytes above the checkpoints, which
-    /// a boot loads into memory again. Split evenly across the shards
-    /// ([`Self::wal_reload_shard_bytes_max`]). Past its share a shard queues
-    /// checkpoints for the partitions whose first op since their checkpoint
-    /// is oldest, until the queued bytes cover the excess. Must be > 0, and
+    /// a boot loads into memory again. Split evenly across the shards that own
+    /// partitions ([`Self::wal_reload_shard_bytes_max`]). Past its share a
+    /// shard queues checkpoints for the partitions whose first op since their
+    /// checkpoint is oldest, until the queued bytes cover the excess. Must be > 0, and
     /// must leave each shard at least 1 byte.
     #[serde(default = "default_wal_reload_node_bytes_max")]
     #[config_env(leaf)]

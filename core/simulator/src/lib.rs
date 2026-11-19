@@ -60,7 +60,7 @@ use seeds::SimSeeds;
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP, PartitionLocation, ShardId};
 use shard::commit_batch;
-use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::shards_table::ShardsTable;
 use shard::{CONSENSUS_TICK_INTERVAL, PartitionMaterialisation};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -152,15 +152,11 @@ pub struct SimReplica {
 }
 
 impl SimReplica {
-    /// The shard owning `namespace`'s partition data, by the same
-    /// deterministic hash the router uses.
-    ///
-    /// # Panics
-    /// If the shard count does not fit `u32`; mesh construction caps it at `u16`.
+    /// The shard owning `namespace`'s partition data, by the placement the
+    /// router uses.
     #[must_use]
     pub fn partition_shard(&self, namespace: IggyNamespace) -> &Rc<Replica> {
-        let shard_count = u32::try_from(self.shards.len()).expect("shard count fits u32");
-        let owner = calculate_shard_assignment(&namespace, shard_count);
+        let owner = self.shards[0].partition_shards().shard_for(&namespace);
         &self.shards[usize::from(owner)]
     }
 }
@@ -2219,8 +2215,7 @@ fn materialise_partition(
     namespace: IggyNamespace,
     consumer_offsets_max: usize,
 ) -> bool {
-    let shard_count = u32::try_from(replica.shards.len()).expect("shard count fits u32");
-    let owner = calculate_shard_assignment(&namespace, shard_count);
+    let owner = replica.shards[0].partition_shards().shard_for(&namespace);
     let streams = replica.shards[0].plane.metadata().mux_stm.streams();
     // Materialization and recovery must never create metadata. Seeding a vacant
     // slab here changes future allocation and makes replicas diverge after deletion.
@@ -2455,6 +2450,7 @@ mod tests {
     use super::*;
     use crate::client::{SIM_ROTATED_WRAP_SET, SIM_STREAM_WRAP_SET, SimClient};
     use crate::workload::apply_sim_commands;
+    use crate::workload::state_checker::StateChecker;
     use bytes::Bytes;
     use consensus::{
         Consensus, PlaneKind, Project, Sequencer, Status, client_table::COMMITTED_WINDOW_BITS,
@@ -2472,6 +2468,7 @@ mod tests {
     use journal::{Journal, JournalHandle};
     use message_bus::lifecycle::Shutdown;
     use message_bus::{AUTO_COMMIT_CLIENT_ID, ConnectionInstaller, MessageBus};
+    use metadata::impls::metadata::SnapshotCoordinator;
     use metadata::stm::stream::Streams;
     use server_common::MessageBag;
     use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, METADATA_GROUP};
@@ -3436,7 +3433,7 @@ mod tests {
         complete_metadata_op(&mut sim, &client, client.create_topic(STREAM, TOPIC, 1));
         let (namespace, deleted) = incarnation(&sim);
         assert_ne!(
-            calculate_shard_assignment(&namespace, u32::from(SHARDS_PER_REPLICA)),
+            sim.replicas[0].partition_shard(namespace).id,
             0,
             "the partition must live off shard 0"
         );
@@ -5737,9 +5734,13 @@ mod tests {
         target: u8,
         request: Message<RoutedRequestHeader>,
     ) -> Message<ReplyHeader> {
+        // A create of partitions that no node builds replies when the hold
+        // of the owner shard ends.
+        const REPLY_STEPS: u128 =
+            100 + shard::PARTITION_BUILD_HOLD.as_micros() / CONSENSUS_TICK_INTERVAL.as_micros();
         let request_id = request.header().request;
         sim.submit_request(client_id, target, request.into_generic());
-        for _ in 0..100 {
+        for _ in 0..REPLY_STEPS {
             if let Some(reply) = sim
                 .step()
                 .into_iter()
@@ -10664,6 +10665,181 @@ mod tests {
         }
     }
 
+    /// Slots for the checkpoint job tests. Their half, where a job starts, sits
+    /// far above the forced-checkpoint margin, so the margin path never runs.
+    const JOB_JOURNAL_SLOTS: usize = 256;
+
+    /// The op whose commit starts the first job: half the WAL above checkpoint 0.
+    const FIRST_JOB_OP: u64 = (JOB_JOURNAL_SLOTS / 2) as u64;
+
+    /// Creates after the register: three jobs per replica, at ops 128, 256 and 384.
+    const JOB_STREAMS: u32 = 400;
+
+    const JOB_STEPS_PER_STREAM: usize = 40;
+
+    /// Checkpoints that start at half the WAL end before appends reach the
+    /// forced-checkpoint margin, so the background job does every trim.
+    ///
+    /// The margin path does nothing while more than the margin is free. A floor
+    /// that moves while every replica keeps more than that free was moved by a job.
+    #[test]
+    fn given_half_the_wal_committed_when_checkpoints_run_should_trim_through_the_job() {
+        const SEED: u64 = 0xC4E0_0007;
+
+        let first = job_checkpoint_run(SEED);
+        let second = job_checkpoint_run(SEED);
+
+        assert_eq!(first, second, "one seed ran two different schedules");
+    }
+
+    /// Each replica's journal floors in order, its committed stream names and the
+    /// schedule hash of one job-checkpointing run.
+    fn job_checkpoint_run(seed: u64) -> (u64, Vec<Vec<u64>>, Vec<BTreeSet<String>>) {
+        const REPLICAS: u8 = 3;
+        let (mut sim, client, _root) = checkpointing_sim(REPLICAS, seed);
+        // Before any op nears the 80-slot margin the helper sets.
+        sim.set_metadata_journal_slots(JOB_JOURNAL_SLOTS);
+        let mut checker = StateChecker::new();
+        let mut floors = vec![Vec::new(); usize::from(REPLICAS)];
+        for sequence in 0..JOB_STREAMS {
+            let msg = client.create_stream(&format!("wl-job-{sequence}"));
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
+            for _ in 0..JOB_STEPS_PER_STREAM {
+                sim.step();
+                checker.check(&sim, seed);
+                for (replica, replica_floors) in floors.iter_mut().enumerate() {
+                    let journal = &sim.replicas[replica].metadata_journal;
+                    let remaining = journal
+                        .remaining_capacity()
+                        .expect("the journal is bounded");
+                    assert!(
+                        remaining > SnapshotCoordinator::<()>::CHECKPOINT_MARGIN,
+                        "replica {replica} has {remaining} free slots, at the forced-checkpoint \
+                         margin, so its next trim need not come from a job"
+                    );
+                    let floor = journal.snapshot_op();
+                    if floor > replica_floors.last().copied().unwrap_or(0) {
+                        replica_floors.push(floor);
+                    }
+                }
+            }
+        }
+        for (replica, replica_floors) in floors.iter().enumerate() {
+            assert!(
+                replica_floors.len() >= 3,
+                "replica {replica} trimmed its WAL at {replica_floors:?}, not at three jobs"
+            );
+        }
+        let names = (0..usize::from(REPLICAS))
+            .map(|replica| committed_stream_names(&sim, replica))
+            .collect();
+        (sim.schedule_hash(), floors, names)
+    }
+
+    /// A backup that crashes after its job made the checkpoint durable, but before
+    /// the job trimmed the WAL, recovers from that checkpoint and rejoins.
+    ///
+    /// The job parks on `journal_gate`, which the test holds, with the snapshot and
+    /// the superblock pairing written and the WAL whole. The crash drops the job.
+    #[test]
+    fn given_a_job_waiting_to_trim_when_the_backup_crashes_should_recover_and_rejoin() {
+        const SEED: u64 = 0xC4E0_0008;
+        const BACKUP: u8 = 1;
+        const DURABLE_STEPS: usize = 200;
+        const REJOIN_STEPS: usize = 8_000;
+        let backup = usize::from(BACKUP);
+        let (mut sim, client, _root) = checkpointing_sim(3, SEED);
+        sim.set_metadata_journal_slots(JOB_JOURNAL_SLOTS);
+        let mut checker = StateChecker::new();
+        let run = |sim: &mut Simulator, checker: &mut StateChecker, steps: usize| {
+            for _ in 0..steps {
+                sim.step();
+                checker.check(sim, SEED);
+            }
+        };
+        let backup_shard = Rc::clone(&sim.replicas[backup].shards[0]);
+        let backup_metadata = backup_shard.plane.metadata();
+        let backup_journal = backup_metadata
+            .journal
+            .as_ref()
+            .expect("shard 0 owns the WAL");
+        let backup_consensus = backup_metadata
+            .consensus
+            .as_ref()
+            .expect("shard 0 owns metadata consensus");
+
+        // Held from the step where the backup journaled the trigger op and has not
+        // committed it, so the job starts under the hold. The backup appends no
+        // more ops, and the commit needs no gate.
+        let mut gate = None;
+        let mut next_sequence = 0;
+        'submit: for sequence in 0..JOB_STREAMS {
+            let msg = client.create_stream(&format!("wl-job-crash-{sequence}"));
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
+            next_sequence = sequence + 1;
+            for _ in 0..JOB_STEPS_PER_STREAM {
+                sim.step();
+                checker.check(&sim, SEED);
+                if backup_journal.last_op() >= Some(FIRST_JOB_OP)
+                    && backup_consensus.commit_min() < FIRST_JOB_OP
+                {
+                    gate = backup_metadata.hold_journal_writes().now_or_never();
+                    if gate.is_some() {
+                        break 'submit;
+                    }
+                }
+            }
+        }
+        assert!(
+            gate.is_some(),
+            "replica {BACKUP} never sat at a step boundary with op {FIRST_JOB_OP} journaled \
+             but not committed"
+        );
+        let durable_checkpoint = |sim: &Simulator| {
+            sim.replicas[backup]
+                .superblock
+                .read_latest_sync()
+                .and_then(|bytes| VsrState::try_from(bytes.as_slice()).ok())
+                .map_or(0, |state| state.checkpoint_op)
+        };
+        assert!(
+            (0..DURABLE_STEPS).any(|_| {
+                sim.step();
+                durable_checkpoint(&sim) >= FIRST_JOB_OP
+            }),
+            "replica {BACKUP}'s job never made its checkpoint durable"
+        );
+        assert_eq!(
+            snapshot_floor(&sim, backup),
+            0,
+            "the job trimmed the WAL while the test held the gate"
+        );
+
+        sim.replica_crash(BACKUP);
+        drop(gate);
+        drop(backup_shard);
+        sim.replica_restart(BACKUP);
+        run(&mut sim, &mut checker, REJOIN_STEPS);
+        for sequence in next_sequence..JOB_STREAMS {
+            let msg = client.create_stream(&format!("wl-job-crash-{sequence}"));
+            sim.submit_request(client.client_id(), 0, msg.into_generic());
+            run(&mut sim, &mut checker, JOB_STEPS_PER_STREAM);
+        }
+        run(&mut sim, &mut checker, REJOIN_STEPS);
+
+        // A trim keeps the checkpoint op's entry as the commit point.
+        assert!(
+            snapshot_floor(&sim, backup) >= FIRST_JOB_OP - 1,
+            "replica {BACKUP} never trimmed to the checkpoint it crashed in"
+        );
+        assert_eq!(
+            committed_stream_names(&sim, backup),
+            committed_stream_names(&sim, 0),
+            "replica {BACKUP} rejoined with other committed metadata than the primary"
+        );
+    }
+
+    /// A solo replica that checkpointed recovers the state the checkpoint absorbed.
     /// A solo replica that checkpointed recovers the state the checkpoint absorbed.
     ///
     /// The case with no second opinion: a clustered replica repairs a botched local
@@ -17012,10 +17188,11 @@ mod metadata_repair_driver_tests {
     /// A rejoining replica awaits a state transfer from the view's primary, as
     /// production's `JoinMode::ProbeAsBackup { await_state_transfer: true }`
     /// arms it; the harness restart does not, so this test does. A primary whose
-    /// checkpoint never finishes refuses each descriptor request as transiently
-    /// busy. If that refusal refills the transfer's stall budget, the replica
-    /// waits in `AwaitingTarget` for good, with its commit walk and journal
-    /// repair both deferred, though the primary's WAL still covers its gap.
+    /// checkpoints replace the snapshot during every offer's read refuses each
+    /// descriptor request as transiently busy. If that refusal refills the
+    /// transfer's stall budget, the replica waits in `AwaitingTarget` for good,
+    /// with its commit walk and journal repair both deferred, though the
+    /// primary's WAL still covers its gap.
     #[test]
     fn given_a_transfer_peer_that_stays_checkpointing_when_the_budget_is_spent_should_fall_back_to_journal_repair()
      {
@@ -17037,12 +17214,10 @@ mod metadata_repair_driver_tests {
         sim.replica_crash(LAGGING);
         create_streams(&mut sim, &client, SHORT_GAP_SENDS, "md-gap");
 
-        let primary = Rc::clone(&sim.replicas[0].shards[0]);
-        let _checkpoint = primary
+        sim.replicas[0].shards[0]
             .plane
             .metadata()
-            .hold_checkpoint_gate()
-            .expect("nothing checkpoints without a snapshot coordinator");
+            .refuse_state_transfer_offers();
 
         sim.replica_restart(LAGGING);
         sim.metadata_consensus(usize::from(LAGGING))
