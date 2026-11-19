@@ -30,8 +30,13 @@
 //! cancelled, and would otherwise leave an older manifest there until the
 //! next change.
 //!
-//! A partition that places its batches says when it owes a pass that no
-//! commit asks for, see [`IggyPartition::manifest_pass_due_at`].
+//! A partition that places its batches stores its manifest at most once a
+//! [`MANIFEST_STORE_INTERVAL`]: the changes of its long-term log within that
+//! time share the next store, which lists the latest of them. It says when it
+//! owes a pass that no commit asks for, see
+//! [`IggyPartition::manifest_pass_due_at`], so a change held back by the
+//! interval is stored once the interval passed, with or without another
+//! change.
 
 use std::cmp::Ordering;
 use std::time::Duration;
@@ -50,6 +55,13 @@ use tracing::{debug, warn};
 
 use crate::IggyPartition;
 use crate::segment_chain::SegmentRecord;
+
+/// The shortest time between the starts of two stores of the manifest of a
+/// partition that places its batches.
+///
+/// The manifest is one object that each store rewrites whole, and another
+/// cluster reads a long-term segment only through it.
+pub const MANIFEST_STORE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long after its first manifest a primary stores the same one again.
 /// Longer than any put of the primary before it can stay in flight.
@@ -197,9 +209,22 @@ pub struct ManifestPublishes {
     failures: u32,
     /// When the publish that failed last may be tried again.
     retry_at: Option<IggyTimestamp>,
+    /// When this view last started to store the manifest. A new view
+    /// stores its first one at once.
+    started_at: Option<IggyTimestamp>,
 }
 
 impl ManifestPublishes {
+    /// The first moment a partition that places its batches may start to
+    /// store its manifest again, `None` before the first store of the view.
+    fn next_store_at(&self) -> Option<u64> {
+        self.started_at.map(|started_at| {
+            started_at
+                .as_micros()
+                .saturating_add(micros(MANIFEST_STORE_INTERVAL))
+        })
+    }
+
     fn repeat_due(&self, now: IggyTimestamp) -> bool {
         !self.repeated
             && self
@@ -207,15 +232,24 @@ impl ManifestPublishes {
                 .is_some_and(|first| now.as_micros() >= repeat_at(first))
     }
 
-    /// When the next pass that no commit asks for is due. A failed publish
-    /// holds the repeat back until its own retry.
-    fn unasked_pass_at(&self) -> Option<IggyTimestamp> {
-        if self.retry_at.is_some() {
-            return self.retry_at;
-        }
-        self.first_published_at
-            .filter(|_| !self.repeated)
-            .map(|first| IggyTimestamp::from(repeat_at(first)))
+    /// When the next pass that no commit asks for is due: the retry of a
+    /// failed publish, the store of a long-term log that `changed` since the
+    /// last stored manifest, or the repeat. A failed publish holds the other
+    /// two back until its own retry, and none is due sooner than
+    /// [`MANIFEST_STORE_INTERVAL`] after the last store started.
+    fn unasked_pass_at(&self, changed: bool) -> Option<IggyTimestamp> {
+        let owed = if let Some(retry_at) = self.retry_at {
+            retry_at.as_micros()
+        } else if changed {
+            0
+        } else {
+            self.first_published_at
+                .filter(|_| !self.repeated)
+                .map(repeat_at)?
+        };
+        Some(IggyTimestamp::from(
+            self.next_store_at().map_or(owed, |next| owed.max(next)),
+        ))
     }
 
     fn note_failure(&mut self, now: IggyTimestamp) {
@@ -342,25 +376,49 @@ where
 
     /// When this replica, the primary of a partition that places its
     /// batches, owes a manifest pass that no commit asks for: the retry of
-    /// the publish that failed last, or the repeat [`MANIFEST_REPEAT_AFTER`]
-    /// after its first one. `None` while a publish runs, before the first
-    /// pass of the view, and on a replica that does not publish.
+    /// the publish that failed last, the store of a long-term log that
+    /// changed since the last stored manifest once
+    /// [`MANIFEST_STORE_INTERVAL`] passed, or the repeat
+    /// [`MANIFEST_REPEAT_AFTER`] after its first one. `None` while a publish
+    /// runs, before the first pass of the view, and on a replica that does
+    /// not publish.
     #[must_use]
     pub fn manifest_pass_due_at(&self) -> Option<IggyTimestamp> {
         let publishes = &self.manifest_publishes;
-        let due_at = publishes.unasked_pass_at()?;
-        (publishes.running.is_none()
+        let owes = publishes.running.is_none()
             && self.places_batches()
             && publishes.view == Some(self.consensus().view())
-            && self.publishes_manifest())
-        .then_some(due_at)
+            && self.publishes_manifest();
+        if !owes {
+            return None;
+        }
+        publishes.unasked_pass_at(publishes.published != Some(self.long_term_progress()))
+    }
+
+    /// Whether this replica, the primary of a partition that places its
+    /// batches, holds back the store of a long-term log that changed since
+    /// the last stored manifest, because [`MANIFEST_STORE_INTERVAL`] has not
+    /// passed by `now` since the last store started.
+    #[must_use]
+    pub fn manifest_store_held(&self, now: IggyTimestamp) -> bool {
+        let publishes = &self.manifest_publishes;
+        publishes.running.is_none()
+            && self.places_batches()
+            && publishes.view == Some(self.consensus().view())
+            && publishes
+                .next_store_at()
+                .is_some_and(|next| now.as_micros() < next)
+            && publishes.published != Some(self.long_term_progress())
+            && self.publishes_manifest()
     }
 
     /// Start the publish of this partition's manifest, when this replica is
     /// the primary, none is in flight, and the manifest differs from the
-    /// one this view last stored or is due again. The caller runs it under
-    /// the returned scope and hands the result to
-    /// [`Self::finish_manifest_publish`] with the returned number.
+    /// one this view last stored or is due again. A partition that places
+    /// its batches also waits [`MANIFEST_STORE_INTERVAL`] from the start of
+    /// its last store. The caller runs it under the returned scope and hands
+    /// the result to [`Self::finish_manifest_publish`] with the returned
+    /// number.
     ///
     /// A replica that is not the primary cancels the job it started, so a
     /// pass over a demoted replica is what stops its job.
@@ -374,9 +432,14 @@ where
         }
         let manifest = self.manifest(now)?;
         let progress = ManifestProgress::from(&manifest);
+        let paced = self.places_batches();
         let publishes = self.manifest_publishes_of_this_view();
         if publishes.running.is_some()
             || (publishes.published == Some(progress) && !publishes.repeat_due(now))
+            || (paced
+                && publishes
+                    .next_store_at()
+                    .is_some_and(|next| now.as_micros() < next))
         {
             return None;
         }
@@ -385,6 +448,7 @@ where
         self.manifest_publish_jobs += 1;
         let id = self.manifest_publish_jobs;
         self.manifest_publishes.running = Some((id, progress, scope));
+        self.manifest_publishes.started_at = Some(now);
         Some((id, manifest, token))
     }
 
@@ -459,6 +523,18 @@ where
                 false
             }
         }
+    }
+
+    /// The first moment from `now` on at which this replica may start to
+    /// store the manifest of its partition that places its batches.
+    #[cfg(test)]
+    pub(crate) fn manifest_store_allowed_from(&self, now: IggyTimestamp) -> IggyTimestamp {
+        let now = now.as_micros();
+        IggyTimestamp::from(
+            self.manifest_publishes
+                .next_store_at()
+                .map_or(now, |next| next.max(now)),
+        )
     }
 
     /// What the manifest this view last stored holds, `None` before its

@@ -1927,14 +1927,22 @@ async fn given_a_replace_at_an_unchanged_floor_when_a_manifest_pass_runs_should_
     let merged = merged_of(&first, &second);
     let replace = partition.replace_segments_request(&merged, 10).unwrap();
     Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+    let later = next_store_at(now);
 
-    let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    let (id, manifest, _scope) = partition.begin_manifest_publish(later).unwrap();
 
     assert_eq!(manifest.floor, Some(3));
     assert_eq!(manifest.trim_point, None);
     assert_eq!(manifest.segments, [merged, third]);
-    assert!(!partition.finish_manifest_publish(id, &STORED, now));
-    assert!(partition.begin_manifest_publish(now).is_none());
+    assert!(!partition.finish_manifest_publish(id, &STORED, later));
+    assert!(partition.begin_manifest_publish(later).is_none());
+}
+
+/// When a partition that started to store its manifest at `started` may
+/// start the next store.
+fn next_store_at(started: IggyTimestamp) -> IggyTimestamp {
+    let interval = u64::try_from(crate::MANIFEST_STORE_INTERVAL.as_micros()).unwrap();
+    IggyTimestamp::from(started.as_micros() + interval)
 }
 
 /// No publish starts while one runs. A replace that commits meanwhile moves
@@ -1971,7 +1979,7 @@ async fn given_a_trimmed_long_term_log_when_building_the_manifest_should_carry_t
     Box::pin(commit_long_term_request(&mut partition, trim, false)).await;
 
     let (_, manifest, _scope) = partition
-        .begin_manifest_publish(now)
+        .begin_manifest_publish(next_store_at(now))
         .expect("a trim is a change of the manifest");
 
     assert_eq!(partition.long_term_trim_point(), Some(0));
@@ -2200,10 +2208,11 @@ async fn given_a_segment_published_during_a_manifest_publish_when_it_ends_should
 
     assert!(partition.finish_manifest_publish(id, &STORED, now));
 
-    let (id, manifest, _scope) = partition.begin_manifest_publish(now).unwrap();
+    let later = next_store_at(now);
+    let (id, manifest, _scope) = partition.begin_manifest_publish(later).unwrap();
     assert_eq!(manifest.floor, Some(3));
     assert!(
-        !partition.finish_manifest_publish(id, &STORED, now),
+        !partition.finish_manifest_publish(id, &STORED, later),
         "the log stood still"
     );
 }
@@ -2458,7 +2467,7 @@ pub(super) async fn publish_manifest(
         iggy_object_store::InlineTierExecutor::new(SharedStore(Rc::clone(store))),
         super::remote_poll::layout(),
     );
-    let now = IggyTimestamp::now();
+    let now = partition.manifest_store_allowed_from(IggyTimestamp::now());
     let (id, manifest, scope) = partition
         .begin_manifest_publish(now)
         .expect("the manifest changed");
@@ -2888,7 +2897,7 @@ async fn given_a_committed_segment_without_its_manifest_when_primacy_moves_shoul
     let outcome = writer(&store).write(rewrite, scope).await;
     let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
     Box::pin(commit_segment_command(&mut partition, &segment, false)).await;
-    let now = IggyTimestamp::now();
+    let now = partition.manifest_store_allowed_from(IggyTimestamp::now());
     let (id, _unstored, _scope) = partition
         .begin_manifest_publish(now)
         .expect("the log changed");

@@ -82,7 +82,7 @@ mod placed_read;
 mod proven_batch;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
-    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
+    MANIFEST_RETRY_AFTER_MAX, MANIFEST_STORE_INTERVAL, ManifestPublishOutcome, ManifestPublisher,
 };
 pub use origin_recovery::{
     DropReason, DroppedBatch, FRESH_INDEX_FIRST_READ, FreshScan, PartitionRecovery,

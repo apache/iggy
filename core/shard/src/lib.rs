@@ -2286,6 +2286,12 @@ where
     /// so the next manifest pass takes them from here.
     undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
 
+    /// The partitions whose changed manifest waits out
+    /// [`partitions::MANIFEST_STORE_INTERVAL`], by namespace and incarnation.
+    /// The pump's tick stages each one's pass once it passed, whether the
+    /// shard paces the partition or not, and whether it sleeps.
+    manifests_held: RefCell<BTreeSet<(IggyNamespace, u64)>>,
+
     /// The upload-first produce path of the partitions here that place their
     /// batches.
     fresh_writes: fresh_writes::FreshWrites,
@@ -2694,6 +2700,7 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
             long_term_writer: RefCell::new(None),
@@ -3688,6 +3695,7 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
             long_term_writer: RefCell::new(None),

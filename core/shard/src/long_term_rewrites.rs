@@ -35,7 +35,8 @@
 //!
 //! A commit to the long-term log also stages a publish of the partition's
 //! manifest, so a reader of the bucket finds the segment without waiting
-//! for the segment cleaner.
+//! for the segment cleaner. The commits within one
+//! [`partitions::MANIFEST_STORE_INTERVAL`] share one publish.
 //!
 //! A segment is stored before its command commits. A pass that finds such
 //! a segment sends its command again and starts no rewrite, so a command
@@ -233,8 +234,9 @@ where
         for plan in plans {
             self.settle_segment_plan(plan).await;
         }
-        let partitions = self.plane.partitions();
         let manifest_now = IggyTimestamp::now();
+        self.stage_held_manifest_passes(manifest_now);
+        let partitions = self.plane.partitions();
         if self.rewrite_pacing.borrow_mut().take_sweep_wanted() {
             for namespace in partitions.namespaces() {
                 if let Some(partition) = partitions.get_by_ns(namespace) {
