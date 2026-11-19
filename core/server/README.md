@@ -835,6 +835,14 @@ consensus. A command lists only the segments that changed, and a large
 catch-up takes several commands. Every replica applies the same commands, so
 every replica serves the same range, and a restart does not go back.
 
+The manifests are all that a node reads of a peer's partitions, apart from
+the segments that polls read: it reads none of the peer's fresh objects. A
+message reaches a shadow topic once the peer's rewrite put it in a long-term
+segment and stored the manifest, and this cluster listed and committed that
+manifest, seconds after its commit: see the [delays](docs/GEO_TOPICS.md#delays).
+A shadow partition never serves an offset past the end of the last segment
+that the manifest it committed lists.
+
 The listings and reads go to the peer's own tier service, in its
 housekeeping class. A slow or unreachable peer therefore takes no job slot of
 this cluster's store, and none that a poll of a shadow partition waits for.
