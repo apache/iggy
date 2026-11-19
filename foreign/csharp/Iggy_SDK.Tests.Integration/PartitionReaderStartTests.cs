@@ -23,6 +23,7 @@ using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
 using Apache.Iggy.Tests.Integrations.Fixtures;
+using Microsoft.Extensions.Logging.Abstractions;
 using Shouldly;
 using Partitioning = Apache.Iggy.Kinds.Partitioning;
 
@@ -61,6 +62,55 @@ public class PartitionReaderStartTests
         return from protocol in IggyServerFixture.ProtocolData()
                from commit in new[] { CommitPolicy.OnRead, CommitPolicy.Manual }
                select new Func<(Protocol, CommitPolicy)>(() => (protocol(), commit));
+    }
+
+    public static IEnumerable<Func<(Protocol, CommitMode, bool)>> ConsumerResumeData()
+    {
+        return from protocol in IggyServerFixture.ProtocolData()
+               from mode in new[] { CommitMode.Manual, CommitMode.OnRead, CommitMode.Auto }
+               from rented in new[] { false, true }
+               select new Func<(Protocol, CommitMode, bool)>(() => (protocol(), mode, rented));
+    }
+
+    [Test]
+    [MethodDataSource(nameof(ConsumerResumeData))]
+    public async Task Consumer_After_PartialIteration_Should_Resume_UnreadMessages(
+        Protocol protocol, CommitMode mode, bool rented)
+    {
+        await using var stream = await StartStream.CreateAsync(Fixture, protocol);
+        var commit = mode switch
+        {
+            CommitMode.OnRead => CommitPolicy.OnRead,
+            CommitMode.Auto => CommitPolicy.Auto(new AutoCommit
+            { Interval = TimeSpan.FromHours(1), After = CommitAfter.Processing }),
+            _ => CommitPolicy.Manual
+        };
+        await using var consumer = await stream.ConsumerAsync("resume-iteration", commit);
+        using var timeout = new CancellationTokenSource(ReadTimeout);
+        List<ulong> offsets = [];
+        for (var iteration = 0; iteration < 3; iteration++)
+        {
+            if (rented)
+            {
+                await foreach (var message in consumer.ReceiveRentedAsync(timeout.Token))
+                {
+                    using (message) { offsets.Add(message.CurrentOffset); }
+                    break;
+                }
+            }
+            else
+            {
+                await foreach (var message in consumer.ReceiveAsync(timeout.Token))
+                {
+                    offsets.Add(message.CurrentOffset);
+                    break;
+                }
+            }
+        }
+        offsets.ShouldBe([0ul, 1ul, 2ul]);
+        await consumer.ShutdownAsync();
+        await using var restarted = await stream.ReaderAsync("resume-iteration", PollingStrategy.Next(), CommitPolicy.Manual);
+        (await TakeAsync(restarted, 1)).ShouldBe([mode == CommitMode.Manual ? 0ul : 3ul]);
     }
 
     [Test]
@@ -196,6 +246,21 @@ public class PartitionReaderStartTests
                 .WithStart(start)
                 .WithOptions(new PollOptions { Count = ReaderCount, MaxWait = ReadWait, Commit = commit })
                 .BuildAsync();
+        }
+
+        public async Task<IggyConsumer> ConsumerAsync(string name, CommitPolicy commit)
+        {
+            var consumer = new IggyConsumer(client, new IggyConsumerConfig
+            {
+                StreamId = stream,
+                TopicId = Topic,
+                Consumer = Consumer.New(name),
+                Partitions = [PartitionId],
+                PollingStrategy = PollingStrategy.First(),
+                PollOptions = new PollOptions { Count = 2, MaxWait = ReadWait, Commit = commit }
+            }, NullLoggerFactory.Instance);
+            await consumer.InitAsync();
+            return consumer;
         }
     }
 }

@@ -45,6 +45,138 @@ public sealed class ConsumerOnReaderTests
 
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
+    [Theory]
+    [InlineData(CommitMode.Manual, false, 1)]
+    [InlineData(CommitMode.OnRead, false, 1)]
+    [InlineData(CommitMode.Auto, false, 1)]
+    [InlineData(CommitMode.Manual, true, 1)]
+    [InlineData(CommitMode.OnRead, true, 1)]
+    [InlineData(CommitMode.Auto, true, 1)]
+    [InlineData(CommitMode.Manual, false, 2)]
+    [InlineData(CommitMode.Manual, true, 2)]
+    public async Task given_partial_iterations_when_receiving_again_should_resume_unread_messages(
+        CommitMode mode, bool rented, int take)
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 8 };
+        using var client = await cluster.ConnectAsync();
+        var commit = mode switch
+        {
+            CommitMode.OnRead => CommitPolicy.OnRead,
+            CommitMode.Auto => CommitPolicy.Auto(new AutoCommit
+            { Interval = TimeSpan.FromHours(1), After = CommitAfter.Processing }),
+            _ => CommitPolicy.Manual
+        };
+        await using var consumer = await StartAsync(client, commit, 1);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        List<ulong> offsets = [];
+        for (var iteration = 0; iteration < 3; iteration++)
+        {
+            var taken = 0;
+            if (rented)
+            {
+                await foreach (var message in consumer.ReceiveRentedAsync(timeout.Token))
+                {
+                    using (message)
+                    {
+                        offsets.Add(message.CurrentOffset);
+                    }
+                    if (++taken == take) break;
+                }
+            }
+            else
+            {
+                offsets.AddRange((await ReceiveAsync(consumer, take)).Select(message => message.CurrentOffset));
+            }
+        }
+
+        Assert.Equal(Enumerable.Range(0, 3 * take).Select(offset => (ulong)offset), offsets);
+        await consumer.ShutdownAsync(Token);
+        if (mode == CommitMode.Manual)
+        {
+            Assert.False(cluster.Stored.ContainsKey(1));
+        }
+        else
+        {
+            Assert.Equal((ulong)(3 * take - 1), cluster.Stored[1]);
+        }
+        await using var restarted = await StartAsync(client, CommitPolicy.Manual, 1);
+        var resumed = await ReceiveAsync(restarted, 1);
+        Assert.Equal(mode == CommitMode.Manual ? 0ul : (ulong)(3 * take), resumed[0].CurrentOffset);
+    }
+
+    [Fact]
+    public async Task given_a_new_iteration_when_processing_should_count_the_previous_message()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 4 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client,
+            CommitPolicy.Auto(new AutoCommit { Every = CommitEvery.Message, After = CommitAfter.Processing }), 1);
+        Assert.Equal(0ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+        Assert.False(cluster.Stored.ContainsKey(1));
+        Assert.Equal(1ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+        await UntilAsync(() => cluster.Stored.TryGetValue(1, out var offset) && offset == 0);
+        await consumer.ShutdownAsync(Token);
+        Assert.Equal(1ul, cluster.Stored[1]);
+    }
+
+    [Fact]
+    public async Task given_a_partial_iteration_when_seeking_should_discard_the_unread_remainder()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        Assert.Equal(0ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+        await consumer.SeekAsync(1, PollingStrategy.Offset(4), Token);
+        Assert.Equal(4ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+    }
+
+    [Fact]
+    public async Task given_a_partial_iteration_when_switching_handlers_should_keep_unread_messages()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
+        Assert.Equal(0ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+        var failure = new InvalidOperationException("Handler failed.");
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => consumer.ConsumeAsync((message, _) =>
+        {
+            Assert.Equal(1ul, message.CurrentOffset);
+            return Task.FromException(failure);
+        }, Token));
+        Assert.Same(failure, error);
+        Assert.Equal(2ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+    }
+
+    [Fact]
+    public async Task given_a_typed_partial_iteration_when_receiving_again_should_resume_unread_messages()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = new IggyConsumer<string>(client, new IggyConsumerConfig<string>
+        {
+            StreamId = Stream,
+            TopicId = Topic,
+            Consumer = Consumer.New(4),
+            Partitions = [1],
+            PollOptions = new PollOptions { MaxWait = TimeSpan.FromMilliseconds(100), Commit = CommitPolicy.Manual },
+            Deserializer = new Utf8Deserializer()
+        }, NullLoggerFactory.Instance);
+        await consumer.InitAsync(Token);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        List<ulong> offsets = [];
+        for (var iteration = 0; iteration < 3; iteration++)
+        {
+            await foreach (var message in consumer.ReceiveDeserializedAsync(timeout.Token))
+            {
+                offsets.Add(message.CurrentOffset);
+                break;
+            }
+        }
+        Assert.Equal([0ul, 1ul, 2ul], offsets);
+    }
+
     [Fact]
     public async Task given_a_standalone_consumer_of_two_partitions_when_receiving_should_hand_over_every_message()
     {

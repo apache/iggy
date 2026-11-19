@@ -35,6 +35,7 @@ public partial class IggyConsumer
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         ThrowIfNotReading();
+        CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
             var checkpoints = Enumerable.Range(0, batch.Messages.Count).Select(batch.CheckpointAt).ToArray();
@@ -42,13 +43,14 @@ public partial class IggyConsumer
             try
             {
                 var rental = handle.Rental;
-                for (var index = 0; index < rental.Messages.Count; index++)
+                while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < rental.Messages.Count)
                 {
                     if (ct.IsCancellationRequested || IsDisposed)
                     {
                         yield break;
                     }
 
+                    var index = _nextMessageIndex++;
                     var message = rental.Messages[index];
                     Hand(checkpoints[index]!, index == rental.Messages.Count - 1);
                     handle.Acquire();

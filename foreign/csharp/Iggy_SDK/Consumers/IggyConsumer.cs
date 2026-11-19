@@ -30,6 +30,7 @@ namespace Apache.Iggy.Consumers;
 /// <summary>
 ///     Hands over the messages of a topic one at a time, on a <see cref="PartitionReader" />: a standalone consumer
 ///     reads the partitions of its configuration, a consumer group reads the assignment of its member.
+///     A later receive or handler loop resumes the unread remainder of its batch. Use one loop at a time.
 /// </summary>
 /// <remarks>
 ///     <para>
@@ -71,6 +72,8 @@ public partial class IggyConsumer : IAsyncDisposable
     private TaskCompletionSource? _handling;
     private TaskCompletionSource? _shutdown;
     private PartitionReader? _reader;
+    private PolledMessages? _currentBatch;
+    private int _nextMessageIndex;
     private int _state;
     private (Checkpoint Checkpoint, bool EndsBatch)? _uncounted;
 
@@ -186,15 +189,17 @@ public partial class IggyConsumer : IAsyncDisposable
     public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
         ThrowIfNotReading();
+        CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            for (var index = 0; index < batch.Messages.Count; index++)
+            while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < batch.Messages.Count)
             {
                 if (ct.IsCancellationRequested || IsDisposed)
                 {
                     yield break;
                 }
 
+                var index = _nextMessageIndex++;
                 var message = batch.Messages[index];
                 var checkpoint = batch.CheckpointAt(index)!;
                 Hand(checkpoint, index == batch.Messages.Count - 1);
@@ -223,15 +228,17 @@ public partial class IggyConsumer : IAsyncDisposable
     {
         ArgumentNullException.ThrowIfNull(handler);
         ThrowIfNotReading();
+        CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            for (var index = 0; index < batch.Messages.Count; index++)
+            while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < batch.Messages.Count)
             {
                 if (ct.IsCancellationRequested || IsDisposed)
                 {
                     return;
                 }
 
+                var index = _nextMessageIndex++;
                 var message = batch.Messages[index];
                 var checkpoint = batch.CheckpointAt(index)!;
                 var endsBatch = index == batch.Messages.Count - 1;
@@ -289,9 +296,13 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>Sets the next read position of a partition, as <see cref="PartitionReader.SeekAsync" /> does.</summary>
-    public Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
+    public async Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
     {
-        return Reader.SeekAsync(partitionId, start, ct);
+        await Reader.SeekAsync(partitionId, start, ct);
+        if (_currentBatch?.PartitionId == partitionId)
+        {
+            _currentBatch = null;
+        }
     }
 
     /// <summary>
@@ -423,11 +434,22 @@ public partial class IggyConsumer : IAsyncDisposable
     private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
+        if (IsDisposed || ct.IsCancellationRequested)
+        {
+            return null;
+        }
+        if (_currentBatch is { } current && _nextMessageIndex < current.Messages.Count)
+        {
+            return current;
+        }
+        _currentBatch = null;
         while (!IsDisposed && !ct.IsCancellationRequested)
         {
             try
             {
-                return await Reader.NextAsync(cancellation.Token);
+                _currentBatch = await Reader.NextAsync(cancellation.Token);
+                _nextMessageIndex = 0;
+                return _currentBatch;
             }
             catch (ReadException error) when (error.Skip is null && !error.StopsPartition && error.Lost is null)
             {

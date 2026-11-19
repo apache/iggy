@@ -1281,6 +1281,10 @@ await consumer.ConsumeAsync(async (message, token) =>
 });
 ```
 
+Breaking out of a receive loop keeps the unread remainder of its batch. A later receive loop or `ConsumeAsync`
+continues with the next message. This also applies to typed and rented messages. Use one receive or handler loop
+at a time. A successful seek discards the remainder of the sought partition's batch.
+
 If the create of the group or the join has an unknown outcome, the consumer abandons it in the client at once.
 Then `InitAsync` throws `VsrRequestOutcomeUnknownException`, and the next `InitAsync` can create the group and join.
 A join that landed keeps the member in the group until the session ends.
