@@ -17,6 +17,7 @@
 
 use crate::error::ObjectStoreError;
 use crate::fresh::FreshObjectId;
+use crate::positions::{GeoLog, PositionsKey};
 use crate::store::{MAX_KEY_LEN, MAX_KEY_SEGMENTS, validate_key};
 
 const META: &str = "meta";
@@ -30,6 +31,7 @@ const FRESH_REPLICA_DIGITS: usize = 2;
 /// Hexadecimal digits of the shard in a fresh object's key.
 const FRESH_SHARD_DIGITS: usize = 4;
 const TOPICS: &str = "topics";
+const POSITIONS: &str = "positions";
 const RECOVERY: &str = "recovery";
 const RECOVERY_RECORD: &str = "record";
 const RECOVERY_REPORT: &str = "report.json";
@@ -441,6 +443,52 @@ impl KeyLayout {
         parts.next().is_none().then_some(topic)
     }
 
+    /// The listing prefix of every positions object under the root, with a
+    /// trailing `/`. No id of a stream is `positions`, so no manifest key is
+    /// under it.
+    #[must_use]
+    pub fn positions_prefix(&self) -> String {
+        format!("{}/{META}/{POSITIONS}/", self.root)
+    }
+
+    /// The key of the positions that one node keeps of one log. The three ids
+    /// and the replica share one segment, as a recovery plan's ids do, so the
+    /// key has no more segments than a long-term segment's.
+    #[must_use]
+    pub fn positions_key(&self, key: &PositionsKey) -> String {
+        format!(
+            "{}{}/{}-{}-{}-{}",
+            self.positions_prefix(),
+            key.log.origin,
+            key.log.stream_id,
+            key.log.topic_id,
+            key.log.created_revision,
+            key.replica
+        )
+    }
+
+    /// The log and node whose positions a listed key names, or `None` when
+    /// this layout did not build the key for a positions object. Parsing is
+    /// strict, so only a key that [`Self::positions_key`] builds again byte
+    /// for byte parses.
+    #[must_use]
+    pub fn parse_positions_key(&self, key: &str) -> Option<PositionsKey> {
+        let (origin, ids) = key
+            .strip_prefix(self.positions_prefix().as_str())?
+            .split_once('/')?;
+        let mut ids = ids.split('-');
+        let parsed = PositionsKey {
+            log: GeoLog {
+                origin: origin.to_owned(),
+                stream_id: parse_id(ids.next()?)?,
+                topic_id: parse_id(ids.next()?)?,
+                created_revision: parse_id(ids.next()?)?,
+            },
+            replica: u8::try_from(parse_id(ids.next()?)?).ok()?,
+        };
+        (ids.next().is_none() && self.positions_key(&parsed) == key).then_some(parsed)
+    }
+
     /// The segment object that a listed key names, or `None` when this layout
     /// did not build the key for a segment, as for a manifest or a key under
     /// another root. Parsing is strict, so only a key that
@@ -604,6 +652,46 @@ mod tests {
                 ..PREFIX
             }
         );
+    }
+
+    #[test]
+    fn given_built_positions_keys_when_parsing_should_round_trip_and_refuse_others() {
+        let layout = layout();
+        let longest_root = KeyLayout::new(root_of_len(MAX_ROOT_LEN)).unwrap();
+        let deepest_root =
+            KeyLayout::new(format!("{}r", "r/".repeat(MAX_ROOT_SEGMENTS - 1))).unwrap();
+        for (origin, id, replica) in [("dc-a", 0, 0), ("a".repeat(32).as_str(), u64::MAX, 255)] {
+            let key = PositionsKey {
+                log: GeoLog {
+                    origin: origin.to_owned(),
+                    stream_id: id,
+                    topic_id: 22,
+                    created_revision: id,
+                },
+                replica,
+            };
+            let built = layout.positions_key(&key);
+
+            assert!(validate_key(&built).is_ok(), "{built}");
+            assert!(validate_key(&longest_root.positions_key(&key)).is_ok());
+            assert!(validate_key(&deepest_root.positions_key(&key)).is_ok());
+            assert!(built.starts_with(&layout.positions_prefix()));
+            assert_eq!(layout.parse_positions_key(&built), Some(key), "{built}");
+            assert_eq!(layout.parse_manifest_key(&built), None);
+            assert_eq!(layout.parse_topic_key(&built), None);
+        }
+        assert_eq!(layout.positions_prefix(), "tenant/iggy/meta/positions/");
+        for key in [
+            "tenant/iggy/meta/positions/dc-a/1-2-3",
+            "tenant/iggy/meta/positions/dc-a/1-2-3-4-5",
+            "tenant/iggy/meta/positions/dc-a/1-2-03-4",
+            "tenant/iggy/meta/positions/dc-a/1-2-3-256",
+            "tenant/iggy/meta/positions/dc-a/x/1-2-3-4",
+            "tenant/iggy/meta/positions/1-2-3-4",
+            "tenant/iggy2/meta/positions/dc-a/1-2-3-4",
+        ] {
+            assert_eq!(layout.parse_positions_key(key), None, "{key}");
+        }
     }
 
     #[test]

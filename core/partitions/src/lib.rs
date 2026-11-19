@@ -19,6 +19,7 @@
 
 mod consumer_offset_capacity;
 mod free_space;
+pub mod geo_positions;
 mod iggy_index;
 mod iggy_index_reader;
 mod iggy_index_writer;

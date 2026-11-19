@@ -50,6 +50,7 @@ mod inline;
 mod layout;
 mod manifest;
 mod memory;
+mod positions;
 mod read_only;
 mod recording;
 mod recovery;
@@ -76,6 +77,10 @@ pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, LongTermKey, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
+pub use positions::{
+    GeoLog, GeoPosition, MAX_GROUP_NAME_LEN, MAX_POSITIONS_OBJECT_LEN, POSITIONS_PER_PARTITION_MAX,
+    PositionValue, PositionsKey, PositionsObject, PositionsObjectError,
+};
 pub use read_only::ReadOnlyStore;
 pub use recording::{RecordingStore, StoreCall, StoreCalls};
 pub use recovery::{
