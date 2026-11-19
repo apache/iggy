@@ -37,8 +37,9 @@
 //!   [`PeerPositions`]. The primaries here commit the ones that win over
 //!   their own, see [`IggyPartition::geo_adoptions`].
 //! - **Resume.** After the node starts, the group polls of geo and shadow
-//!   partitions wait until every peer's positions were handed out once and
-//!   the adoptions they made committed, or until a timeout. A group created
+//!   partitions wait until the positions of every peer that did not retire
+//!   were handed out once and the adoptions they made committed, or until a
+//!   timeout. A group created
 //!   here after a peer's position for its name arrived waits until the
 //!   position is bound to it.
 //!
@@ -70,6 +71,7 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
 use crate::geo_commits::RoundPacing;
+use crate::peers::PeerStore;
 use crate::shards_table::ShardsTable;
 use crate::{
     IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, TaggedSender, bus_timeout,
@@ -353,10 +355,13 @@ where
             );
             return false;
         }
-        let weighed_all = gate
-            .weighed
-            .get(&namespace)
-            .is_some_and(|weighed| settings.peers.iter().all(|peer| weighed.contains(peer)));
+        // No position of a retired peer comes again, so none is waited for.
+        let peer_stores = self.peer_stores();
+        let weighed = gate.weighed.get(&namespace);
+        let weighed_all = settings.peers.iter().all(|peer| {
+            weighed.is_some_and(|weighed| weighed.contains(peer))
+                || peer_stores.get(peer).is_some_and(PeerStore::retired)
+        });
         if weighed_all && !self.geo_positions.in_flight.borrow().contains(&namespace) {
             gate.weighed.remove(&namespace);
             gate.resumed.insert(namespace);

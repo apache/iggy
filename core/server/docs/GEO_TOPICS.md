@@ -115,7 +115,7 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 | Adopt the geo topics of each peer as shadow streams                            | Yes             |
 | A shadow topic serves the published messages of its origin                     | Yes             |
 | A shadow topic serves the committed messages its origin proved, about 1 s late | Yes             |
-| A command that retires an origin that never returns                            | No              |
+| A command that retires an origin that never returns                            | Yes             |
 | Recover the geo topics of a cluster that lost every disk, from its bucket      | Yes             |
 | Consumer positions that move between datacenters                               | Yes             |
 | The `geo_tiered` mode, and a switch between modes                              | No              |
@@ -552,6 +552,7 @@ restarts, keeps serving the published ones, and `geo_shadow_fresh_conflicts_tota
 | A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. A group's own offset store on a geo or shadow topic commits, and is answered with `TransientNotCommitted` (57) after 10 s, which the SDKs send again. Rewrites wait. Peers mark the shadow topics of that origin stale. |
 | A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. As for any topic, the topic's `durability` decides whether a crash of every node at once can lose acknowledged messages: see [replication factor](../README.md#replication-factor).                     |
 | A cluster is destroyed with its disks, its bucket stays | A cluster rebuilt on empty disks takes back its geo topics when an operator asks for it: see [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks). The published messages come back, and so do the committed ones that self-describing fresh objects prove. The other committed messages are lost.    |
+| A cluster is destroyed and never returns                | Its shadow topics in the other clusters stop growing. Retire its origin in each of them: see [Retire an origin](#retire-an-origin). Its shadow topics then expire by their own retention.                                                                                                                                        |
 | A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                                     |
 | A peer's bucket does not answer                         | This cluster keeps the last manifest that each shadow partition committed, removes no shadow topic except those whose grace ended, and sets `geo_shadow_topics_stale` for that origin. Polls of a shadow topic that need bytes from that bucket get 58, which the SDKs retry. Local traffic is not affected.                     |
 | A peer deleted a fresh object that a shadow poll reads  | The peer deletes a fresh object only after a manifest it stored lists its messages. The poll is refused as one to retry, and the retry reads the long-term segments once this cluster lists that manifest.                                                                                                                       |
@@ -624,13 +625,42 @@ To move a group with no message read twice:
 
 ## Retire an origin
 
-This version has no command to retire an origin that never returns.
+If the datacenter of an origin never returns, retire the origin in each surviving cluster:
 
-What an operator can do: remove the origin's `[[geo.peers]]` entry from every node of each
-surviving cluster and restart those nodes. The nodes then stop reading that bucket. The shadow
-streams of that origin stay as they are, read-only, and nothing in this version removes them. No
-client can delete a shadow stream. Iggy never writes to or deletes from the bucket of a peer, so
-cleaning the retired origin's bucket is the job of the operator.
+```bash
+iggy geo retire dc-a
+```
+
+Over HTTP, send `POST /geo/origins/dc-a/retire`. The command needs root or the global
+`manage_servers` permission. The cluster commits the retirement through its metadata, so every
+node keeps it across restarts. A retirement of an origin that is retired already changes nothing.
+
+After the command:
+
+- The nodes send the origin's bucket no request but the reads of polls. They check its identity
+  no more, list none of its topic objects, manifests or consumer group positions, and follow none
+  of its fresh objects. `geo_peer_retired` is 1 for that origin.
+- After a node starts, its group polls wait for the positions of the other peers only.
+- The shadow topics of the origin stop growing. A poll reads the messages that the last
+  committed manifest lists, from the bucket. The proven messages above that manifest are no
+  longer served, so every node serves the same range.
+- Each shadow partition drops its oldest segments by the retention of its topic in the origin:
+  `message_expiry`, and `max_topic_size` shared between the partitions. The last segment stays.
+  The segment cleaner runs this, so `[data_maintenance.messages] cleaner_enabled = false` stops
+  it.
+- A shadow topic is removed once its `message_expiry` passed since the retirement, and a shadow
+  stream once it holds no topic. A topic whose messages never expire stays.
+- A user with the permission to delete streams or topics can delete the shadow streams and
+  shadow topics of the origin. For any other origin, these deletes stay refused.
+
+A retirement cannot be undone, and it names the origin. A node never reads a peer entry with that
+origin name again, whatever its bucket holds. A datacenter that comes back needs another
+`[geo] origin`, and the other clusters need a peer entry for that name.
+
+Keep the `[[geo.peers]]` entry of the retired origin while consumers read its shadow topics,
+because a node reads the bucket through that entry. Remove the entry after that. Iggy never
+writes to or deletes from the bucket of a peer, so cleaning the retired origin's bucket is the job
+of the operator. Clean it only after its shadow topics are gone.
 
 ## Recover an origin that lost its disks
 
@@ -813,6 +843,7 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 | `object_store_unreachable`              | 1 while its own bucket does not answer the check.                                                                                                                              |
 | `geo_peer_identity_verified`            | Per `origin`: 1 while the node reads the peer's bucket.                                                                                                                        |
 | `geo_peer_unreachable`                  | Per `origin`: 1 while the peer's bucket does not answer the check.                                                                                                             |
+| `geo_peer_retired`                      | Per `origin`: 1 once this cluster retired the origin. The node then sends its bucket only the reads of polls.                                                                  |
 | `geo_shadow_topics_stale`               | Per `origin`: stale shadow topics, counted on the metadata primary.                                                                                                            |
 | `geo_peer_manifest_requests_total`      | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.                                                                                                |
 | `geo_peer_manifest_failures_total`      | The same requests that failed.                                                                                                                                                 |
@@ -927,7 +958,7 @@ Alert on these first:
 | `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that commits on read and fails over reads again at most this long, plus the poll interval of the other datacenter.                                                                                                                                                                 |
 | `[geo] positions_commit_interval`          | `50 ms` | The shortest time between two puts of a log's positions for the offsets that groups store themselves, whose answers wait for the put. A store that finds no put running and the interval passed is stored at once. A longer interval makes fewer puts under steady stores, and answers them later. `disabled` answers them at the local commit and leaves them to `positions_publish_interval`. Up to `1 s`. |
 | `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                                                                       |
-| `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer. A peer that does not answer delays them this long.                                                                                                                                                                                                                                             |
+| `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer that did not retire. A peer that does not answer delays them this long.                                                                                                                                                                                                                         |
 | `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                                                                            |
 | `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                                                            |
 | `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                                                                           |
@@ -964,7 +995,6 @@ before an unlisted long-term object is deleted.
 - **Frozen partition count and options.** A geo topic keeps its name, its options, including
   `message_expiry` and `max_topic_size`, and its partition count.
 - **Only the `geo` mode.** `geo_tiered` is refused, and a geo topic cannot change its mode.
-- **No command to retire an origin.** See [Retire an origin](#retire-an-origin).
 - **Each cluster's geo topic is created there.** Adoption creates only shadow topics. Nothing
   checks that the geo topics of the same name in two clusters have the same partition count or
   options.

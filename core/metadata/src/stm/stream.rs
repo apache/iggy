@@ -32,7 +32,10 @@ use crate::stm::result::{
     DeletePartitionsResult, DeleteStreamResult, DeleteTopicResult, DeletedResource,
     ShadowTopicResult, TruncatePartitionResult, UpdateStreamResult, UpdateTopicResult,
 };
-use crate::stm::shadow::{ShadowStream, ShadowTopic, ShadowTopicRequest, is_shadow_stream_name};
+use crate::stm::shadow::{
+    RetiredOrigin, ShadowRetention, ShadowStream, ShadowTopic, ShadowTopicRequest,
+    is_shadow_stream_name,
+};
 use crate::stm::snapshot::{SnapshotError, Snapshotable};
 use crate::stm::walk::{Directed, range_after, slice_after};
 use crate::stm::{ApplyContext, StateHandler};
@@ -62,7 +65,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 // their cfg the import is dead and `-p <crate>` clippy (which skips the
 // simulator feature) rejects it.
 use iggy_binary_protocol::primitives::partition_history::{ConsumerGroupOwner, PartitionContext};
-use iggy_binary_protocol::requests::system::RetirementDebt;
+use iggy_binary_protocol::requests::system::{RetireGeoOriginRequest, RetirementDebt};
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::requests::topics::{
@@ -1247,6 +1250,8 @@ define_state! {
         // Set while a `ShadowTopic` op applies, the one writer of shadow
         // streams.
         pub(crate) shadow_write: bool,
+        // The geo peers that never return, by origin name.
+        pub retired_origins: BTreeMap<String, RetiredOrigin>,
         // Rebuilt after membership changes and restore; ticks visit only open transitions.
         pub(crate) pending_revocations: BTreeMap<(usize, usize, u64, usize), ConsumerGroupOwnershipTransition>,
         // Locations are (stream, topic, group, member); never persisted.
@@ -1562,6 +1567,7 @@ collect_handlers! {
         CompleteLifecycle,
         RewrapStreamKeys,
         ShadowTopic,
+        RetireGeoOrigin,
     }
     internal { RefreshConsumerGroupSession, RemoveConsumerGroupMembers, RecordRetirementDebt }
 }
@@ -1717,6 +1723,21 @@ impl StreamsInner {
                 .items
                 .get(stream_id)
                 .is_some_and(|stream| stream.shadow.is_some())
+    }
+
+    /// Whether a client delete must leave the stream `stream_id` alone: a
+    /// shadow stream takes one only once its origin retired.
+    pub(crate) fn refuses_shadow_delete(&self, stream_id: usize) -> bool {
+        self.refuses_shadow_write(stream_id) && !self.serves_retired_origin(stream_id)
+    }
+
+    /// Whether `stream_id` is a shadow stream of a retired origin.
+    #[must_use]
+    pub fn serves_retired_origin(&self, stream_id: usize) -> bool {
+        self.items
+            .get(stream_id)
+            .and_then(|stream| stream.shadow.as_ref())
+            .is_some_and(|source| self.retired_origins.contains_key(&source.origin))
     }
 
     /// Whether a client command may not give a stream `name`, which only a
@@ -2024,6 +2045,23 @@ impl Streams {
     #[must_use]
     pub fn resolve_stream_id(&self, stream_id: &WireIdentifier) -> Option<usize> {
         self.read(|inner| inner.resolve_stream_id(stream_id))
+    }
+
+    /// Whether `stream_id` names a shadow stream of a retired origin, which
+    /// takes a client delete of itself or of its topics.
+    #[must_use]
+    pub fn is_retired_shadow_stream(&self, stream_id: &WireIdentifier) -> bool {
+        self.read(|inner| {
+            inner
+                .resolve_stream_id(stream_id)
+                .is_some_and(|id| inner.serves_retired_origin(id))
+        })
+    }
+
+    /// The geo peers that never return, by origin name.
+    #[must_use]
+    pub fn retired_origins(&self) -> BTreeMap<String, RetiredOrigin> {
+        self.read(|inner| inner.retired_origins.clone())
     }
 
     /// Whether `stream_id` names a shadow stream, which takes no client
@@ -3106,6 +3144,33 @@ impl Streams {
         })
     }
 
+    /// The retention of the shadow partition `namespace` once its origin
+    /// retired: its incarnation, the retention of its topic in the peer, and
+    /// the topic's partition count. `None` for any other partition.
+    #[must_use]
+    pub fn retired_shadow_retention(
+        &self,
+        namespace: IggyNamespace,
+    ) -> Option<(u64, ShadowRetention, usize)> {
+        self.inner.read(|inner| {
+            if !inner.serves_retired_origin(namespace.stream_id()) {
+                return None;
+            }
+            let topic = inner
+                .items
+                .get(namespace.stream_id())?
+                .topics
+                .get(namespace.topic_id())?;
+            let shadow = topic.shadow?;
+            let partition = find_partition(&topic.partitions, namespace.partition_id())?;
+            Some((
+                partition.created_revision,
+                shadow.retention,
+                topic.partitions.len(),
+            ))
+        })
+    }
+
     /// Name of the stream that [`Self::seed_namespace`] creates at `slab`.
     #[cfg(any(test, feature = "simulator"))]
     #[must_use]
@@ -3593,7 +3658,7 @@ impl StateHandler for DeleteStreamRequest {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return ApplyReply::err(DeleteStreamResult::StreamNotFound);
         };
-        if state.refuses_shadow_write(stream_id) {
+        if state.refuses_shadow_delete(stream_id) {
             return ApplyReply::err(DeleteStreamResult::ShadowStreamReadOnly);
         }
 
@@ -4222,7 +4287,7 @@ impl StateHandler for DeleteTopicRequest {
         let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
             return ApplyReply::err(DeleteTopicResult::StreamNotFound);
         };
-        if state.refuses_shadow_write(stream_id) {
+        if state.refuses_shadow_delete(stream_id) {
             return ApplyReply::err(DeleteTopicResult::ShadowStreamReadOnly);
         }
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
@@ -4532,6 +4597,9 @@ pub struct StreamsSnapshot {
     pub revision: u64,
     pub namespace_revision: u64,
     pub lifecycle_intents: BTreeMap<u64, LifecycleIntent>,
+    /// `#[serde(default)]` so older snapshots restore with no retired origin.
+    #[serde(default)]
+    pub retired_origins: BTreeMap<String, RetiredOrigin>,
 }
 
 impl Snapshotable for Streams {
@@ -4619,6 +4687,7 @@ impl Snapshotable for Streams {
                 revision: inner.revision,
                 namespace_revision: inner.namespace_revision,
                 lifecycle_intents: inner.lifecycle_intents.clone(),
+                retired_origins: inner.retired_origins.clone(),
             }
         })
     }
@@ -4815,6 +4884,7 @@ impl StreamsInner {
             lifecycle_scopes,
             finalizing_lifecycle: None,
             shadow_write: false,
+            retired_origins: snapshot.retired_origins,
             // Recomputed from the restored groups just below.
             pending_revocations: BTreeMap::new(),
             consumer_group_members: AHashMap::new(),

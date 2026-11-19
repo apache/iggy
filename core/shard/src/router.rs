@@ -1446,6 +1446,22 @@ where
             LifecycleFrame::PeerManifestRead(finished) => {
                 self.on_peer_manifest_read(*finished).await;
             }
+            LifecycleFrame::RetainRetiredPeer {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_retired_peer(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
+            }
             LifecycleFrame::PeerFreshFound(found) => {
                 self.on_peer_fresh_found(*found);
             }

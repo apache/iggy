@@ -27,6 +27,11 @@
 //! the policy over those and commits what it removes as a trim, which every
 //! replica follows.
 //!
+//! A shadow topic of a retired origin is the last: no manifest of the origin
+//! trims it again, so the partition primary judges the retention of the
+//! topic in the peer over the manifest it committed, and commits what that
+//! removes as one more manifest. Nothing reaches the peer's store.
+//!
 //! Local and unreplicated: every replica (primary and backup) trims its own
 //! expired or over-budget sealed segments. Divergence in physical log start is
 //! invisible to clients because reads are served by the partition primary. The
@@ -38,7 +43,7 @@
 
 use crate::shell::ServerShard;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_common::{IggyExpiry, IggyTimestamp, MaxTopicSize};
+use iggy_common::{IggyDuration, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::{LONG_TERM_SEGMENT_BYTES, LocalEnvelope};
 use server_common::sharding::IggyNamespace;
@@ -102,6 +107,9 @@ pub fn stage_owned_partitions(
     let max_message_size = u64::try_from(shard.bus_max_message_size()).unwrap_or(u64::MAX);
     let mut tiered = Vec::new();
     for namespace in namespaces {
+        if stage_retired_peer(shard, namespace, now) {
+            continue;
+        }
         let Some((message_expiry, max_topic_size, partition_count, segment_size)) =
             streams.topic_retention_config(namespace.stream_id(), namespace.topic_id())
         else {
@@ -211,6 +219,28 @@ pub fn stage_owned_partitions(
     // advance that did not commit. It is also the only upload pass that
     // knows the committed truncation watermark.
     shard.request_upload_passes(&tiered, now);
+}
+
+/// Stage the retention of `namespace` when it is a shadow partition whose
+/// origin retired: the topic's expiry in the peer, and its size shared
+/// evenly between its partitions. Returns whether it is one.
+fn stage_retired_peer(shard: &ServerShard, namespace: IggyNamespace, now: IggyTimestamp) -> bool {
+    let streams = shard.plane.metadata().mux_stm.streams();
+    let Some((created_revision, retention, partition_count)) =
+        streams.retired_shadow_retention(namespace)
+    else {
+        return false;
+    };
+    let message_expiry = retention
+        .expiry_micros()
+        .map_or(IggyExpiry::NeverExpire, |micros| {
+            IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_micros(micros)))
+        });
+    let max_bytes = retention
+        .max_bytes()
+        .map(|bytes| bytes / u64::try_from(partition_count.max(1)).unwrap_or(u64::MAX));
+    shard.request_retain_retired_peer(namespace, created_revision, now, message_expiry, max_bytes);
+    true
 }
 
 /// The incarnation of the partition of `namespace` when it is on this shard

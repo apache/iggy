@@ -764,6 +764,17 @@ If the identity object of a peer names another cluster than the one that the
 shadow streams came from, the server logs it. It leaves those shadow streams
 as they are.
 
+An operator retires a peer whose datacenter never returns with
+`iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs
+root or the global `manage_servers` permission. The retirement commits through
+the metadata of this cluster and cannot be undone. From then on, the nodes send
+the peer's store only the reads of polls. Each shadow partition of the peer
+drops the segments that the retention of its topic in the peer removes, and the
+primary removes each shadow topic once that `message_expiry` passed since the
+retirement, then each empty shadow stream. A client may delete the shadow
+streams and topics of a retired peer. See
+[Retire an origin](docs/GEO_TOPICS.md#retire-an-origin).
+
 ### Following peer manifests
 
 The primary of each partition of a geo topic publishes a manifest of the

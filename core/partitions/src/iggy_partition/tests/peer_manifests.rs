@@ -28,7 +28,9 @@ use crate::peer_manifests::{
 };
 use crate::state_machine::{Applied, MachineCommand, PartitionStateMachine};
 use crate::{PeerManifestRefusal, SegmentLocation};
+use iggy_common::{IggyDuration, IggyExpiry, IggyTimestamp};
 use iggy_object_store::{MemoryStore, ObjectPrefix, PartitionManifest};
+use std::time::Duration;
 
 /// A manifest of `count` one-segment runs of ten offsets from `first`,
 /// above `trim_point`.
@@ -321,4 +323,108 @@ fn given_the_machine_when_registered_should_own_the_follow_command() {
     let machine = PeerManifests::default();
     assert_eq!(machine.id(), PEER_MANIFEST_MACHINE);
     assert_eq!(machine.command_kinds(), [FOLLOW_PEER_MANIFEST]);
+}
+
+/// A follower that committed `fetched`.
+fn committed_follower(
+    fetched: &PartitionManifest,
+) -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
+    let (directory, mut partition) = follower(Rc::new(MemoryStore::new()));
+    partition.register_builtin_state_machines().unwrap();
+    for (op, delta) in deltas(None, fetched).unwrap().iter().enumerate() {
+        commit(&mut partition, op as u64 + 1, delta);
+    }
+    (directory, partition)
+}
+
+/// Commit what `trimmed` changes, as the primary proposes it.
+fn commit_trim(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    op: u64,
+    trimmed: &PartitionManifest,
+) {
+    let steps = deltas(partition.committed_peer_manifest(), trimmed).unwrap();
+    assert_eq!(steps.len(), 1, "a trim is one command");
+    assert!(steps[0].segments.is_empty(), "a trim lists no segment");
+    assert_eq!(
+        partition.peer_manifest_requests(trimmed, 1).unwrap().len(),
+        1
+    );
+    commit(partition, op, &steps[0]);
+}
+
+fn expiry_of(micros: u64) -> IggyExpiry {
+    IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_micros(micros)))
+}
+
+#[compio::test]
+async fn given_expired_segments_of_a_retired_origin_when_retained_should_commit_a_trim_of_them() {
+    let fetched = run_of(None, 0, 4);
+    let (_directory, mut partition) = committed_follower(&fetched);
+    let remote = |start, end| (start, end, SegmentLocation::Remote);
+    // The newest message of the second segment is a second old.
+    let now = IggyTimestamp::from(1_000_000 + 1_019);
+
+    let trimmed = partition
+        .retired_peer_retention(now, expiry_of(1_000_000), None)
+        .unwrap();
+
+    assert_eq!(trimmed.trim_point, Some(19));
+    assert_eq!(trimmed.floor, fetched.floor);
+    assert_eq!(trimmed.segments, fetched.segments[2..]);
+    commit_trim(&mut partition, 10, &trimmed);
+    assert_eq!(partition.committed_peer_manifest(), Some(&trimmed));
+    let (segments, _, _) = log_shape(&partition);
+    assert_eq!(segments[..2], [remote(20, 29), remote(30, 39)]);
+    assert_eq!(
+        partition.retired_peer_retention(now, expiry_of(1_000_000), None),
+        None,
+        "nothing more expired"
+    );
+}
+
+#[compio::test]
+async fn given_every_segment_expired_when_retained_should_keep_the_last() {
+    let fetched = run_of(None, 0, 3);
+    let (_directory, partition) = committed_follower(&fetched);
+
+    let trimmed = partition
+        .retired_peer_retention(IggyTimestamp::from(u64::MAX / 2), expiry_of(1), None)
+        .unwrap();
+
+    assert_eq!(trimmed.trim_point, Some(19));
+    assert_eq!(trimmed.segments, fetched.segments[2..]);
+}
+
+#[compio::test]
+async fn given_more_bytes_than_the_budget_when_retained_should_trim_the_oldest_segments() {
+    let fetched = run_of(None, 0, 4);
+    let (_directory, partition) = committed_follower(&fetched);
+
+    // Each segment holds 1000 bytes, and three come before the last one.
+    let trimmed = partition
+        .retired_peer_retention(
+            IggyTimestamp::from(2_000),
+            IggyExpiry::NeverExpire,
+            Some(1_500),
+        )
+        .unwrap();
+
+    assert_eq!(trimmed.trim_point, Some(19));
+    assert_eq!(
+        partition.retired_peer_retention(IggyTimestamp::from(2_000), IggyExpiry::NeverExpire, None),
+        None,
+        "a topic without retention keeps every segment"
+    );
+}
+
+#[compio::test]
+async fn given_a_partition_that_follows_nothing_when_retained_should_trim_nothing() {
+    let (_directory, mut partition) = unattached();
+    partition.register_builtin_state_machines().unwrap();
+
+    assert_eq!(
+        partition.retired_peer_retention(IggyTimestamp::from(u64::MAX / 2), expiry_of(1), None),
+        None
+    );
 }

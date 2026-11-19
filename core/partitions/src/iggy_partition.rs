@@ -13764,7 +13764,7 @@ where
     /// Minimum committed offset across all consumers and consumer groups, with
     /// the holder's identity. `None` when nothing has been committed, in which
     /// case there is no deletion barrier. External groups never hold retention.
-    fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
+    pub(crate) fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
         let consumer_guard = self.consumer_offsets.borrow();
         let group_guard = self.consumer_group_offsets.borrow();
         let consumers = consumer_guard.values().map(|offset| {
@@ -16993,7 +16993,7 @@ fn leading_oversized_end<S: RetainedSegment>(segments: &[S], max_bytes: u64) -> 
 /// expired and the over-budget leading runs, cut back to the last segment that
 /// ends at or below `barrier`. `None` when retention removes nothing. The
 /// active segment (last element) is never named.
-fn retention_end<S: RetainedSegment>(
+pub fn retention_end<S: RetainedSegment>(
     segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,

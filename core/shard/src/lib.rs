@@ -1356,6 +1356,18 @@ pub enum LifecycleFrame {
     /// The result of a read that a [`Self::PeerManifestsListed`] pass
     /// started, sent by the task that ran it.
     PeerManifestRead(Box<FinishedPeerManifestRead>),
+    /// Per-shard pass over a shadow partition whose origin retired: every
+    /// replica stops serving the fresh batches it found, and the primary
+    /// commits what the retention of the topic in the peer removes from the
+    /// committed manifest.
+    RetainRetiredPeer {
+        namespace: IggyNamespace,
+        /// The incarnation the retention was read for.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
     /// What reads of a geo peer's fresh objects found for the shadow
     /// partitions the shard owns: from shard 0, which follows the peer's
     /// writers, or from a read that the shard started for a proof.

@@ -86,6 +86,7 @@ var goOperations = map[string]Operation{
 	"JoinConsumerGroup":               OperationJoinConsumerGroup,
 	"LeaveConsumerGroup":              OperationLeaveConsumerGroup,
 	"UpdateResource":                  OperationUpdateResource,
+	"RetireGeoOrigin":                 OperationRetireGeoOrigin,
 	"SendMessages":                    OperationSendMessages,
 	"StoreConsumerOffset":             OperationStoreConsumerOffset,
 	"DeleteConsumerOffset":            OperationDeleteConsumerOffset,

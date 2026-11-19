@@ -30,6 +30,9 @@
 //! does not answer, and every minute after that. The first claim of another
 //! cluster that a check reads is the cluster that the node remembers for the
 //! peer, see [`PeerIdentity`]. The node remembers it in memory only.
+//!
+//! A peer whose origin committed metadata retired is checked no more: shard
+//! 0 marks its status retired, and no read of its identity object goes out.
 
 use std::pin::pin;
 use std::rc::Rc;
@@ -37,6 +40,7 @@ use std::time::{Duration, Instant};
 
 use configs::geo::{GeoConfig, GeoPeerConfig};
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
+use consensus::MetadataHandle;
 use futures::future::{Either, join_all, select};
 use iggy_object_store::s3::{Credentials, S3Store};
 use iggy_object_store::{
@@ -44,6 +48,7 @@ use iggy_object_store::{
     ReadOnlyStore, StoreIdentity,
 };
 use message_bus::{IggyMessageBus, MessageBus};
+use metadata::impls::metadata::StreamsFrontend;
 use shard::metrics::ShardMetrics;
 use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, SharedPeerStatus};
 use shard::{Receiver, Sender, channel};
@@ -63,6 +68,9 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// How long shard 0 waits for this cluster's `cluster_uid`, which the first
 /// committed metadata operation sets.
 const CLUSTER_UID_WAIT: Duration = Duration::from_secs(1);
+/// The longest shard 0 waits before it looks for a retired origin again. A
+/// look sends no request.
+const RETIREMENT_WAIT: Duration = Duration::from_secs(5);
 
 /// Boot-time checks of the peers, after `Validatable::validate`. A peer
 /// whose configuration can never work refuses the boot here, before any
@@ -184,13 +192,20 @@ fn checkers(
         .collect()
 }
 
-/// Check each peer whenever its check is due, until `stop` fires.
+/// Check each peer whenever its check is due, until `stop` fires. A peer
+/// whose origin retired is marked so and never checked again.
 async fn run<S: ObjectStore>(
     shard: Rc<ServerShard>,
     mut checkers: Vec<PeerChecker<S>>,
     stop: Receiver<()>,
 ) {
     loop {
+        let retired = shard.plane.metadata().mux_stm.streams().retired_origins();
+        for checker in &mut checkers {
+            if retired.contains_key(&checker.origin) {
+                checker.retire(shard.metrics());
+            }
+        }
         let wait = match own_cluster_uid(&shard) {
             None => CLUSTER_UID_WAIT,
             Some(own_cluster_uid) => {
@@ -198,7 +213,7 @@ async fn run<S: ObjectStore>(
                 let metrics = shard.metrics();
                 let due = checkers
                     .iter_mut()
-                    .filter(|checker| checker.due <= now)
+                    .filter(|checker| !checker.retired() && checker.due <= now)
                     .map(|checker| checker.step(own_cluster_uid, metrics));
                 match select(pin!(join_all(due)), pin!(stop.recv())).await {
                     Either::Left(_) => {}
@@ -207,6 +222,7 @@ async fn run<S: ObjectStore>(
                 let now = Instant::now();
                 checkers
                     .iter()
+                    .filter(|checker| !checker.retired())
                     .map(|checker| checker.due.saturating_duration_since(now))
                     .min()
                     .unwrap_or(RECHECK_INTERVAL)
@@ -214,7 +230,10 @@ async fn run<S: ObjectStore>(
         };
         // `Ok`: the stop fired, or its sender is gone. `Err`: the wait ran
         // out.
-        if compio::time::timeout(wait, stop.recv()).await.is_ok() {
+        if compio::time::timeout(wait.min(RETIREMENT_WAIT), stop.recv())
+            .await
+            .is_ok()
+        {
             return;
         }
     }
@@ -259,6 +278,29 @@ impl<S: ObjectStore> PeerChecker<S> {
             due: Instant::now(),
             last: None,
         }
+    }
+
+    fn retired(&self) -> bool {
+        self.status.get().retired
+    }
+
+    /// Mark the peer retired, once. The node checks it no more and runs no
+    /// job on its store.
+    fn retire(&self, metrics: &ShardMetrics) {
+        let mut status = self.status.get();
+        if status.retired {
+            return;
+        }
+        status.retired = true;
+        self.status.set(status);
+        metrics.set_geo_peer_retired(&self.origin);
+        info!(
+            origin = %self.origin,
+            root = self.layout.root(),
+            "the origin of the geo peer retired, so this node checks its store no more and \
+             follows nothing of it. Polls of its shadow topics read what they committed until \
+             their retention removes it"
+        );
     }
 
     /// Check once, and record what the check found.
@@ -869,8 +911,26 @@ mod tests {
             PeerStatus {
                 identity: PeerIdentity::Unverified,
                 unreachable: true,
+                retired: false,
             }
         );
         assert_eq!(metrics.geo_peer_status_value("dc-b"), (false, true));
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_retiring_its_checker_should_mark_the_status_and_gauge() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = geo(vec![fs_peer("dc-b", directory.path())]);
+        let statuses = statuses(&config);
+        let metrics = ShardMetrics::for_shard();
+        let checkers = checkers(&config, &TieredStorageConfig::default(), &statuses);
+
+        checkers[0].retire(&metrics);
+        checkers[0].retire(&metrics);
+
+        assert!(checkers[0].retired());
+        assert!(statuses[0].get().retired);
+        assert!(metrics.geo_peer_retired_value("dc-b"));
+        assert!(!statuses[0].get().serves_jobs());
     }
 }
