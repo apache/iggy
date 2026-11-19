@@ -31,10 +31,10 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE, CREATE_TOPIC_CODE,
     DELETE_CONSUMER_OFFSET_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, FETCH_MESSAGES_CODE,
-    GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE, GET_STREAM_CODE, GET_TOPIC_CODE,
-    GET_TOPICS_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE, POLL_MESSAGES_CODE,
-    POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE,
-    SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
+    GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE, GET_PARTITIONS_CODE, GET_STREAM_CODE,
+    GET_TOPIC_CODE, GET_TOPICS_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
+    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE,
+    STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -92,9 +92,10 @@ mod extractor_tests {
     use bytes::Bytes;
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::codes::{
-        CREATE_TOPIC_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, GET_STREAM_CODE, GET_TOPIC_CODE,
-        GET_TOPICS_CODE, SEND_MESSAGES_CODE,
+        CREATE_TOPIC_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, GET_PARTITIONS_CODE,
+        GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, SEND_MESSAGES_CODE,
     };
+    use iggy_binary_protocol::requests::partitions::GetPartitionsRequest;
     use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, GetStreamRequest};
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
@@ -219,6 +220,21 @@ mod extractor_tests {
         .to_bytes();
 
         let context = extract_from_retained_frame(GET_TOPIC_CODE, &body).unwrap();
+
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_partitions_keeps_named_identifiers() {
+        let body = GetPartitionsRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            page: WirePageQuery::default(),
+        }
+        .to_bytes();
+
+        let context = extract_from_retained_frame(GET_PARTITIONS_CODE, &body).unwrap();
 
         assert_eq!(context.stream, Identifier::named("events").unwrap());
         assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
@@ -382,15 +398,18 @@ fn decode_retained_identifier(raw: &[u8]) -> Option<(Identifier, usize)> {
 }
 
 fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorContext> {
+    let has_topic = match code {
+        GET_TOPIC_CODE | DELETE_TOPIC_CODE | GET_PARTITIONS_CODE => true,
+        GET_TOPICS_CODE | CREATE_TOPIC_CODE | GET_STREAM_CODE | DELETE_STREAM_CODE => false,
+        _ => return None,
+    };
     let raw = body.as_ref();
     let (stream, consumed) = decode_retained_identifier(raw)?;
-    let topic = match code {
-        GET_TOPIC_CODE | DELETE_TOPIC_CODE => {
-            let (topic, _) = decode_retained_identifier(raw.get(consumed..)?)?;
-            Some(topic)
-        }
-        GET_TOPICS_CODE | CREATE_TOPIC_CODE | GET_STREAM_CODE | DELETE_STREAM_CODE => None,
-        _ => return None,
+    let topic = if has_topic {
+        let (topic, _) = decode_retained_identifier(raw.get(consumed..)?)?;
+        Some(topic)
+    } else {
+        None
     };
     Some(RequestErrorContext { stream, topic })
 }
