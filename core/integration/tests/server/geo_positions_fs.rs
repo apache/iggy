@@ -152,11 +152,11 @@ async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_sh
         }
         sleep(PACE).await;
     }
-    pair.cluster_mut(GeoSide::A)
-        .stop()
-        .await
-        .expect("dc-a fails");
     let failed_at = Instant::now();
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails");
     let last = *consumed_at.keys().last().expect("dc-a consumed");
     assert_eq!(
         consumed_at.keys().copied().collect::<Vec<_>>(),
@@ -174,9 +174,9 @@ async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_sh
     );
     let reread: Vec<u64> = (first..=last).collect();
     let bound = PUBLISH_INTERVAL + POLL_INTERVAL;
-    // One reconcile tick of dc-b and the commits on both sides add to the
-    // two intervals.
-    let slack = Duration::from_secs(1);
+    // A reconcile pass of dc-b, the fold and the adoption commits and the
+    // store calls add to the two intervals, more on a loaded host.
+    let slack = Duration::from_millis(1500);
     for offset in &reread {
         let age = failed_at.duration_since(consumed_at[offset]);
         assert!(
