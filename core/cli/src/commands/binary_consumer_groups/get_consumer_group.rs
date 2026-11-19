@@ -273,10 +273,10 @@ mod tests {
         Consumer, ConsumerGroup, ConsumerGroupClient, ConsumerGroupDetails, ConsumerGroupMember,
         ConsumerOffsetClient, ConsumerOffsetInfo, DiagnosticEvent, Identifier, IdentityInfo,
         IggyByteSize, IggyError, IggyMessage, IggyTimestamp, MAX_PARTITIONS_COUNT, MessageClient,
-        MetadataChanges, MetadataChangesQuery, NonZeroIggyDuration, OptionSpec, OptionsScope,
-        Partition, PartitionClient, PartitionContext, Partitioning, Permissions,
-        PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PollOptions,
-        PolledMessages, PollingStrategy, RawPersonalAccessToken, SegmentClient,
+        MetadataChanges, MetadataChangesQuery, NamedPageQuery, NonZeroIggyDuration, OptionSpec,
+        OptionsScope, Page, PageQuery, Partition, PartitionClient, PartitionContext, Partitioning,
+        Permissions, PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo,
+        PollOptions, PolledMessages, PollingStrategy, RawPersonalAccessToken, SegmentClient,
         SendMessagesResponse, Snapshot, SnapshotCompression, Stats, Stream, StreamClient,
         StreamCreateOptions, StreamDetails, StreamUpdateOptions, SystemClient, SystemSnapshotType,
         Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient,
@@ -486,6 +486,13 @@ mod tests {
             fail()
         }
 
+        async fn get_users_page(
+            &self,
+            _query: &NamedPageQuery,
+        ) -> Result<Page<UserInfo>, IggyError> {
+            fail()
+        }
+
         async fn create_user(
             &self,
             _username: &str,
@@ -592,6 +599,13 @@ mod tests {
             fail()
         }
 
+        async fn get_streams_page(
+            &self,
+            _query: &NamedPageQuery,
+        ) -> Result<Page<Stream>, IggyError> {
+            fail()
+        }
+
         async fn create_stream(
             &self,
             _name: &str,
@@ -636,6 +650,14 @@ mod tests {
             fail()
         }
 
+        async fn get_topics_page(
+            &self,
+            _stream_id: &Identifier,
+            _query: &NamedPageQuery,
+        ) -> Result<Page<Topic>, IggyError> {
+            fail()
+        }
+
         async fn create_topic(
             &self,
             _stream_id: &Identifier,
@@ -665,6 +687,15 @@ mod tests {
 
     #[async_trait]
     impl PartitionClient for ScriptedClient {
+        async fn get_partitions_page(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _query: &PageQuery,
+        ) -> Result<Page<Partition>, IggyError> {
+            fail()
+        }
+
         async fn create_partitions(
             &self,
             _stream_id: &Identifier,
@@ -827,6 +858,15 @@ mod tests {
             _stream_id: &Identifier,
             _topic_id: &Identifier,
         ) -> Result<Vec<ConsumerGroup>, IggyError> {
+            fail()
+        }
+
+        async fn get_consumer_groups_page(
+            &self,
+            _stream_id: &Identifier,
+            _topic_id: &Identifier,
+            _query: &NamedPageQuery,
+        ) -> Result<Page<ConsumerGroup>, IggyError> {
             fail()
         }
 
