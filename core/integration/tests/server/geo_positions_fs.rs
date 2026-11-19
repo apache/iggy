@@ -35,6 +35,10 @@ use super::http_client::HttpClient;
 const STREAM: &str = "orders";
 const TOPIC: &str = "payments";
 const GROUP: &str = "billing";
+/// The nodes of each cluster in the tests whose partitions have different
+/// leaders, and the partitions of their geo topic.
+const NODES: usize = 3;
+const PARTITIONS: u32 = 3;
 const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a group may take to read what a test expects, or a position to
@@ -43,69 +47,173 @@ const DEADLINE: Duration = Duration::from_secs(60);
 const RETRY: Duration = Duration::from_millis(50);
 
 #[tokio::test]
-async fn given_a_group_drained_in_one_datacenter_when_it_starts_in_the_other_should_resume_on_the_exact_next_message()
+async fn given_a_group_drained_on_every_node_of_one_datacenter_when_it_starts_in_the_other_should_resume_each_partition_on_the_exact_next_message()
  {
-    let mut pair = started_pair().await;
-    let ids = create_and_follow(&pair).await;
+    let mut pair = started_pair(NODES).await;
+    let ids = create_and_follow(&pair, PARTITIONS).await;
     let client_a = pair.a().root_client().await.expect("a client of dc-a");
     let client_b = pair.b().root_client().await.expect("a client of dc-b");
-    send(&client_a, 0..100).await;
-    wait_until_shadow_serves(&client_b, ids, 100).await;
+    for partition in 0..PARTITIONS {
+        send(&client_a, partition, 0..100).await;
+        wait_until_shadow_serves(&client_b, ids, partition, 100).await;
+    }
     let group_a = Group::join(&client_a, ids.own()).await;
-    let consumed = group_a.consume(&client_a, 37).await;
-    assert_eq!(consumed, (0..37).collect::<Vec<_>>());
+    let consumed: BTreeMap<u32, u64> = (0..PARTITIONS)
+        .map(|partition| (partition, 30 + 7 * u64::from(partition)))
+        .collect();
+    for (partition, count) in &consumed {
+        let read = group_a.on(*partition).consume(&client_a, *count).await;
+        assert_eq!(read, (0..*count).collect::<Vec<_>>());
+    }
     group_a.leave(&client_a).await;
 
-    let http = HttpClient::login_root(pair.a().harness()).await;
-    let response = http
-        .post_json(
-            &format!("/streams/{STREAM}/topics/{TOPIC}/consumer-groups/{GROUP}/drain?timeout=30s"),
-            &json!({}),
-        )
-        .await;
-    assert_eq!(response.status(), 200, "the drain stores the positions");
-    let drained: serde_json::Value = response.json().await.expect("a drain body");
-    assert_eq!(drained["positions"][0]["offset"], 36, "{drained}");
-    assert_eq!(drained["not_held"], json!([]), "{drained}");
+    let mut drained = BTreeMap::new();
+    for node in 0..NODES {
+        let answer = drain(pair.a(), node).await;
+        assert_eq!(answer["not_held"], json!([]), "node {node}: {answer}");
+        let not_led: Vec<u64> = serde_json::from_value(answer["not_led"].clone())
+            .expect("the partitions the node does not lead");
+        if node == 0 {
+            assert!(
+                !not_led.is_empty(),
+                "the leaders of the partitions spread over the nodes: {answer}"
+            );
+        }
+        let positions = answer["positions"].as_array().expect("positions");
+        let mut covered = not_led;
+        for position in positions {
+            let partition = position["partition_id"].as_u64().expect("a partition id");
+            let offset = position["offset"].as_u64().expect("an offset");
+            covered.push(partition);
+            assert_eq!(
+                drained.insert(partition, offset),
+                None,
+                "only the node that leads a partition drains it: {answer}"
+            );
+        }
+        covered.sort_unstable();
+        assert_eq!(
+            covered,
+            (0..u64::from(PARTITIONS)).collect::<Vec<_>>(),
+            "node {node}: {answer}"
+        );
+    }
+    let expected: BTreeMap<u64, u64> = consumed
+        .iter()
+        .map(|(partition, count)| (u64::from(*partition), count - 1))
+        .collect();
+    assert_eq!(drained, expected, "one drain stores each partition");
     let stored = pair
         .a()
         .bucket()
         .positions_objects()
         .await
         .expect("dc-a's bucket reads");
-    assert!(
-        stored.iter().any(|object| object.partitions[&0][GROUP]
-            == GeoPosition {
-                reset: 0,
-                value: PositionValue::Offset(36)
-            }),
-        "the drain answers once the bucket holds the position: {stored:?}"
-    );
+    for (partition, offset) in &expected {
+        let partition = u32::try_from(*partition).expect("a partition id");
+        assert!(
+            stored.iter().any(|object| object
+                .partitions
+                .get(&partition)
+                .and_then(|groups| groups.get(GROUP))
+                == Some(&GeoPosition {
+                    reset: 0,
+                    value: PositionValue::Offset(*offset)
+                })),
+            "the drains answer once the bucket holds the positions: {stored:?}"
+        );
+    }
+    for object in &stored {
+        assert!(
+            object.partitions.len() < PARTITIONS as usize,
+            "node {} publishes partitions it does not lead: {object:?}",
+            object.key.replica
+        );
+    }
 
     pair.cluster_mut(GeoSide::A)
         .stop()
         .await
-        .expect("dc-a stops after the drain");
+        .expect("dc-a stops after the drains");
     let group_b = Group::create(&client_b, ids.shadow()).await;
-    group_b.wait_for_offset(&client_b, Some(36)).await;
+    for (partition, count) in &consumed {
+        group_b
+            .on(*partition)
+            .wait_for_offset(&client_b, Some(count - 1))
+            .await;
+    }
     let group_b = group_b.joined(&client_b).await;
-    let resumed = group_b.consume(&client_b, 10).await;
-    assert_eq!(
-        resumed,
-        (37..47).collect::<Vec<_>>(),
-        "the group resumes on the next message"
-    );
+    for (partition, count) in &consumed {
+        assert_eq!(
+            group_b.on(*partition).consume(&client_b, 10).await,
+            (*count..count + 10).collect::<Vec<_>>(),
+            "the group resumes partition {partition} on the next message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_a_partition_whose_leader_fails_when_another_node_takes_it_over_should_publish_the_position_it_had()
+ {
+    let mut pair = started_pair(NODES).await;
+    let ids = create_and_follow(&pair, PARTITIONS).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    for partition in 0..PARTITIONS {
+        send(&client_a, partition, 0..20).await;
+    }
+    let group_a = Group::join(&client_a, ids.own()).await;
+    for partition in 0..PARTITIONS {
+        group_a.on(partition).consume(&client_a, 10).await;
+    }
+    group_a.leave(&client_a).await;
+    for partition in 0..PARTITIONS {
+        wait_for_bucket_offset_on(pair.a(), partition, 9).await;
+    }
+    // Rounds of every node, in which a backup would store what it holds too.
+    sleep(4 * PUBLISH_INTERVAL).await;
+    let mut holders = BTreeMap::new();
+    for partition in 0..PARTITIONS {
+        let replicas = wait_for_bucket_offset_on(pair.a(), partition, 9).await;
+        assert_eq!(
+            replicas.len(),
+            1,
+            "only the leader of partition {partition} publishes it: {replicas:?}"
+        );
+        holders.insert(partition, replicas[0]);
+    }
+    let (partition, leader) = holders
+        .into_iter()
+        .find(|(_, replica)| *replica != 0)
+        .expect("a partition led by another node than the first");
+
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_node(usize::from(leader))
+        .expect("the leader fails");
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let replicas = wait_for_bucket_offset_on(pair.a(), partition, 9).await;
+        if replicas.iter().any(|replica| *replica != leader) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no node took over partition {partition} from node {leader} in the bucket"
+        );
+        sleep(RETRY).await;
+    }
 }
 
 #[tokio::test]
 async fn given_a_group_that_moved_back_in_one_datacenter_when_the_other_holds_a_higher_offset_should_keep_the_move_in_both()
  {
-    let pair = started_pair().await;
-    let ids = create_and_follow(&pair).await;
+    let pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
     let client_a = pair.a().root_client().await.expect("a client of dc-a");
     let client_b = pair.b().root_client().await.expect("a client of dc-b");
-    send(&client_a, 0..100).await;
-    wait_until_shadow_serves(&client_b, ids, 100).await;
+    send(&client_a, 0, 0..100).await;
+    wait_until_shadow_serves(&client_b, ids, 0, 100).await;
     let group_a = Group::join(&client_a, ids.own()).await;
     group_a.consume(&client_a, 60).await;
     group_a.leave(&client_a).await;
@@ -135,12 +243,12 @@ async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_sh
     const MESSAGES: u64 = 600;
     const PACE: Duration = Duration::from_millis(20);
     const CONSUME_FOR: Duration = Duration::from_secs(6);
-    let mut pair = started_pair().await;
-    let ids = create_and_follow(&pair).await;
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
     let client_a = pair.a().root_client().await.expect("a client of dc-a");
     let client_b = pair.b().root_client().await.expect("a client of dc-b");
-    send(&client_a, 0..MESSAGES).await;
-    wait_until_shadow_serves(&client_b, ids, MESSAGES).await;
+    send(&client_a, 0, 0..MESSAGES).await;
+    wait_until_shadow_serves(&client_b, ids, 0, MESSAGES).await;
     let group_b = Group::create(&client_b, ids.shadow()).await;
     let group_a = Group::join(&client_a, ids.own()).await;
 
@@ -195,12 +303,12 @@ async fn given_a_group_consuming_in_one_datacenter_when_that_datacenter_fails_sh
 #[tokio::test]
 async fn given_a_group_that_moved_on_in_the_other_datacenter_when_its_first_datacenter_returns_should_resume_from_the_others_position()
  {
-    let mut pair = started_pair().await;
-    let ids = create_and_follow(&pair).await;
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
     let client_a = pair.a().root_client().await.expect("a client of dc-a");
     let client_b = pair.b().root_client().await.expect("a client of dc-b");
-    send(&client_a, 0..100).await;
-    wait_until_shadow_serves(&client_b, ids, 100).await;
+    send(&client_a, 0, 0..100).await;
+    wait_until_shadow_serves(&client_b, ids, 0, 100).await;
     let group_a = Group::join(&client_a, ids.own()).await;
     group_a.consume(&client_a, 30).await;
     group_a.leave(&client_a).await;
@@ -252,10 +360,11 @@ impl Ids {
     }
 }
 
-/// The group on one topic of one cluster.
+/// The group on one topic of one cluster, read on one partition.
 struct Group {
     stream: Identifier,
     topic: Identifier,
+    partition: u32,
 }
 
 impl Group {
@@ -267,7 +376,20 @@ impl Group {
             }
         })
         .await;
-        Self { stream, topic }
+        Self {
+            stream,
+            topic,
+            partition: 0,
+        }
+    }
+
+    /// The group, read on `partition`.
+    fn on(&self, partition: u32) -> Self {
+        Self {
+            stream: self.stream.clone(),
+            topic: self.topic.clone(),
+            partition,
+        }
     }
 
     async fn join(client: &IggyClient, topic: (Identifier, Identifier)) -> Self {
@@ -301,7 +423,7 @@ impl Group {
             .poll_messages(
                 &self.stream,
                 &self.topic,
-                0,
+                self.partition,
                 &Consumer::group(named(GROUP)),
                 &PollingStrategy::next(),
                 PollOptions {
@@ -343,7 +465,13 @@ impl Group {
     async fn store(&self, client: &IggyClient, offset: u64) {
         let consumer = Consumer::group(named(GROUP));
         retry(|| {
-            client.store_consumer_offset(&consumer, &self.stream, &self.topic, Some(0), offset)
+            client.store_consumer_offset(
+                &consumer,
+                &self.stream,
+                &self.topic,
+                Some(self.partition),
+                offset,
+            )
         })
         .await;
     }
@@ -354,7 +482,7 @@ impl Group {
                 &Consumer::group(named(GROUP)),
                 &self.stream,
                 &self.topic,
-                Some(0),
+                Some(self.partition),
             )
             .await
             .ok()
@@ -378,8 +506,9 @@ impl Group {
     }
 }
 
-async fn started_pair() -> GeoClusterPair {
+async fn started_pair(nodes: usize) -> GeoClusterPair {
     let mut pair = GeoClusterPair::builder()
+        .nodes(nodes)
         .extra_env("IGGY_GEO_POSITIONS_PUBLISH_INTERVAL", "250ms")
         .extra_env("IGGY_GEO_POSITIONS_POLL_INTERVAL", "250ms")
         .extra_env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "250ms")
@@ -390,9 +519,9 @@ async fn started_pair() -> GeoClusterPair {
     pair
 }
 
-/// Create the geo topic of one partition in `dc-a` and wait until `dc-b`
-/// adopts it.
-async fn create_and_follow(pair: &GeoClusterPair) -> Ids {
+/// Create the geo topic of `partitions` partitions in `dc-a` and wait until
+/// `dc-b` adopts it.
+async fn create_and_follow(pair: &GeoClusterPair, partitions: u32) -> Ids {
     let client_a = pair.a().root_client().await.expect("a client of dc-a");
     client_a
         .create_stream(STREAM, &StreamCreateOptions::default())
@@ -400,7 +529,7 @@ async fn create_and_follow(pair: &GeoClusterPair) -> Ids {
         .expect("create the stream");
     let topic = pair
         .a()
-        .create_geo_topic(&client_a, &named(STREAM), TOPIC, 1)
+        .create_geo_topic(&client_a, &named(STREAM), TOPIC, partitions)
         .await
         .expect("dc-a takes the geo topic");
     let client_b = pair.b().root_client().await.expect("a client of dc-b");
@@ -415,8 +544,9 @@ async fn create_and_follow(pair: &GeoClusterPair) -> Ids {
     }
 }
 
-/// Send the messages `indexes` to the geo topic of `dc-a`, ten a send.
-async fn send(client: &IggyClient, indexes: std::ops::Range<u64>) {
+/// Send the messages `indexes` to `partition` of the geo topic of `dc-a`,
+/// ten a send.
+async fn send(client: &IggyClient, partition: u32, indexes: std::ops::Range<u64>) {
     let all: Vec<u64> = indexes.collect();
     for chunk in all.chunks(10) {
         let mut messages: Vec<IggyMessage> = chunk
@@ -432,7 +562,7 @@ async fn send(client: &IggyClient, indexes: std::ops::Range<u64>) {
             .send_messages(
                 &named(STREAM),
                 &named(TOPIC),
-                &Partitioning::partition_id(0),
+                &Partitioning::partition_id(partition),
                 &mut messages,
             )
             .await
@@ -440,8 +570,9 @@ async fn send(client: &IggyClient, indexes: std::ops::Range<u64>) {
     }
 }
 
-/// Wait until the shadow in `dc-b` serves the first `count` messages.
-async fn wait_until_shadow_serves(client: &IggyClient, ids: Ids, count: u64) {
+/// Wait until the shadow in `dc-b` serves the first `count` messages of
+/// `partition`.
+async fn wait_until_shadow_serves(client: &IggyClient, ids: Ids, partition: u32, count: u64) {
     let deadline = Instant::now() + DEADLINE;
     let (stream, topic) = ids.shadow();
     loop {
@@ -449,7 +580,7 @@ async fn wait_until_shadow_serves(client: &IggyClient, ids: Ids, count: u64) {
             .poll_messages(
                 &stream,
                 &topic,
-                0,
+                partition,
                 &Consumer::default(),
                 &PollingStrategy::offset(count - 1),
                 PollOptions {
@@ -464,7 +595,7 @@ async fn wait_until_shadow_serves(client: &IggyClient, ids: Ids, count: u64) {
         }
         assert!(
             Instant::now() < deadline,
-            "dc-b never served offset {}",
+            "dc-b never served offset {} of partition {partition}",
             count - 1
         );
         sleep(RETRY).await;
@@ -474,6 +605,12 @@ async fn wait_until_shadow_serves(client: &IggyClient, ids: Ids, count: u64) {
 /// Wait until the bucket of `cluster` holds `offset` as the group's
 /// position on partition 0.
 async fn wait_for_bucket_offset(cluster: &GeoCluster, offset: u64) {
+    wait_for_bucket_offset_on(cluster, 0, offset).await;
+}
+
+/// Wait until the bucket of `cluster` holds `offset` as the group's
+/// position on `partition`, and return the replicas whose objects hold it.
+async fn wait_for_bucket_offset_on(cluster: &GeoCluster, partition: u32, offset: u64) -> Vec<u8> {
     let deadline = Instant::now() + DEADLINE;
     loop {
         let objects = cluster
@@ -481,22 +618,45 @@ async fn wait_for_bucket_offset(cluster: &GeoCluster, offset: u64) {
             .positions_objects()
             .await
             .expect("the bucket reads");
-        if objects.iter().any(|object| {
-            object
-                .partitions
-                .get(&0)
-                .and_then(|groups| groups.get(GROUP))
-                .is_some_and(|position| position.value == PositionValue::Offset(offset))
-        }) {
-            return;
+        let replicas: Vec<u8> = objects
+            .iter()
+            .filter(|object| {
+                object
+                    .partitions
+                    .get(&partition)
+                    .and_then(|groups| groups.get(GROUP))
+                    .is_some_and(|position| position.value == PositionValue::Offset(offset))
+            })
+            .map(|object| object.key.replica)
+            .collect();
+        if !replicas.is_empty() {
+            return replicas;
         }
         assert!(
             Instant::now() < deadline,
-            "the bucket of {} never held offset {offset}: {objects:?}",
+            "the bucket of {} never held offset {offset} of partition {partition}: {objects:?}",
             cluster.origin()
         );
         sleep(RETRY).await;
     }
+}
+
+/// Drain the group on node `node` of `cluster`, and return its answer.
+async fn drain(cluster: &GeoCluster, node: usize) -> serde_json::Value {
+    let address = cluster
+        .harness()
+        .node(node)
+        .http_addr()
+        .expect("the node's HTTP address");
+    let http = HttpClient::login_root_no_redirect(format!("http://{address}")).await;
+    let response = http
+        .post_json(
+            &format!("/streams/{STREAM}/topics/{TOPIC}/consumer-groups/{GROUP}/drain?timeout=30s"),
+            &json!({}),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "node {node} stores the positions");
+    response.json().await.expect("a drain body")
 }
 
 /// Run `call` until it succeeds, as an SDK does for a retryable refusal.
