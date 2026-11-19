@@ -9,15 +9,17 @@ This page is for operators. It covers the model, the setup of two clusters, the 
 delays, what fails and what is lost, and the limits of this version. The reference for each
 part of the configuration is in the [server README](../README.md): [tiered
 storage](../README.md#tiered-storage), [geo peers](../README.md#geo-peers), [geo topic
-objects](../README.md#geo-topic-objects), [shadow streams](../README.md#shadow-streams) and
-[following peer manifests](../README.md#following-peer-manifests).
+objects](../README.md#geo-topic-objects), [shadow streams](../README.md#shadow-streams),
+[following peer manifests](../README.md#following-peer-manifests) and [consumer group
+positions](../README.md#consumer-group-positions).
 
 > [!IMPORTANT]
 > **Status in this version.** A cluster writes its geo topics to its bucket, publishes them, and
 > adopts the geo topics of its peers as shadow topics. A shadow topic follows the manifests that
 > its origin publishes, and serves the published messages at the origin's offsets. A message that
 > the origin committed and did not publish yet is readable only from the cluster that wrote it.
-> See [What works in this version](#what-works-in-this-version).
+> Consumer groups carry their positions to the other datacenters through the buckets. See [What
+> works in this version](#what-works-in-this-version).
 
 ## Contents
 
@@ -96,8 +98,9 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 - The same key written in two datacenters has no defined order. If `dc-a` and `dc-b` both write
   key `42`, no reader can tell which write came last.
 - It is not a standby. No cluster is promoted, and no cluster ever writes into the log of another.
-- It shares only geo topics. Users, permissions, normal topics and consumer groups stay in the
-  cluster that holds them. Create them in each cluster.
+- It shares only geo topics and the positions of their consumer groups. Users, permissions,
+  normal topics and the consumer groups themselves stay in the cluster that holds them. Create
+  them in each cluster.
 
 ## What works in this version
 
@@ -114,7 +117,7 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 | A shadow topic serves the committed messages its origin proved, about 1 s late | Yes             |
 | A command that retires an origin that never returns                            | No              |
 | Recover the geo topics of a cluster that lost every disk, from its bucket      | Yes             |
-| Consumer positions that move between datacenters                               | No              |
+| Consumer positions that move between datacenters                               | Yes             |
 | The `geo_tiered` mode, and a switch between modes                              | No              |
 | Geo topics in encrypted streams                                                | No              |
 | Geo topics through the Kafka gateway                                           | No              |
@@ -436,11 +439,32 @@ node gets there; its position is never moved back.
 ### Consumer groups and positions
 
 - The topic and each shadow topic are separate topics, so a consumer group keeps one position per
-  log, and all of them are stored in its own cluster.
-- Positions never move between datacenters. A group that moves to another datacenter starts from
-  the positions it has there, if any.
-- The same group name can run in several datacenters. The groups are independent, and each one
-  reads every message it is given.
+  log in each cluster.
+- A group is known across datacenters by its name on the topic. The group `billing` of
+  `orders/payments` in `dc-a` and the group `billing` of `__shadow_dc-a_orders/payments` in
+  `dc-b` read the same log, and share one position on each of its partitions. So do the group
+  `billing` of `__shadow_dc-b_orders/payments` in `dc-a` and the group `billing` of
+  `orders/payments` in `dc-b`.
+- Each cluster stores the positions of its groups in its bucket once a second, when they
+  changed, and takes the positions that the other clusters store there when they are higher. A
+  group that moves to another datacenter resumes from about where it stopped: see [Failover and
+  failback](#failover-and-failback).
+- A position is a reset counter and an offset. Of two positions the one with the higher reset
+  wins, and within one reset the higher offset. A group that stores an offset below the one it
+  had, a seek backwards, or deletes its offset, counts one reset up, so the other datacenters
+  take the move instead of undoing it.
+- A position from another datacenter never moves a group that has members in this cluster. The
+  consumers that read here decide its position here, and the other datacenters take it once the
+  group stops there.
+- A position ahead of what this cluster serves is kept. The group's polls wait there until the
+  messages arrive; the position is never moved back.
+- A group created in this cluster after a position for its name arrived starts from that
+  position. Its first polls are answered with `TransientNotAccepted` (58), which the SDKs retry,
+  until the position is bound to it.
+- Deleting a group in one cluster stores a tombstone for its name, which keeps its old position
+  from coming back from the other clusters. The other clusters keep their groups of that name.
+- Membership, generations and partition assignments do not move. Consumers join and rebalance in
+  the cluster they connect to.
 - Grant read permissions on each shadow stream as on any other stream.
 
 ### Duplicates
@@ -459,6 +483,8 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Committed             | Readable in another datacenter     | About a second: the next object of the shard that carries the proof row, at most 250 ms later when no send follows, its upload, then up to 250 ms until the peer's next probe finds the object and reads its index.    |
 | Published             | Read from long-term segments there | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                     |
 | Geo topic created     | Shadow topic in each peer          | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                        |
+| Consumer group commit | Position stored in the bucket      | Up to `[geo] positions_publish_interval`, 1 s by default, then a commit of the fold and the upload of the object.                                                                                                      |
+| Position stored       | Taken by another datacenter        | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                     |
 | Geo topic deleted     | Shadow topic detached in each peer | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                                                                                     |
 | Shadow topic detached | Shadow topic removed               | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                                                                                 |
 
@@ -532,12 +558,38 @@ clusters already have the geo topic `orders/payments`.
    appends to the log of `dc-b`. No setting changes in `dc-b`.
 2. Let the producers retry in `dc-b` every send that `dc-a` did not acknowledge. Such a send may
    exist in both logs. See [Duplicates](#duplicates).
-3. Start the consumers of `dc-a` in `dc-b`, on `orders/payments`. Their positions in `dc-a` stay
-   in `dc-a`. In `dc-b` each group continues from its own position there, or starts where the
-   consumer is told to start when the group has none.
-4. Consumers in `dc-b` read the messages that `dc-a` published before it failed from the shadow
-   topic `__shadow_dc-a_orders/payments`. The messages that `dc-a` acknowledged and did not
-   publish stay in the log of `dc-a` until it returns.
+3. Start the consumers of `dc-a` in `dc-b`. A group that read `orders/payments` in `dc-a` reads
+   `__shadow_dc-a_orders/payments` in `dc-b`, and a group that read `__shadow_dc-b_orders/payments`
+   in `dc-a` reads `orders/payments` in `dc-b`. Each group resumes from the position that `dc-a`
+   last stored in its bucket and `dc-b` took: it reads again at most what it consumed in the last
+   `positions_publish_interval` plus `positions_poll_interval` before `dc-a` failed, and skips
+   nothing. Create the groups in `dc-b` with the same names, before or at the failover.
+4. Consumers in `dc-b` read the messages that `dc-a` published or proved before it failed from
+   the shadow topic `__shadow_dc-a_orders/payments`. The messages that `dc-a` acknowledged and did
+   not publish stay in the log of `dc-a` until it returns; a group whose position is past what the
+   shadow topic serves waits there.
+
+### Planned failover
+
+To move a group with no message read twice:
+
+1. Stop the group's consumers in `dc-a`.
+2. Drain the group on a node of `dc-a`, for each topic the group reads:
+
+   ```sh
+   curl -s -X POST -H "Authorization: Bearer $IGGY_TOKEN" \
+     "http://dc-a-node-1:3000/streams/orders/topics/payments/consumer-groups/billing/drain?timeout=30s"
+   ```
+
+   The node waits until the group has no members in `dc-a`, folds its offsets, stores its
+   positions in the bucket at once, and answers once the bucket holds them, with the positions it
+   stored. A node holds every partition with the default replication factor; the answer lists
+   under `not_held` any partition the node has no replica of, which a drain on another node
+   covers. A group that still has members after the timeout gets 409.
+3. Wait until `dc-b` shows the positions, `positions_poll_interval` later:
+   `GET /streams/__shadow_dc-a_orders/topics/payments/consumer-offsets?consumer_kind=consumer_group&consumer_id=billing&partition_id=0`
+   on a node of `dc-b`, or the SDK's `get_consumer_offset`.
+4. Start the consumers in `dc-b`. Each group resumes on the next message.
 
 ### Failback
 
@@ -546,9 +598,12 @@ clusters already have the geo topic `orders/payments`.
    `dc-a`.
 2. Move the producers back to `dc-a`, or leave them in `dc-b`. Either way, each message goes to
    the log of the cluster that accepts it.
-3. Move the consumers back to `dc-a`. They continue from their positions in `dc-a`, and so read
-   the messages that `dc-a` acknowledged before it failed. They read the messages written in
-   `dc-b` during the outage from the shadow topic `__shadow_dc-b_orders/payments` in `dc-a`.
+3. Move the consumers back to `dc-a`. After it starts, `dc-a` answers the group polls of geo and
+   shadow topics with `TransientNotAccepted` (58) until it took the positions of every peer, or
+   until `positions_resume_timeout`, 10 s by default, passed. So each group continues from where
+   it got to in `dc-b`, and reads the messages that `dc-a` acknowledged before it failed and
+   never published once it reaches them. They read the messages written in `dc-b` during the
+   outage from the shadow topic `__shadow_dc-b_orders/payments` in `dc-a`.
 
 ## Retire an origin
 
@@ -596,10 +651,12 @@ Fresh objects of the format before (`IGGYFRS1`) say neither whose batches they h
 where those committed, so their messages come back only when they were published. The
 recovery reports each such object.
 
-Nothing else comes back: consumer offsets, consumer groups, users and permissions, normal
-topics, and the idempotent producer state of the published messages are not in the bucket.
-The producers of proven and adopted batches are restored, so their retries are still
-recognized.
+Nothing else comes back from the bucket: consumer offsets, consumer groups, users and
+permissions, normal topics, and the idempotent producer state of the published messages are
+not in it. The producers of proven and adopted batches are restored, so their retries are
+still recognized. The rebuilt cluster takes the positions of the geo topics' consumer groups
+from its peers, as a returning cluster does: create the groups again with their names, and each
+one starts from the position its peers hold.
 
 ### Procedure
 
@@ -685,6 +742,9 @@ per peer:
   check does not pass;
 - the metadata primary lists the peer's topic objects every 5 seconds, reads each new object,
   and reads each known object again every 30 seconds;
+- every `[geo] positions_poll_interval`, shard 0 of each node that leads a partition of a geo or
+  shadow topic lists the peer's consumer group positions, one page per 1,000 objects, and reads
+  each object that changed: one per node of the peer and log whose groups moved;
 - every `[geo] manifest_poll_interval`, shard 0 of each node lists the manifests of each peer
   stream for which the node leads a shadow partition, and the shard that owns the partition reads
   each manifest that changed;
@@ -709,6 +769,8 @@ Requests to a cluster's own bucket:
 - a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
   which read the messages back;
 - a put for each long-term segment and its index, and one for each manifest;
+- up to one put a `positions_publish_interval` on each node for each log whose consumer groups
+  moved;
 - listings of the replica's fresh objects every minute, and the deletes of fresh and long-term
   objects.
 
@@ -723,25 +785,31 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 
 ### Buckets and peers
 
-| Metric                             | Meaning                                                                                                                                                                    |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `object_store_identity_verified`   | 1 while the node passes the store identity check of its own bucket.                                                                                                        |
-| `object_store_unreachable`         | 1 while its own bucket does not answer the check.                                                                                                                          |
-| `geo_peer_identity_verified`       | Per `origin`: 1 while the node reads the peer's bucket.                                                                                                                    |
-| `geo_peer_unreachable`             | Per `origin`: 1 while the peer's bucket does not answer the check.                                                                                                         |
-| `geo_shadow_topics_stale`          | Per `origin`: stale shadow topics, counted on the metadata primary.                                                                                                        |
-| `geo_peer_manifest_requests_total` | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.                                                                                            |
-| `geo_peer_manifest_failures_total` | The same requests that failed.                                                                                                                                             |
-| `geo_peer_manifests_refused_total` | Per `origin`: manifests that this cluster refused.                                                                                                                         |
-| `geo_peer_manifest_commands_total` | Per `origin`: commands that committed a manifest to a shadow partition.                                                                                                    |
-| `geo_peer_manifest_listed_seconds` | Per `origin`: Unix time of the last listing that succeeded, on shard 0.                                                                                                    |
-| `geo_shadow_partitions_behind`     | Per `origin`: shadow partitions whose committed manifest is behind the listed one.                                                                                         |
-| `geo_shadow_manifest_lag_seconds`  | Per `origin`: the longest time one of them has been behind.                                                                                                                |
-| `geo_peer_fresh_requests_total`    | Per `origin` and `request`: `probe`, `index`, `list` or `record` requests for the peer's fresh objects. A probe that finds nothing yet counts as a request, not a failure. |
-| `geo_peer_fresh_failures_total`    | The same requests that failed.                                                                                                                                             |
-| `geo_shadow_fresh_lag_messages`    | Per `origin`: the most proven messages one shadow partition found and does not serve yet.                                                                                  |
-| `geo_shadow_fresh_lag_seconds`     | Per `origin`: by the peer's clock, how much older the newest message that partition serves is than the newest one it found proven.                                         |
-| `geo_shadow_fresh_conflicts_total` | Per `origin`: shadow partitions that found two proof rows binding one offset to different batches, and stopped serving fresh messages. Alert on any.                       |
+| Metric                               | Meaning                                                                                                                                                                    |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `object_store_identity_verified`     | 1 while the node passes the store identity check of its own bucket.                                                                                                        |
+| `object_store_unreachable`           | 1 while its own bucket does not answer the check.                                                                                                                          |
+| `geo_peer_identity_verified`         | Per `origin`: 1 while the node reads the peer's bucket.                                                                                                                    |
+| `geo_peer_unreachable`               | Per `origin`: 1 while the peer's bucket does not answer the check.                                                                                                         |
+| `geo_shadow_topics_stale`            | Per `origin`: stale shadow topics, counted on the metadata primary.                                                                                                        |
+| `geo_peer_manifest_requests_total`   | Per `origin` and `request`, `list` or `get`: requests for the peer's manifests.                                                                                            |
+| `geo_peer_manifest_failures_total`   | The same requests that failed.                                                                                                                                             |
+| `geo_peer_manifests_refused_total`   | Per `origin`: manifests that this cluster refused.                                                                                                                         |
+| `geo_peer_manifest_commands_total`   | Per `origin`: commands that committed a manifest to a shadow partition.                                                                                                    |
+| `geo_peer_manifest_listed_seconds`   | Per `origin`: Unix time of the last listing that succeeded, on shard 0.                                                                                                    |
+| `geo_shadow_partitions_behind`       | Per `origin`: shadow partitions whose committed manifest is behind the listed one.                                                                                         |
+| `geo_shadow_manifest_lag_seconds`    | Per `origin`: the longest time one of them has been behind.                                                                                                                |
+| `geo_peer_fresh_requests_total`      | Per `origin` and `request`: `probe`, `index`, `list` or `record` requests for the peer's fresh objects. A probe that finds nothing yet counts as a request, not a failure. |
+| `geo_peer_fresh_failures_total`      | The same requests that failed.                                                                                                                                             |
+| `geo_shadow_fresh_lag_messages`      | Per `origin`: the most proven messages one shadow partition found and does not serve yet.                                                                                  |
+| `geo_shadow_fresh_lag_seconds`       | Per `origin`: by the peer's clock, how much older the newest message that partition serves is than the newest one it found proven.                                         |
+| `geo_shadow_fresh_conflicts_total`   | Per `origin`: shadow partitions that found two proof rows binding one offset to different batches, and stopped serving fresh messages. Alert on any.                       |
+| `geo_peer_position_requests_total`   | Per `origin` and `request`, `list` or `get`: requests for the peer's consumer group positions.                                                                             |
+| `geo_peer_position_failures_total`   | The same requests that failed.                                                                                                                                             |
+| `geo_peer_positions_adopted_total`   | Per `origin`: positions of the peer that the partitions here proposed to take.                                                                                             |
+| `geo_positions_stored_total`         | Objects of consumer group positions that the node stored in its bucket.                                                                                                    |
+| `geo_positions_store_failures_total` | The ones the bucket refused.                                                                                                                                               |
+| `geo_positions_resume_waiting`       | 1 while group polls on the shard wait for the peers' positions after the node started.                                                                                     |
 
 ### Write path
 
@@ -832,6 +900,9 @@ Alert on these first:
 | `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer.                                                                                       |
 | `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 250 ms after its last. `0` turns this off. Otherwise at least `64 MiB`. |
 | `[tiered_storage.jobs] fresh_uploads`      | `4`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads.                                                                                                                                                                                                                                  |
+| `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the positions of its consumer groups in its bucket, when they changed. A group that fails over reads again at most this long, plus the poll interval of the other datacenter.                                                                                                                                                        |
+| `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                       |
+| `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer. A peer that does not answer delays them this long.                                                                                                                                                                                             |
 | `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                            |
 | `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                            |
 | `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                           |
@@ -852,7 +923,14 @@ before an unlisted long-term object is deleted.
   leads no shadow partition of a peer does not follow it, and a node that starts to follow it
   serves proven messages only once a manifest reaches the first ones it found. A message that is
   committed and not proven reaches the shadow topics only with the next manifest.
-- **Consumer positions stay in their datacenter.** No position moves with a consumer group.
+- **A drain covers the partitions its node holds.** With a replication factor below the cluster
+  size, drain on enough nodes to cover every partition. The server cannot stop a client: stop the
+  consumers before the drain.
+- **A store of exactly the offset a group had when another datacenter's position arrived is not
+  seen as a change.** The group keeps reading from the other datacenter's position.
+- **Deleted topics leave their positions objects behind** when every node that stored them was
+  down at the delete. A node deletes the objects of logs its cluster no longer holds while it
+  runs.
 - **No encrypted streams.** A geo topic in a stream with an encryption key is refused with
   `FeatureUnavailable` (5), because its sends reach the bucket before the stream's encryption
   runs.
