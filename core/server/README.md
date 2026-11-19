@@ -836,7 +836,7 @@ consumers' commits decide its position here, except in the wait after a
 start described below, when no group reads. A position ahead of what the
 partition serves is kept, and the group's polls wait there. A position for a
 group name that does not exist here is kept until a group of that name is
-created; that group's first polls wait until the position is bound to it.
+created. That group's first polls wait until the position is bound to it.
 
 After a node starts, group polls of geo and shadow partitions wait, with
 `TransientNotAccepted` (58), until the partition took the positions of every

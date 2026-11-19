@@ -457,7 +457,7 @@ node gets there; its position is never moved back.
   consumers that read here decide its position here, and the other datacenters take it once the
   group stops there.
 - A position ahead of what this cluster serves is kept. The group's polls wait there until the
-  messages arrive; the position is never moved back.
+  messages arrive, and the position is never moved back.
 - A group created in this cluster after a position for its name arrived starts from that
   position. Its first polls are answered with `TransientNotAccepted` (58), which the SDKs retry,
   until the position is bound to it.
@@ -566,7 +566,7 @@ clusters already have the geo topic `orders/payments`.
    nothing. Create the groups in `dc-b` with the same names, before or at the failover.
 4. Consumers in `dc-b` read the messages that `dc-a` published or proved before it failed from
    the shadow topic `__shadow_dc-a_orders/payments`. The messages that `dc-a` acknowledged and did
-   not publish stay in the log of `dc-a` until it returns; a group whose position is past what the
+   not publish stay in the log of `dc-a` until it returns. A group whose position is past what the
    shadow topic serves waits there.
 
 ### Planned failover
@@ -583,7 +583,7 @@ To move a group with no message read twice:
 
    The node waits until the group has no members in `dc-a`, folds its offsets, stores its
    positions in the bucket at once, and answers once the bucket holds them, with the positions it
-   stored. A node holds every partition with the default replication factor; the answer lists
+   stored. A node holds every partition with the default replication factor, and the answer lists
    under `not_held` any partition the node has no replica of, which a drain on another node
    covers. A group that still has members after the timeout gets 409.
 3. Wait until `dc-b` shows the positions, `positions_poll_interval` later:
