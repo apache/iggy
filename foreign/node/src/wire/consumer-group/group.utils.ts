@@ -16,6 +16,7 @@
 // under the License.
 
 import { serializeIdentifier, type Id } from '../identifier.utils.js';
+import { deserializeError } from '../error.utils.js';
 
 /** Stream, topic, and consumer-group identifiers. */
 export type TargetGroup = {
@@ -65,18 +66,30 @@ export const serializeTargetGroup = (streamId: Id, topicId: Id, groupId: Id) => 
 };
 
 
+/** Fixed header size: id (u32) + partitionsCount (u32) + membersCount (u32) + nameLength (u8). */
+const CONSUMER_GROUP_MIN_SIZE = 13;
+
 /**
  * Deserializes a consumer group from a buffer.
  *
  * @param r - Buffer containing serialized consumer group data
  * @param pos - Starting position in the buffer
  * @returns Object with bytes read and deserialized consumer group data
+ * @throws DeserializeError if the buffer ends inside the group
  */
 export const deserializeConsumerGroup = (r: Buffer, pos = 0): ConsumerGroupDeserialized => {
+  if (r.length - pos < CONSUMER_GROUP_MIN_SIZE)
+    deserializeError('consumer group', pos, r.length, CONSUMER_GROUP_MIN_SIZE);
+
   const id = r.readUInt32LE(pos);
   const partitionsCount = r.readUInt32LE(pos + 4);
   const membersCount = r.readUInt32LE(pos + 8);
   const nameLength = r.readUInt8(pos + 12);
+  if (r.length - pos < CONSUMER_GROUP_MIN_SIZE + nameLength)
+    deserializeError(
+      'consumer group', pos, r.length, CONSUMER_GROUP_MIN_SIZE + nameLength, { nameLength }
+    );
+
   const name = r.subarray(pos + 13, pos + 13 + nameLength).toString();
 
   return {
