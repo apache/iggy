@@ -55,7 +55,7 @@ fn waiting_owner(dc_b_retired: bool) -> IoTestShard {
         origin: "dc-c".to_owned(),
         peers: vec!["dc-a".to_owned(), "dc-b".to_owned()],
         publish_interval: Duration::from_secs(1),
-        commit_interval: None,
+        offset_upload_interval: None,
         resume_timeout: Duration::from_secs(3600),
     }));
     owner

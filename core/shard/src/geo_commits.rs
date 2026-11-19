@@ -26,10 +26,11 @@
 //! the group's position, and shard 0 stores the node's object of the log.
 //! The reply goes out once the store took an object that holds the
 //! position. Only one round runs at a time, and a round of held commits
-//! starts at least `[geo] positions_commit_interval` after the last one
-//! started, so the commits that arrive during a round or within the interval
-//! go into the next one: a busy topic costs one put an interval, not one a
-//! commit. Only the replies wait. The partition and the shard go on.
+//! starts at least `[geo] consumer_offset_upload_interval` after the last
+//! one started, so the commits that arrive during a round or within the
+//! interval go into the next one: a busy topic costs one put an interval,
+//! not one a commit. Only the replies wait. The partition and the shard go
+//! on.
 //!
 //! A position that the store did not take is tried in a later round, which
 //! waits longer after each failed store. A commit that waited
@@ -38,6 +39,10 @@
 //! the same request again: the partition answers it from its dedup table,
 //! and the reply waits again, on the new primary. A commit whose group was
 //! deleted meanwhile has no position to carry and gets its reply.
+//!
+//! Only the stores on a log that the rounds store wait, see
+//! [`crate::geo_positions::topic_log`]. A store on a detached shadow topic
+//! is answered at its commit, and a held one once its shadow topic detaches.
 //!
 //! A poll's `auto_commit` is the server's own store, and is not held. The
 //! publish interval carries it.
@@ -60,7 +65,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
-use crate::geo_positions::PartitionPositions;
+use crate::geo_positions::{PartitionPositions, partition_log};
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, Sender, ShardFrame, TaggedSender};
 
@@ -98,6 +103,8 @@ pub enum CommitCheck {
     NotLed,
     /// Its group was deleted.
     GroupGone,
+    /// No round stores its log any more: its shadow topic detached.
+    LogGone,
 }
 
 /// The commits whose replies wait for their positions to be stored, by
@@ -243,8 +250,8 @@ impl<R> HeldCommits<R> {
     }
 
     /// Take the commits that wait no longer: those held for `timeout` or
-    /// more, and those that `check` finds not led here or of a deleted
-    /// group, with their answers.
+    /// more, and those that `check` finds not led here, of a deleted group
+    /// or of a log no round stores, with their answers.
     pub fn expire(
         &mut self,
         now: u64,
@@ -257,7 +264,7 @@ impl<R> HeldCommits<R> {
             for commit in held.drain(..) {
                 let answer = match check(*namespace, commit.created_revision, commit.group_id) {
                     CommitCheck::NotLed => Some(CommitAnswer::Uncertain),
-                    CommitCheck::GroupGone => Some(CommitAnswer::Committed),
+                    CommitCheck::GroupGone | CommitCheck::LogGone => Some(CommitAnswer::Committed),
                     CommitCheck::Waiting if now.saturating_sub(commit.since) >= timeout => {
                         Some(CommitAnswer::Uncertain)
                     }
@@ -278,8 +285,9 @@ impl<R> HeldCommits<R> {
 /// When shard 0 starts the rounds that store positions.
 ///
 /// One of every log each publish interval, and between those, one of the
-/// topics with held commits once no round runs, the commit interval passed
-/// since the last round started, and the wait after a failed store ended.
+/// topics with held commits once no round runs, the offset upload interval
+/// passed since the last round started, and the wait after a failed store
+/// ended.
 #[derive(Debug, Clone, Default)]
 pub struct RoundPacing {
     /// When the next round of every log is due.
@@ -302,13 +310,13 @@ impl RoundPacing {
 
     /// The round to start at `now`, while no round runs: `Some(None)` for
     /// every log, `Some(Some(topics))` for the topics with held commits.
-    /// Times are microseconds, `commit_interval` is `None` when commits are
-    /// not held.
+    /// Times are microseconds, `offset_upload_interval` is `None` when
+    /// commits are not held.
     pub fn start(
         &mut self,
         now: u64,
         publish_interval: u64,
-        commit_interval: Option<u64>,
+        offset_upload_interval: Option<u64>,
     ) -> Option<Option<Vec<(usize, usize)>>> {
         if now >= self.next_round_at {
             self.next_round_at = now.saturating_add(publish_interval);
@@ -316,10 +324,10 @@ impl RoundPacing {
             self.waiting.clear();
             return Some(None);
         }
-        let commit_interval = commit_interval?;
+        let offset_upload_interval = offset_upload_interval?;
         let spaced = self
             .last_started_at
-            .is_none_or(|started| now >= started.saturating_add(commit_interval));
+            .is_none_or(|started| now >= started.saturating_add(offset_upload_interval));
         if self.waiting.is_empty() || !spaced || now < self.retry_at {
             return None;
         }
@@ -331,16 +339,16 @@ impl RoundPacing {
 
     /// A round ended at `now`, `failed` when the store refused one of its
     /// objects. Each failed round in a row doubles the wait before the next
-    /// round of held commits, from twice the commit interval up to a
+    /// round of held commits, from twice the offset upload interval up to a
     /// second.
-    pub fn finished(&mut self, now: u64, failed: bool, commit_interval: Option<u64>) {
+    pub fn finished(&mut self, now: u64, failed: bool, offset_upload_interval: Option<u64>) {
         if !failed {
             self.failed_rounds = 0;
             self.retry_at = 0;
             return;
         }
         self.failed_rounds = self.failed_rounds.saturating_add(1);
-        let delay = commit_interval
+        let delay = offset_upload_interval
             .unwrap_or(0)
             .saturating_mul(1 << self.failed_rounds.min(16))
             .min(micros(COMMIT_RETRY_DELAY_MAX));
@@ -436,19 +444,23 @@ where
 {
     /// Whether the reply of `request` waits for the position it stores: a
     /// `StoreConsumerOffset` that a consumer group sent itself, with a
-    /// quorum ack, on a geo or shadow partition here, while commits are held
-    /// and this node stores positions.
+    /// quorum ack, on a partition here of a log that the rounds store, while
+    /// commits are held and this node stores positions.
     pub(crate) fn geo_commit_hold(
         &self,
         request: &Message<RoutedRequestHeader>,
-    ) -> Option<GeoCommitHold> {
+    ) -> Option<GeoCommitHold>
+    where
+        M: StreamsFrontend,
+    {
         let header = request.header();
         if header.operation != Operation::StoreConsumerOffset
             || is_auto_commit_client(header.client)
         {
             return None;
         }
-        self.geo_settings()?.commit_interval?;
+        let settings = self.geo_settings()?;
+        settings.offset_upload_interval?;
         self.topic_objects()?;
         let store = StoreConsumerOffsetRequest::decode_from(request.body()).ok()?;
         if store.consumer.kind != KIND_CONSUMER_GROUP || store.ack != AckLevel::Quorum {
@@ -458,12 +470,18 @@ where
             return None;
         };
         let namespace = IggyNamespace::from_raw(header.group);
+        self.plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| partition_log(inner, namespace, &settings.origin))?;
         let created_revision = self
             .plane
             .partitions()
             .with_partition(&namespace, |partition| {
-                let geo = partition.places_batches() || partition.peer_log().is_some();
-                (geo && partition.geo_positions().is_some()).then(|| partition.created_revision())
+                partition
+                    .geo_positions()
+                    .map(|_| partition.created_revision())
             })
             .flatten()?;
         Some(GeoCommitHold {
@@ -591,6 +609,10 @@ where
             return;
         }
         let now = self.bus.monotonic_micros();
+        let settings = self.geo_settings();
+        let origin = settings
+            .as_deref()
+            .map_or("", |settings| settings.origin.as_str());
         let answers = {
             let partitions = self.plane.partitions();
             let mut led = BTreeMap::new();
@@ -608,14 +630,9 @@ where
                     if !led {
                         return CommitCheck::NotLed;
                     }
-                    let exists = *groups
+                    *groups
                         .entry((namespace.stream_id(), namespace.topic_id(), group_id))
-                        .or_insert_with(|| self.geo_group_exists(namespace, group_id));
-                    if exists {
-                        CommitCheck::Waiting
-                    } else {
-                        CommitCheck::GroupGone
-                    }
+                        .or_insert_with(|| self.geo_commit_check(namespace, group_id, origin))
                 },
             )
         };
@@ -636,16 +653,25 @@ where
         }
     }
 
-    fn geo_group_exists(&self, namespace: IggyNamespace, group_id: u32) -> bool
+    /// Where a held commit of the group `group_id` on the partition of
+    /// `namespace` stands in the metadata.
+    fn geo_commit_check(&self, namespace: IggyNamespace, group_id: u32, origin: &str) -> CommitCheck
     where
         M: StreamsFrontend,
     {
         self.plane.metadata().mux_stm.streams().read(|inner| {
-            inner
+            let group_exists = inner
                 .items
                 .get(namespace.stream_id())
                 .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .is_some_and(|topic| topic.consumer_groups.contains_key(&u64::from(group_id)))
+                .is_some_and(|topic| topic.consumer_groups.contains_key(&u64::from(group_id)));
+            if !group_exists {
+                CommitCheck::GroupGone
+            } else if partition_log(inner, namespace, origin).is_none() {
+                CommitCheck::LogGone
+            } else {
+                CommitCheck::Waiting
+            }
         })
     }
 

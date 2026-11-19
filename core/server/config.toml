@@ -1611,7 +1611,7 @@ handshake_grace = "10 s"
 # interval share the next one. Each put rewrites the node's whole object of
 # the log. "disabled" answers them at the local commit and leaves them to
 # positions_publish_interval. Up to 1 s.
-#positions_commit_interval = "50 ms"
+#consumer_offset_upload_interval = "50 ms"
 # How often a node lists the consumer group positions that each peer stores,
 # and takes the ones that win over its own.
 #positions_poll_interval = "1 s"
