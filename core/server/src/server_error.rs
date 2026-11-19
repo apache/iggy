@@ -463,6 +463,18 @@ pub enum ServerError {
         #[source]
         source: iggy_object_store::ObjectStoreError,
     },
+    #[error(
+        "tiered storage cannot start: the object store took a create-only put over the \
+         existing store identity object {key:?}, so it ignores conditional creates, which \
+         uploads rely on. Point tiered_storage.backend ({backend}) and tiered_storage.endpoint \
+         at a store that refuses a create over an existing object"
+    )]
+    TieredStorageConditionalCreate {
+        key: String,
+        backend: configs::tiered_storage::TieredStorageBackend,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
     #[error("tiered storage cannot start: no runtime for the boot probe")]
     TieredStorageProbeRuntime {
         #[source]
