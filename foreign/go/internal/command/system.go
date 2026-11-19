@@ -19,8 +19,12 @@ package command
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math"
+	"slices"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 type GetClient struct {
@@ -172,4 +176,36 @@ func appendOptionalUint64(b []byte, value *uint64) []byte {
 		return append(b, 0)
 	}
 	return binary.LittleEndian.AppendUint64(append(b, 1), *value)
+}
+
+type Snapshot struct {
+	Compression   iggcon.SnapshotCompression
+	SnapshotTypes []iggcon.SystemSnapshotType
+}
+
+func (s *Snapshot) Code() Code {
+	return GetSnapshotFileCode
+}
+
+// MarshalBinary refuses the requests a caller can build by mistake: an unset
+// compression, which is the zero value, and All beside other types.
+// Other codes pass through for the server to check.
+func (s *Snapshot) MarshalBinary() ([]byte, error) {
+	if s.Compression == 0 {
+		return nil, fmt.Errorf("%w: snapshot compression is not set", ierror.ErrInvalidCommand)
+	}
+	if len(s.SnapshotTypes) > math.MaxUint8 {
+		return nil, fmt.Errorf("%w: snapshot type count exceeds %d", ierror.ErrInvalidCommand, math.MaxUint8)
+	}
+	if len(s.SnapshotTypes) > 1 && slices.Contains(s.SnapshotTypes, iggcon.SystemSnapshotTypeAll) {
+		return nil, fmt.Errorf("%w: the all snapshot type cannot be combined with other types", ierror.ErrInvalidCommand)
+	}
+
+	body := make([]byte, 2+len(s.SnapshotTypes))
+	body[0] = byte(s.Compression)
+	body[1] = byte(len(s.SnapshotTypes))
+	for index, snapshotType := range s.SnapshotTypes {
+		body[2+index] = byte(snapshotType)
+	}
+	return body, nil
 }
