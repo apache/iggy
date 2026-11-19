@@ -39,6 +39,10 @@
 //! and the reply waits again, on the new primary. A commit whose group was
 //! deleted meanwhile has no position to carry and gets its reply.
 //!
+//! Only the stores on a log that the rounds store wait, see
+//! [`crate::geo_positions::topic_log`]. A store on a detached shadow topic
+//! is answered at its commit, and a held one once its shadow topic detaches.
+//!
 //! A poll's `auto_commit` is the server's own store, and is not held. The
 //! publish interval carries it.
 
@@ -60,7 +64,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
-use crate::geo_positions::PartitionPositions;
+use crate::geo_positions::{PartitionPositions, partition_log};
 use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, Sender, ShardFrame, TaggedSender};
 
@@ -98,6 +102,8 @@ pub enum CommitCheck {
     NotLed,
     /// Its group was deleted.
     GroupGone,
+    /// No round stores its log any more: its shadow topic detached.
+    LogGone,
 }
 
 /// The commits whose replies wait for their positions to be stored, by
@@ -243,8 +249,8 @@ impl<R> HeldCommits<R> {
     }
 
     /// Take the commits that wait no longer: those held for `timeout` or
-    /// more, and those that `check` finds not led here or of a deleted
-    /// group, with their answers.
+    /// more, and those that `check` finds not led here, of a deleted group
+    /// or of a log no round stores, with their answers.
     pub fn expire(
         &mut self,
         now: u64,
@@ -257,7 +263,7 @@ impl<R> HeldCommits<R> {
             for commit in held.drain(..) {
                 let answer = match check(*namespace, commit.created_revision, commit.group_id) {
                     CommitCheck::NotLed => Some(CommitAnswer::Uncertain),
-                    CommitCheck::GroupGone => Some(CommitAnswer::Committed),
+                    CommitCheck::GroupGone | CommitCheck::LogGone => Some(CommitAnswer::Committed),
                     CommitCheck::Waiting if now.saturating_sub(commit.since) >= timeout => {
                         Some(CommitAnswer::Uncertain)
                     }
@@ -436,19 +442,23 @@ where
 {
     /// Whether the reply of `request` waits for the position it stores: a
     /// `StoreConsumerOffset` that a consumer group sent itself, with a
-    /// quorum ack, on a geo or shadow partition here, while commits are held
-    /// and this node stores positions.
+    /// quorum ack, on a partition here of a log that the rounds store, while
+    /// commits are held and this node stores positions.
     pub(crate) fn geo_commit_hold(
         &self,
         request: &Message<RoutedRequestHeader>,
-    ) -> Option<GeoCommitHold> {
+    ) -> Option<GeoCommitHold>
+    where
+        M: StreamsFrontend,
+    {
         let header = request.header();
         if header.operation != Operation::StoreConsumerOffset
             || is_auto_commit_client(header.client)
         {
             return None;
         }
-        self.geo_settings()?.commit_interval?;
+        let settings = self.geo_settings()?;
+        settings.commit_interval?;
         self.topic_objects()?;
         let store = StoreConsumerOffsetRequest::decode_from(request.body()).ok()?;
         if store.consumer.kind != KIND_CONSUMER_GROUP || store.ack != AckLevel::Quorum {
@@ -458,12 +468,18 @@ where
             return None;
         };
         let namespace = IggyNamespace::from_raw(header.group);
+        self.plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .read(|inner| partition_log(inner, namespace, &settings.origin))?;
         let created_revision = self
             .plane
             .partitions()
             .with_partition(&namespace, |partition| {
-                let geo = partition.places_batches() || partition.peer_log().is_some();
-                (geo && partition.geo_positions().is_some()).then(|| partition.created_revision())
+                partition
+                    .geo_positions()
+                    .map(|_| partition.created_revision())
             })
             .flatten()?;
         Some(GeoCommitHold {
@@ -591,6 +607,10 @@ where
             return;
         }
         let now = self.bus.monotonic_micros();
+        let settings = self.geo_settings();
+        let origin = settings
+            .as_deref()
+            .map_or("", |settings| settings.origin.as_str());
         let answers = {
             let partitions = self.plane.partitions();
             let mut led = BTreeMap::new();
@@ -608,14 +628,9 @@ where
                     if !led {
                         return CommitCheck::NotLed;
                     }
-                    let exists = *groups
+                    *groups
                         .entry((namespace.stream_id(), namespace.topic_id(), group_id))
-                        .or_insert_with(|| self.geo_group_exists(namespace, group_id));
-                    if exists {
-                        CommitCheck::Waiting
-                    } else {
-                        CommitCheck::GroupGone
-                    }
+                        .or_insert_with(|| self.geo_commit_check(namespace, group_id, origin))
                 },
             )
         };
@@ -636,16 +651,25 @@ where
         }
     }
 
-    fn geo_group_exists(&self, namespace: IggyNamespace, group_id: u32) -> bool
+    /// Where a held commit of the group `group_id` on the partition of
+    /// `namespace` stands in the metadata.
+    fn geo_commit_check(&self, namespace: IggyNamespace, group_id: u32, origin: &str) -> CommitCheck
     where
         M: StreamsFrontend,
     {
         self.plane.metadata().mux_stm.streams().read(|inner| {
-            inner
+            let group_exists = inner
                 .items
                 .get(namespace.stream_id())
                 .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .is_some_and(|topic| topic.consumer_groups.contains_key(&u64::from(group_id)))
+                .is_some_and(|topic| topic.consumer_groups.contains_key(&u64::from(group_id)));
+            if !group_exists {
+                CommitCheck::GroupGone
+            } else if partition_log(inner, namespace, origin).is_none() {
+                CommitCheck::LogGone
+            } else {
+                CommitCheck::Waiting
+            }
         })
     }
 

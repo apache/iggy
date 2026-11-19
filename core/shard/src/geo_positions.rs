@@ -61,7 +61,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::{StreamsInner, Topic};
+use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::geo_positions::{
     ADOPT_GEO_POSITIONS, LocalGroup, NOTE_GEO_POSITIONS, encode_adoptions, encode_notes,
 };
@@ -227,42 +227,15 @@ struct Round {
     found: Option<RoundSummary>,
 }
 
-/// Every log that a topic of this cluster holds, with its partitions.
-///
-/// A detached shadow topic takes no new data, so it is left out, and so is a
-/// geo topic whose partitions came at different revisions, which a geo topic
-/// never has.
+/// Every log that a topic of this cluster holds, see [`topic_log`], with its
+/// partitions.
 #[must_use]
 pub fn local_logs(inner: &StreamsInner, origin: &str) -> Vec<LocalLog> {
     let mut logs = Vec::new();
     for (stream_id, stream) in &inner.items {
         for (topic_id, topic) in &stream.topics {
-            let log = match (&stream.shadow, &topic.shadow) {
-                (Some(source), Some(shadow)) if !shadow.is_detached() => GeoLog {
-                    origin: source.origin.clone(),
-                    stream_id: source.stream_id,
-                    topic_id: topic_id as u64,
-                    created_revision: shadow.created_revision,
-                },
-                (None, None) if topic.is_geo() && !origin.is_empty() => {
-                    let Some(first) = topic.partitions.first() else {
-                        continue;
-                    };
-                    if topic
-                        .partitions
-                        .iter()
-                        .any(|partition| partition.created_revision != first.created_revision)
-                    {
-                        continue;
-                    }
-                    GeoLog {
-                        origin: origin.to_owned(),
-                        stream_id: stream_id as u64,
-                        topic_id: topic_id as u64,
-                        created_revision: first.created_revision,
-                    }
-                }
-                _ => continue,
+            let Some(log) = topic_log(stream_id, stream, topic_id, topic, origin) else {
+                continue;
             };
             let partitions = topic
                 .partitions
@@ -284,6 +257,70 @@ pub fn local_logs(inner: &StreamsInner, origin: &str) -> Vec<LocalLog> {
         }
     }
     logs
+}
+
+/// The log that the topic `topic_id` of the stream `stream_id` holds, `None`
+/// for a topic that holds none.
+///
+/// This node stores the positions of such a log and takes them from its
+/// peers, and only the offset stores on one wait for a round, see
+/// [`crate::geo_commits`].
+///
+/// A detached shadow topic takes no new data, and its origin deleted the
+/// topic, so no group of another cluster resumes from its positions: it is
+/// left out. So is a geo topic whose partitions came at different revisions,
+/// which a geo topic never has.
+#[must_use]
+pub fn topic_log(
+    stream_id: usize,
+    stream: &Stream,
+    topic_id: usize,
+    topic: &Topic,
+    origin: &str,
+) -> Option<GeoLog> {
+    match (&stream.shadow, &topic.shadow) {
+        (Some(source), Some(shadow)) if !shadow.is_detached() => Some(GeoLog {
+            origin: source.origin.clone(),
+            stream_id: source.stream_id,
+            topic_id: topic_id as u64,
+            created_revision: shadow.created_revision,
+        }),
+        (None, None) if topic.is_geo() && !origin.is_empty() => {
+            let first = topic.partitions.first()?;
+            if topic
+                .partitions
+                .iter()
+                .any(|partition| partition.created_revision != first.created_revision)
+            {
+                return None;
+            }
+            Some(GeoLog {
+                origin: origin.to_owned(),
+                stream_id: stream_id as u64,
+                topic_id: topic_id as u64,
+                created_revision: first.created_revision,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The log of the topic of the partition `namespace`, see [`topic_log`].
+#[must_use]
+pub fn partition_log(
+    inner: &StreamsInner,
+    namespace: IggyNamespace,
+    origin: &str,
+) -> Option<GeoLog> {
+    let stream = inner.items.get(namespace.stream_id())?;
+    let topic = stream.topics.get(namespace.topic_id())?;
+    topic_log(
+        namespace.stream_id(),
+        stream,
+        namespace.topic_id(),
+        topic,
+        origin,
+    )
 }
 
 /// The consumer groups of `topic` whose ids fit a partition's offset key.

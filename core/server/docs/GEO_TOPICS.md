@@ -947,7 +947,9 @@ before an unlisted long-term object is deleted.
   committed and not proven reaches the shadow topics only with the next manifest.
 - **Only a group's offset stores wait for the bucket.** A poll that commits on read and a delete
   of a group's offset are answered at their commit. A node whose store identity check of its own
-  bucket does not pass publishes no positions, and answers the stores at their commit.
+  bucket does not pass publishes no positions, and answers the stores at their commit. A store on
+  a detached shadow topic is answered at its commit too: its origin deleted the topic, so no node
+  publishes or takes its positions.
 - **A position reaches another datacenter one poll after its store.** A group started there
   sooner reads from the position that datacenter took before.
 - **A store of exactly the offset a group had when another datacenter's position arrived is not
