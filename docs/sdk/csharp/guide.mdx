@@ -1,0 +1,632 @@
+---
+title: Guide
+description: "Client configuration and the full low-level IIggyClient API surface for the C# SDK."
+---
+
+This guide covers client configuration and the full `IIggyClient` API surface - the low-level, per-call operations. For the ergonomic producer/consumer abstractions built on top of these, see the [High-level SDK](/docs/sdk/csharp/high-level-sdk).
+
+The API fragments below reuse a connected, authenticated `client` (see [Creating a client](/docs/sdk/csharp/intro#creating-a-client)) and the imports in the configuration example. Use existing streams and topics for read, update, delete, publish, and poll operations. The create examples show how to prepare them.
+
+## Client configuration
+
+`IggyClientConfigurator` exposes the full set of connection options - buffer sizes, TLS, heartbeat, automatic reconnection with exponential backoff, and auto-login:
+
+```csharp
+using Apache.Iggy.Contracts;
+using System.Text;
+using Apache.Iggy;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Contracts.Auth;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Factory;
+using Apache.Iggy.Headers;
+using Apache.Iggy.IggyClient;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
+using Partitioning = Apache.Iggy.Kinds.Partitioning;
+
+using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+{
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp,
+
+    // Null preserves the operating system socket defaults.
+    ReceiveBufferSize = null,
+    SendBufferSize = null,
+
+    // Upper bound on a reply frame the server sends, 64 MiB by default (TCP)
+    MaxResponseFrameSize = 64 * 1024 * 1024,
+
+    // Idle ping keeping the session alive and consumer-group assignments fresh (TCP).
+    // Default 5 seconds. Init-only
+    HeartbeatInterval = TimeSpan.FromSeconds(5),
+
+    // Automatic reconnection with exponential backoff (enabled by default, infinite retries)
+    ReconnectionSettings = new ReconnectionSettings
+    {
+        Enabled = true,
+        MaxRetries = 0,              // 0 = infinite retries
+        InitialDelay = TimeSpan.FromSeconds(5),
+        MaxDelay = TimeSpan.FromSeconds(30),
+        WaitAfterReconnect = TimeSpan.FromSeconds(1),
+        UseExponentialBackoff = true,
+        BackoffMultiplier = 2.0
+    },
+
+    // Configured credentials are reused when TCP reconnects.
+    AutoLoginSettings = AutoLoginSettings.For("iggy", "iggy")
+    // or AutoLoginSettings.ForPersonalAccessToken("your_token")
+});
+
+await client.ConnectAsync();
+```
+
+With TCP auto-login configured, the client logs in once connected. Successful manual username/password or PAT login is also remembered for reconnects. HTTP `ConnectAsync` does no network work and does not auto-login. Call `LoginUserAsync` or `LoginWithPersonalAccessTokenAsync` explicitly.
+
+#### `IggyClientConfigurator`
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `BaseAddress` | `string` | *required* | Server address. TCP takes `host:port` (e.g. `127.0.0.1:8090`). HTTP needs a full URI (e.g. `http://127.0.0.1:3000`) |
+| `Protocol` | `Protocol` | *required* | Transport: `Protocol.Tcp` or `Protocol.Http` |
+| `MaxResponseFrameSize` | `int` | 64 MiB | Largest reply frame accepted over TCP. A reply above the bound is refused and the connection dropped. Raise it if a single response legitimately exceeds it (a large [snapshot](#snapshots) is the usual case) |
+| `ReceiveBufferSize` | `int?` | `null` | TCP receive buffer override in bytes. Null preserves the OS default |
+| `SendBufferSize` | `int?` | `null` | TCP send buffer override in bytes. Null preserves the OS default |
+| `HeartbeatInterval` | `TimeSpan` | `5s` | Interval between the automatic pings the TCP client sends while connected (see [Heartbeat](#heartbeat)). Init-only. Must be between 1 millisecond and about 49 days |
+| `TlsSettings` | `TlsSettings` | disabled | TCP TLS configuration (see below). HTTP uses its HTTPS URI and standard certificate validation |
+| `ReconnectionSettings` | `ReconnectionSettings` | enabled | TCP reconnection behavior (see below) |
+| `AutoLoginSettings` | `AutoLoginSettings` | disabled | TCP automatic login on connect |
+| `LoggerFactory` | `ILoggerFactory` | `NullLoggerFactory.Instance` | Logger factory for diagnostics (currently applied to TCP clients only) |
+| `MessageEncryptor` | `IMessageEncryptor?` | `null` | Client-side payload encryptor (encrypts on send, decrypts on poll - see [Message encryption](#message-encryption)) |
+| `AllowAutoCommitWithEncryptor` | `bool` | `false` | Allow auto-commit while an encryptor is configured |
+
+#### Heartbeat
+
+The TCP client pings the server on its own every `HeartbeatInterval` while connected, so an idle session survives the server's heartbeat verification and consumer-group memberships and assignments stay fresh. The ping goes through the regular request path: a lost session is repaired by the same reconnect and auto-login any other request would trigger. Heartbeat failures are logged and the loop keeps going until the client is disposed.
+
+#### `TlsSettings`
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Enabled` | `bool` | `false` | Whether TLS is enabled |
+| `Hostname` | `string` | `""` | Server name for the TLS handshake |
+| `CertificatePath` | `string` | `""` | Path to the certificate (CA / self-signed) file |
+
+#### `ReconnectionSettings`
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Enabled` | `bool` | `true` | Enable automatic reconnection when the connection drops |
+| `MaxRetries` | `int` | `0` | Maximum failed passes through the known address roster (`0` = unlimited) |
+| `InitialDelay` | `TimeSpan` | `5s` | Delay before the first reconnection attempt |
+| `MaxDelay` | `TimeSpan` | `30s` | Maximum delay between attempts |
+| `WaitAfterReconnect` | `TimeSpan` | `1s` | Pause after a successful reconnect (e.g. to rejoin a consumer group) |
+| `UseExponentialBackoff` | `bool` | `true` | Use exponential backoff for delays |
+| `BackoffMultiplier` | `double` | `2.0` | Multiplier for exponential backoff |
+
+> **Warning:** TCP reconnection is **on by default** with **unlimited retries**. A failed pass tries the known roster addresses before consuming one retry. Connection and TLS handshake failures can be retried. An invalid local CA file stops after the pass, and rejected login credentials are surfaced. Pass a `CancellationToken` or set `MaxRetries` to bound connection attempts, or set `Enabled = false` to disable reconnection. Request replay also has its own deadline and requires configured or remembered login credentials.
+
+#### `AutoLoginSettings`
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `Enabled` | `bool` | `false` | Log in automatically once connected |
+| `Username` | `string` | `""` | Username for auto-login |
+| `Password` | `string` | `""` | Password for auto-login |
+| `PersonalAccessToken` | `string` | `""` | Personal access token to sign in with instead of a username and password. Takes precedence over them when set |
+
+All properties are init-only: build the settings with an object initializer or the static factories `AutoLoginSettings.For(username, password)` and `AutoLoginSettings.ForPersonalAccessToken(token)`. TCP reconnects use configured auto-login credentials first, then credentials remembered from a successful manual login. Without either, a reconnect cannot restore the authenticated session.
+
+## Message encryption
+
+Set `IggyClientConfigurator.MessageEncryptor` to encrypt message payloads and user headers client-side. They are encrypted on send and decrypted on poll. Routing information and message metadata remain visible to the server. The built-in `AesMessageEncryptor` uses AES-GCM (confidentiality + authenticity) and takes a 16-, 24-, or 32-byte key for AES-128/192/256:
+
+```csharp
+using Apache.Iggy.Factory;
+using Apache.Iggy.Configuration;
+using Apache.Iggy.Enums;
+using Apache.Iggy.Contracts;
+using System.Security.Cryptography;
+using Apache.Iggy.Encryption;
+
+var key = RandomNumberGenerator.GetBytes(32);
+using var encryptor = new AesMessageEncryptor(key);
+
+using var client = IggyClientFactory.CreateClient(new IggyClientConfigurator
+{
+    BaseAddress = "127.0.0.1:8090",
+    Protocol = Protocol.Tcp,
+    MessageEncryptor = encryptor
+});
+```
+
+Keep the same key for clients that exchange encrypted messages and for later reads. The generated key above lasts only for this example. For a custom scheme, implement `IMessageEncryptor`.
+
+Things to know:
+
+- The encryptor applies to **every message on the connection** - topics mixing encrypted and plaintext messages are not supported.
+- You own the encryptor and must dispose it once the client is done with it.
+- With an encryptor configured, polling with `autoCommit: true` throws `InvalidOperationException` by default: the server commits the offset **before the client decrypts**, so a decryption failure would silently skip the whole batch. Poll with `autoCommit: false` and store offsets after processing, or opt in with `AllowAutoCommitWithEncryptor = true`. `IggyConsumer` separately rejects wire auto-commit with encryption. Use `AfterReceive` or `Disabled` there.
+- On the high-level builders, `WithEncryptor(...)` is only valid when the builder creates its own client. For an external client, set `MessageEncryptor` on the configurator instead.
+
+## Connection events
+
+TCP clients publish connection state changes, useful for reacting to reconnects. HTTP subscription methods are no-ops:
+
+```csharp
+Func<ConnectionStateChangedEventArgs, Task> handler = async args =>
+{
+    Console.WriteLine($"Current connection state: {args.CurrentState}");
+    await Task.CompletedTask;
+};
+
+client.SubscribeConnectionEvents(handler);
+
+// Later
+client.UnsubscribeConnectionEvents(handler);
+```
+
+## Identifiers
+
+Streams, topics, users, and consumer groups are referenced by an `Identifier`, which can be either numeric or a name:
+
+```csharp
+var byId = Identifier.Numeric(0);
+var byName = Identifier.String("my-stream");
+```
+
+Server-assigned ids are **0-based**: the first stream, topic, partition, or consumer group gets id 0. The root user has id 0 as well.
+
+## Authentication
+
+### User login
+
+Use the credentials configured when the server was initialized. These examples use the `iggy` / `iggy` setup from the introduction:
+
+```csharp
+var response = await client.LoginUserAsync("iggy", "iggy");
+
+// Log out the currently authenticated user
+await client.LogoutUserAsync();
+```
+
+### Creating users
+
+Create new users with customizable permissions:
+
+```csharp
+var permissions = new Permissions
+{
+    Global = new GlobalPermissions
+    {
+        ManageServers = true,
+        ManageUsers = true,
+        ManageStreams = true,
+        ManageTopics = true,
+        PollMessages = true,
+        ReadServers = true,
+        ReadStreams = true,
+        ReadTopics = true,
+        ReadUsers = true,
+        SendMessages = true
+    }
+};
+
+await client.CreateUserAsync("test_user", "secure_password", UserStatus.Active, permissions);
+
+var loginResponse = await client.LoginUserAsync("test_user", "secure_password");
+```
+
+Besides `Global`, `Permissions.Streams` scopes permissions to specific streams (keyed by numeric stream id), and each `StreamPermissions` can in turn scope down to specific topics:
+
+```csharp
+var permissions = new Permissions
+{
+    Global = new GlobalPermissions
+    {
+        ManageServers = false,
+        ManageUsers = false,
+        ManageStreams = false,
+        ManageTopics = false,
+        PollMessages = false,
+        ReadServers = false,
+        ReadStreams = false,
+        ReadTopics = false,
+        ReadUsers = false,
+        SendMessages = false
+    },
+    Streams = new Dictionary<uint, StreamPermissions>
+    {
+        [0] = new StreamPermissions
+        {
+            ManageStream = false,
+            ReadStream = true,
+            ManageTopics = false,
+            ReadTopics = true,
+            PollMessages = true,
+            SendMessages = true,
+            Topics = new Dictionary<uint, TopicPermissions>
+            {
+                [0] = new TopicPermissions
+                {
+                    ManageTopic = false,
+                    ReadTopic = true,
+                    PollMessages = true,
+                    SendMessages = false
+                }
+            }
+        }
+    }
+};
+```
+
+### Managing users
+
+```csharp
+var userId = Identifier.String("test_user");
+
+// Get / list
+var user = await client.GetUserAsync(userId);
+var users = await client.GetUsersAsync();
+
+// Update name and/or status (both optional)
+await client.UpdateUserAsync(userId, new UserUpdate { Username = "renamed_user", Status = UserStatus.Inactive });
+userId = Identifier.String("renamed_user");
+
+// Replace permissions
+await client.UpdatePermissionsAsync(userId, permissions);
+
+// Change password
+await client.ChangePasswordAsync(userId, "secure_password", "new_password");
+
+// Delete
+await client.DeleteUserAsync(userId);
+```
+
+### Personal access tokens
+
+Create and use Personal Access Tokens (PAT) for programmatic access:
+
+```csharp
+// Create a PAT (expiry is optional. Null = server default, TimeSpan.MaxValue = never expires)
+var pat = await client.CreatePersonalAccessTokenAsync("api-token", TimeSpan.FromHours(1));
+
+// Login with the raw token value
+await client.LoginWithPersonalAccessTokenAsync(pat!.Token);
+
+// List / delete (by name)
+var tokens = await client.GetPersonalAccessTokensAsync();
+await client.DeletePersonalAccessTokenAsync("api-token");
+```
+
+## Streams
+
+```csharp
+// Create
+await client.CreateStreamAsync("my-stream");
+
+// Get / list
+var stream = await client.GetStreamByIdAsync(Identifier.String("my-stream"));
+var streams = await client.GetStreamsAsync();
+
+// Update and delete
+await client.UpdateStreamAsync(Identifier.String("my-stream"), new StreamUpdate { Name = "renamed-stream" });
+await client.DeleteStreamAsync(Identifier.String("renamed-stream"));
+```
+
+## Topics
+
+Create a topic with typed `TopicOptions`. Fields left null use the server default. Compression, durability, partition resize policy and replication factor are fixed at creation.
+
+```csharp
+var streamId = Identifier.String("my-stream");
+await client.CreateTopicAsync(streamId, name: "my-topic", partitionsCount: 3,
+    options: new TopicOptions
+    {
+        SegmentSize = 128 * 1024 * 1024,
+        Durability = Durability.Persisted,
+        ConsumerOffsetDurability = Durability.Persisted,
+        MessageExpiry = TimeSpan.FromDays(7)
+    });
+```
+
+### Topic options
+
+`DescribeOptionsAsync(OptionsScope.Topic)` returns the catalog. Set fields in `TopicUpdate` to change them. `Reset` returns a supported key to its server default. Omitted fields keep their stored values. Compression cannot be updated. See [Topic options](/docs/server/topic-options).
+
+```csharp
+var topicId = Identifier.String("my-topic");
+var topic = await client.GetTopicByIdAsync(streamId, topicId);
+var topics = await client.GetTopicsAsync(streamId);
+await client.UpdateTopicAsync(streamId, topicId, new TopicUpdate
+{
+    MessageExpiry = TimeSpan.FromDays(1),
+    Reset = new HashSet<TopicOptionKey> { TopicOptionKey.MaxTopicSize }
+});
+```
+
+Stream and topic purge are removed. `DeleteTopicAsync` deletes the topic and its data. There is no on-demand flush command. Select both durability policies when creating the topic.
+
+## Partitions
+
+Add partitions to or remove them from an existing topic:
+
+```csharp
+await client.CreatePartitionsAsync(streamId, topicId, partitionsCount: 2);
+await client.DeletePartitionsAsync(streamId, topicId, partitionsCount: 2);
+```
+
+## Publishing messages
+
+### Sending messages
+
+A `Message` takes an id (`Guid` or `UInt128`) and a payload:
+
+```csharp
+var streamId = Identifier.String("my-stream");
+var topicId = Identifier.String("my-topic");
+
+var messages = new List<Message>
+{
+    new(Guid.NewGuid(), "Hello, Iggy!"u8.ToArray()),
+    new(1, "Another message"u8.ToArray())
+};
+
+var response = await client.SendMessagesAsync(
+    streamId,
+    topicId,
+    Partitioning.None(),  // balanced partitioning
+    messages
+);
+
+// The confirmations report where each committed batch landed. This is the only
+// way to learn the partition and offset a message was assigned
+foreach (var confirmation in response.Confirmations)
+{
+    Console.WriteLine($"Partition {confirmation.PartitionId}, base offset {confirmation.BaseOffset}");
+}
+```
+
+`SendMessagesAsync` returns a `SendMessagesResponse` whose `Confirmations` carry `StreamId`, `TopicId`, `PartitionId`, and `BaseOffset` (the offset of the first message of the batch) per committed batch. An empty list reports no assigned offsets. A single-message overload is also available: `SendMessagesAsync(streamId, topicId, partitioning, message)`.
+
+To send many payloads without a `byte[]` allocation per message, build them into a single pooled buffer with `RentedMessageBatchBuilder` - see [Publishing with rented batches](/docs/sdk/csharp/high-level-sdk#publishing-with-rented-batches).
+
+### Partitioning strategies
+
+Control which partition receives each message:
+
+```csharp
+// Balanced - the client round-robins across partitions (default)
+Partitioning.None();
+
+// Send to a specific partition (partition ids are 0-based)
+Partitioning.PartitionId(0);
+
+// Key-based routing - messages with the same key land on the same partition
+Partitioning.EntityIdString("user-123");
+Partitioning.EntityIdInt(12345);
+Partitioning.EntityIdUlong(12345);
+Partitioning.EntityIdGuid(Guid.NewGuid());
+Partitioning.EntityIdBytes(new byte[] { 1, 2, 3 });
+```
+
+Partition selection is resolved **client-side** on both transports. Balanced partitioning round-robins over the topic's partitions, and key-based routing hashes the key with xxHash32 modulo the partition count, consistent with the Rust SDK for the same encoded key bytes and partition count. Strings use UTF-8, integers use little-endian bytes, and GUID keys use `Guid.ToByteArray()`.
+
+### User-defined headers
+
+Add typed custom headers to messages. Build keys with `HeaderKey.FromString` and values with the `HeaderValue.From*` factories:
+
+```csharp
+var headers = new Dictionary<HeaderKey, HeaderValue>
+{
+    { HeaderKey.FromString("correlation_id"), HeaderValue.FromString("req-123") },
+    { HeaderKey.FromString("priority"), HeaderValue.FromInt32(1) },
+    { HeaderKey.FromString("timeout"), HeaderValue.FromInt64(5000) },
+    { HeaderKey.FromString("confidence"), HeaderValue.FromFloat(0.95f) },
+    { HeaderKey.FromString("is_urgent"), HeaderValue.FromBool(true) },
+    { HeaderKey.FromString("request_id"), HeaderValue.FromGuid(Guid.NewGuid()) }
+};
+
+var messages = new List<Message>
+{
+    new(Guid.NewGuid(), "Message with headers"u8.ToArray(), headers)
+};
+
+await client.SendMessagesAsync(streamId, topicId, Partitioning.PartitionId(0), messages);
+```
+
+Available value factories: `FromString`, `FromBool`, `FromBytes`, `FromUInt8`, `FromInt32`, `FromInt64`, `FromInt128`, `FromUInt32`, `FromUInt64`, `FromUInt128`, `FromFloat`, `FromDouble`, `FromGuid`.
+
+## Consuming messages
+
+### Fetching messages
+
+A poll reads one explicit partition. Use a reader for several partitions or a consumer group assignment. `PollOptions` defaults to no wait and manual commits.
+
+```csharp
+var consumer = Consumer.New(1);
+var options = new PollOptions { Count = 100, MaxWait = TimeSpan.FromSeconds(5) };
+var polled = await client.PollMessagesAsync(
+    streamId, topicId, 0, consumer, PollingStrategy.Next(), options);
+foreach (var message in polled.Messages)
+{
+    Console.WriteLine(Encoding.UTF8.GetString(message.Payload));
+}
+if (polled.Checkpoint is { } checkpoint)
+{
+    await client.StoreConsumerPositionAsync(consumer, streamId, topicId, checkpoint);
+}
+```
+
+A checkpoint retains the partition history and owner. A commit after a partition recreation or ownership change is refused. `polled.Continuation` continues the same partition without losing that context.
+
+`CommitPolicy.OnRead` submits the offset with the read, before application processing. `CommitPolicy.Auto()` is available to readers and consumers, but not a one-shot poll. The [deferred polling guide](/docs/sdk/deferred-polling) explains limits and cancellation.
+
+### Partition reader
+
+```csharp
+await using var reader = await client.Reader(streamId, topicId, Consumer.New(1))
+    .WithPartitions(0, 1, 2)
+    .WithOptions(new PollOptions { MaxWait = TimeSpan.FromSeconds(5) })
+    .BuildAsync();
+var batch = await reader.NextAsync();
+foreach (var message in batch.Messages)
+{
+    Console.WriteLine(Encoding.UTF8.GetString(message.Payload));
+}
+await reader.CommitAsync(batch.Checkpoint!);
+```
+
+TCP groups reads by primary. HTTP uses one poll per partition and supports standalone consumers only. A group reader joins and follows its assignment. `ReadException` reports the partition and any continuation that skips an undecodable record. A stopped partition needs an explicit seek before reading resumes.
+
+### Polling with rented buffers
+
+The rental API returns payload slices backed by a pooled buffer. Dispose each rental and copy any bytes that must outlive it. Do not retain a payload or raw-header reference after disposal. The high-level consumer exposes `ReceiveRentedAsync` for this path.
+
+### Polling strategies
+
+Control where consumption starts:
+
+```csharp
+PollingStrategy.Offset(1000);              // from a specific offset
+PollingStrategy.Timestamp(1699564800000000);  // from a timestamp (microseconds since epoch)
+PollingStrategy.First();                   // from the earliest message
+PollingStrategy.Last();                    // from the latest message
+PollingStrategy.Next();                    // from the next unread message
+```
+
+## Offset management
+
+Consumer offsets are keyed by consumer + stream + topic + partition. Note the argument order - the `Consumer` comes first:
+
+```csharp
+var consumer = Consumer.New(1);
+var streamId = Identifier.String("my-stream");
+var topicId = Identifier.String("my-topic");
+
+// Store the current position
+await client.StoreOffsetAsync(consumer, streamId, topicId, offset: 42, partitionId: 0);
+
+// Retrieve the stored offset
+var offsetInfo = await client.GetOffsetAsync(consumer, streamId, topicId, partitionId: 0);
+Console.WriteLine($"Stored offset: {offsetInfo!.StoredOffset}");
+
+// Clear the stored offset
+await client.DeleteOffsetAsync(consumer, streamId, topicId, partitionId: 0);
+```
+
+## Consumer groups
+
+Consumer groups coordinate message consumption across multiple consumers, load-balancing partitions between members.
+
+```csharp
+var streamId = Identifier.String("my-stream");
+var topicId = Identifier.String("my-topic");
+
+// Create
+await client.CreateConsumerGroupAsync(streamId, topicId, "my-consumer-group");
+
+// Inspect
+var groups = await client.GetConsumerGroupsAsync(streamId, topicId);
+var group = await client.GetConsumerGroupByIdAsync(streamId, topicId, Identifier.String("my-consumer-group"));
+
+// Delete
+await client.DeleteConsumerGroupAsync(streamId, topicId, Identifier.String("my-consumer-group"));
+```
+
+### Joining and leaving
+
+> **Note:** Join/Leave are TCP-only and throw `FeatureUnavailableException` on HTTP.
+
+```csharp
+await client.JoinConsumerGroupAsync(streamId, topicId, Identifier.String("my-consumer-group"));
+await client.LeaveConsumerGroupAsync(streamId, topicId, Identifier.String("my-consumer-group"));
+```
+
+## System operations
+
+```csharp
+// Health check
+await client.PingAsync();
+
+// Address of the node the client currently talks to
+var address = client.GetCurrentAddress();
+
+// Server statistics
+var stats = await client.GetStatsAsync();
+
+// Cluster metadata and node information
+var metadata = await client.GetClusterMetadataAsync();
+
+// Connected clients
+var clients = await client.GetClientsAsync();
+var clientById = await client.GetClientByIdAsync(clientId: 1);
+var currentClient = await client.GetMeAsync();  // TCP-only
+```
+
+`PingAsync` is **more than a bare ping** over TCP: it also re-syncs the assignment of every consumer group this client has joined, at the cost of one extra round trip per joined group. The client already pings on its own every [`HeartbeatInterval`](#heartbeat), so an explicit ping is only needed to force an assignment refresh sooner. `GetCurrentAddress()` is useful under leader redirection, when the client may have followed the cluster roster to a different node than the one it was configured with (see [Connection semantics](/docs/sdk/csharp/intro#connection-semantics)).
+
+### Option catalog
+
+`DescribeOptionsAsync` enumerates the option keys a server accepts for a resource scope (`OptionsScope.Topic`, `OptionsScope.Stream`, or `OptionsScope.User`), with the kind, default, and description of each. This is the discovery surface for the [topic options](#topic-options) dictionary:
+
+```csharp
+var specs = await client.DescribeOptionsAsync(OptionsScope.Topic);
+
+foreach (var spec in specs)
+{
+    Console.WriteLine($"{spec.Key} ({spec.Kind}): {spec.Description}");
+}
+```
+
+### Raw binary requests
+
+`SendBinaryRequestAsync` is an escape hatch that sends a raw command code with a prebuilt payload and returns the raw response bytes, for commands the typed API does not cover:
+
+```csharp
+const uint PingCommand = 1;
+var responseBytes = await client.SendBinaryRequestAsync(PingCommand, Array.Empty<byte>());
+```
+
+Session-control codes (login, logout, and the like) are rejected with an invalid-command error, and the operation is TCP-only: HTTP clients throw `FeatureUnavailableException`.
+
+### Snapshots
+
+Capture a system snapshot as a compressed archive:
+
+```csharp
+var snapshotBytes = await client.GetSnapshotAsync(
+    SnapshotCompression.Zstd,
+    new List<SystemSnapshotType>
+    {
+        SystemSnapshotType.ServerLogs,
+        SystemSnapshotType.ServerConfig,
+        SystemSnapshotType.ResourceUsage
+    }
+);
+
+// Or capture everything
+var fullSnapshot = await client.GetSnapshotAsync(
+    SnapshotCompression.Deflated,
+    new List<SystemSnapshotType> { SystemSnapshotType.All }
+);
+```
+
+Compression methods: `Stored`, `Deflated`, `Bzip2`, `Zstd`, `Lzma`, `Xz`. Snapshot types: `FilesystemOverview`, `ProcessList`, `ResourceUsage`, `Test`, `ServerLogs`, `ServerConfig`, `All`.
+
+A full snapshot can exceed the default 64 MiB reply-frame bound, in which case the reply is **refused and the connection dropped**. Raise [`MaxResponseFrameSize`](#iggyclientconfigurator) before requesting large snapshots.
+
+### Segment management
+
+Delete up to N of the oldest sealed segments from a partition. The active segment is retained:
+
+> **Note:** TCP-only - throws `FeatureUnavailableException` on HTTP.
+
+```csharp
+await client.DeleteSegmentsAsync(
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic"),
+    partitionId: 0,
+    segmentsCount: 2
+);
+```
