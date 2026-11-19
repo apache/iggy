@@ -545,6 +545,7 @@ where
                     }
                     self.tick_fresh_writes().await;
                     self.tick_fresh_sweeps();
+                    self.tick_geo_positions();
                     self.tick_long_term_rewrites().await;
                     self.tick_long_term_merges().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
@@ -1447,6 +1448,21 @@ where
             }
             LifecycleFrame::PeerFreshFound(found) => {
                 self.on_peer_fresh_found(*found);
+            }
+            LifecycleFrame::ReportGeoPositions { round } => {
+                self.on_report_geo_positions(round).await;
+            }
+            LifecycleFrame::GeoPositionsReported(report) => {
+                self.on_geo_positions_reported(*report);
+            }
+            LifecycleFrame::GeoPositionsStored(finished) => {
+                self.on_positions_stored(*finished);
+            }
+            LifecycleFrame::PeerPositionsListed(positions) => {
+                self.on_peer_positions_listed(*positions).await;
+            }
+            LifecycleFrame::NoteGeoPositions { namespace } => {
+                self.on_note_geo_positions(namespace).await;
             }
             LifecycleFrame::SegmentMergeFinished(finished) => {
                 self.on_segment_merge_finished(*finished).await;

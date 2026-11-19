@@ -1307,6 +1307,9 @@ where
         let admission = (|| {
             request.options.validate(request.args.count)?;
             let (history, _, view) = self.validate_deferred_context(namespace, &request)?;
+            if let Some(error) = self.geo_position_refusal(namespace, request.consumer) {
+                return Err(error);
+            }
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;

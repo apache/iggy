@@ -88,6 +88,25 @@ pub struct GeoConfig {
     #[serde(default = "default_manifest_poll_interval")]
     #[config_env(leaf)]
     pub manifest_poll_interval: IggyDuration,
+    /// How often a node stores the positions of the consumer groups of its
+    /// geo and shadow topics in its store, when they changed. Another
+    /// datacenter's group re-reads at most this much more after a failover.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_positions_publish_interval")]
+    #[config_env(leaf)]
+    pub positions_publish_interval: IggyDuration,
+    /// How often a node lists the consumer group positions that each peer
+    /// publishes, and takes those that win over its own.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_positions_poll_interval")]
+    #[config_env(leaf)]
+    pub positions_poll_interval: IggyDuration,
+    /// How long, after a node starts, the group polls of its geo and shadow
+    /// partitions wait for the consumer group positions of every peer.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_positions_resume_timeout")]
+    #[config_env(leaf)]
+    pub positions_resume_timeout: IggyDuration,
 }
 
 impl Default for GeoConfig {
@@ -99,6 +118,9 @@ impl Default for GeoConfig {
             recover_cluster_uid: String::new(),
             recover_unproven: default_recover_unproven(),
             manifest_poll_interval: default_manifest_poll_interval(),
+            positions_publish_interval: default_positions_publish_interval(),
+            positions_poll_interval: default_positions_poll_interval(),
+            positions_resume_timeout: default_positions_resume_timeout(),
         }
     }
 }
@@ -197,9 +219,14 @@ impl Display for GeoConfig {
         }
         write!(
             f,
-            "], tombstone_grace: {}, manifest_poll_interval: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
+            "], tombstone_grace: {}, manifest_poll_interval: {}, positions_publish_interval: {}, \
+             positions_poll_interval: {}, positions_resume_timeout: {}, recover_cluster_uid: {}, \
+             recover_unproven: {} }}",
             self.tombstone_grace,
             self.manifest_poll_interval,
+            self.positions_publish_interval,
+            self.positions_poll_interval,
+            self.positions_resume_timeout,
             self.recover_cluster_uid,
             self.recover_unproven
         )
@@ -253,6 +280,12 @@ impl Validatable<ConfigurationError> for GeoConfig {
         }
         if self.manifest_poll_interval.is_zero() {
             return refuse("manifest_poll_interval must be longer than zero");
+        }
+        if self.positions_publish_interval.is_zero() {
+            return refuse("positions_publish_interval must be longer than zero");
+        }
+        if self.positions_poll_interval.is_zero() {
+            return refuse("positions_poll_interval must be longer than zero");
         }
         if self.peers.is_empty() {
             return Ok(());
@@ -395,6 +428,23 @@ fn default_manifest_poll_interval() -> IggyDuration {
     IggyDuration::new_from_secs(5)
 }
 
+/// A second: a group that moves to another datacenter re-reads about this
+/// much, and an object of a few groups each second costs little.
+fn default_positions_publish_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(1)
+}
+
+/// A second, as the publishing: a listing of each peer's positions a second.
+fn default_positions_poll_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(1)
+}
+
+/// Ten seconds: a few listings of each peer, and a short wait when a peer
+/// does not answer.
+fn default_positions_resume_timeout() -> IggyDuration {
+    IggyDuration::new_from_secs(10)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +498,38 @@ mod tests {
                 .contains("tombstone_grace: 1day, manifest_poll_interval: 5s,"),
             "{config}"
         );
+    }
+
+    #[test]
+    fn given_no_positions_keys_when_loading_should_publish_and_poll_each_second() {
+        let config: GeoConfig = serde_json::from_str(r#"{"origin":"dc-a"}"#).unwrap();
+        let tuned: GeoConfig = serde_json::from_str(
+            r#"{"origin":"dc-a","positions_publish_interval":"250 ms","positions_poll_interval":"2 s","positions_resume_timeout":"1 min"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.positions_publish_interval.get_duration().as_secs(),
+            1
+        );
+        assert_eq!(config.positions_poll_interval.get_duration().as_secs(), 1);
+        assert_eq!(config.positions_resume_timeout.get_duration().as_secs(), 10);
+        assert_eq!(
+            tuned.positions_publish_interval.get_duration().as_millis(),
+            250
+        );
+        assert_eq!(tuned.positions_poll_interval.get_duration().as_secs(), 2);
+        assert_eq!(tuned.positions_resume_timeout.get_duration().as_secs(), 60);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_zero_positions_interval_when_validating_should_refuse() {
+        for key in ["positions_publish_interval", "positions_poll_interval"] {
+            let config: GeoConfig =
+                serde_json::from_str(&format!(r#"{{"origin":"dc-a","{key}":"0"}}"#)).unwrap();
+            assert!(config.validate().is_err(), "{key}");
+        }
     }
 
     #[test]

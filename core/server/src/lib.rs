@@ -75,6 +75,7 @@ pub(crate) mod origin_recovery;
 pub(crate) mod partition_reconciler;
 pub(crate) mod peer_fresh;
 pub(crate) mod peer_manifests;
+pub(crate) mod peer_positions;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
     reconcile_partition_lifecycles, reconcile_pending_revocations,

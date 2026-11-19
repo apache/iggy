@@ -37,8 +37,8 @@ use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     KeyLayout, ListRequest, MAX_TOPIC_OBJECT_LEN, ObjectPrefix, ObjectStore, ObjectStoreError,
-    TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
-    TopicKey, TopicObject, TopicRead,
+    PositionsKey, PositionsObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest,
+    TierScope, TierScopeToken, TopicKey, TopicObject, TopicRead,
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -98,6 +98,22 @@ pub trait TopicObjects {
         prefix: ObjectPrefix,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, TopicObjectOutcome<Option<RecoveryPlan>>>;
+
+    /// Store `body`, an encoded [`iggy_object_store::PositionsObject`], under
+    /// `key`, over any object there.
+    fn put_positions(
+        &self,
+        key: PositionsKey,
+        body: Vec<u8>,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, TopicObjectOutcome<()>>;
+
+    /// Delete the positions object under `key`.
+    fn delete_positions(
+        &self,
+        key: PositionsKey,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, TopicObjectOutcome<()>>;
 }
 
 /// The jobs on topic objects, through a tier executor.
@@ -195,6 +211,43 @@ impl<E: TierExecutor> TopicObjects for ExecutorTopicObjects<E> {
         self.executor
             .submit(request, move |store| async move {
                 RecoveryPlan::read(&*store, &layout, retired_cluster_uid, &prefix).await
+            })
+            .boxed_local()
+    }
+
+    /// In the housekeeping class: positions follow commits by a second, and
+    /// nothing a client waits for queues behind them.
+    fn put_positions(
+        &self,
+        key: PositionsKey,
+        body: Vec<u8>,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, TopicObjectOutcome<()>> {
+        let layout = self.layout.clone();
+        let request =
+            TierJobRequest::new(TierJobClass::Housekeeping, scope).with_bytes(body.len() as u64);
+        self.executor
+            .submit(request, move |store| async move {
+                PositionsObject::put_encoded(&*store, &layout, &key, body).await
+            })
+            .boxed_local()
+    }
+
+    fn delete_positions(
+        &self,
+        key: PositionsKey,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, TopicObjectOutcome<()>> {
+        let layout = self.layout.clone();
+        let request = TierJobRequest::new(TierJobClass::Delete, scope);
+        self.executor
+            .submit(request, move |store| async move {
+                let key = layout.positions_key(&key);
+                let outcome = store.delete(std::slice::from_ref(&key)).await?;
+                match outcome.failed.into_iter().next() {
+                    None => Ok(()),
+                    Some(failure) => Err(failure.error),
+                }
             })
             .boxed_local()
     }

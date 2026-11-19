@@ -23,6 +23,7 @@
 //! decoding, the rejection `error` types, and per-credential `session` state.
 
 mod admission;
+mod drain;
 mod error;
 mod extractor;
 mod forward;
@@ -420,7 +421,11 @@ fn router(
             get(forward::answer_metadata_floor),
         )
         .route("/clients", get(get_clients))
-        .route("/clients/{client_id}", get(get_client));
+        .route("/clients/{client_id}", get(get_client))
+        .route(
+            "/streams/{stream_id}/topics/{topic_id}/consumer-groups/{group_id}/drain",
+            post(drain::drain_cg),
+        );
     let local = match metrics_endpoint {
         Some(endpoint) => local.route(endpoint, get(handlers::get_metrics)),
         None => local,

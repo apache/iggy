@@ -188,6 +188,7 @@ use crate::partition_helpers::{
 };
 use crate::peer_fresh::PeerFreshFollower;
 use crate::peer_manifests::{NodePlace, PeerManifestLister};
+use crate::peer_positions::PeerPositionLister;
 use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
@@ -365,6 +366,9 @@ pub struct ReconcilerCtx {
     /// The follows of the geo peers' fresh objects, which bring the shadow
     /// partitions here about a second behind their origins. Shard 0 only.
     peer_fresh: PeerFreshFollower,
+    /// The listings of the geo peers' consumer group positions, which the
+    /// primaries here adopt when they win. Shard 0 only.
+    peer_positions: PeerPositionLister,
     /// When the next pass over the partitions of geo topics may be staged,
     /// in microseconds since the Unix epoch.
     next_topic_object_check_at: Cell<u64>,
@@ -390,6 +394,7 @@ impl ReconcilerCtx {
         let shadow_topics = ShadowTopics::new(&config.geo);
         let peer_manifests = PeerManifestLister::new(&config.geo);
         let peer_fresh = PeerFreshFollower::new(&config.geo);
+        let peer_positions = PeerPositionLister::new(&config.geo);
         Self {
             shard,
             total_shards,
@@ -413,6 +418,7 @@ impl ReconcilerCtx {
             shadow_topics,
             peer_manifests,
             peer_fresh,
+            peer_positions,
             next_topic_object_check_at: Cell::new(0),
         }
     }
@@ -597,6 +603,8 @@ pub async fn run_reconciler(
     ctx.shadow_topics.stop(&ctx.shard);
     ctx.peer_manifests.stop();
     ctx.peer_fresh.stop();
+    ctx.peer_positions.stop();
+    ctx.shard.stop_geo_positions();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -694,6 +702,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     };
     ctx.peer_manifests.pass(&ctx.shard, now, place);
     ctx.peer_fresh.pass(&ctx.shard, place);
+    ctx.peer_positions.pass(&ctx.shard, now, place);
     stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {

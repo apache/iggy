@@ -114,8 +114,9 @@ pub enum GeoNote {
 pub struct LocalGroup {
     pub group_id: u32,
     pub name: String,
-    /// Whether a member of the group reads the partition here.
-    pub owned: bool,
+    /// Whether the group has members in this cluster. Their reads and
+    /// commits make its position here, so a peer's does not move it.
+    pub consuming: bool,
 }
 
 /// The positions of the consumer groups of one partition.
@@ -631,16 +632,16 @@ where
         notes
     }
 
-    /// Whether every one of `groups` that has an entry has it bound and
-    /// folded: the positions this partition publishes are what those groups
-    /// committed.
+    /// Whether every one of `groups` has an entry bound to it that folded
+    /// what it committed: the positions this partition publishes are what
+    /// those groups committed.
     #[must_use]
     pub fn geo_positions_folded(&self, groups: &[LocalGroup]) -> bool {
         let Some(positions) = self.geo_positions() else {
             return true;
         };
         groups.iter().all(|group| {
-            positions.get(&group.name).is_none_or(|entry| {
+            positions.get(&group.name).is_some_and(|entry| {
                 entry.bound == Some(group.group_id)
                     && entry.base == self.committed_group_offset(group.group_id)
             })
@@ -648,8 +649,8 @@ where
     }
 
     /// The positions of `peer` that this partition takes: those higher than
-    /// its own, of a name whose local group no member reads here, or of any
-    /// name while `owned_groups_too` (no member reads anything while it is
+    /// its own, of a name whose local group has no members here, or of any
+    /// name while `consuming_groups_too` (no group reads anything while it is
     /// set). A group with a stored offset its entry has not folded yet waits
     /// for the fold.
     #[must_use]
@@ -657,7 +658,7 @@ where
         &self,
         groups: &[LocalGroup],
         peer: &BTreeMap<String, GeoPosition>,
-        owned_groups_too: bool,
+        consuming_groups_too: bool,
     ) -> Vec<(String, GeoPosition)> {
         let Some(positions) = self.geo_positions() else {
             return Vec::new();
@@ -672,7 +673,7 @@ where
                 continue;
             }
             if let Some(group) = groups.iter().find(|group| group.name == *name) {
-                if group.owned && !owned_groups_too {
+                if group.consuming && !consuming_groups_too {
                     continue;
                 }
                 let folded = entry.is_some_and(|entry| {
