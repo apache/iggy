@@ -295,7 +295,9 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagCmd {
         }
 
         let mut messages = (1..=self.messages_count)
-            .filter_map(|id| IggyMessage::from_str(format!("Test message {id}").as_str()).ok())
+            .map(|id| {
+                IggyMessage::from_str(format!("Test message {id}").as_str()).expect("test message")
+            })
             .collect::<Vec<_>>();
         client
             .send_messages(
@@ -334,18 +336,31 @@ impl IggyCmdTestCase for TestConsumerGroupGetLagCmd {
 
     fn verify_command(&self, command_state: Assert) {
         let current_offset = self.messages_count - 1;
+        let assertion = match self.stored_offset {
+            Some(_) => command_state.success(),
+            None => command_state.success().stdout(contains("Stored offset")),
+        };
+        let stdout = std::str::from_utf8(&assertion.get_output().stdout)
+            .expect("CLI output should be UTF-8");
+        let rows = stdout
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
         match self.stored_offset {
             Some(stored_offset) => {
                 let lag = current_offset as u64 - stored_offset;
-                command_state.success().stdout(contains(format!(
-                    "{current_offset}              | {stored_offset}             | {lag}"
-                )));
+                assert!(
+                    rows.iter().any(|line| {
+                        line.contains(&format!("| {current_offset} | {stored_offset} | {lag}"))
+                    }),
+                    "{stdout}"
+                );
             }
             None => {
-                command_state
-                    .success()
-                    .stdout(contains("Stored offset"))
-                    .stdout(contains("-              | -             | -"));
+                assert!(
+                    rows.iter().any(|line| line.contains("| - | - | -")),
+                    "{stdout}"
+                );
             }
         }
     }

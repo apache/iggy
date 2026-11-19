@@ -68,8 +68,8 @@ impl CliCommand for GetConsumerGroupCmd {
 
         let consumer_group = consumer_group.unwrap();
 
-        // The lookup id can be a name. Offset reads stay on the group this
-        // reply returned, even if that name is recreated before they run.
+        // Lookups can be names. Offset reads stay on the group, stream, and
+        // topic these replies returned, even if a name is recreated first.
         let consumer = Consumer::group(Identifier::numeric(consumer_group.id)?);
         let mut owners = HashMap::with_capacity(
             consumer_group
@@ -103,14 +103,36 @@ impl CliCommand for GetConsumerGroupCmd {
             }
         }
 
-        let topic = match client.get_topic(&self.stream_id, &self.topic_id).await {
+        let log_without_partitions = || {
+            log_consumer_group(
+                &consumer_group,
+                render_members.then_some(&members_table),
+                None,
+            );
+        };
+
+        let stream = match client.get_stream(&self.stream_id).await {
+            Ok(Some(stream)) => stream,
+            Ok(None) => {
+                log_without_partitions();
+                return Err(anyhow::anyhow!(
+                    "Stream with ID: {} was not found",
+                    self.stream_id
+                ));
+            }
+            Err(error) => {
+                log_without_partitions();
+                return Err(error).with_context(|| {
+                    format!("Problem getting stream with ID: {}", self.stream_id)
+                });
+            }
+        };
+        let stream_id = Identifier::numeric(stream.id)?;
+
+        let topic = match client.get_topic(&stream_id, &self.topic_id).await {
             Ok(Some(topic)) => topic,
             Ok(None) => {
-                log_consumer_group(
-                    &consumer_group,
-                    render_members.then_some(&members_table),
-                    None,
-                );
+                log_without_partitions();
                 return Err(anyhow::anyhow!(
                     "Topic with ID: {} in stream with ID: {} was not found",
                     self.topic_id,
@@ -118,11 +140,7 @@ impl CliCommand for GetConsumerGroupCmd {
                 ));
             }
             Err(error) => {
-                log_consumer_group(
-                    &consumer_group,
-                    render_members.then_some(&members_table),
-                    None,
-                );
+                log_without_partitions();
                 return Err(error).with_context(|| {
                     format!(
                         "Problem getting topic with ID: {} in stream with ID: {}",
@@ -142,6 +160,7 @@ impl CliCommand for GetConsumerGroupCmd {
             "Lag",
         ]);
 
+        let topic_id = Identifier::numeric(topic.id)?;
         let mut partitions = topic.partitions;
         partitions.sort_by_key(|partition| partition.id);
         let mut offset_error = None;
@@ -152,12 +171,7 @@ impl CliCommand for GetConsumerGroupCmd {
                 .map(|member_id| format!("{member_id}"))
                 .unwrap_or_else(|| "-".to_string());
             let consumer_offset = client
-                .get_consumer_offset(
-                    &consumer,
-                    &self.stream_id,
-                    &self.topic_id,
-                    Some(partition_id),
-                )
+                .get_consumer_offset(&consumer, &stream_id, &topic_id, Some(partition_id))
                 .await
                 .with_context(|| {
                     format!(
@@ -286,15 +300,22 @@ mod tests {
     struct ScriptedClient {
         partitions_count: u32,
         topic: TopicReply,
-        offset_fails: bool,
         offset_fails_for: Option<u32>,
         /// `(current_offset, stored_offset)` returned for every partition.
         offset: Option<(u64, u64)>,
         members: Vec<ConsumerGroupMember>,
         /// Numeric id returned by `get_consumer_group`.
         group_id: u32,
-        /// Consumers passed to `get_consumer_offset`, in call order.
-        offset_consumers: Mutex<Vec<Identifier>>,
+        stream_missing: bool,
+        /// Stream, topic, and group ids passed to `get_consumer_offset`, in call order.
+        offset_reads: Mutex<Vec<OffsetRead>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct OffsetRead {
+        stream_id: Identifier,
+        topic_id: Identifier,
+        group_id: Identifier,
     }
 
     struct LogBuffer(Arc<Mutex<Vec<u8>>>);
@@ -363,14 +384,7 @@ mod tests {
         )
     }
 
-    async fn error_from(client: &ScriptedClient) -> anyhow::Error {
-        let mut cmd = command();
-        cmd.execute_cmd(client)
-            .await
-            .expect_err("consumer group get should fail")
-    }
-
-    async fn printed_error(client: &ScriptedClient) -> (String, anyhow::Error) {
+    async fn with_logs(client: &ScriptedClient) -> (String, anyhow::Result<()>) {
         let logs = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::INFO)
@@ -381,30 +395,23 @@ mod tests {
             .with_writer(LogBuffer(Arc::clone(&logs)))
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        let error = error_from(client).await;
+        let mut cmd = command();
+        let result = cmd.execute_cmd(client).await;
         drop(_guard);
         let output =
             String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8");
-        (output, error)
+        (output, result)
+    }
+
+    async fn printed_error(client: &ScriptedClient) -> (String, anyhow::Error) {
+        let (output, result) = with_logs(client).await;
+        (output, result.expect_err("consumer group get should fail"))
     }
 
     async fn rendered(client: &ScriptedClient) -> String {
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::INFO)
-            .with_ansi(false)
-            .without_time()
-            .with_target(false)
-            .with_level(false)
-            .with_writer(LogBuffer(Arc::clone(&logs)))
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        let mut cmd = command();
-        cmd.execute_cmd(client)
-            .await
-            .expect("consumer group get should print the group");
-        drop(_guard);
-        String::from_utf8(logs.lock().expect("log buffer").clone()).expect("log is utf-8")
+        let (output, result) = with_logs(client).await;
+        result.expect("consumer group get should print the group");
+        output
     }
 
     #[async_trait]
@@ -566,7 +573,19 @@ mod tests {
             &self,
             _stream_id: &Identifier,
         ) -> Result<Option<StreamDetails>, IggyError> {
-            fail()
+            if self.stream_missing {
+                return Ok(None);
+            }
+            Ok(Some(StreamDetails {
+                id: 1,
+                created_at: IggyTimestamp::zero(),
+                name: "stream".to_owned(),
+                size: IggyByteSize::default(),
+                messages_count: 0,
+                topics_count: 0,
+                topics: Vec::new(),
+                options: Default::default(),
+            }))
         }
 
         async fn get_streams(&self) -> Result<Vec<Stream>, IggyError> {
@@ -729,18 +748,21 @@ mod tests {
         async fn get_consumer_offset(
             &self,
             consumer: &Consumer,
-            _stream_id: &Identifier,
-            _topic_id: &Identifier,
+            stream_id: &Identifier,
+            topic_id: &Identifier,
             _partition_id: Option<u32>,
         ) -> Result<Option<ConsumerOffsetInfo>, IggyError> {
-            self.offset_consumers
+            self.offset_reads
                 .lock()
-                .expect("offset consumers")
-                .push(consumer.id.clone());
-            if self.offset_fails
-                || self
-                    .offset_fails_for
-                    .is_some_and(|partition_id| Some(partition_id) == _partition_id)
+                .expect("offset reads")
+                .push(OffsetRead {
+                    stream_id: stream_id.clone(),
+                    topic_id: topic_id.clone(),
+                    group_id: consumer.id.clone(),
+                });
+            if self
+                .offset_fails_for
+                .is_some_and(|partition_id| Some(partition_id) == _partition_id)
             {
                 Err(IggyError::Error)
             } else if let Some((current_offset, stored_offset)) = self.offset {
@@ -869,12 +891,12 @@ mod tests {
         let (output, error) = printed_error(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Error,
-            offset_fails: false,
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -887,15 +909,35 @@ mod tests {
         let (output, error) = printed_error(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Missing,
-            offset_fails: false,
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
+        assert!(error.to_string().contains("was not found"));
+        assert!(output.contains("group"), "{output}");
+        assert!(!output.contains("Current offset"), "{output}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn should_report_missing_stream() {
+        let (output, error) = printed_error(&ScriptedClient {
+            partitions_count: 1,
+            topic: TopicReply::OnePartition,
+            offset_fails_for: None,
+            offset: None,
+            members: Vec::new(),
+            group_id: 3,
+            stream_missing: true,
+            offset_reads: Mutex::new(Vec::new()),
+        })
+        .await;
+
+        assert!(error.to_string().contains("Stream with ID:"));
         assert!(error.to_string().contains("was not found"));
         assert!(output.contains("group"), "{output}");
         assert!(!output.contains("Current offset"), "{output}");
@@ -906,12 +948,12 @@ mod tests {
         let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Empty,
-            offset_fails: false,
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -924,7 +966,6 @@ mod tests {
         let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Partitions(vec![partition(3)]),
-            offset_fails: false,
             offset_fails_for: None,
             offset: Some((20, 5)),
             members: vec![ConsumerGroupMember {
@@ -933,7 +974,8 @@ mod tests {
                 partitions: vec![3],
             }],
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -947,7 +989,6 @@ mod tests {
         let output = rendered(&ScriptedClient {
             partitions_count: 2,
             topic: TopicReply::Partitions(vec![partition(4), partition(3)]),
-            offset_fails: false,
             offset_fails_for: None,
             offset: Some((20, 5)),
             members: vec![ConsumerGroupMember {
@@ -956,7 +997,8 @@ mod tests {
                 partitions: vec![4, 3],
             }],
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -975,33 +1017,11 @@ mod tests {
         assert!(row_3 < row_4, "{output}");
     }
 
-    #[tokio::test]
-    async fn should_report_offset_fetch_failure() {
-        let error = error_from(&ScriptedClient {
-            partitions_count: 1,
-            topic: TopicReply::OnePartition,
-            offset_fails: true,
-            offset_fails_for: None,
-            offset: None,
-            members: Vec::new(),
-            group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
-        })
-        .await;
-
-        assert!(
-            error
-                .to_string()
-                .contains("Problem getting consumer offset")
-        );
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn should_print_the_group_when_one_offset_read_fails() {
         let (output, error) = printed_error(&ScriptedClient {
             partitions_count: 2,
             topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
-            offset_fails: false,
             offset_fails_for: Some(1),
             offset: Some((20, 5)),
             members: vec![ConsumerGroupMember {
@@ -1010,7 +1030,8 @@ mod tests {
                 partitions: vec![0, 1],
             }],
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -1036,12 +1057,12 @@ mod tests {
         cmd.execute_cmd(&ScriptedClient {
             partitions_count: MAX_PARTITIONS_COUNT + 1,
             topic: TopicReply::Count(MAX_PARTITIONS_COUNT + 1),
-            offset_fails: false,
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await
         .expect("a topic can grow past one create request");
@@ -1055,17 +1076,21 @@ mod tests {
         let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Partitions(vec![partition]),
-            offset_fails: false,
             offset_fails_for: None,
             offset: None,
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
+        let rows = output
+            .lines()
+            .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
         assert!(
-            output.contains("-              | -             | -"),
+            rows.iter().any(|line| line.contains("- | - | -")),
             "local topic counters are not the lag, got {output}"
         );
         assert!(
@@ -1081,12 +1106,12 @@ mod tests {
         let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Partitions(vec![partition]),
-            offset_fails: false,
             offset_fails_for: None,
             offset: Some((4, 10)),
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -1107,12 +1132,12 @@ mod tests {
         let output = rendered(&ScriptedClient {
             partitions_count: 1,
             topic: TopicReply::Partitions(vec![partition]),
-            offset_fails: false,
             offset_fails_for: None,
             offset: Some((20, 5)),
             members: Vec::new(),
             group_id: 3,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         })
         .await;
 
@@ -1128,28 +1153,28 @@ mod tests {
         let client = ScriptedClient {
             partitions_count: 2,
             topic: TopicReply::Partitions(vec![partition(0), partition(1)]),
-            offset_fails: false,
             offset_fails_for: None,
             offset: Some((20, 5)),
             members: Vec::new(),
             group_id: 9,
-            offset_consumers: Mutex::new(Vec::new()),
+            stream_missing: false,
+            offset_reads: Mutex::new(Vec::new()),
         };
         let mut cmd = GetConsumerGroupCmd::new(
-            Identifier::numeric(1).unwrap(),
-            Identifier::numeric(2).unwrap(),
+            Identifier::named("stream").unwrap(),
+            Identifier::named("topic").unwrap(),
             Identifier::named("group").unwrap(),
         );
         cmd.execute_cmd(&client)
             .await
             .expect("consumer group get should read offsets by numeric id");
 
-        let seen = client
-            .offset_consumers
-            .lock()
-            .expect("offset consumers")
-            .clone();
-        let expected = Identifier::numeric(9).unwrap();
+        let seen = client.offset_reads.lock().expect("offset reads").clone();
+        let expected = OffsetRead {
+            stream_id: Identifier::numeric(1).unwrap(),
+            topic_id: Identifier::numeric(2).unwrap(),
+            group_id: Identifier::numeric(9).unwrap(),
+        };
         assert_eq!(seen, vec![expected.clone(), expected]);
     }
 }
