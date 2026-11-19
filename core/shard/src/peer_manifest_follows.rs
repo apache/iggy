@@ -30,6 +30,11 @@
 //! What a shard knows of etags lives in memory and only on the primary. A
 //! new primary reads every manifest once, and one that the partition already
 //! committed costs no command.
+//!
+//! Once the origin of a shadow partition retired, no listing comes again.
+//! The segment cleaner then stages [`LifecycleFrame::RetainRetiredPeer`],
+//! and the primary commits the committed manifest without the segments that
+//! the topic's retention removes, through the same commands.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -37,7 +42,7 @@ use std::rc::Rc;
 
 use consensus::PartitionsHandle;
 use iggy_binary_protocol::PrepareHeader;
-use iggy_common::IggyTimestamp;
+use iggy_common::{IggyExpiry, IggyTimestamp};
 use iggy_object_store::PartitionManifest;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -357,6 +362,96 @@ where
             // Nothing waits for the reply: a command that is refused or lost
             // leaves the committed manifest behind the etag, and the next
             // listing reads the manifest again.
+            let (reply, _unread) = channel(1);
+            self.dispatch_partition_submit(request, reply, None, None)
+                .await;
+        }
+    }
+
+    /// Stage the retention of `namespace`, a shadow partition whose origin
+    /// retired, on this shard's pump. A refused frame is picked up by the
+    /// cleaner's next tick.
+    pub fn request_retain_retired_peer(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::RetainRetiredPeer {
+            namespace,
+            created_revision,
+            now,
+            message_expiry,
+            max_bytes,
+        }));
+    }
+
+    /// Stop serving the fresh batches of `namespace` on this replica, and on
+    /// its primary commit what the retention removes from the committed
+    /// manifest. The partition forgets what it followed, so its lag no
+    /// longer counts.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn on_retain_retired_peer(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) where
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        let requests = {
+            let partitions = self.plane.partitions();
+            let Some(partition) = partitions
+                .get_mut_by_ns(&namespace)
+                .filter(|partition| partition.created_revision() == created_revision)
+            else {
+                return;
+            };
+            partition.drop_peer_fresh();
+            if let Some(follow) = self
+                .peer_manifest_follows
+                .follows
+                .borrow_mut()
+                .remove(&namespace)
+            {
+                self.metrics.set_shadow_manifest_lag(&follow.origin, 0, 0);
+            }
+            let Some(trimmed) = partition.retired_peer_retention(now, message_expiry, max_bytes)
+            else {
+                return;
+            };
+            let first = self.peer_manifest_follows.requests.get().wrapping_add(1);
+            match partition.peer_manifest_requests(&trimmed, first) {
+                Ok(requests) => {
+                    self.peer_manifest_follows
+                        .requests
+                        .set(first.wrapping_add(requests.len() as u64));
+                    requests
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        shard = self.id,
+                        namespace_raw = namespace.inner(),
+                        %error,
+                        "the retention of a shadow partition of a retired origin cannot be committed"
+                    );
+                    return;
+                }
+            }
+        };
+        for request in requests {
+            // The next tick of the cleaner proposes again what did not
+            // commit.
             let (reply, _unread) = channel(1);
             self.dispatch_partition_submit(request, reply, None, None)
                 .await;

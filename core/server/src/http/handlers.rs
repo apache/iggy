@@ -56,7 +56,8 @@ use iggy_binary_protocol::requests::streams::{
     CreateStreamRequest, DeleteStreamRequest, GetStreamRequest, GetStreamsRequest,
 };
 use iggy_binary_protocol::requests::system::{
-    DescribeOptionsRequest, GetStatsRequest, ResourceTarget, UpdateResourceRequest,
+    DescribeOptionsRequest, GetStatsRequest, ResourceTarget, RetireGeoOriginRequest,
+    UpdateResourceRequest,
 };
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
@@ -2367,6 +2368,26 @@ pub(in crate::http) async fn delete_pat_named_login(
     identity: Authenticated,
 ) -> Result<StatusCode, WriteError> {
     delete_pat(state, identity, Path("login".to_owned())).await
+}
+
+/// Retire the geo peer `origin`, which never returns.
+pub(in crate::http) async fn retire_geo_origin(
+    State(state): State<HttpState>,
+    identity: Authenticated,
+    Path(origin): Path<String>,
+) -> Result<StatusCode, WriteError> {
+    let request = RetireGeoOriginRequest {
+        origin: WireName::new(&origin)
+            .map_err(|_| WriteError::Rejected(IggyError::InvalidFormat))?,
+    };
+    SendWrapper::new(submit_write(
+        &state,
+        &identity.session,
+        Operation::RetireGeoOrigin,
+        request.to_bytes(),
+    ))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Mint a token only while the account verified by login or named by the

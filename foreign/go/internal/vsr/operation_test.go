@@ -52,6 +52,7 @@ func TestOperationForCode_ResolvesTheReplicatedTable(t *testing.T) {
 		{code: command.JoinGroupCode, want: OperationJoinConsumerGroup},
 		{code: command.LeaveGroupCode, want: OperationLeaveConsumerGroup},
 		{code: command.UpdateResourceCode, want: OperationUpdateResource},
+		{code: command.RetireGeoOriginCode, want: OperationRetireGeoOrigin},
 	}
 	require.Len(t, tests, len(replicatedOperation), "every replicated entry is covered")
 	for _, test := range tests {
@@ -112,7 +113,7 @@ func TestIsKnownOperation_RejectsUndeclaredDiscriminants(t *testing.T) {
 		assert.True(t, IsKnownOperation(operation), "operation %d", operation)
 	}
 
-	undeclared := []Operation{4, 63, 69, 77, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 255}
+	undeclared := []Operation{4, 63, 69, 77, 127, 129, 131, 133, 135, 142, 152, 159, 163, 164, 165, 255}
 	for _, operation := range undeclared {
 		assert.False(t, IsKnownOperation(operation), "operation %d", operation)
 	}
@@ -142,6 +143,7 @@ func TestIsMetadata_ExcludesDeleteSegments(t *testing.T) {
 		OperationCreatePersonalAccessToken,
 		OperationLeaveConsumerGroup,
 		OperationUpdateResource,
+		OperationRetireGeoOrigin,
 		OperationUpdateStreamResolved,
 		OperationUpdateUserResolved,
 	}

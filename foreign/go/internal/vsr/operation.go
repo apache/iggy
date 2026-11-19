@@ -63,6 +63,7 @@ const (
 	OperationJoinConsumerGroup         Operation = 148
 	OperationLeaveConsumerGroup        Operation = 149
 	OperationUpdateResource            Operation = 150
+	OperationRetireGeoOrigin           Operation = 151
 
 	OperationSendMessages               Operation = 160
 	OperationStoreConsumerOffset        Operation = 161
@@ -117,6 +118,7 @@ var allOperations = []Operation{
 	OperationJoinConsumerGroup,
 	OperationLeaveConsumerGroup,
 	OperationUpdateResource,
+	OperationRetireGeoOrigin,
 	OperationSendMessages,
 	OperationStoreConsumerOffset,
 	OperationDeleteConsumerOffset,
@@ -155,6 +157,7 @@ var replicatedOperation = map[uint32]Operation{
 	uint32(command.JoinGroupCode):            OperationJoinConsumerGroup,
 	uint32(command.LeaveGroupCode):           OperationLeaveConsumerGroup,
 	uint32(command.UpdateResourceCode):       OperationUpdateResource,
+	uint32(command.RetireGeoOriginCode):      OperationRetireGeoOrigin,
 }
 
 func newOperationSet(operations []Operation) map[Operation]struct{} {
@@ -215,7 +218,7 @@ func IsMetadata(operation Operation) bool {
 	if operation == OperationDeleteSegments {
 		return false
 	}
-	return operation >= metadataBandStart && operation <= OperationUpdateResource
+	return operation >= metadataBandStart && operation <= OperationRetireGeoOrigin
 }
 
 // IsResultFramed reports whether the reply body leads with a committed result

@@ -762,6 +762,7 @@ pub const fn operation_as_str(operation: Operation) -> &'static str {
         Operation::UpdateTopicResolved => "update_topic_resolved",
         Operation::UpdateUserResolved => "update_user_resolved",
         Operation::UpdateResource => "update_resource",
+        Operation::RetireGeoOrigin => "retire_geo_origin",
         Operation::CreateStream => "create_stream",
         Operation::DeleteStream => "delete_stream",
         Operation::CreateTopic => "create_topic",

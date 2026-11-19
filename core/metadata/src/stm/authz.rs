@@ -407,6 +407,7 @@ pub(crate) fn authorize(
         Operation::DeleteUser => check(users, |perm| perm.delete_user(user_id)),
         Operation::UpdateUserResolved => check(users, |perm| perm.update_user(user_id)),
         Operation::UpdatePermissions => check(users, |perm| perm.update_permissions(user_id)),
+        Operation::RetireGeoOrigin => check(users, |perm| perm.retire_geo_origin(user_id)),
         Operation::ChangePassword => {
             let Ok(request) = ChangePasswordRequest::decode_from(body) else {
                 return None;

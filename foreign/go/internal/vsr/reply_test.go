@@ -168,7 +168,7 @@ func TestDecodeReplyFor_RejectsAFrameAboveTheTransportLimit(t *testing.T) {
 }
 
 func TestDecodeReplyFor_RejectsAnUndeclaredReplyOperation(t *testing.T) {
-	for _, operation := range []Operation{4, 63, 129, 133, 142, 151, 163, 255} {
+	for _, operation := range []Operation{4, 63, 129, 133, 142, 152, 163, 255} {
 		request, reply := exchange(OperationNonReplicated, 0, 0)
 		reply[replyOffsetOperation] = byte(operation)
 

@@ -47,6 +47,12 @@
 //! shadow topics of the peer are stale: they serve what they hold, and the
 //! pass removes none of them but those whose grace ended.
 //!
+//! A peer whose origin retired is read no more. Each of its shadow topics is
+//! removed once the topic's retention in the peer passed since the
+//! retirement, or once the grace of its tombstone ended, and each of its
+//! shadow streams once it holds no topic. A topic whose messages never
+//! expire stays until a client deletes it.
+//!
 //! A node whose own store names another cluster creates no shadow stream:
 //! that cluster may be one that lost every disk, whose streams a recovery
 //! restores under their ids, and a shadow stream created first could take
@@ -71,7 +77,8 @@ use iggy_object_store::{
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::shadow::{
-    ShadowStream, ShadowTopicRequest, ShadowTopicTarget, shadow_stream_name,
+    RetiredOrigin, ShadowRetention, ShadowStream, ShadowTopicRequest, ShadowTopicTarget,
+    shadow_stream_name,
 };
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::{ExecutorTopicObjects, TopicObjects};
@@ -115,8 +122,7 @@ type PeerSource = Box<dyn Fn(&ServerShard) -> Vec<PeerTopics>>;
 /// The shadow streams that the metadata primary keeps in step with its geo
 /// peers.
 pub struct ShadowTopics {
-    /// `None` on a node without geo peers.
-    settings: Option<Settings>,
+    settings: Settings,
     peers: PeerSource,
     /// Shared with the task of the pass.
     state: Rc<RefCell<State>>,
@@ -126,6 +132,8 @@ pub struct ShadowTopics {
 struct Settings {
     /// In microseconds.
     tombstone_grace: u64,
+    /// The node reads at least one peer.
+    has_peers: bool,
 }
 
 #[derive(Default)]
@@ -193,11 +201,11 @@ impl ShadowTopics {
     /// The shadow streams of the peers that `peers` gives.
     #[must_use]
     pub fn with_peers(config: &GeoConfig, peers: PeerSource) -> Self {
-        let settings = (!config.peers.is_empty()).then(|| Settings {
-            tombstone_grace: micros(config.tombstone_grace.get_duration()),
-        });
         Self {
-            settings,
+            settings: Settings {
+                tombstone_grace: micros(config.tombstone_grace.get_duration()),
+                has_peers: !config.peers.is_empty(),
+            },
             peers,
             state: Rc::default(),
         }
@@ -206,12 +214,15 @@ impl ShadowTopics {
     /// Read the peers' stores and propose what committed metadata lacks, in
     /// a detached task. A pass while that task runs starts nothing. A node
     /// that is not the caught-up metadata primary forgets what it read and
-    /// stops its task.
+    /// stops its task. A node without peers passes only while a shadow
+    /// stream of a retired origin is left to remove.
     pub fn pass(&self, shard: &Rc<ServerShard>, now: IggyTimestamp) {
-        let Some(settings) = self.settings else {
-            return;
-        };
+        let settings = self.settings;
         let metadata = shard.plane.metadata();
+        let streams = metadata.mux_stm.streams();
+        if !settings.has_peers && !streams.read(holds_retired_shadow_streams) {
+            return;
+        }
         if !metadata.is_caught_up_primary()
             || metadata.applied_frontier().store_claimed_by_another()
         {
@@ -223,7 +234,16 @@ impl ShadowTopics {
             return;
         }
         state.next_pass_at = now.as_micros().saturating_add(micros(PASS_INTERVAL));
-        let peers = (self.peers)(shard);
+        let retired = streams.retired_origins();
+        for origin in retired.keys() {
+            if state.peers.remove(origin).is_some() {
+                shard.metrics().set_geo_shadow_topics_stale(origin, 0);
+            }
+        }
+        let peers: Vec<PeerTopics> = (self.peers)(shard)
+            .into_iter()
+            .filter(|peer| !retired.contains_key(&peer.origin))
+            .collect();
         let scope = TierScope::new();
         state.tasks += 1;
         let task = Task {
@@ -627,19 +647,87 @@ fn plan(
     tombstone_grace: u64,
 ) -> Plan {
     let mut plan = Plan::default();
-    for (origin, view) in peers {
+    for (origin, retired) in &inner.retired_origins {
+        if let Some(proposal) = expire_retired(inner, origin, retired, now, tombstone_grace) {
+            plan.proposal = Some(proposal);
+            return plan;
+        }
+    }
+    let followed = peers
+        .iter()
+        .filter(|(origin, _)| !inner.retired_origins.contains_key(*origin));
+    for (origin, view) in followed.clone() {
         if let Some(proposal) = retire(inner, origin, view, now, tombstone_grace) {
             plan.proposal = Some(proposal);
             return plan;
         }
     }
-    for (origin, view) in peers {
+    for (origin, view) in followed {
         if let Some(proposal) = adopt(inner, origin, view, &mut plan.reports) {
             plan.proposal = Some(proposal);
             return plan;
         }
     }
     plan
+}
+
+/// Whether committed metadata holds a shadow stream of a retired origin.
+fn holds_retired_shadow_streams(inner: &StreamsInner) -> bool {
+    inner
+        .retired_origins
+        .keys()
+        .any(|origin| shadow_streams_of(inner, origin).next().is_some())
+}
+
+/// A removal that the retirement of `origin` asks for: a shadow topic whose
+/// retention in the peer passed since the retirement or whose tombstone's
+/// grace ended, then a shadow stream without topics. Every message of the
+/// topic is older than the retirement, so none is left by then.
+fn expire_retired(
+    inner: &StreamsInner,
+    origin: &str,
+    retired: &RetiredOrigin,
+    now: u64,
+    tombstone_grace: u64,
+) -> Option<ShadowTopicRequest> {
+    for (stream_id, stream) in shadow_streams_of(inner, origin) {
+        let source = stream.shadow.as_ref()?;
+        let stream_id = u32::try_from(stream_id).ok()?;
+        for (topic_id, topic) in &stream.topics {
+            let Some(shadow) = topic.shadow else {
+                continue;
+            };
+            let detached_end = shadow
+                .deleted_at
+                .map(|deleted_at| deleted_at.saturating_add(tombstone_grace));
+            let expired_end = shadow
+                .retention
+                .expiry_micros()
+                .map(|expiry| retired.retired_at.saturating_add(expiry));
+            if detached_end
+                .into_iter()
+                .chain(expired_end)
+                .min()
+                .is_some_and(|end| now >= end)
+            {
+                return Some(ShadowTopicRequest::RemoveTopic {
+                    target: ShadowTopicTarget {
+                        stream_id,
+                        source: source.clone(),
+                        topic_id: u32::try_from(topic_id).ok()?,
+                        created_revision: shadow.created_revision,
+                    },
+                });
+            }
+        }
+        if stream.topics.is_empty() {
+            return Some(ShadowTopicRequest::RemoveStream {
+                stream_id,
+                source: source.clone(),
+            });
+        }
+    }
+    None
 }
 
 /// Record when a complete listing first lacked the object of each shadow
@@ -862,6 +950,7 @@ fn adopt(
                     created_revision: object.key.created_revision,
                 },
                 create: Box::new(adoption(stream_id, object)?),
+                retention: retention_of(object),
             });
         }
     }
@@ -890,6 +979,14 @@ fn adoption(stream_id: usize, object: &TopicObject) -> Option<CreateTopicWithAss
     })
 }
 
+/// The retention of the topic of `object` in the peer.
+const fn retention_of(object: &TopicObject) -> ShadowRetention {
+    ShadowRetention {
+        message_expiry: object.message_expiry,
+        max_topic_size: object.max_topic_size,
+    }
+}
+
 /// `proposal` for the log.
 fn describe(proposal: &ShadowTopicRequest) -> String {
     match proposal {
@@ -906,7 +1003,7 @@ fn describe(proposal: &ShadowTopicRequest) -> String {
         ShadowTopicRequest::RemoveStream { stream_id, .. } => {
             format!("remove stream {stream_id}")
         }
-        ShadowTopicRequest::AdoptTopic { target, create } => format!(
+        ShadowTopicRequest::AdoptTopic { target, create, .. } => format!(
             "adopt topic {} ({}) of {} into stream {}",
             target.topic_id,
             create.request.name.as_str(),
@@ -952,6 +1049,7 @@ fn micros(duration: Duration) -> u64 {
 mod tests {
     use super::*;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::system::RetireGeoOriginRequest;
     use iggy_object_store::TopicGeoMode;
     use metadata::stm::StateHandler;
 
@@ -1046,13 +1144,45 @@ mod tests {
 
     /// The committed state once the pass adopted the peer's topic.
     fn adopted() -> (StreamsInner, u32) {
+        adopted_from(object(key(), "orders", 10))
+    }
+
+    /// The committed state once the pass adopted the topic of `object`.
+    fn adopted_from(object: TopicObject) -> (StreamsInner, u32) {
         let mut inner = StreamsInner::new();
-        let peers = view([object(key(), "orders", 10)]);
+        let peers = view([object]);
         apply_plan(&mut inner, &peers);
         apply_plan(&mut inner, &peers);
         let stream_id =
             u32::try_from(inner.resolve_stream_id(&named(SHADOW_NAME)).unwrap()).unwrap();
         (inner, stream_id)
+    }
+
+    /// The peer's object of a topic whose messages live `expiry`
+    /// microseconds, in at most `bytes` bytes.
+    fn retained(expiry: u64, bytes: u64) -> TopicObject {
+        TopicObject {
+            message_expiry: expiry,
+            max_topic_size: bytes,
+            ..object(key(), "orders", 10)
+        }
+    }
+
+    fn target(stream_id: u32) -> ShadowTopicTarget {
+        ShadowTopicTarget {
+            stream_id,
+            source: source(),
+            topic_id: u32::try_from(PEER_TOPIC).unwrap(),
+            created_revision: PEER_REVISION,
+        }
+    }
+
+    /// Commit the retirement of `origin` at `at`.
+    fn retire_origin(inner: &mut StreamsInner, origin: &str, at: u64) {
+        let retire = RetireGeoOriginRequest {
+            origin: WireName::new(origin).unwrap(),
+        };
+        assert_eq!(retire.apply(inner, IggyTimestamp::from(at)).code, 0);
     }
 
     fn named(name: &str) -> WireIdentifier {
@@ -1108,6 +1238,91 @@ mod tests {
             plan(&inner, &view([object(key(), "orders", 10)]), NOW, GRACE).proposal,
             None,
             "nothing more to do"
+        );
+    }
+
+    #[test]
+    fn given_an_object_with_retention_when_adopting_should_keep_the_peers_retention() {
+        let (inner, stream_id) = adopted_from(retained(3_600_000_000, 1 << 30));
+
+        let shadow = inner.items[stream_id as usize].topics[PEER_TOPIC_SLOT]
+            .shadow
+            .unwrap();
+        assert_eq!(
+            shadow.retention,
+            ShadowRetention {
+                message_expiry: 3_600_000_000,
+                max_topic_size: 1 << 30,
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_planning_should_follow_nothing_of_it() {
+        let mut inner = StreamsInner::new();
+        retire_origin(&mut inner, PEER, NOW);
+
+        let plan = plan(&inner, &view([object(key(), "orders", 10)]), NOW, GRACE);
+
+        assert_eq!(plan.proposal, None);
+        assert_eq!(plan.reports, Vec::new());
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_the_topics_expiry_passed_should_remove_the_topic() {
+        let expiry = 60_000_000;
+        let (mut early, stream_id) = adopted_from(retained(expiry, u64::MAX));
+        let (mut late, _) = adopted_from(retained(expiry, u64::MAX));
+        retire_origin(&mut early, PEER, NOW - expiry + 1);
+        retire_origin(&mut late, PEER, NOW - expiry);
+        let no_peers = BTreeMap::new();
+
+        assert_eq!(plan(&early, &no_peers, NOW, GRACE).proposal, None);
+        assert_eq!(
+            plan(&late, &no_peers, NOW, GRACE).proposal,
+            Some(ShadowTopicRequest::RemoveTopic {
+                target: target(stream_id),
+            })
+        );
+        assert!(holds_retired_shadow_streams(&late));
+    }
+
+    #[test]
+    fn given_a_retired_origin_with_a_topic_that_never_expires_should_keep_it() {
+        let (mut inner, _) = adopted();
+        retire_origin(&mut inner, PEER, 0);
+
+        assert_eq!(plan(&inner, &BTreeMap::new(), NOW, GRACE).proposal, None);
+    }
+
+    #[test]
+    fn given_a_detached_topic_of_a_retired_origin_when_its_grace_ended_should_remove_it() {
+        let (mut inner, stream_id) = adopted();
+        detach(&mut inner, stream_id, NOW - GRACE);
+        retire_origin(&mut inner, PEER, NOW);
+
+        assert_eq!(
+            plan(&inner, &BTreeMap::new(), NOW, GRACE).proposal,
+            Some(ShadowTopicRequest::RemoveTopic {
+                target: target(stream_id),
+            })
+        );
+    }
+
+    #[test]
+    fn given_an_empty_shadow_stream_of_a_retired_origin_when_planning_should_remove_it() {
+        let mut inner = StreamsInner::new();
+        apply_plan(&mut inner, &view([object(key(), "orders", 10)]));
+        let stream_id =
+            u32::try_from(inner.resolve_stream_id(&named(SHADOW_NAME)).unwrap()).unwrap();
+        retire_origin(&mut inner, PEER, NOW);
+
+        assert_eq!(
+            plan(&inner, &BTreeMap::new(), NOW, GRACE).proposal,
+            Some(ShadowTopicRequest::RemoveStream {
+                stream_id,
+                source: source(),
+            })
         );
     }
 

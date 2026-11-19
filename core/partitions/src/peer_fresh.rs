@@ -235,6 +235,19 @@ impl PeerFreshTail {
         }
     }
 
+    /// Forget every batch the tail found, and serve none above the floor.
+    /// Returns whether it served any.
+    pub fn clear(&mut self) -> bool {
+        let served = self.served_end().is_some();
+        self.rows.clear();
+        self.next_offset = self.start;
+        self.sources.clear();
+        self.gone.clear();
+        self.conflict_at = None;
+        self.newest = None;
+        served
+    }
+
     /// The store no longer holds `object_id`, so the proofs that need it
     /// wait for a newer manifest.
     pub fn mark_gone(&mut self, object_id: FreshObjectId) {

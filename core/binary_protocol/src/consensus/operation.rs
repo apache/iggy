@@ -112,6 +112,9 @@ pub enum Operation {
     /// Generic option patch for a stream, topic or user. Prepare rewrites it to
     /// the resolved operation of the target's scope.
     UpdateResource = 150,
+    /// A geo peer that never returns: this cluster stops following it, and
+    /// its shadow topics expire by their own retention.
+    RetireGeoOrigin = 151,
 
     // Partition operations (routed by namespace)
     SendMessages = 160,
@@ -217,6 +220,7 @@ impl Operation {
                 | Self::JoinConsumerGroup
                 | Self::LeaveConsumerGroup
                 | Self::UpdateResource
+                | Self::RetireGeoOrigin
         )
     }
 
@@ -329,6 +333,7 @@ impl Operation {
             | Self::JoinConsumerGroup
             | Self::LeaveConsumerGroup
             | Self::UpdateResource
+            | Self::RetireGeoOrigin
             | Self::SendMessages
             | Self::StoreConsumerOffset
             | Self::DeleteConsumerOffset => match crate::dispatch::lookup_by_operation(*self) {
@@ -375,6 +380,7 @@ mod tests {
             Operation::JoinConsumerGroup,
             Operation::LeaveConsumerGroup,
             Operation::UpdateResource,
+            Operation::RetireGeoOrigin,
             Operation::SendMessages,
             Operation::StoreConsumerOffset,
             Operation::DeleteConsumerOffset,

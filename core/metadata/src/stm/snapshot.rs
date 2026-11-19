@@ -82,7 +82,11 @@ use crate::stm::user::UsersSnapshot;
 /// Version 18: `TopicSnapshot` gained `recovered_from`, the cluster that lost
 /// every disk whose geo topic a recovery restored, as a trailing, defaulted
 /// field.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 18;
+///
+/// Version 19: `StreamsSnapshot` gained `retired_origins`, the geo peers that
+/// never return, and the shadow record of a topic its peer's `retention`,
+/// both as trailing, defaulted fields.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 19;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -671,7 +675,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 18;
+        const PINNED_VERSION: u32 = 19;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -696,7 +700,7 @@ mod tests {
         // actually grows need their own pins.
         const TOPIC_FIELD_COUNT: u32 = 12;
         const STREAM_FIELD_COUNT: u32 = 8;
-        const STREAMS_FIELD_COUNT: u32 = 4;
+        const STREAMS_FIELD_COUNT: u32 = 5;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
@@ -789,6 +793,7 @@ mod tests {
             revision: 1,
             namespace_revision: 1,
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
         };
         let encoded = rmp_serde::to_vec(&streams).unwrap();
         assert_eq!(
@@ -1021,6 +1026,7 @@ mod tests {
         let mut snapshot = MetadataSnapshot::new(50);
         snapshot.streams = Some(StreamsSnapshot {
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![(3, stream)],
@@ -1097,6 +1103,7 @@ mod tests {
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![(
@@ -1236,6 +1243,7 @@ mod tests {
 
         let streams_snap = StreamsSnapshot {
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![
