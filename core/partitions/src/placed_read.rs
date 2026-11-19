@@ -113,9 +113,6 @@ pub struct PlacedReadPlan {
     /// The journal's message entries, op-ascending: the placed batches that
     /// no segment holds yet.
     pub(crate) resident: Vec<Frozen<4096>>,
-    /// Placed batches that another cluster proved, in offset order, which a
-    /// partition that follows that cluster's log serves above its floor.
-    pub(crate) proven: Vec<PlacedBatch>,
     pub(crate) remote: Option<Rc<RemoteSegments>>,
     pub(crate) deadline: Option<Instant>,
     /// The partition's prefix in the object store, where its long-term
@@ -303,12 +300,6 @@ impl PlacedReadPlan {
             if let Some(placement) = batch.placement {
                 wanted.take(PlacedBatch::new(batch.header, placement), &mut placed);
             }
-        }
-        for batch in &self.proven {
-            if wanted.is_full() {
-                break;
-            }
-            wanted.take(*batch, &mut placed);
         }
         Ok(placed)
     }
@@ -1214,7 +1205,6 @@ mod tests {
             partition_dir: PartitionDirResolution::NoFiles,
             segments: Vec::new(),
             resident: Vec::new(),
-            proven: Vec::new(),
             remote: Some(Rc::new(RemoteSegments::new(
                 Rc::clone(objects) as Rc<dyn RemoteObjects>,
                 layout(),

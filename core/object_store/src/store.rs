@@ -386,9 +386,6 @@ pub struct ListRequest<'a> {
     pub prefix: &'a str,
     /// [`ListPage::next`] of the previous page, `None` for the first page.
     pub continuation: Option<&'a str>,
-    /// The first page starts strictly after this key, which need not name
-    /// an object. A continuation takes its place.
-    pub start_after: Option<&'a str>,
     /// The most objects the page holds, clamped as [`Self::page_len`] says.
     pub max_keys: usize,
 }
@@ -400,27 +397,7 @@ impl<'a> ListRequest<'a> {
         Self {
             prefix,
             continuation: None,
-            start_after: None,
             max_keys: MAX_KEYS_PER_REQUEST,
-        }
-    }
-
-    /// The first page of the objects under `prefix` whose keys sort after
-    /// `key`.
-    #[must_use]
-    pub const fn starting_after(self, key: &'a str) -> Self {
-        Self {
-            start_after: Some(key),
-            ..self
-        }
-    }
-
-    /// Where the page starts: strictly after this key, or at the prefix.
-    #[must_use]
-    pub const fn resumes_after(&self) -> Option<&'a str> {
-        match self.continuation {
-            Some(continuation) => Some(continuation),
-            None => self.start_after,
         }
     }
 

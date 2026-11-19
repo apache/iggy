@@ -84,34 +84,6 @@ impl FreshObjectId {
         let bytes = self.0.to_le_bytes();
         u16::from_le_bytes([bytes[5], bytes[6]])
     }
-
-    /// When the life of the writer started, in microseconds since the Unix
-    /// epoch.
-    #[must_use]
-    pub const fn started_at(self) -> u64 {
-        let bytes = self.0.to_le_bytes();
-        u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
-        ])
-    }
-
-    /// The object's number in the life of its writer.
-    #[must_use]
-    pub const fn sequence(self) -> u64 {
-        let bytes = self.0.to_le_bytes();
-        u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], 0, 0, 0])
-    }
-
-    /// The next object of the same writer life, `None` past the last one.
-    #[must_use]
-    pub const fn next(self) -> Option<Self> {
-        Self::new(
-            self.replica(),
-            self.shard(),
-            self.started_at(),
-            self.sequence() + 1,
-        )
-    }
 }
 
 /// Collects blobs into one fresh object.
@@ -187,30 +159,6 @@ mod tests {
         assert_eq!(FreshObjectId::from_raw(id.get()), id);
         let lowest = FreshObjectId::new(1, 2, 0, 0).unwrap();
         assert_eq!((lowest.replica(), lowest.shard()), (1, 2));
-    }
-
-    #[test]
-    fn given_an_id_when_reading_its_life_should_return_when_it_started_and_its_number_and_the_next()
-    {
-        let id = FreshObjectId::new(3, 4, 1_700_000_000_000_000, 41).unwrap();
-
-        assert_eq!(id.started_at(), 1_700_000_000_000_000);
-        assert_eq!(id.sequence(), 41);
-        assert_eq!(
-            id.next(),
-            FreshObjectId::new(3, 4, 1_700_000_000_000_000, 42)
-        );
-        let last = FreshObjectId::new(0xff, 0xffff, u64::MAX, FreshObjectId::SEQUENCE_MAX).unwrap();
-        assert_eq!(
-            (
-                last.started_at(),
-                last.sequence(),
-                last.replica(),
-                last.shard()
-            ),
-            (u64::MAX, FreshObjectId::SEQUENCE_MAX, 0xff, 0xffff)
-        );
-        assert_eq!(last.next(), None);
     }
 
     #[test]

@@ -1462,9 +1462,6 @@ where
                 )
                 .await;
             }
-            LifecycleFrame::PeerFreshFound(found) => {
-                self.on_peer_fresh_found(*found);
-            }
             LifecycleFrame::ReportGeoPositions { round, scope } => {
                 self.on_report_geo_positions(round, scope).await;
             }

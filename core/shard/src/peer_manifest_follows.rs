@@ -391,10 +391,9 @@ where
         }));
     }
 
-    /// Stop serving the fresh batches of `namespace` on this replica, and on
-    /// its primary commit what the retention removes from the committed
-    /// manifest. The partition forgets what it followed, so its lag no
-    /// longer counts.
+    /// Forget what this replica knew of the manifests of `namespace`, so its
+    /// lag no longer counts, and on its primary commit what the retention
+    /// removes from the committed manifest.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_retain_retired_peer(
         &self,
@@ -417,7 +416,6 @@ where
             else {
                 return;
             };
-            partition.drop_peer_fresh();
             if let Some(follow) = self
                 .peer_manifest_follows
                 .follows

@@ -535,7 +535,7 @@ impl ObjectStore for GcsStore {
         // One more than the page holds tells whether more follow, on a store
         // that sends no page token, such as an emulator.
         let max_results = (page_len + 1).min(MAX_KEYS_PER_REQUEST);
-        let after = request.resumes_after();
+        let after = request.continuation;
         let mut page_token: Option<String> = None;
         let mut empty_pages = 0;
         loop {

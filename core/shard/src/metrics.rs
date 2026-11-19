@@ -566,25 +566,6 @@ pub struct ShardMetrics {
     /// Per geo peer, how long the furthest behind of those has been behind,
     /// in seconds.
     geo_shadow_manifest_lag_seconds: Family<GeoPeerLabel, Gauge>,
-    /// Per geo peer and request, the reads of its fresh objects that this
-    /// shard sent to its store: `probe`, the read of the next object of a
-    /// writer, `index`, the read of an object a proof or a listing names,
-    /// `list`, a listing of its writers, and `record`, the read of a
-    /// recovery record.
-    geo_peer_fresh_requests_total: Family<GeoPeerRequestLabel, Counter>,
-    /// Per geo peer and request, the ones of those that failed. A probe that
-    /// finds no object yet is no failure.
-    geo_peer_fresh_failures_total: Family<GeoPeerRequestLabel, Counter>,
-    /// Per geo peer, the shadow partitions here whose fresh tail found two
-    /// proof rows that bind one offset to different batches: the alarm of
-    /// a peer whose log diverged.
-    geo_shadow_fresh_conflicts_total: Family<GeoPeerLabel, Counter>,
-    /// Per geo peer, the messages of the shadow partition here that is the
-    /// furthest behind the newest batch it found proven.
-    geo_shadow_fresh_lag_messages: Family<GeoPeerLabel, Gauge>,
-    /// Per geo peer, by the peer's clock, how much older the newest batch
-    /// that partition serves is than the newest one it found proven.
-    geo_shadow_fresh_lag_seconds: Family<GeoPeerLabel, Gauge<f64, AtomicU64>>,
     /// Per geo peer and request, the listings and reads of its consumer
     /// group positions that this shard sent to its store.
     geo_peer_position_requests_total: Family<GeoPeerRequestLabel, Counter>,
@@ -790,11 +771,6 @@ impl ShardMetrics {
             geo_peer_manifest_listed_seconds: Family::default(),
             geo_shadow_partitions_behind: Family::default(),
             geo_shadow_manifest_lag_seconds: Family::default(),
-            geo_peer_fresh_requests_total: Family::default(),
-            geo_peer_fresh_failures_total: Family::default(),
-            geo_shadow_fresh_conflicts_total: Family::default(),
-            geo_shadow_fresh_lag_messages: Family::default(),
-            geo_shadow_fresh_lag_seconds: Family::default(),
             geo_peer_position_requests_total: Family::default(),
             geo_peer_position_failures_total: Family::default(),
             geo_peer_positions_adopted_total: Family::default(),
@@ -1077,24 +1053,6 @@ impl ShardMetrics {
             .set(i64::try_from(lag_micros / 1_000_000).unwrap_or(i64::MAX));
     }
 
-    /// A read of the fresh objects of the geo peer `origin`, `request` as
-    /// [`Self::geo_peer_fresh_requests_total`] names them, and whether it
-    /// succeeded.
-    pub fn record_peer_fresh_request(&self, origin: &str, request: &'static str, succeeded: bool) {
-        let label = GeoPeerRequestLabel {
-            origin: origin.to_owned(),
-            request,
-        };
-        self.geo_peer_fresh_requests_total
-            .get_or_create(&label)
-            .inc();
-        if !succeeded {
-            self.geo_peer_fresh_failures_total
-                .get_or_create(&label)
-                .inc();
-        }
-    }
-
     /// A listing or read, `request`, of the consumer group positions of the
     /// geo peer `origin`, and whether it succeeded.
     pub fn record_peer_position_request(
@@ -1146,67 +1104,6 @@ impl ShardMetrics {
     /// Whether the group polls here wait for the positions of the geo peers.
     pub fn set_positions_resume_waiting(&self, waiting: bool) {
         self.geo_positions_resume_waiting.set(i64::from(waiting));
-    }
-
-    /// A shadow partition of the geo peer `origin` found two proof rows that
-    /// disagree.
-    pub fn record_shadow_fresh_conflict(&self, origin: &str) {
-        self.geo_shadow_fresh_conflicts_total
-            .get_or_create(&GeoPeerLabel {
-                origin: origin.to_owned(),
-            })
-            .inc();
-    }
-
-    /// How far the shadow partition of the geo peer `origin` here that is
-    /// the furthest behind is: in messages, and in microseconds by the
-    /// peer's clock.
-    pub fn set_shadow_fresh_lag(&self, origin: &str, messages: u64, micros: u64) {
-        let label = GeoPeerLabel {
-            origin: origin.to_owned(),
-        };
-        self.geo_shadow_fresh_lag_messages
-            .get_or_create(&label)
-            .set(i64::try_from(messages).unwrap_or(i64::MAX));
-        #[allow(
-            clippy::cast_precision_loss,
-            reason = "a lag of more than 2^52 microseconds is centuries"
-        )]
-        self.geo_shadow_fresh_lag_seconds
-            .get_or_create(&label)
-            .set(micros as f64 / 1_000_000.0);
-    }
-
-    /// The counts of the fresh requests to the geo peer `origin`, as
-    /// `(request, sent, failed)`, and its conflicts.
-    #[cfg(any(test, feature = "simulator"))]
-    #[must_use]
-    pub fn peer_fresh_counts(&self, origin: &str) -> (Vec<(&'static str, u64, u64)>, u64) {
-        let requests = ["probe", "index", "list", "record"]
-            .into_iter()
-            .map(|request| {
-                let label = GeoPeerRequestLabel {
-                    origin: origin.to_owned(),
-                    request,
-                };
-                let sent = self
-                    .geo_peer_fresh_requests_total
-                    .get_or_create(&label)
-                    .get();
-                let failed = self
-                    .geo_peer_fresh_failures_total
-                    .get_or_create(&label)
-                    .get();
-                (request, sent, failed)
-            })
-            .collect();
-        let conflicts = self
-            .geo_shadow_fresh_conflicts_total
-            .get_or_create(&GeoPeerLabel {
-                origin: origin.to_owned(),
-            })
-            .get();
-        (requests, conflicts)
     }
 
     /// The counts of the manifest requests to the geo peer `origin` and of
@@ -3039,31 +2936,6 @@ impl ShardMetrics {
             "geo_positions_resume_waiting",
             "1 while group polls of geo and shadow partitions here wait for every geo peer's positions after a start",
             self.geo_positions_resume_waiting.clone(),
-        );
-        registry.register(
-            "geo_peer_fresh_requests",
-            "Reads of the geo peer's fresh objects that this shard sent to its store: probes, indexes, listings and recovery records",
-            self.geo_peer_fresh_requests_total.clone(),
-        );
-        registry.register(
-            "geo_peer_fresh_failures",
-            "Reads of the geo peer's fresh objects that failed",
-            self.geo_peer_fresh_failures_total.clone(),
-        );
-        registry.register(
-            "geo_shadow_fresh_conflicts",
-            "Shadow partitions on this shard that found two proof rows of the geo peer binding one offset to different batches, and stopped serving fresh batches",
-            self.geo_shadow_fresh_conflicts_total.clone(),
-        );
-        registry.register(
-            "geo_shadow_fresh_lag_messages",
-            "Messages that the furthest behind shadow partition on this shard found proven by the geo peer and does not serve yet",
-            self.geo_shadow_fresh_lag_messages.clone(),
-        );
-        registry.register(
-            "geo_shadow_fresh_lag_seconds",
-            "By the geo peer's clock, how much older the newest batch that the furthest behind shadow partition on this shard serves is than the newest one it found proven",
-            self.geo_shadow_fresh_lag_seconds.clone(),
         );
     }
 
