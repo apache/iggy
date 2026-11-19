@@ -120,7 +120,7 @@ impl Default for TierServiceConfig {
             // No byte cap: the shard that fills the objects bounds the bytes
             // it holds in them.
             fresh_upload: ClassLimits {
-                jobs: 4,
+                jobs: crate::FRESH_UPLOADS,
                 bytes: None,
             },
             speculative_fetch: ClassLimits {
