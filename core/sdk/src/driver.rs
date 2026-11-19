@@ -29,12 +29,12 @@ use crate::vsr::{decode_reply_for, reply_commit};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE, CREATE_TOPIC_CODE,
-    DELETE_CONSUMER_OFFSET_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, FETCH_MESSAGES_CODE,
-    GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE, GET_PARTITIONS_CODE, GET_STREAM_CODE,
-    GET_TOPIC_CODE, GET_TOPICS_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE, CREATE_PARTITIONS_CODE,
+    CREATE_TOPIC_CODE, DELETE_CONSUMER_OFFSET_CODE, DELETE_PARTITIONS_CODE, DELETE_STREAM_CODE,
+    DELETE_TOPIC_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_PARTITIONS_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, LOGIN_REGISTER_CODE,
+    LOGIN_REGISTER_WITH_PAT_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+    SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -92,10 +92,13 @@ mod extractor_tests {
     use bytes::Bytes;
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::codes::{
-        CREATE_TOPIC_CODE, DELETE_STREAM_CODE, DELETE_TOPIC_CODE, GET_PARTITIONS_CODE,
-        GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, SEND_MESSAGES_CODE,
+        CREATE_PARTITIONS_CODE, CREATE_TOPIC_CODE, DELETE_PARTITIONS_CODE, DELETE_STREAM_CODE,
+        DELETE_TOPIC_CODE, GET_PARTITIONS_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
+        SEND_MESSAGES_CODE,
     };
-    use iggy_binary_protocol::requests::partitions::GetPartitionsRequest;
+    use iggy_binary_protocol::requests::partitions::{
+        CreatePartitionsRequest, DeletePartitionsRequest, GetPartitionsRequest,
+    };
     use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, GetStreamRequest};
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
@@ -241,6 +244,58 @@ mod extractor_tests {
     }
 
     #[test]
+    fn extract_from_retained_frame_partition_mutations_keeps_identifiers() {
+        let body = CreatePartitionsRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partitions_count: 1,
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(CREATE_PARTITIONS_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+
+        let body = DeletePartitionsRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partitions_count: 1,
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(DELETE_PARTITIONS_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn call_decodes_context_only_for_namespace_errors() {
+        let stream = Identifier::named("events").unwrap();
+        let topic = Identifier::named("orders").unwrap();
+        let body = GetTopicRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+        }
+        .to_bytes();
+        let call = Call::new(
+            GET_TOPIC_CODE,
+            body,
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+        assert_eq!(
+            call.enrich_error(original),
+            IggyError::TopicIdNotFound(topic, stream)
+        );
+
+        let original = IggyError::InvalidCommand;
+        assert_eq!(call.enrich_error(original.clone()), original);
+    }
+
+    #[test]
     fn extract_from_retained_frame_rejects_invalid_utf8_string_identifier() {
         let body = Bytes::from(vec![IdKind::String.as_code(), 1, 0xff]);
 
@@ -359,7 +414,6 @@ mod extractor_tests {
             Identifier::numeric(2).unwrap(),
         );
 
-        assert!(call.request_error_context.is_none());
         assert_eq!(
             call.enrich_error(original),
             IggyError::TopicIdNotFound(topic, stream)
@@ -399,7 +453,11 @@ fn decode_retained_identifier(raw: &[u8]) -> Option<(Identifier, usize)> {
 
 fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorContext> {
     let has_topic = match code {
-        GET_TOPIC_CODE | DELETE_TOPIC_CODE | GET_PARTITIONS_CODE => true,
+        GET_TOPIC_CODE
+        | DELETE_TOPIC_CODE
+        | GET_PARTITIONS_CODE
+        | CREATE_PARTITIONS_CODE
+        | DELETE_PARTITIONS_CODE => true,
         GET_TOPICS_CODE | CREATE_TOPIC_CODE | GET_STREAM_CODE | DELETE_STREAM_CODE => false,
         _ => return None,
     };
@@ -1876,8 +1934,6 @@ struct Call {
     fetch: Option<FetchMessagesRequest>,
     /// The metadata commit that the last reply named.
     reply_commit: u64,
-    #[allow(dead_code)]
-    request_error_context: Option<RequestErrorContext>,
 }
 
 struct CallReply {
@@ -2067,10 +2123,6 @@ impl Call {
             ),
             RequestTarget::Replica(replica) => (None, Some(replica)),
         };
-        let request_error_context = match target {
-            RequestTarget::Partition(_) => None,
-            _ => extract_from_retained_frame(code, &payload),
-        };
         Self {
             code,
             payload,
@@ -2090,7 +2142,6 @@ impl Call {
             restarted: false,
             fetch: None,
             reply_commit: 0,
-            request_error_context,
         }
     }
 
@@ -2102,13 +2153,11 @@ impl Call {
             partition,
             ..
         } = retained;
-        let request_error_context = extract_from_retained_frame(code, &frame.body);
         Self {
             partition: partition.map(|key| PartitionCall { key, context: None }),
             ticket: Some(ticket),
             frame: Some(frame),
             uncertain: true,
-            request_error_context,
             ..Self::new(code, Bytes::new(), RequestTarget::Metadata, deadline)
         }
     }
@@ -2249,11 +2298,17 @@ impl Call {
 
     /// Adds the identifiers of this call to a binary namespace error.
     fn enrich_error(&self, error: IggyError) -> IggyError {
-        enrich_error(
-            error,
-            self.request_error_context.as_ref(),
-            self.partition.as_ref().map(|partition| &partition.key),
-        )
+        let partition = self.partition.as_ref().map(|partition| &partition.key);
+        let context = if partition.is_none() && matches!(error.as_code(), 1009 | 2010) {
+            let body = self
+                .frame
+                .as_ref()
+                .map_or(&self.payload, |frame| &frame.body);
+            extract_from_retained_frame(self.code, body)
+        } else {
+            None
+        };
+        enrich_error(error, context.as_ref(), partition)
     }
 
     /// The next step after a route lookup of the call failed with `error`.
