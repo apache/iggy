@@ -181,8 +181,9 @@ about an hour later.
   and `s3:ListBucket`. On GCS, the role Storage Object User on the own bucket and Storage Object
   Viewer on each peer's bucket. The server never writes to a peer's bucket.
 - **On GCS, one write per second per object.** GCS throttles a second write to one object name
-  within a second. Each node rewrites one positions object per log, so set
-  `[geo] consumer_offset_upload_interval` to `1 s` or more, or to `disabled`, on a `gcs` backend.
+  within a second. A partition stores its manifest at most once a second, within that limit. Each
+  node rewrites one positions object per log, so set `[geo] consumer_offset_upload_interval` to
+  `1 s` or more, or to `disabled`, on a `gcs` backend.
 - **No lifecycle rule that expires objects under the prefix.** The cluster deletes what it no
   longer needs. An object that a rule removes early is lost data.
 - **The segment cleaner stays on.** `[data_maintenance.messages] cleaner_enabled = true` is the
@@ -535,7 +536,7 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | ----------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Send                    | Committed and acknowledged           | One upload of the fresh object and one commit. A busy shard adds up to `fresh_upload_interval`, 10 ms by default, or the wait for a free upload slot. A partition past `long_term_backlog_limit` adds 10 ms to 250 ms.                    |
 | Committed               | Readable in the origin cluster       | At once.                                                                                                                                                                                                                                  |
-| Committed               | Published                            | The partition's next rewrite, every 250 ms to 10 s, plus the upload and the commit of the segment. The manifest is stored after the commit.                                                                                               |
+| Committed               | Published                            | The partition's next rewrite, every 1 s to 10 s, plus the upload and the commit of the segment. The manifest is stored after the commit, at most once a second: the commits within a second share the next store.                         |
 | Published               | Readable in another datacenter       | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                                        |
 | Committed               | Readable in another datacenter       | The two rows above added up, seconds: the next rewrite and manifest, then the peer's next listing. Nothing else brings a message there.                                                                                                   |
 | Geo topic created       | Shadow topic in each peer            | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                                           |
@@ -545,11 +546,15 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Geo topic deleted       | Shadow topic detached in each peer   | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                                                                                                        |
 | Shadow topic detached   | Shadow topic removed                 | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                                                                                                    |
 
-Each partition adjusts its rewrite interval between 250 ms and 10 s, toward the interval at which
-a long-term segment comes out 80% of 64 MiB full. A segment cut at 64 MiB starts the next rewrite
-as soon as it commits. After a node starts, its partitions rewrite nothing until the first pass
-of the segment cleaner, one `[data_maintenance.messages] interval` after the start, 1 minute by
-default.
+Each partition adjusts its rewrite interval between 1 s and 10 s, toward the interval at which a
+long-term segment comes out 80% of 64 MiB full. A segment cut at 64 MiB starts the next rewrite as
+soon as it commits, so a partition that commits more than 64 MiB a second rewrites back to back.
+Its manifest is still stored at most once a second, with what the long-term log holds then. A
+change that came within the second is stored once the second passed, also when nothing follows
+it. A long-term log that did not change is not stored again, but for one repeat 2 minutes after a
+new primary's first store. After a node starts, its partitions rewrite nothing until the first
+pass of the segment cleaner, one `[data_maintenance.messages] interval` after the start, 1 minute
+by default.
 
 `partition_long_term_rewrite_lag_messages` shows how far publication trails commits on the
 origin. It is the most committed messages that one partition of the shard holds and no long-term
@@ -565,8 +570,8 @@ acknowledged it. At that load each partition rewrites every 10 s, the longest in
 
 | `manifest_poll_interval` | Median | 95th percentile | Longest |
 | ------------------------ | ------ | --------------- | ------- |
-| `5 s`, the default       | 9.1 s  | 13.6 s          | 14.2 s  |
-| `1 s`                    | 5.6 s  | 10.0 s          | 11.1 s  |
+| `5 s`, the default       | 8.9 s  | 13.4 s          | 14.0 s  |
+| `1 s`                    | 6.0 s  | 10.4 s          | 11.0 s  |
 
 ## What fails and what is lost
 
@@ -838,7 +843,9 @@ Requests to a cluster's own bucket:
   that no object with messages carried in that time;
 - a get for each poll that misses the shard's 64 MiB cache, and gets for the rewrites and merges,
   which read the messages back;
-- a put for each long-term segment and its index, and one for each manifest;
+- a put for each long-term segment and its index, and a put of the partition's manifest at most
+  once a second, only when its long-term log changed. The manifest is one object, about 88 bytes
+  per segment it lists, that each put rewrites whole;
 - up to one put a `positions_publish_interval` on each node for each log in which a partition
   that the node leads had its consumer groups move;
 - while groups store their offsets themselves, up to one put a `consumer_offset_upload_interval`
@@ -966,7 +973,7 @@ Alert on these first:
 | Key                                        | Default | Meaning                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer.                                                                                                                                       |
-| `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 250 ms after its last. `0` turns this off. Otherwise at least `64 MiB`.                                                 |
+| `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 1 s after its last. `0` turns this off. Otherwise at least `64 MiB`.                                                    |
 | `[tiered_storage.jobs] fresh_uploads`      | `4`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads.                                                                                                                                                                                                                                                                                  |
 | `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that commits on read and fails over reads again at most this long, plus the poll interval of the other datacenter.                                                                                                                                                                 |
 | `[geo] consumer_offset_upload_interval`    | `50 ms` | The shortest time between two puts of a log's positions for the offsets that groups store themselves, whose answers wait for the put. A store that finds no put running and the interval passed is stored at once. A longer interval makes fewer puts under steady stores, and answers them later. `disabled` answers them at the local commit and leaves them to `positions_publish_interval`. Up to `1 s`. |
