@@ -21,16 +21,19 @@
 //!
 //! Each shard gets its own store and service, because a provider holds
 //! files and connections of the shard that owns it. What the shards share,
-//! the credentials of an `s3` store and the objects of a `mock_s3` store,
-//! is in [`SharedStore`].
+//! the credentials of an `s3` store, the access token of a `gcs` store and
+//! the objects of a `mock_s3` store, is in [`SharedStore`].
 
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::time::Duration;
 
-use configs::tiered_storage::{S3UrlStyle, TieredStorageBackend, TieredStorageConfig};
+use configs::tiered_storage::{
+    GcsConfig as GcsSection, S3UrlStyle, TieredStorageBackend, TieredStorageConfig,
+};
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::IggyByteSize;
+use iggy_object_store::gcs::{GcsAuth, GcsConfig, GcsStore};
 use iggy_object_store::s3::{S3Config, S3Store, SharedCredentials, UrlStyle};
 use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, MockS3Latency, MockS3Store, ObjectStore,
@@ -68,10 +71,12 @@ pub struct S3Location<'a> {
 }
 
 /// What every shard of a node shares to reach the store: the credentials
-/// that an `s3` store signs with, and the objects of a `mock_s3` store.
+/// that an `s3` store signs with, how a `gcs` store authorizes its
+/// requests, and the objects of a `mock_s3` store.
 #[derive(Clone, Default)]
 pub struct SharedStore {
     credentials: Option<SharedCredentials>,
+    gcs: Option<GcsAuth>,
     mock_s3: Option<MockS3Store>,
 }
 
@@ -79,10 +84,14 @@ impl SharedStore {
     /// What the shards of a node with `config` share, built once per node.
     ///
     /// # Errors
-    /// What [`crate::s3_credentials::credentials`] returns.
+    /// What [`crate::s3_credentials::credentials`] and
+    /// [`crate::gcs_credentials::backend_auth`] return.
     pub fn new(config: &TieredStorageConfig) -> Result<Self, ServerError> {
         Ok(Self {
             credentials: crate::s3_credentials::credentials(config)?,
+            gcs: (config.backend == TieredStorageBackend::Gcs)
+                .then(|| crate::gcs_credentials::backend_auth(&config.gcs))
+                .transpose()?,
             mock_s3: (config.backend == TieredStorageBackend::MockS3)
                 .then(|| MockS3Store::new(mock_s3_latency(config))),
         })
@@ -93,7 +102,16 @@ impl From<SharedCredentials> for SharedStore {
     fn from(credentials: SharedCredentials) -> Self {
         Self {
             credentials: Some(credentials),
-            mock_s3: None,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<GcsAuth> for SharedStore {
+    fn from(auth: GcsAuth) -> Self {
+        Self {
+            gcs: Some(auth),
+            ..Self::default()
         }
     }
 }
@@ -104,8 +122,9 @@ impl From<SharedCredentials> for SharedStore {
 pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
     match config.backend {
         TieredStorageBackend::None => return Ok(()),
-        // The credentials of the s3 backend come from `crate::s3_credentials`.
-        TieredStorageBackend::S3 | TieredStorageBackend::MockS3 => {}
+        // The credentials of the s3 and gcs backends come from
+        // `crate::s3_credentials` and `crate::gcs_credentials`.
+        TieredStorageBackend::S3 | TieredStorageBackend::Gcs | TieredStorageBackend::MockS3 => {}
         TieredStorageBackend::Fs => {
             let metadata = std::fs::metadata(&config.path).map_err(|source| {
                 ServerError::TieredStoragePath {
@@ -336,9 +355,9 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
 /// `shared`.
 ///
 /// # Errors
-/// [`ServerError::TieredStorage`] for an `s3` endpoint that cannot address a
-/// bucket, an `s3` backend without credentials, or a `mock_s3` backend
-/// without its store.
+/// [`ServerError::TieredStorage`] for an `s3` or `gcs` endpoint that cannot
+/// address a bucket, an `s3` or `gcs` backend without its credentials, or a
+/// `mock_s3` backend without its store.
 fn store(
     config: &TieredStorageConfig,
     shared: &SharedStore,
@@ -362,13 +381,35 @@ fn store(
                     .map_err(|error| refuse(error.to_string()))?,
             ))
         }
+        TieredStorageBackend::Gcs => {
+            let auth = shared
+                .gcs
+                .clone()
+                .ok_or_else(|| refuse("the gcs backend has no credentials".to_owned()))?;
+            Some(Backend::Gcs(
+                GcsStore::new(gcs_config(&config.gcs, auth))
+                    .map_err(|error| refuse(error.to_string()))?,
+            ))
+        }
     })
+}
+
+/// The bucket of a `[tiered_storage.gcs]` or `[geo.peers.gcs]` table, in the
+/// form the provider takes. An empty endpoint is Google Cloud Storage.
+#[must_use]
+pub fn gcs_config(section: &GcsSection, auth: GcsAuth) -> GcsConfig {
+    GcsConfig {
+        endpoint: section.endpoint().to_owned(),
+        bucket: section.bucket.trim().to_owned(),
+        auth,
+    }
 }
 
 /// Where the store keeps objects, for the log.
 fn store_location(config: &TieredStorageConfig) -> String {
     match config.backend {
         TieredStorageBackend::S3 => S3Location::from(config).to_string(),
+        TieredStorageBackend::Gcs => format!("{}/{}", config.gcs.endpoint(), config.gcs.bucket),
         TieredStorageBackend::MockS3 => "memory".to_owned(),
         TieredStorageBackend::Fs | TieredStorageBackend::None => config.path.clone(),
     }
@@ -850,6 +891,79 @@ mod tests {
 
         assert!(
             !probe(&s3_section(&endpoint), &keys().into()).unwrap(),
+            "the store did not answer"
+        );
+    }
+
+    fn gcs_section(endpoint: &str) -> TieredStorageConfig {
+        TieredStorageConfig {
+            backend: TieredStorageBackend::Gcs,
+            gcs: GcsSection {
+                bucket: "segments".to_owned(),
+                endpoint: endpoint.to_owned(),
+                ..GcsSection::default()
+            },
+            ..TieredStorageConfig::default()
+        }
+    }
+
+    #[test]
+    fn given_gcs_sections_when_mapping_should_default_to_google_and_keep_the_auth() {
+        let google = gcs_config(&gcs_section(" ").gcs, GcsAuth::Anonymous);
+        let emulator = gcs_config(
+            &gcs_section("http://localhost:4443").gcs,
+            GcsAuth::Anonymous,
+        );
+
+        assert_eq!(google.endpoint, "https://storage.googleapis.com");
+        assert_eq!(google.bucket, "segments");
+        assert!(matches!(google.auth, GcsAuth::Anonymous));
+        assert_eq!(emulator.endpoint, "http://localhost:4443");
+        assert_eq!(
+            store_location(&gcs_section("")),
+            "https://storage.googleapis.com/segments"
+        );
+    }
+
+    #[test]
+    fn given_gcs_backend_when_building_stores_should_need_its_credentials() {
+        let config = gcs_section("http://localhost:4443");
+
+        let built = store(&config, &GcsAuth::Anonymous.into()).unwrap();
+        let without = store(&config, &SharedStore::default());
+
+        assert!(matches!(built, Some(Backend::Gcs(_))));
+        assert!(
+            matches!(&without, Err(ServerError::TieredStorage { reason }) if reason.contains("gcs")),
+            "{:?}",
+            without.err()
+        );
+    }
+
+    #[test]
+    fn given_gcs_endpoint_that_cannot_address_a_bucket_when_probing_should_refuse_the_boot() {
+        let error = probe(
+            &gcs_section("http://store/with-a-path"),
+            &GcsAuth::Anonymous.into(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ServerError::TieredStorage { .. }),
+            "{error}"
+        );
+    }
+
+    /// A store that refuses the connection is an outage, which never stops
+    /// the boot.
+    #[test]
+    fn given_gcs_store_that_does_not_answer_when_probing_should_accept() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        assert!(
+            !probe(&gcs_section(&endpoint), &GcsAuth::Anonymous.into()).unwrap(),
             "the store did not answer"
         );
     }

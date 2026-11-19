@@ -33,7 +33,7 @@
 //! takes its timeouts and job caps from `[tiered_storage]`.
 
 use super::COMPONENT;
-use super::tiered_storage::{S3UrlStyle, TieredStorageBackend};
+use super::tiered_storage::{GcsConfig, S3UrlStyle, TieredStorageBackend};
 use crate::ConfigurationError;
 use configs::ConfigEnv;
 use iggy_common::{IggyDuration, Validatable};
@@ -159,7 +159,7 @@ pub struct GeoPeerConfig {
     /// The peer's own `geo.origin`.
     #[serde(default)]
     pub origin: String,
-    /// `fs` or `s3`.
+    /// `fs`, `s3` or `gcs`.
     #[serde(default)]
     #[config_env(leaf)]
     pub backend: TieredStorageBackend,
@@ -193,6 +193,10 @@ pub struct GeoPeerConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub secret_access_key: String,
+    /// The peer's bucket and the access tokens that read it, for the `gcs`
+    /// backend. Read-only access to the bucket is enough.
+    #[serde(default)]
+    pub gcs: GcsConfig,
 }
 
 impl Default for GeoPeerConfig {
@@ -208,6 +212,7 @@ impl Default for GeoPeerConfig {
             url_style: S3UrlStyle::default(),
             access_key_id: String::new(),
             secret_access_key: String::new(),
+            gcs: GcsConfig::default(),
         }
     }
 }
@@ -258,7 +263,7 @@ impl Display for GeoPeerConfig {
         write!(
             f,
             "{{ origin: {}, backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, \
-             region: {}, url_style: {}, credentials: {} }}",
+             region: {}, url_style: {}, credentials: {}, gcs: {} }}",
             self.origin,
             self.backend,
             self.prefix,
@@ -268,6 +273,7 @@ impl Display for GeoPeerConfig {
             self.region,
             self.url_style,
             self.credentials(),
+            self.gcs,
         )
     }
 }
@@ -367,7 +373,16 @@ impl GeoPeerConfig {
         }
         let missing = match self.backend {
             TieredStorageBackend::None | TieredStorageBackend::MockS3 => {
-                return Some("backend must be fs or s3".to_owned());
+                return Some("backend must be fs, s3 or gcs".to_owned());
+            }
+            TieredStorageBackend::Gcs => {
+                if let Some(fault) = self.gcs.fault() {
+                    return Some(fault.to_owned());
+                }
+                if self.prefix.is_empty() {
+                    return Some("prefix must not be empty".to_owned());
+                }
+                return None;
             }
             TieredStorageBackend::Fs if self.path.trim().is_empty() => "path",
             TieredStorageBackend::S3 if self.bucket.trim().is_empty() => "bucket",
@@ -396,6 +411,9 @@ impl GeoPeerConfig {
             }
             TieredStorageBackend::S3 => {
                 format!("{}/{}", self.endpoint.trim(), self.bucket.trim())
+            }
+            TieredStorageBackend::Gcs => {
+                format!("{}/{}", self.gcs.endpoint(), self.gcs.bucket.trim())
             }
             TieredStorageBackend::Fs
             | TieredStorageBackend::None
@@ -511,6 +529,18 @@ mod tests {
             origin: origin.to_owned(),
             backend: TieredStorageBackend::Fs,
             path: format!("/mnt/{origin}"),
+            ..GeoPeerConfig::default()
+        }
+    }
+
+    fn gcs_peer(origin: &str) -> GeoPeerConfig {
+        GeoPeerConfig {
+            origin: origin.to_owned(),
+            backend: TieredStorageBackend::Gcs,
+            gcs: GcsConfig {
+                bucket: format!("iggy-{origin}"),
+                ..GcsConfig::default()
+            },
             ..GeoPeerConfig::default()
         }
     }
@@ -779,6 +809,14 @@ mod tests {
                 prefix: String::new(),
                 ..fs_peer("dc-b")
             },
+            GeoPeerConfig {
+                gcs: GcsConfig::default(),
+                ..gcs_peer("dc-b")
+            },
+            GeoPeerConfig {
+                prefix: String::new(),
+                ..gcs_peer("dc-b")
+            },
         ];
 
         for peer in peers {
@@ -816,6 +854,39 @@ mod tests {
 
         assert!(same_bucket.validate().is_err());
         assert!(other_prefix.validate().is_ok());
+    }
+
+    /// A `gcs` peer needs no key of the `s3` backend, and two of them on one
+    /// bucket and prefix are one root, wherever the endpoint was left empty.
+    #[test]
+    fn given_gcs_peers_when_validating_should_take_the_bucket_of_their_section() {
+        let gcs = with_peers(vec![gcs_peer("dc-b"), s3_peer("dc-c")]);
+        let same_bucket = with_peers(vec![
+            gcs_peer("dc-b"),
+            GeoPeerConfig {
+                gcs: GcsConfig {
+                    bucket: "iggy-dc-b".to_owned(),
+                    endpoint: "https://storage.googleapis.com".to_owned(),
+                    ..GcsConfig::default()
+                },
+                ..gcs_peer("dc-c")
+            },
+        ]);
+        let emulator = with_peers(vec![
+            gcs_peer("dc-b"),
+            GeoPeerConfig {
+                gcs: GcsConfig {
+                    bucket: "iggy-dc-b".to_owned(),
+                    endpoint: "http://localhost:4443".to_owned(),
+                    ..GcsConfig::default()
+                },
+                ..gcs_peer("dc-c")
+            },
+        ]);
+
+        assert!(gcs.validate().is_ok(), "{gcs}");
+        assert!(same_bucket.validate().is_err());
+        assert!(emulator.validate().is_ok());
     }
 
     #[test]

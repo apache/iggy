@@ -80,6 +80,8 @@ pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
+pub(crate) mod credential_refresh;
+pub(crate) mod gcs_credentials;
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;

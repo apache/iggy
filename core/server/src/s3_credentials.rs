@@ -19,49 +19,18 @@
 //!
 //! A node picks its source once, at boot, see [`CredentialSource::select`].
 //! Static keys from the configuration never change. Any other source gets a
-//! thread of its own, which fetches the first credentials and then fetches
-//! new ones before the last ones expire. Every shard's store reads the same
-//! [`SharedCredentials`], so one refresh reaches every shard.
-//!
-//! Log lines name the source and the expiry, never a key or a token.
+//! refresher of [`crate::credential_refresh`]. Every shard's store reads the
+//! same [`SharedCredentials`], so one refresh reaches every shard.
 
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use chrono::{DateTime, Utc};
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
 use iggy_object_store::s3::credentials::{
-    CredentialError, CredentialSource, CredentialTransport, Credentials, HttpTransport,
-    SharedCredentials, next_refresh,
+    CredentialError, CredentialSource, CredentialTransport, Credentials, SharedCredentials,
 };
-use tracing::{error, info, warn};
 
+use crate::credential_refresh::{self, Refresh};
 use crate::server_error::ServerError;
-
-/// How long the boot waits for the first credentials. A source that has not
-/// answered by then is an outage, and the node boots without credentials.
-const FIRST_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
-/// The longest wait for one request to a source.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const REFRESH_THREAD: &str = "iggy-s3-credentials";
-
-/// When a refresher fetches again after a failed fetch.
-#[derive(Debug, Clone, Copy)]
-struct RetryDelays {
-    first: Duration,
-    max: Duration,
-}
-
-impl RetryDelays {
-    const DEFAULT: Self = Self {
-        first: Duration::from_secs(1),
-        max: Duration::from_mins(1),
-    };
-}
-
-/// What the first fetch of a refresher found: the expiry of the credentials
-/// that it handed out, or why it handed out none.
-type FirstFetch = Result<Option<SystemTime>, CredentialError>;
 
 /// The credentials that every shard's `s3` store signs with, `None` for any
 /// other backend.
@@ -100,143 +69,41 @@ fn credentials_from(
         return Ok(Some(SharedCredentials::fixed(keys)));
     }
     let shared = SharedCredentials::refreshed();
-    start_refresher(source, shared.clone())?;
+    credential_refresh::start_and_wait(S3Refresh {
+        source,
+        shared: shared.clone(),
+    })?;
     Ok(Some(shared))
 }
 
-/// Starts the thread that keeps `shared` fresh from `source`, and waits for
-/// its first fetch.
-fn start_refresher(source: CredentialSource, shared: SharedCredentials) -> Result<(), ServerError> {
-    let name = source.name();
-    let (first_sender, first) = mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name(REFRESH_THREAD.to_owned())
-        .spawn(move || {
-            let runtime = match compio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    let _ = first_sender.send(Err(CredentialError::Unreachable(format!(
-                        "no runtime for the refresher: {error}"
-                    ))));
-                    return;
-                }
-            };
-            runtime.block_on(refresh(source, shared, first_sender));
-        })
-        .map_err(|source| ServerError::TieredStorageCredentialsThread { source })?;
-    match first.recv_timeout(FIRST_FETCH_TIMEOUT) {
-        Ok(Ok(expires_at)) => {
-            info!(
-                source = name,
-                expires_at = expires_at.map(rfc3339),
-                "the s3 backend has its first credentials"
-            );
-            Ok(())
-        }
-        Ok(Err(error)) if error.is_transient() => {
-            warn!(
-                source = name,
-                %error,
-                "the s3 backend has no credentials yet, so the node boots without them and \
-                 keeps fetching"
-            );
-            Ok(())
-        }
-        Ok(Err(error)) => Err(ServerError::TieredStorageCredentials {
-            source_name: name,
-            source: error,
-        }),
-        Err(RecvTimeoutError::Timeout) => {
-            warn!(
-                source = name,
-                "the credential service did not answer in time, so the node boots without \
-                 credentials and keeps fetching"
-            );
-            Ok(())
-        }
-        Err(RecvTimeoutError::Disconnected) => Err(ServerError::TieredStorageCredentialsThread {
-            source: std::io::Error::other("the refresher stopped before its first fetch"),
-        }),
-    }
-}
-
-/// The body of the refresher thread.
-async fn refresh(
+/// The refresher of the `s3` backend: its source, and the credentials that
+/// every shard signs with.
+struct S3Refresh {
     source: CredentialSource,
     shared: SharedCredentials,
-    first: SyncSender<FirstFetch>,
-) {
-    let endpoint = source.endpoint().unwrap_or_default();
-    match HttpTransport::new(endpoint, REQUEST_TIMEOUT) {
-        Ok(transport) => {
-            keep_fresh(&source, &transport, &shared, first, RetryDelays::DEFAULT).await;
-        }
-        Err(error) => {
-            let _ = first.send(Err(CredentialError::Refused(format!(
-                "the credential service at {endpoint:?}: {error}"
-            ))));
-        }
-    }
 }
 
-/// Fetches credentials from `source` into `shared` for as long as the node
-/// runs: the first ones at once, each next ones before the last expire, and
-/// after a failed fetch again with a delay that doubles up to `delays.max`.
-/// `first` gets the outcome of the first fetch. A first fetch that the
-/// source refuses for good ends the refresher, because the node does not
-/// boot.
-async fn keep_fresh(
-    source: &CredentialSource,
-    transport: &impl CredentialTransport,
-    shared: &SharedCredentials,
-    first: SyncSender<FirstFetch>,
-    delays: RetryDelays,
-) {
-    let mut first = Some(first);
-    let mut retry = delays.first;
-    loop {
-        let wait = match source.fetch(transport).await {
-            Ok(fetched) => {
-                shared.replace(fetched.credentials);
-                retry = delays.first;
-                if let Some(first) = first.take() {
-                    let _ = first.send(Ok(fetched.expires_at));
-                } else {
-                    info!(
-                        source = source.name(),
-                        expires_at = fetched.expires_at.map(rfc3339),
-                        "refreshed the credentials of the s3 backend"
-                    );
-                }
-                // Credentials without an expiry need no refresh.
-                let Some(expires_at) = fetched.expires_at else {
-                    return;
-                };
-                next_refresh(expires_at, SystemTime::now())
-            }
-            Err(failure) => {
-                let transient = failure.is_transient();
-                if let Some(first) = first.take() {
-                    let _ = first.send(Err(failure));
-                    if !transient {
-                        return;
-                    }
-                } else if transient {
-                    warn!(source = source.name(), error = %failure, retry_in = ?retry, "could not refresh the credentials of the s3 backend");
-                } else {
-                    error!(source = source.name(), error = %failure, retry_in = ?retry, "the credential service refused to refresh the credentials of the s3 backend");
-                }
-                let wait = retry;
-                retry = (retry * 2).min(delays.max);
-                wait
-            }
-        };
-        compio::time::sleep(wait).await;
+impl Refresh for S3Refresh {
+    fn subject(&self) -> &'static str {
+        "the s3 backend"
     }
-}
 
-fn rfc3339(time: SystemTime) -> String {
-    DateTime::<Utc>::from(time).to_rfc3339()
+    fn source_name(&self) -> &'static str {
+        self.source.name()
+    }
+
+    fn endpoint(&self) -> &str {
+        self.source.endpoint().unwrap_or_default()
+    }
+
+    async fn fetch(
+        &self,
+        transport: &impl CredentialTransport,
+    ) -> Result<Option<SystemTime>, CredentialError> {
+        let fetched = self.source.fetch(transport).await?;
+        self.shared.replace(fetched.credentials);
+        Ok(fetched.expires_at)
+    }
 }
 
 #[cfg(test)]
@@ -246,12 +113,16 @@ mod tests {
     use std::future::{Future, ready};
     use std::path::PathBuf;
 
+    use std::sync::mpsc;
+    use std::time::Duration;
+
     use bytes::Bytes;
     use iggy_object_store::s3::credentials::{
         CredentialRequest, CredentialResponse, InstanceMetadata,
     };
 
     use super::*;
+    use crate::credential_refresh::{RetryDelays, keep_fresh, rfc3339};
 
     /// Answers each request with the next of its answers.
     struct ScriptedTransport {
@@ -334,7 +205,11 @@ mod tests {
         let (first, first_fetch) = mpsc::sync_channel(1);
 
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let refresher = keep_fresh(&source, &transport, &node, first, FAST);
+            let refresh = S3Refresh {
+                source,
+                shared: node.clone(),
+            };
+            let refresher = keep_fresh(&refresh, &transport, Some(first), FAST);
             let _ = compio::time::timeout(Duration::from_millis(1500), refresher).await;
         });
 
@@ -362,7 +237,11 @@ mod tests {
         let (first, first_fetch) = mpsc::sync_channel(1);
 
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let refresher = keep_fresh(&source, &transport, &shared, first, FAST);
+            let refresh = S3Refresh {
+                source,
+                shared: shared.clone(),
+            };
+            let refresher = keep_fresh(&refresh, &transport, Some(first), FAST);
             let _ = compio::time::timeout(Duration::from_millis(300), refresher).await;
         });
 
@@ -379,9 +258,13 @@ mod tests {
         let shared = SharedCredentials::refreshed();
         let (first, first_fetch) = mpsc::sync_channel(1);
 
+        let refresh = S3Refresh {
+            source: metadata(),
+            shared: shared.clone(),
+        };
         compio::runtime::Runtime::new()
             .unwrap()
-            .block_on(keep_fresh(&metadata(), &transport, &shared, first, FAST));
+            .block_on(keep_fresh(&refresh, &transport, Some(first), FAST));
 
         assert!(matches!(
             first_fetch.try_recv(),
