@@ -47,7 +47,7 @@ use iggy::prelude::{
 };
 use iggy_object_store::{
     ErrorClass, FsStore, IdentityRead, KeyLayout, ListRequest, ListedObject, ObjectStore,
-    ObjectStoreError, PartitionManifest, StoreIdentity, TopicObject, TopicRead,
+    ObjectStoreError, PartitionManifest, PositionsObject, StoreIdentity, TopicObject, TopicRead,
 };
 use notify::event::{AccessKind, AccessMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -563,6 +563,33 @@ impl Bucket {
                         )));
                     }
                 }
+            }
+            Ok(objects)
+        })
+        .await?
+        .map_err(store_error)
+    }
+
+    /// Every object of consumer group positions in the bucket.
+    ///
+    /// # Errors
+    /// A listing or a read fails, or an object does not decode.
+    pub async fn positions_objects(&self) -> Result<Vec<PositionsObject>, TestBinaryError> {
+        let (path, layout) = (self.path.clone(), self.layout.clone());
+        on_compio(move || async move {
+            let store = reader(&path);
+            let mut objects = Vec::new();
+            for listed in list(&store, &layout.positions_prefix()).await? {
+                let Some(key) = layout.parse_positions_key(&listed.key) else {
+                    continue;
+                };
+                let Some(bytes) = read_whole(&store, &listed).await? else {
+                    continue;
+                };
+                let object = PositionsObject::decode_under(&key, &bytes).map_err(|error| {
+                    ObjectStoreError::Malformed(format!("the positions {}: {error}", listed.key))
+                })?;
+                objects.push(object);
             }
             Ok(objects)
         })
