@@ -37,7 +37,6 @@ use iggy_binary_protocol::codes::{
     SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
-use iggy_binary_protocol::primitives::identifier::WireIdentifier;
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
@@ -59,7 +58,7 @@ use iggy_binary_protocol::{
 };
 use iggy_common::{
     BinaryOperationLineage, ClientState, CommitErrorScope, Credentials, DeferredPollOptions,
-    DiagnosticEvent, FetchedSection, HeaderKind, Identifier, IggyError, OptionKey,
+    DiagnosticEvent, FetchedSection, HeaderKind, IdKind, Identifier, IggyError, OptionKey,
 };
 use route_cache::RouteCache;
 use std::future::pending;
@@ -86,9 +85,7 @@ tokio::task_local! {
 
 #[cfg(test)]
 mod extractor_tests {
-    use super::extract_from_retained_frame;
-    use super::RequestTarget;
-    use super::Call;
+    use super::{RequestErrorContext, enrich_error, extract_from_retained_frame};
     use bytes::Bytes;
     use iggy_binary_protocol::WireEncode;
     use iggy_binary_protocol::codes::{
@@ -99,9 +96,10 @@ mod extractor_tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
     };
-    use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions, primitives::page::WirePageQuery};
-    use iggy_common::Identifier;
-    use tokio::time::Instant;
+    use iggy_binary_protocol::{
+        WireIdentifier, WireName, WireOptions, primitives::page::WirePageQuery,
+    };
+    use iggy_common::{IdKind, Identifier, IggyError};
 
     const UNKNOWN_OPERATION_CODE: u32 = 255;
 
@@ -177,13 +175,13 @@ mod extractor_tests {
 
     fn assert_stream_only(code: u32, body: &Bytes, fixture: &ExtractorTestFixture) {
         let context = extract_from_retained_frame(code, body).expect("supported operation");
-        assert_eq!(context.stream, Some(fixture.stream_id.clone()));
+        assert_eq!(context.stream, fixture.stream_id);
         assert_eq!(context.topic, None);
     }
 
     fn assert_stream_and_topic(code: u32, body: &Bytes, fixture: &ExtractorTestFixture) {
         let context = extract_from_retained_frame(code, body).expect("supported operation");
-        assert_eq!(context.stream, Some(fixture.stream_id.clone()));
+        assert_eq!(context.stream, fixture.stream_id);
         assert_eq!(context.topic, Some(fixture.topic_id.clone()));
     }
 
@@ -206,6 +204,27 @@ mod extractor_tests {
         let fixture = ExtractorTestFixture::new();
         assert_stream_only(GET_TOPICS_CODE, &fixture.get_topics_body(), &fixture);
         assert_stream_only(CREATE_TOPIC_CODE, &fixture.create_topic_body(), &fixture);
+    }
+
+    #[test]
+    fn extract_from_retained_frame_string_identifiers() {
+        let body = GetTopicRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+        }
+        .to_bytes();
+
+        let context = extract_from_retained_frame(GET_TOPIC_CODE, &body).unwrap();
+
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_rejects_invalid_utf8_string_identifier() {
+        let body = Bytes::from(vec![IdKind::String.as_code(), 1, 0xff]);
+
+        assert!(extract_from_retained_frame(GET_STREAM_CODE, &body).is_none());
     }
 
     #[test]
@@ -235,7 +254,7 @@ mod extractor_tests {
         let retained_body = fixture.get_topic_body();
         let resumed_context = extract_from_retained_frame(GET_TOPIC_CODE, &retained_body)
             .expect("retained request identifiers are reconstructed");
-        assert_eq!(resumed_context.stream, Some(fixture.stream_id));
+        assert_eq!(resumed_context.stream, fixture.stream_id);
         assert_eq!(resumed_context.topic, Some(fixture.topic_id));
     }
 
@@ -250,141 +269,51 @@ mod extractor_tests {
         assert_eq!(retry_body, original_body);
     }
 
+    fn context() -> RequestErrorContext {
+        RequestErrorContext {
+            stream: Identifier::named("events").unwrap(),
+            topic: Some(Identifier::named("orders").unwrap()),
+        }
+    }
+
     #[test]
-    fn enrich_error_1009_fallback_no_stream_context() {
-        let call = Call::new(
-            1009,
-            Bytes::new(),
-            RequestTarget::Metadata,
-            Instant::now(),
-        );
+    fn enrich_error_1009_uses_retained_stream_identifier() {
+        let stream = Identifier::named("events").unwrap();
+        let original = IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap());
+
         assert_eq!(
-            call.request_error_context.as_ref().map(|ctx| ctx.stream.clone()),
-            None
-        );
-        assert_eq!(
-            call.request_error_context.as_ref().map(|ctx| ctx.topic.clone()),
-            None
+            enrich_error(original, Some(&context())),
+            IggyError::StreamIdNotFound(stream)
         );
     }
 
     #[test]
-    fn enrich_error_1019_remains_fallback() {
-        let call = Call::new(
-            1019,
-            Bytes::new(),
-            RequestTarget::Metadata,
-            Instant::now(),
+    fn enrich_error_2010_uses_topic_then_stream_identifiers() {
+        let topic = Identifier::named("orders").unwrap();
+        let stream = Identifier::named("events").unwrap();
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
         );
+
         assert_eq!(
-            call.request_error_context.as_ref().map(|ctx| ctx.stream.clone()),
-            None
-        );
-        assert_eq!(
-            call.request_error_context.as_ref().map(|ctx| ctx.topic.clone()),
-            None
+            enrich_error(original, Some(&context())),
+            IggyError::TopicIdNotFound(topic, stream)
         );
     }
 
     #[test]
-    fn enrich_error_unrelated_retains_behavior() {
-        let call = Call::new(
-            42,
-            Bytes::new(),
-            RequestTarget::Metadata,
-            Instant::now(),
+    fn enrich_error_without_topic_context_preserves_original() {
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
         );
-        assert_eq!(
-            call.request_error_context.as_ref().map(|ctx| ctx.stream.clone()),
-            None
-        );
-        assert_eq!(
-            call.request_error_context.as_ref().map(|ctx| ctx.topic.clone()),
-            None
-        );
-    }
-
-    #[test]
-    fn enrich_error_match_1009_with_stream() {
-        let error_code = 1009;
-        let result = match error_code {
-            1009 => {
-                let stream: Option<&str> = /* simulated stream context */ None;
-                match stream {
-                    Some(_) => "enriched",
-                    None => "fallback",
-                }
-            }
-            _ => "other",
+        let context = RequestErrorContext {
+            stream: Identifier::named("events").unwrap(),
+            topic: None,
         };
-        assert_eq!(result, "fallback");
-    }
 
-    #[test]
-    fn enrich_error_match_1009_without_stream() {
-        let error_code = 1009;
-        let result = match error_code {
-            1009 => {
-                let stream: Option<&str> = None;
-                match stream {
-                    Some(_) => "enriched",
-                    None => "fallback",
-                }
-            }
-            _ => "other",
-        };
-        assert_eq!(result, "fallback");
-    }
-
-    #[test]
-    fn enrich_error_match_2010_with_both() {
-        let error_code = 2010;
-        let result = match error_code {
-            2010 => {
-                let stream: Option<&str> = Some("streamId");
-                let topic: Option<&str> = Some("topicId");
-                match (stream, topic) {
-                    (Some(_), Some(_)) => "enriched",
-                    _ => "fallback",
-                }
-            }
-            _ => "other",
-        };
-        assert_eq!(result, "enriched");
-    }
-
-    #[test]
-    fn enrich_error_match_2010_without_stream() {
-        let error_code = 2010;
-        let result = match error_code {
-            2010 => {
-                let stream: Option<&str> = None;
-                let topic: Option<&str> = None;
-                match (stream, topic) {
-                    (Some(_), Some(_)) => "enriched",
-                    _ => "fallback",
-                }
-            }
-            _ => "other",
-        };
-        assert_eq!(result, "fallback");
-    }
-
-    #[test]
-    fn enrich_error_match_2010_with_stream_no_topic() {
-        let error_code = 2010;
-        let result = match error_code {
-            2010 => {
-                let stream: Option<&str> = Some("streamId");
-                let topic: Option<&str> = None;
-                match (stream, topic) {
-                    (Some(_), Some(_)) => "enriched",
-                    _ => "fallback",
-                }
-            }
-            _ => "other",
-        };
-        assert_eq!(result, "fallback");
+        assert_eq!(enrich_error(original.clone(), Some(&context)), original);
     }
 }
 
@@ -403,26 +332,44 @@ pub(crate) struct DeferredLease<'a> {
 /// Stream and topic identifiers decoded from a retained request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RequestErrorContext {
-    stream: Option<Identifier>,
+    stream: Identifier,
     topic: Option<Identifier>,
+}
+
+fn decode_retained_identifier(raw: &[u8]) -> Option<(Identifier, usize)> {
+    let kind = *raw.first()?;
+    let length = usize::from(*raw.get(1)?);
+    let consumed = 2usize.checked_add(length)?;
+    let encoded = raw.get(..consumed)?;
+    if kind == IdKind::String.as_code() {
+        std::str::from_utf8(encoded.get(2..)?).ok()?;
+    }
+    Some((Identifier::from_raw_bytes(encoded).ok()?, consumed))
 }
 
 fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorContext> {
     let raw = body.as_ref();
-    let (wire_stream_id, consumed) = WireIdentifier::decode(raw).ok()?;
-    let stream = Identifier::try_from(&wire_stream_id).ok()?;
+    let (stream, consumed) = decode_retained_identifier(raw)?;
     let topic = match code {
         GET_TOPIC_CODE | DELETE_TOPIC_CODE => {
-            let (wire_topic_id, _) = WireIdentifier::decode(&raw[consumed..]).ok()?;
-            Some(Identifier::try_from(&wire_topic_id).ok()?)
+            let (topic, _) = decode_retained_identifier(raw.get(consumed..)?)?;
+            Some(topic)
         }
         GET_TOPICS_CODE | CREATE_TOPIC_CODE | GET_STREAM_CODE | DELETE_STREAM_CODE => None,
         _ => return None,
     };
-    Some(RequestErrorContext {
-        stream: Some(stream),
-        topic,
-    })
+    Some(RequestErrorContext { stream, topic })
+}
+
+fn enrich_error(error: IggyError, context: Option<&RequestErrorContext>) -> IggyError {
+    match (error.as_code(), context) {
+        (1009, Some(context)) => IggyError::StreamIdNotFound(context.stream.clone()),
+        (2010, Some(context)) => match context.topic.as_ref() {
+            Some(topic) => IggyError::TopicIdNotFound(topic.clone(), context.stream.clone()),
+            None => error,
+        },
+        _ => error,
+    }
 }
 
 impl<'a> DeferredLease<'a> {
@@ -1448,35 +1395,7 @@ impl OperationDriver {
             }
             Err(error) => error,
         };
-        let error = match error.as_code() {
-            1009 => {
-                let stream = call
-                    .request_error_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.stream.clone());
-                match stream {
-                    Some(id) => IggyError::StreamIdNotFound(id),
-                    None => error,
-                }
-            }
-            2010 => {
-                let stream = call
-                    .request_error_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.stream.clone());
-                let topic = call
-                    .request_error_context
-                    .as_ref()
-                    .and_then(|ctx| ctx.topic.clone());
-                match (stream, topic) {
-                    (Some(s), Some(t)) => {
-                        IggyError::TopicIdNotFound(s, t)
-                    }
-                    _ => error,
-                }
-            }
-            _ => error,
-        };
+        let error = enrich_error(error, call.request_error_context.as_ref());
         if call.committing() && sent && fetch_error_is_uncertain(&error) {
             call.uncertain = true;
             return Err(Next::Fail(error));
@@ -2080,7 +1999,7 @@ impl Call {
         };
         let request_error_context = match target {
             RequestTarget::Partition(target) => Some(RequestErrorContext {
-                stream: Some(target.stream_id.clone()),
+                stream: target.stream_id.clone(),
                 topic: Some(target.topic_id.clone()),
             }),
             _ => extract_from_retained_frame(code, &payload),
