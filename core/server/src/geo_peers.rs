@@ -456,6 +456,12 @@ fn store(peer: &GeoPeerConfig) -> Result<ReadOnlyStore, ServerError> {
             Backend::S3(store)
         }
         TieredStorageBackend::None => return Err(refuse(peer, "has no backend".to_owned())),
+        TieredStorageBackend::MockS3 => {
+            return Err(refuse(
+                peer,
+                "has a mock_s3 backend, whose objects only its own server holds".to_owned(),
+            ));
+        }
     };
     Ok(ReadOnlyStore::new(backend))
 }

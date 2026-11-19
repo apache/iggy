@@ -161,8 +161,11 @@ about an hour later.
 - **One cluster per datacenter.** Each cluster has its own `[cluster]` configuration. Every node
   of one cluster gets the same `[tiered_storage]` and `[geo]` sections.
 - **One bucket per datacenter.** Use the `s3` backend for S3 or a store with its API, such as
-  MinIO, Ceph RGW or R2. The `fs` backend takes a directory, which suits tests on one host.
-  Create the bucket before the first start: a missing bucket stops the boot.
+  MinIO, Ceph RGW or R2. The `fs` backend takes a directory, which suits tests on one host. The
+  `mock_s3` backend keeps the objects in the memory of the server with the latency of
+  `[tiered_storage.mock_s3]`, for benchmarks only: a restart loses every message of its geo topics,
+  and no peer can read it. Create the bucket before the first start: a missing bucket stops the
+  boot.
 - **The bucket must not share fate with the cluster that writes to it.** A geo topic is exactly
   as durable as its bucket: the messages are only there, and the replicas hold only where they
   sit. Use a store that outlives the site, such as a regional cloud object store. The server

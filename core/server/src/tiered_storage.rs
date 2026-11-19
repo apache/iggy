@@ -20,7 +20,9 @@
 //! shard with the store identity check of the node.
 //!
 //! Each shard gets its own store and service, because a provider holds
-//! files and connections of the shard that owns it.
+//! files and connections of the shard that owns it. What the shards share,
+//! the credentials of an `s3` store and the objects of a `mock_s3` store,
+//! is in [`SharedStore`].
 
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
@@ -31,7 +33,8 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::IggyByteSize;
 use iggy_object_store::s3::{S3Config, S3Store, SharedCredentials, UrlStyle};
 use iggy_object_store::{
-    Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStoreError, StoreIdentity,
+    Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, MockS3Latency, MockS3Store,
+    ObjectStoreError, StoreIdentity,
 };
 use message_bus::IggyMessageBus;
 use partitions::{
@@ -64,6 +67,37 @@ pub struct S3Location<'a> {
     pub url_style: S3UrlStyle,
 }
 
+/// What every shard of a node shares to reach the store: the credentials
+/// that an `s3` store signs with, and the objects of a `mock_s3` store.
+#[derive(Clone, Default)]
+pub struct SharedStore {
+    credentials: Option<SharedCredentials>,
+    mock_s3: Option<MockS3Store>,
+}
+
+impl SharedStore {
+    /// What the shards of a node with `config` share, built once per node.
+    ///
+    /// # Errors
+    /// What [`crate::s3_credentials::credentials`] returns.
+    pub fn new(config: &TieredStorageConfig) -> Result<Self, ServerError> {
+        Ok(Self {
+            credentials: crate::s3_credentials::credentials(config)?,
+            mock_s3: (config.backend == TieredStorageBackend::MockS3)
+                .then(|| MockS3Store::new(mock_s3_latency(config))),
+        })
+    }
+}
+
+impl From<SharedCredentials> for SharedStore {
+    fn from(credentials: SharedCredentials) -> Self {
+        Self {
+            credentials: Some(credentials),
+            mock_s3: None,
+        }
+    }
+}
+
 /// Boot-time checks of the section, after `Validatable::validate`. A
 /// configuration that can never work refuses the boot here, before any
 /// shard starts.
@@ -71,7 +105,7 @@ pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
     match config.backend {
         TieredStorageBackend::None => return Ok(()),
         // The credentials of the s3 backend come from `crate::s3_credentials`.
-        TieredStorageBackend::S3 => {}
+        TieredStorageBackend::S3 | TieredStorageBackend::MockS3 => {}
         TieredStorageBackend::Fs => {
             let metadata = std::fs::metadata(&config.path).map_err(|source| {
                 ServerError::TieredStoragePath {
@@ -104,10 +138,7 @@ pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
 /// [`ServerError::TieredStorageProbe`] when the bucket is missing or the
 /// store refuses the credentials. [`ServerError::TieredStorageProbeRuntime`]
 /// when the runtime for the read cannot start.
-pub fn probe(
-    config: &TieredStorageConfig,
-    credentials: Option<&SharedCredentials>,
-) -> Result<bool, ServerError> {
+pub fn probe(config: &TieredStorageConfig, shared: &SharedStore) -> Result<bool, ServerError> {
     if config.backend == TieredStorageBackend::None {
         return Ok(true);
     }
@@ -118,7 +149,7 @@ pub fn probe(
         }
     })?;
     runtime.block_on(async {
-        let Some(store) = store(config, credentials)? else {
+        let Some(store) = store(config, shared)? else {
             return Ok(true);
         };
         let read = compio::time::timeout(
@@ -146,10 +177,10 @@ pub fn start(
     bus: &Rc<IggyMessageBus>,
     shard: &Rc<ServerShard>,
     replica_id: u8,
-    credentials: Option<&SharedCredentials>,
+    node_store: &SharedStore,
 ) -> Option<Sender<()>> {
     // `preflight` and `probe` refused the boot already when these fail.
-    let backend = store(config, credentials).ok().flatten()?;
+    let backend = store(config, node_store).ok().flatten()?;
     let layout = layout(config).ok()?;
     let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
     shard.set_fresh_upload_pace(
@@ -185,7 +216,7 @@ pub fn start(
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.
     let checker = if shard.id == 0 {
-        store(config, credentials).ok().flatten().map(|store| {
+        store(config, node_store).ok().flatten().map(|store| {
             IdentityChecker::new(
                 store,
                 layout,
@@ -245,22 +276,30 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
 }
 
 /// The configured store, or `None` without a backend. An `s3` store signs
-/// with `credentials`, which every shard of the node shares.
+/// with the credentials of `shared`, and a `mock_s3` store is the one of
+/// `shared`.
 ///
 /// # Errors
 /// [`ServerError::TieredStorage`] for an `s3` endpoint that cannot address a
-/// bucket, or an `s3` backend without credentials.
+/// bucket, an `s3` backend without credentials, or a `mock_s3` backend
+/// without its store.
 fn store(
     config: &TieredStorageConfig,
-    credentials: Option<&SharedCredentials>,
+    shared: &SharedStore,
 ) -> Result<Option<Backend>, ServerError> {
     let refuse = |reason: String| ServerError::TieredStorage { reason };
     Ok(match config.backend {
         TieredStorageBackend::None => None,
         TieredStorageBackend::Fs => Some(Backend::Fs(FsStore::new(&config.path))),
+        TieredStorageBackend::MockS3 => {
+            Some(Backend::MockS3(shared.mock_s3.clone().ok_or_else(
+                || refuse("the mock_s3 backend has no store".to_owned()),
+            )?))
+        }
         TieredStorageBackend::S3 => {
-            let credentials = credentials
-                .cloned()
+            let credentials = shared
+                .credentials
+                .clone()
                 .ok_or_else(|| refuse("the s3 backend has no credentials".to_owned()))?;
             Some(Backend::S3(
                 S3Store::new(S3Location::from(config).config(credentials))
@@ -274,7 +313,18 @@ fn store(
 fn store_location(config: &TieredStorageConfig) -> String {
     match config.backend {
         TieredStorageBackend::S3 => S3Location::from(config).to_string(),
+        TieredStorageBackend::MockS3 => "memory".to_owned(),
         TieredStorageBackend::Fs | TieredStorageBackend::None => config.path.clone(),
+    }
+}
+
+fn mock_s3_latency(config: &TieredStorageConfig) -> MockS3Latency {
+    let mock = &config.mock_s3;
+    MockS3Latency {
+        put: mock.put_latency.get_duration(),
+        get: mock.get_latency.get_duration(),
+        other: mock.other_latency.get_duration(),
+        bytes_per_second: mock.bytes_per_second.as_bytes_u64(),
     }
 }
 
@@ -386,6 +436,8 @@ fn probe_verdict(
 mod tests {
     use std::path::Path;
 
+    use iggy_object_store::{ObjectStore, PutBody, PutOptions};
+
     use super::*;
 
     fn fs_config(path: &Path) -> TieredStorageConfig {
@@ -495,15 +547,43 @@ mod tests {
     }
 
     #[test]
+    fn given_mock_s3_backend_when_building_stores_should_share_one_store_across_them() {
+        let config = TieredStorageConfig {
+            backend: TieredStorageBackend::MockS3,
+            ..TieredStorageConfig::default()
+        };
+        let shared = SharedStore::new(&config).unwrap();
+        let writer = store(&config, &shared).unwrap().unwrap();
+        let reader = store(&config, &shared).unwrap().unwrap();
+
+        assert!(probe(&config, &shared).unwrap());
+        let read = server_common::create_shard_executor()
+            .unwrap()
+            .block_on(async {
+                writer
+                    .put("a/b", PutBody::from_bytes("bytes"), &PutOptions::default())
+                    .await
+                    .unwrap();
+                reader.get_range("a/b", 0..u64::MAX).await.unwrap()
+            });
+
+        assert_eq!(read.bytes, "bytes");
+        assert!(matches!(
+            store(&config, &SharedStore::default()),
+            Err(ServerError::TieredStorage { .. })
+        ));
+    }
+
+    #[test]
     fn given_no_backend_when_probing_should_accept() {
-        assert!(probe(&TieredStorageConfig::default(), None).unwrap());
+        assert!(probe(&TieredStorageConfig::default(), &SharedStore::default()).unwrap());
     }
 
     #[test]
     fn given_fs_backend_with_a_directory_when_probing_should_accept() {
         let directory = tempfile::tempdir().unwrap();
 
-        assert!(probe(&fs_config(directory.path()), None).unwrap());
+        assert!(probe(&fs_config(directory.path()), &SharedStore::default()).unwrap());
     }
 
     /// A file that no node wrote fails the store identity check, but it
@@ -519,14 +599,18 @@ mod tests {
         )
         .unwrap();
 
-        assert!(probe(&fs_config(directory.path()), None).unwrap());
+        assert!(probe(&fs_config(directory.path()), &SharedStore::default()).unwrap());
     }
 
     #[test]
     fn given_fs_backend_without_its_directory_when_probing_should_refuse_the_boot() {
         let directory = tempfile::tempdir().unwrap();
 
-        let error = probe(&fs_config(&directory.path().join("missing")), None).unwrap_err();
+        let error = probe(
+            &fs_config(&directory.path().join("missing")),
+            &SharedStore::default(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -582,7 +666,11 @@ mod tests {
 
     #[test]
     fn given_s3_backend_without_credentials_when_probing_should_refuse_the_boot() {
-        let error = probe(&s3_section("http://localhost:4566"), None).unwrap_err();
+        let error = probe(
+            &s3_section("http://localhost:4566"),
+            &SharedStore::default(),
+        )
+        .unwrap_err();
 
         assert!(
             matches!(error, ServerError::TieredStorage { .. }),
@@ -616,7 +704,7 @@ mod tests {
 
     #[test]
     fn given_s3_endpoint_that_cannot_address_a_bucket_when_probing_should_refuse_the_boot() {
-        let error = probe(&s3_section("http://store/with-a-path"), Some(&keys())).unwrap_err();
+        let error = probe(&s3_section("http://store/with-a-path"), &keys().into()).unwrap_err();
 
         assert!(
             matches!(error, ServerError::TieredStorage { .. }),
@@ -633,7 +721,7 @@ mod tests {
         drop(listener);
 
         assert!(
-            !probe(&s3_section(&endpoint), Some(&keys())).unwrap(),
+            !probe(&s3_section(&endpoint), &keys().into()).unwrap(),
             "the store did not answer"
         );
     }

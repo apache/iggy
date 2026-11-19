@@ -1465,8 +1465,11 @@ handshake_grace = "10 s"
 # the cluster takes both only while every node passes the store identity check
 # that 'prefix' describes, and refuses them with FeatureUnavailable until then.
 #[tiered_storage]
-# "none", "fs" (a directory) or "s3" (S3 and stores with its API, such as
-# Ceph RGW and R2).
+# "none", "fs" (a directory), "s3" (S3 and stores with its API, such as
+# Ceph RGW and R2) or "mock_s3". "mock_s3" keeps every object in the memory
+# of the server, which loses them all when it stops, and answers each call
+# after the latency of [tiered_storage.mock_s3]. It is for benchmarks and
+# tests only, and no geo peer can read it.
 #backend = "none"
 # The key prefix of this cluster's objects. Two clusters can share a bucket
 # under different prefixes, but never under the same one. The cluster claims
@@ -1555,6 +1558,18 @@ handshake_grace = "10 s"
 #speculative_fetch_bytes = "32 MiB"
 #deletes = 2
 #housekeeping = 1
+# The mock_s3 backend: what it adds to each store call. A put waits out its
+# latency after its body arrived and before it commits, and calls in flight
+# wait at the same time, as on a remote store. 'bytes_per_second' adds the
+# time to move the body of a put or the bytes of a read, "0" for no limit.
+# Each latency must be shorter than the timeout of its call:
+# 'progress_timeout' for a put, 'request_timeout' for the others.
+#[tiered_storage.mock_s3]
+#put_latency = "0"
+#get_latency = "0"
+# Heads, deletes and listings.
+#other_latency = "0"
+#bytes_per_second = "0"
 
 # Geo topics: the name of this cluster among the datacenters, its origin, and
 # the object stores of the other clusters that it reads, its peers. Without

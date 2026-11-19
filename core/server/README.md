@@ -525,6 +525,11 @@ in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
 an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the
 bucket goes in the URL path or in the host name.
 
+The `mock_s3` backend keeps the objects in the memory of the server, where
+every shard reads them, and answers each call after the latencies of
+`[tiered_storage.mock_s3]`. The server loses them all when it stops, so it is
+for benchmarks and tests only.
+
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:
 

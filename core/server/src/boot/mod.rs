@@ -63,11 +63,11 @@ use crate::server_error::ServerError;
 use crate::shell::{
     ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
 };
+use crate::tiered_storage::SharedStore;
 use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::Operation;
-use iggy_object_store::s3::SharedCredentials;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
@@ -304,9 +304,9 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
     crate::tiered_storage::preflight(&config.tiered_storage)?;
-    let tiered_credentials = crate::s3_credentials::credentials(&config.tiered_storage)?;
+    let tiered_store = SharedStore::new(&config.tiered_storage)?;
     let object_store_answered =
-        crate::tiered_storage::probe(&config.tiered_storage, tiered_credentials.as_ref())?;
+        crate::tiered_storage::probe(&config.tiered_storage, &tiered_store)?;
     crate::geo_peers::preflight(&config.geo)?;
     let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
     // The sync GetStats read path has no access to server config, so capture
@@ -468,7 +468,7 @@ pub fn bootstrap(
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
-        let tiered_credentials_for_shard = tiered_credentials.clone();
+        let tiered_store_for_shard = tiered_store.clone();
         let geo_peer_statuses_for_shard = geo_peer_statuses.clone();
         let primary_handoff_for_shard = Arc::clone(&primary_handoff);
         let handle = match thread::Builder::new()
@@ -493,7 +493,7 @@ pub fn bootstrap(
                     shard_metrics_for_shard,
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
-                    tiered_credentials_for_shard,
+                    tiered_store_for_shard,
                     geo_peer_statuses_for_shard,
                     primary_handoff_for_shard,
                 )
@@ -572,7 +572,7 @@ async fn shard_main(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
-    tiered_credentials: Option<SharedCredentials>,
+    tiered_store: SharedStore,
     geo_peer_statuses: Vec<SharedPeerStatus>,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
@@ -1044,7 +1044,7 @@ async fn shard_main(
         &bus,
         &shard,
         topology.self_replica_id,
-        tiered_credentials.as_ref(),
+        &tiered_store,
     );
     let geo_peers_stop = crate::geo_peers::start(
         &config.geo,

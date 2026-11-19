@@ -364,7 +364,9 @@ impl GeoPeerConfig {
             return Some(format!("origin {:?} {reason}", self.origin));
         }
         let missing = match self.backend {
-            TieredStorageBackend::None => return Some("backend must be fs or s3".to_owned()),
+            TieredStorageBackend::None | TieredStorageBackend::MockS3 => {
+                return Some("backend must be fs or s3".to_owned());
+            }
             TieredStorageBackend::Fs if self.path.trim().is_empty() => "path",
             TieredStorageBackend::S3 if self.bucket.trim().is_empty() => "bucket",
             TieredStorageBackend::S3 if self.region.trim().is_empty() => "region",
@@ -393,7 +395,9 @@ impl GeoPeerConfig {
             TieredStorageBackend::S3 => {
                 format!("{}/{}", self.endpoint.trim(), self.bucket.trim())
             }
-            TieredStorageBackend::Fs | TieredStorageBackend::None => self.path.trim().to_owned(),
+            TieredStorageBackend::Fs
+            | TieredStorageBackend::None
+            | TieredStorageBackend::MockS3 => self.path.trim().to_owned(),
         };
         (self.backend, location, &self.prefix)
     }
@@ -730,6 +734,10 @@ mod tests {
             },
             GeoPeerConfig {
                 backend: TieredStorageBackend::None,
+                ..s3_peer("dc-b")
+            },
+            GeoPeerConfig {
+                backend: TieredStorageBackend::MockS3,
                 ..s3_peer("dc-b")
             },
             GeoPeerConfig {
