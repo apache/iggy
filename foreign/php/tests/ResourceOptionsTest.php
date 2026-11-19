@@ -342,6 +342,8 @@ final class ResourceOptionsTest extends TestCase
         $topic = $client->getTopic($stream->id, $topicName);
         assert_not_null($topic);
         self::assertTopicOptions($topic, $expected);
+        assert_same('normal', $topic->topic_type);
+        assert_null($topic->geo_mode);
 
         $renamed = unique_name('renamed-topic');
         $client->updateTopic(
@@ -590,6 +592,8 @@ final class ResourceOptionsTest extends TestCase
         assert_same($source, $stream->derived_options['encryption_key_source']);
         assert_same($stream->encryption_key_fingerprint, $stream->derived_options['encryption_key_fingerprint']);
         assert_same($stream->encryption_kek_fingerprint, $stream->derived_options['encryption_kek_fingerprint']);
+        // Only a shadow stream, which serves the geo topics of another datacenter, has an origin.
+        assert_null($stream->shadow_origin);
         Assert::assertMatchesRegularExpression(self::FINGERPRINT_PATTERN, (string) $stream->encryption_key_fingerprint);
         Assert::assertNotNull($stream->encryption_kek_fingerprint);
         foreach (explode(',', $stream->encryption_kek_fingerprint) as $kekFingerprint) {

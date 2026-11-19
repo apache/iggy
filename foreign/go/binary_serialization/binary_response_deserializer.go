@@ -553,6 +553,19 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 			topic.CompressionAlgorithm = uint8(algorithm)
 		}
 	}
+	topic.TopicType = iggcon.TopicTypeNormal
+	if topicStringOption(topic, iggcon.TopicOptionTopicType) == string(iggcon.TopicTypeGeo) {
+		topic.TopicType = iggcon.TopicTypeGeo
+	}
+	// The server refuses a mode on a normal topic, so a stored one is ignored
+	// rather than trusted.
+	if topic.TopicType == iggcon.TopicTypeGeo {
+		mode := iggcon.GeoModeGeo
+		if topicStringOption(topic, iggcon.TopicOptionGeoMode) == string(iggcon.GeoModeGeoTiered) {
+			mode = iggcon.GeoModeGeoTiered
+		}
+		topic.GeoMode = &mode
+	}
 
 	return topic, readBytes, nil
 }
@@ -576,6 +589,16 @@ func topicOption(topic iggcon.Topic, key iggcon.TopicOptionKey) (iggcon.HeaderVa
 	}
 	value, ok := topic.DerivedOptions[string(key)]
 	return value, ok
+}
+
+// topicStringOption reads a String option, empty when the server reported
+// none.
+func topicStringOption(topic iggcon.Topic, key iggcon.TopicOptionKey) string {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.String {
+		return ""
+	}
+	return string(value.Value)
 }
 
 // topicUint64Option reads a Uint64 option, or the catalog default when the

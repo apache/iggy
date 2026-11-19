@@ -108,6 +108,31 @@ public sealed class TopicResponse
     public ulong LocalRetentionSize => OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.LocalRetentionSize);
 
     /// <summary>
+    ///     Whether the topic is normal or geo, read from the topic's options. <see cref="Enums.TopicType.Normal" />
+    ///     when the server reports no type.
+    /// </summary>
+    [JsonIgnore]
+    public TopicType TopicType =>
+        OptionValues.Find(Options, DerivedOptions, TopicOptionKey.TopicType) is { Kind: HeaderKind.String } value
+        && value.ToString() == "geo"
+            ? Enums.TopicType.Geo
+            : Enums.TopicType.Normal;
+
+    /// <summary>
+    ///     How a geo topic writes its messages, read from the topic's options. Null on a normal topic.
+    /// </summary>
+    [JsonIgnore]
+    public GeoMode? GeoMode =>
+        OptionValues.Find(Options, DerivedOptions, TopicOptionKey.GeoMode) is { Kind: HeaderKind.String } value
+            ? value.ToString() switch
+            {
+                "geo" => Enums.GeoMode.Geo,
+                "geo_tiered" => Enums.GeoMode.GeoTiered,
+                _ => null
+            }
+            : null;
+
+    /// <summary>
     ///     Number of messages in the topic.
     /// </summary>
     public required ulong MessagesCount { get; init; }

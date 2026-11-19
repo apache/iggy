@@ -409,6 +409,17 @@ extension Topic {
     public var localRetentionSize: MaxTopicSize {
         resolvedLocalRetentionSize(options)
     }
+
+    /// What the topic is, from ``options``.
+    public var topicType: TopicType {
+        resolvedTopicType(options)
+    }
+
+    /// How a geo topic writes its messages, from ``options``. Nil for a
+    /// normal topic.
+    public var geoMode: GeoMode? {
+        resolvedGeoMode(options)
+    }
 }
 
 extension TopicDetails {
@@ -449,6 +460,17 @@ extension TopicDetails {
     public var localRetentionSize: MaxTopicSize {
         resolvedLocalRetentionSize(options)
     }
+
+    /// What the topic is, from ``options``.
+    public var topicType: TopicType {
+        resolvedTopicType(options)
+    }
+
+    /// How a geo topic writes its messages, from ``options``. Nil for a
+    /// normal topic.
+    public var geoMode: GeoMode? {
+        resolvedGeoMode(options)
+    }
 }
 
 // An unreported or unreadable key resolves to its catalog default, as in the Rust crate.
@@ -466,6 +488,19 @@ private func resolvedCompressionAlgorithm(_ options: ResourceOptions) -> Compres
 
 private func resolvedTieredStorage(_ options: ResourceOptions) -> Bool {
     options[TopicOptionKey.tieredStorage.rawValue]?.value.boolValue ?? false
+}
+
+private func resolvedTopicType(_ options: ResourceOptions) -> TopicType {
+    options[TopicOptionKey.topicType.rawValue]?.value.stringValue.flatMap(TopicType.init(rawValue:)) ?? .normal
+}
+
+// A mode stored on a normal topic is ignored rather than trusted, as in the
+// Rust crate.
+private func resolvedGeoMode(_ options: ResourceOptions) -> GeoMode? {
+    guard resolvedTopicType(options) == .geo else {
+        return nil
+    }
+    return options[TopicOptionKey.geoMode.rawValue]?.value.stringValue.flatMap(GeoMode.init(rawValue:)) ?? .geo
 }
 
 // A tiered topic keeps nothing on local disk longer, or in a larger amount,

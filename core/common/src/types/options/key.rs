@@ -64,6 +64,7 @@ pub enum OptionKey {
     LocalRetentionSize,
     TopicType,
     GeoMode,
+    ShadowOrigin,
     CriticalKeys,
 }
 

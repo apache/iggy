@@ -73,8 +73,9 @@ use iggy_binary_protocol::{
 };
 use iggy_common::wire_conversions::{describe_options_response, resource_options_to_wire_split};
 use iggy_common::{
-    HeaderValue, IggyError, IggyTimestamp, NamedPageQuery, OptionKey, OptionsScope, PageCursor,
-    PageOrder, PageQuery, ResourceOptions, UserStatus, public_options,
+    GeoMode, HeaderValue, IggyError, IggyTimestamp, NamedPageQuery, OptionKey, OptionsScope,
+    PageCursor, PageOrder, PageQuery, ResourceOptions, UserStatus, project_shadow_origin,
+    project_shadow_topic, public_options,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -108,6 +109,12 @@ struct StoredEntry<'a> {
     messages_count: u64,
     name: Arc<str>,
     options: Cow<'a, ResourceOptions>,
+    /// The origin of a shadow stream. `None` for any other stream and for a
+    /// topic.
+    shadow_origin: Option<String>,
+    /// The peer's geo mode of a topic in a shadow stream. `None` for any
+    /// other topic and for a stream.
+    shadow_geo_mode: Option<GeoMode>,
 }
 
 /// The stored fields a user read returns, read like [`StoredEntry`].
@@ -129,6 +136,8 @@ impl StoredEntry<'_> {
             messages_count: self.messages_count,
             name: self.name,
             options: Cow::Owned(self.options.into_owned()),
+            shadow_origin: self.shadow_origin,
+            shadow_geo_mode: self.shadow_geo_mode,
         }
     }
 }
@@ -155,6 +164,8 @@ impl<'a> From<&'a Stream> for StoredEntry<'a> {
             messages_count: stream.stats.messages_count_inconsistent(),
             name: Arc::clone(&stream.name),
             options: Cow::Borrowed(&stream.options),
+            shadow_origin: stream.shadow.as_ref().map(|source| source.origin.clone()),
+            shadow_geo_mode: None,
         }
     }
 }
@@ -169,6 +180,8 @@ impl<'a> From<&'a Topic> for StoredEntry<'a> {
             messages_count: topic.stats.messages_count_inconsistent(),
             name: Arc::clone(&topic.name),
             options: Cow::Borrowed(&topic.options),
+            shadow_origin: None,
+            shadow_geo_mode: topic.shadow.map(|shadow| shadow.geo_mode),
         }
     }
 }
@@ -956,7 +969,11 @@ where
 }
 
 fn stream_response(stream: &StoredEntry<'_>) -> Result<StreamResponse, IggyError> {
-    let (options, derived_options) = public_blocks(OptionsScope::Stream, &stream.options)?;
+    let mut public = public_options(OptionsScope::Stream, &stream.options)?;
+    if let Some(origin) = &stream.shadow_origin {
+        project_shadow_origin(&mut public, origin)?;
+    }
+    let (options, derived_options) = resource_options_to_wire_split(&public)?;
     Ok(StreamResponse {
         id: usize_to_u32(stream.id)?,
         created_at: stream.created_at.as_micros(),
@@ -970,7 +987,11 @@ fn stream_response(stream: &StoredEntry<'_>) -> Result<StreamResponse, IggyError
 }
 
 fn topic_response(topic: &StoredEntry<'_>) -> Result<TopicResponse, IggyError> {
-    let (options, derived_options) = public_blocks(OptionsScope::Topic, &topic.options)?;
+    let mut public = public_options(OptionsScope::Topic, &topic.options)?;
+    if let Some(geo_mode) = topic.shadow_geo_mode {
+        project_shadow_topic(&mut public, geo_mode)?;
+    }
+    let (options, derived_options) = resource_options_to_wire_split(&public)?;
     Ok(TopicResponse {
         id: usize_to_u32(topic.id)?,
         created_at: topic.created_at.as_micros(),

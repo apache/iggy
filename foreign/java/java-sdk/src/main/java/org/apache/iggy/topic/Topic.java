@@ -82,4 +82,14 @@ public record Topic(
     public Optional<BigInteger> localRetentionSize() {
         return TopicSettings.uint64(options, derivedOptions, TopicOptionKey.LOCAL_RETENTION_SIZE);
     }
+
+    /** Whether the topic is normal or geo. */
+    public Optional<TopicType> topicType() {
+        return TopicSettings.topicType(options, derivedOptions);
+    }
+
+    /** How a geo topic writes its messages, empty on a normal topic. */
+    public Optional<GeoMode> geoMode() {
+        return TopicSettings.geoMode(options, derivedOptions);
+    }
 }

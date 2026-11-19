@@ -30,6 +30,29 @@ std::optional<StreamEncryptionSource> EncryptionKeySourceFromFfi(bool has_source
     return static_cast<StreamEncryptionSource>(source);
 }
 
+TopicType TopicTypeFromFfi(ffi::TopicType topic_type) {
+    switch (topic_type) {
+        case ffi::TopicType::Normal:
+            return TopicType::Normal;
+        case ffi::TopicType::Geo:
+            return TopicType::Geo;
+    }
+    throw IggyException("Unknown topic type");
+}
+
+std::optional<GeoMode> GeoModeFromFfi(bool has_geo_mode, ffi::GeoMode geo_mode) {
+    if (!has_geo_mode) {
+        return std::nullopt;
+    }
+    switch (geo_mode) {
+        case ffi::GeoMode::Geo:
+            return GeoMode::Geo;
+        case ffi::GeoMode::GeoTiered:
+            return GeoMode::GeoTiered;
+    }
+    throw IggyException("Unknown geo mode");
+}
+
 std::optional<std::string> TextFromFfi(bool has_text, const rust::String &text) {
     if (!has_text) {
         return std::nullopt;
@@ -282,7 +305,8 @@ Topic Topic::FromFfi(ffi::Topic topic) {
     return Topic(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
                  topic.message_expiry,
                  std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
-                 topic.max_topic_size, topic.messages_count, topic.partitions_count,
+                 topic.max_topic_size, TopicTypeFromFfi(topic.topic_type),
+                 GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode), topic.messages_count, topic.partitions_count,
                  ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
@@ -304,11 +328,12 @@ TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {
         partitions.push_back(Partition::FromFfi(partition));
     }
 
-    return TopicDetails(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()),
-                        topic.size_bytes, topic.message_expiry,
-                        std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
-                        topic.max_topic_size, topic.messages_count, topic.partitions_count, std::move(partitions),
-                        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+    return TopicDetails(
+        topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
+        topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
+        topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
+        topic.messages_count, topic.partitions_count, std::move(partitions),
+        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {
@@ -323,7 +348,8 @@ StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {
                          ResourceOptions::FromFfi(std::move(stream.options), std::move(stream.derived_options)),
                          EncryptionKeySourceFromFfi(stream.has_encryption_key_source, stream.encryption_key_source),
                          TextFromFfi(stream.has_encryption_key_fingerprint, stream.encryption_key_fingerprint),
-                         TextsFromFfi(stream.encryption_kek_fingerprints));
+                         TextsFromFfi(stream.encryption_kek_fingerprints),
+                         TextFromFfi(stream.has_shadow_origin, stream.shadow_origin));
 }
 
 Stream Stream::FromFfi(ffi::Stream stream) {
@@ -332,7 +358,8 @@ Stream Stream::FromFfi(ffi::Stream stream) {
                   ResourceOptions::FromFfi(std::move(stream.options), std::move(stream.derived_options)),
                   EncryptionKeySourceFromFfi(stream.has_encryption_key_source, stream.encryption_key_source),
                   TextFromFfi(stream.has_encryption_key_fingerprint, stream.encryption_key_fingerprint),
-                  TextsFromFfi(stream.encryption_kek_fingerprints));
+                  TextsFromFfi(stream.encryption_kek_fingerprints),
+                  TextFromFfi(stream.has_shadow_origin, stream.shadow_origin));
 }
 
 OptionSpec OptionSpec::FromFfi(ffi::OptionSpec spec) {

@@ -118,6 +118,8 @@ pub enum OptionKey {
     TopicType,
     /// How a geo topic writes its messages, fixed at creation.
     GeoMode,
+    /// The geo origin a shadow stream serves, computed by the server.
+    ShadowOrigin,
 }
 
 /// Whether partitions can be added to or deleted from a topic after creation.
@@ -490,6 +492,7 @@ impl From<OptionKey> for RustOptionKey {
             OptionKey::LocalRetentionSize => Self::LocalRetentionSize,
             OptionKey::TopicType => Self::TopicType,
             OptionKey::GeoMode => Self::GeoMode,
+            OptionKey::ShadowOrigin => Self::ShadowOrigin,
         }
     }
 }
@@ -517,6 +520,24 @@ impl From<GeoMode> for RustGeoMode {
         match mode {
             GeoMode::Geo => Self::Geo,
             GeoMode::GeoTiered => Self::GeoTiered,
+        }
+    }
+}
+
+impl From<RustTopicType> for TopicType {
+    fn from(topic_type: RustTopicType) -> Self {
+        match topic_type {
+            RustTopicType::Normal => Self::Normal,
+            RustTopicType::Geo => Self::Geo,
+        }
+    }
+}
+
+impl From<RustGeoMode> for GeoMode {
+    fn from(mode: RustGeoMode) -> Self {
+        match mode {
+            RustGeoMode::Geo => Self::Geo,
+            RustGeoMode::GeoTiered => Self::GeoTiered,
         }
     }
 }
@@ -585,6 +606,11 @@ mod tests {
                     )
                     .expect("fingerprint list")
                 );
+                // Only a shadow stream's vector carries the key.
+                assert_eq!(
+                    attribute::<Option<String>>(stream.as_any(), "shadow_origin"),
+                    expected["shadow_origin"].as_str().map(str::to_owned)
+                );
                 assert_options(stream.as_any(), &expected["options"]);
             }
         });
@@ -626,6 +652,18 @@ mod tests {
                 assert!(
                     max_topic_size.getattr("bytes").is_err(),
                     "the unlimited cap carries no byte count"
+                );
+                assert_eq!(
+                    attribute::<TopicType>(topic.as_any(), "topic_type"),
+                    TopicType::Normal
+                );
+                assert_eq!(
+                    expected["options"]["topic_type"]["value"].as_str(),
+                    Some("normal")
+                );
+                assert!(
+                    attribute::<Option<GeoMode>>(topic.as_any(), "geo_mode").is_none(),
+                    "a normal topic has no geo mode"
                 );
                 assert_options(topic.as_any(), &expected["options"]);
             }

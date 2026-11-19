@@ -323,6 +323,8 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_EQ(explicit_options.count("local_retention_age"), 1u);
     EXPECT_EQ(explicit_options.count("local_retention_size"), 1u);
     EXPECT_EQ(explicit_options.count("topic_type"), 1u);
+    EXPECT_EQ(topic_details.TopicType(), iggy::TopicType::Normal);
+    EXPECT_FALSE(topic_details.GeoMode().has_value());
 
     auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
         auto it = explicit_options.find(key);

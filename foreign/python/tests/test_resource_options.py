@@ -322,6 +322,8 @@ class TestTopicOptions:
         assert topic.compression_algorithm == "gzip"
         assert isinstance(topic.max_topic_size, MaxTopicSize.Custom)
         assert topic.max_topic_size.bytes == GIB
+        assert topic.topic_type == TopicType.Normal
+        assert topic.geo_mode is None
 
     @pytest.mark.asyncio
     async def test_given_topic_reset_when_updating_should_preserve_unmentioned_values(  # noqa: E501

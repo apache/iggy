@@ -35,7 +35,8 @@ use crate::error::to_php_exception;
 /// Stream option keys, as the cases an update's reset list takes.
 ///
 /// No stream option is resettable in this release, so `Client::updateStream()` refuses every
-/// case with the error the server would return.
+/// case with the error the server would return. The source, fingerprint and shadow origin keys
+/// are read-only.
 #[php_enum]
 #[php(name = "Iggy\\StreamOptionKey")]
 #[derive(Clone, Copy)]
@@ -50,6 +51,8 @@ pub enum StreamOptionKey {
     EncryptionKeyFingerprint,
     #[php(value = "encryption_kek_fingerprint")]
     EncryptionKekFingerprint,
+    #[php(value = "shadow_origin")]
+    ShadowOrigin,
 }
 
 impl From<StreamOptionKey> for OptionKey {
@@ -60,6 +63,7 @@ impl From<StreamOptionKey> for OptionKey {
             StreamOptionKey::EncryptionKeySource => Self::EncryptionKeySource,
             StreamOptionKey::EncryptionKeyFingerprint => Self::EncryptionKeyFingerprint,
             StreamOptionKey::EncryptionKekFingerprint => Self::EncryptionKekFingerprint,
+            StreamOptionKey::ShadowOrigin => Self::ShadowOrigin,
         }
     }
 }
@@ -73,6 +77,7 @@ impl StubLiteral for StreamOptionKey {
             Self::EncryptionKeySource => "EncryptionKeySource",
             Self::EncryptionKeyFingerprint => "EncryptionKeyFingerprint",
             Self::EncryptionKekFingerprint => "EncryptionKekFingerprint",
+            Self::ShadowOrigin => "ShadowOrigin",
         };
         format!("\\Iggy\\StreamOptionKey::{case}")
     }

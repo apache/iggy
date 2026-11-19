@@ -417,6 +417,13 @@ enum Requests {
         [scope.rawValue]
     }
 
+    /// `[origin_len:u8][origin]`
+    static func retireGeoOrigin(origin: String) throws -> [UInt8] {
+        var writer = ByteWriter()
+        try writer.writeName(validatedWireName(origin, what: "origin"))
+        return writer.bytes
+    }
+
     /// `[start:u8][cursor:44][has_since:u8][since:u64][has_until:u8][until:u64][limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]`.
     /// The cursor is all zero unless the read starts after it, and groups
     /// travel in the caller's order, at most 255 of them as in the Rust encoder.

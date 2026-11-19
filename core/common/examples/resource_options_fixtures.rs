@@ -743,6 +743,7 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
                 data_key: None,
                 kek_config_keys: Vec::new(),
                 stored_extra: ResourceOptions::new(),
+                shadow_origin: None,
             },
         ),
         (
@@ -757,6 +758,7 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
                     HeaderKey::try_from("future_option")?,
                     OptionValue::explicit(HeaderValue::try_from("enabled")?),
                 )]),
+                shadow_origin: None,
             },
         ),
         (
@@ -773,6 +775,19 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
                     SECOND_KEK_CONFIG_KEY.to_owned(),
                 ],
                 stored_extra: ResourceOptions::new(),
+                shadow_origin: None,
+            },
+        ),
+        (
+            "stream_shadow_of_a_geo_peer",
+            4,
+            "__shadow_dc-a_orders",
+            StreamKeyState {
+                encryption_key_source: StreamEncryptionSource::None,
+                data_key: None,
+                kek_config_keys: Vec::new(),
+                stored_extra: ResourceOptions::new(),
+                shadow_origin: Some("dc-a".to_owned()),
             },
         ),
     ];
@@ -781,7 +796,7 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
         .map(|(case, id, name, state)| {
             let stored = state.stored_options()?;
             let (options, derived_options) =
-                resource_options_to_wire_split(&public_options(OptionsScope::Stream, &stored)?)?;
+                resource_options_to_wire_split(&state.public_options()?)?;
             let bytes = GetStreamResponse {
                 stream: StreamResponse {
                     id,

@@ -555,6 +555,19 @@ namespace Iggy {
         public function resolveOperation(string $operation_id, mixed $timeout_micros = null): void {}
 
         /**
+         * Retires the geo origin of a datacenter that never returns.
+         *
+         * The cluster then follows nothing more of the origin: its shadow topics serve what they
+         * hold until their retention removes it, and a client may delete them. Retiring an origin
+         * that is retired already changes nothing. A datacenter that comes back needs another
+         * origin name. Needs root or the global `manage_servers` permission.
+         *
+         * @param string $origin
+         * @return void
+         */
+        public function retireGeoOrigin(string $origin): void {}
+
+        /**
          * Sends a command code with a payload and returns the raw response bytes.
          * Session-control codes return an invalid-command exception.
          *
@@ -2862,6 +2875,14 @@ namespace Iggy {
          */
         public readonly array $options;
 
+        /**
+         * The geo origin whose topics this shadow stream serves, such as `dc-a`. Null for any
+         * stream that is not a shadow stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $shadow_origin;
+
         public readonly int $size_bytes;
 
         public readonly int $topics_count;
@@ -2915,6 +2936,14 @@ namespace Iggy {
          */
         public readonly array $options;
 
+        /**
+         * The geo origin whose topics this shadow stream serves, such as `dc-a`. Null for any
+         * stream that is not a shadow stream.
+         *
+         * @var string|null
+         */
+        public readonly ?string $shadow_origin;
+
         public readonly int $topics_count;
 
         public function __construct() {}
@@ -2924,7 +2953,8 @@ namespace Iggy {
      * Stream option keys, as the cases an update's reset list takes.
      *
      * No stream option is resettable in this release, so `Client::updateStream()` refuses every
-     * case with the error the server would return.
+     * case with the error the server would return. The source, fingerprint and shadow origin keys
+     * are read-only.
      */
     enum StreamOptionKey: string {
       case Name = 'name';
@@ -2932,6 +2962,7 @@ namespace Iggy {
       case EncryptionKeySource = 'encryption_key_source';
       case EncryptionKeyFingerprint = 'encryption_key_fingerprint';
       case EncryptionKekFingerprint = 'encryption_kek_fingerprint';
+      case ShadowOrigin = 'shadow_origin';
     }
 
     /**
@@ -2977,6 +3008,14 @@ namespace Iggy {
          */
         public readonly array $derived_options;
 
+        /**
+         * How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
+         * for a normal topic.
+         *
+         * @var string|null
+         */
+        public readonly ?string $geo_mode;
+
         public readonly int $id;
 
         public readonly int $messages_count;
@@ -2996,6 +3035,13 @@ namespace Iggy {
 
         public readonly int $size_bytes;
 
+        /**
+         * What the topic is, `normal` or `geo`, fixed at creation.
+         *
+         * @var string
+         */
+        public readonly string $topic_type;
+
         public function __construct() {}
     }
 
@@ -3006,6 +3052,14 @@ namespace Iggy {
          * @var array
          */
         public readonly array $derived_options;
+
+        /**
+         * How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
+         * for a normal topic.
+         *
+         * @var string|null
+         */
+        public readonly ?string $geo_mode;
 
         public readonly int $id;
 
@@ -3033,6 +3087,13 @@ namespace Iggy {
         public readonly array $partitions;
 
         public readonly int $partitions_count;
+
+        /**
+         * What the topic is, `normal` or `geo`, fixed at creation.
+         *
+         * @var string
+         */
+        public readonly string $topic_type;
 
         public function __construct() {}
     }

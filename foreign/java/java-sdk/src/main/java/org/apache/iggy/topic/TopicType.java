@@ -19,6 +19,8 @@
 
 package org.apache.iggy.topic;
 
+import java.util.Optional;
+
 /** What a topic is, fixed at create and never changed afterwards. */
 public enum TopicType {
     /** The topic's messages stay in this cluster. */
@@ -30,6 +32,16 @@ public enum TopicType {
 
     TopicType(String value) {
         this.value = value;
+    }
+
+    /** The topic type named {@code value}, or empty for a topic type this build does not know. */
+    public static Optional<TopicType> fromValue(String value) {
+        for (TopicType type : values()) {
+            if (type.value.equals(value)) {
+                return Optional.of(type);
+            }
+        }
+        return Optional.empty();
     }
 
     public String value() {

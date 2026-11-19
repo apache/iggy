@@ -76,6 +76,20 @@ public interface SystemClient {
     CompletableFuture<MetadataChanges> getMetadataChanges(MetadataChangesQuery query);
 
     /**
+     * Retires the geo peer {@code origin}, a datacenter that never returns, asynchronously.
+     *
+     * <p>The cluster then follows nothing of it again: its shadow topics serve what they hold until their
+     * retention removes it, and a client may delete them. A datacenter that comes back needs another origin
+     * name. Requires root or the global manage servers permission.
+     *
+     * @param origin the origin name of the geo peer, 1 to 255 bytes when UTF-8 encoded
+     * @return A CompletableFuture that completes when the cluster has retired the origin
+     * @throws org.apache.iggy.exception.IggyInvalidArgumentException for an origin of the wrong length, before
+     *     anything is sent
+     */
+    CompletableFuture<Void> retireGeoOrigin(String origin);
+
+    /**
      * Gets information about the current client asynchronously.
      *
      * @return A CompletableFuture containing current client details

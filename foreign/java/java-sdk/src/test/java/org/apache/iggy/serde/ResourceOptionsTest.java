@@ -33,15 +33,18 @@ import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamOptionKey;
 import org.apache.iggy.stream.StreamOptions;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.MetadataChangeBody;
 import org.apache.iggy.system.OptionKey;
 import org.apache.iggy.system.OptionSpec;
 import org.apache.iggy.system.OptionsScope;
 import org.apache.iggy.topic.CompressionAlgorithm;
 import org.apache.iggy.topic.Durability;
+import org.apache.iggy.topic.GeoMode;
 import org.apache.iggy.topic.Topic;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.iggy.topic.TopicOptionKey;
 import org.apache.iggy.topic.TopicOptions;
+import org.apache.iggy.topic.TopicType;
 import org.apache.iggy.topic.TopicUpdate;
 import org.apache.iggy.user.UserInfo;
 import org.apache.iggy.user.UserInfoDetails;
@@ -376,6 +379,20 @@ class ResourceOptionsTest {
             List<String> keks = new ArrayList<>();
             expected.get("encryption_kek_fingerprints").forEach(kek -> keks.add(kek.asString()));
             assertThat(stream.encryptionKekFingerprints()).as(name).isEqualTo(keks);
+            Optional<String> origin = textOrEmpty(expected.get("shadow_origin"));
+            assertThat(stream.shadowOrigin()).as(name).isEqualTo(origin);
+            assertThat(BytesDeserializer.readStreamBase(responseOf(vector)).shadowOrigin())
+                    .as(name)
+                    .isEqualTo(origin);
+            var change = new MetadataChangeBody.StreamChange(
+                    stream.id(),
+                    BigInteger.ONE,
+                    stream.createdAt(),
+                    stream.name(),
+                    stream.options(),
+                    stream.derivedOptions(),
+                    false);
+            assertThat(change.shadowOrigin()).as(name).isEqualTo(origin);
             assertNoSecretKeys(
                     name, stream.options().keySet(), stream.derivedOptions().keySet());
         }
@@ -426,6 +443,8 @@ class ResourceOptionsTest {
                             .get("local_retention_size")
                             .get("value")
                             .asString()));
+            assertThat(topic.topicType().map(TopicType::value)).as(name).isEqualTo(optionText(expected, "topic_type"));
+            assertThat(topic.geoMode().map(GeoMode::value)).as(name).isEqualTo(optionText(expected, "geo_mode"));
         }
         for (JsonNode vector : section("user_responses")) {
             JsonNode expected = vector.get("expected");
@@ -625,6 +644,15 @@ class ResourceOptionsTest {
                 .hasValue(key);
         assertThat(options.entries().get(StreamOptionKey.ENCRYPTION_KEY.value()))
                 .isEqualTo(new HeaderValue(HeaderKind.Raw, key));
+    }
+
+    private static Optional<String> optionText(JsonNode expected, String key) {
+        JsonNode option = expected.get("options").get(key);
+        return option == null ? Optional.empty() : textOrEmpty(option.get("value"));
+    }
+
+    private static Optional<String> textOrEmpty(JsonNode node) {
+        return node == null || node.isNull() ? Optional.empty() : Optional.of(node.asString());
     }
 
     private static void assertInvalidKey(IggyValidationException refusal) {

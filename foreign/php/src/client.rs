@@ -574,6 +574,23 @@ impl IggyClient {
         })
     }
 
+    /// Retires the geo origin of a datacenter that never returns.
+    ///
+    /// The cluster then follows nothing more of the origin: its shadow topics serve what they
+    /// hold until their retention removes it, and a client may delete them. Retiring an origin
+    /// that is retired already changes nothing. A datacenter that comes back needs another
+    /// origin name. Needs root or the global `manage_servers` permission.
+    pub fn retire_geo_origin(&self, origin: String) -> PhpResult {
+        let inner = self.inner.clone();
+
+        runtime().block_on(async move {
+            inner
+                .retire_geo_origin(&origin)
+                .await
+                .map_err(to_php_exception)
+        })
+    }
+
     /// Gets a topic by stream and topic id/name.
     ///
     /// Over TCP, QUIC and WebSocket, a topic with too many partitions for one reply throws
