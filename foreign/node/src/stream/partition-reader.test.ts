@@ -4016,6 +4016,47 @@ describe('consumer', () => {
     }
   }
 
+  for (const commit of [CommitPolicy.Manual, CommitPolicy.OnRead,
+    CommitPolicy.Auto({ interval: 3_600_000, after: CommitAfter.Delivery })]) {
+    for (const handler of [false, true]) {
+      it(`checks the assignment during ${handler ? 'a handler loop' : 'iteration'} with ${commit.kind}`, async () => {
+        const topic = new FakeTopic(6n);
+        topic.assigned = [1];
+        const client = topic.client();
+        const reader = await PartitionReader.open(async () => client, {
+          streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 },
+          options: { maxWait: 100, commit }, retryInterval: 20
+        });
+        const consumer = new IggyConsumer(reader, commit.kind === 'auto' ? CommitAfter.Delivery : undefined);
+        const received: Array<[number, bigint]> = [];
+        const record = async (partitionId: number, offset: bigint) => {
+          received.push([partitionId, offset]);
+          if (received.length !== 1) return;
+          topic.assigned = [3];
+          await waitFor(() => consumer.partitions().length === 1 && consumer.partitions()[0] === 3,
+            'the assignment did not move to partition 3', 2 * GROUP_REFRESH_MS);
+        };
+        try {
+          if (handler) {
+            const stop = new Error('handler stopped');
+            await assert.rejects(consumer.consume(async ({ partitionId, message }) => {
+              await record(partitionId, message.headers.offset);
+              if (received.length === 2) throw stop;
+            }), (error: unknown) => error === stop);
+          } else {
+            for await (const { partitionId, message } of consumer) {
+              await record(partitionId, message.headers.offset);
+              if (received.length === 2) break;
+            }
+          }
+          assert.deepEqual(received, [[1, 0n], commit.kind === 'onRead' ? [1, 1n] : [3, 0n]]);
+        } finally {
+          await consumer.shutdown();
+        }
+      });
+    }
+  }
+
   it('drops a retained batch from an earlier assignment of the same partition', async () => {
     const topic = new FakeTopic(6n);
     topic.assigned = [1];

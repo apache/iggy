@@ -897,8 +897,8 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
 
   /** @internal Whether a consumer may still hand over the unread messages of a batch. */
   keepsBatch(batch: PolledBatch): boolean {
-    const stamp = batch.checkpoint()?.stamp;
-    return stamp?.reader === this.id && this.keeps(batch.partitionId, stamp.generation);
+    const generation = batch.checkpoint()?.stamp?.generation;
+    return generation !== undefined && this.keeps(batch.partitionId, generation);
   }
 
   /**

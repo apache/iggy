@@ -58,7 +58,9 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
 /**
  * Hands over the messages of a topic one at a time, on a `PartitionReader`.
  * After a loop ends, a later iteration or `consume()` continues with the next
- * unread message of its batch. Use one iterator or handler loop at a time.
+ * unread message of its batch. A seek drops the unread remainder for that
+ * partition, as does revocation under Manual or Auto. Use one iterator or
+ * handler loop at a time.
  * With `CommitPolicy.Manual` the application commits checkpoints. With
  * `CommitPolicy.OnRead` the server stores the offset of each read and
  * `shutdown()` moves it back to the last message handed over. It does not
@@ -79,7 +81,7 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
 export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private uncounted?: { checkpoint: Checkpoint, endsBatch: boolean };
   private stopped = false;
-  /** The batch whose messages the consumer hands over, until a seek of its partition drops the rest. */
+  /** The batch retained across loops while the reader still allows delivery. */
   private current?: PolledBatch;
   private index = 0;
 
@@ -103,7 +105,7 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
       const batch = await this.nextBatch();
       if (!batch) return;
       this.current = batch;
-      while (this.index < batch.messages.length && this.current === batch) {
+      while (this.index < batch.messages.length && this.current === batch && this.reader.keepsBatch(batch)) {
         if (this.stopped) return;
         const message = this.hand(batch, this.index++);
         yield message;
@@ -124,7 +126,7 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
       const batch = await this.nextBatch();
       if (!batch) return;
       this.current = batch;
-      while (this.index < batch.messages.length && this.current === batch) {
+      while (this.index < batch.messages.length && this.current === batch && this.reader.keepsBatch(batch)) {
         if (this.stopped) return;
         const message = this.hand(batch, this.index++);
         // A shutdown while the handler runs must not count its message.
@@ -155,9 +157,8 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
    * does, and drops the rest of the batch of that partition that the consumer
    * hands over.
    */
-  async seek(partitionId: number, start: PollingStrategy): Promise<void> {
-    await this.reader.seek(partitionId, start);
-    if (this.current?.partitionId === partitionId) this.current = undefined;
+  seek(partitionId: number, start: PollingStrategy): Promise<void> {
+    return this.reader.seek(partitionId, start);
   }
 
   /**
