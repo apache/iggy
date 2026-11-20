@@ -154,6 +154,17 @@ pub struct CheckpointJob {
     capture_time: Duration,
 }
 
+/// A WAL trim that waits for the journal gate or holds it, from
+/// [`IggyMetadata::announce_checkpoint_trim`]. The trim stops being pending
+/// when this drops, also when the job future is dropped at an await.
+pub struct PendingTrim<'a>(&'a Cell<u32>);
+
+impl Drop for PendingTrim<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
 /// Who took a checkpoint and how long each step took, for its completion log.
 #[derive(Clone, Copy, Debug, Default)]
 struct CheckpointTimings {
@@ -1560,6 +1571,11 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// as unsound: the drain's live-set partition misses an append landing
     /// mid-rewrite and the rewrite silently discards it. See [`LocalGate`].
     journal_gate: LocalGate,
+    /// Checkpoint jobs that wait for `journal_gate` or hold it for their WAL
+    /// trim. The gate serves its waiters in arrival order, so an append that
+    /// arrives behind such a job waits for the whole rewrite. The shard 0 pump
+    /// must not wait that long: see [`Self::checkpoint_trim_pending`].
+    pending_trims: Cell<u32>,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
     /// Late-bound post-commit notifier. Fires once per committed normal op
@@ -1686,6 +1702,7 @@ where
             placement: RefCell::default(),
             coordinator,
             journal_gate: LocalGate::new(),
+            pending_trims: Cell::new(0),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
             checkpoint_spawner: RefCell::new(None),
@@ -2205,8 +2222,11 @@ where
 
         // Two-queue admission: prepare slot then project+replicate; prepare
         // full + request room then buffer; both full then drop+warn (SDK
-        // retries via read-timeout).
-        if consensus.pipeline_is_full() {
+        // retries via read-timeout). A pending WAL trim buffers too: the
+        // append would wait for it on the pump, see
+        // [`Self::checkpoint_trim_pending`]. No await separates this test
+        // from the gate acquire in `on_replicate`.
+        if consensus.pipeline_is_full() || self.checkpoint_trim_pending() {
             let push_result = consensus.push_queued_request(consensus::RequestEntry::new(message));
             if push_result.is_err() {
                 warn!(
@@ -2215,7 +2235,7 @@ where
                     replica_id = consensus.replica(),
                     client = client_id,
                     request = request,
-                    "on_request: prepare and request queues both full, dropping"
+                    "on_request: request queue full behind a full prepare queue or a pending WAL trim, dropping"
                 );
             }
             return;
@@ -4889,7 +4909,11 @@ where
         // one commit window drains the moment the window closes. Promoted
         // prepares are un-quorum'd, so they never re-close the gate here.
         loop {
-            if consensus.pipeline_is_full() {
+            // A pending WAL trim ends the promotion as a full pipeline does,
+            // and the tick promotes the rest once the trim ended. A request
+            // that passes its preflight reaches the gate acquire in
+            // `on_replicate` without an await after this test.
+            if consensus.pipeline_is_full() || self.checkpoint_trim_pending() {
                 break;
             }
             let req = consensus.pop_queued_request();
@@ -5026,13 +5050,23 @@ where
         self.journal_gate.acquire()
     }
 
-    /// Whether a journal write holds the gate or waits for it, so the next
-    /// writer would wait: a prepare in `on_replicate`, or a caller of
-    /// [`Self::hold_journal_writes`]. The WAL trim of a checkpoint job holds
-    /// it for a whole rewrite.
+    /// Whether a checkpoint job waits for `journal_gate` or holds it for its
+    /// WAL trim. A journal write that starts now waits for the whole rewrite.
+    ///
+    /// The shard 0 pump reads this before each step that appends, and keeps
+    /// the step for later while it is set. A short hold of the gate, as by the
+    /// append of an in-process submit, does not set it.
     #[must_use]
-    pub fn journal_writes_held(&self) -> bool {
-        self.journal_gate.try_acquire().is_none()
+    pub const fn checkpoint_trim_pending(&self) -> bool {
+        self.pending_trims.get() > 0
+    }
+
+    /// Counts a WAL trim as pending until the returned guard drops. A
+    /// checkpoint job calls this before it waits for `journal_gate`.
+    #[must_use]
+    pub fn announce_checkpoint_trim(&self) -> PendingTrim<'_> {
+        self.pending_trims.set(self.pending_trims.get() + 1);
+        PendingTrim(&self.pending_trims)
     }
 
     /// Persist the current VSR state to the superblock when the view changed since
@@ -5355,6 +5389,7 @@ where
             return;
         }
 
+        let _trim = self.announce_checkpoint_trim();
         let wait_started = Instant::now();
         let _journal_writes = self.journal_gate.acquire().await;
         // Margin waiters and installs take `journal_gate` first, so only a newer job
@@ -13233,6 +13268,45 @@ mod tests {
         drop(newer_job);
     }
 
+    /// The shard 0 pump keeps its appends for later only while a trim is
+    /// pending. The gate serves its waiters in arrival order, so the job must
+    /// report its trim before it waits: an append that arrives behind the
+    /// waiting job waits for the whole rewrite.
+    #[compio::test]
+    async fn given_a_job_waiting_on_the_journal_gate_when_asked_should_report_a_pending_trim_until_it_ends()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        for op in 1..=JOB_TRIGGER_OP {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        let gate = md.journal_gate.try_acquire().unwrap();
+        for op in 1..=JOB_TRIGGER_OP {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+        }
+        assert!(
+            !md.checkpoint_trim_pending(),
+            "a held gate alone is no pending trim"
+        );
+        for _ in 0..JOB_POLL_BUDGET {
+            if md.checkpoint_trim_pending() {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            md.checkpoint_trim_pending(),
+            "a job that waits for the gate must report its trim"
+        );
+
+        drop(gate);
+        assert_eq!(await_jobs(&jobs).await, 1);
+        assert!(!md.checkpoint_trim_pending());
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+    }
+
     /// An install waits for a running job's durable part, then moves the floor past
     /// the job's checkpoint, so the job's later trim does nothing.
     #[compio::test]
@@ -16868,6 +16942,77 @@ mod tests {
         assert!(
             journaled.is_none(),
             "the append failed, so the WAL must hold nothing at that op"
+        );
+    }
+
+    /// A checkpoint job holds `journal_gate` while it rewrites the WAL. A
+    /// request that the primary prepared meanwhile waited for the rewrite on
+    /// the shard 0 pump, and so did the promotion of a queued one.
+    #[compio::test]
+    async fn given_a_pending_wal_trim_when_a_request_arrives_should_queue_it_until_the_trim_ends() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        let journal = md.journal.as_ref().unwrap().handle();
+
+        // As a checkpoint job: it announces its trim, then takes the gate.
+        let trim = md.announce_checkpoint_trim();
+        let rewrite = md.hold_journal_writes().await;
+        futures::FutureExt::now_or_never(md.on_request(create_stream_request(CLIENT, 1, "s1")))
+            .expect("a request must not wait for the WAL trim on the pump");
+        assert_eq!(consensus.request_queue_len(), 1);
+        futures::FutureExt::now_or_never(md.resume_stranded_commits())
+            .expect("the promotion must not wait for the WAL trim on the pump");
+        assert_eq!(
+            consensus.request_queue_len(),
+            1,
+            "no request is promoted while the trim is pending"
+        );
+        assert_eq!(journal.last_op(), None);
+
+        drop(rewrite);
+        drop(trim);
+        md.resume_stranded_commits().await;
+
+        assert_eq!(consensus.request_queue_len(), 0);
+        assert_eq!(
+            journal.last_op(),
+            Some(consensus.sequencer().current_sequence()),
+            "the tick promotes the queued request once the trim ended"
         );
     }
 }

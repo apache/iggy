@@ -632,9 +632,31 @@ where
                                 self.process_frame(reply).await;
                             }
                             self.process_one_poll_completion(&mut loopback_buf).await;
+                            // One per main frame, as the reply lane above: the
+                            // arm below never runs while the main lane is busy.
+                            if let Some(frame) = self.pop_gated_metadata_frame() {
+                                self.replay_gated_metadata_frame(frame, &mut loopback_buf).await;
+                            }
                         }
                         Err(_) => break,
                     }
+                }
+                frame = poll_fn(|_| {
+                    self.pop_gated_metadata_frame().map_or(Poll::Pending, Poll::Ready)
+                }).fuse() => {
+                    // Below the main lane, not with the redispatch arm above
+                    // it: a trim can leave a deep queue, and the frames that
+                    // arrive meanwhile, such as the replies to this replica's
+                    // heartbeats, must not wait for all of it.
+                    self.replay_gated_metadata_frame(frame, &mut loopback_buf).await;
+                    // As the redispatch arm does: this arm outranks the reply
+                    // lane and the poll completions too.
+                    if let Ok(reply) = self.reply_inbox.try_recv()
+                        && self.accept_frame_for_self(&reply)
+                    {
+                        self.process_frame(reply).await;
+                    }
+                    self.process_one_poll_completion(&mut loopback_buf).await;
                 }
                 frame = self.reply_inbox.recv().fuse() => {
                     // Reached only while the main lane is quiet (biased order):
@@ -873,6 +895,23 @@ where
             self.process_loopback(loopback_buf).await;
             self.apply_reconcile_ops();
         }
+    }
+
+    /// Hand the plane one metadata frame that waited for the end of a WAL
+    /// trim, see `Self::defer_gated_metadata_frame`.
+    #[allow(clippy::future_not_send)]
+    async fn replay_gated_metadata_frame(&self, frame: MessageBag, loopback_buf: &mut LoopbackRound)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        self.deliver_message(frame, None).await;
+        self.cooperate().await;
+        self.process_loopback(loopback_buf).await;
+        self.apply_reconcile_ops();
     }
 
     /// Process queued work after the select loop has stopped. Redispatch keeps

@@ -787,13 +787,14 @@ const MAX_HELD_READS_PER_NAMESPACE: usize = MAX_PARKED_PER_NAMESPACE;
 /// offset reads counts each of its reads.
 const MAX_HELD_READS: usize = MAX_PARKED_BYTES / MESSAGE_ALIGN;
 
-/// Budget for a partition write's wait on its committed reply. Longer than a
-/// read: the wait spans replication quorum plus any park-and-promote the
-/// request rides through, and a view change mid-flight re-proposes under the
-/// new primary. Shorter than the SDK's operation deadline, so the unknown
-/// outcome the relay answers on expiry still reaches a client that can replay
-/// the request id within its deadline.
-const PARTITION_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Budget for a partition write's wait on its committed reply.
+///
+/// Longer than a read: the wait spans replication quorum plus any
+/// park-and-promote the request rides through, and a view change mid-flight
+/// re-proposes under the new primary. Shorter than the SDK's operation
+/// deadline, so the unknown outcome the relay answers on expiry still reaches
+/// a client that can replay the request id within its deadline.
+pub const PARTITION_SUBMIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const _: () =
     assert!(PARTITION_SUBMIT_TIMEOUT.as_nanos() < iggy_common::BINARY_OPERATION_TIMEOUT.as_nanos());
 
@@ -2458,9 +2459,10 @@ where
     /// stalling behind the whole bounded queue.
     redispatch_queue: RefCell<VecDeque<ParkedFrame>>,
 
-    /// Metadata prepares that arrived while the metadata journal gate was
-    /// busy, in arrival order. See [`Self::defer_gated_metadata_prepare`].
-    deferred_metadata_prepares: RefCell<DeferredMetadataPrepares>,
+    /// Frames of the metadata plane that arrived while a WAL trim of a
+    /// checkpoint job was pending, in arrival order. See
+    /// [`Self::defer_gated_metadata_frame`].
+    gated_metadata_frames: RefCell<GatedMetadataFrames>,
 
     /// Set while the shard-wide budget is shedding for namespaces holding no
     /// park entry of their own, which have no [`ParkEntry::shed`] to warn once
@@ -2795,7 +2797,7 @@ where
             held_reads: RefCell::default(),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
-            deferred_metadata_prepares: RefCell::default(),
+            gated_metadata_frames: RefCell::default(),
             shard_park_shedding: Cell::new(false),
             partition_submit_stalled: Cell::new(false),
             metadata_repair: RefCell::new(None),
@@ -3914,7 +3916,7 @@ where
             held_reads: RefCell::default(),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
-            deferred_metadata_prepares: RefCell::default(),
+            gated_metadata_frames: RefCell::default(),
             shard_park_shedding: Cell::new(false),
             partition_submit_stalled: Cell::new(false),
             metadata_repair: RefCell::new(None),
@@ -4671,11 +4673,11 @@ struct RedispatchedFrame {
     attachment: Option<ConsumerAttachment>,
 }
 
-/// Metadata prepares that wait for the metadata journal gate off the plane,
-/// and the bytes they hold.
+/// Frames of the metadata plane that wait off the plane for the end of a WAL
+/// trim, and the bytes that their buffers hold.
 #[derive(Default)]
-struct DeferredMetadataPrepares {
-    prepares: VecDeque<Message<PrepareHeader>>,
+struct GatedMetadataFrames {
+    frames: VecDeque<MessageBag>,
     bytes: usize,
 }
 
@@ -4751,12 +4753,12 @@ const MAX_PARKED_PER_NAMESPACE: usize = 128;
 /// every other namespace's convergence window.
 const MAX_PARKED_BYTES: usize = 16 * 1024 * 1024;
 
-/// Byte budget of the metadata prepares that wait for the metadata journal
-/// gate. The primary keeps sending while another backup acks, so one wait can
-/// collect more than a pipeline of prepares. A prepare past the budget is
-/// dropped as a lost frame is: the primary sends it again, or the repair of
-/// this replica fetches it.
-const MAX_DEFERRED_METADATA_PREPARE_BYTES: usize = MAX_PARKED_BYTES;
+/// Byte budget of the metadata frames that wait for the end of a WAL trim.
+/// The primary keeps sending while another backup acks, so one wait can
+/// collect more than a pipeline of prepares. A frame past the budget is
+/// dropped as a lost frame is: the primary sends a prepare again, and the
+/// repair of this replica fetches what a repair stream lost.
+const MAX_GATED_METADATA_FRAME_BYTES: usize = MAX_PARKED_BYTES;
 
 /// Per-namespace ceiling on parked bytes, so one un-materialised namespace
 /// cannot spend the whole shard's budget and shed everyone else's frames.
@@ -4778,6 +4780,12 @@ const MAX_PARKED_BYTES_PER_NAMESPACE: usize = MAX_PARKED_BYTES / 4;
 /// resident per shard.
 const fn parked_footprint(len: usize) -> usize {
     len.next_multiple_of(MESSAGE_ALIGN)
+}
+
+/// Whether a repaired prepare belongs to the metadata group. An entry that a
+/// metadata WAL holds from before the group id existed names group 0.
+const fn claims_metadata_group(metadata_group: u64, header: &PrepareHeader) -> bool {
+    header.group == metadata_group || (header.group == 0 && header.operation.is_metadata_plane())
 }
 
 /// Whether consecutive superblock write failures crossed the fail-stop bound.
@@ -4836,17 +4844,6 @@ where
     /// materialisation can append off-pump without colliding with a suspended
     /// `RefCell` guard.
     fn pop_redispatched_frame(&self) -> Option<RedispatchedFrame> {
-        if let Some(prepare) = self.pop_deferred_metadata_prepare() {
-            return Some(RedispatchedFrame {
-                message: MessageBag::Prepare(prepare),
-                provenance: ParkProvenance {
-                    epoch: None,
-                    passes: 0,
-                },
-                reply: None,
-                attachment: None,
-            });
-        }
         loop {
             let ParkedFrame {
                 epoch,
@@ -4889,65 +4886,83 @@ where
         }
     }
 
-    /// Keeps a metadata prepare off the plane while the metadata journal gate
-    /// is busy. Returns the prepare when the plane can take it now.
+    /// Keeps a frame that appends to the metadata journal off the plane while
+    /// a WAL trim of a checkpoint job is pending. Returns the frame when the
+    /// plane can take it now.
     ///
-    /// `on_replicate` waits for that gate before it appends, and a checkpoint
-    /// job holds it while it rewrites the WAL. A wait on the pump would stop
-    /// the ticks of every partition group of this shard for that long, and
-    /// their heartbeats with them. The pump hands a kept prepare back once
-    /// the gate is free, see [`Self::pop_deferred_metadata_prepare`], so the
-    /// plane takes it as a frame that arrived late. A prepare that arrives
-    /// behind kept ones is kept too, which preserves their order.
-    fn defer_gated_metadata_prepare(
-        &self,
-        prepare: Message<PrepareHeader>,
-    ) -> Option<Message<PrepareHeader>> {
-        if !self.metadata_prepares_wait_for_gate() {
-            return Some(prepare);
+    /// The appends wait for the metadata journal gate: a live prepare in
+    /// `on_replicate`, a repaired one in `on_repair_prepare`. The job holds
+    /// that gate while it rewrites the WAL. A wait on the pump would stop the
+    /// ticks of every partition group of this shard for that long, and their
+    /// heartbeats with them. The pump hands a kept frame back once the trim
+    /// ended, see [`Self::pop_gated_metadata_frame`], so the plane takes it as
+    /// a frame that arrived late. A frame that arrives behind kept ones is
+    /// kept too, which preserves their order.
+    fn defer_gated_metadata_frame(&self, message: MessageBag) -> Option<MessageBag> {
+        if !(self.metadata_frames_wait_for_trim() && self.appends_to_metadata_journal(&message)) {
+            return Some(message);
         }
-        let mut deferred = self.deferred_metadata_prepares.borrow_mut();
-        let size = prepare.header().size as usize;
-        if deferred.bytes.saturating_add(size) > MAX_DEFERRED_METADATA_PREPARE_BYTES {
+        let mut gated = self.gated_metadata_frames.borrow_mut();
+        let cost = parked_footprint(message.size() as usize);
+        if gated.bytes.saturating_add(cost) > MAX_GATED_METADATA_FRAME_BYTES {
             self.metrics.record_frame_drop(
                 crate::metrics::frame_drop_variant::CONSENSUS,
                 crate::metrics::frame_drop_reason::PARK_OVERFLOW,
             );
             tracing::warn!(
                 shard = self.id,
-                op = prepare.header().op,
-                deferred_bytes = deferred.bytes,
-                "metadata prepares that wait for the journal gate are at capacity; dropping one"
+                gated_bytes = gated.bytes,
+                "metadata frames that wait for the end of a WAL trim are at capacity; dropping one"
             );
             return None;
         }
-        deferred.bytes += size;
-        deferred.prepares.push_back(prepare);
+        gated.bytes += cost;
+        gated.frames.push_back(message);
         None
     }
 
-    /// True while a metadata prepare must wait: a job holds the metadata
-    /// journal gate, or kept prepares go to the journal first.
-    fn metadata_prepares_wait_for_gate(&self) -> bool {
-        !self.deferred_metadata_prepares.borrow().prepares.is_empty()
-            || self.plane.metadata().journal_writes_held()
+    /// Whether `message` appends to the metadata journal, or must stay behind
+    /// the frames that do: a live prepare, a repaired prepare, and the
+    /// terminator of a repair stream, which walks what its prepares appended.
+    fn appends_to_metadata_journal(&self, message: &MessageBag) -> bool {
+        let Some(consensus) = self.plane.metadata().consensus.as_ref() else {
+            return false;
+        };
+        match message {
+            MessageBag::Prepare(prepare) => {
+                let operation = prepare.header().operation;
+                operation.is_plane_routable() && !operation.is_partition()
+            }
+            MessageBag::RepairPrepare(repair) => {
+                claims_metadata_group(consensus.group(), &repair.header().0)
+            }
+            MessageBag::RepairRangeReply(reply) => consensus.group() == reply.header().group,
+            _ => false,
+        }
     }
 
-    /// The oldest kept metadata prepare, once the metadata journal gate is
-    /// free. The pump asks on each pass, and no frame has to arrive for that:
-    /// its tick ends the wait at the latest. No await separates this test
-    /// from the gate acquire in `on_replicate`, so the prepare finds the gate
-    /// free.
-    fn pop_deferred_metadata_prepare(&self) -> Option<Message<PrepareHeader>> {
-        let mut deferred = self.deferred_metadata_prepares.borrow_mut();
-        if deferred.prepares.is_empty() || self.plane.metadata().journal_writes_held() {
+    /// True while a frame that appends to the metadata journal must wait: a
+    /// WAL trim is pending, or kept frames go to the journal first.
+    fn metadata_frames_wait_for_trim(&self) -> bool {
+        !self.gated_metadata_frames.borrow().frames.is_empty()
+            || self.plane.metadata().checkpoint_trim_pending()
+    }
+
+    /// The oldest kept metadata frame, once no WAL trim is pending. The pump
+    /// asks on each pass, and no frame has to arrive for that: its tick ends
+    /// the wait at the latest. A live prepare reaches the gate acquire in
+    /// `on_replicate` with no await after this test. A repaired prepare that
+    /// writes the superblock first tests again after the write.
+    pub(crate) fn pop_gated_metadata_frame(&self) -> Option<MessageBag> {
+        if self.plane.metadata().checkpoint_trim_pending() {
             return None;
         }
-        let prepare = deferred.prepares.pop_front()?;
-        deferred.bytes = deferred
+        let mut gated = self.gated_metadata_frames.borrow_mut();
+        let frame = gated.frames.pop_front()?;
+        gated.bytes = gated
             .bytes
-            .saturating_sub(prepare.header().size as usize);
-        Some(prepare)
+            .saturating_sub(parked_footprint(frame.size() as usize));
+        Some(frame)
     }
 
     /// Deliver one staged frame, through the admission path it arrived on.
@@ -5028,9 +5043,31 @@ where
     /// [`Self::on_message`] carrying the park provenance of a frame the pump is
     /// re-delivering, so a second park keeps the stamp and age the first one
     /// derived instead of deriving them again against newer committed state.
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    ///
+    /// A frame that appends to the metadata journal waits here while a WAL
+    /// trim is pending, see [`Self::defer_gated_metadata_frame`].
+    #[allow(clippy::future_not_send)]
     async fn dispatch_message(&self, message: MessageBag, provenance: Option<ParkProvenance>)
     where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+        T: ShardsTable,
+    {
+        if let Some(message) = self.defer_gated_metadata_frame(message) {
+            self.deliver_message(message, provenance).await;
+        }
+    }
+
+    /// Hands a frame to the plane that it belongs to.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    pub(crate) async fn deliver_message(
+        &self,
+        message: MessageBag,
+        provenance: Option<ParkProvenance>,
+    ) where
         B: MessageBus + 'static,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
@@ -5103,15 +5140,6 @@ where
                     );
                     return;
                 }
-                // A prepare that the pump hands back waited for the gate already.
-                let prepare = if provenance.is_none() && !routing.0.is_partition() {
-                    let Some(prepare) = self.defer_gated_metadata_prepare(prepare) else {
-                        return;
-                    };
-                    prepare
-                } else {
-                    prepare
-                };
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -8131,9 +8159,8 @@ where
         // being metadata mutations, so `is_metadata` alone is too narrow), which
         // is why both sites share it rather than re-deriving the set.
         let metadata_plane_op = header.operation.is_metadata_plane();
-        let legacy_metadata_claim = header.group == 0 && metadata_plane_op;
         if let Some(ref consensus) = planes.0.consensus
-            && (consensus.group() == header.group || legacy_metadata_claim)
+            && claims_metadata_group(consensus.group(), &header)
         {
             let session = *self.metadata_repair.borrow();
             let Some(session) = session else {
@@ -8279,6 +8306,17 @@ where
             // this replica has not proven is no history of its certified view, and a
             // restart drops it only when it finds that later view recorded.
             if !planes.0.persist_superblock_if_needed(consensus).await {
+                return;
+            }
+            // A WAL trim can start during the superblock write above, and the
+            // append would wait for it on the pump. Dropped as a lost frame is:
+            // the repair fetches the op again.
+            if planes.0.checkpoint_trim_pending() {
+                tracing::debug!(
+                    shard = self.id,
+                    op = header.op,
+                    "dropping a repaired metadata prepare that a WAL trim got ahead of"
+                );
                 return;
             }
             // A WAL rewrite or checkpoint trim running under the append would drop
@@ -9288,6 +9326,12 @@ where
         let (Some(consensus), Some(journal)) = (&metadata.consensus, &metadata.journal) else {
             return;
         };
+        // Each repaired prepare asks for a reconcile, and with a proven view
+        // log there is nothing to do. A wait for the gate would then hold the
+        // pump for the WAL rewrite of a checkpoint job for no reason.
+        if !consensus.view_log_unproven() {
+            return;
+        }
         let _journal_writes = metadata.hold_journal_writes().await;
         while reconcile_metadata_view_log(self.id, consensus, journal.handle()).await
             == MetadataViewLogStep::PersistFirst
@@ -9521,10 +9565,10 @@ where
         if peer == consensus.replica() {
             return;
         }
-        // A kept prepare is not a gap, and the prepares of a repair would
-        // wait for the journal gate on the pump. The gap detector of the
-        // tick asks again once the gate is free.
-        if self.metadata_prepares_wait_for_gate() {
+        // A kept prepare is not a gap, and a repair armed now would only
+        // add frames to keep. The gap detector of the tick asks again once
+        // the trim ended.
+        if self.metadata_frames_wait_for_trim() {
             return;
         }
         if consensus.is_normal()
