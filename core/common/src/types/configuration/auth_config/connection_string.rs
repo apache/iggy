@@ -166,6 +166,88 @@ mod tests {
     use secrecy::ExposeSecret;
 
     #[test]
+    fn should_enforce_shared_transport_option_contract() {
+        macro_rules! check_transport {
+            ($protocol:literal, $options:ty, $config:ty, $field:ident, $default:literal) => {{
+                let parse = |query: &str| {
+                    ConnectionString::<$options>::new(&format!(
+                        "iggy+{}://user:secret@localhost:8090{query}",
+                        $protocol
+                    ))
+                    .map(<$config>::from)
+                };
+                let defaults = parse("").unwrap();
+                assert_eq!(defaults.$field, $default);
+                assert_eq!(defaults.reconnection.max_retries, None);
+                let configured = parse(
+                    "?reconnection_max_retries=3&reestablish_after=500ms&tls_validate_certificate=true&reconnection_max_retries=7",
+                )
+                .unwrap();
+                assert!(configured.$field);
+                assert_eq!(configured.reconnection.max_retries, Some(7));
+                assert_eq!(
+                    configured.reconnection.reestablish_after.get_duration(),
+                    std::time::Duration::from_millis(500)
+                );
+                assert!(!parse("?tls_validate_certificate=false").unwrap().$field);
+                for query in [
+                    "?reconnection_max_retries=4294967296&reconnection_max_retries=7",
+                    "?reconnection_max_retries=7&reconnection_max_retries=4294967296",
+                    "?reestablish_after=500&reestablish_after=500ms",
+                    "?reestablish_after=500ms&reestablish_after=500",
+                ] {
+                    assert!(matches!(parse(query), Err(IggyError::InvalidConnectionString)));
+                }
+                for invalid in [concat!("tu", "re"), "yes", "1", "TRUE", "", "invalid"] {
+                    for query in [
+                        format!("?tls_validate_certificate={invalid}&tls_validate_certificate=true"),
+                        format!("?tls_validate_certificate=true&tls_validate_certificate={invalid}"),
+                    ] {
+                        assert!(matches!(parse(&query), Err(IggyError::InvalidConnectionString)));
+                    }
+                }
+            }};
+        }
+        check_transport!(
+            "tcp",
+            TcpConnectionStringOptions,
+            TcpClientConfig,
+            tls_validate_certificate,
+            true
+        );
+        check_transport!(
+            "quic",
+            QuicConnectionStringOptions,
+            QuicClientConfig,
+            validate_certificate,
+            false
+        );
+        check_transport!(
+            "ws",
+            WebSocketConnectionStringOptions,
+            WebSocketClientConfig,
+            tls_validate_certificate,
+            false
+        );
+    }
+
+    #[test]
+    fn should_reject_invalid_tls_enable_flags_before_dialing() {
+        for invalid in [concat!("tu", "re"), "yes", "1", "TRUE", "", "invalid"] {
+            let tcp = format!("iggy+tcp://user:secret@localhost:8090?tls={invalid}&tls=true");
+            let websocket = format!("iggy+ws://user:secret@localhost:8092?tls={invalid}&tls=true");
+            assert!(matches!(
+                ConnectionString::<TcpConnectionStringOptions>::new(&tcp),
+                Err(IggyError::InvalidConnectionString)
+            ));
+            assert!(matches!(
+                ConnectionString::<WebSocketConnectionStringOptions>::new(&websocket),
+                Err(IggyError::InvalidConnectionString)
+            ));
+        }
+    }
+
+    #[test]
     fn should_succeed_with_ipv4_address_or_hostname() {
         for server_address in [
             "127.0.0.1:8090",

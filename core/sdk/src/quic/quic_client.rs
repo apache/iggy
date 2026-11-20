@@ -184,6 +184,29 @@ mod tests {
     };
     use secrecy::ExposeSecret;
 
+    #[test]
+    fn connection_string_options_reach_quic_transport_configuration() {
+        let canonical = QuicClient::from_connection_string(
+            "iggy+quic://user:secret@127.0.0.1:8080?tls_validate_certificate=false&reestablish_after=250ms",
+        )
+        .unwrap();
+        let deprecated = QuicClient::from_connection_string(
+            "iggy+quic://user:secret@127.0.0.1:8080?validate_certificate=false&reconnection_reestablish_after=250ms",
+        )
+        .unwrap();
+
+        assert!(!canonical.config.validate_certificate);
+        assert!(!deprecated.config.validate_certificate);
+        assert_eq!(
+            canonical.config.reconnection.reestablish_after,
+            IggyDuration::from_str("250ms").unwrap()
+        );
+        assert_eq!(
+            deprecated.config.reconnection.reestablish_after,
+            canonical.config.reconnection.reestablish_after
+        );
+    }
+
     #[tokio::test]
     async fn given_a_cancelled_shutdown_when_called_again_should_finish_cleanup_once() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -594,3 +617,6 @@ mod tests {
         assert!(client.is_err());
     }
 }
+
+#[cfg(test)]
+mod tls_tests;

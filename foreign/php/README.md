@@ -221,6 +221,21 @@ TLS connection strings use the Rust SDK connection-string format, for example:
 iggy+tcp://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=/path/to/ca.pem
 ```
 
+## Deprecated connection-string keys
+
+`Iggy\Client::fromConnectionString()` uses the Rust SDK connection-string format.
+Use the canonical keys in new connection strings. Existing strings can still
+use these aliases.
+
+| Transport | Deprecated key | Canonical key |
+| --- | --- | --- |
+| TCP and WebSocket | `reconnection_retries` | `reconnection_max_retries` |
+| QUIC | `reconnection_reestablish_after` | `reestablish_after` |
+| QUIC | `validate_certificate` | `tls_validate_certificate` |
+
+When a key or its alias appears more than once, the last occurrence wins.
+A malformed value fails even if a later occurrence would override it.
+
 ## Resource Options
 
 Streams and topics carry options. A read returns two arrays of option name to value: `options` holds what the creating or updating client set, `derived_options` what the server filled in. Integers above `PHP_INT_MAX`, such as the never-expire and unlimited value 18446744073709551615, are decimal strings, and the 64-bit topic arguments take an int or a decimal string.

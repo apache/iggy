@@ -89,6 +89,7 @@ mod tests {
     use super::*;
     use iggy_common::{AutoLogin, BinaryTransport, ClientState, NonZeroIggyDuration};
     use std::str::FromStr;
+    use std::time::Duration;
 
     #[test]
     fn should_be_created_with_default_config() {
@@ -113,6 +114,38 @@ mod tests {
         let connection_string = "iggy+ws://user:secret@127.0.0.1:8092";
         let client = WebSocketClient::from_connection_string(connection_string);
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn should_propagate_connection_string_options_to_client_config() {
+        for (query, retries, cooldown, tls_enabled, validate_certificate) in [
+            ("", None, Duration::from_secs(5), false, false),
+            ("?tls=true", None, Duration::from_secs(5), true, false),
+            (
+                "?reconnection_retries=3&reconnection_max_retries=8&reestablish_after=500ms&tls=true&tls_validate_certificate=true",
+                Some(8),
+                Duration::from_millis(500),
+                true,
+                true,
+            ),
+            (
+                "?reconnection_max_retries=8&reconnection_retries=3&reestablish_after=0&tls=true&tls_validate_certificate=false",
+                Some(3),
+                Duration::ZERO,
+                true,
+                false,
+            ),
+        ] {
+            let connection_string = format!("iggy+ws://user:secret@localhost:8092{query}");
+            let client = WebSocketClient::from_connection_string(&connection_string).unwrap();
+            assert_eq!(client.config.reconnection.max_retries, retries);
+            assert_eq!(
+                client.config.reconnection.reestablish_after.get_duration(),
+                cooldown
+            );
+            assert_eq!(client.config.tls_enabled, tls_enabled);
+            assert_eq!(client.config.tls_validate_certificate, validate_certificate);
+        }
     }
 
     #[test]
