@@ -346,9 +346,10 @@ where
 ///
 /// An owner that does not answer cannot take the time in which the other
 /// targets are read: the wait for a held read, and the last wait over every
-/// target, end half a margin before the read deadline at the latest, and
-/// every target is read then. That also bounds the wait of a fetch whose
-/// targets all have their start.
+/// target, end half a margin before the read deadline at the latest. The
+/// ready targets of the owners that answered the last wait are read then,
+/// and every target when none is ready. That also bounds the wait of a
+/// fetch whose targets all have their start.
 ///
 /// Also returns the targets that their held read refused, which leave
 /// `targets`.
@@ -391,7 +392,14 @@ where
             ));
             let mut starts = None;
             for (end, min_count) in [(wait_end, wire.min_count), (hold_until, ANY_MESSAGE)] {
-                let wait = pin!(wait_for_ready(shard, caller, known, wire, min_count, end));
+                let wait = pin!(wait_for_ready(
+                    shard,
+                    caller,
+                    known,
+                    wire,
+                    min_count,
+                    (end, None)
+                ));
                 match select(held.as_mut(), wait).await {
                     Either::Left((answered, _)) => {
                         starts = Some(answered);
@@ -413,26 +421,19 @@ where
         apply_next_starts(targets, (&pending, starts), false, false)?.0
     };
     let waiting = &targets[skip..];
-    // The timer is armed at its first poll. A fetch whose messages are stored
-    // already must not pay for one that it then cancels.
-    if let Some(ready) = next_backlog(waiting, wire.min_count) {
-        return Ok(((ready, false), refused));
-    }
-    let timer = pin!(shard.bus.sleep(Duration::from_micros(
-        cutoff.saturating_sub(shard.bus.monotonic_micros())
-    )));
-    let wait = pin!(wait_for_ready(
+    let ready = wait_for_ready(
         shard,
         caller,
         waiting,
         wire,
         wire.min_count,
-        wait_end
-    ));
-    let ready = match select(timer, wait).await {
-        Either::Left(_) => every_target_reads(waiting, wire),
-        Either::Right((ready, _)) => ready?,
-    };
+        (wait_end.min(cutoff), Some(cutoff)),
+    )
+    .await?;
+    // Nothing ended the wait before the cutoff, where every target is read.
+    if ready.0.is_empty() && cutoff <= shard.bus.monotonic_micros() {
+        return Ok((every_target_reads(waiting, wire), refused));
+    }
     Ok((ready, refused))
 }
 
@@ -490,6 +491,10 @@ where
 /// target reads a share because a condition of a target ended the wait, so
 /// that each read reports its own. Only a condition of the caller fails. A
 /// target that still lacks its start takes no part.
+///
+/// With `cutoff`, an owner that does not answer the admission of the wait is
+/// awaited until then at the latest. The ready targets of the other owners
+/// are returned then, and the targets of that owner wait for a later fetch.
 #[allow(clippy::future_not_send)]
 async fn wait_for_ready<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -497,7 +502,7 @@ async fn wait_for_ready<B, MJ, S, SB>(
     targets: &[FetchTarget],
     wire: &FetchMessagesRequest,
     min_count: u32,
-    wait_end: u64,
+    (wait_end, cutoff): (u64, Option<u64>),
 ) -> Result<(Vec<ReadyTarget>, bool), IggyError>
 where
     B: ShellBus,
@@ -513,12 +518,14 @@ where
     if let Some(ready) = next_backlog(targets, min_count) {
         return Ok((ready, false));
     }
+    let now = shard.bus.monotonic_micros();
     match shard
         .wait_for_messages(
             caller.clone(),
             known().map(FetchTarget::readiness).collect(),
-            Duration::from_micros(wait_end.saturating_sub(shard.bus.monotonic_micros())),
+            Duration::from_micros(wait_end.saturating_sub(now)),
             min_count,
+            cutoff.map(|cutoff| Duration::from_micros(cutoff.saturating_sub(now))),
         )
         .await
     {
@@ -1408,10 +1415,11 @@ mod tests {
     use server_common::send_messages::{
         COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
     };
+    use server_common::sharding::{PartitionLocation, ShardId};
     use shard::config::DeferredPollConfig;
     use shard::{
         ANY_MESSAGE, LifecycleFrame, PartitionRead, ReadinessWait, Receiver, Sender, ShardFrame,
-        shard_channel,
+        TaggedSender, shard_channel,
     };
     use std::collections::BTreeMap;
     use std::future::Future;
@@ -2099,6 +2107,150 @@ mod tests {
             2,
             "the wait for a held read ends half a margin before the read deadline too"
         );
+    }
+
+    /// A wait keeps the answers of its owners while one admission is missing.
+    /// The cutoff of the fetch dropped the wait with them and read every
+    /// target, the one of the silent owner first, so the ready one was never
+    /// read.
+    #[compio::test]
+    async fn given_a_silent_owner_beside_a_ready_target_when_the_wait_reaches_its_cutoff_should_read_the_ready_target()
+     {
+        const STARTED: u64 = 1_000_000;
+        const ANSWERING_OWNER: u16 = OWNER + 1;
+        let (sender, answering_inbox, _answering_replies) =
+            shard_channel(ANSWERING_OWNER, INBOX_CAPACITY, 1);
+        let fixture = Fixture::with_shards(2, vec![sender]);
+        fixture.shard.shards_table().insert(
+            fixture.namespaces[1],
+            PartitionLocation::new(ShardId::new(ANSWERING_OWNER), 0),
+        );
+        fixture.bus.monotonic.set(Some(STARTED));
+        let record = stored_batch_record(None);
+        let wire = fetch_of(vec![
+            fixture.target(0, WirePollingStrategy::offset(0)),
+            fixture.target(1, WirePollingStrategy::offset(0)),
+        ]);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { reply, .. })) =
+            answering_inbox.try_recv()
+        else {
+            panic!("the fetch waits for the target of each owner");
+        };
+        reply
+            .try_send(PartitionReadReply::Ready {
+                shard: ANSWERING_OWNER,
+                parked: None,
+                partitions: vec![ReadyTarget {
+                    partition_id: 1,
+                    available: 1,
+                    known_bytes: None,
+                }],
+            })
+            .expect("the fetch awaits its wait");
+        let (fire, timer) = oneshot::channel();
+        *fixture.bus.held_timer.borrow_mut() = Some(timer);
+        assert!(
+            futures::poll!(fetch.as_mut()).is_pending(),
+            "the admission of the other owner is still awaited"
+        );
+        let silent = fixture.owner_work();
+        assert_eq!(silent.waits.len(), 1);
+
+        let read_deadline = STARTED + REQUEST_TIMEOUT_US - 2 * FETCH_REPLY_MARGIN_US;
+        let cutoff = read_deadline - FETCH_REPLY_MARGIN_US / 2;
+        assert_eq!(
+            *fixture.bus.sleeps.borrow(),
+            [Duration::from_micros(cutoff - STARTED); 2],
+            "no admission answer is awaited past the cutoff"
+        );
+        fixture.bus.monotonic.set(Some(cutoff));
+        fire.send(()).expect("the wait holds the timer");
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            namespace,
+            read: PartitionRead::DeferredPoll(_),
+            reply,
+            ..
+        })) = answering_inbox.try_recv()
+        else {
+            panic!("the ready target must be read at the cutoff");
+        };
+        assert_eq!(namespace, fixture.namespaces[1]);
+        assert!(
+            fixture.owner_work().reads.is_empty(),
+            "the target of the silent owner waits for a later fetch"
+        );
+        reply
+            .try_send(served(fixture.context(1), whole(&record)))
+            .expect("the fetch awaits its read");
+        let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
+            panic!("the fetch answers once its read did");
+        };
+        let reply = reply.expect("the fetch succeeds").into_contiguous();
+        let statuses: Vec<_> = sections(reply.as_slice())
+            .iter()
+            .map(|section| (section.header.partition_id, section.header.status))
+            .collect();
+        assert_eq!(statuses, [(1, STATUS_OK)]);
+        drop(silent);
+    }
+
+    /// A request can ask for a wait that ends after the cutoff. When every
+    /// owner answered its admission and no target got messages, the wait ends
+    /// at the cutoff and every target is read there.
+    #[compio::test]
+    async fn given_a_requested_wait_past_the_cutoff_when_no_target_gets_messages_should_read_every_target_at_the_cutoff()
+     {
+        const STARTED: u64 = 1_000_000;
+        let fixture = Fixture::new(2);
+        fixture.bus.monotonic.set(Some(STARTED));
+        let record = stored_batch_record(None);
+        let wire = FetchMessagesRequest {
+            wait_us: REQUEST_TIMEOUT_US,
+            ..fetch_of(vec![
+                fixture.target(0, WirePollingStrategy::offset(0)),
+                fixture.target(1, WirePollingStrategy::offset(0)),
+            ])
+        };
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let read_deadline = STARTED + REQUEST_TIMEOUT_US - 2 * FETCH_REPLY_MARGIN_US;
+        let cutoff = read_deadline - FETCH_REPLY_MARGIN_US / 2;
+        let (fire, timer) = oneshot::channel();
+        *fixture.bus.held_timer.borrow_mut() = Some(timer);
+        let (wait, parked) = fixture
+            .owner_work()
+            .waits
+            .pop()
+            .expect("the fetch waits for its targets");
+        assert_eq!(
+            wait.deadline, cutoff,
+            "the owners end the wait where the fetch reads"
+        );
+        parked
+            .try_send(PartitionReadReply::Ready {
+                shard: OWNER,
+                parked: None,
+                partitions: Vec::new(),
+            })
+            .expect("the fetch awaits its wait");
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+        assert!(
+            fixture.owner_work().reads.is_empty(),
+            "no target is read before the cutoff"
+        );
+
+        fixture.bus.monotonic.set(Some(cutoff));
+        fire.send(()).expect("the wait holds the timer");
+        assert_both_targets_read(&fixture, fetch, &record).await;
+        drop(parked);
     }
 
     #[compio::test]
@@ -4550,11 +4702,17 @@ mod tests {
 
     impl Fixture {
         fn new(partitions: u32) -> Self {
+            Self::with_shards(partitions, Vec::new())
+        }
+
+        /// [`Self::new`] on a shard that also reaches `others`, the shards
+        /// after the owner.
+        fn with_shards(partitions: u32, others: Vec<TaggedSender>) -> Self {
             let bus = SpyBus::default();
             let mut shard = test_shard(&bus, 0, 1, FIRST_BOOT);
             let (own, own_inbox, own_replies) = shard_channel(0, INBOX_CAPACITY, 1);
             let (sender, owner_inbox, owner_replies) = shard_channel(OWNER, INBOX_CAPACITY, 1);
-            shard.attach_senders(vec![own, sender]);
+            shard.attach_senders([own, sender].into_iter().chain(others).collect());
             let shard = Rc::new(shard);
             let namespaces = route_partitions_to(&shard, partitions, OWNER);
             shard.plane.metadata().applied_frontier().advance(COMMIT);
