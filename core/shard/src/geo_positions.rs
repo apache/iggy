@@ -70,7 +70,7 @@ use partitions::{PollingConsumer, TopicObjects};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
-use crate::geo_commits::RoundPacing;
+use crate::geo_commits::{RoundPacing, RoundStart, TopicPace};
 use crate::peers::PeerStore;
 use crate::shards_table::ShardsTable;
 use crate::{
@@ -174,7 +174,11 @@ pub struct PeerPositions {
 #[derive(Default)]
 pub struct ShardGeoPositions {
     settings: RefCell<Option<Rc<GeoPositionSettings>>>,
-    /// When group polls stop waiting for the peers, on the bus clock.
+    /// When group polls began to wait for the peers, on the bus clock.
+    resume_from: Cell<u64>,
+    /// When the group polls of every partition stop waiting for the peers,
+    /// on the bus clock: after the node's timeout, or after the longest that
+    /// a topic sets.
     resume_by: Cell<u64>,
     gate: RefCell<ResumeGate>,
     /// Partitions with a command in flight, which get no other until it ends.
@@ -221,6 +225,9 @@ struct Round {
     /// The topics the round covers, by stream and topic id, `None` for
     /// every log.
     scope: Option<Vec<(usize, usize)>>,
+    /// The topics whose logs a round of every log does not store, see
+    /// [`RoundStart::skipped`].
+    skipped: BTreeSet<(usize, usize)>,
     reports: Vec<Option<GeoPositionsReport>>,
     /// The shards whose reports carry held commits, which learn what the
     /// store took.
@@ -353,10 +360,11 @@ where
     pub fn set_geo_positions(&self, settings: Option<GeoPositionSettings>) {
         let state = &self.geo_positions;
         if let Some(settings) = &settings {
-            let timeout = u64::try_from(settings.resume_timeout.as_micros()).unwrap_or(u64::MAX);
+            let now = self.bus.monotonic_micros();
+            state.resume_from.set(now);
             state
                 .resume_by
-                .set(self.bus.monotonic_micros().saturating_add(timeout));
+                .set(now.saturating_add(micros(settings.resume_timeout)));
             let mut gate = state.gate.borrow_mut();
             gate.over = settings.peers.is_empty();
             self.metrics.set_positions_resume_waiting(!gate.over);
@@ -368,12 +376,54 @@ where
         self.geo_positions.settings.borrow().clone()
     }
 
+    /// The longest wait of group polls for the peers' positions: `node`, or a
+    /// longer one that a topic sets.
+    fn longest_resume_timeout(&self, node: Duration) -> Duration
+    where
+        M: StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .iter()
+                .flat_map(|(_, stream)| stream.topics.iter())
+                .filter_map(|(_, topic)| topic.resolved.geo_durations.positions_resume_timeout)
+                .map(|timeout| timeout.get_duration())
+                .fold(node, Duration::max)
+        })
+    }
+
+    /// The paces that the topics of this node's logs set for their rounds.
+    fn topic_paces(&self, origin: &str) -> BTreeMap<(usize, usize), TopicPace>
+    where
+        M: StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            local_logs(inner, origin)
+                .into_iter()
+                .filter_map(|local| {
+                    let topic = inner
+                        .items
+                        .get(local.stream_id)?
+                        .topics
+                        .get(local.topic_id)?;
+                    let pace = TopicPace::of(&topic.resolved.geo_durations)?;
+                    Some(((local.stream_id, local.topic_id), pace))
+                })
+                .collect()
+        })
+    }
+
     /// Whether the group polls of the partition of `namespace` still wait
     /// for the peers' positions: until it weighed those of every peer as
     /// their primary and the adoptions they gave committed, or until the
-    /// timeout after the node started.
+    /// timeout after the node started. The timeout is the one that the
+    /// partition's topic sets, or else the node's.
     #[must_use]
-    pub fn geo_positions_resume_waiting(&self, namespace: IggyNamespace) -> bool {
+    pub fn geo_positions_resume_waiting(&self, namespace: IggyNamespace) -> bool
+    where
+        M: StreamsFrontend,
+    {
         let Some(settings) = self.geo_settings() else {
             return false;
         };
@@ -381,15 +431,32 @@ where
         if gate.over || gate.resumed.contains(&namespace) {
             return false;
         }
-        if self.bus.monotonic_micros() >= self.geo_positions.resume_by.get() {
-            gate.over = true;
-            gate.weighed.clear();
-            gate.resumed.clear();
-            self.metrics.set_positions_resume_waiting(false);
-            tracing::info!(
-                shard = self.id,
-                "the wait of group polls for the geo peers' positions timed out"
-            );
+        let now = self.bus.monotonic_micros();
+        let from = self.geo_positions.resume_from.get();
+        if now >= self.geo_positions.resume_by.get() {
+            let longest = self.longest_resume_timeout(settings.resume_timeout);
+            let resume_by = from.saturating_add(micros(longest));
+            if now >= resume_by {
+                gate.over = true;
+                gate.weighed.clear();
+                gate.resumed.clear();
+                self.metrics.set_positions_resume_waiting(false);
+                tracing::info!(
+                    shard = self.id,
+                    "the wait of group polls for the geo peers' positions timed out"
+                );
+                return false;
+            }
+            // Only the topics that set a longer timeout wait on.
+            self.geo_positions.resume_by.set(resume_by);
+        }
+        let timeout = self
+            .geo_durations(namespace)
+            .positions_resume_timeout
+            .map_or(settings.resume_timeout, |timeout| timeout.get_duration());
+        if now >= from.saturating_add(micros(timeout)) {
+            gate.weighed.remove(&namespace);
+            gate.resumed.insert(namespace);
             return false;
         }
         // No position of a retired peer comes again, so none is waited for.
@@ -493,7 +560,10 @@ where
     /// in between, see [`RoundPacing`]. A round that waited too long for the
     /// shards or the store is dropped, and the commits it carried go into a
     /// later one.
-    pub fn start_geo_positions_round(&self, now: IggyTimestamp) {
+    pub fn start_geo_positions_round(&self, now: IggyTimestamp)
+    where
+        M: StreamsFrontend,
+    {
         if self.id != 0 {
             return;
         }
@@ -508,7 +578,13 @@ where
             publisher.round = None;
             publisher.scope = None;
         }
-        let Some(scope) = publisher.pacing.start(
+        // Read again before each round of every log, so a changed interval
+        // applies within the node's publish interval.
+        if publisher.pacing.every_log_due(now.as_micros()) {
+            let paces = self.topic_paces(&settings.origin);
+            publisher.pacing.set_paces(paces, now.as_micros());
+        }
+        let Some(RoundStart { scope, skipped }) = publisher.pacing.start(
             now.as_micros(),
             micros(settings.publish_interval),
             settings.offset_upload_interval.map(micros),
@@ -521,6 +597,7 @@ where
             id,
             now,
             scope: scope.clone(),
+            skipped,
             reports: vec![None; self.senders.len()],
             carrying: BTreeSet::new(),
             found: None,
@@ -544,17 +621,30 @@ where
     }
 
     /// Shard 0 learns that `topics` have held commits, and starts their
-    /// round when it may.
-    pub(crate) fn on_geo_commits_waiting(&self, topics: Vec<(usize, usize)>) {
+    /// round when it may. It reads their paces first, so a topic that sets a
+    /// new offset upload interval has its next round spaced by it.
+    pub(crate) fn on_geo_commits_waiting(&self, topics: Vec<(usize, usize)>)
+    where
+        M: StreamsFrontend,
+    {
         if self.id != 0 {
             return;
         }
-        self.geo_positions
-            .publisher
-            .borrow_mut()
-            .pacing
-            .wait(topics);
-        self.start_geo_positions_round(IggyTimestamp::from(self.bus.realtime_micros()));
+        let now = IggyTimestamp::from(self.bus.realtime_micros());
+        let paces: Vec<_> = topics
+            .iter()
+            .map(|&(stream_id, topic_id)| {
+                let durations = self.geo_durations(IggyNamespace::new(stream_id, topic_id, 0));
+                ((stream_id, topic_id), TopicPace::of(&durations))
+            })
+            .collect();
+        let mut publisher = self.geo_positions.publisher.borrow_mut();
+        for (topic, pace) in paces {
+            publisher.pacing.set_pace(topic, pace, now.as_micros());
+        }
+        publisher.pacing.wait(topics);
+        drop(publisher);
+        self.start_geo_positions_round(now);
     }
 
     /// Stop the rounds of shard 0: drop the one in flight and its store
@@ -970,18 +1060,28 @@ where
         let round_id = round.id;
         let now = round.now;
         let every_log = round.scope.is_none();
+        let skipped = std::mem::take(&mut round.skipped);
         let replica = self.partition_consensus.self_replica_id;
-        let held: BTreeSet<GeoLog> = self.geo_settings().map_or_else(BTreeSet::new, |settings| {
-            self.plane.metadata().mux_stm.streams().read(|inner| {
-                local_logs(inner, &settings.origin)
-                    .into_iter()
-                    .map(|local| local.log)
-                    .collect()
-            })
-        });
+        let (held, skipped_logs) = self
+            .geo_settings()
+            .map_or_else(Default::default, |settings| {
+                self.plane.metadata().mux_stm.streams().read(|inner| {
+                    let mut held = BTreeSet::new();
+                    let mut skipped_logs = BTreeSet::new();
+                    for local in local_logs(inner, &settings.origin) {
+                        if skipped.contains(&(local.stream_id, local.topic_id)) {
+                            skipped_logs.insert(local.log.clone());
+                        }
+                        held.insert(local.log);
+                    }
+                    (held, skipped_logs)
+                })
+            });
         publisher.seen.extend(held.iter().cloned());
-        let (puts, mut deletes) =
+        let (mut puts, mut deletes) =
             store_plan(&publisher.stored, &publisher.seen, &summary, replica, &held);
+        // Their logs wait for the rounds of their own publish interval.
+        puts.retain(|(key, _)| !skipped_logs.contains(&key.log));
         // A round of the topics with held commits answers them sooner, and
         // leaves the deletes to the rounds of every log.
         if !every_log {
@@ -1025,7 +1125,10 @@ where
     /// Take the store's answer to a round, tell the shards whose held
     /// commits it carried which logs the store took, and start the next
     /// round when one is due.
-    pub(crate) fn on_positions_stored(&self, finished: FinishedPositionsStore) {
+    pub(crate) fn on_positions_stored(&self, finished: FinishedPositionsStore)
+    where
+        M: StreamsFrontend,
+    {
         let mut publisher = self.geo_positions.publisher.borrow_mut();
         if publisher
             .round

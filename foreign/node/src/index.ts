@@ -43,6 +43,7 @@ export {
   PartitionResizePolicy,
   TopicType,
   GeoMode,
+  type GeoTopicDurations,
   EncryptionKeySource,
   OptionsScope,
   StreamOptionKey,

@@ -27,7 +27,7 @@ use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch, Plac
 use iggy_object_store::{
     FreshIndex, FreshObjectId, FreshProofRow, FsStore, KeyLayout, ObjectStore,
 };
-use integration::harness::{TestHarness, TestServerConfig};
+use integration::harness::{TestHarness, TestServerConfig, wait_for_consumer_group_assignment};
 use server_common::sharding::IggyNamespace;
 use tokio::time::{Instant, sleep};
 
@@ -255,8 +255,224 @@ async fn given_a_geo_topic_when_changing_it_should_keep_its_partitions_and_optio
     );
 }
 
+/// A geo topic reports the durations it sets, and an update can change
+/// them and nothing else of the topic. A normal topic takes none.
+#[tokio::test]
+async fn given_a_geo_topic_with_its_own_durations_when_reading_and_changing_them_should_report_each_change()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    let duration = |text: &str| Some(text.parse::<IggyDuration>().expect("a duration"));
+    let created = GeoTopicDurations {
+        tombstone_grace: duration("6h"),
+        fresh_upload_interval: duration("0"),
+        ..GeoTopicDurations::default()
+    };
+    create_geo_topic_with(
+        &client,
+        &stream,
+        TOPIC,
+        TopicCreateOptions {
+            geo_durations: created,
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await
+    .expect("create the geo topic with its durations");
+    let durations = || async {
+        client
+            .get_topic(&stream, &topic)
+            .await
+            .expect("get topic")
+            .expect("the topic exists")
+            .resolved_options()
+            .geo_durations
+    };
+    assert_eq!(durations().await, created);
+
+    let update = |geo_durations: GeoTopicDurations| TopicUpdateOptions {
+        geo_durations,
+        ..TopicUpdateOptions::default()
+    };
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &update(GeoTopicDurations {
+                tombstone_grace: duration("1h"),
+                positions_publish_interval: duration("2s"),
+                ..GeoTopicDurations::default()
+            }),
+        )
+        .await
+        .expect("a geo topic takes a change of its durations");
+    assert_eq!(
+        durations().await,
+        GeoTopicDurations {
+            tombstone_grace: duration("1h"),
+            positions_publish_interval: duration("2s"),
+            fresh_upload_interval: duration("0"),
+            ..GeoTopicDurations::default()
+        }
+    );
+
+    let refusals = [
+        (
+            TopicUpdateOptions {
+                raw_reset: ["tombstone_grace".to_owned()].into(),
+                ..TopicUpdateOptions::default()
+            },
+            IggyError::OptionNotResettable(String::new()),
+        ),
+        (
+            TopicUpdateOptions {
+                message_expiry: Some(IggyExpiry::ExpireDuration(IggyDuration::from(
+                    Duration::from_secs(3600),
+                ))),
+                ..update(created)
+            },
+            IggyError::OptionNotUpdatable(String::new()),
+        ),
+    ];
+    for (refused, expected) in refusals {
+        let error = client
+            .update_topic(&stream, &topic, &refused)
+            .await
+            .expect_err("the geo topic refuses the update");
+        assert_eq!(error.as_code(), expected.as_code(), "{refused:?}");
+    }
+
+    let normal = TopicCreateOptions {
+        partitions_count: Some(1),
+        geo_durations: created,
+        ..TopicCreateOptions::default()
+    };
+    let refused = client
+        .create_topic(&stream, "normal", &normal)
+        .await
+        .expect_err("a normal topic refuses a duration");
+    assert_eq!(
+        refused.as_code(),
+        IggyError::InvalidOptionValue(String::new()).as_code()
+    );
+    client
+        .create_topic(
+            &stream,
+            "normal",
+            &TopicCreateOptions {
+                partitions_count: Some(1),
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create a normal topic");
+    let refused = client
+        .update_topic(
+            &stream,
+            &Identifier::named("normal").expect("topic identifier"),
+            &update(created),
+        )
+        .await
+        .expect_err("a normal topic refuses a duration in an update");
+    assert_eq!(
+        refused.as_code(),
+        IggyError::InvalidOptionValue(String::new()).as_code()
+    );
+}
+
+/// The offsets that a group stores itself are answered once the bucket holds
+/// them, and each geo topic spaces those uploads by its own interval.
+#[tokio::test]
+async fn given_two_geo_topics_with_their_own_offset_upload_intervals_when_their_groups_store_offsets_should_answer_each_at_its_pace()
+ {
+    const STORES: u64 = 4;
+    const SLOW: Duration = Duration::from_secs(1);
+    const QUICK: Duration = Duration::from_millis(20);
+    const GROUP: &str = "group";
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    // A round of every log carries the waiting stores too, so they come
+    // rarely here and leave each topic to its own interval.
+    let mut harness = server_with_fs_store_and(
+        store.path(),
+        &[("IGGY_GEO_POSITIONS_PUBLISH_INTERVAL", "60s")],
+    );
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    let mut answered = Vec::new();
+    for (name, interval) in [("slow", SLOW), ("quick", QUICK)] {
+        create_geo_topic_with(
+            &client,
+            &stream,
+            name,
+            TopicCreateOptions {
+                geo_durations: GeoTopicDurations {
+                    consumer_offset_upload_interval: Some(IggyDuration::new(interval)),
+                    ..GeoTopicDurations::default()
+                },
+                ..TopicCreateOptions::default()
+            },
+        )
+        .await
+        .expect("create the geo topic");
+        let topic = Identifier::named(name).expect("topic identifier");
+        send(&client, &stream, &topic, 0..STORES).await;
+        client
+            .create_consumer_group(&stream, &topic, GROUP)
+            .await
+            .expect("create the group");
+        let group = Identifier::named(GROUP).expect("group identifier");
+        client
+            .join_consumer_group(&stream, &topic, &group)
+            .await
+            .expect("join the group");
+        wait_for_consumer_group_assignment(&client, &stream, &topic, &group, 1, READY_DEADLINE)
+            .await;
+        let started = Instant::now();
+        for offset in 0..STORES {
+            client
+                .store_consumer_offset(
+                    &Consumer::group(group.clone()),
+                    &stream,
+                    &topic,
+                    Some(PARTITION_ID),
+                    offset,
+                )
+                .await
+                .expect("the store is answered once the bucket holds it");
+        }
+        answered.push(started.elapsed());
+    }
+
+    let (slow, quick) = (answered[0], answered[1]);
+    // Each store after the first waits for the interval since the last put.
+    let spaced = SLOW * u32::try_from(STORES - 1).expect("a few stores") * 4 / 5;
+    assert!(slow >= spaced, "the slow topic answered in {slow:?}");
+    assert!(
+        quick < slow / 3,
+        "the quick topic answered in {quick:?}, the slow one in {slow:?}"
+    );
+}
+
 fn server_with_fs_store(store: &Path) -> TestHarness {
-    let extra_envs = HashMap::from([
+    server_with_fs_store_and(store, &[])
+}
+
+/// [`server_with_fs_store`] with the server settings `more` on top.
+fn server_with_fs_store_and(store: &Path, more: &[(&str, &str)]) -> TestHarness {
+    let mut extra_envs = HashMap::from([
         // A geo topic takes messages once the metadata primary stored its
         // object, and a node without an origin stores none.
         ("IGGY_GEO_ORIGIN".to_owned(), "dc-a".to_owned()),
@@ -274,6 +490,10 @@ fn server_with_fs_store(store: &Path) -> TestHarness {
             "100ms".to_owned(),
         ),
     ]);
+    extra_envs.extend(
+        more.iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    );
     TestHarness::builder()
         .server(TestServerConfig::builder().extra_envs(extra_envs).build())
         .build()
@@ -288,11 +508,29 @@ async fn create_geo_topic(
     name: &str,
     geo_mode: Option<GeoMode>,
 ) -> Result<(), IggyError> {
+    create_geo_topic_with(
+        client,
+        stream,
+        name,
+        TopicCreateOptions {
+            geo_mode,
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await
+}
+
+/// [`create_geo_topic`] with `options` on top of the type and the count.
+async fn create_geo_topic_with(
+    client: &IggyClient,
+    stream: &Identifier,
+    name: &str,
+    options: TopicCreateOptions,
+) -> Result<(), IggyError> {
     let options = TopicCreateOptions {
         partitions_count: Some(1),
         topic_type: Some(TopicType::Geo),
-        geo_mode,
-        ..TopicCreateOptions::default()
+        ..options
     };
     wait_until_ready(client, stream).await;
     client

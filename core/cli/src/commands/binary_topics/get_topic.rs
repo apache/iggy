@@ -21,8 +21,10 @@ use anyhow::{Context, bail};
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
+use iggy_common::GeoTopicDurations;
 use iggy_common::Identifier;
 use iggy_common::IggyExpiry;
+use iggy_common::OptionKey;
 use iggy_common::TopicDetails;
 use tracing::{Level, event};
 
@@ -122,6 +124,9 @@ fn topic_table(topic: &TopicDetails, origin: Option<&str>) -> Table {
     if let Some(origin) = origin {
         table.add_row(vec!["Origin", origin]);
     }
+    for (label, duration) in geo_duration_rows(&resolved.geo_durations) {
+        table.add_row(vec![label, duration.as_str()]);
+    }
     table.add_row(vec!["Topic size", format!("{}", topic.size).as_str()]);
     table.add_row(vec![
         "Compression",
@@ -175,6 +180,31 @@ fn topic_table(topic: &TopicDetails, origin: Option<&str>) -> Table {
     }
 
     table
+}
+
+/// The durations that a geo topic sets for itself, each with its label. The
+/// node's settings apply to the ones it does not set, so they have no row.
+fn geo_duration_rows(durations: &GeoTopicDurations) -> Vec<(&'static str, String)> {
+    GeoTopicDurations::KEYS
+        .into_iter()
+        .filter_map(|key| {
+            let duration = durations.get(key)?;
+            let label = match key {
+                OptionKey::FreshUploadInterval => "Fresh upload interval",
+                OptionKey::ConsumerOffsetUploadInterval => "Offset upload interval",
+                OptionKey::PositionsPublishInterval => "Positions publish interval",
+                OptionKey::TombstoneGrace => "Tombstone grace",
+                OptionKey::PositionsResumeTimeout => "Positions resume timeout",
+                _ => "Rewrite max interval",
+            };
+            let shown = match (key, duration.is_zero()) {
+                (OptionKey::ConsumerOffsetUploadInterval, true) => "disabled".to_owned(),
+                (_, true) => "0".to_owned(),
+                (_, false) => duration.to_string(),
+            };
+            Some((label, shown))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -329,6 +359,44 @@ mod tests {
         assert!(normal.contains("Topic type          | normal"));
         assert!(!normal.contains("Geo mode"));
         assert!(!normal.contains("Origin"));
+    }
+
+    #[test]
+    fn given_a_geo_topic_with_its_own_durations_should_show_the_ones_it_sets() {
+        let mut fixture = topic();
+        fixture.options = ResourceOptions::from([
+            (
+                HeaderKey::try_from("topic_type").unwrap(),
+                OptionValue::explicit(HeaderValue::try_from("geo").unwrap()),
+            ),
+            (
+                HeaderKey::try_from("tombstone_grace").unwrap(),
+                OptionValue::explicit(HeaderValue::from(3_600_000_000u64)),
+            ),
+            (
+                HeaderKey::try_from("consumer_offset_upload_interval").unwrap(),
+                OptionValue::explicit(HeaderValue::from(0u64)),
+            ),
+        ]);
+
+        let table = topic_table(&fixture, None).to_string();
+        let row = |label: &str| {
+            table
+                .lines()
+                .find(|line| line.contains(label))
+                .map(|line| line.split('|').nth(2).unwrap_or_default().trim().to_owned())
+        };
+
+        assert_eq!(row("Tombstone grace").as_deref(), Some("1h"));
+        assert_eq!(row("Offset upload interval").as_deref(), Some("disabled"));
+        for unset in [
+            "Fresh upload interval",
+            "Positions publish interval",
+            "Positions resume timeout",
+            "Rewrite max interval",
+        ] {
+            assert_eq!(row(unset), None, "{unset} in {table}");
+        }
     }
 
     #[test]

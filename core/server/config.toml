@@ -1532,6 +1532,7 @@ handshake_grace = "10 s"
 # its next send completes one send per max(interval, upload + commit). A longer
 # interval means fewer and larger objects, so fewer store requests, and a
 # longer wait for every producer. Up to 10 s.
+# A geo topic can set its own with the topic option of the same name.
 #fresh_upload_interval = "10 ms"
 # The bytes of messages one partition that stores them in fresh objects may
 # have committed that its primary has not yet rewritten into long-term
@@ -1615,6 +1616,7 @@ handshake_grace = "10 s"
 # of a peer after which the peer must still see the tombstone. A cluster that
 # reads peers also keeps a detached shadow topic this long after the peer wrote
 # its tombstone.
+# A geo topic can set its own with the topic option of the same name.
 #tombstone_grace = "24 h"
 # How often a node lists the manifests of each peer stream that a shadow
 # stream serves. A shadow partition then commits each changed manifest, so it
@@ -1630,12 +1632,14 @@ handshake_grace = "10 s"
 # long-term segments on quiet partitions: more merges and more manifest
 # stores, still at most one a second per partition. At least 1 s. "1 s"
 # rewrites every second.
+# A geo topic can set its own with the topic option of the same name.
 #long_term_rewrite_max_interval = "10 s"
 # How often a node stores the positions of the consumer groups of its geo and
 # shadow topics in its bucket, one object per log in which it leads a
 # partition, when they changed. It carries the commits of polls with
 # auto_commit: a group that fails over reads again at most this long, plus the
 # poll interval of the other datacenter.
+# A geo topic can set its own with the topic option of the same name.
 #positions_publish_interval = "1 s"
 # The shortest time between two stores of positions for the offsets that
 # consumer groups store themselves (StoreConsumerOffset). Such a store is
@@ -1645,12 +1649,14 @@ handshake_grace = "10 s"
 # interval share the next one. Each put rewrites the node's whole object of
 # the log. "disabled" answers them at the local commit and leaves them to
 # positions_publish_interval. Up to 1 s.
+# A geo topic can set its own with the topic option of the same name.
 #consumer_offset_upload_interval = "50 ms"
 # How often a node lists the consumer group positions that each peer stores,
 # and takes the ones that win over its own.
 #positions_poll_interval = "1 s"
 # How long, after a node starts, the group polls of its geo and shadow
 # partitions wait for the positions of every peer.
+# A geo topic can set its own with the topic option of the same name.
 #positions_resume_timeout = "10 s"
 # The cluster_uid of a cluster that lost every disk, as the store identity
 # object "<prefix>/meta/identity" names it, whose geo topics this cluster

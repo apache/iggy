@@ -192,9 +192,19 @@ namespace Iggy {
          * also become readable in the other datacenters through the object store. A geo topic needs
          * an object store on every node of the cluster: while one is not ready, the server refuses
          * `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
-         * stream, and keeps its name, options and partition count. `geo_mode` says how a geo topic
-         * writes its messages, `geo` or `geo_tiered`, and null resolves to `geo` there. The server
-         * refuses `geo_tiered` with `Feature is unavailable` for now, and any mode on a normal topic.
+         * stream, and keeps its name, its partition count and every option but the durations below.
+         * `geo_mode` says how a geo topic writes its messages, `geo` or `geo_tiered`, and null
+         * resolves to `geo` there. The server refuses `geo_tiered` with `Feature is unavailable` for
+         * now, and any mode on a normal topic.
+         *
+         * The six durations after `geo_mode` override, for a geo topic, the server settings of the
+         * same name on each node: `[tiered_storage] fresh_upload_interval` (at most 10 s) and the
+         * `[geo]` settings `consumer_offset_upload_interval` (at most 1 s, 0 answers an offset store
+         * at its local commit), `positions_publish_interval` and `tombstone_grace` (above 0),
+         * `positions_resume_timeout` (0 waits for no peer) and `long_term_rewrite_max_interval` (at
+         * least 1 s). Each takes an int or a decimal string of microseconds. 0 is sent as a value,
+         * and null leaves the server setting in force. The server refuses any of them on a normal
+         * topic with `Invalid option value`.
          *
          * @param mixed $stream
          * @param string $name
@@ -217,9 +227,15 @@ namespace Iggy {
          * @param mixed $local_retention_size
          * @param string|null $topic_type
          * @param string|null $geo_mode
+         * @param mixed $fresh_upload_interval_micros
+         * @param mixed $consumer_offset_upload_interval_micros
+         * @param mixed $positions_publish_interval_micros
+         * @param mixed $tombstone_grace_micros
+         * @param mixed $positions_resume_timeout_micros
+         * @param mixed $long_term_rewrite_max_interval_micros
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, ?string $topic_type = null, ?string $geo_mode = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, ?string $topic_type = null, ?string $geo_mode = null, mixed $fresh_upload_interval_micros = null, mixed $consumer_offset_upload_interval_micros = null, mixed $positions_publish_interval_micros = null, mixed $tombstone_grace_micros = null, mixed $positions_resume_timeout_micros = null, mixed $long_term_rewrite_max_interval_micros = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
@@ -688,6 +704,11 @@ namespace Iggy {
          * tiered topic keeps on local disk after upload, with the same int or decimal string values
          * and the same refusal of 0 as the expiry and the size cap.
          *
+         * The six durations of a geo topic take the values `createTopic()` takes, 0 included. They
+         * are the only options an update can change on a geo topic, a normal topic refuses them with
+         * `Invalid option value`, and they cannot be reset: a `reset` case or a `raw_reset` name of
+         * one is refused with `Option cannot be reset`.
+         *
          * @param mixed $stream
          * @param mixed $topic
          * @param string|null $name
@@ -699,9 +720,15 @@ namespace Iggy {
          * @param bool|null $tiered_storage
          * @param mixed $local_retention_age_micros
          * @param mixed $local_retention_size
+         * @param mixed $fresh_upload_interval_micros
+         * @param mixed $consumer_offset_upload_interval_micros
+         * @param mixed $positions_publish_interval_micros
+         * @param mixed $tombstone_grace_micros
+         * @param mixed $positions_resume_timeout_micros
+         * @param mixed $long_term_rewrite_max_interval_micros
          * @return void
          */
-        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
+        public function updateTopic(mixed $stream, mixed $topic, ?string $name = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, array $reset = [], ?array $raw = null, ?array $raw_reset = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, mixed $fresh_upload_interval_micros = null, mixed $consumer_offset_upload_interval_micros = null, mixed $positions_publish_interval_micros = null, mixed $tombstone_grace_micros = null, mixed $positions_resume_timeout_micros = null, mixed $long_term_rewrite_max_interval_micros = null): void {}
     }
 
     /**
@@ -2995,6 +3022,15 @@ namespace Iggy {
      */
     class Topic {
         /**
+         * The shortest time between two uploads of the positions that stored consumer group
+         * offsets wait for, in microseconds (a decimal string above `PHP_INT_MAX`). Null when the
+         * topic sets none, and each node applies its own `[geo] consumer_offset_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $consumer_offset_upload_interval_micros;
+
+        /**
          * Creation time in microseconds.
          *
          * @var int
@@ -3009,6 +3045,15 @@ namespace Iggy {
         public readonly array $derived_options;
 
         /**
+         * The longest time a send waits for its upload to start, in microseconds (a decimal
+         * string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies its own
+         * `[tiered_storage] fresh_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $fresh_upload_interval_micros;
+
+        /**
          * How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
          * for a normal topic.
          *
@@ -3017,6 +3062,15 @@ namespace Iggy {
         public readonly ?string $geo_mode;
 
         public readonly int $id;
+
+        /**
+         * The longest wait between two long-term rewrites of a partition, in microseconds (a
+         * decimal string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies
+         * its own `[geo] long_term_rewrite_max_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $long_term_rewrite_max_interval_micros;
 
         public readonly int $messages_count;
 
@@ -3033,7 +3087,34 @@ namespace Iggy {
 
         public readonly int $partitions_count;
 
+        /**
+         * How often a node uploads the changed positions of the topic's consumer groups, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] positions_publish_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_publish_interval_micros;
+
+        /**
+         * How long, after a node starts, the group polls of the topic's partitions wait for the
+         * positions of the geo peers, in microseconds (a decimal string above `PHP_INT_MAX`). Null
+         * when the topic sets none, and each node applies its own `[geo] positions_resume_timeout`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_resume_timeout_micros;
+
         public readonly int $size_bytes;
+
+        /**
+         * How long the tombstone and the objects of the deleted topic stay in the object store, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] tombstone_grace`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $tombstone_grace_micros;
 
         /**
          * What the topic is, `normal` or `geo`, fixed at creation.
@@ -3047,11 +3128,29 @@ namespace Iggy {
 
     class TopicDetails {
         /**
+         * The shortest time between two uploads of the positions that stored consumer group
+         * offsets wait for, in microseconds (a decimal string above `PHP_INT_MAX`). Null when the
+         * topic sets none, and each node applies its own `[geo] consumer_offset_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $consumer_offset_upload_interval_micros;
+
+        /**
          * Options the server filled in from its catalog defaults.
          *
          * @var array
          */
         public readonly array $derived_options;
+
+        /**
+         * The longest time a send waits for its upload to start, in microseconds (a decimal
+         * string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies its own
+         * `[tiered_storage] fresh_upload_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $fresh_upload_interval_micros;
 
         /**
          * How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
@@ -3062,6 +3161,15 @@ namespace Iggy {
         public readonly ?string $geo_mode;
 
         public readonly int $id;
+
+        /**
+         * The longest wait between two long-term rewrites of a partition, in microseconds (a
+         * decimal string above `PHP_INT_MAX`). Null when the topic sets none, and each node applies
+         * its own `[geo] long_term_rewrite_max_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $long_term_rewrite_max_interval_micros;
 
         public readonly int $messages_count;
 
@@ -3089,6 +3197,33 @@ namespace Iggy {
         public readonly int $partitions_count;
 
         /**
+         * How often a node uploads the changed positions of the topic's consumer groups, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] positions_publish_interval`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_publish_interval_micros;
+
+        /**
+         * How long, after a node starts, the group polls of the topic's partitions wait for the
+         * positions of the geo peers, in microseconds (a decimal string above `PHP_INT_MAX`). Null
+         * when the topic sets none, and each node applies its own `[geo] positions_resume_timeout`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $positions_resume_timeout_micros;
+
+        /**
+         * How long the tombstone and the objects of the deleted topic stay in the object store, in
+         * microseconds (a decimal string above `PHP_INT_MAX`). Null when the topic sets none, and
+         * each node applies its own `[geo] tombstone_grace`.
+         *
+         * @var mixed
+         */
+        public readonly mixed $tombstone_grace_micros;
+
+        /**
          * What the topic is, `normal` or `geo`, fixed at creation.
          *
          * @var string
@@ -3102,7 +3237,8 @@ namespace Iggy {
      * Topic option keys, as the cases an update's reset list takes.
      *
      * Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
-     * resettable in this release. The server refuses every other case with its own category.
+     * resettable in this release. The server refuses every other case with its own category. The
+     * durations of a geo topic, from `FreshUploadInterval` on, have no default to return to.
      */
     enum TopicOptionKey: string {
       case Name = 'name';
@@ -3123,6 +3259,12 @@ namespace Iggy {
       case LocalRetentionSize = 'local_retention_size';
       case TopicType = 'topic_type';
       case GeoMode = 'geo_mode';
+      case FreshUploadInterval = 'fresh_upload_interval';
+      case ConsumerOffsetUploadInterval = 'consumer_offset_upload_interval';
+      case PositionsPublishInterval = 'positions_publish_interval';
+      case TombstoneGrace = 'tombstone_grace';
+      case PositionsResumeTimeout = 'positions_resume_timeout';
+      case LongTermRewriteMaxInterval = 'long_term_rewrite_max_interval';
     }
 
     /**

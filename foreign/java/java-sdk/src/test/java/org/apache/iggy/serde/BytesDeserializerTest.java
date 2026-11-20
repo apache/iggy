@@ -339,6 +339,40 @@ class BytesDeserializerTest {
         }
 
         @Test
+        void shouldReadTheDurationsAGeoTopicSetsAndNoneItLeavesUnset() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(
+                            HeaderKey.fromString("topic_type"),
+                            HeaderValue.fromString("geo"),
+                            HeaderKey.fromString("consumer_offset_upload_interval"),
+                            HeaderValue.fromUint64(BigInteger.ZERO),
+                            HeaderKey.fromString("tombstone_grace"),
+                            HeaderValue.fromUint64(BigInteger.valueOf(3_600_000_000L))),
+                    Map.of(HeaderKey.fromString("geo_mode"), HeaderValue.fromString("geo")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topic.consumerOffsetUploadInterval()).contains(BigInteger.ZERO);
+            assertThat(topic.tombstoneGrace()).contains(BigInteger.valueOf(3_600_000_000L));
+            assertThat(topic.freshUploadInterval()).isEmpty();
+            assertThat(topic.positionsPublishInterval()).isEmpty();
+            assertThat(topic.positionsResumeTimeout()).isEmpty();
+            assertThat(topic.longTermRewriteMaxInterval()).isEmpty();
+            assertThat(topicDetails.consumerOffsetUploadInterval()).contains(BigInteger.ZERO);
+            assertThat(topicDetails.tombstoneGrace()).contains(BigInteger.valueOf(3_600_000_000L));
+            assertThat(topicDetails.freshUploadInterval()).isEmpty();
+            assertThat(topicDetails.positionsPublishInterval()).isEmpty();
+            assertThat(topicDetails.positionsResumeTimeout()).isEmpty();
+            assertThat(topicDetails.longTermRewriteMaxInterval()).isEmpty();
+        }
+
+        @Test
         void shouldDeserializeTopicDetails() {
             // given
             ByteBuf buffer = Unpooled.buffer();

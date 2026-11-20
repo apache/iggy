@@ -42,6 +42,14 @@ public enum TopicOptionKey: String, Sendable, Hashable, CaseIterable {
     case localRetentionSize = "local_retention_size"
     case topicType = "topic_type"
     case geoMode = "geo_mode"
+    /// The six durations of a geo topic, from here to
+    /// ``longTermRewriteMaxInterval``, are updatable and never resettable.
+    case freshUploadInterval = "fresh_upload_interval"
+    case consumerOffsetUploadInterval = "consumer_offset_upload_interval"
+    case positionsPublishInterval = "positions_publish_interval"
+    case tombstoneGrace = "tombstone_grace"
+    case positionsResumeTimeout = "positions_resume_timeout"
+    case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
 }
 
 /// How far a write has to get before the server completes it.
@@ -154,6 +162,32 @@ public struct TopicCreateOptions: Sendable, Hashable {
     /// now, and any mode on a normal topic with
     /// ``IggyErrorCode/invalidOptionValue``.
     public var geoMode: GeoMode?
+    /// The longest time a send waits for the upload of its fresh object to
+    /// start, at most 10 seconds.
+    ///
+    /// This and the five durations below belong to a geo topic, and a normal
+    /// topic refuses them with ``IggyErrorCode/invalidOptionValue``. Each
+    /// travels as whole microseconds and overrides the server setting of the
+    /// same name on every node, and nil leaves that setting. Zero is a value
+    /// here, not a server default, so it is sent. An update can change them
+    /// but not reset them.
+    public var freshUploadInterval: Duration?
+    /// The shortest time between two uploads of the positions that an offset
+    /// the consumer group stores itself waits for, at most 1 second. Zero
+    /// answers such a store at its local commit.
+    public var consumerOffsetUploadInterval: Duration?
+    /// How often a node uploads the changed positions of the topic's
+    /// consumer groups. The server refuses zero.
+    public var positionsPublishInterval: Duration?
+    /// How long the tombstone and the objects of the deleted topic stay in
+    /// the object store. The server refuses zero.
+    public var tombstoneGrace: Duration?
+    /// How long, after a node starts, the group polls of the topic's
+    /// partitions wait for the positions of the geo peers. Zero does not wait.
+    public var positionsResumeTimeout: Duration?
+    /// The longest wait between two long-term rewrites of a partition, at
+    /// least 1 second.
+    public var longTermRewriteMaxInterval: Duration?
     public var raw: [String: String]
 
     public init(
@@ -162,7 +196,9 @@ public struct TopicCreateOptions: Sendable, Hashable {
         consumerOffsetDurability: Durability = .replicated, partitionResizePolicy: PartitionResizePolicy? = nil, messagesRequiredToSave: UInt32? = nil,
         sizeOfMessagesRequiredToSaveBytes: UInt64? = nil, preallocateSegments: Bool? = nil, replicationFactor: UInt32? = nil,
         segmentMaxAge: IggyExpiry? = nil, tieredStorage: Bool? = nil, localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil,
-        topicType: TopicType? = nil, geoMode: GeoMode? = nil, raw: [String: String] = [:]
+        topicType: TopicType? = nil, geoMode: GeoMode? = nil, freshUploadInterval: Duration? = nil, consumerOffsetUploadInterval: Duration? = nil,
+        positionsPublishInterval: Duration? = nil, tombstoneGrace: Duration? = nil, positionsResumeTimeout: Duration? = nil,
+        longTermRewriteMaxInterval: Duration? = nil, raw: [String: String] = [:]
     ) {
         self.partitionsCount = partitionsCount
         self.compressionAlgorithm = compressionAlgorithm
@@ -182,6 +218,12 @@ public struct TopicCreateOptions: Sendable, Hashable {
         self.localRetentionSize = localRetentionSize
         self.topicType = topicType
         self.geoMode = geoMode
+        self.freshUploadInterval = freshUploadInterval
+        self.consumerOffsetUploadInterval = consumerOffsetUploadInterval
+        self.positionsPublishInterval = positionsPublishInterval
+        self.tombstoneGrace = tombstoneGrace
+        self.positionsResumeTimeout = positionsResumeTimeout
+        self.longTermRewriteMaxInterval = longTermRewriteMaxInterval
         self.raw = raw
     }
 
@@ -251,7 +293,20 @@ public struct TopicCreateOptions: Sendable, Hashable {
         if let geoMode {
             options[TopicOptionKey.geoMode.rawValue] = .explicit(try .string(geoMode.rawValue))
         }
+        try insertGeoDurations(geoDurations, into: &options)
         return options
+    }
+
+    /// Each duration of a geo topic with its key, in catalog order.
+    var geoDurations: [(key: TopicOptionKey, duration: Duration?)] {
+        [
+            (key: .freshUploadInterval, duration: freshUploadInterval),
+            (key: .consumerOffsetUploadInterval, duration: consumerOffsetUploadInterval),
+            (key: .positionsPublishInterval, duration: positionsPublishInterval),
+            (key: .tombstoneGrace, duration: tombstoneGrace),
+            (key: .positionsResumeTimeout, duration: positionsResumeTimeout),
+            (key: .longTermRewriteMaxInterval, duration: longTermRewriteMaxInterval),
+        ]
     }
 
     func encode() throws -> [UInt8] {
@@ -286,6 +341,16 @@ public struct TopicUpdateOptions: Sendable, Hashable {
     /// ``MaxTopicSize/serverDefault`` changes nothing: reset
     /// ``TopicOptionKey/localRetentionSize`` to return to the default.
     public var localRetentionSize: MaxTopicSize?
+    /// The durations of a geo topic, see ``TopicCreateOptions``. They are the
+    /// only keys an update may change on a geo topic, and a normal topic
+    /// refuses them. Nil keeps the stored value and zero is sent as a value.
+    /// None of them can be reset.
+    public var freshUploadInterval: Duration?
+    public var consumerOffsetUploadInterval: Duration?
+    public var positionsPublishInterval: Duration?
+    public var tombstoneGrace: Duration?
+    public var positionsResumeTimeout: Duration?
+    public var longTermRewriteMaxInterval: Duration?
     /// Keys to return to their defaults: ``TopicOptionKey/messageExpiry``,
     /// ``TopicOptionKey/maxTopicSize``, ``TopicOptionKey/localRetentionAge``
     /// or ``TopicOptionKey/localRetentionSize``. Any other key is refused
@@ -299,8 +364,10 @@ public struct TopicUpdateOptions: Sendable, Hashable {
 
     public init(
         name: String? = nil, messageExpiry: IggyExpiry? = nil, maxTopicSize: MaxTopicSize? = nil, tieredStorage: Bool? = nil,
-        localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil, reset: Set<TopicOptionKey> = [], raw: [String: String] = [:],
-        rawReset: Set<String> = []
+        localRetentionAge: IggyExpiry? = nil, localRetentionSize: MaxTopicSize? = nil, freshUploadInterval: Duration? = nil,
+        consumerOffsetUploadInterval: Duration? = nil, positionsPublishInterval: Duration? = nil, tombstoneGrace: Duration? = nil,
+        positionsResumeTimeout: Duration? = nil, longTermRewriteMaxInterval: Duration? = nil, reset: Set<TopicOptionKey> = [],
+        raw: [String: String] = [:], rawReset: Set<String> = []
     ) {
         self.name = name
         self.messageExpiry = messageExpiry
@@ -308,6 +375,12 @@ public struct TopicUpdateOptions: Sendable, Hashable {
         self.tieredStorage = tieredStorage
         self.localRetentionAge = localRetentionAge
         self.localRetentionSize = localRetentionSize
+        self.freshUploadInterval = freshUploadInterval
+        self.consumerOffsetUploadInterval = consumerOffsetUploadInterval
+        self.positionsPublishInterval = positionsPublishInterval
+        self.tombstoneGrace = tombstoneGrace
+        self.positionsResumeTimeout = positionsResumeTimeout
+        self.longTermRewriteMaxInterval = longTermRewriteMaxInterval
         self.reset = reset
         self.raw = raw
         self.rawReset = rawReset
@@ -338,12 +411,26 @@ public struct TopicUpdateOptions: Sendable, Hashable {
         if let localRetentionSize, localRetentionSize != .serverDefault {
             options[TopicOptionKey.localRetentionSize.rawValue] = .explicit(.uint64(localRetentionSize.wireValue))
         }
+        try insertGeoDurations(geoDurations, into: &options)
         return options
     }
 
+    /// Each duration of a geo topic with its key, in catalog order.
+    var geoDurations: [(key: TopicOptionKey, duration: Duration?)] {
+        [
+            (key: .freshUploadInterval, duration: freshUploadInterval),
+            (key: .consumerOffsetUploadInterval, duration: consumerOffsetUploadInterval),
+            (key: .positionsPublishInterval, duration: positionsPublishInterval),
+            (key: .tombstoneGrace, duration: tombstoneGrace),
+            (key: .positionsResumeTimeout, duration: positionsResumeTimeout),
+            (key: .longTermRewriteMaxInterval, duration: longTermRewriteMaxInterval),
+        ]
+    }
+
     func toPatch() throws -> OptionsPatch {
-        // A server default sets nothing, so it is no set key either.
-        let typed: [TopicOptionKey] = [
+        // A server default sets nothing, so it is no set key either. A
+        // duration of a geo topic has no server default: zero sets it too.
+        var typed: [TopicOptionKey] = [
             name.map { _ in .name },
             messageExpiry.flatMap { $0 == .serverDefault ? nil : .messageExpiry },
             maxTopicSize.flatMap { $0 == .serverDefault ? nil : .maxTopicSize },
@@ -351,7 +438,21 @@ public struct TopicUpdateOptions: Sendable, Hashable {
             localRetentionAge.flatMap { $0 == .serverDefault ? nil : .localRetentionAge },
             localRetentionSize.flatMap { $0 == .serverDefault ? nil : .localRetentionSize },
         ].compactMap { $0 }
+        typed += geoDurations.filter { $0.duration != nil }.map { $0.key }
         return try OptionsPatch(typed: typed, raw: raw, reset: reset, rawReset: rawReset, values: toResourceOptions)
+    }
+}
+
+/// Writes the durations of a geo topic that are set, in whole microseconds.
+/// Zero is a value of these keys, not the server default an ``IggyExpiry``
+/// of zero would be, so it is sent. A negative duration, or one past the
+/// `UInt64` range, is refused.
+private func insertGeoDurations(_ durations: [(key: TopicOptionKey, duration: Duration?)], into options: inout ResourceOptions) throws {
+    for case let (key, duration?) in durations {
+        guard let microseconds = duration.wholeMicroseconds else {
+            throw IggyError(.invalidOptionValue, context: "\(key.rawValue) must be between 0 and 2^64 - 1 microseconds, got \(duration)")
+        }
+        options[key.rawValue] = .explicit(.uint64(microseconds))
     }
 }
 
@@ -362,6 +463,9 @@ extension TopicOptionKey: CatalogOptionKey {
         case .messageExpiry, .maxTopicSize, .localRetentionAge, .localRetentionSize: [.updatable, .resettable]
         case .segmentMaxAge, .topicType, .geoMode: .critical
         case .tieredStorage: [.updatable, .critical]
+        case .freshUploadInterval, .consumerOffsetUploadInterval, .positionsPublishInterval, .tombstoneGrace, .positionsResumeTimeout,
+            .longTermRewriteMaxInterval:
+            .updatable
         default: []
         }
     }
@@ -420,6 +524,44 @@ extension Topic {
     public var geoMode: GeoMode? {
         resolvedGeoMode(options)
     }
+
+    /// The longest time a send waits for the upload of its fresh object to
+    /// start, from ``options``. This and the five durations below are nil
+    /// where the geo topic sets none, and on a normal topic: each node then
+    /// applies its own server setting.
+    public var freshUploadInterval: Duration? {
+        resolvedGeoDuration(options, .freshUploadInterval)
+    }
+
+    /// The shortest time between two uploads of the positions that a stored
+    /// offset waits for, from ``options``.
+    public var consumerOffsetUploadInterval: Duration? {
+        resolvedGeoDuration(options, .consumerOffsetUploadInterval)
+    }
+
+    /// How often a node uploads the changed positions of the topic's
+    /// consumer groups, from ``options``.
+    public var positionsPublishInterval: Duration? {
+        resolvedGeoDuration(options, .positionsPublishInterval)
+    }
+
+    /// How long the tombstone and the objects of the deleted topic stay in
+    /// the object store, from ``options``.
+    public var tombstoneGrace: Duration? {
+        resolvedGeoDuration(options, .tombstoneGrace)
+    }
+
+    /// How long the group polls wait for the positions of the geo peers
+    /// after a node starts, from ``options``.
+    public var positionsResumeTimeout: Duration? {
+        resolvedGeoDuration(options, .positionsResumeTimeout)
+    }
+
+    /// The longest wait between two long-term rewrites of a partition, from
+    /// ``options``.
+    public var longTermRewriteMaxInterval: Duration? {
+        resolvedGeoDuration(options, .longTermRewriteMaxInterval)
+    }
 }
 
 extension TopicDetails {
@@ -471,6 +613,44 @@ extension TopicDetails {
     public var geoMode: GeoMode? {
         resolvedGeoMode(options)
     }
+
+    /// The longest time a send waits for the upload of its fresh object to
+    /// start, from ``options``. This and the five durations below are nil
+    /// where the geo topic sets none, and on a normal topic: each node then
+    /// applies its own server setting.
+    public var freshUploadInterval: Duration? {
+        resolvedGeoDuration(options, .freshUploadInterval)
+    }
+
+    /// The shortest time between two uploads of the positions that a stored
+    /// offset waits for, from ``options``.
+    public var consumerOffsetUploadInterval: Duration? {
+        resolvedGeoDuration(options, .consumerOffsetUploadInterval)
+    }
+
+    /// How often a node uploads the changed positions of the topic's
+    /// consumer groups, from ``options``.
+    public var positionsPublishInterval: Duration? {
+        resolvedGeoDuration(options, .positionsPublishInterval)
+    }
+
+    /// How long the tombstone and the objects of the deleted topic stay in
+    /// the object store, from ``options``.
+    public var tombstoneGrace: Duration? {
+        resolvedGeoDuration(options, .tombstoneGrace)
+    }
+
+    /// How long the group polls wait for the positions of the geo peers
+    /// after a node starts, from ``options``.
+    public var positionsResumeTimeout: Duration? {
+        resolvedGeoDuration(options, .positionsResumeTimeout)
+    }
+
+    /// The longest wait between two long-term rewrites of a partition, from
+    /// ``options``.
+    public var longTermRewriteMaxInterval: Duration? {
+        resolvedGeoDuration(options, .longTermRewriteMaxInterval)
+    }
 }
 
 // An unreported or unreadable key resolves to its catalog default, as in the Rust crate.
@@ -501,6 +681,15 @@ private func resolvedGeoMode(_ options: ResourceOptions) -> GeoMode? {
         return nil
     }
     return options[TopicOptionKey.geoMode.rawValue]?.value.stringValue.flatMap(GeoMode.init(rawValue:)) ?? .geo
+}
+
+// Only a geo topic has durations, as in the Rust crate, so ones stored on a
+// normal topic are ignored rather than trusted.
+private func resolvedGeoDuration(_ options: ResourceOptions, _ key: TopicOptionKey) -> Duration? {
+    guard resolvedTopicType(options) == .geo, let microseconds = options[key.rawValue]?.value.uint64Value else {
+        return nil
+    }
+    return Duration.microseconds(Int64(clamping: microseconds))
 }
 
 // A tiered topic keeps nothing on local disk longer, or in a larger amount,

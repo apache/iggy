@@ -33,8 +33,10 @@ import java.util.Set;
  *
  * <p>Every key here is fixed at create except {@code message_expiry}, {@code max_topic_size},
  * {@code local_retention_age} and {@code local_retention_size}, which a {@link TopicUpdate} may change
- * later, and {@code tiered_storage}, which it may turn on. A key left unset is resolved by the server and
- * reported in the topic's derived options. {@code describeOptions} enumerates what a given server accepts.
+ * later, {@code tiered_storage}, which it may turn on, and the six durations of a geo topic, which it may set
+ * again. A key left unset is resolved by the server and reported in the topic's derived options, except
+ * those durations, which stay unset for each node to apply its own server setting. {@code describeOptions}
+ * enumerates what a given server accepts.
  *
  * <pre>{@code
  * var options = TopicOptions.builder()
@@ -241,6 +243,61 @@ public final class TopicOptions {
          */
         public Builder geoMode(GeoMode mode) {
             return set(TopicOptionKey.GEO_MODE, HeaderValue.fromString(mode.value()));
+        }
+
+        /**
+         * The longest time a send waits for the upload of its fresh object to start, in microseconds, at most ten
+         * seconds. Zero uploads as soon as an upload slot is free. Overrides the server's
+         * {@code [tiered_storage] fresh_upload_interval}.
+         *
+         * <p>This and the five durations below are only on a geo topic: the server refuses them on a normal
+         * topic with {@code INVALID_OPTION_VALUE}. Zero is a value for them and is sent, unlike a zero
+         * {@code message_expiry}. Left unset, each node applies its own server setting of the same name.
+         */
+        public Builder freshUploadInterval(BigInteger micros) {
+            return set(TopicOptionKey.FRESH_UPLOAD_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * The shortest time between two uploads of the positions that the offsets its consumer groups store
+         * themselves wait for, in microseconds, at most one second. Zero answers such a store at its local commit.
+         * Overrides the server's {@code [geo] consumer_offset_upload_interval}.
+         */
+        public Builder consumerOffsetUploadInterval(BigInteger micros) {
+            return set(TopicOptionKey.CONSUMER_OFFSET_UPLOAD_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * How often a node uploads the changed positions of the topic's consumer groups, in microseconds, more
+         * than zero. Overrides the server's {@code [geo] positions_publish_interval}.
+         */
+        public Builder positionsPublishInterval(BigInteger micros) {
+            return set(TopicOptionKey.POSITIONS_PUBLISH_INTERVAL, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * How long the tombstone and the objects of the deleted topic stay in the object store, in microseconds,
+         * more than zero. Overrides the server's {@code [geo] tombstone_grace}.
+         */
+        public Builder tombstoneGrace(BigInteger micros) {
+            return set(TopicOptionKey.TOMBSTONE_GRACE, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * How long, after a node starts, the group polls of the topic's partitions wait for the positions of the
+         * geo peers, in microseconds. Zero does not wait. Overrides the server's
+         * {@code [geo] positions_resume_timeout}.
+         */
+        public Builder positionsResumeTimeout(BigInteger micros) {
+            return set(TopicOptionKey.POSITIONS_RESUME_TIMEOUT, HeaderValue.fromUint64(micros));
+        }
+
+        /**
+         * The longest wait between two rewrites of a partition's committed messages into long-term segments, in
+         * microseconds, at least one second. Overrides the server's {@code [geo] long_term_rewrite_max_interval}.
+         */
+        public Builder longTermRewriteMaxInterval(BigInteger micros) {
+            return set(TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL, HeaderValue.fromUint64(micros));
         }
 
         /** An option this build has no setter for. A typed setter wins on collision. */

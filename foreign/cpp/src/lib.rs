@@ -77,6 +77,8 @@ mod ffi {
         /// False on a normal topic, which has no geo mode.
         has_geo_mode: bool,
         geo_mode: GeoMode,
+        /// Each one unset on a normal topic.
+        geo_durations: GeoTopicDurations,
         messages_count: u64,
         partitions_count: u32,
         /// Options the creating client set explicitly. Carried as
@@ -127,6 +129,8 @@ mod ffi {
         /// See [`Topic::has_geo_mode`].
         has_geo_mode: bool,
         geo_mode: GeoMode,
+        /// See [`Topic::geo_durations`].
+        geo_durations: GeoTopicDurations,
         messages_count: u64,
         partitions_count: u32,
         partitions: Vec<Partition>,
@@ -182,6 +186,25 @@ mod ffi {
     enum GeoMode {
         Geo = 0,
         GeoTiered = 1,
+    }
+
+    /// The durations of a geo topic in microseconds, each overriding the
+    /// server setting of the same name on every node. A `has_` flag is false
+    /// when the topic leaves its duration to that setting. Zero is a value.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct GeoTopicDurations {
+        has_fresh_upload_interval: bool,
+        fresh_upload_interval_micros: u64,
+        has_consumer_offset_upload_interval: bool,
+        consumer_offset_upload_interval_micros: u64,
+        has_positions_publish_interval: bool,
+        positions_publish_interval_micros: u64,
+        has_tombstone_grace: bool,
+        tombstone_grace_micros: u64,
+        has_positions_resume_timeout: bool,
+        positions_resume_timeout_micros: u64,
+        has_long_term_rewrite_max_interval: bool,
+        long_term_rewrite_max_interval_micros: u64,
     }
 
     #[repr(u8)]
@@ -717,6 +740,7 @@ mod ffi {
         pending_max_bytes: u64,
     }
 
+    #[derive(Default)]
     struct TopicCreateOptions {
         has_partitions_count: bool,
         partitions_count: u32,
@@ -757,12 +781,14 @@ mod ffi {
         topic_type: String,
         has_geo_mode: bool,
         geo_mode: String,
+        geo_durations: GeoTopicDurations,
         raw_options: Vec<HeaderEntry>,
     }
 
     /// Reset keys travel as catalog names and are validated against the
     /// scope's catalog before anything is sent. Raw reset names are left to
     /// the server.
+    #[derive(Default)]
     struct TopicUpdateOptions {
         has_name: bool,
         name: String,
@@ -778,6 +804,8 @@ mod ffi {
         local_retention_age_value: u64,
         has_local_retention_size: bool,
         local_retention_size: String,
+        /// Set-only: none of the durations can be reset.
+        geo_durations: GeoTopicDurations,
         reset: Vec<String>,
         raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,

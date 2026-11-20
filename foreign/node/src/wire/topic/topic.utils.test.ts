@@ -150,6 +150,39 @@ describe('deserializeBaseTopic', () => {
   });
 });
 
+describe('deserializeBaseTopic durations', () => {
+  const topicWith = (topicType: string) => {
+    const fixed = Buffer.alloc(34);
+    fixed.writeUInt32LE(4, 0);
+    fixed.writeUInt8(1, 32);
+    fixed.write('g', 33);
+    const explicit = serializeOptions([
+      { key: 'consumer_offset_upload_interval', value: HeaderValue.Uint64(0n) },
+      { key: 'tombstone_grace', value: HeaderValue.Uint64(3_600_000_000n) },
+      { key: 'topic_type', value: HeaderValue.String(topicType) }
+    ]);
+    const length = Buffer.alloc(4);
+    length.writeUInt32LE(explicit.length, 0);
+    return deserializeBaseTopic(Buffer.concat([fixed, length, explicit, Buffer.alloc(4)])).data;
+  };
+
+  it('reads the durations a geo topic sets, 0n included, and null for the unset ones', () => {
+    const topic = topicWith('geo');
+    assert.equal(topic.consumerOffsetUploadInterval, 0n);
+    assert.equal(topic.tombstoneGrace, 3_600_000_000n);
+    assert.equal(topic.freshUploadInterval, null);
+    assert.equal(topic.positionsPublishInterval, null);
+    assert.equal(topic.positionsResumeTimeout, null);
+    assert.equal(topic.longTermRewriteMaxInterval, null);
+  });
+
+  it('ignores durations stored on a normal topic', () => {
+    const topic = topicWith('normal');
+    assert.equal(topic.consumerOffsetUploadInterval, null);
+    assert.equal(topic.tombstoneGrace, null);
+  });
+});
+
 describe('deserializePartition', () => {
   it('decodes the pinned vector with its member and in-sync lists', () => {
     assert.equal(PINNED_PARTITION.length, 71);

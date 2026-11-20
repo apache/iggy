@@ -57,7 +57,7 @@ use iggy_binary_protocol::{
     AckLevel, GenericHeader, KIND_CONSUMER_GROUP, Operation, ReplyHeader, RoutedRequestHeader,
     WireDecode, WireIdentifier,
 };
-use iggy_common::IggyError;
+use iggy_common::{GeoTopicDurations, IggyError};
 use iggy_object_store::GeoLog;
 use journal::superblock::SuperblockStore;
 use message_bus::{MessageBus, is_auto_commit_client};
@@ -282,16 +282,61 @@ impl<R> HeldCommits<R> {
     }
 }
 
+/// The pace that a geo topic sets for the rounds of its logs. A field that
+/// is `None` follows the node's setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TopicPace {
+    /// The topic's own publish interval, in microseconds.
+    pub publish_interval: Option<u64>,
+    /// The topic's own offset upload interval in microseconds, `Some(None)`
+    /// when the topic answers the offsets its groups store at their commit.
+    pub offset_upload_interval: Option<Option<u64>>,
+}
+
+impl TopicPace {
+    /// The pace of a topic with `durations`, `None` for a topic that follows
+    /// the node's settings.
+    #[must_use]
+    pub fn of(durations: &GeoTopicDurations) -> Option<Self> {
+        let pace = Self {
+            publish_interval: durations
+                .positions_publish_interval
+                .map(|interval| interval.as_micros()),
+            offset_upload_interval: durations
+                .consumer_offset_upload_interval
+                .map(|interval| (!interval.is_zero()).then(|| interval.as_micros())),
+        };
+        (pace != Self::default()).then_some(pace)
+    }
+}
+
+/// A round that [`RoundPacing::start`] starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundStart {
+    /// The topics whose logs the round stores, by stream and topic id,
+    /// `None` for every log.
+    pub scope: Option<Vec<(usize, usize)>>,
+    /// The topics whose logs a round of every log does not store: each sets
+    /// its own publish interval, which has not passed, and none of its held
+    /// commits is due.
+    pub skipped: BTreeSet<(usize, usize)>,
+}
+
 /// When shard 0 starts the rounds that store positions.
 ///
 /// One of every log each publish interval, and between those, one of the
 /// topics with held commits once no round runs, the offset upload interval
 /// passed since the last round started, and the wait after a failed store
-/// ended.
+/// ended. A topic that sets its own publish interval gets a round at that
+/// interval, and the rounds of every log leave it out until it is due. A
+/// topic that sets its own offset upload interval spaces the rounds of its
+/// held commits by it, apart from the other topics.
 #[derive(Debug, Clone, Default)]
 pub struct RoundPacing {
     /// When the next round of every log is due.
     next_round_at: u64,
+    /// When the last round started that carried the held commits of the
+    /// topics that follow the node's offset upload interval.
     last_started_at: Option<u64>,
     /// The topics, by stream and topic id, whose held commits wait for a
     /// round.
@@ -300,6 +345,15 @@ pub struct RoundPacing {
     retry_at: u64,
     /// The rounds in a row whose store failed.
     failed_rounds: u32,
+    /// The topics that set their own pace, as of the last round of every
+    /// log.
+    paces: BTreeMap<(usize, usize), TopicPace>,
+    /// Of each topic with its own publish interval, when its next round is
+    /// due.
+    publish_at: BTreeMap<(usize, usize), u64>,
+    /// Of each topic with its own offset upload interval, when the last
+    /// round that carried its held commits started.
+    held_started_at: BTreeMap<(usize, usize), u64>,
 }
 
 impl RoundPacing {
@@ -308,39 +362,121 @@ impl RoundPacing {
         self.waiting.extend(topics);
     }
 
-    /// The round to start at `now`, while no round runs: `Some(None)` for
-    /// every log, `Some(Some(topics))` for the topics with held commits.
-    /// Times are microseconds, `offset_upload_interval` is `None` when
-    /// commits are not held.
+    /// Whether the next round of every log is due at `now`, when shard 0
+    /// reads the paces of the topics again.
+    #[must_use]
+    pub const fn every_log_due(&self, now: u64) -> bool {
+        now >= self.next_round_at
+    }
+
+    /// Take the paces that the topics set, at `now`, in place of the ones
+    /// taken before.
+    pub fn set_paces(&mut self, paces: BTreeMap<(usize, usize), TopicPace>, now: u64) {
+        let gone: Vec<(usize, usize)> = self
+            .paces
+            .keys()
+            .filter(|topic| !paces.contains_key(*topic))
+            .copied()
+            .collect();
+        for topic in gone {
+            self.set_pace(topic, None, now);
+        }
+        for (topic, pace) in paces {
+            self.set_pace(topic, Some(pace), now);
+        }
+    }
+
+    /// Take the pace that `topic` sets at `now`, `None` when it follows the
+    /// node. A topic that sets its own publish interval is due one interval
+    /// later, or sooner when it was due sooner.
+    pub fn set_pace(&mut self, topic: (usize, usize), pace: Option<TopicPace>, now: u64) {
+        let pace = pace.unwrap_or_default();
+        match pace.publish_interval {
+            Some(interval) => {
+                let due_at = now.saturating_add(interval);
+                self.publish_at
+                    .entry(topic)
+                    .and_modify(|at| *at = (*at).min(due_at))
+                    .or_insert(due_at);
+            }
+            None => {
+                self.publish_at.remove(&topic);
+            }
+        }
+        if !matches!(pace.offset_upload_interval, Some(Some(_))) {
+            self.held_started_at.remove(&topic);
+        }
+        if pace == TopicPace::default() {
+            self.paces.remove(&topic);
+        } else {
+            self.paces.insert(topic, pace);
+        }
+    }
+
+    /// The round to start at `now`, while no round runs. Times are
+    /// microseconds. `publish_interval` and `offset_upload_interval` are the
+    /// node's, and `offset_upload_interval` is `None` when the node does not
+    /// hold commits.
     pub fn start(
         &mut self,
         now: u64,
         publish_interval: u64,
         offset_upload_interval: Option<u64>,
-    ) -> Option<Option<Vec<(usize, usize)>>> {
+    ) -> Option<RoundStart> {
+        let held = self.due_held(now, offset_upload_interval);
         if now >= self.next_round_at {
             self.next_round_at = now.saturating_add(publish_interval);
+            let skipped: BTreeSet<(usize, usize)> = self
+                .publish_at
+                .iter()
+                .filter(|(topic, due_at)| now < **due_at && !held.contains(*topic))
+                .map(|(topic, _)| *topic)
+                .collect();
+            let carried: Vec<(usize, usize)> = self
+                .waiting
+                .iter()
+                .filter(|topic| !skipped.contains(*topic))
+                .copied()
+                .collect();
+            self.carry(now, &carried);
             self.last_started_at = Some(now);
-            self.waiting.clear();
-            return Some(None);
+            let published: Vec<(usize, usize)> = self
+                .publish_at
+                .keys()
+                .filter(|topic| !skipped.contains(*topic))
+                .copied()
+                .collect();
+            self.published(now, &published);
+            return Some(RoundStart {
+                scope: None,
+                skipped,
+            });
         }
-        let offset_upload_interval = offset_upload_interval?;
-        let spaced = self
-            .last_started_at
-            .is_none_or(|started| now >= started.saturating_add(offset_upload_interval));
-        if self.waiting.is_empty() || !spaced || now < self.retry_at {
+        let mut topics: BTreeSet<(usize, usize)> = self
+            .publish_at
+            .iter()
+            .filter(|(_, due_at)| now >= **due_at)
+            .map(|(topic, _)| *topic)
+            .collect();
+        topics.extend(held.iter().copied());
+        if topics.is_empty() {
             return None;
         }
-        self.last_started_at = Some(now);
-        Some(Some(
-            std::mem::take(&mut self.waiting).into_iter().collect(),
-        ))
+        let held: Vec<(usize, usize)> = held.into_iter().collect();
+        self.carry(now, &held);
+        let topics: Vec<(usize, usize)> = topics.into_iter().collect();
+        self.published(now, &topics);
+        Some(RoundStart {
+            scope: Some(topics),
+            skipped: BTreeSet::new(),
+        })
     }
 
     /// A round ended at `now`, `failed` when the store refused one of its
     /// objects. Each failed round in a row doubles the wait before the next
     /// round of held commits, from twice the offset upload interval up to a
-    /// second.
+    /// second. The node's interval is the base, or the shortest a topic sets
+    /// when the node holds no commits.
     pub fn finished(&mut self, now: u64, failed: bool, offset_upload_interval: Option<u64>) {
         if !failed {
             self.failed_rounds = 0;
@@ -348,11 +484,72 @@ impl RoundPacing {
             return;
         }
         self.failed_rounds = self.failed_rounds.saturating_add(1);
-        let delay = offset_upload_interval
+        let base = offset_upload_interval.or_else(|| {
+            self.paces
+                .values()
+                .filter_map(|pace| pace.offset_upload_interval.flatten())
+                .min()
+        });
+        let delay = base
             .unwrap_or(0)
             .saturating_mul(1 << self.failed_rounds.min(16))
             .min(micros(COMMIT_RETRY_DELAY_MAX));
         self.retry_at = now.saturating_add(delay);
+    }
+
+    /// The waiting topics whose round of held commits may start at `now`.
+    fn due_held(&self, now: u64, offset_upload_interval: Option<u64>) -> BTreeSet<(usize, usize)> {
+        if now < self.retry_at {
+            return BTreeSet::new();
+        }
+        let spaced = |started: Option<u64>, interval: u64| {
+            started.is_none_or(|started| now >= started.saturating_add(interval))
+        };
+        self.waiting
+            .iter()
+            .filter(|topic| {
+                match self
+                    .paces
+                    .get(*topic)
+                    .and_then(|pace| pace.offset_upload_interval)
+                {
+                    Some(Some(own)) => spaced(self.held_started_at.get(*topic).copied(), own),
+                    // Commits held before the topic stopped holding them go at once.
+                    Some(None) => true,
+                    None => offset_upload_interval
+                        .is_some_and(|interval| spaced(self.last_started_at, interval)),
+                }
+            })
+            .copied()
+            .collect()
+    }
+
+    /// A round that starts at `now` carries the held commits of `topics`.
+    fn carry(&mut self, now: u64, topics: &[(usize, usize)]) {
+        for topic in topics {
+            self.waiting.remove(topic);
+            match self
+                .paces
+                .get(topic)
+                .and_then(|pace| pace.offset_upload_interval)
+            {
+                Some(Some(_)) => {
+                    self.held_started_at.insert(*topic, now);
+                }
+                Some(None) => {}
+                None => self.last_started_at = Some(now),
+            }
+        }
+    }
+
+    /// A round that starts at `now` stores the logs of `topics`: the next
+    /// round of each that sets its own publish interval is one interval on.
+    fn published(&mut self, now: u64, topics: &[(usize, usize)]) {
+        for topic in topics {
+            if let Some(interval) = self.paces.get(topic).and_then(|pace| pace.publish_interval) {
+                self.publish_at.insert(*topic, now.saturating_add(interval));
+            }
+        }
     }
 }
 
@@ -460,7 +657,18 @@ where
             return None;
         }
         let settings = self.geo_settings()?;
-        settings.offset_upload_interval?;
+        let namespace = IggyNamespace::from_raw(header.group);
+        // The topic's own interval wins over the node's, and zero holds none.
+        match self
+            .geo_durations(namespace)
+            .consumer_offset_upload_interval
+        {
+            Some(interval) if interval.is_zero() => return None,
+            Some(_) => {}
+            None => {
+                settings.offset_upload_interval?;
+            }
+        }
         self.topic_objects()?;
         let store = StoreConsumerOffsetRequest::decode_from(request.body()).ok()?;
         if store.consumer.kind != KIND_CONSUMER_GROUP || store.ack != AckLevel::Quorum {
@@ -469,7 +677,6 @@ where
         let WireIdentifier::Numeric(group_id) = store.consumer.id else {
             return None;
         };
-        let namespace = IggyNamespace::from_raw(header.group);
         self.plane
             .metadata()
             .mux_stm
@@ -902,14 +1109,17 @@ mod tests {
     #[test]
     fn given_commits_that_arrive_together_when_pacing_should_start_one_round_for_their_topics() {
         let mut pacing = RoundPacing::default();
-        assert_eq!(pacing.start(0, 1_000 * MS, Some(50 * MS)), Some(None));
+        assert_eq!(
+            pacing.start(0, 1_000 * MS, Some(50 * MS)),
+            Some(every_log())
+        );
 
         pacing.wait([(1, 1)]);
         pacing.wait([(1, 1), (1, 2)]);
         let round = pacing.start(60 * MS, 1_000 * MS, Some(50 * MS));
         let next = pacing.start(200 * MS, 1_000 * MS, Some(50 * MS));
 
-        assert_eq!(round, Some(Some(vec![(1, 1), (1, 2)])));
+        assert_eq!(round, Some(topics(vec![(1, 1), (1, 2)])));
         assert_eq!(next, None, "nothing waits");
     }
 
@@ -922,13 +1132,13 @@ mod tests {
         assert_eq!(pacing.start(20 * MS, 1_000 * MS, Some(50 * MS)), None);
         assert_eq!(
             pacing.start(50 * MS, 1_000 * MS, Some(50 * MS)),
-            Some(Some(vec![(1, 1)]))
+            Some(topics(vec![(1, 1)]))
         );
         pacing.wait([(1, 1)]);
         assert_eq!(pacing.start(70 * MS, 1_000 * MS, Some(50 * MS)), None);
         assert_eq!(
             pacing.start(100 * MS, 1_000 * MS, Some(50 * MS)),
-            Some(Some(vec![(1, 1)]))
+            Some(topics(vec![(1, 1)]))
         );
     }
 
@@ -940,7 +1150,7 @@ mod tests {
 
         assert_eq!(
             pacing.start(1_000 * MS, 1_000 * MS, Some(50 * MS)),
-            Some(None)
+            Some(every_log())
         );
         assert_eq!(
             pacing.start(1_100 * MS, 1_000 * MS, Some(50 * MS)),
@@ -980,6 +1190,136 @@ mod tests {
 
         assert_eq!(waits, [100, 200, 400, 800, 1_000, 1_000]);
         assert!(starts(&pacing, now + 50 * MS), "a success ends the wait");
+    }
+
+    #[test]
+    fn given_topics_with_their_own_offset_upload_intervals_when_commits_keep_coming_should_space_each_by_its_own()
+     {
+        let (quick, slow, node) = ((1, 1), (1, 2), (1, 3));
+        let own = |interval: u64| TopicPace {
+            offset_upload_interval: Some(Some(interval * MS)),
+            ..TopicPace::default()
+        };
+        let mut pacing = RoundPacing::default();
+        pacing.set_paces(BTreeMap::from([(quick, own(20)), (slow, own(200))]), 0);
+        assert_eq!(
+            pacing.start(0, 60_000 * MS, Some(50 * MS)),
+            Some(every_log())
+        );
+
+        let mut carried: BTreeMap<(usize, usize), Vec<u64>> = BTreeMap::new();
+        for ms in 1..=400 {
+            pacing.wait([quick, slow, node]);
+            if let Some(RoundStart {
+                scope: Some(topics),
+                ..
+            }) = pacing.start(ms * MS, 60_000 * MS, Some(50 * MS))
+            {
+                for topic in topics {
+                    carried.entry(topic).or_default().push(ms);
+                }
+            }
+        }
+
+        assert_eq!(carried[&quick], (1..=400).step_by(20).collect::<Vec<_>>());
+        assert_eq!(carried[&slow], [1, 201]);
+        // The round of every log at 0 started the node's interval.
+        assert_eq!(carried[&node], (50..=400).step_by(50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn given_topics_with_their_own_publish_intervals_when_pacing_should_give_each_its_rounds_and_skip_it_in_rounds_of_every_log()
+     {
+        let (slow, quick) = ((1, 1), (1, 2));
+        let own = |interval: u64| TopicPace {
+            publish_interval: Some(interval * MS),
+            ..TopicPace::default()
+        };
+        let mut pacing = RoundPacing::default();
+        pacing.set_paces(BTreeMap::from([(slow, own(5_000)), (quick, own(250))]), 0);
+        let first = pacing.start(0, 1_000 * MS, Some(50 * MS));
+        assert_eq!(
+            first,
+            Some(RoundStart {
+                scope: None,
+                skipped: BTreeSet::from([slow, quick]),
+            })
+        );
+
+        let mut every_log = Vec::new();
+        let mut own_rounds = Vec::new();
+        for ms in 1..=5_000 {
+            match pacing.start(ms * MS, 1_000 * MS, Some(50 * MS)) {
+                Some(RoundStart {
+                    scope: None,
+                    skipped,
+                }) => every_log.push((ms, skipped)),
+                Some(RoundStart {
+                    scope: Some(topics),
+                    ..
+                }) => own_rounds.push((ms, topics)),
+                None => {}
+            }
+        }
+
+        assert_eq!(
+            every_log,
+            [
+                (1_000, BTreeSet::from([slow])),
+                (2_000, BTreeSet::from([slow])),
+                (3_000, BTreeSet::from([slow])),
+                (4_000, BTreeSet::from([slow])),
+                (5_000, BTreeSet::new()),
+            ]
+        );
+        let expected: Vec<(u64, Vec<(usize, usize)>)> = (250..5_000)
+            .step_by(250)
+            .filter(|ms| ms % 1_000 != 0)
+            .map(|ms| (ms, vec![quick]))
+            .collect();
+        assert_eq!(own_rounds, expected);
+    }
+
+    #[test]
+    fn given_a_node_that_holds_no_commits_when_a_topic_holds_them_and_its_store_fails_should_back_off_from_its_interval()
+     {
+        let mut pacing = RoundPacing::default();
+        pacing.set_paces(
+            BTreeMap::from([(
+                (1, 1),
+                TopicPace {
+                    offset_upload_interval: Some(Some(20 * MS)),
+                    ..TopicPace::default()
+                },
+            )]),
+            0,
+        );
+        pacing.start(0, 60_000 * MS, None);
+
+        pacing.finished(0, true, None);
+        pacing.wait([(1, 1)]);
+
+        assert_eq!(pacing.clone().start(39 * MS, 60_000 * MS, None), None);
+        assert_eq!(
+            pacing.start(40 * MS, 60_000 * MS, None),
+            Some(topics(vec![(1, 1)]))
+        );
+    }
+
+    /// A round of every log that leaves no topic out.
+    fn every_log() -> RoundStart {
+        RoundStart {
+            scope: None,
+            skipped: BTreeSet::new(),
+        }
+    }
+
+    /// A round of the logs of `topics`.
+    fn topics(topics: Vec<(usize, usize)>) -> RoundStart {
+        RoundStart {
+            scope: Some(topics),
+            skipped: BTreeSet::new(),
+        }
     }
 
     /// Whether `pacing` starts a round at `now`, left as it was.

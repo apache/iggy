@@ -35,7 +35,7 @@
 //! created_revision u64 | partition_count u32
 //! compression u8 | max_message_size u64
 //! message_expiry u64 | max_topic_size u64 | geo_mode u8
-//! created_at u64 | published_at u64 | deleted_at u64
+//! created_at u64 | published_at u64 | deleted_at u64 | tombstone_grace u64
 //! crc32c of every byte before it u32
 //! ```
 //!
@@ -45,11 +45,11 @@ use crate::error::ObjectStoreError;
 use crate::layout::{KeyLayout, TopicKey};
 use crate::store::{ObjectStore, PutBody, PutOptions};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"IGGYTOP1");
+const MAGIC: u64 = u64::from_le_bytes(*b"IGGYTOP2");
 /// The longest name, in bytes: the most that its one-byte length says.
 pub const MAX_TOPIC_NAME_LEN: usize = u8::MAX as usize;
 /// The bytes of every field but the bytes of the three names.
-const FIXED_LEN: usize = 110;
+const FIXED_LEN: usize = 118;
 const CHECKSUM_LEN: usize = size_of::<u32>();
 /// The most bytes that a topic object takes: three names of the longest
 /// length.
@@ -154,6 +154,11 @@ pub struct TopicObject {
     /// When the origin built this object.
     pub published_at: u64,
     pub state: TopicState,
+    /// How long the origin keeps the topic's objects after it writes the
+    /// tombstone, in microseconds, as the topic sets it. Zero when the topic
+    /// sets none: the `[geo] tombstone_grace` of the sweeping node applies.
+    /// Readers in other datacenters do not use it.
+    pub tombstone_grace: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -232,6 +237,7 @@ impl TopicObject {
         for timestamp in [self.created_at, self.published_at, deleted_at] {
             bytes.extend_from_slice(&timestamp.to_le_bytes());
         }
+        bytes.extend_from_slice(&self.tombstone_grace.to_le_bytes());
         let checksum = crc32c::crc32c(&bytes);
         bytes.extend_from_slice(&checksum.to_le_bytes());
         Ok(bytes)
@@ -263,6 +269,7 @@ impl TopicObject {
         let created_at = reader.u64()?;
         let published_at = reader.u64()?;
         let deleted_at = reader.u64()?;
+        let tombstone_grace = reader.u64()?;
         let body_len = bytes.len() - reader.left();
         if reader.left() != CHECKSUM_LEN {
             return Err(TopicObjectError::WrongLength {
@@ -301,6 +308,7 @@ impl TopicObject {
             created_at,
             published_at,
             state,
+            tombstone_grace,
         })
     }
 
@@ -475,6 +483,7 @@ mod tests {
             created_at: 1_700_000_000_000_000,
             published_at: 1_700_000_000_500_000,
             state: TopicState::Live,
+            tombstone_grace: 3_600_000_000,
         }
     }
 
@@ -482,18 +491,22 @@ mod tests {
     fn given_fixed_len_when_counting_the_fields_should_match_the_layout() {
         // magic, state, cluster_uid, three name lengths, three ids, the
         // partition count, compression, three limits, geo_mode, three
-        // timestamps and the checksum.
-        let fields = [8, 1, 16, 1, 1, 1, 8, 8, 8, 4, 1, 8, 8, 8, 1, 8, 8, 8, 4];
+        // timestamps, the tombstone grace and the checksum.
+        let fields = [8, 1, 16, 1, 1, 1, 8, 8, 8, 4, 1, 8, 8, 8, 1, 8, 8, 8, 8, 4];
         assert_eq!(fields.iter().sum::<usize>(), FIXED_LEN);
-        assert_eq!(MAX_TOPIC_OBJECT_LEN, 875);
+        assert_eq!(MAX_TOPIC_OBJECT_LEN, 883);
     }
 
     #[test]
     fn given_live_and_tombstone_when_encoding_and_decoding_should_give_them_back() {
         let live = object();
         let tombstone = object().into_tombstone(1_700_000_900_000_000);
+        let server_grace = TopicObject {
+            tombstone_grace: 0,
+            ..object()
+        };
 
-        for object in [live, tombstone] {
+        for object in [live, tombstone, server_grace] {
             let encoded = object.encode().unwrap();
             assert_eq!(
                 encoded.len(),
@@ -594,12 +607,12 @@ mod tests {
     #[test]
     fn given_another_magic_when_decoding_should_report_an_unsupported_version() {
         let mut encoded = object().encode().unwrap();
-        encoded[..8].copy_from_slice(b"IGGYTOP2");
+        encoded[..8].copy_from_slice(b"IGGYTOP1");
 
         assert_eq!(
             TopicObject::decode(&encoded),
             Err(TopicObjectError::UnsupportedVersion(u64::from_le_bytes(
-                *b"IGGYTOP2"
+                *b"IGGYTOP1"
             )))
         );
     }

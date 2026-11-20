@@ -63,6 +63,17 @@ type Topic struct {
 	PartitionsCount      uint32                 `json:"partitionsCount"`
 	Options              map[string]HeaderValue `json:"options,omitempty"`
 	DerivedOptions       map[string]HeaderValue `json:"derivedOptions,omitempty"`
+
+	// FreshUploadInterval to LongTermRewriteMaxInterval are the durations a
+	// geo topic sets, in microseconds, see TopicOptions. Each is nil where the
+	// topic sets none and on a normal topic: each node then applies its own
+	// server setting of the same name.
+	FreshUploadInterval          *Duration `json:"freshUploadInterval,omitempty"`
+	ConsumerOffsetUploadInterval *Duration `json:"consumerOffsetUploadInterval,omitempty"`
+	PositionsPublishInterval     *Duration `json:"positionsPublishInterval,omitempty"`
+	TombstoneGrace               *Duration `json:"tombstoneGrace,omitempty"`
+	PositionsResumeTimeout       *Duration `json:"positionsResumeTimeout,omitempty"`
+	LongTermRewriteMaxInterval   *Duration `json:"longTermRewriteMaxInterval,omitempty"`
 }
 
 type TopicDetails struct {

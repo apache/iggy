@@ -325,6 +325,13 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_EQ(explicit_options.count("topic_type"), 1u);
     EXPECT_EQ(topic_details.TopicType(), iggy::TopicType::Normal);
     EXPECT_FALSE(topic_details.GeoMode().has_value());
+    // Only a geo topic has durations.
+    EXPECT_FALSE(topic_details.FreshUploadInterval().has_value());
+    EXPECT_FALSE(topic_details.ConsumerOffsetUploadInterval().has_value());
+    EXPECT_FALSE(topic_details.PositionsPublishInterval().has_value());
+    EXPECT_FALSE(topic_details.TombstoneGrace().has_value());
+    EXPECT_FALSE(topic_details.PositionsResumeTimeout().has_value());
+    EXPECT_FALSE(topic_details.LongTermRewriteMaxInterval().has_value());
 
     auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
         auto it = explicit_options.find(key);

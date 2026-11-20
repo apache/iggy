@@ -113,6 +113,24 @@ class StringTag {
 template <typename Operation>
 decltype(auto) RethrowAsIggyException(Operation &&operation);
 
+/** @brief The durations of a geo topic, each empty when the topic leaves it to the server setting. */
+struct GeoTopicDurations {
+    std::optional<std::chrono::microseconds> fresh_upload_interval;
+    std::optional<std::chrono::microseconds> consumer_offset_upload_interval;
+    std::optional<std::chrono::microseconds> positions_publish_interval;
+    std::optional<std::chrono::microseconds> tombstone_grace;
+    std::optional<std::chrono::microseconds> positions_resume_timeout;
+    std::optional<std::chrono::microseconds> long_term_rewrite_max_interval;
+};
+
+/** @brief Returns a geo topic duration, which can be zero but never negative. */
+inline std::chrono::microseconds GeoTopicDuration(std::chrono::microseconds duration) {
+    if (duration.count() < 0) {
+        throw std::invalid_argument("A geo topic duration cannot be negative");
+    }
+    return duration;
+}
+
 }  // namespace detail
 
 /**
@@ -1486,6 +1504,72 @@ class Topic final {
     [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
 
     /**
+     * @brief Returns the longest time a send to this geo topic waits for the
+     *        upload of its fresh object to start.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[tiered_storage] fresh_upload_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Returns the shortest time between two uploads of the positions
+     *        that the offset stores of this geo topic's consumer groups wait
+     *        for.
+     * @return Duration the topic sets, zero when such a store answers at its
+     *         local commit, or `std::nullopt` when every node applies its
+     *         `[geo] consumer_offset_upload_interval`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Returns how often a node uploads the changed positions of this
+     *        geo topic's consumer groups.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] positions_publish_interval`, and on a normal
+     *         topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Returns how long the tombstone and the objects of this geo topic
+     *        stay in the object store after it is deleted.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] tombstone_grace`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Returns how long, after a node starts, the group polls of this
+     *        geo topic wait for the positions of the geo peers.
+     * @return Duration the topic sets, zero for no wait, or `std::nullopt`
+     *         when every node applies its `[geo] positions_resume_timeout`, and
+     *         on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Returns the longest wait between two long-term rewrites of a
+     *        partition of this geo topic.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] long_term_rewrite_max_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1513,6 +1597,7 @@ class Topic final {
           std::uint64_t max_topic_size,
           ::iggy::TopicType topic_type,
           std::optional<::iggy::GeoMode> geo_mode,
+          detail::GeoTopicDurations geo_durations,
           std::uint64_t messages_count,
           std::uint32_t partitions_count,
           ResourceOptions options)
@@ -1525,6 +1610,7 @@ class Topic final {
           max_topic_size_(max_topic_size),
           topic_type_(topic_type),
           geo_mode_(geo_mode),
+          geo_durations_(geo_durations),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           options_(std::move(options)) {}
@@ -1534,6 +1620,8 @@ class Topic final {
     friend class IggyBlockingClient;
     friend class StreamDetails;
     friend class TopicsPage;
+    // The unit tests have no server to read a topic from, so they build one through this class.
+    friend class TopicTestPeer;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -1544,6 +1632,7 @@ class Topic final {
     std::uint64_t max_topic_size_;
     ::iggy::TopicType topic_type_;
     std::optional<::iggy::GeoMode> geo_mode_;
+    detail::GeoTopicDurations geo_durations_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     ResourceOptions options_;
@@ -1782,6 +1871,72 @@ class TopicDetails final {
     [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
 
     /**
+     * @brief Returns the longest time a send to this geo topic waits for the
+     *        upload of its fresh object to start.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[tiered_storage] fresh_upload_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Returns the shortest time between two uploads of the positions
+     *        that the offset stores of this geo topic's consumer groups wait
+     *        for.
+     * @return Duration the topic sets, zero when such a store answers at its
+     *         local commit, or `std::nullopt` when every node applies its
+     *         `[geo] consumer_offset_upload_interval`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Returns how often a node uploads the changed positions of this
+     *        geo topic's consumer groups.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] positions_publish_interval`, and on a normal
+     *         topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Returns how long the tombstone and the objects of this geo topic
+     *        stay in the object store after it is deleted.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] tombstone_grace`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Returns how long, after a node starts, the group polls of this
+     *        geo topic wait for the positions of the geo peers.
+     * @return Duration the topic sets, zero for no wait, or `std::nullopt`
+     *         when every node applies its `[geo] positions_resume_timeout`, and
+     *         on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Returns the longest wait between two long-term rewrites of a
+     *        partition of this geo topic.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] long_term_rewrite_max_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1818,6 +1973,7 @@ class TopicDetails final {
                  std::uint64_t max_topic_size,
                  ::iggy::TopicType topic_type,
                  std::optional<::iggy::GeoMode> geo_mode,
+                 detail::GeoTopicDurations geo_durations,
                  std::uint64_t messages_count,
                  std::uint32_t partitions_count,
                  std::vector<Partition> partitions,
@@ -1831,6 +1987,7 @@ class TopicDetails final {
           max_topic_size_(max_topic_size),
           topic_type_(topic_type),
           geo_mode_(geo_mode),
+          geo_durations_(geo_durations),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           partitions_(std::move(partitions)),
@@ -1839,6 +1996,8 @@ class TopicDetails final {
     static TopicDetails FromFfi(ffi::TopicDetails topic);
 
     friend class IggyBlockingClient;
+    // The unit tests have no server to read a topic from, so they build one through this class.
+    friend class TopicTestPeer;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -1849,6 +2008,7 @@ class TopicDetails final {
     std::uint64_t max_topic_size_;
     ::iggy::TopicType topic_type_;
     std::optional<::iggy::GeoMode> geo_mode_;
+    detail::GeoTopicDurations geo_durations_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     std::vector<Partition> partitions_;
@@ -3154,8 +3314,10 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
  *
  * Name, MessageExpiry, MaxTopicSize, LocalRetentionAge, and
  * LocalRetentionSize are updatable, and all of them but Name are also
- * resettable. An update can turn TieredStorage on, never off. Every other key
- * is create-only.
+ * resettable. An update can turn TieredStorage on, never off. The durations
+ * from FreshUploadInterval to LongTermRewriteMaxInterval are only on a geo
+ * topic, where an update can set them but not reset them. Every other key is
+ * create-only.
  */
 enum class TopicOptionKey : std::uint8_t {
     Name,
@@ -3176,6 +3338,12 @@ enum class TopicOptionKey : std::uint8_t {
     LocalRetentionSize,
     TopicType,
     GeoMode,
+    FreshUploadInterval,
+    ConsumerOffsetUploadInterval,
+    PositionsPublishInterval,
+    TombstoneGrace,
+    PositionsResumeTimeout,
+    LongTermRewriteMaxInterval,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3216,6 +3384,18 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "topic_type";
         case TopicOptionKey::GeoMode:
             return "geo_mode";
+        case TopicOptionKey::FreshUploadInterval:
+            return "fresh_upload_interval";
+        case TopicOptionKey::ConsumerOffsetUploadInterval:
+            return "consumer_offset_upload_interval";
+        case TopicOptionKey::PositionsPublishInterval:
+            return "positions_publish_interval";
+        case TopicOptionKey::TombstoneGrace:
+            return "tombstone_grace";
+        case TopicOptionKey::PositionsResumeTimeout:
+            return "positions_resume_timeout";
+        case TopicOptionKey::LongTermRewriteMaxInterval:
+            return "long_term_rewrite_max_interval";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3247,6 +3427,12 @@ constexpr std::string_view to_string(const UserOptionKey key) {
  * unset to use the server default. Use SetRawEntries() for supported options
  * that do not yet have a typed setter. When both specify the same option, the
  * typed setting takes precedence.
+ *
+ * The durations from SetFreshUploadInterval() to
+ * SetLongTermRewriteMaxInterval() override the server settings of the same
+ * name on every node. Only a geo topic takes them: the server refuses one on
+ * a normal topic with InvalidOptionValue. Zero is a value, sent as zero, and
+ * an unset duration leaves the node to its own setting.
  */
 class TopicCreateOptions final {
   public:
@@ -3639,6 +3825,149 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns the longest time a send to the geo topic waits for the
+     *        upload of its fresh object to start.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[tiered_storage] fresh_upload_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Sets the longest time a send to the geo topic waits for the
+     *        upload of its fresh object to start.
+     *
+     * One object carries the sends of every partition a shard leads, so a
+     * send also goes with an earlier upload.
+     * @param fresh_upload_interval Duration from zero to 10 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p fresh_upload_interval is negative.
+     */
+    TopicCreateOptions &SetFreshUploadInterval(std::chrono::microseconds fresh_upload_interval) {
+        geo_durations_.fresh_upload_interval = detail::GeoTopicDuration(fresh_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the shortest time between two uploads of the positions
+     *        that the offset stores of the geo topic's consumer groups wait
+     *        for.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] consumer_offset_upload_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Sets the shortest time between two uploads of the positions that
+     *        the offset stores of the geo topic's consumer groups wait for.
+     * @param consumer_offset_upload_interval Duration from zero to 1 s. Zero
+     *        answers such a store at its local commit.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p consumer_offset_upload_interval is
+     *         negative.
+     */
+    TopicCreateOptions &SetConsumerOffsetUploadInterval(std::chrono::microseconds consumer_offset_upload_interval) {
+        geo_durations_.consumer_offset_upload_interval = detail::GeoTopicDuration(consumer_offset_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns how often a node uploads the changed positions of the
+     *        geo topic's consumer groups.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] positions_publish_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Sets how often a node uploads the changed positions of the geo
+     *        topic's consumer groups.
+     * @param positions_publish_interval Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_publish_interval is
+     *         negative.
+     */
+    TopicCreateOptions &SetPositionsPublishInterval(std::chrono::microseconds positions_publish_interval) {
+        geo_durations_.positions_publish_interval = detail::GeoTopicDuration(positions_publish_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long the tombstone and the objects of the geo topic
+     *        stay in the object store after it is deleted.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] tombstone_grace`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Sets how long the tombstone and the objects of the geo topic stay
+     *        in the object store after it is deleted.
+     * @param tombstone_grace Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p tombstone_grace is negative.
+     */
+    TopicCreateOptions &SetTombstoneGrace(std::chrono::microseconds tombstone_grace) {
+        geo_durations_.tombstone_grace = detail::GeoTopicDuration(tombstone_grace);
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long, after a node starts, the group polls of the geo
+     *        topic wait for the positions of the geo peers.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] positions_resume_timeout`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Sets how long, after a node starts, the group polls of the geo
+     *        topic wait for the positions of the geo peers.
+     * @param positions_resume_timeout Duration to wait. Zero does not wait.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_resume_timeout is negative.
+     */
+    TopicCreateOptions &SetPositionsResumeTimeout(std::chrono::microseconds positions_resume_timeout) {
+        geo_durations_.positions_resume_timeout = detail::GeoTopicDuration(positions_resume_timeout);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the longest wait between two long-term rewrites of a
+     *        partition of the geo topic.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] long_term_rewrite_max_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
+     * @brief Sets the longest wait between two long-term rewrites of a
+     *        partition of the geo topic.
+     *
+     * A quiet partition waits the longest, so its shadow topics in other
+     * datacenters are about this far behind.
+     * @param long_term_rewrite_max_interval Duration of at least 1 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p long_term_rewrite_max_interval is
+     *         negative.
+     */
+    TopicCreateOptions &SetLongTermRewriteMaxInterval(std::chrono::microseconds long_term_rewrite_max_interval) {
+        geo_durations_.long_term_rewrite_max_interval = detail::GeoTopicDuration(long_term_rewrite_max_interval);
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3696,6 +4025,7 @@ class TopicCreateOptions final {
     std::optional<::iggy::MaxTopicSize> local_retention_size_;
     std::optional<::iggy::TopicType> topic_type_;
     std::optional<::iggy::GeoMode> geo_mode_;
+    detail::GeoTopicDurations geo_durations_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -3714,6 +4044,13 @@ class TopicCreateOptions final {
  * other supported mutable settings. When both configure the same setting, the
  * typed setting takes precedence. An update must change at least one setting,
  * and must not both set and reset the same one.
+ *
+ * The durations from SetFreshUploadInterval() to
+ * SetLongTermRewriteMaxInterval() are the only settings an update can change
+ * on a geo topic. They have no default, so none of them can be reset: the
+ * server refuses one on a normal topic with InvalidOptionValue, and
+ * UpdateTopic() refuses a Reset() of one before sending with
+ * OptionNotResettable. Zero is a value, sent as zero.
  */
 class TopicUpdateOptions final {
   public:
@@ -3859,6 +4196,137 @@ class TopicUpdateOptions final {
     }
 
     /**
+     * @brief Returns the requested fresh upload interval of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Sets the longest time a send to the geo topic waits for the
+     *        upload of its fresh object to start.
+     * @param fresh_upload_interval Duration from zero to 10 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p fresh_upload_interval is negative.
+     */
+    TopicUpdateOptions &SetFreshUploadInterval(std::chrono::microseconds fresh_upload_interval) {
+        geo_durations_.fresh_upload_interval = detail::GeoTopicDuration(fresh_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested consumer offset upload interval of a geo
+     *        topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Sets the shortest time between two uploads of the positions that
+     *        the offset stores of the geo topic's consumer groups wait for.
+     * @param consumer_offset_upload_interval Duration from zero to 1 s. Zero
+     *        answers such a store at its local commit.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p consumer_offset_upload_interval is
+     *         negative.
+     */
+    TopicUpdateOptions &SetConsumerOffsetUploadInterval(std::chrono::microseconds consumer_offset_upload_interval) {
+        geo_durations_.consumer_offset_upload_interval = detail::GeoTopicDuration(consumer_offset_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested positions publish interval of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Sets how often a node uploads the changed positions of the geo
+     *        topic's consumer groups.
+     * @param positions_publish_interval Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_publish_interval is
+     *         negative.
+     */
+    TopicUpdateOptions &SetPositionsPublishInterval(std::chrono::microseconds positions_publish_interval) {
+        geo_durations_.positions_publish_interval = detail::GeoTopicDuration(positions_publish_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested tombstone grace of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Sets how long the tombstone and the objects of the geo topic stay
+     *        in the object store after it is deleted.
+     * @param tombstone_grace Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p tombstone_grace is negative.
+     */
+    TopicUpdateOptions &SetTombstoneGrace(std::chrono::microseconds tombstone_grace) {
+        geo_durations_.tombstone_grace = detail::GeoTopicDuration(tombstone_grace);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested positions resume timeout of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Sets how long, after a node starts, the group polls of the geo
+     *        topic wait for the positions of the geo peers.
+     * @param positions_resume_timeout Duration to wait. Zero does not wait.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_resume_timeout is negative.
+     */
+    TopicUpdateOptions &SetPositionsResumeTimeout(std::chrono::microseconds positions_resume_timeout) {
+        geo_durations_.positions_resume_timeout = detail::GeoTopicDuration(positions_resume_timeout);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested long-term rewrite interval of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
+     * @brief Sets the longest wait between two long-term rewrites of a
+     *        partition of the geo topic.
+     * @param long_term_rewrite_max_interval Duration of at least 1 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p long_term_rewrite_max_interval is
+     *         negative.
+     */
+    TopicUpdateOptions &SetLongTermRewriteMaxInterval(std::chrono::microseconds long_term_rewrite_max_interval) {
+        geo_durations_.long_term_rewrite_max_interval = detail::GeoTopicDuration(long_term_rewrite_max_interval);
+        return *this;
+    }
+
+    /**
      * @brief Returns additional mutable topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3941,6 +4409,7 @@ class TopicUpdateOptions final {
     std::optional<bool> tiered_storage_;
     std::optional<::iggy::Expiry> local_retention_age_;
     std::optional<::iggy::MaxTopicSize> local_retention_size_;
+    detail::GeoTopicDurations geo_durations_;
     std::map<std::string, std::string> raw_;
     std::set<TopicOptionKey> reset_;
     std::set<std::string> raw_reset_;

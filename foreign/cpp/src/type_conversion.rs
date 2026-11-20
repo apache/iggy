@@ -27,7 +27,8 @@ use iggy::prelude::{
     AutoCommit as RustAutoCommit, CommitAfter as RustCommitAfter, CommitEvery as RustCommitEvery,
     CommitPolicy as RustCommitPolicy, CompressionAlgorithm as RustCompressionAlgorithm,
     ConsumerGroupDetails as RustConsumerGroupDetails, Durability as RustDurability,
-    GeoMode as RustGeoMode, IdKind, Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
+    GeoMode as RustGeoMode, GeoTopicDurations as RustGeoTopicDurations, IdKind,
+    Identifier as RustIdentifier, IggyByteSize as RustIggyByteSize,
     IggyDuration as RustIggyDuration, IggyExpiry as RustIggyExpiry, IggyMessage as RustIggyMessage,
     MaxTopicSize as RustMaxTopicSize, NonZeroIggyDuration as RustNonZeroIggyDuration, OptionKey,
     OptionSpec as RustOptionSpec, Partition as RustPartition,
@@ -819,6 +820,7 @@ impl TryFrom<ffi::TopicCreateOptions> for RustTopicCreateOptions {
             local_retention_size,
             topic_type,
             geo_mode,
+            geo_durations: options.geo_durations.into(),
             raw,
         })
     }
@@ -865,6 +867,7 @@ impl TryFrom<ffi::TopicUpdateOptions> for RustTopicUpdateOptions {
             tiered_storage: options.has_tiered_storage.then_some(options.tiered_storage),
             local_retention_age,
             local_retention_size,
+            geo_durations: options.geo_durations.into(),
             reset: ffi_reset_keys(options.reset)?,
             raw_reset: options.raw_reset.into_iter().collect(),
             raw: ffi_options_to_raw(options.raw_options)?,
@@ -937,6 +940,65 @@ impl From<RustGeoMode> for ffi::GeoMode {
     }
 }
 
+impl From<ffi::GeoTopicDurations> for RustGeoTopicDurations {
+    fn from(durations: ffi::GeoTopicDurations) -> Self {
+        let duration =
+            |has_value: bool, micros: u64| has_value.then(|| RustIggyDuration::from(micros));
+        RustGeoTopicDurations {
+            fresh_upload_interval: duration(
+                durations.has_fresh_upload_interval,
+                durations.fresh_upload_interval_micros,
+            ),
+            consumer_offset_upload_interval: duration(
+                durations.has_consumer_offset_upload_interval,
+                durations.consumer_offset_upload_interval_micros,
+            ),
+            positions_publish_interval: duration(
+                durations.has_positions_publish_interval,
+                durations.positions_publish_interval_micros,
+            ),
+            tombstone_grace: duration(
+                durations.has_tombstone_grace,
+                durations.tombstone_grace_micros,
+            ),
+            positions_resume_timeout: duration(
+                durations.has_positions_resume_timeout,
+                durations.positions_resume_timeout_micros,
+            ),
+            long_term_rewrite_max_interval: duration(
+                durations.has_long_term_rewrite_max_interval,
+                durations.long_term_rewrite_max_interval_micros,
+            ),
+        }
+    }
+}
+
+impl From<RustGeoTopicDurations> for ffi::GeoTopicDurations {
+    fn from(durations: RustGeoTopicDurations) -> Self {
+        let micros = |duration: Option<RustIggyDuration>| {
+            duration.map_or(0, |duration| duration.as_micros())
+        };
+        ffi::GeoTopicDurations {
+            has_fresh_upload_interval: durations.fresh_upload_interval.is_some(),
+            fresh_upload_interval_micros: micros(durations.fresh_upload_interval),
+            has_consumer_offset_upload_interval: durations
+                .consumer_offset_upload_interval
+                .is_some(),
+            consumer_offset_upload_interval_micros: micros(
+                durations.consumer_offset_upload_interval,
+            ),
+            has_positions_publish_interval: durations.positions_publish_interval.is_some(),
+            positions_publish_interval_micros: micros(durations.positions_publish_interval),
+            has_tombstone_grace: durations.tombstone_grace.is_some(),
+            tombstone_grace_micros: micros(durations.tombstone_grace),
+            has_positions_resume_timeout: durations.positions_resume_timeout.is_some(),
+            positions_resume_timeout_micros: micros(durations.positions_resume_timeout),
+            has_long_term_rewrite_max_interval: durations.long_term_rewrite_max_interval.is_some(),
+            long_term_rewrite_max_interval_micros: micros(durations.long_term_rewrite_max_interval),
+        }
+    }
+}
+
 impl From<RustTopic> for ffi::Topic {
     fn from(topic: RustTopic) -> Self {
         let resolved = topic.resolved_options();
@@ -951,6 +1013,7 @@ impl From<RustTopic> for ffi::Topic {
             topic_type: resolved.topic_type.into(),
             has_geo_mode: resolved.geo_mode.is_some(),
             geo_mode: resolved.geo_mode.unwrap_or_default().into(),
+            geo_durations: resolved.geo_durations.into(),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             options: resource_options_to_ffi(&topic.options, true),
@@ -973,6 +1036,7 @@ impl From<RustTopicDetails> for ffi::TopicDetails {
             topic_type: resolved.topic_type.into(),
             has_geo_mode: resolved.geo_mode.is_some(),
             geo_mode: resolved.geo_mode.unwrap_or_default().into(),
+            geo_durations: resolved.geo_durations.into(),
             messages_count: topic.messages_count,
             partitions_count: topic.partitions_count,
             partitions: topic
@@ -2080,11 +2144,17 @@ mod tests {
         Checkpoint as RustCheckpoint, HeaderKey, HeaderValue, IggyTimestamp, OptionValue,
         ResourceOptions,
     };
-    use iggy_binary_protocol::WireDecode;
+    use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+    use iggy_binary_protocol::requests::topics::CreateTopicRequest;
     use iggy_binary_protocol::responses::streams::GetStreamResponse;
     use iggy_binary_protocol::responses::topics::GetTopicResponse;
-    use iggy_common::ReaderStamp as RustReaderStamp;
-    use serde_json::Value;
+    use iggy_binary_protocol::{WireDecode, WireEncode, WireName};
+    use iggy_common::create_topic::CreateTopic;
+    use iggy_common::wire_conversions::{identifier_to_wire, resource_options_from_wire};
+    use iggy_common::{
+        DEFAULT_PARTITIONS_COUNT, OptionInputMap, OptionInputValue, ReaderStamp as RustReaderStamp,
+    };
+    use serde_json::{Map, Value};
 
     const RESOURCE_OPTIONS_FIXTURE: &str = include_str!("../tests/fixtures/resource_options.json");
 
@@ -2173,6 +2243,10 @@ mod tests {
             local_retention_age_value: 5,
             has_local_retention_size: false,
             local_retention_size: "unlimited".to_owned(),
+            geo_durations: ffi::GeoTopicDurations {
+                fresh_upload_interval_micros: 5,
+                ..ffi::GeoTopicDurations::default()
+            },
             reset: vec!["max_topic_size".to_owned()],
             raw_reset: Vec::new(),
             raw_options: Vec::new(),
@@ -2259,6 +2333,7 @@ mod tests {
             local_retention_age_value: 0,
             has_local_retention_size: false,
             local_retention_size: String::new(),
+            geo_durations: ffi::GeoTopicDurations::default(),
             reset: vec!["max_topic_size".to_owned()],
             raw_reset: vec!["future_key".to_owned()],
             raw_options: Vec::new(),
@@ -2291,6 +2366,7 @@ mod tests {
             local_retention_age_value: 1_800_000_000,
             has_local_retention_size: true,
             local_retention_size: size.to_owned(),
+            geo_durations: ffi::GeoTopicDurations::default(),
             reset: Vec::new(),
             raw_reset: Vec::new(),
             raw_options: Vec::new(),
@@ -2419,35 +2495,47 @@ mod tests {
     }
 
     #[test]
-    fn given_topic_response_vectors_when_bridging_should_report_a_normal_topic_without_geo_mode() {
+    fn given_topic_response_vectors_when_bridging_should_match_type_mode_and_geo_durations() {
+        let mut geo_topics = 0;
         for vector in fixture_vectors("topic_responses") {
+            let case = &vector["case"];
             let bytes = decode_hex(&vector["response_hex"]);
             let (response, _) = GetTopicResponse::decode(&bytes).expect("topic decodes");
             let details = RustTopicDetails::try_from(response).expect("topic converts");
             let topic = ffi::TopicDetails::from(details);
+            let expected = &vector["expected"];
+            let geo = expected["options"]["topic_type"]["value"].as_str() == Some("geo");
 
-            assert_eq!(
-                vector["expected"]["options"]["topic_type"]["value"].as_str(),
-                Some("normal")
-            );
-            assert!(topic.topic_type == ffi::TopicType::Normal);
-            assert!(!topic.has_geo_mode);
+            let topic_type = if geo {
+                ffi::TopicType::Geo
+            } else {
+                ffi::TopicType::Normal
+            };
+            assert!(topic.topic_type == topic_type, "{case}");
+            assert_eq!(topic.has_geo_mode, geo, "{case}");
+            for (key, micros) in bridged_geo_durations(&topic.geo_durations) {
+                assert_eq!(micros, decimal(&expected[key]), "{case} {key}");
+            }
+            geo_topics += usize::from(geo);
         }
+        assert_eq!(geo_topics, 1, "one response vector reads a geo topic");
     }
 
     #[test]
     fn given_geo_topic_options_when_bridging_should_carry_topic_type_and_geo_mode() {
         let geo_tiered: ResourceOptions = [
-            (OptionKey::TopicType, RustTopicType::Geo.as_ref()),
-            (OptionKey::GeoMode, RustGeoMode::GeoTiered.as_ref()),
+            (
+                OptionKey::TopicType,
+                HeaderValue::from_str(RustTopicType::Geo.as_ref()).expect("type"),
+            ),
+            (
+                OptionKey::GeoMode,
+                HeaderValue::from_str(RustGeoMode::GeoTiered.as_ref()).expect("mode"),
+            ),
+            (OptionKey::PositionsResumeTimeout, HeaderValue::from(0u64)),
         ]
         .into_iter()
-        .map(|(key, value)| {
-            (
-                HeaderKey::from(key),
-                OptionValue::explicit(HeaderValue::from_str(value).expect("value")),
-            )
-        })
+        .map(|(key, value)| (HeaderKey::from(key), OptionValue::explicit(value)))
         .collect();
         let topic = ffi::Topic::from(RustTopic {
             id: 1,
@@ -2468,13 +2556,363 @@ mod tests {
             partitions: Vec::new(),
             options: geo_tiered,
         });
+        let zero_resume_timeout = ffi::GeoTopicDurations {
+            has_positions_resume_timeout: true,
+            ..ffi::GeoTopicDurations::default()
+        };
 
         assert!(topic.topic_type == ffi::TopicType::Geo);
         assert!(topic.has_geo_mode);
         assert!(topic.geo_mode == ffi::GeoMode::GeoTiered);
+        assert_eq!(topic.geo_durations, zero_resume_timeout);
         assert!(details.topic_type == ffi::TopicType::Geo);
         assert!(details.has_geo_mode);
         assert!(details.geo_mode == ffi::GeoMode::GeoTiered);
+        assert_eq!(details.geo_durations, zero_resume_timeout);
+    }
+
+    #[test]
+    fn given_create_topic_vectors_when_bridging_typed_options_should_match_wire_bytes_and_http_body()
+     {
+        for vector in fixture_vectors("create_topic") {
+            let case = &vector["case"];
+            let input = &vector["input"];
+            let options = RustTopicCreateOptions::try_from(bridged_create_options(input))
+                .expect("options convert");
+            let stream_id = fixture_identifier(&input["stream_id"]);
+            let name = input["name"].as_str().expect("name");
+            let partitions_count = options.partitions_count.unwrap_or(DEFAULT_PARTITIONS_COUNT);
+
+            let request = CreateTopicRequest {
+                stream_id: identifier_to_wire(&stream_id).expect("stream id encodes"),
+                partitions_count,
+                name: WireName::new(name).expect("name encodes"),
+                options: options.to_wire().expect("options encode"),
+            };
+            assert_eq!(
+                request.to_bytes().as_ref(),
+                decode_hex(&vector["body_hex"]).as_slice(),
+                "{case}"
+            );
+            let posted = serde_json::to_string(&CreateTopic {
+                stream_id,
+                partitions_count,
+                name: name.to_owned(),
+                options: OptionInputMap(options.to_input_map().expect("HTTP options encode")),
+            })
+            .expect("HTTP body encodes");
+            assert_eq!(
+                Some(posted.as_str()),
+                vector["http_body"].as_str(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_update_vectors_when_bridging_typed_options_should_match_wire_bytes() {
+        let vectors = fixture_vectors("update_resource");
+        let topic_vectors: Vec<&Value> = vectors
+            .iter()
+            .filter(|vector| vector["scope"] == "topic")
+            .collect();
+        assert!(
+            topic_vectors
+                .iter()
+                .any(|vector| vector["case"] == "topic_set_geo_durations")
+        );
+        for vector in topic_vectors {
+            let case = &vector["case"];
+            let target = &vector["target"];
+            let options =
+                RustTopicUpdateOptions::try_from(bridged_update_options(&vector["input"]))
+                    .expect("options convert");
+            let patch = options.to_patch().expect("patch encodes");
+
+            let request = UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: identifier_to_wire(&fixture_identifier(&target["stream_id"]))
+                        .expect("stream id encodes"),
+                    topic_id: identifier_to_wire(&fixture_identifier(&target["topic_id"]))
+                        .expect("topic id encodes"),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            };
+            assert_eq!(
+                request.to_bytes().as_ref(),
+                decode_hex(&vector["body_hex"]).as_slice(),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_geo_durations_update_when_bridging_should_put_them_as_numbers_over_http() {
+        let vector = fixture_vectors("update_resource")
+            .into_iter()
+            .find(|vector| vector["case"] == "topic_set_geo_durations")
+            .expect("geo durations vector");
+        let input = vector["input"].as_object().expect("update input");
+        let options = RustTopicUpdateOptions::try_from(bridged_update_options(&vector["input"]))
+            .expect("options convert");
+
+        let body = serde_json::to_value(options.to_update_body().expect("HTTP body encodes"))
+            .expect("HTTP body serializes");
+        let numbers: Map<String, Value> = input
+            .iter()
+            .map(|(key, micros)| (key.clone(), Value::from(decimal(micros).expect("micros"))))
+            .collect();
+        assert_eq!(body, Value::Object(numbers));
+    }
+
+    #[test]
+    fn given_zero_and_unset_geo_durations_when_bridging_should_send_zero_and_omit_unset() {
+        let durations = ffi::GeoTopicDurations {
+            has_positions_resume_timeout: true,
+            positions_resume_timeout_micros: 0,
+            // Without its flag, a value beside it is not a setting.
+            tombstone_grace_micros: 3_600_000_000,
+            ..ffi::GeoTopicDurations::default()
+        };
+        let create = RustTopicCreateOptions::try_from(ffi::TopicCreateOptions {
+            has_topic_type: true,
+            topic_type: "geo".to_owned(),
+            geo_durations: durations,
+            ..ffi::TopicCreateOptions::default()
+        })
+        .expect("create options convert");
+        let update = RustTopicUpdateOptions::try_from(ffi::TopicUpdateOptions {
+            geo_durations: durations,
+            ..ffi::TopicUpdateOptions::default()
+        })
+        .expect("update options convert");
+        let zero_resume_timeout = RustGeoTopicDurations {
+            positions_resume_timeout: Some(RustIggyDuration::from(0u64)),
+            ..RustGeoTopicDurations::default()
+        };
+        assert_eq!(create.geo_durations, zero_resume_timeout);
+        assert_eq!(update.geo_durations, zero_resume_timeout);
+
+        let created = create.to_wire().expect("create encodes");
+        let patched = update.to_patch().expect("update encodes").set;
+        for sent in [&created, &patched] {
+            let sent = resource_options_from_wire(sent, true).expect("options decode");
+            for key in RustGeoTopicDurations::KEYS {
+                let value = sent
+                    .get(&HeaderKey::from(key))
+                    .map(|option| option.value.as_uint64().expect("micros"));
+                let expected = (key == OptionKey::PositionsResumeTimeout).then_some(0);
+                assert_eq!(value, expected, "{key}");
+            }
+        }
+        let posted = create.to_input_map().expect("HTTP options encode");
+        assert!(matches!(
+            posted.get("positions_resume_timeout"),
+            Some(OptionInputValue::U64(0))
+        ));
+        assert!(!posted.contains_key("tombstone_grace"));
+    }
+
+    #[test]
+    fn given_bridged_geo_durations_when_naming_them_should_follow_catalog_order() {
+        let names = bridged_geo_durations(&ffi::GeoTopicDurations::default()).map(|(key, _)| key);
+        let catalog = RustGeoTopicDurations::KEYS.map(|key| key.to_string());
+
+        assert_eq!(names.as_slice(), catalog.as_slice());
+    }
+
+    /// Each duration the bridge carries, by its catalog key: the value only
+    /// when its flag says the topic sets it.
+    fn bridged_geo_durations(
+        durations: &ffi::GeoTopicDurations,
+    ) -> [(&'static str, Option<u64>); 6] {
+        [
+            (
+                "fresh_upload_interval",
+                durations
+                    .has_fresh_upload_interval
+                    .then_some(durations.fresh_upload_interval_micros),
+            ),
+            (
+                "consumer_offset_upload_interval",
+                durations
+                    .has_consumer_offset_upload_interval
+                    .then_some(durations.consumer_offset_upload_interval_micros),
+            ),
+            (
+                "positions_publish_interval",
+                durations
+                    .has_positions_publish_interval
+                    .then_some(durations.positions_publish_interval_micros),
+            ),
+            (
+                "tombstone_grace",
+                durations
+                    .has_tombstone_grace
+                    .then_some(durations.tombstone_grace_micros),
+            ),
+            (
+                "positions_resume_timeout",
+                durations
+                    .has_positions_resume_timeout
+                    .then_some(durations.positions_resume_timeout_micros),
+            ),
+            (
+                "long_term_rewrite_max_interval",
+                durations
+                    .has_long_term_rewrite_max_interval
+                    .then_some(durations.long_term_rewrite_max_interval_micros),
+            ),
+        ]
+    }
+
+    /// Set the duration that `key` names, as its C++ setter does. False when
+    /// `key` names no duration.
+    fn set_geo_duration(durations: &mut ffi::GeoTopicDurations, key: &str, micros: u64) -> bool {
+        let (has_value, value) = match key {
+            "fresh_upload_interval" => (
+                &mut durations.has_fresh_upload_interval,
+                &mut durations.fresh_upload_interval_micros,
+            ),
+            "consumer_offset_upload_interval" => (
+                &mut durations.has_consumer_offset_upload_interval,
+                &mut durations.consumer_offset_upload_interval_micros,
+            ),
+            "positions_publish_interval" => (
+                &mut durations.has_positions_publish_interval,
+                &mut durations.positions_publish_interval_micros,
+            ),
+            "tombstone_grace" => (
+                &mut durations.has_tombstone_grace,
+                &mut durations.tombstone_grace_micros,
+            ),
+            "positions_resume_timeout" => (
+                &mut durations.has_positions_resume_timeout,
+                &mut durations.positions_resume_timeout_micros,
+            ),
+            "long_term_rewrite_max_interval" => (
+                &mut durations.has_long_term_rewrite_max_interval,
+                &mut durations.long_term_rewrite_max_interval_micros,
+            ),
+            _ => return false,
+        };
+        *has_value = true;
+        *value = micros;
+        true
+    }
+
+    /// The bridge options that `IggyBlockingClient::CreateTopic` sends for
+    /// the typed C++ options a fixture input names.
+    fn bridged_create_options(input: &Value) -> ffi::TopicCreateOptions {
+        let mut options = ffi::TopicCreateOptions::default();
+        for (key, value) in input.as_object().expect("create input") {
+            let text = || value.as_str().expect("text input").to_owned();
+            match key.as_str() {
+                "stream_id" | "name" => {}
+                "partitions_count" => {
+                    options.has_partitions_count = true;
+                    options.partitions_count =
+                        u32::try_from(value.as_u64().expect("count")).expect("count fits");
+                }
+                "compression_algorithm" => {
+                    options.has_compression_algorithm = true;
+                    options.compression_algorithm = text();
+                }
+                "message_expiry" => {
+                    options.has_message_expiry = true;
+                    options.message_expiry_kind = "duration".to_owned();
+                    options.message_expiry_value = decimal(value).expect("expiry");
+                }
+                "max_topic_size" => {
+                    options.has_max_topic_size = true;
+                    options.max_topic_size = text();
+                }
+                "segment_size" => {
+                    options.has_segment_size = true;
+                    options.segment_size = decimal(value).expect("segment size");
+                }
+                "durability" => {
+                    options.has_durability = true;
+                    options.durability = text();
+                }
+                "consumer_offset_durability" => {
+                    options.has_consumer_offset_durability = true;
+                    options.consumer_offset_durability = text();
+                }
+                "topic_type" => {
+                    options.has_topic_type = true;
+                    options.topic_type = text();
+                }
+                key => assert!(
+                    set_geo_duration(
+                        &mut options.geo_durations,
+                        key,
+                        decimal(value).expect("micros")
+                    ),
+                    "unmapped create input {key}"
+                ),
+            }
+        }
+        options
+    }
+
+    /// The bridge options that `IggyBlockingClient::UpdateTopic` sends for
+    /// the typed C++ options a fixture input names.
+    fn bridged_update_options(input: &Value) -> ffi::TopicUpdateOptions {
+        let mut options = ffi::TopicUpdateOptions::default();
+        for (key, value) in input.as_object().expect("update input") {
+            match key.as_str() {
+                "name" => {
+                    options.has_name = true;
+                    options.name = value.as_str().expect("name").to_owned();
+                }
+                "message_expiry" => {
+                    options.has_message_expiry = true;
+                    options.message_expiry_kind = "duration".to_owned();
+                    options.message_expiry_value = decimal(value).expect("expiry");
+                }
+                "max_topic_size" => {
+                    options.has_max_topic_size = true;
+                    options.max_topic_size = value.as_str().expect("size").to_owned();
+                }
+                "reset" => {
+                    options.reset = value
+                        .as_array()
+                        .expect("reset names")
+                        .iter()
+                        .map(|name| name.as_str().expect("reset name").to_owned())
+                        .collect();
+                }
+                key => assert!(
+                    set_geo_duration(
+                        &mut options.geo_durations,
+                        key,
+                        decimal(value).expect("micros")
+                    ),
+                    "unmapped update input {key}"
+                ),
+            }
+        }
+        options
+    }
+
+    /// A numeric fixture identifier as `Identifier::Numeric`, a text one as
+    /// `Identifier::String`.
+    fn fixture_identifier(value: &Value) -> RustIdentifier {
+        match value.as_u64() {
+            Some(id) => RustIdentifier::numeric(u32::try_from(id).expect("id fits"))
+                .expect("numeric identifier"),
+            None => RustIdentifier::named(value.as_str().expect("identifier text"))
+                .expect("named identifier"),
+        }
+    }
+
+    /// A decimal string of the fixture, `None` when the key is absent.
+    fn decimal(value: &Value) -> Option<u64> {
+        value
+            .as_str()
+            .map(|text| text.parse().expect("decimal string"))
     }
 
     fn fixture_vectors(section: &str) -> Vec<Value> {

@@ -207,13 +207,22 @@ struct ResourceOptionsTests {
             #expect(try Requests.createStream(name: vector.input.name, options: options.encode()) == [UInt8](hex: vector.bodyHex), "\(vector.name)")
         }
         for vector in fixture.createTopic {
+            // A knob the input leaves out stays nil, for the server to resolve.
             let input = vector.input
+            let messageExpiry = try input.messageExpiry.map { IggyExpiry(wireMicroseconds: try #require(UInt64($0))) }
+            let maxTopicSize = try input.maxTopicSize.map { MaxTopicSize(wireValue: try #require(UInt64($0))) }
+            let segmentSizeBytes = try input.segmentSize.map { try #require(UInt64($0)) }
+            let topicType = try input.topicType.map { try #require(TopicType(rawValue: $0)) }
             let options = TopicCreateOptions(
-                partitionsCount: input.partitionsCount, compressionAlgorithm: CompressionAlgorithm(name: input.compressionAlgorithm),
-                messageExpiry: IggyExpiry(wireMicroseconds: try #require(UInt64(input.messageExpiry))),
-                maxTopicSize: MaxTopicSize(wireValue: try #require(UInt64(input.maxTopicSize))), segmentSizeBytes: UInt64(input.segmentSize),
+                partitionsCount: input.partitionsCount, compressionAlgorithm: input.compressionAlgorithm.flatMap(CompressionAlgorithm.init(name:)),
+                messageExpiry: messageExpiry, maxTopicSize: maxTopicSize, segmentSizeBytes: segmentSizeBytes,
                 durability: try #require(Durability(rawValue: input.durability)),
-                consumerOffsetDurability: try #require(Durability(rawValue: input.consumerOffsetDurability)))
+                consumerOffsetDurability: try #require(Durability(rawValue: input.consumerOffsetDurability)), topicType: topicType,
+                freshUploadInterval: try duration(input.freshUploadInterval),
+                consumerOffsetUploadInterval: try duration(input.consumerOffsetUploadInterval),
+                positionsPublishInterval: try duration(input.positionsPublishInterval), tombstoneGrace: try duration(input.tombstoneGrace),
+                positionsResumeTimeout: try duration(input.positionsResumeTimeout),
+                longTermRewriteMaxInterval: try duration(input.longTermRewriteMaxInterval))
             let body = try Requests.createTopic(
                 streamID: identifier(input.streamID), partitionsCount: input.partitionsCount, name: input.name, options: options.encode())
             #expect(body == [UInt8](hex: vector.bodyHex), "\(vector.name)")
@@ -271,8 +280,15 @@ struct ResourceOptionsTests {
             #expect(String(topic.localRetentionSize.wireValue) == expected.options["local_retention_size"]?.value)
             #expect(topic.topicType.rawValue == expected.options["topic_type"]?.value)
             #expect(topic.geoMode?.rawValue == expected.options["geo_mode"]?.value)
+            #expect(microseconds(topic.freshUploadInterval) == expected.freshUploadInterval, "\(vector.name)")
+            #expect(microseconds(topic.consumerOffsetUploadInterval) == expected.consumerOffsetUploadInterval, "\(vector.name)")
+            #expect(microseconds(topic.positionsPublishInterval) == expected.positionsPublishInterval, "\(vector.name)")
+            #expect(microseconds(topic.tombstoneGrace) == expected.tombstoneGrace, "\(vector.name)")
+            #expect(microseconds(topic.positionsResumeTimeout) == expected.positionsResumeTimeout, "\(vector.name)")
+            #expect(microseconds(topic.longTermRewriteMaxInterval) == expected.longTermRewriteMaxInterval, "\(vector.name)")
             #expect(neverReturned.isDisjoint(with: topic.options.keys))
         }
+        #expect(fixture.topicResponses.contains { $0.expected.consumerOffsetUploadInterval == "0" }, "no topic vector sets a zero duration")
         for vector in fixture.userResponses {
             let user = try Responses.userDetails([UInt8](hex: vector.responseHex)[...])
             let expected = vector.expected
@@ -311,7 +327,9 @@ struct ResourceOptionsTests {
             partitionsCount: 3, compressionAlgorithm: .gzip, messageExpiry: .never, maxTopicSize: .bytes(1 << 30), segmentSizeBytes: 1 << 20,
             durability: .persisted, consumerOffsetDurability: .persisted, partitionResizePolicy: .fixed, messagesRequiredToSave: 10,
             sizeOfMessagesRequiredToSaveBytes: 1 << 10, preallocateSegments: true, replicationFactor: 3, segmentMaxAge: .after(.seconds(3_600)),
-            tieredStorage: false, localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(1 << 29), topicType: .geo, geoMode: .geoTiered)
+            tieredStorage: false, localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(1 << 29), topicType: .geo, geoMode: .geoTiered,
+            freshUploadInterval: .milliseconds(50), consumerOffsetUploadInterval: .zero, positionsPublishInterval: .seconds(2),
+            tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .zero, longTermRewriteMaxInterval: .seconds(20))
         #expect(unsetFields(streamCreate, except: ["raw"]).isEmpty)
         #expect(unsetFields(topicCreate, except: ["raw"]).isEmpty)
         #expect(Set(try streamCreate.toResourceOptions().keys) == creatable("stream"))
@@ -321,7 +339,8 @@ struct ResourceOptionsTests {
         let streamUpdate = StreamUpdateOptions(name: "renamed")
         let topicUpdate = TopicUpdateOptions(
             name: "renamed", messageExpiry: .never, maxTopicSize: .bytes(1 << 30), tieredStorage: true, localRetentionAge: .after(.seconds(1_800)),
-            localRetentionSize: .bytes(1 << 29))
+            localRetentionSize: .bytes(1 << 29), freshUploadInterval: .milliseconds(50), consumerOffsetUploadInterval: .zero,
+            positionsPublishInterval: .seconds(2), tombstoneGrace: .seconds(3_600), positionsResumeTimeout: .zero, longTermRewriteMaxInterval: .seconds(20))
         let userUpdate = UserUpdateOptions(username: "renamed", status: .inactive)
         let untyped: Set<String> = ["reset", "raw", "rawReset"]
         #expect(unsetFields(streamUpdate, except: untyped).isEmpty)
@@ -507,6 +526,31 @@ struct ResourceOptionsTests {
         #expect(unreported.geoMode == nil)
     }
 
+    /// A geo topic reports the durations it sets, zero included, and nil for
+    /// the others. A normal topic has none, even when some are stored.
+    @Test func givenGeoTopicWhenDecodingShouldProjectItsDurations() throws {
+        let durations =
+            optionEntry("consumer_offset_upload_interval", kind: HeaderKind.uint64.rawValue, value: UInt64(0).littleEndianBytes)
+            + optionEntry("tombstone_grace", kind: HeaderKind.uint64.rawValue, value: UInt64(3_600_000_000).littleEndianBytes)
+        let geoType = optionEntry("topic_type", kind: HeaderKind.string.rawValue, value: Array("geo".utf8))
+        let details = try Responses.topicDetails(topicResponse(explicit: durations + geoType, derived: [])[...])
+        #expect(details.consumerOffsetUploadInterval == Duration.zero)
+        #expect(details.tombstoneGrace == Duration.seconds(3_600))
+        #expect(details.freshUploadInterval == nil)
+        #expect(details.positionsPublishInterval == nil)
+        #expect(details.positionsResumeTimeout == nil)
+        #expect(details.longTermRewriteMaxInterval == nil)
+        var listReader = ByteReader(try topicResponse(explicit: durations + geoType, derived: []))
+        let listed = try Responses.topic(from: &listReader)
+        #expect(listed.consumerOffsetUploadInterval == Duration.zero)
+        #expect(listed.tombstoneGrace == Duration.seconds(3_600))
+
+        let normalType = optionEntry("topic_type", kind: HeaderKind.string.rawValue, value: Array("normal".utf8))
+        let normal = try Responses.topicDetails(topicResponse(explicit: durations + normalType, derived: [])[...])
+        #expect(normal.consumerOffsetUploadInterval == nil)
+        #expect(normal.tombstoneGrace == nil)
+    }
+
     // MARK: Helpers
 
     func fakeServerClient(_ server: FakeVSRServer) -> IggyClient {
@@ -540,7 +584,20 @@ struct ResourceOptionsTests {
         TopicUpdateOptions(
             name: input.name, messageExpiry: try input.messageExpiry.map { IggyExpiry(wireMicroseconds: try #require(UInt64($0))) },
             maxTopicSize: try input.maxTopicSize.map { MaxTopicSize(wireValue: try #require(UInt64($0))) },
+            freshUploadInterval: try duration(input.freshUploadInterval), consumerOffsetUploadInterval: try duration(input.consumerOffsetUploadInterval),
+            positionsPublishInterval: try duration(input.positionsPublishInterval), tombstoneGrace: try duration(input.tombstoneGrace),
+            positionsResumeTimeout: try duration(input.positionsResumeTimeout), longTermRewriteMaxInterval: try duration(input.longTermRewriteMaxInterval),
             reset: Set((input.reset ?? []).compactMap(TopicOptionKey.init(rawValue:))), rawReset: rawResetNames(TopicOptionKey.self, input))
+    }
+
+    /// A duration of a geo topic from the fixture's decimal microseconds.
+    func duration(_ text: String?) throws -> Duration? {
+        try text.map { Duration.microseconds(try #require(Int64($0))) }
+    }
+
+    /// A duration in the fixture's form: decimal microseconds, nil when unset.
+    func microseconds(_ duration: Duration?) -> String? {
+        duration.flatMap { $0.wholeMicroseconds }.map(String.init)
     }
 
     func streamUpdate(_ input: ResourceOptionsFixture.UpdateInput) throws -> StreamUpdateOptions {
