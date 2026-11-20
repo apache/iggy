@@ -147,7 +147,7 @@ pub async fn dispatch_partition_request<B, MJ, S, SB>(
     acting_user_id: Option<u32>,
     consumer_session: Option<(u128, SessionAttachment)>,
     resolved_namespace: Option<u64>,
-    in_flight: Option<InFlight>,
+    mut in_flight: Option<InFlight>,
 ) -> PartitionAdmission
 where
     B: ShellBus,
@@ -170,7 +170,7 @@ where
         header.minimum_metadata_op,
         consumer_session.as_ref().map(|(_, attachment)| attachment),
         in_flight.as_ref().map(|in_flight| &*in_flight.drain),
-        admission_left(),
+        admission_left,
     )
     .await
     {
@@ -273,8 +273,7 @@ where
     // this is an admission courtesy that keeps the steady state off that park
     // buffer, not a correctness gate. See `wait_for_partition_routable`, which
     // spells out why asking the owner there is no readiness gate either.
-    if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace), admission_left())
-        .await
+    if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace), admission_left).await
     {
         // The op never reached the partition plane, so it is safe to re-issue
         // anywhere -- the same contract the plane itself answers for a
@@ -285,6 +284,32 @@ where
             namespace,
             operation = ?header.operation,
             "partition request not routable within budget; replying transient"
+        );
+        send_deny_reply(
+            shard,
+            origin,
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return PartitionAdmission::Denied;
+    }
+    // The drain takes an offset write without its progress lane while this
+    // node has not applied the partition. The waits above let it resolve, and
+    // a read of the offset that the connection sent behind the write must
+    // still wait for it. The key comes from the request as the client sent
+    // it, as the drain keys the frames behind it.
+    if matches!(
+        header.operation,
+        Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+    ) && let Some(in_flight) = in_flight.as_mut()
+        && !in_flight.claim_progress(|| progress_key(shard, request.as_generic()))
+    {
+        warn!(
+            transport_client_id,
+            namespace,
+            operation = ?header.operation,
+            "offset write resolved after the drain took it, behind a request of its lane; replying transient"
         );
         send_deny_reply(
             shard,
@@ -1216,8 +1241,9 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
 /// A newer route can name group membership that this replica has not applied
 /// yet, so a request ahead of the local frontier waits for it, for at most
 /// the partition request budget of the frontier and never longer than
-/// `admission_left`. The wait parks the drain of its connection. The session
-/// can end and admission can close during it, so both are tested again.
+/// `admission_left`, which is asked only when a wait starts. The wait parks
+/// the drain of its connection. The session can end and admission can close
+/// during it, so both are tested again.
 ///
 /// After a wait in vain, `drain` refuses the next requests ahead of the
 /// frontier at once, until the frontier moves, so the frames behind such a
@@ -1236,7 +1262,7 @@ async fn admit_partition_request<B, MJ, S, SB>(
     minimum_metadata_op: u64,
     attachment: Option<&SessionAttachment>,
     drain: Option<&ClientDrain>,
-    admission_left: Duration,
+    admission_left: impl FnOnce() -> Duration,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -1265,6 +1291,7 @@ where
     if expired_at.is_none_or(|expired_at| expired_at.get() != Some(applied)) {
         let reached = frontier.reached(minimum_metadata_op);
         let budget = frontier.partition_request_budget();
+        let admission_left = admission_left();
         if bus_timeout(&shard.bus, budget.min(admission_left), reached)
             .await
             .is_some()
@@ -1314,7 +1341,7 @@ where
 async fn wait_for_partition_routable<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
-    admission_left: Duration,
+    admission_left: impl FnOnce() -> Duration,
 ) -> bool
 where
     B: ShellBus,
@@ -1326,6 +1353,7 @@ where
     if shard.shards_table().shard_for(namespace).is_some() {
         return true;
     }
+    let admission_left = admission_left();
     if admission_left.is_zero() {
         return false;
     }
@@ -4730,7 +4758,7 @@ mod tests {
             LOCAL_FRONTIER + 1,
             Some(&session),
             None,
-            PARTITION_ADMISSION_BUDGET,
+            || PARTITION_ADMISSION_BUDGET,
         ));
         assert!(
             futures::poll!(admission.as_mut()).is_pending(),

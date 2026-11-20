@@ -6718,6 +6718,43 @@ mod tests {
         );
     }
 
+    /// A WAL trim keeps the answer of the peer off the plane, also after its
+    /// end while kept frames remain. The tick counted the session as idle
+    /// meanwhile, asked for the range again and spent its attempts.
+    #[compio::test]
+    async fn given_repair_frames_kept_for_a_wal_trim_when_the_plane_ticks_should_not_count_the_session_as_stalled()
+     {
+        let ServedMetadataRepair { backup, stream, .. } = served_metadata_repair().await;
+        let idle_ticks = || {
+            backup
+                .metadata_repair
+                .borrow()
+                .as_ref()
+                .map(|session| session.idle_ticks)
+        };
+        backup.tick_metadata().await;
+        let counted = idle_ticks().expect("the backup waits for the repair stream");
+        assert!(counted > 0, "a tick without an answer counts as idle");
+
+        let trim = backup.plane.inner().0.announce_checkpoint_trim();
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .now_or_never()
+                .expect("a repair frame must not wait for the WAL trim on the pump");
+        }
+        backup.tick_metadata().await;
+        assert_eq!(idle_ticks(), Some(counted), "the trim is pending");
+
+        drop(trim);
+        backup.tick_metadata().await;
+        assert_eq!(
+            idle_ticks(),
+            Some(counted),
+            "the kept frames have not reached the plane yet"
+        );
+    }
+
     /// The WAL trim of a checkpoint job holds `journal_gate` for a whole
     /// rewrite. A repaired prepare that waited for it on the pump stopped the
     /// ticks of every partition group of shard 0.

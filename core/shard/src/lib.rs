@@ -3497,8 +3497,10 @@ where
     /// # Errors
     /// Returns the first rejection. A target that no shard owns, or an inbox
     /// that refuses the frame, returns `TransientNotAccepted`. An evaluator
-    /// that does not answer its admission within `PARTITION_READ_TIMEOUT`
+    /// that does not answer its admission within `PARTITION_READ_TIMEOUT`,
+    /// or within `admission_wait` when the caller gives a shorter one,
     /// returns `ShardCommunicationError`, unless another target is ready.
+    /// The wait then returns the ready targets of the evaluators that answered.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub async fn wait_for_messages(
         &self,
@@ -3506,6 +3508,7 @@ where
         targets: Vec<ReadinessTarget>,
         wait: std::time::Duration,
         min_count: u32,
+        admission_wait: Option<std::time::Duration>,
     ) -> Result<Vec<ReadyTarget>, IggyError>
     where
         M: StreamsFrontend,
@@ -3515,6 +3518,8 @@ where
             .ok()
             .and_then(|wait| now.checked_add(wait))
             .ok_or(IggyError::InvalidCommand)?;
+        let admission_end = admission_wait
+            .map(|wait| now.saturating_add(u64::try_from(wait.as_micros()).unwrap_or(u64::MAX)));
         // A zero wait asks the owners, so that its answer covers every commit
         // that its client saw acknowledged. A `Next` start needs the stored
         // offset, which only the owner holds.
@@ -3597,12 +3602,16 @@ where
                     Err(_) => break,
                 }
             } else {
-                let mut budget = std::time::Duration::from_micros(
-                    deadline.saturating_sub(self.bus.monotonic_micros()),
-                );
-                // Every admission answer counts, even after a short wait expires.
+                let now = self.bus.monotonic_micros();
+                let until = |end: u64| std::time::Duration::from_micros(end.saturating_sub(now));
+                let mut budget = until(deadline);
+                // Every admission answer counts, even after a short wait
+                // expires, but the caller cannot wait for one past its bound.
                 if !admitting.is_empty() {
                     budget = budget.max(PARTITION_READ_TIMEOUT);
+                    if let Some(end) = admission_end {
+                        budget = budget.min(until(end));
+                    }
                 }
                 match bus_timeout(&self.bus, budget, replies.recv()).await {
                     Some(Ok(reply)) => reply,
@@ -3670,6 +3679,7 @@ where
                 stale,
                 std::time::Duration::ZERO,
                 ANY_MESSAGE,
+                None,
             ));
             if let Some(Ok(owned)) = bus_timeout(&self.bus, budget, owners).await {
                 ready.extend(owned);
@@ -9114,6 +9124,13 @@ where
             );
             *self.metadata_repair.borrow_mut() = None;
             self.note_metadata_repair_walked();
+            return;
+        }
+
+        // The answer of the peer can wait off the plane for a WAL trim. The
+        // session is not stalled then: a count of these ticks would ask for
+        // the same frames again and spend the attempts of the session.
+        if self.metadata_frames_wait_for_trim() {
             return;
         }
 

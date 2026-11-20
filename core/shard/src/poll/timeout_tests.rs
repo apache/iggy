@@ -43,11 +43,11 @@ use super::test_support::{
 };
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    ConsumerOffsetRead, DeferredPollContext, DeferredPollRequest, IggyShard, LifecycleFrame,
-    MAX_HELD_READS, MAX_HELD_READS_PER_NAMESPACE, OffsetReadDeadlines, PARTITION_BUILD_HOLD,
-    PARTITION_READ_TIMEOUT, PartitionConsensusConfig, PartitionRead, PartitionReadReply,
-    PollQuotaIdentity, Receiver, ReconcileOp, ReplicaTopology, ShardFrame, ShardIdentity, channel,
-    shard_channel, shard_mesh_channels,
+    ANY_MESSAGE, ConsumerOffsetRead, DeferredPollContext, DeferredPollRequest, IggyShard,
+    LifecycleFrame, MAX_HELD_READS, MAX_HELD_READS_PER_NAMESPACE, OffsetReadDeadlines,
+    PARTITION_BUILD_HOLD, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, PartitionRead,
+    PartitionReadReply, PollQuotaIdentity, ReadinessTarget, ReadyTarget, Receiver, ReconcileOp,
+    ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel, shard_mesh_channels,
 };
 
 /// Expire the requester before releasing a nonempty completion to the owner.
@@ -1604,6 +1604,95 @@ async fn given_one_silent_owner_when_reading_offsets_on_primary_should_keep_the_
         ),
         "only the read of the silent owner stays unanswered, not {offsets:?}"
     );
+}
+
+/// A fetch reads its targets by its read deadline. An owner that does not
+/// answer the admission of a wait is awaited for `admission_wait` at most.
+/// The wait then returns the ready targets of the other owners, and fails
+/// when it has none.
+#[compio::test]
+async fn given_one_silent_owner_when_waiting_for_messages_should_end_at_the_admission_wait_with_the_ready_targets_of_the_others()
+ {
+    const ADMISSION_WAIT: Duration = Duration::from_millis(250);
+    const SILENT_OWNER: u16 = 1;
+    const ANSWERING_OWNER: u16 = 2;
+    const CONSUMER: u128 = 7;
+    let silent = IggyNamespace::new(0, 0, 0);
+    let answering = IggyNamespace::new(1, 0, 0);
+    for ready in [true, false] {
+        let bus = PollTestBus::default();
+        bus.read_budget.set(Some(ADMISSION_WAIT));
+        let (mut owner, created_revision) = owner_with_unbuilt_partition(&bus, silent, &[]);
+        let (senders, mut inboxes, _reply_inboxes) = shard_mesh_channels(3, 1, 1);
+        owner.attach_senders(senders);
+        let streams = owner.plane.metadata().mux_stm.streams();
+        streams.seed_namespace_on(answering, answering.inner(), 0, Durability::Persisted, &[]);
+        for (namespace, shard) in [(silent, SILENT_OWNER), (answering, ANSWERING_OWNER)] {
+            owner.shards_table.insert(
+                namespace,
+                PartitionLocation::new(ShardId::new(shard), created_revision),
+            );
+        }
+        let target = |namespace, partition_id| ReadinessTarget {
+            namespace,
+            partition_id,
+            consumer: PollingConsumer::Consumer(7, 0),
+            strategy: PollingStrategy::offset(0),
+            metadata: streams
+                .poll_metadata(namespace, None, CONSUMER)
+                .expect("metadata names the partition"),
+        };
+        let found = ReadyTarget {
+            partition_id: 1,
+            available: 1,
+            known_bytes: None,
+        };
+
+        let wait = owner.wait_for_messages(
+            DeferredPollContext {
+                session: None,
+                user_id: 0,
+                credential: None,
+                quota: PollQuotaIdentity::Session(CONSUMER),
+                primary: true,
+            },
+            vec![target(silent, 0), target(answering, 1)],
+            Duration::ZERO,
+            ANY_MESSAGE,
+            Some(ADMISSION_WAIT),
+        );
+        futures::pin_mut!(wait);
+        assert!(futures::poll!(wait.as_mut()).is_pending());
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { reply, .. })) = inboxes
+            [usize::from(ANSWERING_OWNER)]
+        .take()
+        .unwrap()
+        .try_recv() else {
+            panic!("the answering owner gets its frame");
+        };
+        reply
+            .try_send(PartitionReadReply::Ready {
+                shard: ANSWERING_OWNER,
+                parked: None,
+                partitions: if ready { vec![found] } else { Vec::new() },
+            })
+            .unwrap();
+        let (admission_wait_passed, timeout) = oneshot::channel();
+        *bus.next_timeout.borrow_mut() = Some(timeout);
+        assert!(
+            futures::poll!(wait.as_mut()).is_pending(),
+            "the silent owner has until the end of the admission wait"
+        );
+
+        admission_wait_passed.send(()).unwrap();
+
+        let outcome = wait.await;
+        if ready {
+            assert_eq!(outcome.expect("an owner answered with messages"), [found]);
+        } else {
+            assert!(matches!(outcome, Err(IggyError::ShardCommunicationError)));
+        }
+    }
 }
 
 #[compio::test]
