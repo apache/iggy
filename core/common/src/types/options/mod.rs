@@ -66,8 +66,9 @@ pub use catalog::{
     OPTION_FLAG_SECRET, OPTION_FLAG_UPDATABLE, OptionAdmissionContext, OptionColumns,
     OptionDefault, OptionDescriptor, OptionMutability, OptionOperation, OptionStorage,
     OptionVisibility, StreamEncryptionSource, admit, canonical_value, check_critical_options,
-    critical_keys_marker, derived_defaults, descriptors_for, project_shadow_origin,
-    project_shadow_topic, public_options, stream_key_from_entry, stream_wrap_set,
+    critical_keys_marker, derived_defaults, descriptors_for, drop_options_fixed_by_type,
+    project_shadow_origin, project_shadow_topic, public_options, stream_key_from_entry,
+    stream_wrap_set,
 };
 pub use codec::OptionValueCodec;
 pub use durability::Durability;
@@ -1663,6 +1664,8 @@ pub struct TopicCreateOptions {
     /// `0` is normalized to `None`.
     pub segment_size: Option<IggyByteSize>,
     /// Message completion policy, independent of consumer-offset durability.
+    /// A geo topic in the `geo` mode has no choice: the server ignores this
+    /// and stores [`Durability::Persisted`].
     pub durability: Durability,
     pub consumer_offset_durability: Durability,
     /// Immutable after creation. `None` resolves to
@@ -1717,6 +1720,16 @@ impl TopicCreateOptions {
     #[must_use]
     pub const fn is_geo(&self) -> bool {
         matches!(self.topic_type, Some(TopicType::Geo))
+    }
+
+    /// The durability the topic's type and mode fix, or `None` when the
+    /// topic's own `durability` decides. See [`GeoMode::fixed_durability`].
+    #[must_use]
+    pub fn fixed_durability(&self) -> Option<Durability> {
+        if !self.is_geo() {
+            return None;
+        }
+        self.geo_mode.unwrap_or_default().fixed_durability()
     }
 
     pub fn to_explicit_wire(

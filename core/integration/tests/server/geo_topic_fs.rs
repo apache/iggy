@@ -21,9 +21,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchProducer};
+use iggy_binary_protocol::codes::CREATE_TOPIC_CODE;
 use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch, Placement};
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+use iggy_binary_protocol::{WireEncode, WireName};
+use iggy_common::BinaryTransport;
+use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_object_store::{
     FreshIndex, FreshObjectId, FreshProofRow, FsStore, KeyLayout, ObjectStore,
 };
@@ -78,6 +84,14 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
         .expect("the mode is stored");
     assert!(!mode.explicit, "admission derived the mode");
 
+    // `TopicCreateOptions` sends `replicated`, which the geo mode ignores.
+    let durability = details
+        .options
+        .get(&HeaderKey::from(OptionKey::Durability))
+        .expect("the durability is stored");
+    assert_eq!(resolved.runtime.durability, Durability::Persisted);
+    assert!(!durability.explicit, "the geo mode set the durability");
+
     send(&client, &stream, &topic, 0..MESSAGES).await;
     // A placed send is uploaded before it commits, and an uploaded object is
     // deleted only once a long-term segment holds its messages.
@@ -88,6 +102,94 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
         files(store.path())
     );
     assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+}
+
+/// A geo topic in the `geo` mode has no durability choice: whatever a create
+/// names, or with no `durability` at all, every transport reports `persisted`
+/// as derived. A normal topic keeps the durability it names.
+#[tokio::test]
+async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_report_persisted() {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let tcp = harness.tcp_root_client().await.expect("tcp root client");
+    let http = harness.http_root_client().await.expect("http root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    tcp.create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    wait_until_ready(&tcp, &stream).await;
+    let geo = TopicCreateOptions {
+        partitions_count: Some(1),
+        topic_type: Some(TopicType::Geo),
+        ..TopicCreateOptions::default()
+    };
+
+    tcp.create_topic(&stream, "sdk-defaults", &geo)
+        .await
+        .expect("create a geo topic with the SDK's defaults");
+    http.create_topic(
+        &stream,
+        "http-replicated",
+        &TopicCreateOptions {
+            durability: Durability::Replicated,
+            ..geo.clone()
+        },
+    )
+    .await
+    .expect("create a geo topic that names replicated over HTTP");
+    let create = CreateTopicRequest {
+        stream_id: identifier_to_wire(&stream).expect("wire stream identifier"),
+        partitions_count: 1,
+        name: WireName::new("no-key").expect("wire topic name"),
+        options: geo
+            .to_explicit_wire(|_| false)
+            .expect("a block without the durability keys"),
+    }
+    .to_bytes();
+    match &*tcp.client().read().await {
+        ClientWrapper::Tcp(client) => client
+            .send_raw_with_response(CREATE_TOPIC_CODE, create)
+            .await
+            .expect("create a geo topic without the key"),
+        _ => panic!("the harness root client speaks TCP"),
+    };
+    tcp.create_topic(
+        &stream,
+        "normal",
+        &TopicCreateOptions {
+            partitions_count: Some(1),
+            ..TopicCreateOptions::default()
+        },
+    )
+    .await
+    .expect("create a normal topic");
+
+    for (name, expected, explicit) in [
+        ("sdk-defaults", Durability::Persisted, false),
+        ("http-replicated", Durability::Persisted, false),
+        ("no-key", Durability::Persisted, false),
+        ("normal", Durability::Replicated, true),
+    ] {
+        let topic = Identifier::named(name).expect("topic identifier");
+        for (transport, client) in [("tcp", &tcp), ("http", &http)] {
+            let details = client
+                .get_topic(&stream, &topic)
+                .await
+                .expect("get topic")
+                .expect("the topic exists");
+            let durability = details
+                .options
+                .get(&HeaderKey::from(OptionKey::Durability))
+                .expect("the durability is stored");
+            assert_eq!(
+                details.resolved_options().runtime.durability,
+                expected,
+                "{name} over {transport}"
+            );
+            assert_eq!(durability.explicit, explicit, "{name} over {transport}");
+        }
+    }
 }
 
 /// A reader of the bucket alone, with no access to the cluster, finds every
