@@ -114,7 +114,9 @@ use message_bus::installer::conn_info::{ClientConnMeta, ClientTransportKind};
 use message_bus::replica::listener::MessageHandler;
 use message_bus::{BusMessage, ConnectionPermit, MessageBus, ReplicaLinkId, SharedTlsServerConfig};
 use metadata::IggyMetadata;
-use metadata::impls::metadata::{PartitionPlacementView, StreamsFrontend, metadata_wal_head};
+use metadata::impls::metadata::{
+    PartitionPlacementView, StreamsFrontend, metadata_wal_head, verify_state_transfer_manifest,
+};
 use metadata::stm::StateMachine;
 use metadata::stm::snapshot::SnapshotError;
 use metadata::{BoundSession, CommitWalkStop, MetadataSubmitError};
@@ -10050,24 +10052,43 @@ where
             );
             return;
         };
-        // The install refuses this tail, after the whole fetch. A manifest
-        // without a client table fails there too.
+        // The install refuses these frontiers and this tail after the whole
+        // fetch, and charges the generation. `commit_op` belongs to this
+        // descriptor, not to the generation: a peer can pair its snapshot with
+        // a commit op that is still behind it and catch up later. A manifest
+        // without a client table fails at the install too.
         if let Some(table) = manifest
             .iter()
             .find(|entry| entry.kind == consensus::artifact_kind::CLIENT_TABLE)
-            && let Err(error) = planes
+        {
+            if let Err(error) =
+                verify_state_transfer_manifest(generation, header.commit_op, table.frontier)
+            {
+                tracing::error!(
+                    shard = self.id,
+                    peer = header.replica,
+                    snapshot_seq = generation,
+                    commit_op = header.commit_op,
+                    table_frontier = table.frontier,
+                    %error,
+                    "state transfer descriptor has incoherent frontiers; ignoring"
+                );
+                return;
+            }
+            if let Err(error) = planes
                 .0
                 .verify_state_transfer_tail(generation, table.frontier)
-        {
-            tracing::error!(
-                shard = self.id,
-                peer = header.replica,
-                snapshot_seq = generation,
-                table_frontier = table.frontier,
-                %error,
-                "state transfer descriptor has a tail this replica cannot journal; ignoring"
-            );
-            return;
+            {
+                tracing::error!(
+                    shard = self.id,
+                    peer = header.replica,
+                    snapshot_seq = generation,
+                    table_frontier = table.frontier,
+                    %error,
+                    "state transfer descriptor has a tail this replica cannot journal; ignoring"
+                );
+                return;
+            }
         }
         if self.decode_budget_exhausted(generation) {
             // Pulling this generation again cannot end differently; refuse the

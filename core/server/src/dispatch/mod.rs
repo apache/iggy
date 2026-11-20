@@ -608,25 +608,27 @@ pub struct InFlight {
 }
 
 impl InFlight {
-    /// Takes the progress lane of a request that the drain took without one,
-    /// because its target did not resolve there yet. `resolve` runs only for
-    /// such a request. `false` when another request of the connection holds
-    /// the lane: nothing orders the two then, and a second holder would free
-    /// the lane of the first when it ends.
-    pub(in crate::dispatch) fn claim_progress(
-        &mut self,
-        resolve: impl FnOnce() -> Option<ConsumerProgress>,
-    ) -> bool {
-        if self.progress.is_some() {
+    /// Moves the progress lane of an offset write to `key`, which the write
+    /// resolved after the drain took it: without a lane, because its target
+    /// did not resolve there yet, or with the lane of metadata that changed
+    /// meanwhile. `false` when another request of the connection holds `key`:
+    /// nothing orders the two then, and a second holder would free the lane
+    /// of the first when it ends.
+    pub(in crate::dispatch) fn claim_progress(&mut self, key: ConsumerProgress) -> bool {
+        if matches!(self.progress, Some(ProgressKeys::One(held)) if held == key) {
             return true;
         }
-        let Some(key) = resolve() else {
-            return true;
-        };
-        if !self.drain.progress.borrow_mut().insert(key) {
+        let mut progress = self.drain.progress.borrow_mut();
+        if !progress.insert(key) {
             return false;
         }
-        self.progress = Some(ProgressKeys::One(key));
+        // No wake: the drain runs this request inline and checks the lanes
+        // again when it pops next.
+        if let Some(stale) = self.progress.replace(ProgressKeys::One(key)) {
+            for key in stale.as_slice() {
+                progress.remove(key);
+            }
+        }
         true
     }
 }
@@ -1484,6 +1486,7 @@ mod tests {
         create_partitions_in, create_reader_request, prepare_message, recreate_topic_in,
         register_reply, request_message, test_shard, test_shard_with_frontier,
     };
+    use crate::dispatch::test_support::{create_consumer_group, recreate_consumer_group};
     use bytes::Bytes;
     use consensus::Sequencer;
     use consensus::client_table::bind_verifier;
@@ -1543,7 +1546,7 @@ mod tests {
     use prometheus_client::encoding::text::encode;
     use prometheus_client::registry::Registry;
     use server_common::MESSAGE_ALIGN;
-    use server_common::sharding::{PartitionLocation, ShardId};
+    use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use shard::metrics::ShardMetrics;
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
@@ -4357,11 +4360,16 @@ mod tests {
         );
     }
 
-    /// A consumer-offset store of the root session for partition 0 of the
-    /// first topic, which needs metadata op `minimum_metadata_op`.
-    fn root_offset_store(request: u64, minimum_metadata_op: u64) -> Message<GenericHeader> {
+    /// A consumer-offset store of `consumer` by the root session for
+    /// partition 0 of the first topic, which needs metadata op
+    /// `minimum_metadata_op`.
+    fn root_offset_store(
+        request: u64,
+        consumer: WireConsumer,
+        minimum_metadata_op: u64,
+    ) -> Message<GenericHeader> {
         let body = StoreConsumerOffsetRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
+            consumer,
             stream_id: WireIdentifier::numeric(0),
             topic_id: WireIdentifier::numeric(0),
             partition_id: Some(0),
@@ -4381,6 +4389,42 @@ mod tests {
         )
         .minimum_metadata_op = minimum_metadata_op;
         store.into_generic()
+    }
+
+    /// A `GetConsumerOffset` of `consumer` by the root session for partition 0
+    /// of the first topic, which is the partition at `namespace`.
+    fn root_offset_read(
+        shard: &TestShard,
+        namespace: IggyNamespace,
+        request: u64,
+        consumer: WireConsumer,
+    ) -> Message<GenericHeader> {
+        let body = GetConsumerOffsetRequest {
+            consumer,
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            partition_id: Some(0),
+        }
+        .to_bytes();
+        let mut read = wire_request(
+            Operation::NonReplicated,
+            ROOT_CLIENT,
+            ROOT_SESSION,
+            request,
+            &body,
+        );
+        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
+            &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+        );
+        header.reserved[..4].copy_from_slice(&GET_CONSUMER_OFFSET_CODE.to_le_bytes());
+        header.partition_incarnation = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .unwrap();
+        read.into_generic()
     }
 
     /// A shard whose partition owner is `owner_inbox`, with the root session
@@ -4418,7 +4462,7 @@ mod tests {
 
         host.on_client_request(
             ROOT_TRANSPORT,
-            root_offset_store(STORE_REQUEST, created_frontier),
+            root_offset_store(STORE_REQUEST, plain_consumer(), created_frontier),
         );
         settle().await;
         assert!(
@@ -4441,32 +4485,10 @@ mod tests {
             panic!("the owner must receive the store");
         };
 
-        let offset = GetConsumerOffsetRequest {
-            consumer: WireConsumer::consumer(WireIdentifier::numeric(1)),
-            stream_id: WireIdentifier::numeric(0),
-            topic_id: WireIdentifier::numeric(0),
-            partition_id: Some(0),
-        }
-        .to_bytes();
-        let mut read = wire_request(
-            Operation::NonReplicated,
-            ROOT_CLIENT,
-            ROOT_SESSION,
-            OFFSET_REQUEST,
-            &offset,
+        host.on_client_request(
+            ROOT_TRANSPORT,
+            root_offset_read(&shard, namespace, OFFSET_REQUEST, plain_consumer()),
         );
-        let header = bytemuck::checked::from_bytes_mut::<RequestHeader>(
-            &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
-        );
-        header.reserved[..4].copy_from_slice(&GET_CONSUMER_OFFSET_CODE.to_le_bytes());
-        header.partition_incarnation = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .created_revision_for_namespace(namespace)
-            .unwrap();
-        host.on_client_request(ROOT_TRANSPORT, read.into_generic());
         settle().await;
         assert!(
             owner_inbox.try_recv().is_err(),
@@ -4495,6 +4517,121 @@ mod tests {
         );
     }
 
+    /// The plain consumer whose offsets the lane tests store and read.
+    const fn plain_consumer() -> WireConsumer {
+        WireConsumer::consumer(WireIdentifier::numeric(1))
+    }
+
+    /// The drain picks the lane of a store from the metadata of this node. A
+    /// group created again under its name during the frontier wait of the
+    /// store gets a new id, and the store writes the offset of that id. The
+    /// store kept the lane of the old id, so a read of the new one ran beside
+    /// it.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_group_created_again_during_the_frontier_wait_of_a_store_when_its_offset_is_read_should_hold_the_read_until_the_store_ends()
+     {
+        const STORE_REQUEST: u64 = 1;
+        const OFFSET_REQUEST: u64 = 2;
+        const POLL_ROUNDS: usize = 50;
+        let (bus, shard, host, owner_inbox) = root_host_with_owner().await;
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        create_consumer_group(&shard);
+        let group = || WireConsumer::external_group(WireIdentifier::named("group").unwrap());
+        let frontier = shard.plane.metadata().applied_frontier();
+        let recreated_frontier = frontier.get() + 1;
+        let store = || root_offset_store(STORE_REQUEST, group(), recreated_frontier);
+        let old_key = progress_key(&shard, &store()).expect("the store resolves its group");
+        let config = Arc::new(ServerConfig::default());
+        let drain = Rc::new(ClientDrain::new(&config));
+        let mut queue = ClientRequestQueue::default();
+        queue.push_back(QueuedClientRequest::new(
+            ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+            store(),
+        ));
+        let queues = Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, queue)])));
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            Rc::clone(&queues),
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert!(
+            drain.progress.borrow().contains(&old_key),
+            "the drain gives the store the lane of the group it knows"
+        );
+
+        recreate_consumer_group(&shard);
+        let new_key = progress_key(&shard, &store()).expect("the group exists again");
+        assert_ne!(new_key, old_key, "the group created again has a new id");
+        frontier.advance(recreated_frontier);
+        let mut submitted = None;
+        for _ in 0..POLL_ROUNDS {
+            assert!(futures::poll!(running.as_mut()).is_pending());
+            if let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionSubmit { reply, .. })) =
+                owner_inbox.try_recv()
+            {
+                submitted = Some(reply);
+                break;
+            }
+            settle().await;
+        }
+        let store_reply = submitted.expect("the store must reach its partition owner");
+        {
+            let held = drain.progress.borrow();
+            assert!(
+                held.contains(&new_key),
+                "the store holds the lane of the offset it writes"
+            );
+            assert!(
+                !held.contains(&old_key),
+                "the lane of the old group is free"
+            );
+        }
+
+        queues
+            .borrow_mut()
+            .entry(ROOT_TRANSPORT)
+            .or_default()
+            .push_back(QueuedClientRequest::new(
+                ClientOrigin::capture(&bus, ROOT_TRANSPORT),
+                root_offset_read(&shard, namespace, OFFSET_REQUEST, group()),
+            ));
+        drain.wake();
+        for _ in 0..POLL_ROUNDS {
+            assert!(futures::poll!(running.as_mut()).is_pending());
+            settle().await;
+        }
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "the read must wait for the store of its offset"
+        );
+
+        drop(store_reply);
+        let mut finished = false;
+        let mut read = None;
+        for _ in 0..POLL_ROUNDS {
+            if !finished {
+                finished = futures::poll!(running.as_mut()).is_ready();
+            }
+            if let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { reply, .. })) =
+                owner_inbox.try_recv()
+            {
+                read = Some(reply);
+                break;
+            }
+            settle().await;
+        }
+        assert!(read.is_some(), "the read must run once the store ended");
+    }
+
     /// Nothing orders a store that resolves late against a request that took
     /// its lane meanwhile. The store is refused before the owner sees it, and
     /// its end must not free the lane of the other request.
@@ -4511,7 +4648,7 @@ mod tests {
         let mut queue = ClientRequestQueue::default();
         queue.push_back(QueuedClientRequest::new(
             ClientOrigin::capture(&bus, ROOT_TRANSPORT),
-            root_offset_store(STORE_REQUEST, created_frontier),
+            root_offset_store(STORE_REQUEST, plain_consumer(), created_frontier),
         ));
         let queues = Rc::new(RefCell::new(AHashMap::from_iter([(ROOT_TRANSPORT, queue)])));
         let running = drain_client_requests(
@@ -4530,8 +4667,11 @@ mod tests {
         shard
             .shards_table()
             .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
-        let key = progress_key(&shard, &root_offset_store(STORE_REQUEST, created_frontier))
-            .expect("the store resolves once its partition exists");
+        let key = progress_key(
+            &shard,
+            &root_offset_store(STORE_REQUEST, plain_consumer(), created_frontier),
+        )
+        .expect("the store resolves once its partition exists");
         let held = drain.admit_progress(ProgressKeys::One(key));
         frontier.advance(created_frontier);
         for _ in 0..POLL_ROUNDS {

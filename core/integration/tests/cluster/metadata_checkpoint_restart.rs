@@ -68,6 +68,8 @@ const MARKER_POLL: Duration = Duration::from_millis(200);
 
 const INSTALL_MARKER: &str = "metadata state transfer installed";
 
+const CHECKPOINT_MARKER: &str = "forced checkpoint completed";
+
 /// Poll until `node`'s stdout contains `marker` `at_least` times.
 async fn await_marker(
     harness: &TestHarness,
@@ -102,7 +104,7 @@ async fn await_checkpoint_on_all_nodes(harness: &TestHarness, generation: usize)
         await_marker(
             harness,
             node,
-            "forced checkpoint completed",
+            CHECKPOINT_MARKER,
             generation,
             "checkpoint wait",
         )
@@ -355,19 +357,9 @@ async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_f
     drop(client);
 
     // Filling half the WAL must have driven the coordinator to persist a snapshot and
-    // drain the WAL prefix behind it.
-    let snapshot_path = harness
-        .node(0)
-        .data_path()
-        .join("metadata")
-        .join("snapshot.bin");
-    let snapshot_len = std::fs::metadata(&snapshot_path).map(|m| m.len()).ok();
-    assert!(
-        snapshot_len.is_some_and(|len| len > 0),
-        "{STREAMS} committed metadata ops must start a checkpoint and persist a \
-         non-empty snapshot at {}, got {snapshot_len:?}",
-        snapshot_path.display()
-    );
+    // drain the WAL prefix behind it. The snapshot file is on disk before the drain,
+    // and a restart before it replays the whole WAL.
+    await_marker(harness, 0, CHECKPOINT_MARKER, 1, "solo checkpoint").await;
 
     // Restart the solo node: recovery loads the snapshot, holding the drained prefix,
     // and replays the committed WAL suffix on top.
