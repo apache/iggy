@@ -19,11 +19,10 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { CREATE_PARTITION } from './create-partition.command.js';
 import { DELETE_PARTITIONS } from './delete-partition.command.js';
-import { COMMAND_CODE } from '../command.code.js';
 
 describe('CreatePartition', () => {
   it('uses the CreatePartitions command code', () => {
-    assert.equal(CREATE_PARTITION.code, COMMAND_CODE.CreatePartitions);
+    assert.equal(CREATE_PARTITION.code, 402);
   });
 
   describe('serialize', () => {
@@ -69,12 +68,19 @@ describe('CreatePartition', () => {
         );
       });
     }
+
+    it(`accepts a partition count of 1000`, () => {
+      assert.deepEqual(
+        CREATE_PARTITION.serialize({ streamId: 5, topicId: 10, partitionCount: 1000 }).subarray(-4),
+        Buffer.from([0xe8, 0x03, 0, 0])
+      );
+    });
   });
 });
 
 describe('DeletePartitions', () => {
   it('uses the DeletePartitions command code', () => {
-    assert.equal(DELETE_PARTITIONS.code, COMMAND_CODE.DeletePartitions);
+    assert.equal(DELETE_PARTITIONS.code, 403);
   });
 
   describe('serialize', () => {
@@ -120,5 +126,12 @@ describe('DeletePartitions', () => {
         );
       });
     }
+
+    it(`accepts a partition count of 1000`, () => {
+      assert.deepEqual(
+        DELETE_PARTITIONS.serialize({ streamId: 5, topicId: 10, partitionCount: 1000 }).subarray(-4),
+        Buffer.from([0xe8, 0x03, 0, 0])
+      );
+    });
   });
 });
