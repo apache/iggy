@@ -1262,10 +1262,9 @@ where
                 namespace,
                 read,
                 reply,
-                hold_deadline,
+                hold,
             } => {
-                self.on_partition_read(namespace, read, reply, hold_deadline)
-                    .await;
+                self.on_partition_read(namespace, read, reply, hold).await;
             }
             LifecycleFrame::ReadinessWait { wait, reply, watch } => {
                 self.admit_readiness_wait(*wait, &reply, watch);
@@ -2373,7 +2372,7 @@ mod tests {
                         namespace: IggyNamespace::new(0, 0, id),
                         read: PartitionRead::Primary,
                         reply,
-                        hold_deadline: None,
+                        hold: None,
                     }))
                     .unwrap();
                 replies

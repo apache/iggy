@@ -623,6 +623,18 @@ impl PartitionRead {
     }
 }
 
+/// The limits of a hold that a read carries to its owner, see
+/// [`LifecycleFrame::PartitionRead`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadHold {
+    /// Bus-clock micros at which a hold of the read ends.
+    pub deadline: u64,
+    /// `created_revision` of the partition that an earlier hold of the read
+    /// waited for. The read runs on that incarnation only. `None` for a read
+    /// that no owner held yet.
+    pub created_revision: Option<u64>,
+}
+
 /// One partition of [`PartitionRead::ConsumerOffsetsOnPrimary`], named as
 /// [`PartitionRead::ConsumerOffsetOnPrimary`] names it.
 #[derive(Debug, Clone, Copy)]
@@ -1191,11 +1203,11 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
-        /// The end of a hold of the read. Its requester sets it from a
+        /// The limits of a hold of the read. Its requester sets them from a
         /// budget of its own, and an owner that hands a held read back to
-        /// its inbox sets it to the end of that hold. With `None` a hold
-        /// ends [`PARTITION_BUILD_HOLD`] after it starts.
-        hold_deadline: Option<u64>,
+        /// its inbox sets them from that hold. With `None` a hold ends
+        /// [`PARTITION_BUILD_HOLD`] after it starts.
+        hold: Option<ReadHold>,
     },
     /// Evaluate a readiness wait on the shard that owns its targets, or on
     /// the shard of the wait for the targets that it mirrors. The evaluator
@@ -3192,7 +3204,10 @@ where
         self.partition_read_held(
             namespace,
             read,
-            Some(hold_deadline),
+            Some(ReadHold {
+                deadline: hold_deadline,
+                created_revision: None,
+            }),
             PARTITION_READ_TIMEOUT.min(budget),
         )
         .await
@@ -3206,7 +3221,7 @@ where
         &self,
         namespace: IggyNamespace,
         mut read: PartitionRead,
-        hold_deadline: Option<u64>,
+        hold: Option<ReadHold>,
         reply_timeout: std::time::Duration,
     ) -> Option<PartitionReadReply>
     where
@@ -3229,7 +3244,7 @@ where
         } else {
             reply_timeout
         };
-        self.partition_read_within(namespace, read, timeout, hold_deadline)
+        self.partition_read_within(namespace, read, timeout, hold)
             .await
     }
 
@@ -3241,12 +3256,12 @@ where
         namespace: IggyNamespace,
         read: PartitionRead,
         timeout: std::time::Duration,
-        hold_deadline: Option<u64>,
+        hold: Option<ReadHold>,
     ) -> Option<PartitionReadReply>
     where
         M: StreamsFrontend,
     {
-        let (target, reply_rx) = match self.send_partition_read(namespace, read, hold_deadline) {
+        let (target, reply_rx) = match self.send_partition_read(namespace, read, hold) {
             Ok(sent) => sent,
             Err(error) => return Some(PartitionReadReply::Rejected(error)),
         };
@@ -3429,7 +3444,7 @@ where
         &self,
         namespace: IggyNamespace,
         read: PartitionRead,
-        hold_deadline: Option<u64>,
+        hold: Option<ReadHold>,
     ) -> Result<(u16, Receiver<PartitionReadReply>), IggyError>
     where
         M: StreamsFrontend,
@@ -3460,7 +3475,7 @@ where
             namespace,
             read,
             reply: reply_tx,
-            hold_deadline,
+            hold,
         });
         let Some(sender) = self.senders.get(target as usize) else {
             return Err(IggyError::TransientNotAccepted);

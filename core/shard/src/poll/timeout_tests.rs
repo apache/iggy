@@ -46,8 +46,9 @@ use crate::{
     ANY_MESSAGE, ConsumerOffsetRead, DeferredPollContext, DeferredPollRequest, IggyShard,
     LifecycleFrame, MAX_HELD_READS, MAX_HELD_READS_PER_NAMESPACE, OffsetReadDeadlines,
     PARTITION_BUILD_HOLD, PARTITION_READ_TIMEOUT, PartitionConsensusConfig, PartitionRead,
-    PartitionReadReply, PollQuotaIdentity, ReadinessTarget, ReadyTarget, Receiver, ReconcileOp,
-    ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel, shard_mesh_channels,
+    PartitionReadReply, PollQuotaIdentity, ReadHold, ReadinessTarget, ReadyTarget, Receiver,
+    ReconcileOp, ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel,
+    shard_mesh_channels,
 };
 
 /// Expire the requester before releasing a nonempty completion to the owner.
@@ -187,16 +188,14 @@ async fn given_auto_commit_poll_when_completion_arrives_after_timeout_should_ret
         namespace,
         read,
         reply,
-        hold_deadline,
+        hold,
     }) = owner_inbox
         .try_recv()
         .expect("subsequent Next reached the owner inbox")
     else {
         panic!("expected the subsequent poll request");
     };
-    owner
-        .on_partition_read(namespace, read, reply, hold_deadline)
-        .await;
+    owner.on_partition_read(namespace, read, reply, hold).await;
     let Some(PartitionReadReply::Poll { fragments, .. }) = next_poll.await else {
         panic!("subsequent Next must return messages successfully");
     };
@@ -669,6 +668,81 @@ async fn given_held_poll_when_another_incarnation_is_built_should_refuse_it() {
     assert_eq!(owner.held_read_count(), 0);
 }
 
+/// The build ends the hold and hands the poll back to the inbox. A delete and
+/// a create can put another incarnation of its ids there before the pump
+/// takes the poll from the inbox, and the poll must not run on that one.
+#[compio::test]
+async fn given_held_poll_handed_back_when_another_incarnation_is_built_before_it_runs_should_refuse_it()
+ {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (mut owner, created_revision) = owner_with_unbuilt_partition(&bus, namespace, &[]);
+    let (senders, mut inboxes, _reply_inboxes) = shard_mesh_channels(1, 4, 1);
+    owner.attach_senders(senders);
+    let owner_inbox = inboxes[0].take().unwrap();
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(namespace, offset_poll(), reply, None)
+        .await;
+    insert_built_partition(&owner, &bus, namespace, created_revision);
+    let (read, reply, hold) = std::iter::from_fn(|| owner_inbox.try_recv().ok())
+        .find_map(|frame| match frame {
+            ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                read, reply, hold, ..
+            }) => Some((read, reply, hold)),
+            _ => None,
+        })
+        .expect("the build hands the held poll back to the inbox");
+    assert_eq!(
+        hold.and_then(|hold| hold.created_revision),
+        Some(created_revision),
+        "the poll carries the incarnation that its hold waited for"
+    );
+
+    begin_teardown(&owner, namespace);
+    confirm_remove(&owner, namespace);
+    insert_built_partition(&owner, &bus, namespace, created_revision + 1);
+    owner.on_partition_read(namespace, read, reply, hold).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_eq!(owner.held_read_count(), 0);
+}
+
+/// A poll that a hold handed back can find its partition gone and the next
+/// incarnation of its ids due. It must not wait for that one.
+#[compio::test]
+async fn given_held_poll_handed_back_when_another_incarnation_is_due_should_refuse_it_without_a_hold()
+ {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (owner, created_revision) = owner_with_unbuilt_partition(&bus, namespace, &[]);
+    let waited_for = created_revision
+        .checked_sub(1)
+        .expect("the seed commits above revision 0");
+    let (reply, replies) = channel(1);
+    let hold = ReadHold {
+        deadline: u64::try_from(PARTITION_BUILD_HOLD.as_micros()).unwrap(),
+        created_revision: Some(waited_for),
+    };
+
+    owner
+        .on_partition_read(namespace, offset_poll(), reply, Some(hold))
+        .await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_eq!(owner.held_read_count(), 0);
+}
+
 /// A delete and a create that reuse the ids of a partition commit while this
 /// owner still has the old incarnation. A create waits on this lookup, so it
 /// must get the primary of the new one, also through the teardown of the old
@@ -1108,14 +1182,12 @@ async fn given_a_requester_budget_when_reading_an_unbuilt_partition_should_end_t
             namespace: routed,
             read: poll,
             reply,
-            hold_deadline,
+            hold: limits,
         }) = owner_inbox.try_recv().expect("the read reached the owner")
         else {
             panic!("expected the routed poll");
         };
-        owner
-            .on_partition_read(routed, poll, reply, hold_deadline)
-            .await;
+        owner.on_partition_read(routed, poll, reply, limits).await;
         assert_eq!(owner.held_read_count(), 1, "budget {budget:?}");
 
         bus.now.set(hold - 1);
@@ -1328,12 +1400,10 @@ async fn given_offset_batch_held_again_for_another_entry_when_its_first_hold_end
             namespace,
             read,
             reply,
-            hold_deadline,
+            hold,
         }) = frame
         {
-            owner
-                .on_partition_read(namespace, read, reply, hold_deadline)
-                .await;
+            owner.on_partition_read(namespace, read, reply, hold).await;
         }
     }
     assert_eq!(

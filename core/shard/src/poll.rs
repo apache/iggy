@@ -35,7 +35,7 @@ use crate::shards_table::ShardsTable;
 use crate::{
     COLD_POLL_BUDGET, ConsumerOffsetRead, ExternalGroupRead, IggyShard, LifecycleFrame,
     MAX_HELD_READS, MAX_HELD_READS_PER_NAMESPACE, PARTITION_BUILD_HOLD, PartitionRead,
-    PartitionReadReply, Sender, ShardFrame,
+    PartitionReadReply, ReadHold, Sender, ShardFrame,
 };
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
@@ -267,18 +267,44 @@ where
     /// A lookup of the primary, or a read of messages or offsets, gets no
     /// answer here while its partition cannot serve yet: see
     /// [`Self::read_hold`]. It is held until the partition can, and not past
-    /// `hold_deadline`, the end that its requester or an earlier hold of the
-    /// read set.
+    /// the deadline of `hold`, the end that its requester or an earlier hold
+    /// of the read set. A read that an earlier hold handed back to the inbox
+    /// runs only on the incarnation that the hold waited for.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub(crate) async fn on_partition_read(
         &self,
         namespace: IggyNamespace,
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
-        hold_deadline: Option<u64>,
+        hold: Option<ReadHold>,
     ) {
-        if let Some((awaited, created_revision)) = self.read_hold(namespace, &read) {
-            self.hold_read(awaited, created_revision, read, reply, hold_deadline);
+        let awaited = self.read_hold(namespace, &read);
+        // The pump can remove the partition that a hold ended for, and build
+        // the next incarnation of its ids, before the read that the hold
+        // handed back runs. Not every read carries a fence of its own.
+        if let Some(waited_for) = hold.and_then(|hold| hold.created_revision) {
+            let incarnation = awaited
+                .map(|(_, created_revision)| created_revision)
+                .or_else(|| {
+                    self.plane
+                        .partitions()
+                        .with_partition(&namespace, IggyPartition::created_revision)
+                });
+            if incarnation.is_some_and(|incarnation| incarnation != waited_for) {
+                let _ = reply.try_send(PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted,
+                ));
+                return;
+            }
+        }
+        if let Some((awaited, created_revision)) = awaited {
+            self.hold_read(
+                awaited,
+                created_revision,
+                read,
+                reply,
+                hold.map(|hold| hold.deadline),
+            );
             return;
         }
         if let PartitionRead::DeferredPoll(request) = read {
@@ -595,13 +621,14 @@ where
     }
 
     /// Hands a held read back to the inbox of this shard, where it runs as a
-    /// read that arrives now, except that a new hold ends where this one does.
+    /// read that arrives now, except that a new hold ends where this one does
+    /// and that it runs only on the incarnation that this hold waited for.
     fn resubmit_held_read(&self, namespace: IggyNamespace, held: HeldRead) {
         let HeldRead {
             read,
             reply,
+            created_revision,
             deadline,
-            ..
         } = held;
         // A read whose requester left must not run: it can commit an offset
         // that nobody receives.
@@ -609,11 +636,18 @@ where
             return;
         }
         let refused = reply.clone();
+        // A batch waits for one partition after the other, and each of its
+        // reads has a fence of its own.
+        let created_revision = (!matches!(read, PartitionRead::ConsumerOffsetsOnPrimary { .. }))
+            .then_some(created_revision);
         let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
             namespace,
             read,
             reply,
-            hold_deadline: Some(deadline),
+            hold: Some(ReadHold {
+                deadline,
+                created_revision,
+            }),
         });
         let sent = self
             .senders

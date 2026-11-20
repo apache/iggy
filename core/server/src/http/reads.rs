@@ -1477,7 +1477,7 @@ pub(in crate::http) mod tests {
                 .unwrap();
             let mut response = pin!(service.call(request));
             assert!(poll!(response.as_mut()).is_pending());
-            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { hold_deadline, .. })) =
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { hold, .. })) =
                 shard_inbox.try_recv()
             else {
                 panic!("{uri} must wait for its partition data");
@@ -1485,8 +1485,8 @@ pub(in crate::http) mod tests {
             let latest = state.shard.bus.monotonic_micros()
                 + u64::try_from(PARTITION_BUILD_HOLD.as_micros()).unwrap();
             assert!(
-                hold_deadline.is_some_and(|end| end <= latest),
-                "{uri} must end a hold of its read by {latest}, got {hold_deadline:?}"
+                hold.is_some_and(|hold| hold.deadline <= latest),
+                "{uri} must end a hold of its read by {latest}, got {hold:?}"
             );
         }
     }

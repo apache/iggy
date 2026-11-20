@@ -1847,7 +1847,7 @@ async fn given_full_owner_inbox_when_reserved_reads_complete_should_interleave_b
                     namespace,
                     read: PartitionRead::GroupOffsetState { group_id },
                     reply,
-                    hold_deadline: None,
+                    hold: None,
                 }))
                 .is_ok()
         );
@@ -2562,7 +2562,7 @@ async fn given_kept_metadata_prepares_when_inbox_frames_arrive_should_hand_back_
                 namespace: IggyNamespace::new(9, 9, 9),
                 read: PartitionRead::Primary,
                 reply,
-                hold_deadline: None,
+                hold: None,
             }))
             .unwrap();
         replies
@@ -2622,7 +2622,7 @@ async fn given_kept_metadata_prepares_when_a_reply_lane_frame_arrives_should_ser
             namespace: IggyNamespace::new(9, 9, 9),
             read: PartitionRead::Primary,
             reply,
-            hold_deadline: None,
+            hold: None,
         }))
         .unwrap();
 
