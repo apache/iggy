@@ -22,13 +22,13 @@ use std::time::Duration;
 
 use iggy_common::{IggyByteSize, IggyDuration, MAX_DEFERRED_POLL_WAIT_US, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use server_common::sharding::PARTITION_IO_CAPACITY_MAX;
 
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
 use crate::common::validators::validate_cpu_allocation;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 
 // Re-exported so callers reach these through `configs::sharding::*`
 // alongside the rest of the section.
@@ -51,6 +51,10 @@ pub const SHUTDOWN_DRAIN_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 /// than the drain timeout makes the flag effectively unobservable; cap
 /// at 5s so Ctrl-C latency stays bounded regardless of config.
 pub const SHUTDOWN_POLL_INTERVAL_MAX: Duration = Duration::from_secs(5);
+
+/// Hard upper bound on `shutdown_primary_handoff_timeout`. The handoff runs
+/// before the shutdown flag flips, so nothing else bounds a typo here.
+pub const SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX: Duration = Duration::from_secs(600);
 
 /// Hard upper bound on `shutdown_join_timeout`. Comfortably above the
 /// drain cap so a full drain always fits inside the join budget, while
@@ -117,7 +121,7 @@ pub struct ShardingConfig {
     pub partition_io_bytes_max: Option<IggyByteSize>,
     /// Longest wait of a deferred poll or readiness wait. A longer requested
     /// wait is shortened to it. At most 10 minutes.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub deferred_poll_max_wait: IggyDuration,
     /// Deferred polls and readiness waits parked on one shard. A request
@@ -144,7 +148,7 @@ pub struct ShardingConfig {
     /// force-tears the bus. Slow-fsync hosts may need to extend this past
     /// the default; the cap is `SHUTDOWN_DRAIN_TIMEOUT_MAX` so a config
     /// typo cannot wedge process exit.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub shutdown_drain_timeout: IggyDuration,
     /// Poll cadence for the cross-thread shutdown flag and for the
@@ -153,16 +157,24 @@ pub struct ShardingConfig {
     /// keeps shutdown observably prompt without measurable scheduler
     /// overhead. Capped at `SHUTDOWN_POLL_INTERVAL_MAX` so the flag
     /// remains effectively observable regardless of config.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub shutdown_poll_interval: IggyDuration,
+    /// Longest time a clustered node hands off the partitions it leads
+    /// before the shutdown flag flips. Runs ahead of the drain and outside
+    /// `shutdown_join_timeout`. Zero skips the handoff, and so do
+    /// "disabled", "none" and "unlimited", which also parse as zero. At most
+    /// [`SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX`].
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[config_env(leaf)]
+    pub shutdown_primary_handoff_timeout: IggyDuration,
     /// Hard wall-clock deadline for joining shard threads at process
     /// exit. A shard whose pump or listener wedges past this budget is
     /// abandoned with an error log instead of blocking exit forever.
     /// Must be at least `shutdown_drain_timeout` (abandoning a shard
     /// mid-drain would interrupt its WAL fsync / replica drain) and at
     /// most [`SHUTDOWN_JOIN_TIMEOUT_MAX`].
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub shutdown_join_timeout: IggyDuration,
     /// Tick cadence for the partition reconciliation loop. The reconciler
@@ -172,7 +184,7 @@ pub struct ShardingConfig {
     /// commit announces, ages parked requests, and covers dropped wake-ups
     /// (the wake channel is capacity-1). Values above
     /// [`RECONCILE_PERIODIC_INTERVAL_MAX`] are rejected by the validator.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub reconcile_periodic_interval: IggyDuration,
 }
@@ -215,6 +227,11 @@ impl Default for ShardingConfig {
             shutdown_poll_interval: SERVER_CONFIG
                 .sharding
                 .shutdown_poll_interval
+                .parse()
+                .unwrap(),
+            shutdown_primary_handoff_timeout: SERVER_CONFIG
+                .sharding
+                .shutdown_primary_handoff_timeout
                 .parse()
                 .unwrap(),
             shutdown_join_timeout: SERVER_CONFIG
@@ -380,6 +397,17 @@ impl Validatable<ConfigurationError> for ShardingConfig {
                  shutdown_drain_timeout {:?} (a poll cadence coarser than the drain budget makes \
                  the shutdown flag effectively unobservable)",
                 poll, drain
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+
+        let handoff = self.shutdown_primary_handoff_timeout.get_duration();
+        if handoff > SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX {
+            eprintln!(
+                "Invalid sharding configuration: shutdown_primary_handoff_timeout {:?} exceeds the \
+                 {:?} cap (the handoff runs before the shutdown starts, so a long one delays process \
+                 exit)",
+                handoff, SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
@@ -584,6 +612,26 @@ mod tests {
     }
 
     #[test]
+    fn over_cap_primary_handoff_is_rejected() {
+        let cfg = ShardingConfig {
+            shutdown_primary_handoff_timeout: IggyDuration::new(
+                SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX + Duration::from_secs(1),
+            ),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_primary_handoff_is_accepted() {
+        let cfg = ShardingConfig {
+            shutdown_primary_handoff_timeout: IggyDuration::new(Duration::ZERO),
+            ..ShardingConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
     fn join_shorter_than_drain_is_rejected() {
         // A join budget under the drain would abandon shards mid-drain.
         let cfg = ShardingConfig {
@@ -633,6 +681,10 @@ mod tests {
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(
+            sharding.shutdown_primary_handoff_timeout,
+            "15 s".parse().unwrap()
+        );
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
@@ -653,6 +705,10 @@ mod tests {
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(
+            sharding.shutdown_primary_handoff_timeout,
+            "15 s".parse().unwrap()
+        );
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }
@@ -670,6 +726,10 @@ mod tests {
         assert_eq!(sharding.poll_completion_capacity, 1024);
         assert_eq!(sharding.shutdown_drain_timeout, "10 s".parse().unwrap());
         assert_eq!(sharding.shutdown_poll_interval, "50 ms".parse().unwrap());
+        assert_eq!(
+            sharding.shutdown_primary_handoff_timeout,
+            "15 s".parse().unwrap()
+        );
         assert_eq!(sharding.shutdown_join_timeout, "30 s".parse().unwrap());
         assert_eq!(sharding.reconcile_periodic_interval, "1 s".parse().unwrap());
     }

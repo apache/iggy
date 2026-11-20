@@ -1,0 +1,100 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Builds iggy.apache.org with the docs/ of this pull request. apache/iggy-website
+# builds /docs from docs/ of this repository, and /docs/connectors from docs/
+# of apache/iggy-connectors.
+
+name: _test_docs
+on:
+  workflow_call:
+
+# The job runs npm packages from another repository, so it gets a read-only
+# token and no secrets.
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout docs
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: docs
+
+      # The deploy record names the website commit and the docs commits of the
+      # last deploy, which built together. A broken master in another
+      # repository then cannot fail this job. Before the first deploy writes
+      # the record, website main still holds the connectors docs.
+      - name: Read the deploy record
+        id: record
+        run: |
+          record="$RUNNER_TEMP/docs-source.json"
+          status=$(curl -sS --retry 5 --retry-all-errors -o "$record" -w '%{http_code}' \
+            https://raw.githubusercontent.com/apache/iggy-website/asf-site/docs-source.json)
+          case "$status" in
+            200)
+              website=$(jq -r .website "$record")
+              connectors=$(jq -r .connectors_commit "$record")
+              for commit in "$website" "$connectors"; do
+                if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "::error::docs-source.json names '$commit' and not a commit"
+                  exit 1
+                fi
+              done
+              ;;
+            404)
+              website=main
+              connectors=
+              ;;
+            *)
+              echo "::error::docs-source.json returned HTTP $status"
+              exit 1
+              ;;
+          esac
+          echo "website=$website" >> "$GITHUB_OUTPUT"
+          echo "connectors=$connectors" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout apache/iggy-website
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: apache/iggy-website
+          ref: ${{ steps.record.outputs.website }}
+          path: website
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: website/.nvmrc
+          package-manager-cache: false
+
+      # IGGY_DOCS_DIR replaces the website copy of these docs.
+      # IGGY_CONNECTORS_DOCS_REF pins the connectors docs to the deployed commit.
+      - name: Build the site
+        working-directory: website
+        env:
+          IGGY_DOCS_DIR: ${{ github.workspace }}/docs
+          IGGY_CONNECTORS_DOCS_REF: ${{ steps.record.outputs.connectors }}
+        run: |
+          npm ci
+          npm run check:links
+          npm run build

@@ -16,11 +16,10 @@
 // under the License.
 
 use super::defaults::default_sysinfo_print_interval;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
 use serde_with::formats::PreferMany;
 use serde_with::{OneOrMany, serde_as};
 use server_common::log::LoggingSettings;
@@ -41,13 +40,13 @@ pub struct LoggingConfig {
     #[config_env(leaf)]
     pub max_total_size: IggyByteSize,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub rotation_check_interval: IggyDuration,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub retention: IggyDuration,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_sysinfo_print_interval")]
     pub sysinfo_print_interval: IggyDuration,
 }

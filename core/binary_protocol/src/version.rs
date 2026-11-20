@@ -124,8 +124,11 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
 /// it whenever a build stops decoding what another build sends. Revision 1 adds
 /// partition member lists, partition status bodies on metadata probes and
 /// replies, retirement debt on session finalization and the paid-through mark
-/// on session retirement.
-pub const REPLICA_WIRE_REVISION: u32 = 1;
+/// on session retirement. Revision 2 batches `Commit` and `CommitReply`
+/// frames, one entry per group. Revision 3 retires ended sessions in batches:
+/// retirement reports and session finalization carry a walk watermark instead
+/// of one session and a namespace revision.
+pub const REPLICA_WIRE_REVISION: u32 = 3;
 
 /// Oldest protocol version this build accepts at login.
 ///

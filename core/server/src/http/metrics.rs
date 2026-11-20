@@ -263,10 +263,10 @@ impl Collector for DiskUsageMetrics {
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
-/// Unlike the legacy server, the entity gauges are not counted at mutation
-/// sites: the scrape handler (`http::handlers::get_metrics`) samples the live
-/// state on every scrape, so a gauge can never drift from the state it
-/// describes.
+/// The scrape handler (`http::handlers::get_metrics`) sets the entity gauges
+/// on every scrape, from the counts the metadata applies keep and from the
+/// node stats, so they walk no stream. Only the per-topic series walk every
+/// topic, and `[http.metrics] topic_gauges = false` turns them off.
 pub(in crate::http) struct HttpMetrics {
     registry: Registry,
     /// The per-topic and disk series. They name every stream and topic and
@@ -534,6 +534,7 @@ mod tests {
         HttpMetricsConfig {
             enabled,
             endpoint: endpoint.to_owned(),
+            topic_gauges: true,
         }
     }
 
