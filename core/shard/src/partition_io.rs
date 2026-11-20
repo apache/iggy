@@ -6528,20 +6528,26 @@ mod tests {
         );
     }
 
-    /// A repaired metadata prepare appends only under `journal_gate`, so a WAL
-    /// rewrite that holds the gate (a checkpoint trim, a view reconcile) cannot
-    /// lose it from the rewritten file.
-    #[compio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn given_held_journal_writes_when_a_metadata_repair_arrives_should_append_after_release()
-    {
+    /// A backup of a three-replica metadata group and the repair stream of the
+    /// root user that its primary served. The backup did not take the stream.
+    struct ServedMetadataRepair {
+        backup: IoTestShard,
+        /// The `RepairPrepare` of the root user, then the `RepairDone` that
+        /// ends the stream.
+        stream: [Message<GenericHeader>; 2],
+        root_header: PrepareHeader,
+        _peers: Vec<IoTestShard>,
+        _inboxes: Vec<TaggedSender>,
+        _directory: tempfile::TempDir,
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn served_metadata_repair() -> ServedMetadataRepair {
         const REPLICAS: u8 = 3;
         const PRIMARY: usize = 0;
         const BACKUP: usize = 2;
         const ROOT_OP: u64 = 1;
         const STEP_LIMIT: usize = 10_000;
-        /// Runtime turns the held repair gets, each long enough for a WAL append.
-        const HELD_TURNS: usize = 20;
         let root_slot = usize::try_from(ROOT_OP).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let frames: Vec<MetadataFrames> = (0..REPLICAS)
@@ -6590,7 +6596,7 @@ mod tests {
             );
             owners.push((owner, inbox_owner));
         }
-        let (owners, _inbox_owners): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
+        let (mut owners, inboxes): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
         let metadata = |replica: usize| &owners[replica].plane.inner().0;
         let consensus = |replica| metadata(replica).consensus.as_ref().unwrap();
         let journal = |replica| metadata(replica).journal.as_ref().unwrap();
@@ -6649,14 +6655,45 @@ mod tests {
         owners[PRIMARY]
             .on_message(MessageBag::try_from(request).unwrap())
             .await;
-        let repaired = take(PRIMARY, BACKUP, Command::RepairPrepare);
+        let stream = [
+            take(PRIMARY, BACKUP, Command::RepairPrepare),
+            take(PRIMARY, BACKUP, Command::RepairDone),
+        ];
+        drop(root);
+        let backup = owners.swap_remove(BACKUP);
+        ServedMetadataRepair {
+            backup,
+            stream,
+            root_header,
+            _peers: owners,
+            _inboxes: inboxes,
+            _directory: directory,
+        }
+    }
 
-        let writes = metadata(BACKUP)
+    /// A repaired metadata prepare appends only under `journal_gate`, so a WAL
+    /// rewrite that holds the gate, as a view reconcile does, cannot lose it
+    /// from the rewritten file.
+    #[compio::test]
+    async fn given_held_journal_writes_when_a_metadata_repair_arrives_should_append_after_release()
+    {
+        /// Runtime turns the held repair gets, each long enough for a WAL append.
+        const HELD_TURNS: usize = 20;
+        let ServedMetadataRepair {
+            backup,
+            stream: [repaired, _],
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let journal = metadata.journal.as_ref().unwrap();
+        let root_slot = usize::try_from(root_header.op).unwrap();
+
+        let writes = metadata
             .hold_journal_writes()
             .now_or_never()
             .expect("nothing else holds the backup's journal gate");
-        let mut ingest =
-            Box::pin(owners[BACKUP].on_message(MessageBag::try_from(repaired).unwrap()));
+        let mut ingest = Box::pin(backup.on_message(MessageBag::try_from(repaired).unwrap()));
         for _ in 0..HELD_TURNS {
             assert!(
                 futures::poll!(&mut ingest).is_pending(),
@@ -6665,19 +6702,131 @@ mod tests {
             compio::runtime::time::sleep(Duration::from_millis(1)).await;
         }
         assert!(
-            journal(BACKUP).header(root_slot).is_none(),
+            journal.header(root_slot).is_none(),
             "the repaired prepare landed while journal writes were held"
         );
 
         drop(writes);
         ingest.await;
         assert_eq!(
-            journal(BACKUP)
-                .header(root_slot)
-                .map(|header| header.checksum),
+            journal.header(root_slot).map(|header| header.checksum),
             Some(root_header.checksum),
             "the repaired prepare must land once journal writes are released"
         );
+    }
+
+    /// The WAL trim of a checkpoint job holds `journal_gate` for a whole
+    /// rewrite. A repaired prepare that waited for it on the pump stopped the
+    /// ticks of every partition group of shard 0.
+    #[compio::test]
+    async fn given_a_pending_wal_trim_when_a_metadata_repair_arrives_should_keep_its_frames_in_order_until_the_trim_ends()
+     {
+        let ServedMetadataRepair {
+            backup,
+            stream,
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let journal = metadata.journal.as_ref().unwrap();
+        let root_slot = usize::try_from(root_header.op).unwrap();
+
+        // As a checkpoint job: it announces its trim, then takes the gate.
+        let trim = metadata.announce_checkpoint_trim();
+        let rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .now_or_never()
+                .expect("a repair frame must not wait for the WAL trim on the pump");
+        }
+        assert!(
+            backup.pop_gated_metadata_frame().is_none(),
+            "no repair frame reaches the plane while the trim is pending"
+        );
+        assert!(journal.header(root_slot).is_none());
+
+        drop(rewrite);
+        drop(trim);
+        let mut replayed = Vec::new();
+        while let Some(frame) = backup.pop_gated_metadata_frame() {
+            replayed.push(frame.command());
+            backup.deliver_message(frame, None).await;
+        }
+        assert_eq!(
+            replayed,
+            [Command::RepairPrepare, Command::RepairDone],
+            "the end of the stream stays behind the prepare that it walks"
+        );
+        assert_eq!(
+            journal.header(root_slot).map(|header| header.checksum),
+            Some(root_header.checksum),
+            "the repaired prepare lands once the trim ended"
+        );
+    }
+
+    /// A repaired prepare can pass the pump's test and then write the
+    /// superblock. A WAL trim that starts during that write would hold the
+    /// append on the pump for the whole rewrite.
+    #[compio::test]
+    async fn given_a_wal_trim_that_starts_under_a_repaired_prepare_when_it_reaches_the_append_should_drop_it()
+     {
+        let ServedMetadataRepair {
+            backup,
+            stream: [repaired, _],
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let _trim = metadata.announce_checkpoint_trim();
+        let _rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+
+        // Past the pump's test, as a frame that was in flight when the trim started.
+        backup
+            .deliver_message(MessageBag::try_from(repaired).unwrap(), None)
+            .now_or_never()
+            .expect("a repaired prepare must not wait for the WAL trim on the pump");
+
+        assert!(
+            metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .header(usize::try_from(root_header.op).unwrap())
+                .is_none(),
+            "the repair fetches a dropped prepare again"
+        );
+    }
+
+    /// Each repaired prepare asks for a reconcile of the view log. With a
+    /// proven log it changes nothing, and its wait for `journal_gate` held
+    /// the pump for the WAL rewrite of a checkpoint job that took the gate
+    /// during the append.
+    #[compio::test]
+    async fn given_a_proven_view_log_when_reconciling_under_held_journal_writes_should_not_wait() {
+        let ServedMetadataRepair { backup, stream, .. } = served_metadata_repair().await;
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .await;
+        }
+        let metadata = &backup.plane.inner().0;
+        assert!(!metadata.consensus.as_ref().unwrap().view_log_unproven());
+
+        let _rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        backup
+            .reconcile_metadata_view_divergence()
+            .now_or_never()
+            .expect("a reconcile with nothing to do must not wait for the journal gate");
     }
 
     type MetadataFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;

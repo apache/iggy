@@ -1014,7 +1014,11 @@ prepare_queue_depth = 32
 # upgrade a cluster of such servers, set journal_slots = 1024 on each node as
 # you upgrade it, so that every node runs 1024 during the upgrade. After the
 # last node, raise the value node by node: the backups first, the metadata
-# primary last.
+# primary last. The order holds only while the primary stays the same. If a
+# view change makes a raised node the primary before you raised every node,
+# a node with the smaller value can refuse a transfer as described above.
+# Raise that node next: it joins once it restarts with the value of the
+# primary.
 journal_slots = 65536
 
 # Initial capacity of the metadata session registry, shared by binary clients

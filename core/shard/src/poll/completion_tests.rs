@@ -2333,121 +2333,307 @@ async fn given_a_parked_checkpoint_job_when_a_descriptor_arrives_should_defer_it
     assert_eq!(request.header().nonce, nonce);
 }
 
+/// A backup of a three-replica metadata group on shard 0, and the chained
+/// prepares that its primary sends. `sent` holds what the backup sends.
+struct MetadataBackup {
+    owner: CompletionTestShard,
+    inbox: TaggedSender,
+    sent: SentFrames,
+    prepares: Vec<Message<PrepareHeader>>,
+    _directory: tempfile::TempDir,
+}
+
+impl MetadataBackup {
+    const PRIMARY: u8 = 0;
+
+    #[allow(clippy::future_not_send)]
+    async fn with_prepares(count: u64) -> Self {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let sent = SentFrames::default();
+        let captured = Rc::clone(&sent);
+        bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+            captured.borrow_mut().push((peer, frame));
+            Ok(())
+        }));
+        crate::test_support::connect_replica_on(&bus, Self::PRIMARY, 1);
+        let directory = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open(&directory.path().join("metadata.wal"), 0)
+            .await
+            .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            1,
+            3,
+            server_common::sharding::METADATA_GROUP,
+            bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            PollTestMetadata::default(),
+            None,
+        );
+        let (owner, inbox) = owner_with_metadata_plane(
+            &bus,
+            partitions_config(),
+            IggyNamespace::new(0, 0, 0),
+            metadata,
+        );
+        let retry_capacity = owner.plane.metadata().client_table_capacity();
+        let mut prepares: Vec<Message<PrepareHeader>> = Vec::new();
+        for op in 1..=count {
+            let prepare = denied_register_prepare(op, retry_capacity);
+            let prepare = match prepares.last().map(|last| last.header().checksum) {
+                Some(parent) => seal_prepare_capacity(
+                    prepare.transmute_header(|old, header: &mut PrepareHeader| {
+                        *header = old;
+                        header.parent = parent;
+                    }),
+                    retry_capacity,
+                ),
+                None => prepare,
+            };
+            prepares.push(prepare);
+        }
+        Self {
+            owner,
+            inbox,
+            sent,
+            prepares,
+            _directory: directory,
+        }
+    }
+
+    /// The ops that the backup acked to its primary, in the order of the acks.
+    fn acked_ops(&self) -> Vec<u64> {
+        self.sent
+            .borrow()
+            .iter()
+            .filter(|(peer, _)| *peer == Self::PRIMARY)
+            .filter_map(|(_, frame)| {
+                Message::<PrepareOkHeader>::try_from(Owned::copy_from_slice(frame.as_slice())).ok()
+            })
+            .filter(|ack| ack.header().command == Command::PrepareOk)
+            .map(|ack| ack.header().op)
+            .collect()
+    }
+}
+
 /// A checkpoint job holds the metadata journal gate while it rewrites the
 /// WAL. A prepare that waited for the gate on the pump stopped the ticks of
 /// every partition group of shard 0, and their heartbeats with them.
 #[compio::test]
-async fn given_a_held_journal_gate_when_metadata_prepares_arrive_should_keep_them_off_the_pump_until_it_is_free()
+async fn given_a_pending_wal_trim_when_metadata_prepares_arrive_should_keep_them_off_the_pump_until_it_ends()
  {
-    const PRIMARY: u8 = 0;
-    let bus = Rc::new(IggyMessageBus::new(0));
-    let sent = Rc::new(RefCell::new(Vec::new()));
-    let captured = Rc::clone(&sent);
-    bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
-        captured.borrow_mut().push((peer, frame));
-        Ok(())
-    }));
-    crate::test_support::connect_replica_on(&bus, PRIMARY, 1);
-    let dir = tempfile::tempdir().unwrap();
-    let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)
-        .await
-        .unwrap();
-    let consensus = VsrConsensus::new(
-        1,
-        1,
-        3,
-        server_common::sharding::METADATA_GROUP,
-        bus.clone(),
-        LocalPipeline::new(),
-    );
-    consensus.init();
-    let metadata = IggyMetadata::new(
-        Some(consensus),
-        Some(journal),
-        None,
-        None,
-        PollTestMetadata::default(),
-        None,
-    );
-    let (owner, _sender) = owner_with_metadata_plane(
-        &bus,
-        partitions_config(),
-        IggyNamespace::new(0, 0, 0),
-        metadata,
-    );
+    let mut backup = MetadataBackup::with_prepares(3).await;
+    let after_trim = backup.prepares.pop().unwrap();
+    let prepares = std::mem::take(&mut backup.prepares);
+    let owner = &backup.owner;
     let metadata = owner.plane.metadata();
     let journal = metadata.journal.as_ref().unwrap();
-    let retry_capacity = metadata.client_table_capacity();
-    let first = denied_register_prepare(1, retry_capacity);
-    let parent = first.header().checksum;
-    let second = seal_prepare_capacity(
-        denied_register_prepare(2, retry_capacity).transmute_header(
-            |old, header: &mut PrepareHeader| {
-                *header = old;
-                header.parent = parent;
-            },
-        ),
-        retry_capacity,
-    );
 
-    let gate = metadata.hold_journal_writes().await;
-    for prepare in [first, second] {
+    // As a checkpoint job: it announces its trim, then takes the gate.
+    let trim = metadata.announce_checkpoint_trim();
+    let rewrite = metadata.hold_journal_writes().await;
+    for prepare in prepares {
         futures::FutureExt::now_or_never(owner.on_message(MessageBag::Prepare(prepare)))
-            .expect("a prepare must not wait for the journal gate on the pump");
+            .expect("a prepare must not wait for the WAL trim on the pump");
     }
     // The primary and the other backup are a quorum, so the commit point
-    // passes the kept prepares while the gate is held.
+    // passes the kept prepares while the trim is pending.
     let committed = primary_commit(
         IggyNamespace::from_raw(server_common::sharding::METADATA_GROUP),
-        PRIMARY,
+        MetadataBackup::PRIMARY,
         0,
         2,
     );
     futures::FutureExt::now_or_never(owner.on_message(MessageBag::Commit(committed)))
-        .expect("a commit heartbeat must not wait for the journal gate on the pump");
+        .expect("a commit heartbeat must not wait for the WAL trim on the pump");
     owner.set_repair_gap_debounce_ticks(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
     for _ in 0..=REPAIR_GAP_DEBOUNCE_TICKS_MIN {
         owner.tick_metadata().await;
     }
     assert!(
-        owner.pop_redispatched_frame().is_none(),
-        "no prepare reaches the plane while the gate is held"
+        owner.pop_gated_metadata_frame().is_none(),
+        "no prepare reaches the plane while the trim is pending"
     );
     assert_eq!(journal.last_op(), None);
     assert_eq!(
-        drain_prepare_requests(&sent),
+        drain_prepare_requests(&backup.sent),
         [],
-        "a kept prepare is not missing, and its repair would wait for the gate on the pump"
+        "a kept prepare is not missing, and its repair would be kept too"
     );
 
-    drop(gate);
-    while let Some(frame) = owner.pop_redispatched_frame() {
-        owner.dispatch_redispatched_frame(frame).await;
+    drop(rewrite);
+    drop(trim);
+    owner.on_message(MessageBag::Prepare(after_trim)).await;
+    assert_eq!(
+        journal.last_op(),
+        None,
+        "a prepare that arrives behind kept ones waits behind them"
+    );
+    while let Some(frame) = owner.pop_gated_metadata_frame() {
+        owner.deliver_message(frame, None).await;
     }
     owner.tick_metadata().await;
 
-    assert_eq!(journal.last_op(), Some(2));
+    assert_eq!(journal.last_op(), Some(3));
     assert_eq!(
         metadata.consensus.as_ref().unwrap().commit_min(),
         2,
         "the kept prepares commit without a repair"
     );
-    let acked: Vec<u64> = sent
-        .borrow()
-        .iter()
-        .filter(|(peer, _)| *peer == PRIMARY)
-        .filter_map(|(_, frame)| {
-            Message::<PrepareOkHeader>::try_from(Owned::copy_from_slice(frame.as_slice())).ok()
-        })
-        .filter(|ack| ack.header().command == Command::PrepareOk)
-        .map(|ack| ack.header().op)
-        .collect();
     assert_eq!(
-        acked,
-        [1, 2],
+        backup.acked_ops(),
+        [1, 2, 3],
         "the kept prepares reach the journal in order"
     );
-    assert_eq!(drain_prepare_requests(&sent), []);
+    assert_eq!(drain_prepare_requests(&backup.sent), []);
+}
+
+/// A WAL trim can leave many kept prepares. Handed back ahead of the inbox,
+/// they made each frame that arrived meanwhile wait for all of them, the
+/// replies to the heartbeats of this replica included.
+#[compio::test]
+async fn given_kept_metadata_prepares_when_inbox_frames_arrive_should_hand_back_one_prepare_per_frame()
+ {
+    const KEPT: u64 = 3;
+    let mut backup = MetadataBackup::with_prepares(KEPT).await;
+    let prepares = std::mem::take(&mut backup.prepares);
+    let owner = &backup.owner;
+    let trim = owner.plane.metadata().announce_checkpoint_trim();
+    for prepare in prepares {
+        futures::FutureExt::now_or_never(owner.on_message(MessageBag::Prepare(prepare)))
+            .expect("a prepare must not wait for the WAL trim on the pump");
+    }
+    drop(trim);
+    // A read of a partition that no shard knows: the pump answers it at once.
+    let read_unknown_partition = || {
+        let (reply, replies) = channel(1);
+        backup
+            .inbox
+            .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
+                namespace: IggyNamespace::new(9, 9, 9),
+                read: PartitionRead::Primary,
+                reply,
+                hold_deadline: None,
+            }))
+            .unwrap();
+        replies
+    };
+    let first = read_unknown_partition();
+    let second = read_unknown_partition();
+
+    let (_stop_sender, stop_receiver) = channel(1);
+    let pump = futures::FutureExt::fuse(
+        owner.run_message_pump(stop_receiver, Arc::new(AtomicBool::new(false))),
+    );
+    let answered = futures::FutureExt::fuse(async {
+        first.recv().await.unwrap();
+        let acked_at_first = backup.acked_ops();
+        second.recv().await.unwrap();
+        (acked_at_first, backup.acked_ops())
+    });
+    futures::pin_mut!(pump, answered);
+    let (acked_at_first, acked_at_second) = futures::select_biased! {
+        _ = pump => panic!("the pump stopped"),
+        acked = answered => acked,
+    };
+
+    assert_eq!(
+        acked_at_first, [0_u64; 0],
+        "the first frame runs before any kept prepare"
+    );
+    assert_eq!(
+        acked_at_second,
+        [1],
+        "one kept prepare runs between two frames, and no more"
+    );
+}
+
+/// The arm that hands kept prepares back while the inbox is quiet ranks above
+/// the reply lane. Without a turn for that lane, a client reply that another
+/// shard forwarded waited for every kept prepare.
+#[compio::test]
+async fn given_kept_metadata_prepares_when_a_reply_lane_frame_arrives_should_serve_it_after_one_prepare()
+ {
+    const KEPT: u64 = 3;
+    let mut backup = MetadataBackup::with_prepares(KEPT).await;
+    let prepares = std::mem::take(&mut backup.prepares);
+    let owner = &backup.owner;
+    let trim = owner.plane.metadata().announce_checkpoint_trim();
+    for prepare in prepares {
+        futures::FutureExt::now_or_never(owner.on_message(MessageBag::Prepare(prepare)))
+            .expect("a prepare must not wait for the WAL trim on the pump");
+    }
+    drop(trim);
+    // A read of a partition that no shard knows: the pump answers it at once.
+    let (reply, replies) = channel(1);
+    backup
+        .inbox
+        .reply_sender()
+        .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
+            namespace: IggyNamespace::new(9, 9, 9),
+            read: PartitionRead::Primary,
+            reply,
+            hold_deadline: None,
+        }))
+        .unwrap();
+
+    let (_stop_sender, stop_receiver) = channel(1);
+    let pump = futures::FutureExt::fuse(
+        owner.run_message_pump(stop_receiver, Arc::new(AtomicBool::new(false))),
+    );
+    let answered = futures::FutureExt::fuse(async {
+        replies.recv().await.unwrap();
+        backup.acked_ops()
+    });
+    futures::pin_mut!(pump, answered);
+    let acked_at_reply = futures::select_biased! {
+        _ = pump => panic!("the pump stopped"),
+        acked = answered => acked,
+    };
+
+    assert_eq!(
+        acked_at_reply,
+        [1],
+        "the reply lane gets its turn after one kept prepare"
+    );
+}
+
+/// A kept frame holds its whole buffer, which the allocator sizes in steps
+/// of `MESSAGE_ALIGN`. Charged by their wire size, small kept frames held
+/// many times the budget.
+#[compio::test]
+async fn given_kept_metadata_frames_when_their_buffers_fill_the_budget_should_drop_the_next_frame()
+{
+    let mut backup = MetadataBackup::with_prepares(1).await;
+    let prepare = backup.prepares.pop().unwrap();
+    let owner = &backup.owner;
+    let within_budget =
+        crate::MAX_PARKED_BYTES / prepare.as_slice().len().next_multiple_of(MESSAGE_ALIGN);
+    let overflow_drops = || {
+        owner.metrics.frame_drop_count(
+            crate::metrics::frame_drop_variant::CONSENSUS,
+            crate::metrics::frame_drop_reason::PARK_OVERFLOW,
+        )
+    };
+
+    let _trim = owner.plane.metadata().announce_checkpoint_trim();
+    for _ in 0..within_budget {
+        futures::FutureExt::now_or_never(
+            owner.on_message(MessageBag::Prepare(prepare.deep_copy())),
+        )
+        .expect("a prepare must not wait for the WAL trim on the pump");
+    }
+    assert_eq!(overflow_drops(), 0);
+    futures::FutureExt::now_or_never(owner.on_message(MessageBag::Prepare(prepare)))
+        .expect("a prepare must not wait for the WAL trim on the pump");
+    assert_eq!(overflow_drops(), 1);
 }
 
 #[compio::test]
