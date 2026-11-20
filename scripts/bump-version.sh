@@ -107,6 +107,7 @@ get_version_files() {
             ;;
         rust-server)
             echo "core/server/Cargo.toml:cargo"
+            echo "core/server/openapi.json:json"
             ;;
         rust-cli)
             echo "core/cli/Cargo.toml:cargo"
