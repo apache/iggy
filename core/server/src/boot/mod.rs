@@ -1043,6 +1043,9 @@ async fn shard_main(
         _ => None,
     };
 
+    shard.set_long_term_rewrite_max_interval(
+        config.geo.long_term_rewrite_max_interval.get_duration(),
+    );
     let store_identity_stop = crate::tiered_storage::start(
         &config.tiered_storage,
         crate::origin_recovery::OriginRecovery::from_config(&config.geo),
@@ -1396,6 +1399,23 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two crates keep their own copy of the bounds, and they must not
+    /// drift apart.
+    #[test]
+    fn given_default_geo_section_when_reading_the_rewrite_ceiling_should_give_the_shard_bounds() {
+        assert_eq!(
+            ServerConfig::default()
+                .geo
+                .long_term_rewrite_max_interval
+                .get_duration(),
+            shard::rewrite_pacing::REWRITE_INTERVAL_MAX
+        );
+        assert_eq!(
+            configs::geo::LONG_TERM_REWRITE_MAX_INTERVAL_MIN,
+            shard::rewrite_pacing::REWRITE_INTERVAL_MIN
+        );
+    }
 
     #[compio::test]
     async fn given_missing_or_empty_storage_when_booting_should_initialize_without_wiping_on_restart()
