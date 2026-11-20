@@ -92,6 +92,9 @@ For more information, visit: https://iggy.apache.org/docs/introduction/getting-s
 // These doc comments are rendered verbatim as `--help` output, so environment
 // variable names and paths must stay unquoted rather than wear rustdoc backticks.
 #[allow(clippy::doc_markdown)]
+// The bools are independent clap switches, each with its own help text;
+// an enum state machine would obscure the flag parsing rather than clarify it.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Args {
     #[arg(
         long,
@@ -143,6 +146,25 @@ Example:
     ///   iggy-server --with-default-root-credentials     # Root logs in as iggy/iggy
     #[arg(long, default_value_t = false, verbatim_doc_comment)]
     pub with_default_root_credentials: bool,
+
+    /// Reset the root password at startup (for operators with machine access)
+    ///
+    /// Prompts for the stored root username and a new password on the
+    /// terminal, or reads both lines from stdin when it is not a TTY; the
+    /// values never come from environment variables and are never logged.
+    /// Boot fails when the username does not match the stored root user or
+    /// when combined with --fresh.
+    ///
+    /// The new password is first verified against root's stored hash: when
+    /// it already matches, no operation is submitted. Otherwise the reset is
+    /// proposed through metadata replication (a functioning quorum required);
+    /// on a backup it waits for this node to become primary. Run the flag on
+    /// one node only, and remove it after the reset.
+    ///
+    /// Examples:
+    ///   iggy-server --reset-root-password             # Prompts for username and new password
+    #[arg(long, default_value_t = false, verbatim_doc_comment)]
+    pub reset_root_password: bool,
 
     /// Identifies this node within `cluster.nodes` by its replica ID.
     ///

@@ -28,6 +28,7 @@ use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{Client, IggyClientBuilder, UserClient};
 use iggy_binary_protocol::{HEADER_SIZE, PrepareHeader};
 use std::fs::File;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream as StdTcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -55,6 +56,9 @@ const ROOT_PASSWORD_ENV: &str = "IGGY_ROOT_PASSWORD";
 /// Values that never occur in a log by chance, so any hit is a leak.
 const SENTINEL_ROOT_USERNAME: &str = "sentinel-root-user-4Kq9";
 const SENTINEL_ROOT_PASSWORD: &str = "sentinel-root-password-7Qm2xZ";
+
+/// Supplied to `--reset-root-password` over stdin; never in the environment.
+const RESET_ROOT_PASSWORD: &str = "reset-new-password-3Tt8v";
 
 const LOGS_DIRECTORY: &str = "logs";
 const STDOUT_FILE: &str = "stdout.txt";
@@ -296,6 +300,99 @@ async fn given_initialized_root_when_killed_and_restarted_without_credentials_sh
         .await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn given_initialized_root_when_resetting_the_password_should_apply_the_new_password() {
+    let mut server = TestServer::start();
+
+    server.restart_with_reset(&format!(
+        "{SENTINEL_ROOT_USERNAME}\n{RESET_ROOT_PASSWORD}\n"
+    ));
+
+    // Leak check while the captured output covers only the reset boot and
+    // no client session has touched the server yet.
+    let output = read_process_output(server.workspace.path());
+    let logs = read_log_files(&server.data_path().join(LOGS_DIRECTORY));
+    assert!(
+        output.contains("Root password reset committed through metadata replication."),
+        "the reset must commit through metadata replication, got: {output}"
+    );
+    for (source, text) in [("stdout and stderr", &output), ("log files", &logs)] {
+        assert!(
+            !text.contains(RESET_ROOT_PASSWORD),
+            "{source} must not contain the new root password"
+        );
+        assert!(
+            !text.contains(SENTINEL_ROOT_PASSWORD),
+            "{source} must not contain the old root password"
+        );
+        assert!(
+            !text.contains(SENTINEL_ROOT_USERNAME),
+            "{source} must not contain the root username"
+        );
+    }
+
+    assert!(
+        server
+            .root_login_accepted(SENTINEL_ROOT_USERNAME, RESET_ROOT_PASSWORD)
+            .await,
+        "the new password must authenticate"
+    );
+    assert!(
+        !server
+            .root_login_accepted(SENTINEL_ROOT_USERNAME, SENTINEL_ROOT_PASSWORD)
+            .await,
+        "the old password must stop authenticating"
+    );
+
+    let status = server.stop();
+    assert!(
+        status.success(),
+        "server must shut down cleanly, got {status}"
+    );
+}
+
+#[test]
+fn given_reset_flag_with_a_non_root_username_when_server_starts_should_exit_with_error() {
+    let workspace = TempDir::new().expect("tempdir for the server workspace");
+    let mut command = server_command(workspace.path());
+    command
+        .env(ROOT_USERNAME_ENV, SENTINEL_ROOT_USERNAME)
+        .env(ROOT_PASSWORD_ENV, SENTINEL_ROOT_PASSWORD)
+        .arg("--reset-root-password")
+        .stdin(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .expect("iggy-server must spawn under cargo test");
+    child
+        .stdin
+        .take()
+        .expect("the prompt input must be piped")
+        .write_all(b"someone-else\nirrelevant-password\n")
+        .expect("feed the reset prompt");
+
+    let status = match wait_for_exit(&mut child, STARTUP_TIMEOUT) {
+        Ok(status) => status,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("a mismatched username must refuse to boot: {error}");
+        }
+    };
+    let output = read_process_output(workspace.path());
+    assert!(
+        !status.success(),
+        "server must exit with an error, got {status}"
+    );
+    assert!(
+        output.contains("supplied username does not match the stored root username"),
+        "boot error must name the mismatch, got: {output}"
+    );
+    assert!(
+        !output.contains("someone-else"),
+        "the supplied username must never be echoed, got: {output}"
+    );
+}
+
 /// Spawned binary handle. Drops on test exit kill the child + wait so
 /// the test does not leave zombie processes if it panics mid-assertion.
 struct TestServer {
@@ -363,6 +460,43 @@ impl TestServer {
             .unwrap_or_else(|error| panic!("restart must recover root: {error}"));
         wait_for_root_initialization(self.workspace.path())
             .unwrap_or_else(|error| panic!("restart must initialize root: {error}"));
+    }
+
+    /// Restart with `--reset-root-password`, feed the prompt from `stdin`,
+    /// and wait until the reset commits or is skipped.
+    fn restart_with_reset(&mut self, stdin: &str) {
+        let runtime_path = self.data_path().join("runtime/current_config.toml");
+        std::fs::remove_file(&runtime_path).expect("remove the previous runtime address");
+        let mut command = server_command(self.workspace.path());
+        command.arg("--reset-root-password").stdin(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .expect("restart the server with --reset-root-password");
+        let mut prompt_input = child.stdin.take().expect("the prompt input must be piped");
+        prompt_input
+            .write_all(stdin.as_bytes())
+            .expect("feed the reset prompt");
+        // Dropping the pipe delivers EOF after the two prompted lines.
+        drop(prompt_input);
+        self.child = child;
+        self.tcp_addr = wait_for_bound_tcp(&runtime_path, STARTUP_TIMEOUT)
+            .unwrap_or_else(|error| panic!("reset restart must bind: {error}"));
+        let workspace = self.workspace.path();
+        wait_for_root_reset(workspace, &mut self.child)
+            .unwrap_or_else(|error| panic!("reset restart must complete the reset: {error}"));
+    }
+
+    /// Whether a root login with these credentials is accepted.
+    async fn root_login_accepted(&self, username: &str, password: &str) -> bool {
+        let client = IggyClientBuilder::new()
+            .with_tcp()
+            .with_server_address(self.tcp_addr.to_string())
+            .build()
+            .expect("TCP client");
+        client.connect().await.expect("connect to the server");
+        let accepted = client.login_user(username, password).await.is_ok();
+        client.disconnect().await.expect("disconnect the client");
+        accepted
     }
 
     async fn assert_root_login(&self, username: &str, password: &str) {
@@ -505,6 +639,35 @@ fn wait_for_root_initialization(workspace: &Path) -> Result<(), String> {
         sleep(POLL_INTERVAL);
     }
     Err("root initialization did not complete".to_owned())
+}
+
+/// Poll the captured output until the reset either commits or is skipped;
+/// an early child exit fails the wait so a crash cannot pass for success.
+fn wait_for_root_reset(workspace: &Path, child: &mut Child) -> Result<(), String> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    loop {
+        let output = read_process_output(workspace);
+        if output.contains("Root password reset committed")
+            || output.contains("Root password reset skipped")
+        {
+            return Ok(());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(format!(
+                    "server exited with {status} before the reset completed: {output}"
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => return Err(format!("try_wait failed: {error}")),
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the root password reset did not complete: {output}"
+            ));
+        }
+        sleep(POLL_INTERVAL);
+    }
 }
 
 fn read_process_output(workspace: &Path) -> String {
