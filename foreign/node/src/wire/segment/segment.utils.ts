@@ -22,8 +22,8 @@ export const serializeSegmentsParams = (
   streamId: Id, topicId: Id, partitionId: number, segmentsCount: number,
 ) => {
 
-  if (segmentsCount < 1 || segmentsCount > 1000)
-    throw new Error('Topic partition_count must be between 1 and 1000');
+  if (segmentsCount < 1)
+    throw new Error('segmentsCount must be greater than 0');
 
   const streamIdentifier = serializeIdentifier(streamId);
   const topicIdentifier = serializeIdentifier(topicId);
