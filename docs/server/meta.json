@@ -1,0 +1,20 @@
+{
+  "title": "Server",
+  "pages": [
+    "introduction",
+    "upgrading",
+    "configuration",
+    "topic-options",
+    "stream-options",
+    "storage-engine",
+    "durability",
+    "networking",
+    "security",
+    "external-authentication",
+    "monitoring",
+    "docker",
+    "testing",
+    "linux-tuning",
+    "benchmarking"
+  ]
+}
