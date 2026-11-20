@@ -1818,5 +1818,6 @@ handshake_grace = "10 s"
 # cluster the same disk size, or watch 'data_disk_below_free_space_reserve' on
 # each node.
 #
-# "0" disables the reserve.
+# "0" disables the reserve, as does a data disk that reports no size, such as
+# ramfs.
 free_space_reserve = "1 GiB"
