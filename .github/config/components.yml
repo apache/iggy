@@ -23,6 +23,8 @@ components:
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".cargo/**"
+      - "deny.toml"
+      - "scripts/ci/cargo-deny.sh"
 
   # crates.io publish chain verification. Runs scripts/verify-crates-publish.sh,
   # which spins up cargo-http-registry as a local alt-registry and chain-publishes

@@ -29,6 +29,8 @@ jobs:
     name: Check RustSec advisories
     runs-on: ubuntu-26.04
     timeout-minutes: 30
+    outputs:
+      advisory_ids: ${{ steps.check.outputs.advisory_ids }}
     permissions:
       contents: read
     steps:
@@ -47,7 +49,14 @@ jobs:
         with:
           tool: cargo-deny
       - name: Check advisories
-        run: ./scripts/ci/cargo-deny.sh advisories
+        id: check
+        shell: bash
+        run: |
+          status=0
+          ./scripts/ci/cargo-deny.sh advisories 2>&1 | tee advisory-output.log || status=$?
+          advisory_ids=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]+' advisory-output.log | sort -u | paste -sd ',' - | sed 's/,/, /g' || true)
+          echo "advisory_ids=$advisory_ids" >> "$GITHUB_OUTPUT"
+          exit "$status"
 
   report:
     name: Report advisory failure
@@ -61,11 +70,14 @@ jobs:
     steps:
       - name: Open or update the issue
         uses: actions/github-script@v9
+        env:
+          ADVISORY_IDS: ${{ needs.advisories.outputs.advisory_ids }}
         with:
           script: |
             const title = 'Cargo deny nightly advisories failed';
             const { owner, repo } = context.repo;
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const advisoryIds = process.env.ADVISORY_IDS || 'Unavailable (see workflow logs)';
             const openIssues = await github.paginate(github.rest.issues.listForRepo, {
               owner,
               repo,
@@ -79,7 +91,12 @@ jobs:
                 owner,
                 repo,
                 issue_number: existing.number,
-                body: `The advisory check failed again: ${runUrl}`,
+                body: [
+                  'The advisory check failed again.',
+                  '',
+                  `**Advisory IDs:** ${advisoryIds}`,
+                  `**Workflow run:** ${runUrl}`,
+                ].join('\n'),
               });
               return;
             }
@@ -88,12 +105,13 @@ jobs:
               repo,
               title,
               labels: ['bug'],
-             body: [
+              body: [
                 'The daily `cargo-deny` advisory check failed.',
                 '',
+                `**Advisory IDs:** ${advisoryIds}`,
                 `**Workflow run:** ${runUrl}`,
                 '',
                 'The check monitors RustSec vulnerabilities and unmaintained dependencies.',
                 'Advisory findings are non-blocking on PRs but tracked here for follow-up.',
-             ].join('\n'),
+              ].join('\n'),
             });

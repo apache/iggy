@@ -150,10 +150,6 @@ impl HttpJwtConfig {
     }
 
     pub fn get_decoding_key(&self) -> Result<DecodingKey, IggyError> {
-        if self.decoding_secret.is_empty() {
-            return Err(IggyError::InvalidJwtSecret);
-        }
-
         Ok(match self.get_decoding_secret() {
             JwtSecret::Default(ref secret) => DecodingKey::from_secret(secret.as_ref())
                 .map_err(|_| IggyError::InvalidJwtSecret)?,
@@ -164,10 +160,6 @@ impl HttpJwtConfig {
     }
 
     pub fn get_encoding_key(&self) -> Result<EncodingKey, IggyError> {
-        if self.encoding_secret.is_empty() {
-            return Err(IggyError::InvalidJwtSecret);
-        }
-
         Ok(match self.get_encoding_secret() {
             JwtSecret::Default(ref secret) => EncodingKey::from_secret(secret.as_ref())
                 .map_err(|_| IggyError::InvalidJwtSecret)?,

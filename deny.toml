@@ -15,8 +15,6 @@
 # specific language governing permissions and limitations
 # under the License.
 
-[graph]
-# The output table provides options for how/if diagnostics are outputted
 [output]
 # When outputting inclusion graphs in diagnostics that include features, this
 # option can be used to specify the depth at which feature edges will be added.
@@ -26,9 +24,6 @@
 feature-depth = 1
 
 [advisories]
-# The lint level for crates that have been yanked from their source registry
-yanked = "warn"
-
 # Transitive unmaintained crates do not fail, but direct workspace dependencies do.
 unmaintained = "workspace"
 # Accepted risks. Revisit when safe upstream alternatives are available.
@@ -78,9 +73,7 @@ exceptions = [
 
 [bans]
 multiple-versions = "allow"
-wildcards = "allow"
 
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-registry = ["https://github.com/rust-lang/crates.io-index"]
