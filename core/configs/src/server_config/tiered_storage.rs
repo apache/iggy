@@ -55,6 +55,12 @@ pub const GCS_ENDPOINT: &str = "https://storage.googleapis.com";
 /// up.
 pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
 
+/// The smallest `fresh_pending_bytes` and `fresh_partition_pending_bytes`:
+/// the bytes of messages at which a fresh object closes. Below it, the
+/// sends of one shard, or of one partition, could not fill an object, so
+/// each object would wait for the upload interval.
+pub const FRESH_PENDING_BYTES_MIN: u64 = 4 * 1024 * 1024;
+
 /// The object store that tiered storage keeps segments in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -282,6 +288,20 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_long_term_backlog_limit")]
     #[config_env(leaf)]
     pub long_term_backlog_limit: IggyByteSize,
+    /// The most bytes of messages one shard holds for sends to partitions
+    /// that store them in fresh objects and that have not reached their
+    /// partitions. A send past it is answered as not accepted, unless
+    /// nothing waits. At least [`FRESH_PENDING_BYTES_MIN`].
+    #[serde(default = "default_fresh_pending_bytes")]
+    #[config_env(leaf)]
+    pub fresh_pending_bytes: IggyByteSize,
+    /// The most of `fresh_pending_bytes` that the waiting sends of one
+    /// partition hold. A send past it is answered as not accepted, unless
+    /// nothing of its partition waits. At least [`FRESH_PENDING_BYTES_MIN`]
+    /// and at most `fresh_pending_bytes`.
+    #[serde(default = "default_fresh_partition_pending_bytes")]
+    #[config_env(leaf)]
+    pub fresh_partition_pending_bytes: IggyByteSize,
 }
 
 /// How many jobs of each class the tier service of one shard runs at once,
@@ -376,6 +396,8 @@ impl Default for TieredStorageConfig {
             max_retry_delay: default_max_retry_delay(),
             fresh_upload_interval: default_fresh_upload_interval(),
             long_term_backlog_limit: default_long_term_backlog_limit(),
+            fresh_pending_bytes: default_fresh_pending_bytes(),
+            fresh_partition_pending_bytes: default_fresh_partition_pending_bytes(),
         }
     }
 }
@@ -422,7 +444,8 @@ impl Display for TieredStorageConfig {
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
              url_style: {}, credentials: {}, gcs: {}, jobs: {}, mock_s3: {}, \
              request_timeout: {}, progress_timeout: {}, max_attempts: {}, retry_delay: {}, \
-             max_retry_delay: {}, fresh_upload_interval: {}, long_term_backlog_limit: {} }}",
+             max_retry_delay: {}, fresh_upload_interval: {}, long_term_backlog_limit: {}, \
+             fresh_pending_bytes: {}, fresh_partition_pending_bytes: {} }}",
             self.backend,
             self.prefix,
             self.path,
@@ -441,6 +464,8 @@ impl Display for TieredStorageConfig {
             self.max_retry_delay,
             self.fresh_upload_interval,
             self.long_term_backlog_limit,
+            self.fresh_pending_bytes,
+            self.fresh_partition_pending_bytes,
         )
     }
 }
@@ -578,6 +603,27 @@ impl TieredStorageConfig {
                 IggyByteSize::from(LONG_TERM_BACKLOG_LIMIT_MIN)
             ));
         }
+        self.validate_fresh_pending_bytes()
+    }
+
+    fn validate_fresh_pending_bytes(&self) -> Result<(), ConfigurationError> {
+        let shard_bytes = self.fresh_pending_bytes.as_bytes_u64();
+        let partition_bytes = self.fresh_partition_pending_bytes.as_bytes_u64();
+        let floor = IggyByteSize::from(FRESH_PENDING_BYTES_MIN);
+        if shard_bytes < FRESH_PENDING_BYTES_MIN {
+            return refuse(&format!("fresh_pending_bytes must be at least {floor}"));
+        }
+        if partition_bytes < FRESH_PENDING_BYTES_MIN {
+            return refuse(&format!(
+                "fresh_partition_pending_bytes must be at least {floor}"
+            ));
+        }
+        if partition_bytes > shard_bytes {
+            return refuse(&format!(
+                "fresh_partition_pending_bytes must be at most fresh_pending_bytes ({})",
+                self.fresh_pending_bytes
+            ));
+        }
         Ok(())
     }
 
@@ -651,6 +697,14 @@ fn default_fresh_upload_interval() -> IggyDuration {
 
 fn default_long_term_backlog_limit() -> IggyByteSize {
     IggyByteSize::from(1024 * 1024 * 1024)
+}
+
+fn default_fresh_pending_bytes() -> IggyByteSize {
+    IggyByteSize::from(32 * 1024 * 1024)
+}
+
+fn default_fresh_partition_pending_bytes() -> IggyByteSize {
+    IggyByteSize::from(8 * 1024 * 1024)
 }
 
 const fn default_demand_fetches() -> u32 {
@@ -1003,6 +1057,77 @@ mod tests {
         assert!(limit("64 MiB").validate().is_ok());
         assert!(limit("1 B").validate().is_err());
         assert!(limit("67108863 B").validate().is_err());
+    }
+
+    #[test]
+    fn given_no_fresh_pending_bytes_keys_when_reading_the_section_should_use_32_mib_and_8_mib() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(config.fresh_pending_bytes.as_bytes_u64(), 32 << 20);
+        assert_eq!(config.fresh_partition_pending_bytes.as_bytes_u64(), 8 << 20);
+        assert_eq!(
+            config.fresh_pending_bytes,
+            TieredStorageConfig::default().fresh_pending_bytes
+        );
+        assert_eq!(
+            config.fresh_partition_pending_bytes,
+            TieredStorageConfig::default().fresh_partition_pending_bytes
+        );
+        assert!(config.validate().is_ok());
+        let printed = format!(
+            "fresh_pending_bytes: {}, fresh_partition_pending_bytes: {} }}",
+            config.fresh_pending_bytes, config.fresh_partition_pending_bytes
+        );
+        assert!(config.to_string().ends_with(&printed), "{config}");
+    }
+
+    #[test]
+    fn given_fresh_pending_bytes_keys_when_reading_the_section_should_take_them() {
+        let config: TieredStorageConfig = serde_json::from_str(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered",
+                "fresh_pending_bytes": "128 MiB", "fresh_partition_pending_bytes": "48 MiB"}"#,
+        )
+        .unwrap();
+        let unreadable = serde_json::from_str::<TieredStorageConfig>(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered", "fresh_pending_bytes": "lots"}"#,
+        );
+
+        assert_eq!(config.fresh_pending_bytes.as_bytes_u64(), 128 << 20);
+        assert_eq!(
+            config.fresh_partition_pending_bytes.as_bytes_u64(),
+            48 << 20
+        );
+        assert!(config.validate().is_ok());
+        assert!(unreadable.is_err());
+    }
+
+    #[test]
+    fn given_fresh_pending_bytes_below_one_object_when_validating_should_refuse() {
+        let bounds = |shard: &str, partition: &str| TieredStorageConfig {
+            fresh_pending_bytes: shard.parse().unwrap(),
+            fresh_partition_pending_bytes: partition.parse().unwrap(),
+            ..fs_config()
+        };
+
+        assert!(bounds("4 MiB", "4 MiB").validate().is_ok());
+        assert!(bounds("4194303 B", "4194303 B").validate().is_err());
+        assert!(bounds("0", "0").validate().is_err());
+        assert!(bounds("32 MiB", "4194303 B").validate().is_err());
+        assert!(bounds("32 MiB", "0").validate().is_err());
+    }
+
+    #[test]
+    fn given_a_partition_share_above_the_shard_cap_when_validating_should_refuse() {
+        let bounds = |shard: &str, partition: &str| TieredStorageConfig {
+            fresh_pending_bytes: shard.parse().unwrap(),
+            fresh_partition_pending_bytes: partition.parse().unwrap(),
+            ..fs_config()
+        };
+
+        assert!(bounds("16 MiB", "16 MiB").validate().is_ok());
+        assert!(bounds("16 MiB", "16777217 B").validate().is_err());
+        assert!(bounds("8 MiB", "32 MiB").validate().is_err());
     }
 
     #[test]

@@ -515,10 +515,11 @@ of a producer's home datacenter: a message belongs to the log of the cluster tha
 The producer is acknowledged after its messages are stored in the bucket and the placed batch
 commits. When the bucket does not answer, a send is answered with `TransientNotAccepted` (58),
 which the SDKs retry, after at most 3 attempts at the upload within 10 seconds. A shard also
-answers 58 while it holds 32 MiB of sends that wait for the bucket or for their partition, or
-8 MiB of the sends of one partition. When the messages a partition committed and no long-term
-segment holds yet pass `long_term_backlog_limit`, its sends are slowed instead of refused: each
-waits 10 ms to 250 ms before the shard takes it.
+answers 58 while it holds `fresh_pending_bytes` (32 MiB by default) of sends that wait for the
+bucket or for their partition, or `fresh_partition_pending_bytes` (8 MiB by default) of the sends
+of one partition. [Tunables](#tunables) says when to raise them. When the messages a partition
+committed and no long-term segment holds yet pass `long_term_backlog_limit`, its sends are slowed
+instead of refused: each waits 10 ms to 250 ms before the shard takes it.
 
 A send to a shadow topic returns `ShadowStreamReadOnly` (1021). No SDK retries it, since a
 shadow topic never takes a send.
@@ -974,23 +975,23 @@ the `_total` suffix, and histograms the `_bucket`, `_sum` and `_count` suffixes.
 
 ### Write path
 
-| Metric                               | Kind      | Meaning                                                                              |
-| ------------------------------------ | --------- | ------------------------------------------------------------------------------------ |
-| `fresh_uploads`                      | counter   | Fresh objects the shard stored.                                                      |
-| `fresh_upload_bytes`                 | counter   | Bytes of those objects.                                                              |
-| `fresh_upload_retries`               | counter   | Attempts after an attempt that failed.                                               |
-| `fresh_upload_failures`              | counter   | Objects the bucket refused. Their sends were answered as not accepted.               |
-| `fresh_sends_denied`                 | counter   | Sends the shard answered as not accepted, for any reason.                            |
-| `fresh_sends_denied_partition_share` | counter   | Of those, sends past the 8 MiB that the waiting sends of one partition may hold.     |
-| `fresh_sends_denied_shard_cap`       | counter   | Of those, sends past the 32 MiB that the waiting sends of the shard may hold.        |
-| `fresh_uploads_in_flight`            | gauge     | Uploads that hold one of the shard's `fresh_uploads` slots.                          |
-| `fresh_staged_sends`                 | gauge     | Sends whose messages the shard holds and whose record has not reached its partition. |
-| `fresh_window_wait_seconds`          | histogram | How long an upload window stayed open after its first send.                          |
-| `fresh_upload_seconds`               | histogram | How long the upload of a fresh object took.                                          |
-| `fresh_commit_seconds`               | histogram | How long a send waited for its answer after its fresh object was stored.             |
-| `fresh_object_size_bytes`            | histogram | Size of each fresh object the shard stored, in bytes.                                |
-| `fresh_proof_lag_seconds`            | gauge     | How long the oldest proof row of a committed batch has waited for a stored object.   |
-| `fresh_confirmations`                | counter   | Fresh objects of proof rows alone, stored when no window closed within 250 ms.       |
+| Metric                               | Kind      | Meaning                                                                                                 |
+| ------------------------------------ | --------- | ------------------------------------------------------------------------------------------------------- |
+| `fresh_uploads`                      | counter   | Fresh objects the shard stored.                                                                         |
+| `fresh_upload_bytes`                 | counter   | Bytes of those objects.                                                                                 |
+| `fresh_upload_retries`               | counter   | Attempts after an attempt that failed.                                                                  |
+| `fresh_upload_failures`              | counter   | Objects the bucket refused. Their sends were answered as not accepted.                                  |
+| `fresh_sends_denied`                 | counter   | Sends the shard answered as not accepted, for any reason.                                               |
+| `fresh_sends_denied_partition_share` | counter   | Of those, sends past `fresh_partition_pending_bytes`, what the waiting sends of one partition may hold. |
+| `fresh_sends_denied_shard_cap`       | counter   | Of those, sends past `fresh_pending_bytes`, what the waiting sends of the shard may hold.               |
+| `fresh_uploads_in_flight`            | gauge     | Uploads that hold one of the shard's `fresh_uploads` slots.                                             |
+| `fresh_staged_sends`                 | gauge     | Sends whose messages the shard holds and whose record has not reached its partition.                    |
+| `fresh_window_wait_seconds`          | histogram | How long an upload window stayed open after its first send.                                             |
+| `fresh_upload_seconds`               | histogram | How long the upload of a fresh object took.                                                             |
+| `fresh_commit_seconds`               | histogram | How long a send waited for its answer after its fresh object was stored.                                |
+| `fresh_object_size_bytes`            | histogram | Size of each fresh object the shard stored, in bytes.                                                   |
+| `fresh_proof_lag_seconds`            | gauge     | How long the oldest proof row of a committed batch has waited for a stored object.                      |
+| `fresh_confirmations`                | counter   | Fresh objects of proof rows alone, stored when no window closed within 250 ms.                          |
 
 ### Fresh objects
 
@@ -1052,32 +1053,41 @@ Alert on these first:
 
 ## Tunables
 
-| Key                                        | Default | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| ------------------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer. A geo topic can set its own.                                                                                                                                       |
-| `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 1 s after its last. `0` turns this off. Otherwise at least `64 MiB`.                                                                                 |
-| `[tiered_storage.jobs] fresh_uploads`      | `16`    | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads. A shard keeps to `fresh_upload_interval` only while the slots cover the time of a put: 16 slots cover puts of up to 160 ms at the default 10 ms. What the uploads hold counts in the 32 MiB of waiting sends of the shard, so more slots take no more memory.                                                 |
-| `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that commits on read and fails over reads again at most this long, plus the poll interval of the other datacenter. A geo topic can set its own.                                                                                                                                                                 |
-| `[geo] consumer_offset_upload_interval`    | `50 ms` | The shortest time between two puts of a log's positions for the offsets that groups store themselves, whose answers wait for the put. A store that finds no put running and the interval passed is stored at once. A longer interval makes fewer puts under steady stores, and answers them later. `disabled` answers them at the local commit and leaves them to `positions_publish_interval`. Up to `1 s`. A geo topic can set its own. |
-| `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                                                                                                    |
-| `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer that did not retire. A peer that does not answer delays them this long. A geo topic can set its own.                                                                                                                                                                                                                         |
-| `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                                                                                                         |
-| `[geo] long_term_rewrite_max_interval`     | `10 s`  | The longest wait between two rewrites of a geo partition into long-term segments, which a partition with little load waits. Its shadow topics are about this plus `manifest_poll_interval` behind. A lower value publishes sooner, and leaves more and smaller segments on quiet partitions: more merges and manifest stores, still at most one a second. At least `1 s`, which rewrites every second. A geo topic can set its own.       |
-| `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                                                                                         |
-| `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                                                                                                        |
-| `[geo] tombstone_grace`                    | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage. A geo topic can set its own.                                                                                                                                                                                                                     |
+| Key                                              | Default  | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[tiered_storage] fresh_upload_interval`         | `10 ms`  | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer. A geo topic can set its own.                                                                                                                                       |
+| `[tiered_storage] long_term_backlog_limit`       | `1 GiB`  | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 1 s after its last. `0` turns this off. Otherwise at least `64 MiB`.                                                                                 |
+| `[tiered_storage] fresh_pending_bytes`           | `32 MiB` | The most bytes of messages one shard holds for sends to geo topics that have not reached their partitions: in the open window, in fresh objects that upload or wait for a slot, and in stored objects whose partition has no room yet. A send past it is answered with 58 and sent again by the client. A send larger than it still gets in while nothing waits on the shard. At least `4 MiB`, one fresh object.                         |
+| `[tiered_storage] fresh_partition_pending_bytes` | `8 MiB`  | The most of `fresh_pending_bytes` that the waiting sends of one partition hold. A send past it is answered with 58 the same way. A send larger than it still gets in while nothing of its partition waits. At least `4 MiB`, and at most `fresh_pending_bytes`.                                                                                                                                                                           |
+| `[tiered_storage.jobs] fresh_uploads`            | `16`     | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads. A shard keeps to `fresh_upload_interval` only while the slots cover the time of a put: 16 slots cover puts of up to 160 ms at the default 10 ms. What the uploads hold counts in `fresh_pending_bytes`, so more slots take no more memory.                                                                    |
+| `[geo] positions_publish_interval`               | `1 s`    | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that commits on read and fails over reads again at most this long, plus the poll interval of the other datacenter. A geo topic can set its own.                                                                                                                                                                 |
+| `[geo] consumer_offset_upload_interval`          | `50 ms`  | The shortest time between two puts of a log's positions for the offsets that groups store themselves, whose answers wait for the put. A store that finds no put running and the interval passed is stored at once. A longer interval makes fewer puts under steady stores, and answers them later. `disabled` answers them at the local commit and leaves them to `positions_publish_interval`. Up to `1 s`. A geo topic can set its own. |
+| `[geo] positions_poll_interval`                  | `1 s`    | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                                                                                                    |
+| `[geo] positions_resume_timeout`                 | `10 s`   | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer that did not retire. A peer that does not answer delays them this long. A geo topic can set its own.                                                                                                                                                                                                                         |
+| `[geo] manifest_poll_interval`                   | `5 s`    | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                                                                                                         |
+| `[geo] long_term_rewrite_max_interval`           | `10 s`   | The longest wait between two rewrites of a geo partition into long-term segments, which a partition with little load waits. Its shadow topics are about this plus `manifest_poll_interval` behind. A lower value publishes sooner, and leaves more and smaller segments on quiet partitions: more merges and manifest stores, still at most one a second. At least `1 s`, which rewrites every second. A geo topic can set its own.       |
+| `[geo] recover_cluster_uid`                      | empty    | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                                                                                         |
+| `[geo] recover_unproven`                         | `true`   | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                                                                                                        |
+| `[geo] tombstone_grace`                          | `24 h`   | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage. A geo topic can set its own.                                                                                                                                                                                                                     |
 
 The keys that a geo topic can set for itself are in
 [Durations of a geo topic](#durations-of-a-geo-topic).
+
+The two bounds of waiting sends protect the memory of a node when the bucket or a partition stops
+answering. A node holds at most `fresh_pending_bytes` times its shards for them. The share of one
+partition keeps a partition that stops answering from taking the room of the others on its shard.
+A send past a bound is refused for a moment, and the SDKs send it again. Raise both when producers
+send batches of several MiB to the same partition at once. With batches of 10 KB to 10 MB from 32
+producers on 64 partitions, 17 % of sends were refused once at the defaults.
+`fresh_sends_denied_partition_share` and `fresh_sends_denied_shard_cap` count these refusals.
 
 The other `[tiered_storage]` keys apply to geo topics as they do to tiered topics: the timeouts
 and retries of store calls, and the job caps of `[tiered_storage.jobs]`. Each shard runs one tier
 service per peer with the same caps, so a slow peer takes no slot from the cluster's own bucket.
 
-These values are fixed in this version: 4 MiB per fresh object before it closes early, 32 MiB
-of waiting sends per shard and 8 MiB per partition, 3 attempts and 10 seconds per fresh object,
-64 MiB per long-term segment, 10 minutes before an unnamed fresh object is deleted, and 1 hour
-before an unlisted long-term object is deleted.
+These values are fixed in this version: 4 MiB per fresh object before it closes early, 3 attempts
+and 10 seconds per fresh object, 64 MiB per long-term segment, 10 minutes before an unnamed fresh
+object is deleted, and 1 hour before an unlisted long-term object is deleted.
 
 ## Limits of this version
 
