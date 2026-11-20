@@ -84,7 +84,7 @@ use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use secrecy::ExposeSecret;
 use server_common::Message;
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::mem::offset_of;
@@ -510,9 +510,17 @@ pub(in crate::dispatch) struct ClientDrain {
     /// Whether a frame holds the metadata lane.
     metadata_write: Cell<bool>,
     progress: RefCell<AHashSet<ConsumerProgress>>,
+    /// The queue that the drain task serves, set when the task starts.
+    queue: OnceCell<(ClientRequestQueues, u128)>,
+    /// How many frames waited in that queue ahead of the request that the
+    /// drain took last. They are older than it, and the drain takes no other
+    /// frame while it runs that request inline.
+    passed: Cell<usize>,
     /// The applied metadata frontier when a partition request of this
     /// connection last waited for it in vain. While the frontier stays
-    /// there, the next requests ahead of it are refused without a wait.
+    /// there, the next requests ahead of it are refused without a wait. The
+    /// drain starts from the mark of its connection and hands it back when
+    /// it ends, so a retry on an idle connection does not wait again.
     frontier_wait_expired_at: Cell<Option<u64>>,
     /// The drain task, while it waits for a frame or for room to admit one.
     parked: Cell<Option<Waker>>,
@@ -534,6 +542,8 @@ impl ClientDrain {
             in_flight: Cell::new(0),
             metadata_write: Cell::new(false),
             progress: RefCell::default(),
+            queue: OnceCell::new(),
+            passed: Cell::new(0),
             frontier_wait_expired_at: Cell::new(None),
             parked: Cell::new(None),
         }
@@ -612,10 +622,31 @@ impl InFlight {
     /// did not resolve there yet, or with the lane of metadata that changed
     /// meanwhile. `false` when another request of the connection holds `key`:
     /// nothing orders the two then, and a second holder would free the lane
-    /// of the first when it ends.
-    pub(in crate::dispatch) fn claim_progress(&mut self, key: ConsumerProgress) -> bool {
+    /// of the first when it ends. Also `false` when an older frame of the
+    /// connection still waits in the queue for `key`, as `resolve` reads its
+    /// lanes now: the write would pass it.
+    pub(in crate::dispatch) fn claim_progress(
+        &mut self,
+        key: ConsumerProgress,
+        resolve: impl Fn(&Message<GenericHeader>) -> Option<ProgressKeys>,
+    ) -> bool {
         if matches!(self.progress, Some(ProgressKeys::One(held)) if held == key) {
             return true;
+        }
+        // A cancel can remove one of the frames that the drain passed. The
+        // check then reads one younger frame, which only refuses more.
+        if let Some((queues, client_id)) = self.drain.queue.get()
+            && queues.borrow().get(client_id).is_some_and(|queue| {
+                queue
+                    .requests
+                    .iter()
+                    .take(self.drain.passed.get())
+                    .any(|queued| {
+                        resolve(&queued.message).is_some_and(|keys| keys.as_slice().contains(&key))
+                    })
+            })
+        {
+            return false;
         }
         let mut progress = self.drain.progress.borrow_mut();
         if !progress.insert(key) {
@@ -663,6 +694,10 @@ async fn drain_client_requests<B, MJ, S, SB>(
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    drain.queue.get_or_init(|| (Rc::clone(&queues), client_id));
+    drain
+        .frontier_wait_expired_at
+        .set(sessions.borrow().frontier_wait_expired_at(client_id));
     loop {
         let metadata_frontier = shard.plane.metadata().applied_frontier().get();
         let next = pop_next_client_request(&queues, client_id, |queued| {
@@ -690,7 +725,8 @@ async fn drain_client_requests<B, MJ, S, SB>(
                         && !keys.as_slice().iter().any(|key| held.contains(key))
                 })
         });
-        if let Some(queued) = next {
+        if let Some((passed, queued)) = next {
+            drain.passed.set(passed);
             let progress = queued
                 .progress
                 .and_then(|(_, keys)| keys)
@@ -707,6 +743,9 @@ async fn drain_client_requests<B, MJ, S, SB>(
             )
             .await;
         } else if drain.in_flight.get() == 0 {
+            sessions
+                .borrow_mut()
+                .record_frontier_wait_expired(client_id, drain.frontier_wait_expired_at.get());
             return;
         } else {
             drain.park().await;
@@ -714,11 +753,13 @@ async fn drain_client_requests<B, MJ, S, SB>(
     }
 }
 
+/// Takes the next frame of `client_id` that can run, with the number of
+/// older frames that stay queued ahead of it.
 fn pop_next_client_request(
     queues: &ClientRequestQueues,
     client_id: u128,
     mut ready: impl FnMut(&mut QueuedClientRequest) -> bool,
-) -> Option<QueuedClientRequest> {
+) -> Option<(usize, QueuedClientRequest)> {
     // Freed as soon as it drains empty. Keeping it would cost the connection
     // one `VecDeque` (at its peak depth, since `pop_front` never gives
     // capacity back), and the connection-lost hook cannot be the sole owner:
@@ -763,7 +804,7 @@ fn pop_next_client_request(
     if queue.requests.is_empty() {
         queues.remove(&client_id);
     }
-    message
+    message.map(|message| (index, message))
 }
 
 fn is_ping(message: &Message<GenericHeader>) -> bool {
@@ -4146,9 +4187,24 @@ mod tests {
         consumer: WireConsumer,
         minimum_metadata_op: u64,
     ) -> Message<GenericHeader> {
+        root_offset_store_in(
+            WireIdentifier::numeric(0),
+            request,
+            consumer,
+            minimum_metadata_op,
+        )
+    }
+
+    /// [`root_offset_store`] that names the first stream as `stream_id`.
+    fn root_offset_store_in(
+        stream_id: WireIdentifier,
+        request: u64,
+        consumer: WireConsumer,
+        minimum_metadata_op: u64,
+    ) -> Message<GenericHeader> {
         let body = StoreConsumerOffsetRequest {
             consumer,
-            stream_id: WireIdentifier::numeric(0),
+            stream_id,
             topic_id: WireIdentifier::numeric(0),
             partition_id: Some(0),
             offset: 7,
@@ -4478,6 +4534,186 @@ mod tests {
         );
         drop(held);
         assert!(!drain.progress.borrow().contains(&key));
+    }
+
+    /// The drain passes a read that waits for its lane, and takes a store
+    /// behind it that names the stream by a name this node has not applied
+    /// yet. The holder of the lane can end during the frontier wait of the
+    /// store. The store then took the free lane and reached the owner before
+    /// the older read.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_store_that_resolves_to_the_lane_of_an_older_queued_read_when_its_frontier_wait_ends_should_refuse_it()
+     {
+        const READ_REQUEST: u64 = 1;
+        const STORE_REQUEST: u64 = 2;
+        const POLL_ROUNDS: usize = 50;
+        const NEW_NAME: &str = "renamed";
+        let (bus, shard, host, owner_inbox) = root_host_with_owner().await;
+        let namespace = create_one_partition(&shard);
+        shard
+            .shards_table()
+            .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+        let frontier = shard.plane.metadata().applied_frontier();
+        let renamed_frontier = frontier.get() + 1;
+        let config = Arc::new(ServerConfig::default());
+        let drain = Rc::new(ClientDrain::new(&config));
+        let read = root_offset_read(&shard, namespace, READ_REQUEST, plain_consumer());
+        let key = progress_key(&shard, &read).expect("the read resolves its partition");
+        let holder = drain.admit_progress(ProgressKeys::One(key));
+        let queues = root_queue(
+            &bus,
+            [
+                read,
+                root_offset_store_in(
+                    WireIdentifier::named(NEW_NAME).unwrap(),
+                    STORE_REQUEST,
+                    plain_consumer(),
+                    renamed_frontier,
+                ),
+            ],
+        );
+        let running = drain_client_requests(
+            Rc::clone(&shard),
+            Rc::clone(host.sessions()),
+            config,
+            Rc::clone(&queues),
+            &drain,
+            ROOT_TRANSPORT,
+        );
+        futures::pin_mut!(running);
+        assert!(futures::poll!(running.as_mut()).is_pending());
+        assert_eq!(
+            queued_requests(&queues),
+            [READ_REQUEST],
+            "the drain passes the read and takes the store, which has no lane yet"
+        );
+        assert!(bus.client_replies.borrow().is_empty());
+
+        let renamed = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::UpdateStreamResolved,
+                0,
+                4,
+                &UpdateStreamResolvedRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    name: Some(WireName::new(NEW_NAME).unwrap()),
+                    explicit_options: WireOptions::empty(),
+                    derived_options: WireOptions::empty(),
+                }
+                .to_bytes(),
+            ))
+            .unwrap();
+        assert_eq!(renamed.code, 0);
+        drop(holder);
+        frontier.advance(renamed_frontier);
+        for _ in 0..POLL_ROUNDS {
+            assert!(futures::poll!(running.as_mut()).is_pending());
+            if !bus.client_replies.borrow().is_empty() {
+                break;
+            }
+            settle().await;
+        }
+
+        assert_eq!(
+            bus.client_replies
+                .borrow()
+                .iter()
+                .map(|(_, reply)| (reply_request(reply), reply_status(reply)))
+                .collect::<Vec<_>>(),
+            [(STORE_REQUEST, IggyError::TransientNotAccepted.as_code())],
+            "a store that would pass the older read of its offset must be refused"
+        );
+        let mut reached_owner = None;
+        for _ in 0..POLL_ROUNDS {
+            assert!(futures::poll!(running.as_mut()).is_pending());
+            reached_owner = owner_inbox.try_recv().ok();
+            if reached_owner.is_some() {
+                break;
+            }
+            settle().await;
+        }
+        assert!(
+            matches!(
+                reached_owner,
+                Some(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { .. }))
+            ),
+            "the read must reach the owner, and the store must not"
+        );
+    }
+
+    /// A drain ends when its connection has nothing queued and nothing in
+    /// flight, so a client that retries one request at a time gets a new
+    /// drain for each retry. The mark of a frontier wait in vain ended with
+    /// its drain, and each retry waited one more budget.
+    #[compio::test]
+    async fn given_a_frontier_wait_in_vain_when_the_connection_retries_on_a_new_drain_should_refuse_at_once_until_the_frontier_moves()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+        commit_root_session(&shard);
+        let shard_handle = Rc::new(RefCell::new(Some(Rc::downgrade(&shard))));
+        let sessions = Rc::new(RefCell::new(SessionManager::new()));
+        bind_root_session(&shard, &sessions).await;
+        let server_config = Arc::new(ServerConfig::default());
+        let queues: ClientRequestQueues = Rc::default();
+        let active: ActiveClientRequests = Rc::default();
+        let frontier = shard.plane.metadata().applied_frontier();
+        let budget = frontier.partition_request_budget();
+        bus.instant_timers.set(true);
+        let slept_before = bus.sleeps.borrow().len();
+        let frontier_waits = || bus.sleeps.borrow()[slept_before..].to_vec();
+        let send_ahead_of_the_frontier = |request| {
+            enqueue_client_request(
+                &bus,
+                &shard_handle,
+                &sessions,
+                &server_config,
+                &queues,
+                &active,
+                ROOT_TRANSPORT,
+                root_offset_store(request, plain_consumer(), frontier.get() + 1),
+            );
+        };
+
+        send_ahead_of_the_frontier(1);
+        await_replies(&bus, 1).await;
+        settle().await;
+        assert!(
+            active.borrow().is_empty(),
+            "the drain ends with its only request"
+        );
+        assert_eq!(frontier_waits(), [budget]);
+
+        send_ahead_of_the_frontier(2);
+        await_replies(&bus, 2).await;
+        settle().await;
+        assert!(active.borrow().is_empty());
+        assert_eq!(
+            frontier_waits(),
+            [budget],
+            "the retry on a new drain waits for nothing"
+        );
+
+        frontier.advance(frontier.get() + 1);
+        send_ahead_of_the_frontier(3);
+        await_replies(&bus, 3).await;
+        assert_eq!(
+            frontier_waits(),
+            [budget, budget],
+            "the connection waits again for a frontier that moved"
+        );
+        assert_eq!(
+            bus.client_replies
+                .borrow()
+                .iter()
+                .map(|(_, reply)| reply_status(reply))
+                .collect::<Vec<_>>(),
+            [IggyError::TransientNotAccepted.as_code(); 3]
+        );
     }
 
     /// A fetch of `targets` of the first topic by the root session, sent as
@@ -4967,11 +5203,12 @@ mod tests {
                     .request
                     != BLOCKED
             };
-            let ping = pop_next_client_request(&queues, ROOT_TRANSPORT, ready).unwrap();
+            let (_, ping) = pop_next_client_request(&queues, ROOT_TRANSPORT, ready).unwrap();
             assert!(is_ping(&ping.message));
             assert!(pop_next_client_request(&queues, ROOT_TRANSPORT, ready).is_none());
             for expected in [BLOCKED, BARRIER, READ] {
-                let message = pop_next_client_request(&queues, ROOT_TRANSPORT, |_| true).unwrap();
+                let (_, message) =
+                    pop_next_client_request(&queues, ROOT_TRANSPORT, |_| true).unwrap();
                 assert_eq!(
                     message
                         .message

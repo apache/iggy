@@ -2113,7 +2113,7 @@ async fn given_stored_offsets_of_this_shard_and_another_when_read_should_read_in
             namespace,
             read,
             reply,
-            hold_deadline,
+            hold,
         })) = remote_inbox.recv().await
         else {
             panic!("the other owner gets one frame");
@@ -2125,9 +2125,7 @@ async fn given_stored_offsets_of_this_shard_and_another_when_read_should_read_in
             reads.iter().map(|read| read.namespace).collect::<Vec<_>>(),
             [partition_namespace(1), partition_namespace(2)]
         );
-        owner
-            .on_partition_read(namespace, read, reply, hold_deadline)
-            .await;
+        owner.on_partition_read(namespace, read, reply, hold).await;
     };
 
     let (offsets, ()) = futures::join!(
@@ -2243,11 +2241,9 @@ async fn pump(shard: &TestShard, inbox: &Inbox) {
                 namespace,
                 read,
                 reply,
-                hold_deadline,
+                hold,
             } => {
-                shard
-                    .on_partition_read(namespace, read, reply, hold_deadline)
-                    .await;
+                shard.on_partition_read(namespace, read, reply, hold).await;
             }
             _ => panic!("a readiness test sends readiness frames and reads only"),
         }

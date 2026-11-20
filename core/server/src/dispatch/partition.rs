@@ -313,34 +313,6 @@ where
         .await;
         return PartitionAdmission::Denied;
     }
-    // The drain picks the lane of an offset write from the metadata of this
-    // node before the waits above. The write can resolve only after them, or
-    // to another key: a group created again under its name gets a new id. A
-    // read of the offset that the connection sent behind the write must still
-    // wait for it. The key comes from the request as the client sent it, as
-    // the drain keys the frames behind it.
-    if matches!(
-        header.operation,
-        Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
-    ) && let Some(in_flight) = in_flight.as_mut()
-        && let Some(key) = progress_key(shard, request.as_generic())
-        && !in_flight.claim_progress(key)
-    {
-        warn!(
-            transport_client_id,
-            namespace,
-            operation = ?header.operation,
-            "offset write resolved after the drain took it, behind a request of its lane; replying transient"
-        );
-        send_deny_reply(
-            shard,
-            origin,
-            &header,
-            IggyError::TransientNotAccepted.as_code(),
-        )
-        .await;
-        return PartitionAdmission::Denied;
-    }
     // A group consumer-offset op carries the group NAME on the wire; the
     // partition plane keys the offset by the group's monotonic id (the same
     // key the poll path auto-commits under and the read path resolves), so
@@ -361,6 +333,33 @@ where
             return PartitionAdmission::Denied;
         }
     };
+    // The drain picks the lane of an offset write from the metadata of this
+    // node before the waits above. The write can resolve only after them, or
+    // to another key: a group created again under its name gets a new id. A
+    // read of the offset that the connection sent behind the write must still
+    // wait for it. The key names the consumer of the request that replicates,
+    // so the lane and the write agree on the group id.
+    if let Some(in_flight) = in_flight.as_mut()
+        && let Some((kind, consumer_id)) = offset_write_consumer(&request)
+        && !in_flight.claim_progress((namespace, kind, consumer_id), |queued| {
+            progress_keys(shard, queued)
+        })
+    {
+        warn!(
+            transport_client_id,
+            namespace,
+            operation = ?header.operation,
+            "offset write resolved after the drain took it, behind a request of its lane; replying transient"
+        );
+        send_deny_reply(
+            shard,
+            origin,
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return PartitionAdmission::Denied;
+    }
     let request = request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
         *new_header = header;
         new_header.group = namespace;
@@ -602,6 +601,30 @@ where
         })
         .collect::<Option<Vec<_>>>()?;
     Some(ProgressKeys::Many(keys))
+}
+
+/// The consumer kind and id that key the progress lane of an offset write,
+/// read from the request that replicates. Its group id is the one that
+/// [`maybe_rewrite_consumer_offset_request`] resolved, so the lane and the
+/// write name one group.
+fn offset_write_consumer(request: &Message<RoutedRequestHeader>) -> Option<(u8, usize)> {
+    if !matches!(
+        request.header().operation,
+        Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
+    ) {
+        return None;
+    }
+    // Both bodies start with the consumer.
+    let (consumer, _) = WireConsumer::decode(request_body(request)).ok()?;
+    let target = if consumer.kind == KIND_EXTERNAL_GROUP {
+        let WireIdentifier::Numeric(group_id) = consumer.id else {
+            return None;
+        };
+        ConsumerOffsetTarget::ExternalGroup(group_id)
+    } else {
+        ConsumerOffsetTarget::Consumer(polling_consumer_from_wire(&consumer, 0).ok()?)
+    };
+    progress_consumer(&target)
 }
 
 /// The consumer kind and id that key the progress lane of `target`.
@@ -1268,9 +1291,9 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
 ///
 /// After a wait in vain, `drain` refuses the next requests ahead of the
 /// frontier at once, until the frontier moves, so the frames behind such a
-/// request do not wait one after the other. The mark is per connection:
-/// `minimum_metadata_op` comes from the client, so a mark of the node would
-/// let one client end the wait of all. A request without a drain always
+/// request do not wait one after the other. The mark is per connection and
+/// outlives the drain: `minimum_metadata_op` comes from the client, so a
+/// mark of the node would let one client end the wait of all. A request without a drain always
 /// waits. A wait that `admission_left` cut short sets no mark: it says how
 /// long the request was on its way, not that the frontier stays behind.
 ///
@@ -2544,6 +2567,90 @@ mod tests {
             expected,
             "stored-offset reads must still wait for explicit progress"
         );
+    }
+
+    /// The drain keys a read of a stored offset by [`progress_key`]. An
+    /// offset write claims its lane from the request that replicates. A read
+    /// can pass a write of its offset when the two lanes differ.
+    #[compio::test]
+    async fn given_an_offset_write_of_each_consumer_kind_when_rewritten_should_claim_the_lane_of_a_read_of_its_offset()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = create_one_partition(&shard);
+        create_consumer_group(&shard);
+        let group = || WireIdentifier::named("group").unwrap();
+        for consumer in [
+            WireConsumer::consumer(WireIdentifier::numeric(7)),
+            WireConsumer::consumer(WireIdentifier::named("worker").unwrap()),
+            WireConsumer::consumer_group(group()),
+            WireConsumer::external_group(group()),
+        ] {
+            let mut read = request_message(
+                Operation::NonReplicated,
+                1,
+                1,
+                1,
+                &GetConsumerOffsetRequest {
+                    consumer: consumer.clone(),
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(0),
+                    partition_id: Some(0),
+                }
+                .to_bytes(),
+            );
+            bytemuck::checked::from_bytes_mut::<RequestHeader>(
+                &mut read.as_mut_slice()[..size_of::<RequestHeader>()],
+            )
+            .reserved[..4]
+                .copy_from_slice(&GET_CONSUMER_OFFSET_CODE.to_le_bytes());
+            let read_lane = progress_key(&shard, &read.into_generic());
+            assert!(read_lane.is_some(), "a read of {consumer:?} has a lane");
+            let writes = [
+                request_message(
+                    Operation::StoreConsumerOffset,
+                    1,
+                    1,
+                    2,
+                    &StoreConsumerOffsetRequest {
+                        consumer: consumer.clone(),
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                        partition_id: Some(0),
+                        offset: 1,
+                        ack: iggy_binary_protocol::AckLevel::Quorum,
+                    }
+                    .to_bytes(),
+                ),
+                request_message(
+                    Operation::DeleteConsumerOffset,
+                    1,
+                    1,
+                    3,
+                    &DeleteConsumerOffsetRequest {
+                        consumer: consumer.clone(),
+                        stream_id: WireIdentifier::numeric(0),
+                        topic_id: WireIdentifier::numeric(0),
+                        partition_id: Some(0),
+                        ack: iggy_binary_protocol::AckLevel::Quorum,
+                    }
+                    .to_bytes(),
+                ),
+            ];
+            for write in writes {
+                let operation = write.header().operation;
+                let write = maybe_rewrite_consumer_offset_request(&shard, write).unwrap();
+                assert_eq!(
+                    offset_write_consumer(&write).map(|(kind, consumer_id)| (
+                        namespace.inner(),
+                        kind,
+                        consumer_id
+                    )),
+                    read_lane,
+                    "{operation:?} of {consumer:?}"
+                );
+            }
+        }
     }
 
     #[compio::test]
