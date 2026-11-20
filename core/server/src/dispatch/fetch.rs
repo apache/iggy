@@ -119,6 +119,7 @@ where
 {
     let started = shard.bus.monotonic_micros();
     let timeout = started.saturating_add(wire.request_timeout_us);
+    let read_deadline = usable_read_deadline(started, timeout)?;
     let (mut targets, mut refused) =
         resolve_fetch(shard, wire, request.header(), consumer_client_id, user_id)?;
     let caller = DeferredPollContext {
@@ -133,11 +134,10 @@ where
     let asked: Vec<usize> = (0..targets.len())
         .filter(|index| targets[*index].next)
         .collect();
-    let read_deadline = timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US);
     // No owner holds these reads: `started` is not after its clock.
     let unheld = OffsetReadDeadlines {
         hold_until: started,
-        answer_by: read_deadline,
+        answer_by: owner_wait_end(read_deadline),
     };
     let (starts, (mut replies, mut held_reads)) = join(
         next_starts(shard, &targets, &asked, unheld),
@@ -217,6 +217,29 @@ where
     fetch.fire_to_reply = Duration::from_micros(shard.bus.monotonic_micros().saturating_sub(fired));
     shard.metrics().record_fetch(&fetch);
     Ok((reply, held_reads))
+}
+
+/// The time by which each read of a fetch must commit.
+///
+/// A fetch that waited in the drain can start with no time left for a read
+/// after the waits for its owners. It stored nothing, so it is refused and
+/// its client can send it again.
+const fn usable_read_deadline(started: u64, timeout: u64) -> Result<u64, IggyError> {
+    let read_deadline = timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US);
+    if owner_wait_end(read_deadline) <= started {
+        return Err(IggyError::TransientNotAccepted);
+    }
+    Ok(read_deadline)
+}
+
+/// The end of each wait for an owner that comes before the reads of a fetch.
+///
+/// An owner that does not answer holds the admission of a wait for
+/// `PARTITION_READ_TIMEOUT`, and a stored-offset read until the wait for it
+/// ends. These waits end half a margin before the read deadline, so the
+/// targets of the owners that answer still commit in time.
+const fn owner_wait_end(read_deadline: u64) -> u64 {
+    read_deadline.saturating_sub(FETCH_REPLY_MARGIN_US / 2)
 }
 
 /// The wait and the reads of a fetch after its stored-offset reads, when a
@@ -318,9 +341,14 @@ where
 ///   the read deadline.
 /// - When the held reads answer first, or the wait ends with nothing to
 ///   return, the targets that got their start join, and the wait runs once
-///   more over every target. That wait ends half a margin before the read
-///   deadline at the latest, and every target is read then. After the wait
-///   of the request ended, any message of the other targets ends the hold.
+///   more over every target. After the wait of the request ended, any
+///   message of the other targets ends the hold.
+///
+/// An owner that does not answer cannot take the time in which the other
+/// targets are read: the wait for a held read, and the last wait over every
+/// target, end half a margin before the read deadline at the latest, and
+/// every target is read then. That also bounds the wait of a fetch whose
+/// targets all have their start.
 ///
 /// Also returns the targets that their held read refused, which leave
 /// `targets`.
@@ -342,54 +370,49 @@ where
     let pending: Vec<usize> = (skip..targets.len())
         .filter(|index| !targets[*index].start_known())
         .collect();
-    if pending.is_empty() {
-        let waiting = &targets[skip..];
-        let ready = wait_for_ready(shard, caller, waiting, wire, wire.min_count, wait_end).await?;
-        return Ok((ready, Vec::new()));
-    }
     let read_deadline = timeout.saturating_sub(2 * FETCH_REPLY_MARGIN_US);
-    // One margin before the read deadline. An owner ends a hold on its tick,
-    // which is far shorter, so its answer arrives before the wait for it
-    // ends, and the targets that got their start can still be read.
-    let hold_until = read_deadline.saturating_sub(FETCH_REPLY_MARGIN_US);
-    let starts = {
-        let known = &targets[skip..];
-        let mut held = pin!(next_starts(
-            shard,
-            targets,
-            &pending,
-            OffsetReadDeadlines {
-                hold_until,
-                answer_by: read_deadline,
-            },
-        ));
-        let mut starts = None;
-        for (end, min_count) in [(wait_end, wire.min_count), (hold_until, ANY_MESSAGE)] {
-            let wait = pin!(wait_for_ready(shard, caller, known, wire, min_count, end));
-            match select(held.as_mut(), wait).await {
-                Either::Left((answered, _)) => {
-                    starts = Some(answered);
-                    break;
-                }
-                Either::Right((ready, _)) => {
-                    let ready = ready?;
-                    if !ready.0.is_empty() {
-                        return Ok((ready, Vec::new()));
+    let cutoff = owner_wait_end(read_deadline);
+    let refused = if pending.is_empty() {
+        Vec::new()
+    } else {
+        // One margin before the read deadline. An owner ends a hold on its tick,
+        // which is far shorter, so its answer arrives before `cutoff`.
+        let hold_until = read_deadline.saturating_sub(FETCH_REPLY_MARGIN_US);
+        let starts = {
+            let known = &targets[skip..];
+            let mut held = pin!(next_starts(
+                shard,
+                targets,
+                &pending,
+                OffsetReadDeadlines {
+                    hold_until,
+                    answer_by: cutoff,
+                },
+            ));
+            let mut starts = None;
+            for (end, min_count) in [(wait_end, wire.min_count), (hold_until, ANY_MESSAGE)] {
+                let wait = pin!(wait_for_ready(shard, caller, known, wire, min_count, end));
+                match select(held.as_mut(), wait).await {
+                    Either::Left((answered, _)) => {
+                        starts = Some(answered);
+                        break;
+                    }
+                    Either::Right((ready, _)) => {
+                        let ready = ready?;
+                        if !ready.0.is_empty() {
+                            return Ok((ready, Vec::new()));
+                        }
                     }
                 }
             }
-        }
-        match starts {
-            Some(starts) => starts,
-            None => held.await,
-        }
+            match starts {
+                Some(starts) => starts,
+                None => held.await,
+            }
+        };
+        apply_next_starts(targets, (&pending, starts), false, false)?.0
     };
-    let (refused, _) = apply_next_starts(targets, (&pending, starts), false, false)?;
     let waiting = &targets[skip..];
-    // An evaluator that does not answer the admission of this wait holds it
-    // for `PARTITION_READ_TIMEOUT`, and the held reads can end close to the
-    // read deadline. Half a margin before it leaves the reads time to commit.
-    let cutoff = read_deadline.saturating_sub(FETCH_REPLY_MARGIN_US / 2);
     let timer = pin!(shard.bus.sleep(Duration::from_micros(
         cutoff.saturating_sub(shard.bus.monotonic_micros())
     )));
@@ -554,8 +577,8 @@ fn served_sections(
 
 /// Runs the allotted reads and collects the replies that arrive before the
 /// reply deadline, by target, with the session room of each answered read
-/// settled to the bytes it returned. The reads that did not answer by then are
-/// dropped.
+/// settled to the bytes it returned, and that of each refused read released.
+/// The reads that did not answer by then are dropped.
 ///
 /// Only the first read holds the turn to return a first record above its
 /// bytes, alone, and every other read follows it. A read whose bytes
@@ -635,7 +658,11 @@ where
             Some(PartitionReadReply::Poll { fragments, .. }) => fragments.is_empty(),
             _ => false,
         };
-        if let Some(mut reservation) = reservation {
+        // A refused read stored nothing and adds nothing to the reply. Its
+        // room goes back now, so the fetch can read that target again.
+        if let Some(mut reservation) = reservation
+            && !matches!(&reply, Some(PartitionReadReply::Rejected(_)))
+        {
             reservation.settle(bytes);
             held_reads.push(reservation);
         }
@@ -1686,6 +1713,24 @@ mod tests {
         // The timeout ran from the start of the handler, so a frame that waited
         // in the drain after its client gave up still waited, read and stored
         // offsets for a reply nobody took.
+        assert_queued_fetch_refused_unread(REQUEST_TIMEOUT_US).await;
+    }
+
+    #[compio::test]
+    async fn given_a_fetch_queued_until_no_read_fits_its_deadline_when_served_should_refuse_it_unread()
+     {
+        const NO_TIME_AFTER_OWNER_WAITS: u64 = 5 * FETCH_REPLY_MARGIN_US / 2;
+        // One margin is left of the timeout, so the read deadline is before
+        // the start. The stored-offset reads then got a hold end after the
+        // end of the wait for them.
+        assert_queued_fetch_refused_unread(REQUEST_TIMEOUT_US - FETCH_REPLY_MARGIN_US).await;
+        // The waits for the owners end at the start, so no read can follow.
+        assert_queued_fetch_refused_unread(REQUEST_TIMEOUT_US - NO_TIME_AFTER_OWNER_WAITS).await;
+    }
+
+    /// Serves a committing fetch of a `Next` target whose frame waited
+    /// `queued_us` in the drain. It must be refused and reach no owner.
+    async fn assert_queued_fetch_refused_unread(queued_us: u64) {
         const ARRIVED: u64 = 1_000_000;
         let fixture = Fixture::new(1);
         fixture.sessions.borrow_mut().ensure_connection(
@@ -1696,10 +1741,7 @@ mod tests {
         );
         fixture.bus.monotonic.set(Some(ARRIVED));
         let origin = ClientOrigin::capture(&fixture.bus, TRANSPORT);
-        fixture
-            .bus
-            .monotonic
-            .set(Some(ARRIVED + REQUEST_TIMEOUT_US));
+        fixture.bus.monotonic.set(Some(ARRIVED + queued_us));
         let wire = FetchMessagesRequest {
             auto_commit: true,
             ..fetch_of(vec![fixture.target(0, WirePollingStrategy::next())])
@@ -1940,14 +1982,15 @@ mod tests {
         );
     }
 
-    /// Two `Next` targets whose owner never answers the stored-offset reads,
-    /// with a read budget of [`UNANSWERED_READ_BUDGET_US`]. The fixture skips
-    /// the wire check of the timers, so the test waits milliseconds, not the
-    /// 600 ms that the shortest valid request leaves.
+    /// Two `Next` targets whose owner never answers the stored-offset reads.
+    /// The wait for that owner lasts [`UNANSWERED_READ_BUDGET_US`], and half a
+    /// margin is left for reads after it. The fixture skips the wire check of
+    /// the timers, so the test waits milliseconds, not the 500 ms that the
+    /// shortest valid request gives the owner.
     fn fetch_with_unanswered_stored_offsets(fixture: &Fixture) -> FetchMessagesRequest {
         FetchMessagesRequest {
             wait_us: 0,
-            request_timeout_us: 2 * FETCH_REPLY_MARGIN_US + UNANSWERED_READ_BUDGET_US,
+            request_timeout_us: 5 * FETCH_REPLY_MARGIN_US / 2 + UNANSWERED_READ_BUDGET_US,
             min_count: 1,
             auto_commit: true,
             ..fetch_of(vec![
@@ -1979,7 +2022,7 @@ mod tests {
             .answer(served(fixture.context(0), whole(&record)));
         assert!(
             futures::poll!(fetch.as_mut()).is_pending(),
-            "the stored-offset reads have until the read deadline"
+            "the stored-offset reads have until the wait for their owner ends"
         );
 
         let reply = compio::time::timeout(Duration::from_micros(FETCH_REPLY_MARGIN_US), fetch)
@@ -2002,7 +2045,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_next_targets_when_fetching_should_bound_the_stored_offset_reads_by_the_read_deadline()
+    async fn given_next_targets_when_fetching_should_end_the_stored_offset_reads_before_the_read_deadline()
      {
         const STARTED: u64 = 1_000_000;
         let fixture = Fixture::new(2);
@@ -2016,19 +2059,21 @@ mod tests {
         assert!(futures::poll!(fetch.as_mut()).is_pending());
 
         let read_deadline = STARTED + REQUEST_TIMEOUT_US - 2 * FETCH_REPLY_MARGIN_US;
+        let owner_wait = Duration::from_micros(read_deadline - FETCH_REPLY_MARGIN_US / 2 - STARTED);
+        let owner_waits = || {
+            let sleeps = fixture.bus.sleeps.borrow();
+            sleeps.iter().filter(|sleep| **sleep == owner_wait).count()
+        };
         let mut work = fixture.owner_work();
         let (first, hold_until) = work.offsets.pop().expect("the fetch reads stored offsets");
         assert_eq!(
             hold_until, STARTED,
             "no owner holds the first stored-offset reads"
         );
-        assert!(
-            fixture
-                .bus
-                .sleeps
-                .borrow()
-                .contains(&Duration::from_micros(read_deadline - STARTED)),
-            "the wait for the owner ends at the read deadline"
+        assert_eq!(
+            owner_waits(),
+            1,
+            "the wait for the owner ends half a margin before the read deadline"
         );
         first.answer(BTreeMap::from([(0, cannot_serve()), (1, cannot_serve())]));
         assert!(futures::poll!(fetch.as_mut()).is_pending());
@@ -2044,6 +2089,51 @@ mod tests {
             [read_deadline - FETCH_REPLY_MARGIN_US],
             "an owner ends its hold one margin before the read deadline"
         );
+        assert_eq!(
+            owner_waits(),
+            2,
+            "the wait for a held read ends half a margin before the read deadline too"
+        );
+    }
+
+    #[compio::test]
+    async fn given_explicit_offsets_when_the_owner_never_answers_the_wait_should_read_every_target_before_the_read_deadline()
+     {
+        // Every target of this fetch has its start, so its wait ran without
+        // a bound of the fetch. An owner that did not answer the admission
+        // kept it for the whole read timeout, past the read deadline.
+        const STARTED: u64 = 1_000_000;
+        let fixture = Fixture::new(2);
+        fixture.bus.monotonic.set(Some(STARTED));
+        let record = stored_batch_record(None);
+        let wire = fetch_of(vec![
+            fixture.target(0, WirePollingStrategy::offset(0)),
+            fixture.target(1, WirePollingStrategy::offset(0)),
+        ]);
+        let (fire, timer) = oneshot::channel();
+        *fixture.bus.held_timer.borrow_mut() = Some(timer);
+        let fetch = fixture.fetch(&wire);
+        let mut fetch = pin!(fetch);
+        assert!(futures::poll!(fetch.as_mut()).is_pending());
+
+        let read_deadline = STARTED + REQUEST_TIMEOUT_US - 2 * FETCH_REPLY_MARGIN_US;
+        let cutoff = read_deadline - FETCH_REPLY_MARGIN_US / 2;
+        assert_eq!(
+            fixture.bus.sleeps.borrow().first(),
+            Some(&Duration::from_micros(cutoff - STARTED)),
+            "the wait ends half a margin before the read deadline"
+        );
+        let unanswered = fixture.owner_work();
+        assert_eq!(unanswered.waits.len(), 1, "the fetch waits for its targets");
+        assert!(
+            unanswered.reads.is_empty(),
+            "no target is read before the timer fires"
+        );
+
+        fixture.bus.monotonic.set(Some(cutoff));
+        fire.send(()).expect("the wait holds the timer");
+        assert_both_targets_read(&fixture, fetch, &record).await;
+        drop(unanswered);
     }
 
     #[compio::test]
@@ -2317,19 +2407,31 @@ mod tests {
 
         fixture.bus.monotonic.set(Some(cutoff));
         fire.send(()).expect("the restarted wait holds the timer");
+        assert_both_targets_read(&fixture, fetch, &record).await;
+        drop((beside_hold, restarted));
+    }
+
+    /// Polls a fetch of two targets whose wait just ended on its timer. It
+    /// must read both targets, the second after the first answered, and
+    /// answer a section for each.
+    async fn assert_both_targets_read(
+        fixture: &Fixture,
+        mut fetch: Pin<&mut impl Future<Output = Result<BusMessage, IggyError>>>,
+        record: &Frozen<MESSAGE_ALIGN>,
+    ) {
         assert!(futures::poll!(fetch.as_mut()).is_pending());
         let mut reads = fixture.owner_work().reads;
         reads
             .remove(&0)
             .expect("the timer starts the reads")
-            .answer(served(fixture.context(0), whole(&record)));
+            .answer(served(fixture.context(0), whole(record)));
         assert!(futures::poll!(fetch.as_mut()).is_pending());
         fixture
             .owner_work()
             .reads
             .remove(&1)
             .expect("every target is read")
-            .answer(served(fixture.context(1), whole(&record)));
+            .answer(served(fixture.context(1), whole(record)));
 
         let Poll::Ready(reply) = futures::poll!(fetch.as_mut()) else {
             panic!("the fetch answers once its reads did");
@@ -2340,7 +2442,6 @@ mod tests {
             .map(|section| (section.header.partition_id, section.header.status))
             .collect();
         assert_eq!(statuses, [(0, STATUS_OK), (1, STATUS_OK)]);
-        drop((beside_hold, restarted));
     }
 
     #[compio::test]
@@ -2350,7 +2451,26 @@ mod tests {
         // before the fetch knows that the partition cannot serve yet. Its
         // refusal stored nothing and must not become the section of a target
         // that the owner then holds for.
+        assert_refused_first_read_reads_again(DeferredPollConfig::default()).await;
+    }
+
+    #[compio::test]
+    async fn given_a_session_read_cap_of_one_when_the_first_read_is_refused_should_read_it_once_it_serves()
+     {
+        // The refused read kept its room until the reply, so the read after
+        // the build found the session full and the fetch failed.
+        assert_refused_first_read_reads_again(DeferredPollConfig {
+            max_pending_per_session: 1,
+            ..DeferredPollConfig::default()
+        })
+        .await;
+    }
+
+    /// Refuses the early read of a first target that cannot serve yet. The
+    /// fetch must read that target once it serves, under `limits`.
+    async fn assert_refused_first_read_reads_again(limits: DeferredPollConfig) {
         let fixture = Fixture::new(2);
+        fixture.shard.set_deferred_poll_config(limits);
         let record = stored_batch_record(None);
         let wire = FetchMessagesRequest {
             min_count: 1,

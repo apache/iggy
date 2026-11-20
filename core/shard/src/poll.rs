@@ -550,18 +550,28 @@ where
     }
 
     /// Ends the holds of `namespace`. A lookup gets its answer, and every
-    /// other read runs again, unless another incarnation took the place of
-    /// the one it waited for: not every read carries a fence of its own.
+    /// other read runs again, unless its hold ended or another incarnation
+    /// took the place of the one it waited for: not every read carries a
+    /// fence of its own.
+    ///
+    /// A build can land after the end of a hold and before the sweep that
+    /// expires it. The requester of that read no longer waits long enough
+    /// for a run to reach it, and a poll that runs then can commit an offset
+    /// whose messages nobody receives.
     fn release_held_reads(&self, namespace: IggyNamespace) {
         let held = self.held_reads.borrow_mut().take(namespace);
         let built = self
             .plane
             .partitions()
             .with_partition(&namespace, IggyPartition::created_revision);
+        let now = self.bus.monotonic_micros();
         for held in held {
             if matches!(held.read, PartitionRead::Primary) {
                 let answer = self.lookup_answer(namespace, held.created_revision);
                 let _ = held.reply.try_send(answer);
+            } else if held.deadline <= now {
+                self.metrics.record_partition_held_read_expired();
+                self.answer_unheld(namespace, held);
             } else if built.is_some_and(|built| built != held.created_revision) {
                 self.answer_unheld(namespace, held);
             } else {

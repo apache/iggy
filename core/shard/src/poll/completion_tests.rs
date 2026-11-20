@@ -36,8 +36,8 @@ use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::requests::users::login_register::{BIND_SECRET_BYTES, RegisterRequest};
 use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
-    AckLevel, CommitEntry, CommitHeader, HeartbeatState, RepairRangeReplyHeader, ReplyHeader,
-    RequestPreparesHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    AckLevel, CommitEntry, CommitHeader, HeartbeatState, PrepareOkHeader, RepairRangeReplyHeader,
+    ReplyHeader, RequestPreparesHeader, RequestStateChunkHeader, RequestStateTransferHeader,
     RoutedRequestHeader, StartViewChangeHeader, StateChunkHeader, StateTransferTargetHeader,
     WireConsumer,
 };
@@ -63,6 +63,7 @@ use partitions::{
 };
 use server_common::MESSAGE_ALIGN;
 use server_common::Message;
+use server_common::MessageBag;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{
     COMMAND_HEADER_SIZE, IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
@@ -79,8 +80,8 @@ use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
     ConsumerAttachment, IggyShard, LifecycleFrame, NoopHost, PartitionConsensusConfig,
-    PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver, ReplicaTopology, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_channel,
+    PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, REPAIR_GAP_DEBOUNCE_TICKS_MIN, Receiver,
+    ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
@@ -2330,6 +2331,123 @@ async fn given_a_parked_checkpoint_job_when_a_descriptor_arrives_should_defer_it
     assert_eq!(peer, PEER);
     assert_eq!(request.header().command, Command::RequestStateChunk);
     assert_eq!(request.header().nonce, nonce);
+}
+
+/// A checkpoint job holds the metadata journal gate while it rewrites the
+/// WAL. A prepare that waited for the gate on the pump stopped the ticks of
+/// every partition group of shard 0, and their heartbeats with them.
+#[compio::test]
+async fn given_a_held_journal_gate_when_metadata_prepares_arrive_should_keep_them_off_the_pump_until_it_is_free()
+ {
+    const PRIMARY: u8 = 0;
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let captured = Rc::clone(&sent);
+    bus.set_replica_forward_fn(Box::new(move |peer, _, frame| {
+        captured.borrow_mut().push((peer, frame));
+        Ok(())
+    }));
+    crate::test_support::connect_replica_on(&bus, PRIMARY, 1);
+    let dir = tempfile::tempdir().unwrap();
+    let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)
+        .await
+        .unwrap();
+    let consensus = VsrConsensus::new(
+        1,
+        1,
+        3,
+        server_common::sharding::METADATA_GROUP,
+        bus.clone(),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let metadata = IggyMetadata::new(
+        Some(consensus),
+        Some(journal),
+        None,
+        None,
+        PollTestMetadata::default(),
+        None,
+    );
+    let (owner, _sender) = owner_with_metadata_plane(
+        &bus,
+        partitions_config(),
+        IggyNamespace::new(0, 0, 0),
+        metadata,
+    );
+    let metadata = owner.plane.metadata();
+    let journal = metadata.journal.as_ref().unwrap();
+    let retry_capacity = metadata.client_table_capacity();
+    let first = denied_register_prepare(1, retry_capacity);
+    let parent = first.header().checksum;
+    let second = seal_prepare_capacity(
+        denied_register_prepare(2, retry_capacity).transmute_header(
+            |old, header: &mut PrepareHeader| {
+                *header = old;
+                header.parent = parent;
+            },
+        ),
+        retry_capacity,
+    );
+
+    let gate = metadata.hold_journal_writes().await;
+    for prepare in [first, second] {
+        futures::FutureExt::now_or_never(owner.on_message(MessageBag::Prepare(prepare)))
+            .expect("a prepare must not wait for the journal gate on the pump");
+    }
+    // The primary and the other backup are a quorum, so the commit point
+    // passes the kept prepares while the gate is held.
+    let committed = primary_commit(
+        IggyNamespace::from_raw(server_common::sharding::METADATA_GROUP),
+        PRIMARY,
+        0,
+        2,
+    );
+    futures::FutureExt::now_or_never(owner.on_message(MessageBag::Commit(committed)))
+        .expect("a commit heartbeat must not wait for the journal gate on the pump");
+    owner.set_repair_gap_debounce_ticks(REPAIR_GAP_DEBOUNCE_TICKS_MIN);
+    for _ in 0..=REPAIR_GAP_DEBOUNCE_TICKS_MIN {
+        owner.tick_metadata().await;
+    }
+    assert!(
+        owner.pop_redispatched_frame().is_none(),
+        "no prepare reaches the plane while the gate is held"
+    );
+    assert_eq!(journal.last_op(), None);
+    assert_eq!(
+        drain_prepare_requests(&sent),
+        [],
+        "a kept prepare is not missing, and its repair would wait for the gate on the pump"
+    );
+
+    drop(gate);
+    while let Some(frame) = owner.pop_redispatched_frame() {
+        owner.dispatch_redispatched_frame(frame).await;
+    }
+    owner.tick_metadata().await;
+
+    assert_eq!(journal.last_op(), Some(2));
+    assert_eq!(
+        metadata.consensus.as_ref().unwrap().commit_min(),
+        2,
+        "the kept prepares commit without a repair"
+    );
+    let acked: Vec<u64> = sent
+        .borrow()
+        .iter()
+        .filter(|(peer, _)| *peer == PRIMARY)
+        .filter_map(|(_, frame)| {
+            Message::<PrepareOkHeader>::try_from(Owned::copy_from_slice(frame.as_slice())).ok()
+        })
+        .filter(|ack| ack.header().command == Command::PrepareOk)
+        .map(|ack| ack.header().op)
+        .collect();
+    assert_eq!(
+        acked,
+        [1, 2],
+        "the kept prepares reach the journal in order"
+    );
+    assert_eq!(drain_prepare_requests(&sent), []);
 }
 
 #[compio::test]
