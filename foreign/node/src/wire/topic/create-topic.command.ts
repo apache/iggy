@@ -26,6 +26,8 @@ import {
   TopicType, GeoMode,
   compressionAlgorithmName,
   deserializeTopic,
+  geoDurationOptions,
+  type GeoTopicDurations,
   type Topic,
   type CompressionAlgorithm as CompressionAlgorithmT
 } from './topic.utils.js';
@@ -33,10 +35,10 @@ import {
 
 /**
  * Settings a topic takes at create. Only the message expiry, the size cap,
- * the local retention and turning tiered storage on can change later, through
- * `updateTopic`.
+ * the local retention, turning tiered storage on and the durations of a geo
+ * topic can change later, through `updateTopic`.
  */
-export type TopicOptions = {
+export type TopicOptions = GeoTopicDurations & {
   /** Compression algorithm label (None or Gzip), stored and reported only */
   compressionAlgorithm?: CompressionAlgorithmT,
   /**
@@ -169,6 +171,12 @@ export const CREATE_TOPIC = {
     localRetentionSize = 0n,
     topicType,
     geoMode,
+    freshUploadInterval,
+    consumerOffsetUploadInterval,
+    positionsPublishInterval,
+    tombstoneGrace,
+    positionsResumeTimeout,
+    longTermRewriteMaxInterval,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -185,7 +193,8 @@ export const CREATE_TOPIC = {
     // options block: the server rejects it as an unsupported option key.
     // Server-default sentinels (expiry, segment age and local retention 0,
     // size 0, compression none) and unset optionals are omitted so the server resolves them from
-    // its own config and reports them back as derived options.
+    // its own config and reports them back as derived options. A geo topic's
+    // durations have no sentinel, so their `0n` is sent.
     // Caller keys first so a typed field below overwrites one of them.
     const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
@@ -275,6 +284,10 @@ export const CREATE_TOPIC = {
         key: 'geo_mode', value: HeaderValue.String(geoMode)
       });
     }
+    options.push(...geoDurationOptions({
+      freshUploadInterval, consumerOffsetUploadInterval, positionsPublishInterval,
+      tombstoneGrace, positionsResumeTimeout, longTermRewriteMaxInterval
+    }));
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
     b.writeUInt8(bName.length, 4);

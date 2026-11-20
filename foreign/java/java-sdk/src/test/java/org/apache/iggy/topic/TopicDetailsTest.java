@@ -44,7 +44,9 @@ class TopicDetailsTest {
                         "message_expiry",
                         HeaderValue.fromUint64(BigInteger.valueOf(10000L)),
                         "compression_algorithm",
-                        HeaderValue.fromString("gzip")),
+                        HeaderValue.fromString("gzip"),
+                        "positions_resume_timeout",
+                        HeaderValue.fromUint64(BigInteger.ZERO)),
                 Map.of(
                         "max_topic_size",
                         HeaderValue.fromUint64(BigInteger.TWO),
@@ -80,6 +82,8 @@ class TopicDetailsTest {
         assertThat(topicDetails.tieredStorage()).contains(false);
         assertThat(topicDetails.localRetentionAge()).contains(BigInteger.valueOf(86_400_000_000L));
         assertThat(topicDetails.localRetentionSize()).contains(BigInteger.valueOf(1_073_741_824L));
+        assertThat(topicDetails.positionsResumeTimeout()).contains(BigInteger.ZERO);
+        assertThat(topicDetails.tombstoneGrace()).isEmpty();
         assertThat(topicDetails.messagesCount()).isEqualTo(BigInteger.ZERO);
         assertThat(topicDetails.partitionsCount()).isEqualTo(1L);
         assertThat(topicDetails.partitions()).isEqualTo(partitions);

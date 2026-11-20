@@ -214,6 +214,14 @@ asyncio.run(main())
 
 A topic's `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` are the only resettable keys. `tiered_storage` can only be turned on by an update, never off. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
 
+A geo topic (`topic_type=TopicType.Geo`) also takes six durations as `datetime.timedelta`:
+`fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`,
+`tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`. Each overrides
+the server setting of the same name on every node. Zero is a value, and a topic that does not set
+one reads it as `None`. `update_topic` can change them, they are the only options it changes on a
+geo topic, and none of them can be reset. A normal topic refuses them with an `OptionError` of kind
+`"invalid_option_value"`.
+
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 
 Root user rename and status refusals also raise `OptionError` with code `4108` and kind `"cannot_modify_root_user"`.

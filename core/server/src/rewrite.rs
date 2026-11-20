@@ -808,8 +808,8 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
-        GeoMode, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue,
-        OptionsUpdate, PartitionResizePolicy, ServerKeyContext, StreamCreateOptions,
+        GeoMode, GeoTopicDurations, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey,
+        OptionValue, OptionsUpdate, PartitionResizePolicy, ServerKeyContext, StreamCreateOptions,
         StreamEncryptionKey, StreamKeyOrigin, TopicType, TopicUpdateOptions, UserUpdateOptions,
         stream_wrap_set, text,
     };
@@ -1197,9 +1197,10 @@ mod tests {
     }
 
     /// An edge that reads a geo topic refuses a patch of it by key, so the
-    /// client learns which key it may not change.
+    /// client learns which key it may not change. Only its durations change.
     #[test]
-    fn given_a_geo_topic_when_patching_it_should_refuse_any_key_on_either_chain() {
+    fn given_a_geo_topic_when_patching_it_should_refuse_any_key_but_its_durations_on_either_chain()
+    {
         let bus = SpyBus::default();
         let shard = Rc::new(test_shard(&bus, 0, 1, 1));
         create_one_partition(&shard);
@@ -1277,6 +1278,83 @@ mod tests {
             )
             .map(|_| ()),
             Ok(())
+        );
+    }
+
+    /// A geo topic takes a change of its durations, and refuses their reset
+    /// as no default exists. The normal topic beside it takes none.
+    #[test]
+    fn given_a_geo_topic_when_patching_its_durations_should_take_them_and_refuse_a_reset_on_either_chain()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        commit_geo_topic(&shard, 3);
+        let sessions = root_sessions(&shard, 1);
+        let patch_geo = |update: TopicUpdateOptions| {
+            let patch = update.to_patch().expect("the patch encodes");
+            UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(1),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let both_chains = |body: &Bytes| {
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|_| ());
+            (tcp, http)
+        };
+        let durations = patch_geo(TopicUpdateOptions {
+            geo_durations: GeoTopicDurations {
+                tombstone_grace: Some(IggyDuration::from_str("6h").unwrap()),
+                consumer_offset_upload_interval: Some(IggyDuration::from_str("0").unwrap()),
+                ..GeoTopicDurations::default()
+            },
+            ..TopicUpdateOptions::default()
+        });
+        assert_eq!(both_chains(&durations), (Ok(()), Ok(())));
+        let reset = patch_geo(TopicUpdateOptions {
+            raw_reset: [OptionKey::TombstoneGrace.to_string()].into(),
+            ..TopicUpdateOptions::default()
+        });
+        let not_resettable = IggyError::OptionNotResettable(OptionKey::TombstoneGrace.to_string());
+        assert_eq!(
+            both_chains(&reset),
+            (Err(not_resettable.clone()), Err(not_resettable))
+        );
+        // The normal topic beside it has no durations.
+        assert_eq!(
+            http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(
+                    Operation::UpdateResource,
+                    1,
+                    1,
+                    1,
+                    &topic_patch(&[(OptionKey::TombstoneGrace, "6h")], &[])
+                ),
+            )
+            .map(|_| ()),
+            Err(IggyError::InvalidOptionValue(
+                OptionKey::TombstoneGrace.to_string()
+            ))
         );
     }
 

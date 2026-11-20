@@ -77,6 +77,21 @@ public sealed class ResourceOptionsTests
 
     private static readonly string[] HttpUpdateCases = ["topic_reset_array", "stream_rename", "user_username_and_status"];
 
+    private static readonly HashSet<string> CreateTopicInputs =
+    [
+        "stream_id", "name", "partitions_count", "compression_algorithm", "message_expiry", "max_topic_size",
+        "segment_size", "durability", "consumer_offset_durability", "topic_type", "fresh_upload_interval",
+        "consumer_offset_upload_interval", "positions_publish_interval", "tombstone_grace", "positions_resume_timeout",
+        "long_term_rewrite_max_interval"
+    ];
+
+    private static readonly TopicOptionKey[] GeoDurationKeys =
+    [
+        TopicOptionKey.FreshUploadInterval, TopicOptionKey.ConsumerOffsetUploadInterval,
+        TopicOptionKey.PositionsPublishInterval, TopicOptionKey.TombstoneGrace, TopicOptionKey.PositionsResumeTimeout,
+        TopicOptionKey.LongTermRewriteMaxInterval
+    ];
+
     public static TheoryData<string, string> SharedVectors
     {
         get
@@ -262,6 +277,41 @@ public sealed class ResourceOptionsTests
 
         Assert.Empty(patch.Set);
         Assert.Equal(["message_expiry", "retention"], patch.Reset);
+    }
+
+    [Fact]
+    public void given_geo_durations_when_patching_should_send_zero_and_refuse_a_reset()
+    {
+        var patch = new TopicUpdate
+        {
+            ConsumerOffsetUploadInterval = TimeSpan.Zero,
+            PositionsResumeTimeout = TimeSpan.FromSeconds(30),
+            MessageExpiry = TimeSpan.Zero
+        }.ToPatch();
+
+        // A zero expiry is the sentinel for no change, while a zero duration of a geo topic is a value.
+        Assert.Equal(["consumer_offset_upload_interval", "positions_resume_timeout"],
+            patch.Set.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(HeaderKind.Uint64, patch.Set["consumer_offset_upload_interval"].Kind);
+        Assert.Equal(0UL, patch.Set["consumer_offset_upload_interval"].ToUInt64());
+        Assert.Equal(30_000_000UL, patch.Set["positions_resume_timeout"].ToUInt64());
+        Assert.Equal(["fresh_upload_interval"], new TopicUpdate { FreshUploadInterval = TimeSpan.Zero }.ToPatch().Set.Keys);
+        var empty = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+            new TopicUpdate { MessageExpiry = TimeSpan.Zero }.ToPatch());
+        Assert.Equal(VsrError.INVALID_COMMAND, empty.StatusCode);
+
+        foreach (var key in GeoDurationKeys)
+        {
+            var reset = Assert.Throws<IggyInvalidStatusCodeException>(() =>
+                new TopicUpdate { Reset = new HashSet<TopicOptionKey> { key } }.ToPatch());
+            Assert.Equal(VsrError.OPTION_NOT_RESETTABLE, reset.StatusCode);
+        }
+
+        // A reset by name travels raw, and the server refuses it for a key without a default.
+        Assert.Equal(["tombstone_grace"],
+            new TopicUpdate { RawReset = new HashSet<string> { "tombstone_grace" } }.ToPatch().Reset);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new TopicUpdate { TombstoneGrace = TimeSpan.FromSeconds(-1) }.ToPatch());
     }
 
     [Fact]
@@ -517,7 +567,13 @@ public sealed class ResourceOptionsTests
                     LocalRetentionAge = TimeSpan.FromHours(6),
                     LocalRetentionSize = 536_870_912,
                     TopicType = TopicType.Geo,
-                    GeoMode = GeoMode.GeoTiered
+                    GeoMode = GeoMode.GeoTiered,
+                    FreshUploadInterval = TimeSpan.FromMilliseconds(50),
+                    ConsumerOffsetUploadInterval = TimeSpan.Zero,
+                    PositionsPublishInterval = TimeSpan.FromSeconds(2),
+                    TombstoneGrace = TimeSpan.FromHours(1),
+                    PositionsResumeTimeout = TimeSpan.Zero,
+                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20)
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {
@@ -526,7 +582,13 @@ public sealed class ResourceOptionsTests
                     MaxTopicSize = 1_073_741_824,
                     TieredStorage = true,
                     LocalRetentionAge = TimeSpan.FromHours(6),
-                    LocalRetentionSize = 536_870_912
+                    LocalRetentionSize = 536_870_912,
+                    FreshUploadInterval = TimeSpan.Zero,
+                    ConsumerOffsetUploadInterval = TimeSpan.FromMilliseconds(20),
+                    PositionsPublishInterval = TimeSpan.FromSeconds(2),
+                    TombstoneGrace = TimeSpan.FromHours(1),
+                    PositionsResumeTimeout = TimeSpan.Zero,
+                    LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20)
                 }.ToPatch().Set.Keys.ToHashSet());
                 AssertEnableOnlyKeys(rows);
                 break;
@@ -733,16 +795,7 @@ public sealed class ResourceOptionsTests
         var streamId = TargetIdentifier(input.GetProperty("stream_id"));
         var name = input.GetProperty("name").GetString()!;
         var partitionsCount = input.GetProperty("partitions_count").GetUInt32();
-        var options = new TopicOptions
-        {
-            CompressionAlgorithm = Enum.Parse<CompressionAlgorithm>(input.GetProperty("compression_algorithm").GetString()!, true),
-            MessageExpiry = DurationHelpers.FromDuration(ParseU64(input, "message_expiry")),
-            MaxTopicSize = ParseU64(input, "max_topic_size"),
-            SegmentSize = ParseU64(input, "segment_size"),
-            Durability = Enum.Parse<Durability>(input.GetProperty("durability").GetString()!, true),
-            ConsumerOffsetDurability =
-                Enum.Parse<Durability>(input.GetProperty("consumer_offset_durability").GetString()!, true)
-        };
+        var options = TopicOptionsFrom(input);
 
         Assert.Equal(Hex(vector, "body_hex"),
             TcpContracts.CreateTopic(streamId, name, partitionsCount, options.ToDictionary()));
@@ -862,6 +915,12 @@ public sealed class ResourceOptionsTests
                 topic.LocalRetentionSize);
             Assert.Equal(OptionText(expected, "topic_type") ?? "normal", SnakeCase(topic.TopicType));
             Assert.Equal(OptionText(expected, "geo_mode"), topic.GeoMode is { } mode ? SnakeCase(mode) : null);
+            foreach (var (key, duration) in GeoDurations(topic))
+            {
+                ulong? micros = expected.TryGetProperty(key, out _) ? ParseU64(expected, key) : null;
+                Assert.Equal(micros, duration is { } value ? DurationHelpers.ToDuration(value) : (ulong?)null);
+            }
+
             AssertNeverReturned(topic.Options, topic.DerivedOptions);
         }
 
@@ -955,12 +1014,67 @@ public sealed class ResourceOptionsTests
         return new TopicUpdate
         {
             Name = input.TryGetProperty("name", out var name) ? name.GetString() : null,
-            MessageExpiry = input.TryGetProperty("message_expiry", out _)
-                ? DurationHelpers.FromDuration(ParseU64(input, "message_expiry"))
-                : null,
+            MessageExpiry = Micros(input, "message_expiry"),
             MaxTopicSize = input.TryGetProperty("max_topic_size", out _) ? ParseU64(input, "max_topic_size") : null,
+            FreshUploadInterval = Micros(input, "fresh_upload_interval"),
+            ConsumerOffsetUploadInterval = Micros(input, "consumer_offset_upload_interval"),
+            PositionsPublishInterval = Micros(input, "positions_publish_interval"),
+            TombstoneGrace = Micros(input, "tombstone_grace"),
+            PositionsResumeTimeout = Micros(input, "positions_resume_timeout"),
+            LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval"),
             Reset = ResetKeys<TopicOptionKey>(input),
             RawReset = RawResetNames<TopicOptionKey>(input)
+        };
+    }
+
+    /// <summary>
+    ///     The typed options a <c>create_topic</c> vector's input describes. An input field this runner does not know
+    ///     fails the vector, so a new fixture field cannot be skipped unnoticed.
+    /// </summary>
+    private static TopicOptions TopicOptionsFrom(JsonElement input)
+    {
+        Assert.All(input.EnumerateObject(), member => Assert.Contains(member.Name, CreateTopicInputs));
+        return new TopicOptions
+        {
+            CompressionAlgorithm = input.TryGetProperty("compression_algorithm", out var compression)
+                ? Enum.Parse<CompressionAlgorithm>(compression.GetString()!, true)
+                : null,
+            MessageExpiry = Micros(input, "message_expiry"),
+            MaxTopicSize = input.TryGetProperty("max_topic_size", out _) ? ParseU64(input, "max_topic_size") : null,
+            SegmentSize = input.TryGetProperty("segment_size", out _) ? ParseU64(input, "segment_size") : null,
+            Durability = input.TryGetProperty("durability", out var durability)
+                ? Enum.Parse<Durability>(durability.GetString()!, true)
+                : Durability.Replicated,
+            ConsumerOffsetDurability = input.TryGetProperty("consumer_offset_durability", out var offsetDurability)
+                ? Enum.Parse<Durability>(offsetDurability.GetString()!, true)
+                : Durability.Replicated,
+            TopicType = input.TryGetProperty("topic_type", out var topicType)
+                ? Enum.Parse<TopicType>(topicType.GetString()!, true)
+                : null,
+            FreshUploadInterval = Micros(input, "fresh_upload_interval"),
+            ConsumerOffsetUploadInterval = Micros(input, "consumer_offset_upload_interval"),
+            PositionsPublishInterval = Micros(input, "positions_publish_interval"),
+            TombstoneGrace = Micros(input, "tombstone_grace"),
+            PositionsResumeTimeout = Micros(input, "positions_resume_timeout"),
+            LongTermRewriteMaxInterval = Micros(input, "long_term_rewrite_max_interval")
+        };
+    }
+
+    private static TimeSpan? Micros(JsonElement input, string property)
+    {
+        return input.TryGetProperty(property, out _) ? DurationHelpers.FromDuration(ParseU64(input, property)) : null;
+    }
+
+    private static Dictionary<string, TimeSpan?> GeoDurations(TopicResponse topic)
+    {
+        return new Dictionary<string, TimeSpan?>
+        {
+            ["fresh_upload_interval"] = topic.FreshUploadInterval,
+            ["consumer_offset_upload_interval"] = topic.ConsumerOffsetUploadInterval,
+            ["positions_publish_interval"] = topic.PositionsPublishInterval,
+            ["tombstone_grace"] = topic.TombstoneGrace,
+            ["positions_resume_timeout"] = topic.PositionsResumeTimeout,
+            ["long_term_rewrite_max_interval"] = topic.LongTermRewriteMaxInterval
         };
     }
 

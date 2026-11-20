@@ -31,7 +31,7 @@ use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::utils::stream_key::{StreamEncryptionKey, StreamKeyOrigin, WrapSet};
 use crate::wire_conversions::options_block_size;
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::{WireHeaderKind, WireOptions, WireUserHeaderEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,7 +69,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 27] = [
+pub static CATALOG: [OptionDescriptor; 33] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -489,6 +489,120 @@ pub static CATALOG: [OptionDescriptor; 27] = [
         },
     },
     OptionDescriptor {
+        key: OptionKey::FreshUploadInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        // Unset, each node applies its own server setting of the same name.
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        // It paces work that each node does on its own, so a node that
+        // ignored it would only apply its server setting.
+        critical: false,
+        description: || {
+            "The longest time a send waits for the upload of its fresh object to start, in \
+             microseconds or a humantime string (e.g. 50ms), up to 10 s. One object carries \
+             the sends of every partition a shard leads, so a send also goes with an \
+             earlier upload that a shorter interval of another topic starts. Overrides \
+             [tiered_storage] fresh_upload_interval. Only on a geo topic, where an update \
+             can change it but not reset it. Unset, each node applies its server setting of \
+             the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::ConsumerOffsetUploadInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "The shortest time between two uploads of the positions that the offsets its \
+             consumer groups store themselves wait for, in microseconds or a humantime \
+             string, up to 1 s. 0 or disabled answers such a store at its local commit. \
+             Overrides [geo] consumer_offset_upload_interval. Only on a geo topic, where an \
+             update can change it but not reset it. Unset, each node applies its server \
+             setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::PositionsPublishInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How often a node uploads the changed positions of its consumer groups, which \
+             carry the commits of polls with auto_commit, in microseconds or a humantime \
+             string, longer than zero. Overrides [geo] positions_publish_interval. Only on \
+             a geo topic, where an update can change it but not reset it. Unset, each node \
+             applies its server setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::TombstoneGrace,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How long the tombstone and the objects of the deleted topic stay in the object \
+             store, in microseconds or a humantime string, longer than zero. Overrides \
+             [geo] tombstone_grace. Only on a geo topic, where an update can change it but \
+             not reset it. Unset, each node applies its server setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::PositionsResumeTimeout,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How long, after a node starts, the group polls of its partitions wait for the \
+             positions of the geo peers, in microseconds or a humantime string. Overrides \
+             [geo] positions_resume_timeout. Only on a geo topic, where an update can \
+             change it but not reset it. Unset, each node applies its server setting of the \
+             same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::LongTermRewriteMaxInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "The longest wait between two rewrites of the committed messages of a partition \
+             into long-term segments, in microseconds or a humantime string, at least 1 s. \
+             A quiet partition waits the longest, so its shadow topics in other datacenters \
+             are about this far behind. Overrides [geo] long_term_rewrite_max_interval. \
+             Only on a geo topic, where an update can change it but not reset it. Unset, \
+             each node applies its server setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
         key: OptionKey::ShadowOrigin,
         scopes: STREAM_ONLY,
         kind: HeaderKind::String,
@@ -785,13 +899,16 @@ pub fn derived_defaults(
 /// 3. `ReadOnlyOption`: an internal or read-only key.
 /// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset, an
 ///    enable-only key that an update resets or sets to false, or any key of an
-///    update to a geo topic, which keeps its name and options. The geo rule
-///    runs only when `context` holds the topic's stored options.
+///    update to a geo topic other than its durations, as it keeps its name and
+///    its other options. The geo rule runs only when `context` holds the
+///    topic's stored options.
 /// 5. `OptionNotResettable`: a reset of a column or of a key without default.
 /// 6. Value errors: a column inside a create block is `InvalidOptionValue`,
 ///    column values keep their own errors, other keys `InvalidOptionValue`,
 ///    except a well-formed `replication_factor` out of range, which is
-///    `InvalidReplicationFactor`.
+///    `InvalidReplicationFactor`. A duration of a geo topic in an update to a
+///    normal topic is `InvalidOptionValue`, when `context` holds the stored
+///    options.
 /// 7. `InvalidCommand`: an update that changes nothing once its zero
 ///    sentinels are dropped.
 /// 8. `OptionsBlockTooLarge`: the resulting map exceeds the block limits.
@@ -855,13 +972,12 @@ pub fn admit(
     }
     // Only a caller that read the stored map knows the topic is geo. Apply
     // refuses the patch again for a caller that did not.
-    if operation == OptionOperation::Update
-        && scope == OptionsScope::Topic
-        && context
-            .current
-            .as_ref()
-            .is_some_and(|current| TopicCreateOptions::from_resource_options(current).is_geo())
-        && let Some(key) = all_keys().next()
+    let stored_geo = (operation == OptionOperation::Update && scope == OptionsScope::Topic)
+        .then_some(context.current.as_ref())
+        .flatten()
+        .map(|current| TopicCreateOptions::from_resource_options(current).is_geo());
+    if stored_geo == Some(true)
+        && let Some(key) = all_keys().find(|key| !key.is_geo_duration())
     {
         return Err(IggyError::OptionNotUpdatable(key.to_string()));
     }
@@ -912,6 +1028,12 @@ pub fn admit(
             erase_options(explicit);
             return Err(error);
         }
+    }
+    if stored_geo == Some(false)
+        && let Some(key) = set_keys.iter().find(|key| key.is_geo_duration())
+    {
+        erase_options(explicit);
+        return Err(invalid(*key));
     }
     if operation == OptionOperation::Update
         && explicit.is_empty()
@@ -1000,6 +1122,12 @@ pub fn canonical_value(
         }
         OptionKey::TopicType => TopicType::decode(key, entry)?.encode()?,
         OptionKey::GeoMode => GeoMode::decode(key, entry)?.encode()?,
+        OptionKey::FreshUploadInterval
+        | OptionKey::ConsumerOffsetUploadInterval
+        | OptionKey::PositionsPublishInterval
+        | OptionKey::TombstoneGrace
+        | OptionKey::PositionsResumeTimeout
+        | OptionKey::LongTermRewriteMaxInterval => IggyDuration::decode(key, entry)?.encode()?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }

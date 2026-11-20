@@ -172,19 +172,32 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         }
     }
 
-    /// Typed update input. u64 values are decimal strings.
+    /// Typed update input. u64 values are decimal strings, and the durations
+    /// of a geo topic are decimal microseconds.
     struct UpdateInput: Decodable {
         let name: String?
         let username: String?
         let status: String?
         let messageExpiry: String?
         let maxTopicSize: String?
+        let freshUploadInterval: String?
+        let consumerOffsetUploadInterval: String?
+        let positionsPublishInterval: String?
+        let tombstoneGrace: String?
+        let positionsResumeTimeout: String?
+        let longTermRewriteMaxInterval: String?
         let reset: [String]?
 
         enum CodingKeys: String, CodingKey {
             case name, username, status, reset
             case messageExpiry = "message_expiry"
             case maxTopicSize = "max_topic_size"
+            case freshUploadInterval = "fresh_upload_interval"
+            case consumerOffsetUploadInterval = "consumer_offset_upload_interval"
+            case positionsPublishInterval = "positions_publish_interval"
+            case tombstoneGrace = "tombstone_grace"
+            case positionsResumeTimeout = "positions_resume_timeout"
+            case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
         }
     }
 
@@ -242,16 +255,25 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         }
     }
 
+    /// Typed create input. An absent knob is left to the server, and the
+    /// durations of a geo topic are decimal microseconds.
     struct CreateTopicInput: Decodable {
         let streamID: TargetID
         let name: String
         let partitionsCount: UInt32
-        let compressionAlgorithm: String
-        let messageExpiry: String
-        let maxTopicSize: String
-        let segmentSize: String
+        let compressionAlgorithm: String?
+        let messageExpiry: String?
+        let maxTopicSize: String?
+        let segmentSize: String?
         let durability: String
         let consumerOffsetDurability: String
+        let topicType: String?
+        let freshUploadInterval: String?
+        let consumerOffsetUploadInterval: String?
+        let positionsPublishInterval: String?
+        let tombstoneGrace: String?
+        let positionsResumeTimeout: String?
+        let longTermRewriteMaxInterval: String?
 
         enum CodingKeys: String, CodingKey {
             case name, durability
@@ -262,6 +284,13 @@ struct ResourceOptionsFixture: Decodable, Sendable {
             case maxTopicSize = "max_topic_size"
             case segmentSize = "segment_size"
             case consumerOffsetDurability = "consumer_offset_durability"
+            case topicType = "topic_type"
+            case freshUploadInterval = "fresh_upload_interval"
+            case consumerOffsetUploadInterval = "consumer_offset_upload_interval"
+            case positionsPublishInterval = "positions_publish_interval"
+            case tombstoneGrace = "tombstone_grace"
+            case positionsResumeTimeout = "positions_resume_timeout"
+            case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
         }
     }
 
@@ -340,6 +369,13 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         let compressionAlgorithm: String
         let messageExpiry: String
         let maxTopicSize: String
+        /// The durations a geo topic sets, absent when unset.
+        let freshUploadInterval: String?
+        let consumerOffsetUploadInterval: String?
+        let positionsPublishInterval: String?
+        let tombstoneGrace: String?
+        let positionsResumeTimeout: String?
+        let longTermRewriteMaxInterval: String?
 
         enum CodingKeys: String, CodingKey {
             case id, name, options
@@ -350,6 +386,12 @@ struct ResourceOptionsFixture: Decodable, Sendable {
             case compressionAlgorithm = "compression_algorithm"
             case messageExpiry = "message_expiry"
             case maxTopicSize = "max_topic_size"
+            case freshUploadInterval = "fresh_upload_interval"
+            case consumerOffsetUploadInterval = "consumer_offset_upload_interval"
+            case positionsPublishInterval = "positions_publish_interval"
+            case tombstoneGrace = "tombstone_grace"
+            case positionsResumeTimeout = "positions_resume_timeout"
+            case longTermRewriteMaxInterval = "long_term_rewrite_max_interval"
         }
     }
 

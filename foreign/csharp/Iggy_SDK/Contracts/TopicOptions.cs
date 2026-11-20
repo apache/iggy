@@ -30,9 +30,10 @@ namespace Apache.Iggy.Contracts;
 /// <remarks>
 ///     <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />, <see cref="LocalRetentionAge" /> and
 ///     <see cref="LocalRetentionSize" /> can change later through a <see cref="TopicUpdate" />, which can also turn
-///     <see cref="TieredStorage" /> on. Every other setting is fixed at creation. A property left null emits no key,
-///     which leaves the server default in place. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates the
-///     keys a given server accepts, with the kind, default and mutability of each.
+///     <see cref="TieredStorage" /> on and set the six durations of a geo topic again. Every other setting is fixed
+///     at creation. A property left null emits no key, which leaves the server default in place, or for a duration
+///     of a geo topic the server setting of each node. <see cref="IIggySystem.DescribeOptionsAsync" /> enumerates
+///     the keys a given server accepts, with the kind, default and mutability of each.
 /// </remarks>
 public sealed class TopicOptions
 {
@@ -160,6 +161,50 @@ public sealed class TopicOptions
     public GeoMode? GeoMode { get; init; }
 
     /// <summary>
+    ///     The longest time a send waits for the upload of its fresh object to start, at most ten seconds. Zero
+    ///     uploads as soon as an upload slot is free. Overrides the server's <c>[tiered_storage]
+    ///     fresh_upload_interval</c>.
+    /// </summary>
+    /// <remarks>
+    ///     This and the five durations below are only on a geo topic: the server refuses them on a normal topic
+    ///     with error code 4042, <c>invalid_option_value</c>. Zero is a value for them and is sent, unlike a zero
+    ///     <see cref="MessageExpiry" />, and a negative span is refused before anything is sent. Null leaves each
+    ///     node to apply its own server setting of the same name.
+    /// </remarks>
+    public TimeSpan? FreshUploadInterval { get; init; }
+
+    /// <summary>
+    ///     The shortest time between two uploads of the positions that the offsets its consumer groups store
+    ///     themselves wait for, at most one second. Zero answers such a store at its local commit. Overrides the
+    ///     server's <c>[geo] consumer_offset_upload_interval</c>.
+    /// </summary>
+    public TimeSpan? ConsumerOffsetUploadInterval { get; init; }
+
+    /// <summary>
+    ///     How often a node uploads the changed positions of the topic's consumer groups, more than zero. Overrides
+    ///     the server's <c>[geo] positions_publish_interval</c>.
+    /// </summary>
+    public TimeSpan? PositionsPublishInterval { get; init; }
+
+    /// <summary>
+    ///     How long the tombstone and the objects of the deleted topic stay in the object store, more than zero.
+    ///     Overrides the server's <c>[geo] tombstone_grace</c>.
+    /// </summary>
+    public TimeSpan? TombstoneGrace { get; init; }
+
+    /// <summary>
+    ///     How long, after a node starts, the group polls of the topic's partitions wait for the positions of the geo
+    ///     peers. Zero does not wait. Overrides the server's <c>[geo] positions_resume_timeout</c>.
+    /// </summary>
+    public TimeSpan? PositionsResumeTimeout { get; init; }
+
+    /// <summary>
+    ///     The longest wait between two rewrites of a partition's committed messages into long-term segments, at
+    ///     least one second. Overrides the server's <c>[geo] long_term_rewrite_max_interval</c>.
+    /// </summary>
+    public TimeSpan? LongTermRewriteMaxInterval { get; init; }
+
+    /// <summary>
     ///     Option keys with no property of their own, keyed by option name, for keys newer than this build. A
     ///     property above wins on collision, and the server refuses a key outside its catalog by name. A raw
     ///     durability is kept unless the matching property asks for persisted durability.
@@ -172,6 +217,7 @@ public sealed class TopicOptions
     /// </summary>
     /// <returns>Option values keyed by option name, including both durability policies.</returns>
     /// <exception cref="ArgumentException">A raw durability is invalid or contradicts a persisted property.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">A duration of a geo topic is negative.</exception>
     public Dictionary<string, HeaderValue> ToDictionary()
     {
         var options = OptionKeys.Raw(Options);
@@ -279,7 +325,27 @@ public sealed class TopicOptions
             });
         }
 
+        AddGeoDuration(options, TopicOptionKey.FreshUploadInterval, FreshUploadInterval, nameof(FreshUploadInterval));
+        AddGeoDuration(options, TopicOptionKey.ConsumerOffsetUploadInterval, ConsumerOffsetUploadInterval,
+            nameof(ConsumerOffsetUploadInterval));
+        AddGeoDuration(options, TopicOptionKey.PositionsPublishInterval, PositionsPublishInterval,
+            nameof(PositionsPublishInterval));
+        AddGeoDuration(options, TopicOptionKey.TombstoneGrace, TombstoneGrace, nameof(TombstoneGrace));
+        AddGeoDuration(options, TopicOptionKey.PositionsResumeTimeout, PositionsResumeTimeout,
+            nameof(PositionsResumeTimeout));
+        AddGeoDuration(options, TopicOptionKey.LongTermRewriteMaxInterval, LongTermRewriteMaxInterval,
+            nameof(LongTermRewriteMaxInterval));
+
         return options;
+    }
+
+    private static void AddGeoDuration(Dictionary<string, HeaderValue> options, TopicOptionKey key,
+        TimeSpan? duration, string property)
+    {
+        if (duration is { } value)
+        {
+            options[Name(key)] = OptionKeys.GeoDuration(value, property);
+        }
     }
 
     private HeaderValue DurabilityValue(TopicOptionKey key, Durability policy)

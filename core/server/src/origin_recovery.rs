@@ -55,8 +55,8 @@ use iggy_binary_protocol::requests::topics::{
 };
 use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
 use iggy_common::{
-    CompressionAlgorithm, GeoMode, IggyByteSize, IggyDuration, IggyExpiry, IggyTimestamp,
-    MaxTopicSize, TopicCreateOptions, TopicType,
+    CompressionAlgorithm, GeoMode, GeoTopicDurations, IggyByteSize, IggyDuration, IggyExpiry,
+    IggyTimestamp, MaxTopicSize, TopicCreateOptions, TopicType,
 };
 use iggy_object_store::{
     KeyLayout, ManifestError, ObjectPrefix, ObjectStore, ObjectStoreError, PartitionManifest,
@@ -414,6 +414,8 @@ pub struct RetiredTopic {
     /// When the retired cluster described the topic, so that the newest
     /// description names its stream.
     pub described_at: u64,
+    /// The topic's own `tombstone_grace` in microseconds, zero for none.
+    pub tombstone_grace: u64,
 }
 
 /// Every geo topic that the retired cluster `retired_cluster_uid` described
@@ -458,6 +460,7 @@ impl From<TopicObject> for RetiredTopic {
                 TopicState::Tombstone { deleted_at } => Some(deleted_at),
             },
             described_at: object.published_at,
+            tombstone_grace: object.tombstone_grace,
         }
     }
 }
@@ -652,6 +655,12 @@ fn restored_topic(
         }),
         topic_type: Some(TopicType::Geo),
         geo_mode: Some(GeoMode::Geo),
+        // The only duration of the topic that its object records.
+        geo_durations: GeoTopicDurations {
+            tombstone_grace: (object.tombstone_grace != 0)
+                .then(|| IggyDuration::from(object.tombstone_grace)),
+            ..GeoTopicDurations::default()
+        },
         ..TopicCreateOptions::default()
     };
     Some(CreateTopicWithAssignmentsRequest {
@@ -790,6 +799,7 @@ mod tests {
             max_topic_size: u64::MAX,
             deleted_at: None,
             described_at,
+            tombstone_grace: 0,
         }
     }
 
@@ -817,6 +827,7 @@ mod tests {
             created_at: 1,
             published_at: 2,
             state: TopicState::Live,
+            tombstone_grace: 0,
         };
         for object in [
             described(1, RETIRED),

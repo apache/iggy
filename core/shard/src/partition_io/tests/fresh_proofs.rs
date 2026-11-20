@@ -162,7 +162,11 @@ async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_
         for round in 1..=ROUNDS {
             for partition in &placing {
                 request += 1;
-                owner.offer_fresh_send(sized_send_request(*partition, request, 100), channel(1).0);
+                owner.offer_fresh_send(
+                    sized_send_request(*partition, request, 100),
+                    channel(1).0,
+                    None,
+                );
             }
             until(&owner, |owner| {
                 placing

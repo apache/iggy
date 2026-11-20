@@ -74,6 +74,30 @@ rust::Vec<std::uint8_t> ToFfiBytes(const std::vector<std::uint8_t> &bytes) {
     return ffi_bytes;
 }
 
+void SetGeoTopicDuration(bool &has_value, std::uint64_t &micros, std::optional<std::chrono::microseconds> duration) {
+    if (duration) {
+        has_value = true;
+        micros    = static_cast<std::uint64_t>(duration->count());
+    }
+}
+
+template <typename Options>
+ffi::GeoTopicDurations ToFfiGeoTopicDurations(const Options &options) {
+    ffi::GeoTopicDurations durations{};
+    SetGeoTopicDuration(durations.has_fresh_upload_interval, durations.fresh_upload_interval_micros,
+                        options.FreshUploadInterval());
+    SetGeoTopicDuration(durations.has_consumer_offset_upload_interval, durations.consumer_offset_upload_interval_micros,
+                        options.ConsumerOffsetUploadInterval());
+    SetGeoTopicDuration(durations.has_positions_publish_interval, durations.positions_publish_interval_micros,
+                        options.PositionsPublishInterval());
+    SetGeoTopicDuration(durations.has_tombstone_grace, durations.tombstone_grace_micros, options.TombstoneGrace());
+    SetGeoTopicDuration(durations.has_positions_resume_timeout, durations.positions_resume_timeout_micros,
+                        options.PositionsResumeTimeout());
+    SetGeoTopicDuration(durations.has_long_term_rewrite_max_interval, durations.long_term_rewrite_max_interval_micros,
+                        options.LongTermRewriteMaxInterval());
+    return durations;
+}
+
 template <typename FfiOptions, typename Options>
 void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
     if (const auto &value = options.MessageExpiry()) {
@@ -98,7 +122,8 @@ void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
         ffi_options.has_local_retention_size = true;
         ffi_options.local_retention_size     = std::string(value->Value());
     }
-    ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+    ffi_options.geo_durations = ToFfiGeoTopicDurations(options);
+    ffi_options.raw_options   = ToFfiRawOptions(options.RawEntries());
 }
 
 }  // namespace

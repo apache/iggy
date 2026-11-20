@@ -719,6 +719,9 @@ console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
 
 Only the topic keys `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. The topic key `tiered_storage` is enable-only: an update can set it to `true`, and setting it to `false` or resetting it is refused with 4103. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
 
+A geo topic takes six durations of its own, in microseconds: `freshUploadInterval`, `consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`, `positionsResumeTimeout` and `longTermRewriteMaxInterval` (`GeoTopicDurations`). Each overrides the server setting of the same name, and one left out leaves that setting. `0n` is a value and is sent.
+`topic.update` can set them, and they are the only keys it may change on a geo topic, but a reset of one is refused with 4104. A normal topic refuses them with 4042. Reads report them as `bigint`, `null` when unset.
+
 The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
 
 The server returns 4108 when a non-root caller tries to rename root or change root's status, or when root tries to deactivate itself.

@@ -29,7 +29,7 @@
 use super::COMPONENT;
 use crate::ConfigurationError;
 use configs::ConfigEnv;
-use iggy_common::{IggyByteSize, IggyDuration, Validatable};
+use iggy_common::{FRESH_UPLOAD_INTERVAL_MAX, IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::fmt::{self, Debug, Display, Formatter};
@@ -44,10 +44,6 @@ const TIMEOUT_BOUNDS: RangeInclusive<Duration> = Duration::from_secs(1)..=Durati
 /// Bounds of `retry_delay` and `max_retry_delay`.
 const RETRY_DELAY_BOUNDS: RangeInclusive<Duration> =
     Duration::from_millis(1)..=Duration::from_hours(1);
-
-/// The longest `fresh_upload_interval`. A producer waits out the interval
-/// before its messages are stored, so a longer one would only answer late.
-const FRESH_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(10);
 
 /// The JSON API of Google Cloud Storage, which an empty `gcs.endpoint`
 /// names.

@@ -64,6 +64,12 @@ pub enum OptionKey {
     LocalRetentionSize,
     TopicType,
     GeoMode,
+    FreshUploadInterval,
+    ConsumerOffsetUploadInterval,
+    PositionsPublishInterval,
+    TombstoneGrace,
+    PositionsResumeTimeout,
+    LongTermRewriteMaxInterval,
     ShadowOrigin,
     CriticalKeys,
 }

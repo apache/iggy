@@ -4081,11 +4081,19 @@ impl StateHandler for UpdateTopicResolvedRequest {
         let Some(topic) = stream.topics.get(topic_id) else {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
-        // A geo topic keeps the name and options it was created with. The
-        // edge refuses such a patch by key when it can read the topic, and
-        // this refuses one that reached the primary without that read.
+        // A geo topic keeps the name and the options it was created with, all
+        // but its durations, and only a geo topic has those. The edge refuses
+        // such a patch by key when it can read the topic, and this refuses one
+        // that reached the primary without that read.
         if topic.resolved.topic_type == TopicType::Geo {
-            return ApplyReply::err(UpdateTopicResult::OptionNotUpdatable);
+            if self.name.is_some()
+                || !self.derived_options.is_empty()
+                || !sets_only_geo_durations(&self.explicit_options)
+            {
+                return ApplyReply::err(UpdateTopicResult::OptionNotUpdatable);
+            }
+        } else if sets_a_geo_duration(&self.explicit_options) {
+            return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
         }
         // Every check runs before any mutation, so a refused patch leaves the
         // topic exactly as it was: no half-applied rename or option change.
@@ -4243,6 +4251,28 @@ pub(crate) enum PatchError {
 /// encoder enforces, so a stored map can always be read back. It depends only
 /// on the committed blocks and state, so every replica reaches the same
 /// verdict.
+/// Whether every key that `explicit` sets names a duration of a geo topic.
+/// The names alone decide, so every build gives the same verdict for them.
+fn sets_only_geo_durations(explicit: &WireOptions) -> bool {
+    explicit
+        .into_iter()
+        .all(|entry| names_a_geo_duration(entry.key))
+}
+
+/// Whether a key that `explicit` sets names a duration of a geo topic.
+fn sets_a_geo_duration(explicit: &WireOptions) -> bool {
+    explicit
+        .into_iter()
+        .any(|entry| names_a_geo_duration(entry.key))
+}
+
+fn names_a_geo_duration(key: &[u8]) -> bool {
+    str::from_utf8(key)
+        .ok()
+        .and_then(|name| name.parse::<OptionKey>().ok())
+        .is_some_and(OptionKey::is_geo_duration)
+}
+
 pub(crate) fn patched_options(
     current: &ResourceOptions,
     explicit: &WireOptions,
@@ -5932,6 +5962,94 @@ mod tests {
             StateHandler::apply(&patch(1, None, &expiry), &mut inner, IggyTimestamp::now()).code,
             0,
             "a normal topic takes the same patch"
+        );
+    }
+
+    #[test]
+    fn given_a_geo_topic_when_applying_a_patch_of_its_durations_alone_should_take_it() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "geo", &geo_topic(), 1).code,
+            0
+        );
+        let normal = TopicCreateOptions::default();
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "normal", &normal, 2).code,
+            0
+        );
+        let options = |entries: &[(OptionKey, u64)], explicit: bool| -> WireOptions {
+            let options: ResourceOptions = entries
+                .iter()
+                .map(|(key, value)| {
+                    let value = HeaderValue::from(*value);
+                    let option = if explicit {
+                        OptionValue::explicit(value)
+                    } else {
+                        OptionValue::derived(value)
+                    };
+                    (HeaderKey::from(*key), option)
+                })
+                .collect();
+            resource_options_to_wire(&options, OptionsProvenance::All).unwrap()
+        };
+        let patch = |topic_id: u32, explicit: WireOptions, derived: WireOptions| {
+            UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(topic_id),
+                name: None,
+                explicit_options: explicit,
+                derived_options: derived,
+            }
+        };
+        let durations = [
+            (OptionKey::TombstoneGrace, 3_600_000_000),
+            (OptionKey::FreshUploadInterval, 0),
+        ];
+        let apply = |inner: &mut StreamsInner, request: &UpdateTopicResolvedRequest| {
+            StateHandler::apply(request, inner, IggyTimestamp::now()).code
+        };
+
+        let taken = patch(0, options(&durations, true), WireOptions::empty());
+        assert_eq!(apply(&mut inner, &taken), 0);
+        let resolved = inner.items[0].topics[0].resolved.geo_durations;
+        assert_eq!(
+            resolved.tombstone_grace,
+            Some(iggy_common::IggyDuration::from(3_600_000_000u64))
+        );
+        assert_eq!(
+            resolved.fresh_upload_interval,
+            Some(iggy_common::IggyDuration::from(0u64))
+        );
+
+        let not_updatable = IggyError::OptionNotUpdatable(String::new()).as_code();
+        let beside_another_key = patch(
+            0,
+            options(
+                &[
+                    (OptionKey::TombstoneGrace, 60_000_000),
+                    (OptionKey::MessageExpiry, 9_000_000),
+                ],
+                true,
+            ),
+            WireOptions::empty(),
+        );
+        let with_a_reset = patch(
+            0,
+            options(&durations, true),
+            options(&[(OptionKey::MessageExpiry, u64::MAX)], false),
+        );
+        for refused in [beside_another_key, with_a_reset] {
+            assert_eq!(apply(&mut inner, &refused), not_updatable);
+        }
+        assert_eq!(inner.items[0].topics[0].resolved.geo_durations, resolved);
+        assert_eq!(
+            apply(
+                &mut inner,
+                &patch(1, options(&durations, true), WireOptions::empty())
+            ),
+            IggyError::InvalidOptionValue(String::new()).as_code(),
+            "a normal topic has no durations"
         );
     }
 

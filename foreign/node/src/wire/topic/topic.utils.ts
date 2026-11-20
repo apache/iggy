@@ -18,7 +18,8 @@
 import { deserializePartitionContext, PARTITION_CONTEXT_SIZE, type PartitionContext } from '../vsr/header.js';
 import { toDate } from '../serialize.utils.js';
 import type { ValueOf } from '../../type.utils.js';
-import { deserializePrefixedOptions, type ParsedOptions } from '../options.utils.js';
+import { deserializePrefixedOptions, type OptionEntry, type ParsedOptions } from '../options.utils.js';
+import { HeaderValue } from '../message/header.utils.js';
 import { deserializeError } from '../error.utils.js';
 
 /**
@@ -67,6 +68,17 @@ export type BaseTopic = {
   topicType: TopicType,
   /** How a geo topic writes its messages, read from the options, `null` on a normal topic */
   geoMode: GeoMode | null,
+  /**
+   * The durations of a geo topic in microseconds, read from the options. Each
+   * is `null` where the topic sets none and on a normal topic: each node then
+   * applies its own server setting. See `GeoTopicDurations`.
+   */
+  freshUploadInterval: bigint | null,
+  consumerOffsetUploadInterval: bigint | null,
+  positionsPublishInterval: bigint | null,
+  tombstoneGrace: bigint | null,
+  positionsResumeTimeout: bigint | null,
+  longTermRewriteMaxInterval: bigint | null,
   /** Total size of the topic in bytes */
   sizeBytes: bigint,
   /** Total number of messages in the topic */
@@ -202,9 +214,14 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
   const localRetentionAge = limit('local_retention_age', DEFAULT_LOCAL_RETENTION_AGE);
   const localRetentionSize = limit('local_retention_size');
   const topicType = setting('topic_type') === TopicType.Geo ? TopicType.Geo : TopicType.Normal;
-  // A normal topic refuses a mode at create, so a stored one is ignored.
+  // A normal topic refuses a mode and the durations at create, so stored ones
+  // are ignored.
   const geoMode = topicType === TopicType.Normal ? null
     : setting('geo_mode') === GeoMode.GeoTiered ? GeoMode.GeoTiered : GeoMode.Geo;
+  const duration = (key: string) => {
+    const value = setting(key);
+    return topicType === TopicType.Geo && typeof value === 'bigint' ? value : null;
+  };
 
   return {
     bytesRead: pos - start,
@@ -222,6 +239,12 @@ export const deserializeBaseTopic = (p: Buffer, pos = 0): BaseTopicSerialized =>
       localRetentionSize,
       topicType,
       geoMode,
+      freshUploadInterval: duration('fresh_upload_interval'),
+      consumerOffsetUploadInterval: duration('consumer_offset_upload_interval'),
+      positionsPublishInterval: duration('positions_publish_interval'),
+      tombstoneGrace: duration('tombstone_grace'),
+      positionsResumeTimeout: duration('positions_resume_timeout'),
+      longTermRewriteMaxInterval: duration('long_term_rewrite_max_interval'),
       messagesCount,
       sizeBytes,
       options: explicit.options,
@@ -353,3 +376,55 @@ export const GeoMode = {
 } as const;
 
 export type GeoMode = typeof GeoMode[keyof typeof GeoMode];
+
+/**
+ * The durations of a geo topic, in microseconds, for `createTopic` and
+ * `updateTopic`. Each overrides the server setting of the same name on every
+ * node, and one left out leaves that setting. `0n` is a value here, not the
+ * server-default sentinel of `messageExpiry`, so it is sent. An update can set
+ * them, the only keys it may change on a geo topic, but cannot reset them. A
+ * normal topic refuses them with error 4042, invalid option value.
+ */
+export type GeoTopicDurations = {
+  /** Longest time a send waits for the upload of its fresh object to start, at most 10 s */
+  freshUploadInterval?: bigint,
+  /**
+   * Shortest time between two uploads of the positions that an offset the
+   * consumer group stores itself waits for, at most 1 s. `0n` answers such a
+   * store at its local commit.
+   */
+  consumerOffsetUploadInterval?: bigint,
+  /** How often a node uploads the changed positions of the topic's consumer groups, not `0n` */
+  positionsPublishInterval?: bigint,
+  /** How long the tombstone and the objects of the deleted topic stay in the object store, not `0n` */
+  tombstoneGrace?: bigint,
+  /**
+   * How long, after a node starts, the group polls of the topic's partitions
+   * wait for the positions of the geo peers. `0n` does not wait.
+   */
+  positionsResumeTimeout?: bigint,
+  /** Longest wait between two long-term rewrites of a partition, at least 1 s */
+  longTermRewriteMaxInterval?: bigint
+};
+
+/** The option key of each duration of a geo topic, in catalog order. */
+const GEO_DURATION_KEYS: Readonly<Record<keyof GeoTopicDurations, string>> = {
+  freshUploadInterval: 'fresh_upload_interval',
+  consumerOffsetUploadInterval: 'consumer_offset_upload_interval',
+  positionsPublishInterval: 'positions_publish_interval',
+  tombstoneGrace: 'tombstone_grace',
+  positionsResumeTimeout: 'positions_resume_timeout',
+  longTermRewriteMaxInterval: 'long_term_rewrite_max_interval'
+};
+
+/**
+ * The option entries of the durations that are set, `0n` included.
+ *
+ * @param durations - Durations of a geo topic, in microseconds
+ * @returns One uint64 entry per duration that is set
+ */
+export const geoDurationOptions = (durations: GeoTopicDurations): OptionEntry[] =>
+  Object.entries(GEO_DURATION_KEYS).flatMap(([field, key]) => {
+    const value = durations[field as keyof GeoTopicDurations];
+    return value === undefined ? [] : [{ key, value: HeaderValue.Uint64(value) }];
+  });

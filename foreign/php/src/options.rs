@@ -86,7 +86,8 @@ impl StubLiteral for StreamOptionKey {
 /// Topic option keys, as the cases an update's reset list takes.
 ///
 /// Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
-/// resettable in this release. The server refuses every other case with its own category.
+/// resettable in this release. The server refuses every other case with its own category. The
+/// durations of a geo topic, from `FreshUploadInterval` on, have no default to return to.
 #[php_enum]
 #[php(name = "Iggy\\TopicOptionKey")]
 #[derive(Clone, Copy)]
@@ -127,6 +128,18 @@ pub enum TopicOptionKey {
     TopicType,
     #[php(value = "geo_mode")]
     GeoMode,
+    #[php(value = "fresh_upload_interval")]
+    FreshUploadInterval,
+    #[php(value = "consumer_offset_upload_interval")]
+    ConsumerOffsetUploadInterval,
+    #[php(value = "positions_publish_interval")]
+    PositionsPublishInterval,
+    #[php(value = "tombstone_grace")]
+    TombstoneGrace,
+    #[php(value = "positions_resume_timeout")]
+    PositionsResumeTimeout,
+    #[php(value = "long_term_rewrite_max_interval")]
+    LongTermRewriteMaxInterval,
 }
 
 impl From<TopicOptionKey> for OptionKey {
@@ -150,6 +163,12 @@ impl From<TopicOptionKey> for OptionKey {
             TopicOptionKey::LocalRetentionSize => Self::LocalRetentionSize,
             TopicOptionKey::TopicType => Self::TopicType,
             TopicOptionKey::GeoMode => Self::GeoMode,
+            TopicOptionKey::FreshUploadInterval => Self::FreshUploadInterval,
+            TopicOptionKey::ConsumerOffsetUploadInterval => Self::ConsumerOffsetUploadInterval,
+            TopicOptionKey::PositionsPublishInterval => Self::PositionsPublishInterval,
+            TopicOptionKey::TombstoneGrace => Self::TombstoneGrace,
+            TopicOptionKey::PositionsResumeTimeout => Self::PositionsResumeTimeout,
+            TopicOptionKey::LongTermRewriteMaxInterval => Self::LongTermRewriteMaxInterval,
         }
     }
 }
@@ -176,6 +195,12 @@ impl StubLiteral for TopicOptionKey {
             Self::LocalRetentionSize => "LocalRetentionSize",
             Self::TopicType => "TopicType",
             Self::GeoMode => "GeoMode",
+            Self::FreshUploadInterval => "FreshUploadInterval",
+            Self::ConsumerOffsetUploadInterval => "ConsumerOffsetUploadInterval",
+            Self::PositionsPublishInterval => "PositionsPublishInterval",
+            Self::TombstoneGrace => "TombstoneGrace",
+            Self::PositionsResumeTimeout => "PositionsResumeTimeout",
+            Self::LongTermRewriteMaxInterval => "LongTermRewriteMaxInterval",
         };
         format!("\\Iggy\\TopicOptionKey::{case}")
     }
@@ -320,6 +345,15 @@ pub(crate) fn options_array(
     Ok(array)
 }
 
+/// An unsigned 64-bit value as an int, or as a decimal string above `PHP_INT_MAX`.
+pub(crate) fn unsigned_scalar(number: u64) -> PhpResult<Zval> {
+    match i64::try_from(number) {
+        Ok(number) => number.into_zval(false),
+        Err(_) => number.to_string().into_zval(false),
+    }
+    .map_err(to_php_exception)
+}
+
 fn option_scalar(value: &HeaderValue) -> PhpResult<Zval> {
     let zval = match value.kind() {
         HeaderKind::Raw => Binary::new(value.as_bytes().to_vec()).into_zval(false),
@@ -348,11 +382,7 @@ fn option_scalar(value: &HeaderValue) -> PhpResult<Zval> {
             i64::from(value.as_uint32().map_err(to_php_exception)?).into_zval(false)
         }
         HeaderKind::Uint64 => {
-            let number = value.as_uint64().map_err(to_php_exception)?;
-            match i64::try_from(number) {
-                Ok(number) => number.into_zval(false),
-                Err(_) => number.to_string().into_zval(false),
-            }
+            return unsigned_scalar(value.as_uint64().map_err(to_php_exception)?);
         }
         HeaderKind::Uint128 => value
             .as_uint128()

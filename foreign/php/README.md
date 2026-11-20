@@ -248,11 +248,18 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
 - `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros`, `max_topic_size`, `local_retention_age_micros` and `local_retention_size`, and turns `tiered_storage` on, never off. Null arguments keep stored values.
 - `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry, size cap, local retention age and local retention size are resettable, every other case is refused with the server's error.
+- A geo topic (`topic_type: 'geo'`) can override six server settings of the same name on each node:
+  `fresh_upload_interval_micros`, `consumer_offset_upload_interval_micros`, `positions_publish_interval_micros`,
+  `tombstone_grace_micros`, `positions_resume_timeout_micros` and `long_term_rewrite_max_interval_micros`.
+  `createTopic()` and `updateTopic()` take each as an int or a decimal string of microseconds. 0 is a value of its own,
+  for example no wait, and null leaves the server setting in force. An update can change them, the only options it can
+  change on a geo topic, but cannot reset them. A normal topic refuses them as `Invalid option value` (code 4042).
+  Topic reads have properties of the same names. If the topic does not set a duration, its property is null.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
 - `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
 - A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).
 - `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
-- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key) and 2018 (invalid replication factor).
+- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key), 4042 (invalid option value) and 2018 (invalid replication factor).
 
 ## List Pages
 

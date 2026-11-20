@@ -27,7 +27,11 @@
 //! when the upload interval has passed since the last upload started and an
 //! upload slot is free. So a send that finds the shard idle is stored at
 //! once, a busy shard starts at most one object per interval plus the ones
-//! that fill, and the windows grow with the load. Several objects upload at
+//! that fill, and the windows grow with the load. The interval of a window
+//! is the shortest of its sends: each send's topic can set its own, the
+//! longest time the send waits for its upload to start, and the others take
+//! the shard's. A send of a topic with a long interval goes with an earlier
+//! upload that a send of another topic starts. Several objects upload at
 //! the same time. An upload the store fails for a passing reason is tried
 //! again under the same id, which names the same bytes for good.
 //!
@@ -175,14 +179,22 @@ struct DelayedSend {
     reply: SubmitReply,
     /// The bus's monotonic clock when the shard takes it.
     due_at: u64,
+    /// The upload interval of the send, see [`Window::interval_micros`].
+    interval_micros: u64,
 }
 
 impl DelayedSend {
-    const fn new(request: Message<RoutedRequestHeader>, reply: SubmitReply, due_at: u64) -> Self {
+    const fn new(
+        request: Message<RoutedRequestHeader>,
+        reply: SubmitReply,
+        due_at: u64,
+        interval_micros: u64,
+    ) -> Self {
         Self {
             request,
             reply,
             due_at,
+            interval_micros,
         }
     }
 }
@@ -214,6 +226,9 @@ struct Window {
     partitions: BTreeSet<IggyNamespace>,
     /// The bus's monotonic clock when the first send came.
     opened_at: u64,
+    /// The shortest upload interval of its sends, in microseconds: the one
+    /// that the topic of a send sets, or else the shard's.
+    interval_micros: u64,
 }
 
 /// An object that takes no more sends and is not stored yet.
@@ -419,11 +434,20 @@ impl FreshWrites {
                 .is_some_and(|window| window.sequence == sequence)
     }
 
-    /// Whether the upload interval has passed since the last upload started.
-    fn interval_passed(&self, now: u64) -> bool {
+    /// Whether the open window can become an object at `now`: its upload
+    /// interval passed since the last upload started. False without one.
+    fn window_due(&self, now: u64) -> bool {
+        let Some(interval) = self
+            .window
+            .borrow()
+            .as_ref()
+            .map(|window| window.interval_micros)
+        else {
+            return false;
+        };
         self.last_upload_started_at
             .get()
-            .is_none_or(|started_at| now.saturating_sub(started_at) >= self.interval_micros.get())
+            .is_none_or(|started_at| now.saturating_sub(started_at) >= interval)
     }
 
     const fn has_free_upload(&self) -> bool {
@@ -529,10 +553,13 @@ impl FreshWrites {
     /// of time, a delayed send is due, or proof rows waited long enough. On
     /// the bus's monotonic clock.
     fn next_deadline(&self) -> Option<u64> {
-        let window_due = (self.window.borrow().is_some() && self.has_free_upload())
-            .then(|| self.last_upload_started_at.get())
-            .flatten()
-            .map(|started_at| started_at.saturating_add(self.interval_micros.get()));
+        let window_due = self
+            .window
+            .borrow()
+            .as_ref()
+            .filter(|_| self.has_free_upload())
+            .zip(self.last_upload_started_at.get())
+            .map(|(window, started_at)| started_at.saturating_add(window.interval_micros));
         let closed = self.closed.borrow();
         let objects = closed.values().filter_map(|object| {
             object.retry_at.or_else(|| {
@@ -624,8 +651,8 @@ where
     }
 
     /// Set the shortest time between the starts of two uploads that no full
-    /// object forces, and how many uploads run at once. Fewer than one
-    /// upload counts as one.
+    /// object forces, for the sends of a topic that sets none, and how many
+    /// uploads run at once. Fewer than one upload counts as one.
     pub fn set_fresh_upload_pace(&self, interval: Duration, uploads: usize) {
         self.fresh_writes.interval_micros.set(micros(interval));
         self.fresh_writes.uploads_max.set(uploads.max(1));
@@ -650,12 +677,18 @@ where
     /// request that commits where they sit. Answers the producer here when
     /// the send cannot be taken, and holds the send back a while when the
     /// rewrites of its partition fell behind.
+    ///
+    /// `upload_interval` is the `fresh_upload_interval` of the send's topic,
+    /// `None` for one that sets none.
     pub(crate) fn offer_fresh_send(
         &self,
         request: Message<RoutedRequestHeader>,
         reply: SubmitReply,
+        upload_interval: Option<Duration>,
     ) {
-        self.admit_fresh_send(request, reply, true);
+        let interval_micros =
+            upload_interval.map_or_else(|| self.fresh_writes.interval_micros.get(), micros);
+        self.admit_fresh_send(request, reply, true, interval_micros);
         self.drive_fresh_uploads();
     }
 
@@ -666,6 +699,7 @@ where
         request: Message<RoutedRequestHeader>,
         reply: SubmitReply,
         may_delay: bool,
+        interval_micros: u64,
     ) {
         let header = *request.header();
         let deny = |error: &IggyError| {
@@ -697,7 +731,10 @@ where
         // refused: a producer answered as not accepted sends all of them
         // again.
         if may_delay && let Some(due_at) = self.fresh_send_due_at(namespace) {
-            self.hold_fresh_send(namespace, DelayedSend::new(request, reply, due_at));
+            self.hold_fresh_send(
+                namespace,
+                DelayedSend::new(request, reply, due_at, interval_micros),
+            );
             return;
         }
         // By the size the request declares, which bounds its messages, so a
@@ -735,29 +772,16 @@ where
         }
         let mut slot = fresh.window.borrow_mut();
         if slot.is_none() {
-            let sequence = fresh.sequence.get();
-            let Some(id) = FreshObjectId::new(
-                self.partition_consensus.self_replica_id,
-                self.id,
-                fresh.started_at,
-                sequence,
-            ) else {
+            let Some(window) = self.open_fresh_window(interval_micros) else {
                 deny(&IggyError::TransientNotAccepted);
                 return;
             };
-            fresh.sequence.set(sequence + 1);
-            *slot = Some(Window {
-                id,
-                sequence,
-                bytes: 0,
-                sends: 0,
-                partitions: BTreeSet::new(),
-                opened_at: self.bus.monotonic_micros(),
-            });
+            *slot = Some(window);
         }
         let Some(window) = slot.as_mut() else {
             return;
         };
+        window.interval_micros = window.interval_micros.min(interval_micros);
         window.bytes += bytes;
         window.sends += 1;
         window.partitions.insert(namespace);
@@ -778,6 +802,29 @@ where
         if full {
             self.close_fresh_window();
         }
+    }
+
+    /// A window numbered next, for a first send whose upload interval is
+    /// `interval_micros`. `None` when no id names it.
+    fn open_fresh_window(&self, interval_micros: u64) -> Option<Window> {
+        let fresh = &self.fresh_writes;
+        let sequence = fresh.sequence.get();
+        let id = FreshObjectId::new(
+            self.partition_consensus.self_replica_id,
+            self.id,
+            fresh.started_at,
+            sequence,
+        )?;
+        fresh.sequence.set(sequence + 1);
+        Some(Window {
+            id,
+            sequence,
+            bytes: 0,
+            sends: 0,
+            partitions: BTreeSet::new(),
+            opened_at: self.bus.monotonic_micros(),
+            interval_micros,
+        })
     }
 
     /// Seal the open window into an object that waits for an upload slot.
@@ -1140,8 +1187,14 @@ where
             });
             released
         };
-        for DelayedSend { request, reply, .. } in released {
-            self.admit_fresh_send(request, reply, false);
+        for DelayedSend {
+            request,
+            reply,
+            interval_micros,
+            ..
+        } in released
+        {
+            self.admit_fresh_send(request, reply, false, interval_micros);
         }
     }
 
@@ -1227,7 +1280,7 @@ where
             self.start_fresh_upload(sequence, now);
         }
         if fresh.has_free_upload()
-            && fresh.interval_passed(now)
+            && fresh.window_due(now)
             && let Some(sequence) = self.close_fresh_window()
         {
             self.start_fresh_upload(sequence, now);

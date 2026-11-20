@@ -26,7 +26,9 @@ type TopicOptionKey string
 // TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge and
 // TopicOptionLocalRetentionSize are updatable, and all but the name
 // resettable. TopicOptionTieredStorage is enable-only: an update may turn it
-// on, never off, and may not reset it. Every other key is create-only, so an
+// on, never off, and may not reset it. The six durations of a geo topic,
+// TopicOptionFreshUploadInterval to TopicOptionLongTermRewriteMaxInterval,
+// are updatable and never resettable. Every other key is create-only, so an
 // update refuses it by name.
 // DescribeOptions enumerates the catalog one server serves, with the bounds
 // each value is checked against.
@@ -49,6 +51,12 @@ const (
 	TopicOptionLocalRetentionSize           TopicOptionKey = "local_retention_size"
 	TopicOptionTopicType                    TopicOptionKey = "topic_type"
 	TopicOptionGeoMode                      TopicOptionKey = "geo_mode"
+	TopicOptionFreshUploadInterval          TopicOptionKey = "fresh_upload_interval"
+	TopicOptionConsumerOffsetUploadInterval TopicOptionKey = "consumer_offset_upload_interval"
+	TopicOptionPositionsPublishInterval     TopicOptionKey = "positions_publish_interval"
+	TopicOptionTombstoneGrace               TopicOptionKey = "tombstone_grace"
+	TopicOptionPositionsResumeTimeout       TopicOptionKey = "positions_resume_timeout"
+	TopicOptionLongTermRewriteMaxInterval   TopicOptionKey = "long_term_rewrite_max_interval"
 )
 
 // TopicOptions are the options CreateTopic may carry. A nil *TopicOptions
@@ -105,6 +113,32 @@ type TopicOptions struct {
 	TopicType *TopicType
 	// GeoMode, see GeoModeOption. A geo topic resolves nil to GeoModeGeo.
 	GeoMode *GeoMode
+	// FreshUploadInterval to LongTermRewriteMaxInterval are the durations of
+	// a geo topic, in microseconds. Each overrides the server setting of the
+	// same name on every node, and nil leaves that setting. Zero is a value
+	// here, not the server-default sentinel of MessageExpiry, so it is sent.
+	// A normal topic refuses them with InvalidOptionValue.
+	//
+	// FreshUploadInterval is the longest time a send waits for the upload of
+	// its fresh object to start, at most 10 seconds.
+	FreshUploadInterval *Duration
+	// ConsumerOffsetUploadInterval is the shortest time between two uploads
+	// of the positions that an offset the consumer group stores itself waits
+	// for, at most 1 second. Zero answers such a store at its local commit.
+	ConsumerOffsetUploadInterval *Duration
+	// PositionsPublishInterval is how often a node uploads the changed
+	// positions of the topic's consumer groups. The server refuses zero.
+	PositionsPublishInterval *Duration
+	// TombstoneGrace is how long the tombstone and the objects of the deleted
+	// topic stay in the object store. The server refuses zero.
+	TombstoneGrace *Duration
+	// PositionsResumeTimeout is how long, after a node starts, the group polls
+	// of the topic's partitions wait for the positions of the geo peers. Zero
+	// does not wait.
+	PositionsResumeTimeout *Duration
+	// LongTermRewriteMaxInterval is the longest wait between two long-term
+	// rewrites of a partition, at least 1 second.
+	LongTermRewriteMaxInterval *Duration
 	// Raw carries keys newer than this build.
 	Raw []HeaderEntry
 }
@@ -131,6 +165,16 @@ type TopicUpdate struct {
 	// LocalRetentionSize sets the local size cap in bytes. Zero changes
 	// nothing, Reset returns the key to its default.
 	LocalRetentionSize *uint64
+	// FreshUploadInterval to LongTermRewriteMaxInterval set the durations of
+	// a geo topic in microseconds, see TopicOptions. They are the only keys
+	// an update may change on a geo topic, and a normal topic refuses them.
+	// Zero is a value and is sent. None of them can be reset.
+	FreshUploadInterval          *Duration
+	ConsumerOffsetUploadInterval *Duration
+	PositionsPublishInterval     *Duration
+	TombstoneGrace               *Duration
+	PositionsResumeTimeout       *Duration
+	LongTermRewriteMaxInterval   *Duration
 	// Reset names keys to return to their defaults: TopicOptionMessageExpiry,
 	// TopicOptionMaxTopicSize, TopicOptionLocalRetentionAge or
 	// TopicOptionLocalRetentionSize.

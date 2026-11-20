@@ -11047,6 +11047,34 @@ mod tests {
         repair_rings: Option<Rc<partitions::RepairRingBudget>>,
         runtime: TopicRuntimeOptions,
     ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_shaped(bus, store, (repair_memory, repair_rings), |topic| {
+            topic.resolved.runtime = runtime;
+        })
+    }
+
+    /// [`test_owner`] whose committed topic is a geo topic that sets
+    /// `durations` for itself.
+    fn test_owner_of_geo_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        durations: iggy_common::GeoTopicDurations,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_shaped(bus, None, (None, None), |topic| {
+            topic.resolved.topic_type = iggy_common::TopicType::Geo;
+            topic.resolved.geo_mode = Some(iggy_common::GeoMode::Geo);
+            topic.resolved.geo_durations = durations;
+        })
+    }
+
+    /// The test owner, its committed topic shaped by `shape`.
+    fn test_owner_shaped<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        (repair_memory, repair_rings): (
+            Option<Arc<partitions::RepairMemoryBudget>>,
+            Option<Rc<partitions::RepairRingBudget>>,
+        ),
+        shape: impl FnOnce(&mut Topic),
+    ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
             messages_required_to_save: 100,
@@ -11068,7 +11096,7 @@ mod tests {
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
-        topic.resolved.runtime = runtime;
+        shape(&mut topic);
         for partition_id in 0..TEST_PARTITIONS {
             let namespace = IggyNamespace::new(0, 0, partition_id);
             let consensus = VsrConsensus::new(

@@ -116,6 +116,25 @@ pub(super) async fn placing_owner(directory: &Path) -> IoTestShard {
 async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions) -> IoTestShard {
     let bus = Rc::new(IggyMessageBus::new(0));
     let (owner, _sender) = test_owner_of_topic(&bus, None, None, None, committed);
+    Box::pin(placing(owner, directory)).await
+}
+
+/// [`placing_owner`] whose committed topic is a geo topic that sets
+/// `durations` for itself.
+#[allow(clippy::future_not_send)]
+async fn placing_owner_of_geo_topic(
+    directory: &Path,
+    durations: iggy_common::GeoTopicDurations,
+) -> IoTestShard {
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let (owner, _sender) = test_owner_of_geo_topic(&bus, durations);
+    Box::pin(placing(owner, directory)).await
+}
+
+/// `owner` with its partition [`namespace`] a single-replica primary on
+/// disk that places its batches.
+#[allow(clippy::future_not_send)]
+async fn placing(owner: IoTestShard, directory: &Path) -> IoTestShard {
     let partitions = owner.plane.partitions();
     partitions.set_io_notifier(
         owner.partition_io.notifier(),
@@ -1905,7 +1924,11 @@ async fn given_sends_to_many_placing_partitions_when_they_arrive_within_an_inter
                 // Offered as the pump offers a send it routed. The pump
                 // itself refuses a partition that the fixture's metadata
                 // does not list.
-                owner.offer_fresh_send(sized_send_request(*partition, request, 100), channel(1).0);
+                owner.offer_fresh_send(
+                    sized_send_request(*partition, request, 100),
+                    channel(1).0,
+                    None,
+                );
             }
             until(&owner, |owner| {
                 placing
@@ -2224,6 +2247,95 @@ async fn given_an_idle_shard_when_sends_arrive_should_upload_the_first_at_once_a
         until(&owner, |_| stored(3)).await;
         assert!(third_sent.elapsed() < INTERVAL / 2);
         until(&owner, |owner| committed_sends(owner) == 3).await;
+    })
+    .await;
+}
+
+/// A send of a topic that sets a long upload interval waits that long after
+/// the last upload started, not the shard's short interval. The pump reads
+/// the interval from the topic's committed options.
+#[compio::test]
+async fn given_a_shard_that_leads_only_a_topic_with_a_long_upload_interval_when_sends_arrive_should_upload_at_that_interval()
+ {
+    const TOPIC_INTERVAL: Duration = Duration::from_secs(1);
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner_of_geo_topic(
+        directory.path(),
+        iggy_common::GeoTopicDurations {
+            fresh_upload_interval: Some(iggy_common::IggyDuration::new(TOPIC_INTERVAL)),
+            ..iggy_common::GeoTopicDurations::default()
+        },
+    ))
+    .await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::from_millis(10), 4);
+    let stored = |count: u64| data_objects_stored(&owner) == count;
+
+    pumped(&owner, async {
+        let first_sent = std::time::Instant::now();
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |_| stored(1)).await;
+        assert!(first_sent.elapsed() < TOPIC_INTERVAL / 2);
+
+        let _second = submit_send(&owner, 2, 100);
+        compio::time::sleep(TOPIC_INTERVAL / 4).await;
+        assert_eq!(
+            data_objects_stored(&owner),
+            1,
+            "the shard's 10 ms do not apply"
+        );
+        until(&owner, |_| stored(2)).await;
+        assert!(first_sent.elapsed() >= TOPIC_INTERVAL);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+    })
+    .await;
+}
+
+/// A window holds the sends of every topic the shard leads, and it uploads
+/// at the shortest interval among them: a send of a topic with a short
+/// interval takes the waiting send of a topic with a long one along.
+#[compio::test]
+async fn given_a_window_with_a_send_of_a_long_interval_when_a_send_of_a_short_interval_joins_it_should_upload_at_the_short_interval()
+ {
+    const LONG: Duration = Duration::from_secs(2);
+    const SHORT: Duration = Duration::from_millis(20);
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let short_partition = place_other_partition(&owner);
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::from_millis(10), 4);
+    let stored = |count: u64| data_objects_stored(&owner) == count;
+    let offer = |partition: IggyNamespace, request: u64, interval: Duration| {
+        let (reply, answer) = channel(1);
+        owner.offer_fresh_send(
+            sized_send_request(partition, request, 100),
+            reply,
+            Some(interval),
+        );
+        answer
+    };
+
+    pumped(&owner, async {
+        let first_sent = std::time::Instant::now();
+        let _first = offer(namespace(), 1, LONG);
+        until(&owner, |_| stored(1)).await;
+
+        let _long = offer(namespace(), 2, LONG);
+        compio::time::sleep(LONG / 8).await;
+        assert_eq!(data_objects_stored(&owner), 1, "the long interval holds it");
+        let _short = offer(short_partition, 1, SHORT);
+        until(&owner, |_| stored(2)).await;
+        assert!(
+            first_sent.elapsed() < LONG / 2,
+            "the short interval took the long send along: {:?}",
+            first_sent.elapsed()
+        );
+        until(&owner, |owner| {
+            committed_sends(owner) == 2 && committed(owner, short_partition) == 1
+        })
+        .await;
     })
     .await;
 }
@@ -2608,7 +2720,11 @@ async fn given_a_stored_object_whose_sends_wait_behind_a_full_partition_when_ask
     owner.set_fresh_upload_pace(LONG_INTERVAL, 2);
     let offer = |request: u64, payload_len: usize| {
         let (reply, answer) = channel(1);
-        owner.offer_fresh_send(sized_send_request(namespace(), request, payload_len), reply);
+        owner.offer_fresh_send(
+            sized_send_request(namespace(), request, payload_len),
+            reply,
+            None,
+        );
         answer
     };
     let stored = |sequence: u64| crate::fresh_writes::FinishedFreshUpload {
@@ -4747,6 +4863,39 @@ async fn given_a_rewrite_ceiling_of_two_seconds_when_a_small_segment_settles_sho
  {
     let directory = tempfile::tempdir().unwrap();
     let owner = Box::pin(placing_owner(directory.path())).await;
+    owner.set_long_term_rewrite_max_interval(Duration::from_secs(2));
+
+    let wait = Box::pin(wait_after_a_small_segment(&owner)).await;
+
+    assert_eq!(wait, Some(Duration::from_secs(2)));
+}
+
+/// A topic's own ceiling wins over the shard's, for its partitions alone.
+#[compio::test]
+async fn given_a_topic_with_its_own_rewrite_ceiling_when_a_small_segment_settles_should_wait_that_long()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner_of_geo_topic(
+        directory.path(),
+        iggy_common::GeoTopicDurations {
+            long_term_rewrite_max_interval: Some(iggy_common::IggyDuration::new(
+                Duration::from_secs(3),
+            )),
+            ..iggy_common::GeoTopicDurations::default()
+        },
+    ))
+    .await;
+    owner.set_long_term_rewrite_max_interval(Duration::from_secs(2));
+
+    let wait = Box::pin(wait_after_a_small_segment(&owner)).await;
+
+    assert_eq!(wait, Some(Duration::from_secs(3)));
+}
+
+/// The wait of the partition [`namespace`] after its first rewrite stored
+/// a segment of one small send, which lengthens the wait to its ceiling.
+#[allow(clippy::future_not_send)]
+async fn wait_after_a_small_segment(owner: &IoTestShard) -> Option<Duration> {
     let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
     owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
         executor.clone(),
@@ -4763,8 +4912,7 @@ async fn given_a_rewrite_ceiling_of_two_seconds_when_a_small_segment_settles_sho
             Rc::new(ExecutorObjects::new(executor.clone())),
             layout(),
         )));
-    owner.set_long_term_rewrite_max_interval(Duration::from_secs(2));
-    let revision = staged_revision(&owner);
+    let revision = staged_revision(owner);
     let floor = |owner: &IoTestShard| {
         owner
             .plane
@@ -4774,17 +4922,15 @@ async fn given_a_rewrite_ceiling_of_two_seconds_when_a_small_segment_settles_sho
             .long_term_floor()
     };
 
-    let wait = pumped(&owner, async {
-        let _first = submit_send(&owner, 1, 100);
-        until(&owner, |owner| committed_sends(owner) == 1).await;
+    pumped(owner, async {
+        let _first = submit_send(owner, 1, 100);
+        until(owner, |owner| committed_sends(owner) == 1).await;
         owner.request_rewrite_segments(namespace(), revision);
-        until(&owner, |owner| floor(owner) == Some(0)).await;
+        until(owner, |owner| floor(owner) == Some(0)).await;
         owner
             .rewrite_pacing
             .borrow()
             .interval(&(namespace(), revision))
     })
-    .await;
-
-    assert_eq!(wait, Some(Duration::from_secs(2)));
+    .await
 }

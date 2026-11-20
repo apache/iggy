@@ -33,7 +33,9 @@
 //! - It turns the live object of each topic that committed metadata no
 //!   longer holds into a tombstone, which records when it was written.
 //! - It deletes the segments and manifests of each topic whose tombstone is
-//!   older than `[geo] tombstone_grace`, and then the tombstone.
+//!   older than its grace, and then the tombstone. The grace is the topic's
+//!   own `tombstone_grace`, which its object records because the topic is no
+//!   longer in metadata then, or else `[geo] tombstone_grace`.
 //!
 //! The store holds everything that the sweep acts on, so nothing is lost
 //! when the node restarts or another node becomes the metadata primary. The
@@ -305,7 +307,7 @@ impl Task {
 
     /// Act on the object of a topic that committed metadata no longer holds:
     /// write its tombstone, or delete the topic once the tombstone is older
-    /// than `tombstone_grace`.
+    /// than the grace that the object records, or else `tombstone_grace`.
     async fn retire(
         &self,
         found: TopicObject,
@@ -320,7 +322,11 @@ impl Task {
             }
             TopicState::Tombstone { deleted_at } => deleted_at,
         };
-        if self.now.as_micros() < deleted_at.saturating_add(tombstone_grace) {
+        let grace = match found.tombstone_grace {
+            0 => tombstone_grace,
+            topic_grace => topic_grace,
+        };
+        if self.now.as_micros() < deleted_at.saturating_add(grace) {
             return Ok(());
         }
         match self
@@ -455,6 +461,11 @@ fn topic_object(
         created_at: topic.created_at.as_micros(),
         published_at: now.as_micros(),
         state: TopicState::Live,
+        tombstone_grace: topic
+            .resolved
+            .geo_durations
+            .tombstone_grace
+            .map_or(0, |grace| grace.as_micros()),
     })
 }
 
