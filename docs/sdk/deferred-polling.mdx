@@ -51,7 +51,7 @@ Raw HTTP defaults differ from `PollOptions`: count is 10, wait is one second, an
 
 The query uses `wait_us`, `min_count`, `max_bytes` and `request_timeout_us` alongside the normal consumer, partition, strategy and count fields. A positive wait needs at least one second between the wait and request timeout. Configure a proxy timeout long enough to receive the reply.
 
-The node that receives an HTTP read looks for the primary of the partition. The 3 second hold can end before a node can serve the partition. The node then keeps looking until a primary can serve the read, or until the request deadline passes. The deadline is `request_timeout_us` for a deferred read and 10 seconds for an immediate read. At the deadline the read fails with a retryable error.
+The node that receives an HTTP read looks for the primary of the partition. The 3 second hold can end before a node can serve the partition. The node then keeps looking until a primary can serve the read, or until the request deadline passes. The deadline is `request_timeout_us` for a deferred read and 10 seconds for an immediate read. If no primary can serve the read before the deadline, the node refuses the read with a retryable error, and the read stored no offset. A read that reached a primary and got no answer in time fails with HTTP 504. A committing read that fails so can have stored its offset, see [Cancellation and uncertain results](#cancellation-and-uncertain-results).
 
 ## Server capacity
 

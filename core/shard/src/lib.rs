@@ -490,7 +490,8 @@ pub struct GatheredClients<T = ConnectedClientInfo> {
 pub enum PartitionRead {
     Primary,
     /// As `Primary`, but the owner never holds it. For a caller that waits in
-    /// a loop of its own, and must see that the group has no primary yet.
+    /// a loop of its own, and must see that the group has no primary yet. A
+    /// primary on this node that cannot serve yet counts as none.
     PrimaryNow,
     DeferredPoll(Box<DeferredPollRequest>),
     /// Whether the replica holds a whole retirement batch retired; see

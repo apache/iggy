@@ -379,6 +379,15 @@ fn valid_header_checksum(header: &PrepareHeader) -> bool {
     header.checksum == CHECKSUM_UNSEALED || header.identity_checksum() == header.checksum
 }
 
+/// Whether `header` comes right after the entry with `previous_op` and
+/// `previous_checksum` and does not chain to it. The scan refuses a WAL that
+/// stores such a pair with entries after it.
+const fn breaks_chain(previous_op: u64, previous_checksum: u128, header: &PrepareHeader) -> bool {
+    previous_op + 1 == header.op
+        && previous_checksum != CHECKSUM_UNSEALED
+        && header.parent != previous_checksum
+}
+
 fn valid_body_checksum(header: &PrepareHeader, body: &[u8]) -> bool {
     header.checksum_body == CHECKSUM_BODY_UNSEALED
         || u128::from(XxHash3_64::oneshot(body)) == header.checksum_body
@@ -687,9 +696,7 @@ impl PrepareJournal {
             // ends sealed. A gap means compaction dropped the predecessor, and an
             // unsealed end has nothing to chain from, so neither is evidence of damage.
             if let Some((previous_op, previous_checksum)) = chain_previous
-                && previous_op + 1 == header.op
-                && previous_checksum != CHECKSUM_UNSEALED
-                && header.parent != previous_checksum
+                && breaks_chain(previous_op, previous_checksum, &header)
             {
                 if pos + entry_size < file_len {
                     return Err(JournalError::Io(io::Error::new(
@@ -1156,7 +1163,9 @@ impl Journal for PrepareJournal {
     ///
     /// Internally advances the snapshot watermark to `end_op` so that
     /// future appends treat drained slots as safe to overwrite. Rewrites
-    /// the WAL file keeping only entries outside the drained range.
+    /// the WAL file keeping only entries outside the drained range, in op
+    /// order. Refuses a rewrite that would put two entries side by side that
+    /// do not chain and that the file keeps apart.
     async fn drain(&self, ops: RangeInclusive<u64>) -> io::Result<usize> {
         if let Some(state) = self.poisoned.get() {
             return Err(Self::poisoned_io_error(state));
@@ -1188,6 +1197,24 @@ impl Journal for PrepareJournal {
             }
         }
         live.sort_unstable_by_key(|(h, _)| h.op);
+        // A view repair can append a repaired entry while the entry of the
+        // older view right below it is still here. The file boots because
+        // the two are apart in it, and op order would put them side by side.
+        // The reconcile of the view log removes the older entry.
+        if let Some(pair) = live.windows(2).find(|pair| {
+            let ((below, offset), (above, above_offset)) = (&pair[0], &pair[1]);
+            breaks_chain(below.op, below.checksum, above)
+                && offset + u64::from(below.size) != *above_offset
+        }) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "drain would store op {} right after op {}, which it does not chain to, \
+                     and the boot scan rejects such a pair",
+                    pair[1].0.op, pair[0].0.op,
+                ),
+            ));
+        }
 
         self.rewrite_wal(&live, &RewriteStages::DRAIN).await?;
 
@@ -1899,6 +1926,55 @@ mod tests {
             bytes_before,
             "the refusal must leave the WAL bytes untouched"
         );
+    }
+
+    #[compio::test]
+    async fn given_an_entry_of_an_older_view_below_a_repaired_one_when_draining_should_refuse_the_order_that_boot_rejects()
+     {
+        // What a view repair leaves before its reconcile: op 2 of the older
+        // view, then the repaired ops 4 and 3. Op 4 vouches for op 3, so op 3
+        // is appended after it, and the scan accepts that order.
+        const BODY: usize = 64;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("journal.wal");
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            let op_1 = make_identity_sealed_prepare(1, BODY, 0);
+            let checksum_1 = op_1.header().checksum;
+            journal.append(op_1.deep_copy()).await.unwrap();
+            let older_2 = make_identity_sealed_prepare(2, BODY, checksum_1);
+            journal.append(older_2.deep_copy()).await.unwrap();
+            let repaired_2 = make_identity_sealed_prepare(2, 2 * BODY, checksum_1);
+            let op_3 = make_identity_sealed_prepare(3, BODY, repaired_2.header().checksum);
+            let op_4 = make_identity_sealed_prepare(4, BODY, op_3.header().checksum);
+            journal.append(op_4.deep_copy()).await.unwrap();
+            journal.append(op_3.deep_copy()).await.unwrap();
+
+            let error = journal.drain(0..=1).await.unwrap_err();
+
+            assert!(
+                error.to_string().contains("does not chain"),
+                "the drain must refuse to store op 3 right after the older op 2, got: {error}"
+            );
+        }
+        {
+            let journal = PrepareJournal::open(&path, 0).await.unwrap();
+            assert_eq!(
+                journal.last_op(),
+                Some(4),
+                "the refused drain keeps a WAL that boots"
+            );
+            assert!(
+                journal.drain(0..=1).await.is_err(),
+                "a restart must not change what the drain refuses"
+            );
+            // The reconcile removes the older entry, and the trim runs after it.
+            assert_eq!(journal.remove_range(2..=2).await.unwrap(), 1);
+            assert_eq!(journal.drain(0..=1).await.unwrap(), 1);
+        }
+        let journal = PrepareJournal::open(&path, 1).await.unwrap();
+        assert_eq!(journal.last_op(), Some(4));
+        assert!(journal.header(3).is_some() && journal.header(2).is_none());
     }
 
     #[compio::test]

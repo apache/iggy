@@ -1279,6 +1279,56 @@ async fn given_primary_with_a_pending_view_write_when_reading_primary_should_ans
     assert_eq!(owner.held_read_count(), 0);
 }
 
+/// HTTP serves a read at the primary that its lookup names. A primary here
+/// that still starts refuses that read after the hold, so the lookup must
+/// name no primary until the view write lands.
+#[compio::test]
+async fn given_primary_with_a_pending_view_write_when_looking_up_the_primary_now_should_name_it_after_the_write_lands()
+ {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (owner, created_revision) = owner_with_unbuilt_partition(&bus, namespace, &[]);
+    owner.enqueue_reconcile_op(ReconcileOp::InsertOwned {
+        namespace,
+        partition: Box::new(primary_with_pending_view_write(
+            bus.clone(),
+            namespace,
+            created_revision,
+        )),
+        epoch: created_revision,
+    });
+    owner.apply_reconcile_ops();
+    let lookup = async || {
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(namespace, PartitionRead::PrimaryNow, reply, None)
+            .await;
+        replies.try_recv()
+    };
+
+    assert!(matches!(
+        lookup().await,
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_eq!(owner.held_read_count(), 0);
+
+    let landed = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace)
+        .unwrap()
+        .persist_superblock_if_needed()
+        .await;
+    assert!(landed);
+
+    assert!(matches!(
+        lookup().await,
+        Ok(PartitionReadReply::Primary { .. })
+    ));
+}
+
 /// A batch is held for one partition that cannot serve. Its requester stops
 /// the wait before the build hold ends, so the hold must end at the moment
 /// that the requester named, and the other entries must get their offsets.

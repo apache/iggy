@@ -232,7 +232,8 @@ pub enum PrimaryLookup {
     /// older incarnation is in its place, for [`shard::PARTITION_BUILD_HOLD`]
     /// at most.
     Hold,
-    /// The owner answers at once with what the partition says now.
+    /// The owner answers at once with what the partition says now. A primary
+    /// on this node that cannot serve yet is no primary.
     AnswerNow,
 }
 

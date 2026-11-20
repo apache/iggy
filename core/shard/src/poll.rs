@@ -316,9 +316,21 @@ where
             return;
         }
         if matches!(read, PartitionRead::Primary | PartitionRead::PrimaryNow) {
-            let answer = self
-                .primary_read_reply(namespace)
-                .unwrap_or(PartitionReadReply::NotFound);
+            // The caller of `PrimaryNow` serves at the primary that the answer
+            // names, and a primary here that still starts refuses that read.
+            let starts = matches!(read, PartitionRead::PrimaryNow)
+                && self
+                    .plane
+                    .partitions()
+                    .with_partition(&namespace, Self::starting_revision)
+                    .flatten()
+                    .is_some();
+            let answer = if starts {
+                PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+            } else {
+                self.primary_read_reply(namespace)
+                    .unwrap_or(PartitionReadReply::NotFound)
+            };
             let _ = reply.try_send(answer);
             return;
         }

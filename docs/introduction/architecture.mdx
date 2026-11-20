@@ -28,7 +28,7 @@ Shard 0 has a special role: it binds **every listener** - the replica plane and 
 - **TCP and WebSocket** connections, plaintext or TLS, are handed off round-robin across the shards. Shard 0's coordinator duplicates the socket's file descriptor, ships a connection-setup frame to the target shard, and drops its own handle, so the owning shard serves the connection from then on - before a single byte is read. For TLS-wrapped TCP and secure WebSocket (WSS), the target shard runs the TLS handshake. Shard 0 is part of the rotation by default. `skip_shard_zero_for_clients = true` under `[cluster.coordinator]` takes it out.
 - **QUIC** connections stay on shard 0, installed through its UDP endpoint. HTTP is also served on shard 0.
 
-All shards, **including shard 0**, own partitions and serve partition requests.
+By default all shards, **including shard 0**, own partitions and serve partition requests. With `skip_shard_zero_for_partitions = true` under `[cluster.coordinator]`, a node with more than one shard places no partition on shard 0. See [Coordinator placement](/docs/clustering/configuration#coordinator-placement).
 
 ### Request routing
 
@@ -37,7 +37,7 @@ Requests are routed between shards using **message passing** (via `crossfire` bo
 - **Metadata operations** (create/delete stream/topic/user etc.) always execute on **shard 0** - it is the only shard that commits metadata
 - **Partition operations** (send_messages, poll_messages, store_consumer_offset) are routed to the shard owning that partition via a lock-free concurrent map lookup. The request is sent into the owning shard's channel, whichever shard received it
 
-Partition-to-shard assignment is **deterministic**: the packed `IggyNamespace` is hashed with `Murmur3`, and the upper 16 bits of the hash are taken modulo the shard count (the upper bits are used because Murmur3 has weak lower bits for small integer inputs).
+Partition-to-shard assignment is **deterministic**: the packed `IggyNamespace` is hashed with `Murmur3`, and the upper 16 bits of the hash are taken modulo the number of shards that own partitions (the upper bits are used because Murmur3 has weak lower bits for small integer inputs). That number is the shard count by default, and one less with `skip_shard_zero_for_partitions`.
 
 Across nodes, the SDK uses a partition route before this shard-local dispatch. Partition primaries are distributed across eligible nodes and rebalanced by the metadata primary. Each topic selects its own replication factor at creation. See [Multi-leader partitions](/docs/clustering/multi-leader).
 
