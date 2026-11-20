@@ -509,6 +509,7 @@ async fn partition_write(
             PartitionWriteError::Unavailable
         })?;
     let attachment = session.attachment.borrow().clone();
+    let mut admitted = false;
     let outcome =
         compio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
             let admission = dispatch_partition_request(
@@ -523,10 +524,9 @@ async fn partition_write(
                 None,
             )
             .await;
+            admitted = admission == PartitionAdmission::Admitted;
             // A deny is already in the reply slot, so NoAck answers it below.
-            if admission == PartitionAdmission::Admitted
-                && let Some(dispatched) = dispatched.take()
-            {
+            if admitted && let Some(dispatched) = dispatched.take() {
                 let _ = dispatched.send(Ok(()));
             }
             receiver.await
@@ -538,6 +538,12 @@ async fn partition_write(
             let reply = reply.into_contiguous();
             classify_partition_reply(&reply).map(|header| (reply, header))
         }
+        // The deadline passed in a wait of the dispatch, before the partition
+        // plane took the write. Nothing can commit, so the caller may send
+        // the write again.
+        Err(_) if !admitted => Err(PartitionWriteError::Rejected(
+            IggyError::TransientNotAccepted,
+        )),
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),
     }
 }
@@ -815,6 +821,24 @@ mod tests {
             fixture
         }
 
+        /// A `SendMessages` to the partition of the topic. That partition
+        /// has no routing row, so the dispatch asks its owner first.
+        async fn send_messages(
+            &self,
+        ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
+            const DEADLINE: Duration = Duration::from_millis(50);
+            partition_write_replicated(
+                &self.state,
+                &self.session,
+                Operation::SendMessages,
+                &[],
+                IggyNamespace::new(0, 0, 0),
+                PartitionContext::default(),
+                Instant::now() + DEADLINE,
+            )
+            .await
+        }
+
         fn stream(name: &str) -> Bytes {
             CreateStreamRequest {
                 name: WireName::new(name).unwrap(),
@@ -906,6 +930,81 @@ mod tests {
         assert_eq!(
             committed_reply_commit(&create_reply),
             Some(PendingCreate::CREATE_OP)
+        );
+    }
+
+    /// The write waits for the owner of a partition without a routing row. A
+    /// deadline that ends in that wait is before the partition plane took the
+    /// write, so the caller gets the retryable refusal and not the unknown
+    /// outcome.
+    #[compio::test]
+    async fn given_partition_write_over_http_when_the_deadline_ends_before_dispatch_should_refuse_as_transient()
+     {
+        let fixture = PendingCreate::new();
+
+        let outcome = fixture.send_messages().await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(PartitionWriteError::Rejected(
+                    IggyError::TransientNotAccepted
+                ))
+            ),
+            "a write that reached no partition is safe to send again"
+        );
+        let frames: Vec<_> = std::iter::from_fn(|| fixture.owner_inbox.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    read: PartitionRead::Primary,
+                    ..
+                })]
+            ),
+            "the deadline ended in the wait for the owner, before any submit"
+        );
+    }
+
+    /// The partition plane took the write and no reply came before the
+    /// deadline. The write can still commit, so the caller gets the unknown
+    /// outcome and not a refusal that invites a second send.
+    #[compio::test]
+    async fn given_partition_write_over_http_when_the_deadline_ends_after_dispatch_should_report_an_unknown_outcome()
+     {
+        let fixture = PendingCreate::new();
+        let mut write = pin!(fixture.send_messages());
+        assert!(
+            poll!(write.as_mut()).is_pending(),
+            "the write waits for the owner of its partition"
+        );
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            read: PartitionRead::Primary,
+            reply: owner,
+            ..
+        })) = fixture.owner_inbox.try_recv()
+        else {
+            panic!("the owner is asked for the partition");
+        };
+        owner
+            .try_send(PartitionReadReply::Primary {
+                view: 0,
+                primary: 0,
+            })
+            .unwrap();
+
+        let outcome = write.await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(PartitionWriteError::Timeout(Operation::SendMessages))
+            ),
+            "a write that the partition plane took may commit after the deadline"
+        );
+        assert!(
+            fixture.owner_inbox.try_recv().is_ok(),
+            "the owner got the write before the deadline ended"
         );
     }
 

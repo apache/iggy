@@ -1226,7 +1226,9 @@ async fn handle_client_request<B, MJ, S, SB>(
             shard.bus.spawn(async move {
                 let _in_flight = in_flight;
                 let (shard, sessions) = (&task_shard, &task_sessions);
-                let Some(reply) = submit_client_request_on_owner(shard, request).await else {
+                let submitted =
+                    submit_client_request_on_owner(shard, request, origin.arrived_us()).await;
+                let Some(reply) = submitted else {
                     // No verdict came back, for example because the inbox of
                     // shard 0 refused the forward. The outcome is unknown, so
                     // only a replay of this request id is safe. A silent drop
@@ -5282,7 +5284,8 @@ mod tests {
         .reply;
         assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
 
-        let resent = submit_client_request_on_owner(&shard, minted)
+        let arrived_us = message_bus::MessageBus::monotonic_micros(&shard.bus);
+        let resent = submit_client_request_on_owner(&shard, minted, arrived_us)
             .await
             .expect("the resend must be answered");
         let (header, result) = resent.as_slice().split_at(size_of::<ReplyHeader>());

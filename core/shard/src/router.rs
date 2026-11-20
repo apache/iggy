@@ -566,8 +566,8 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
-                    // After the apply: a build that lands on this tick answers
-                    // its held reads before their deadline is tested.
+                    // After the apply: a build that lands on this tick releases
+                    // the held reads whose hold has not ended.
                     self.expire_held_reads();
                     self.tick_deferred_polls();
                     self.sweep_readiness_watches();

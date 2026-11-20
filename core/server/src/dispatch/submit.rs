@@ -37,12 +37,14 @@ use crate::shell::{ShellBus, ShellShard};
 use ahash::AHashMap;
 use consensus::{Consensus, MetadataHandle};
 use futures::future::join_all;
+use iggy_binary_protocol::requests::messages::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
 use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
     PrepareHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier,
 };
+use iggy_common::BINARY_OPERATION_TIMEOUT;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
@@ -53,7 +55,7 @@ use metadata::stm::stream::{Streams, TruncatePartitionRequest};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
-use shard::{PartitionRead, PartitionReadReply};
+use shard::{PartitionRead, PartitionReadReply, bus_timeout};
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::task::Poll;
@@ -68,6 +70,13 @@ const COMPLETION_RELAY_BROADCASTS: u32 = 2;
 
 /// Covers the commit of the completion and the delivery of the broadcasts.
 const COMPLETION_RELAY_MARGIN: Duration = Duration::from_millis(500);
+
+/// How long after the arrival of a create its committed reply waits for the
+/// partition builds at most. A binary client stops its wait
+/// [`BINARY_OPERATION_TIMEOUT`] after it sent the request and then reports an
+/// unknown outcome, so the reply leaves one reply margin before that.
+const CREATE_REPLY_BUDGET: Duration = BINARY_OPERATION_TIMEOUT
+    .saturating_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US));
 
 /// Shard 0's end of the RPC, run for an inbound [`shard::MetadataSubmit`]:
 /// a peer shard has verified credentials and owns the session locally, and
@@ -356,10 +365,14 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
 /// The committed reply of a create that adds partitions returns only after
 /// `await_created_partitions`. A replay of that create gets its cached reply
 /// through here too, so it waits the same way on the node that serves it.
+/// That wait ends [`CREATE_REPLY_BUDGET`] after `arrived_us`, the bus clock
+/// reading at which the request arrived, so a create that committed late
+/// still answers its client in time.
 #[allow(clippy::future_not_send)]
 pub async fn submit_client_request_on_owner<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
+    arrived_us: u64,
 ) -> Option<Message<GenericHeader>>
 where
     B: ShellBus,
@@ -371,7 +384,16 @@ where
     let create = PartitionCreate::named_by(&request);
     let reply = submit_before_partition_wait(shard, request).await?;
     if let Some(create) = &create {
-        await_created_partitions(shard, create, &reply).await;
+        let budget = u64::try_from(CREATE_REPLY_BUDGET.as_micros()).unwrap_or(u64::MAX);
+        let remaining = arrived_us
+            .saturating_add(budget)
+            .saturating_sub(shard.bus.monotonic_micros());
+        // A wait that ends here drops its reply receivers only: the owners
+        // end their holds as they do after a read timeout.
+        if remaining > 0 {
+            let wait = await_created_partitions(shard, create, &reply);
+            let _ = bus_timeout(&shard.bus, Duration::from_micros(remaining), wait).await;
+        }
     }
     Some(reply)
 }
@@ -967,9 +989,10 @@ fn relay_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionKey, CompletionRelays, commit_retention_truncate, committed_reply_commit,
-        decode_relayed_truncation, forward_completion_message, handle_metadata_submit,
-        relay_message, retention_truncate_request, submit_client_request_on_owner,
+        CREATE_REPLY_BUDGET, CompletionKey, CompletionRelays, commit_retention_truncate,
+        committed_reply_commit, decode_relayed_truncation, forward_completion_message,
+        handle_metadata_submit, relay_message, retention_truncate_request,
+        submit_client_request_on_owner,
     };
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
@@ -998,6 +1021,7 @@ mod tests {
     };
     use iggy_common::{IggyDuration, IggyError, TopicCreateOptions};
     use journal::prepare_journal::PrepareJournal;
+    use message_bus::MessageBus as _;
     use metadata::MetadataSubmitError;
     use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateMachine as _;
@@ -1229,6 +1253,11 @@ mod tests {
             )
         }
 
+        /// The bus clock reading of a request that arrives now.
+        fn arrived_now(&self) -> u64 {
+            self.shard.bus.monotonic_micros()
+        }
+
         /// The read that the owner of a new partition was asked: the
         /// partition, and the sender of the answer.
         fn asked(&self) -> Option<(IggyNamespace, shard::Sender<PartitionReadReply>)> {
@@ -1252,6 +1281,54 @@ mod tests {
         }
     }
 
+    /// A create that committed late must answer its client before the client
+    /// stops waiting, so the reply budget ends the wait for an owner that
+    /// stays silent.
+    #[compio::test]
+    async fn given_committed_create_when_reply_budget_ends_should_reply_without_owner_answer() {
+        const NOW: u64 = 100_000_000;
+        const LEFT: Duration = Duration::from_secs(5);
+        let bus = SpyBus::default();
+        bus.monotonic.set(Some(NOW));
+        // The read budget of the owner takes the first timer and never ends,
+        // so only the reply budget can end the wait.
+        let (_read_budget, held) = oneshot::channel();
+        *bus.held_timer.borrow_mut() = Some(held);
+        bus.instant_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let spent = u64::try_from(CREATE_REPLY_BUDGET.saturating_sub(LEFT).as_micros()).unwrap();
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, NOW - spent)
+            .now_or_never()
+            .expect("the reply budget ends the wait");
+
+        assert!(
+            fixture.asked().is_some(),
+            "the owner was asked and did not answer"
+        );
+        assert_eq!(bus.sleeps.borrow().last(), Some(&LEFT));
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_reply_budget_is_spent_should_reply_at_once() {
+        const NOW: u64 = 100_000_000;
+        let bus = SpyBus::default();
+        bus.monotonic.set(Some(NOW));
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let spent = u64::try_from(CREATE_REPLY_BUDGET.as_micros()).unwrap();
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, NOW - spent)
+            .now_or_never()
+            .expect("no time is left for the wait");
+
+        assert!(fixture.asked().is_none(), "no owner is asked");
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+    }
+
     /// Sends the committed create again and plays the owner of its partition.
     /// The reply must wait for `answer`, and then be the committed success.
     async fn assert_reply_waits_for_owner(answer: PartitionReadReply) {
@@ -1261,7 +1338,11 @@ mod tests {
         let fixture = CreateFixture::new(&bus, 1, &[&[]]);
         let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
 
-        let mut reply = Box::pin(submit_client_request_on_owner(&fixture.shard, request));
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
         assert!(
             futures::poll!(reply.as_mut()).is_pending(),
             "the reply waits for the owner of the new partition"
@@ -1298,7 +1379,7 @@ mod tests {
         let fixture = CreateFixture::new(&bus, 1, &[&[1, 2]]);
         let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
 
-        let reply = submit_client_request_on_owner(&fixture.shard, request)
+        let reply = submit_client_request_on_owner(&fixture.shard, request, fixture.arrived_now())
             .now_or_never()
             .expect("no partition to wait for");
 
@@ -1315,7 +1396,7 @@ mod tests {
         fixture.commit_create(CREATE_REQUEST, CREATE_OP);
         let request = fixture.commit_create(CREATE_REQUEST + 1, CREATE_OP + 1);
 
-        let reply = submit_client_request_on_owner(&fixture.shard, request)
+        let reply = submit_client_request_on_owner(&fixture.shard, request, fixture.arrived_now())
             .now_or_never()
             .expect("a rejection waits for nothing")
             .unwrap();
@@ -1336,7 +1417,11 @@ mod tests {
         let fixture = CreateFixture::new(&bus, 1, &[&[], &[]]);
         let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
 
-        let mut reply = Box::pin(submit_client_request_on_owner(&fixture.shard, request));
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
         assert!(futures::poll!(reply.as_mut()).is_pending());
         let (namespace, answer_to) = fixture.asked().expect("the owner took one read");
         assert_eq!(namespace, IggyNamespace::new(0, 0, 0));
@@ -1384,7 +1469,11 @@ mod tests {
         assert_eq!(fixture.shard.partition_shards(), placement);
         let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
 
-        let mut reply = Box::pin(submit_client_request_on_owner(&fixture.shard, request));
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
         assert!(futures::poll!(reply.as_mut()).is_pending());
         let (taken, answer_to) = fixture
             .asked_on(full)

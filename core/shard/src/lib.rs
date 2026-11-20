@@ -2458,6 +2458,10 @@ where
     /// stalling behind the whole bounded queue.
     redispatch_queue: RefCell<VecDeque<ParkedFrame>>,
 
+    /// Metadata prepares that arrived while the metadata journal gate was
+    /// busy, in arrival order. See [`Self::defer_gated_metadata_prepare`].
+    deferred_metadata_prepares: RefCell<DeferredMetadataPrepares>,
+
     /// Set while the shard-wide budget is shedding for namespaces holding no
     /// park entry of their own, which have no [`ParkEntry::shed`] to warn once
     /// from. Cleared when the park map empties, so one episode warns once.
@@ -2791,6 +2795,7 @@ where
             held_reads: RefCell::default(),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
+            deferred_metadata_prepares: RefCell::default(),
             shard_park_shedding: Cell::new(false),
             partition_submit_stalled: Cell::new(false),
             metadata_repair: RefCell::new(None),
@@ -3909,6 +3914,7 @@ where
             held_reads: RefCell::default(),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
+            deferred_metadata_prepares: RefCell::default(),
             shard_park_shedding: Cell::new(false),
             partition_submit_stalled: Cell::new(false),
             metadata_repair: RefCell::new(None),
@@ -4665,6 +4671,14 @@ struct RedispatchedFrame {
     attachment: Option<ConsumerAttachment>,
 }
 
+/// Metadata prepares that wait for the metadata journal gate off the plane,
+/// and the bytes they hold.
+#[derive(Default)]
+struct DeferredMetadataPrepares {
+    prepares: VecDeque<Message<PrepareHeader>>,
+    bytes: usize,
+}
+
 /// What a frame keeps if it parks again after the pump re-delivers it.
 ///
 /// Production prevents that race by ranking redispatch above inbox work and by
@@ -4736,6 +4750,13 @@ const MAX_PARKED_PER_NAMESPACE: usize = 128;
 /// max-size frame consumes the entire shard-wide budget and head-of-line-blocks
 /// every other namespace's convergence window.
 const MAX_PARKED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Byte budget of the metadata prepares that wait for the metadata journal
+/// gate. The primary keeps sending while another backup acks, so one wait can
+/// collect more than a pipeline of prepares. A prepare past the budget is
+/// dropped as a lost frame is: the primary sends it again, or the repair of
+/// this replica fetches it.
+const MAX_DEFERRED_METADATA_PREPARE_BYTES: usize = MAX_PARKED_BYTES;
 
 /// Per-namespace ceiling on parked bytes, so one un-materialised namespace
 /// cannot spend the whole shard's budget and shed everyone else's frames.
@@ -4815,6 +4836,17 @@ where
     /// materialisation can append off-pump without colliding with a suspended
     /// `RefCell` guard.
     fn pop_redispatched_frame(&self) -> Option<RedispatchedFrame> {
+        if let Some(prepare) = self.pop_deferred_metadata_prepare() {
+            return Some(RedispatchedFrame {
+                message: MessageBag::Prepare(prepare),
+                provenance: ParkProvenance {
+                    epoch: None,
+                    passes: 0,
+                },
+                reply: None,
+                attachment: None,
+            });
+        }
         loop {
             let ParkedFrame {
                 epoch,
@@ -4855,6 +4887,67 @@ where
                 }
             }
         }
+    }
+
+    /// Keeps a metadata prepare off the plane while the metadata journal gate
+    /// is busy. Returns the prepare when the plane can take it now.
+    ///
+    /// `on_replicate` waits for that gate before it appends, and a checkpoint
+    /// job holds it while it rewrites the WAL. A wait on the pump would stop
+    /// the ticks of every partition group of this shard for that long, and
+    /// their heartbeats with them. The pump hands a kept prepare back once
+    /// the gate is free, see [`Self::pop_deferred_metadata_prepare`], so the
+    /// plane takes it as a frame that arrived late. A prepare that arrives
+    /// behind kept ones is kept too, which preserves their order.
+    fn defer_gated_metadata_prepare(
+        &self,
+        prepare: Message<PrepareHeader>,
+    ) -> Option<Message<PrepareHeader>> {
+        if !self.metadata_prepares_wait_for_gate() {
+            return Some(prepare);
+        }
+        let mut deferred = self.deferred_metadata_prepares.borrow_mut();
+        let size = prepare.header().size as usize;
+        if deferred.bytes.saturating_add(size) > MAX_DEFERRED_METADATA_PREPARE_BYTES {
+            self.metrics.record_frame_drop(
+                crate::metrics::frame_drop_variant::CONSENSUS,
+                crate::metrics::frame_drop_reason::PARK_OVERFLOW,
+            );
+            tracing::warn!(
+                shard = self.id,
+                op = prepare.header().op,
+                deferred_bytes = deferred.bytes,
+                "metadata prepares that wait for the journal gate are at capacity; dropping one"
+            );
+            return None;
+        }
+        deferred.bytes += size;
+        deferred.prepares.push_back(prepare);
+        None
+    }
+
+    /// True while a metadata prepare must wait: a job holds the metadata
+    /// journal gate, or kept prepares go to the journal first.
+    fn metadata_prepares_wait_for_gate(&self) -> bool {
+        !self.deferred_metadata_prepares.borrow().prepares.is_empty()
+            || self.plane.metadata().journal_writes_held()
+    }
+
+    /// The oldest kept metadata prepare, once the metadata journal gate is
+    /// free. The pump asks on each pass, and no frame has to arrive for that:
+    /// its tick ends the wait at the latest. No await separates this test
+    /// from the gate acquire in `on_replicate`, so the prepare finds the gate
+    /// free.
+    fn pop_deferred_metadata_prepare(&self) -> Option<Message<PrepareHeader>> {
+        let mut deferred = self.deferred_metadata_prepares.borrow_mut();
+        if deferred.prepares.is_empty() || self.plane.metadata().journal_writes_held() {
+            return None;
+        }
+        let prepare = deferred.prepares.pop_front()?;
+        deferred.bytes = deferred
+            .bytes
+            .saturating_sub(prepare.header().size as usize);
+        Some(prepare)
     }
 
     /// Deliver one staged frame, through the admission path it arrived on.
@@ -5010,6 +5103,15 @@ where
                     );
                     return;
                 }
+                // A prepare that the pump hands back waited for the gate already.
+                let prepare = if provenance.is_none() && !routing.0.is_partition() {
+                    let Some(prepare) = self.defer_gated_metadata_prepare(prepare) else {
+                        return;
+                    };
+                    prepare
+                } else {
+                    prepare
+                };
                 // A tombstoned prepare still flows to the plane: replicated
                 // traffic has no client awaiting a reply on this node, and
                 // the plane's own tombstone guard drops it.
@@ -9417,6 +9519,12 @@ where
         // re-sends to the same place, and `metadata_repair.is_some()` fences
         // every other arming site meanwhile.
         if peer == consensus.replica() {
+            return;
+        }
+        // A kept prepare is not a gap, and the prepares of a repair would
+        // wait for the journal gate on the pump. The gap detector of the
+        // tick asks again once the gate is free.
+        if self.metadata_prepares_wait_for_gate() {
             return;
         }
         if consensus.is_normal()

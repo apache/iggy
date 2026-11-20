@@ -85,6 +85,10 @@ use tracing::{debug, warn};
 
 /// Whether [`dispatch_partition_request`] handed its request to the partition
 /// plane. After `Denied`, the deny reply has already gone to the transport.
+///
+/// The dispatch awaits nothing after the submit to the plane. So a caller that
+/// drops the dispatch before it returned knows that the plane did not take
+/// the request, as the HTTP write deadline does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PartitionAdmission {
     Admitted,
@@ -1666,7 +1670,8 @@ pub(in crate::dispatch) async fn handle_delete_segments_request<B, MJ, S, SB>(
     // refusal makes the SDK replay the request.
     // Acking unconditionally here would swallow a not-primary rejection and
     // drop the delete on the floor while the client believes it succeeded.
-    let Some(reply) = submit_client_request_on_owner(shard, truncate).await else {
+    let submitted = submit_client_request_on_owner(shard, truncate, origin.arrived_us()).await;
+    let Some(reply) = submitted else {
         // No verdict came back, so the outcome is unknown. The transient deny
         // makes the SDK replay the same request id, which re-resolves and
         // commits. An ack here advances the client past an unrecorded request

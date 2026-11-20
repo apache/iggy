@@ -5026,6 +5026,15 @@ where
         self.journal_gate.acquire()
     }
 
+    /// Whether a journal write holds the gate or waits for it, so the next
+    /// writer would wait: a prepare in `on_replicate`, or a caller of
+    /// [`Self::hold_journal_writes`]. The WAL trim of a checkpoint job holds
+    /// it for a whole rewrite.
+    #[must_use]
+    pub fn journal_writes_held(&self) -> bool {
+        self.journal_gate.try_acquire().is_none()
+    }
+
     /// Persist the current VSR state to the superblock when the view changed since
     /// the last write. The split-brain gate: callers MUST invoke this before
     /// dispatching any view-scoped VSR message, so a replica that acted in a view can

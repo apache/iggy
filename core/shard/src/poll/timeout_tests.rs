@@ -1031,6 +1031,44 @@ async fn given_held_poll_when_hold_expires_should_reject_as_transient() {
     assert_eq!(owner.held_read_count(), 0);
 }
 
+/// A build can land after the end of a hold and before the sweep that
+/// expires it. The requester of that poll no longer waits for a run, which
+/// could commit an offset whose messages nobody receives.
+#[compio::test]
+async fn given_held_poll_when_its_partition_is_built_after_the_hold_ended_should_reject_as_transient()
+ {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (mut owner, created_revision) = owner_with_unbuilt_partition(&bus, namespace, &[]);
+    let (senders, mut inboxes, _reply_inboxes) = shard_mesh_channels(1, 4, 1);
+    owner.attach_senders(senders);
+    let owner_inbox = inboxes[0].take().unwrap();
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(namespace, offset_poll(), reply, None)
+        .await;
+    assert_eq!(owner.held_read_count(), 1);
+
+    bus.now
+        .set(u64::try_from(PARTITION_BUILD_HOLD.as_micros()).unwrap());
+    insert_built_partition(&owner, &bus, namespace, created_revision);
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    assert_eq!(owner.held_read_count(), 0);
+    let resubmitted = std::iter::from_fn(|| owner_inbox.try_recv().ok()).any(|frame| {
+        matches!(
+            frame,
+            ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { .. })
+        )
+    });
+    assert!(!resubmitted, "a poll whose hold ended must not run");
+}
+
 /// The hop target of an HTTP relay stops its wait at the end of its budget.
 /// The hold of its read must end one reply margin before that, and never
 /// later than a hold without a budget.
