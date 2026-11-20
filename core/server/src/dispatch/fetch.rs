@@ -413,6 +413,11 @@ where
         apply_next_starts(targets, (&pending, starts), false, false)?.0
     };
     let waiting = &targets[skip..];
+    // The timer is armed at its first poll. A fetch whose messages are stored
+    // already must not pay for one that it then cancels.
+    if let Some(ready) = next_backlog(waiting, wire.min_count) {
+        return Ok(((ready, false), refused));
+    }
     let timer = pin!(shard.bus.sleep(Duration::from_micros(
         cutoff.saturating_sub(shard.bus.monotonic_micros())
     )));
@@ -2781,6 +2786,7 @@ mod tests {
             let fetch = fixture.fetch(&wire);
             let mut fetch = pin!(fetch);
             assert!(futures::poll!(fetch.as_mut()).is_pending());
+            let timers_before = fixture.bus.sleeps.borrow().len();
             fixture.answer_stored_offsets(BTreeMap::from([
                 (
                     0,
@@ -2818,6 +2824,11 @@ mod tests {
                     })
                     .collect();
                 assert_eq!(read, [(0, PollingKind::Next)], "the first backlog is read");
+                assert_eq!(
+                    fixture.bus.sleeps.borrow().len() - timers_before,
+                    1,
+                    "a fetch that waits for nothing arms the timer of its read only"
+                );
             }
         }
     }

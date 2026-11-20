@@ -5426,9 +5426,8 @@ where
         // a write that reported an error. A crash before the next superblock
         // write then leaves a pairing that recovery refuses. So a pending
         // checkpoint retries its superblock write and its trim, never its
-        // capture. Only an op with no checkpoint yet is captured again.
-        let needs_capture = coordinator.checkpoint_pending.get() && checkpoint == (0, 0);
-        if snap_op < checkpoint.0 || (snap_op == checkpoint.0 && !needs_capture) {
+        // capture.
+        if snap_op <= checkpoint.0 {
             return None;
         }
         // A transferred table may include replies above the restored STM floor.
@@ -12460,16 +12459,21 @@ mod tests {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
         let consensus = metadata.consensus.as_ref().unwrap();
+        commit_on_spy_bus_primary(&metadata, create_stream_request(CLIENT, 1, "committed")).await;
+        assert_eq!(
+            consensus.commit_min(),
+            1,
+            "op 1 gives a checkpoint a subject"
+        );
+        // Each prepare from here on finds the journal at the margin.
         metadata.set_checkpoint_margin(usize::MAX);
-        let coordinator = metadata.coordinator.as_ref().unwrap();
-        coordinator.checkpoint_pending.set(true);
 
         let held = metadata.journal_gate.try_acquire().unwrap();
         let waiting = compio::runtime::spawn({
             let metadata = Rc::clone(&metadata);
             async move {
                 metadata
-                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .submit_request_in_process(create_stream_request(CLIENT, 2, "stale"))
                     .await
             }
         });
@@ -12477,9 +12481,9 @@ mod tests {
         assert_eq!(
             consensus.pipeline_len(),
             1,
-            "the submit claims op 1 and waits on the gate"
+            "the submit claims op 2 and waits on the gate"
         );
-        adopt_view(consensus, 1);
+        adopt_view(consensus, 1, 1);
         drop(held);
         let reply = waiting.await.unwrap().unwrap();
 
@@ -12494,17 +12498,19 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .handle()
-                .header(1)
+                .header(2)
                 .is_none(),
             "a prepare of view 0 must not enter the journal of view 1"
         );
-        assert!(
-            coordinator.checkpoint_pending.get(),
+        assert_eq!(
+            metadata.coordinator.as_ref().unwrap().last_checkpoint().0,
+            0,
             "a prepare of view 0 must not run a checkpoint in view 1"
         );
         for backup in 1..=2 {
-            assert!(
-                sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+            assert_eq!(
+                sent_prepare_ops(consensus.message_bus(), backup),
+                [1],
                 "backup {backup} must not be sent a prepare of the view that ended"
             );
         }
@@ -12519,20 +12525,20 @@ mod tests {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
         let consensus = metadata.consensus.as_ref().unwrap();
-        // An interrupted checkpoint stays pending, and the next prepare retries it.
+        commit_on_spy_bus_primary(&metadata, create_stream_request(CLIENT, 1, "committed")).await;
+        assert_eq!(
+            consensus.commit_min(),
+            1,
+            "op 1 gives the checkpoint a subject"
+        );
+        // Each prepare from here on finds the journal at the margin.
         metadata.set_checkpoint_margin(usize::MAX);
-        metadata
-            .coordinator
-            .as_ref()
-            .unwrap()
-            .checkpoint_pending
-            .set(true);
 
         let checkpointing = compio::runtime::spawn({
             let metadata = Rc::clone(&metadata);
             async move {
                 metadata
-                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .submit_request_in_process(create_stream_request(CLIENT, 2, "stale"))
                     .await
             }
         });
@@ -12541,7 +12547,7 @@ mod tests {
             metadata.checkpoint_lock.try_acquire().is_none(),
             "the submit must be inside its checkpoint"
         );
-        adopt_view(consensus, 1);
+        adopt_view(consensus, 1, 1);
         let reply = checkpointing.await.unwrap().unwrap();
 
         assert_eq!(
@@ -12555,18 +12561,19 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .handle()
-                .header(1)
+                .header(2)
                 .is_none(),
             "a prepare of view 0 must not enter the journal of view 1"
         );
         assert_eq!(
             consensus.sequencer().current_sequence(),
-            0,
+            1,
             "a prepare of view 0 must not move the sequencer of view 1"
         );
         for backup in 1..=2 {
-            assert!(
-                sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+            assert_eq!(
+                sent_prepare_ops(consensus.message_bus(), backup),
+                [1],
                 "backup {backup} must not be sent a prepare of the view that ended"
             );
         }
@@ -12626,7 +12633,7 @@ mod tests {
             journal.handle().header(1).is_none(),
             "the write must still be in flight"
         );
-        adopt_view(consensus, NEXT_VIEW);
+        adopt_view(consensus, NEXT_VIEW, 0);
         appending.await.unwrap().unwrap();
 
         assert!(
@@ -13406,9 +13413,41 @@ mod tests {
         (dir, metadata)
     }
 
-    /// Adopts `view` from its primary with an empty log, as the shard does on a
-    /// `StartView`.
-    fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32) {
+    /// Commits `request` as the next op of that primary: its own ack and the
+    /// ack of backup 1 make the quorum.
+    #[allow(clippy::future_not_send)]
+    async fn commit_on_spy_bus_primary(
+        metadata: &IggyMetadata<VsrConsensus<ReplicaSendSpyBus>, PrepareJournal, (), TestMux>,
+        request: Message<RoutedRequestHeader>,
+    ) {
+        const BACKUP: u8 = 1;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let prepare = metadata.prepare_request(request).unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        metadata.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let own_ack = loopback
+            .pop()
+            .unwrap()
+            .try_into_typed::<PrepareOkHeader>()
+            .unwrap();
+        let backup_ack: Message<PrepareOkHeader> = Message::<PrepareOkHeader>::new(size_of::<
+            PrepareOkHeader,
+        >())
+        .transmute_header(|_, ack| {
+            *ack = PrepareOkHeader {
+                replica: BACKUP,
+                ..*own_ack.header()
+            };
+        });
+        metadata.on_ack(own_ack).await;
+        metadata.on_ack(backup_ack).await;
+    }
+
+    /// Adopts `view` from its primary with a log that ends at the committed
+    /// `head`, as the shard does on a `StartView`.
+    fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32, head: u64) {
         let start_view = StartViewHeader {
             checksum: 0,
             checksum_body: 0,
@@ -13419,8 +13458,8 @@ mod tests {
             command: Command::StartView,
             replica: consensus.primary_index(view),
             reserved_frame: [0; 66],
-            op: 0,
-            commit: 0,
+            op: head,
+            commit: head,
             group: server_common::sharding::METADATA_GROUP,
             partition_incarnation: 0,
             reserved: [0; 80],

@@ -1010,13 +1010,16 @@ prepare_queue_depth = 32
 # Run the same value on every node. A replica that joins by state transfer
 # must hold every op after the snapshot it receives. A replica with fewer
 # slots than the primary refuses a transfer whose tail does not fit and logs
-# an error that names this key. A server from before this default does not
-# refuse: it stalls on the tail, takes no later op and sends no ack, until it
-# restarts with at least the value of the primary.
-# A server from before this default uses 1024 when the key is absent. To
-# upgrade a cluster of such servers, set journal_slots = 1024 on each node as
-# you upgrade it, so that every node runs 1024 during the upgrade. After the
-# last node, raise the value node by node: the backups first, the metadata
+# an error that names this key.
+# Nodes of different server versions refuse the replica links of each other,
+# so a version upgrade stops every node first: see the Upgrading page of the
+# docs. Two defaults of this key can meet only between builds of one version.
+# A build from before this default uses 1024 when the key is absent. It does
+# not refuse a transfer: it stalls on the tail, takes no later op and sends
+# no ack, until it restarts with at least the value of the primary. To
+# replace such builds node by node, set journal_slots = 1024 on each node as
+# you replace it, so that every node runs 1024 meanwhile. After the last
+# node, raise the value node by node: the backups first, the metadata
 # primary last. The order holds only while the primary stays the same. If a
 # view change makes a raised node the primary before you raised every node,
 # a node with the smaller value can refuse a transfer as described above.

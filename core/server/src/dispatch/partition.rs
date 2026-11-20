@@ -54,7 +54,8 @@ use iggy_binary_protocol::requests::consumer_offsets::{
     DeleteConsumerOffsetRequest, GetConsumerOffsetRequest, StoreConsumerOffsetRequest,
 };
 use iggy_binary_protocol::requests::messages::{
-    DeferredPollMessagesRequest, FetchMessagesRequest, PollMessagesRequest,
+    DeferredPollMessagesRequest, FetchMessagesRequest, MIN_DEFERRED_POLL_REPLY_MARGIN_US,
+    PollMessagesRequest,
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::responses::messages::poll_messages::PollMessagesResponseHeader;
@@ -62,7 +63,10 @@ use iggy_binary_protocol::{
     GenericHeader, KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation,
     RequestHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier,
 };
-use iggy_common::{ConsumerKind, IggyError, PollingStrategy, RESYNC_REQUIRED_PARTITION_SENTINEL};
+use iggy_common::{
+    BINARY_OPERATION_TIMEOUT, ConsumerKind, IggyError, PollingStrategy,
+    RESYNC_REQUIRED_PARTITION_SENTINEL,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::BusMessage;
@@ -77,11 +81,23 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
 use shard::{
-    ConsumerAttachment, DeferredPollContext, DeferredPollRequest, ExternalGroupRead, PartitionRead,
-    PartitionReadReply, PollQuotaIdentity, bus_timeout,
+    ConsumerAttachment, DeferredPollContext, DeferredPollRequest, ExternalGroupRead,
+    PARTITION_SUBMIT_TIMEOUT, PartitionRead, PartitionReadReply, PollQuotaIdentity, bus_timeout,
 };
 use std::rc::Rc;
+use std::time::Duration;
 use tracing::{debug, warn};
+
+/// How long after its arrival a partition request may wait for admission:
+/// for the applied frontier, then for the owner of a partition without a
+/// routing row. The submit that follows waits [`PARTITION_SUBMIT_TIMEOUT`]
+/// for its reply, and a binary client stops its wait
+/// [`BINARY_OPERATION_TIMEOUT`] after it sent the request. A refusal or a
+/// submit that comes later finds a client that reported an unknown outcome.
+const PARTITION_ADMISSION_BUDGET: Duration = BINARY_OPERATION_TIMEOUT
+    .saturating_sub(PARTITION_SUBMIT_TIMEOUT)
+    .saturating_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US));
+const _: () = assert!(!PARTITION_ADMISSION_BUDGET.is_zero());
 
 /// Whether [`dispatch_partition_request`] handed its request to the partition
 /// plane. After `Denied`, the deny reply has already gone to the transport.
@@ -142,11 +158,19 @@ where
 {
     let transport_client_id = origin.id;
     let header = *request.header();
+    let admission_left = || {
+        let waited = shard
+            .bus
+            .monotonic_micros()
+            .saturating_sub(origin.arrived_us());
+        PARTITION_ADMISSION_BUDGET.saturating_sub(Duration::from_micros(waited))
+    };
     if let Err(error) = admit_partition_request(
         shard,
         header.minimum_metadata_op,
         consumer_session.as_ref().map(|(_, attachment)| attachment),
         in_flight.as_ref().map(|in_flight| &*in_flight.drain),
+        admission_left(),
     )
     .await
     {
@@ -249,7 +273,9 @@ where
     // this is an admission courtesy that keeps the steady state off that park
     // buffer, not a correctness gate. See `wait_for_partition_routable`, which
     // spells out why asking the owner there is no readiness gate either.
-    if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace)).await {
+    if !wait_for_partition_routable(shard, IggyNamespace::from_raw(namespace), admission_left())
+        .await
+    {
         // The op never reached the partition plane, so it is safe to re-issue
         // anywhere -- the same contract the plane itself answers for a
         // non-primary routing artifact. A status-0 empty reply here would
@@ -1189,16 +1215,17 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
 ///
 /// A newer route can name group membership that this replica has not applied
 /// yet, so a request ahead of the local frontier waits for it, for at most
-/// the partition request budget of the frontier. The wait parks the drain of
-/// its connection. The session can end and admission can close during it, so
-/// both are tested again.
+/// the partition request budget of the frontier and never longer than
+/// `admission_left`. The wait parks the drain of its connection. The session
+/// can end and admission can close during it, so both are tested again.
 ///
 /// After a wait in vain, `drain` refuses the next requests ahead of the
 /// frontier at once, until the frontier moves, so the frames behind such a
 /// request do not wait one after the other. The mark is per connection:
 /// `minimum_metadata_op` comes from the client, so a mark of the node would
 /// let one client end the wait of all. A request without a drain always
-/// waits.
+/// waits. A wait that `admission_left` cut short sets no mark: it says how
+/// long the request was on its way, not that the frontier stays behind.
 ///
 /// # Errors
 /// `StaleClient` for a session that ended. `TransientNotAccepted` while
@@ -1209,6 +1236,7 @@ async fn admit_partition_request<B, MJ, S, SB>(
     minimum_metadata_op: u64,
     attachment: Option<&SessionAttachment>,
     drain: Option<&ClientDrain>,
+    admission_left: Duration,
 ) -> Result<(), IggyError>
 where
     B: ShellBus,
@@ -1236,13 +1264,16 @@ where
     let expired_at = drain.map(|drain| &drain.frontier_wait_expired_at);
     if expired_at.is_none_or(|expired_at| expired_at.get() != Some(applied)) {
         let reached = frontier.reached(minimum_metadata_op);
-        if bus_timeout(&shard.bus, frontier.partition_request_budget(), reached)
+        let budget = frontier.partition_request_budget();
+        if bus_timeout(&shard.bus, budget.min(admission_left), reached)
             .await
             .is_some()
         {
             return session_and_admission();
         }
-        if let Some(expired_at) = expired_at {
+        if admission_left >= budget
+            && let Some(expired_at) = expired_at
+        {
             expired_at.set(Some(frontier.get()));
         }
     }
@@ -1269,8 +1300,9 @@ where
 /// owner holds it until the partition can serve, and answers from the
 /// partition itself, never from a row. `Primary` and `Rejected` both let the
 /// request go on to the owner, which serves or refuses it. `NotFound` or no
-/// answer means that the owner is not due to build the partition, or did not
-/// build it within its hold, and the request is refused here.
+/// answer within `admission_left` means that the owner is not due to build
+/// the partition, or did not build it in time, and the request is refused
+/// here. With no time left the read is not sent.
 ///
 /// This is still no readiness gate. An earlier probe of the owner ran here, on
 /// the theory that the table could not be trusted; it could not close the
@@ -1282,6 +1314,7 @@ where
 async fn wait_for_partition_routable<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
+    admission_left: Duration,
 ) -> bool
 where
     B: ShellBus,
@@ -1293,9 +1326,12 @@ where
     if shard.shards_table().shard_for(namespace).is_some() {
         return true;
     }
+    if admission_left.is_zero() {
+        return false;
+    }
     matches!(
         shard
-            .partition_read(namespace, PartitionRead::Primary)
+            .partition_read_budgeted(namespace, PartitionRead::Primary, admission_left)
             .await,
         Some(PartitionReadReply::Primary { .. } | PartitionReadReply::Rejected(_))
     )
@@ -4275,6 +4311,28 @@ mod tests {
         session: Option<SessionAttachment>,
         drain: Option<&Rc<ClientDrain>>,
     ) -> PartitionAdmission {
+        let origin = ClientOrigin::capture(&shard.bus, WRITE_TRANSPORT);
+        dispatch_write_from(
+            shard,
+            namespace,
+            minimum_metadata_op,
+            session,
+            drain,
+            origin,
+        )
+        .await
+    }
+
+    /// [`dispatch_write_on`] of a request that arrived as `origin` says.
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_write_from(
+        shard: &Rc<TestShard>,
+        namespace: IggyNamespace,
+        minimum_metadata_op: u64,
+        session: Option<SessionAttachment>,
+        drain: Option<&Rc<ClientDrain>>,
+        origin: ClientOrigin,
+    ) -> PartitionAdmission {
         let request = request_message(Operation::SendMessages, WRITE_CLIENT, WRITE_SESSION, 1, &[])
             .transmute_header(|old, header: &mut RoutedRequestHeader| {
                 *header = old;
@@ -4289,13 +4347,24 @@ mod tests {
             request,
             WRITE_CLIENT,
             WRITE_SESSION,
-            ClientOrigin::capture(&shard.bus, WRITE_TRANSPORT),
+            origin,
             Some(DEFAULT_ROOT_USER_ID),
             session.map(|session| (WRITE_CLIENT, session)),
             Some(namespace.inner()),
             in_flight,
         )
         .await
+    }
+
+    /// The origin of a write that arrived so long ago that `left` of its
+    /// admission budget remains.
+    fn origin_with_admission_left(bus: &SpyBus, left: Duration) -> ClientOrigin {
+        bus.monotonic.set(Some(0));
+        let origin = ClientOrigin::capture(bus, WRITE_TRANSPORT);
+        let waited = PARTITION_ADMISSION_BUDGET.checked_sub(left).unwrap();
+        bus.monotonic
+            .set(Some(u64::try_from(waited.as_micros()).unwrap()));
+        origin
     }
 
     /// The status of each frame that [`dispatch_write`] answered with.
@@ -4496,6 +4565,131 @@ mod tests {
         assert_eq!(write_statuses(&bus), [refused; 4]);
     }
 
+    /// A write that waited in the queue of its connection can have less than
+    /// one frontier budget before its client gives up, and its wait ends
+    /// there. That says nothing about the frontier, so the next write of the
+    /// connection waits again.
+    #[compio::test]
+    async fn given_a_write_late_in_its_admission_budget_when_the_frontier_stays_behind_should_wait_only_the_time_left()
+     {
+        const LOCAL_FRONTIER: u64 = 10;
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = route_one_partition(&shard);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.advance(LOCAL_FRONTIER);
+        let budget = frontier.partition_request_budget();
+        let left = budget / 2;
+        let drain = Rc::new(ClientDrain::new(&ServerConfig::default()));
+        let origin = origin_with_admission_left(&bus, left);
+
+        let admission = dispatch_write_from(
+            &shard,
+            namespace,
+            LOCAL_FRONTIER + 1,
+            None,
+            Some(&drain),
+            origin,
+        )
+        .await;
+
+        assert_eq!(admission, PartitionAdmission::Denied);
+        assert_eq!(
+            write_statuses(&bus),
+            [IggyError::TransientNotAccepted.as_code()]
+        );
+        assert_eq!(*bus.sleeps.borrow(), [left]);
+
+        dispatch_write_on(&shard, namespace, LOCAL_FRONTIER + 1, None, Some(&drain)).await;
+        assert_eq!(
+            *bus.sleeps.borrow(),
+            [left, budget],
+            "a wait that the arrival cut short must not end the waits of the connection"
+        );
+    }
+
+    /// The read that asks the owner of a partition without a routing row
+    /// shares the admission budget. Its own budget would let the refusal, or
+    /// the submit, come after the client gave up.
+    #[compio::test]
+    async fn given_missing_row_when_a_late_write_asks_the_owner_should_wait_only_the_time_left() {
+        const LEFT: Duration = Duration::from_secs(2);
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let (shard, owner_inbox, namespace) = shard_without_route(&bus);
+        let origin = origin_with_admission_left(&bus, LEFT);
+
+        let admission = dispatch_write_from(&shard, namespace, 0, None, None, origin).await;
+
+        assert_eq!(admission, PartitionAdmission::Denied);
+        assert_eq!(
+            write_statuses(&bus),
+            [IggyError::TransientNotAccepted.as_code()]
+        );
+        assert_eq!(*bus.sleeps.borrow(), [LEFT]);
+        assert!(
+            primary_read(&owner_inbox).now_or_never().is_some(),
+            "the owner was asked"
+        );
+    }
+
+    /// A write whose admission budget ended in the queue of its connection
+    /// waits for nothing. Without a routing row it is refused, and the owner
+    /// is not asked for an answer that nobody waits for.
+    #[compio::test]
+    async fn given_no_admission_time_left_when_the_row_is_missing_should_refuse_without_asking_the_owner()
+     {
+        let bus = SpyBus::default();
+        bus.instant_timers.set(true);
+        let (shard, owner_inbox, namespace) = shard_without_route(&bus);
+        let origin = origin_with_admission_left(&bus, Duration::ZERO);
+
+        let admission = dispatch_write_from(&shard, namespace, 0, None, None, origin).await;
+
+        assert_eq!(admission, PartitionAdmission::Denied);
+        assert_eq!(
+            write_statuses(&bus),
+            [IggyError::TransientNotAccepted.as_code()]
+        );
+        assert!(bus.sleeps.borrow().is_empty(), "{:?}", bus.sleeps.borrow());
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "the owner must not be asked"
+        );
+    }
+
+    /// The admission budget bounds the waits of the admission, not the write:
+    /// a write that needs no wait is submitted however late it is.
+    #[compio::test]
+    async fn given_no_admission_time_left_when_a_write_needs_no_wait_should_submit_it() {
+        const LOCAL_FRONTIER: u64 = 10;
+        let bus = SpyBus::default();
+        bus.frozen_timers.set(true);
+        let mut shard = test_shard(&bus, 0, 1, 1);
+        let (sender, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        shard.attach_senders(vec![sender]);
+        let shard = Rc::new(shard);
+        let namespace = route_one_partition(&shard);
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(LOCAL_FRONTIER);
+        let origin = origin_with_admission_left(&bus, Duration::ZERO);
+
+        let admission =
+            dispatch_write_from(&shard, namespace, LOCAL_FRONTIER, None, None, origin).await;
+
+        assert_eq!(admission, PartitionAdmission::Admitted);
+        assert!(matches!(
+            owner_inbox.try_recv(),
+            Ok(ShardFrame::Lifecycle(
+                LifecycleFrame::PartitionSubmit { .. }
+            ))
+        ));
+    }
+
     /// A session that ended is told so at once, whatever the frontier is.
     #[compio::test]
     async fn given_an_ended_session_ahead_of_the_frontier_when_a_partition_request_arrives_should_refuse_stale_client_without_a_wait()
@@ -4536,6 +4730,7 @@ mod tests {
             LOCAL_FRONTIER + 1,
             Some(&session),
             None,
+            PARTITION_ADMISSION_BUDGET,
         ));
         assert!(
             futures::poll!(admission.as_mut()).is_pending(),
