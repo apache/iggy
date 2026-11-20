@@ -46,10 +46,12 @@ export const deserializeClient = (r: Buffer, pos = 0): ClientDeserialized => {
    * 13 - x   string - address
    *  x - x+4 u32 - consumerGroupCount
    */
-  if(r.length < 17)
+  if (r.length - pos < 17)
     throw new Error('Client does not exist');
 
   const addressLength = r.readUInt32LE(pos + 9);
+  if (r.length - pos < 13 + addressLength + 4)
+    throw new Error('Client does not exist');
 
   return {
     bytesRead: 13 + addressLength + 4,
