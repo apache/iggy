@@ -499,7 +499,9 @@ pub struct ShardMetrics {
     fresh_sends_denied_total: Counter,
     /// Of those, the sends turned away because the waiting sends of their
     /// partition held its share of the bytes, and because the waiting sends
-    /// of the shard held all the bytes they may.
+    /// of the shard held all the bytes they may: the bounds
+    /// `tiered_storage.fresh_partition_pending_bytes` and
+    /// `tiered_storage.fresh_pending_bytes`.
     fresh_sends_denied_partition_share_total: Counter,
     fresh_sends_denied_shard_cap_total: Counter,
     /// Fresh objects whose upload holds one of the shard's upload slots.
@@ -2775,14 +2777,14 @@ impl ShardMetrics {
         );
         registry.register(
             "fresh_sends_denied_partition_share",
-            "sends turned away because the waiting sends of their partition held its share of \
-             the bytes that may wait",
+            "sends turned away because the waiting sends of their partition held \
+             tiered_storage.fresh_partition_pending_bytes",
             self.fresh_sends_denied_partition_share_total.clone(),
         );
         registry.register(
             "fresh_sends_denied_shard_cap",
-            "sends turned away because the waiting sends of the shard held all the bytes that \
-             may wait",
+            "sends turned away because the waiting sends of the shard held \
+             tiered_storage.fresh_pending_bytes",
             self.fresh_sends_denied_shard_cap_total.clone(),
         );
         registry.register(

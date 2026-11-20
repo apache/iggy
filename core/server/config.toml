@@ -1546,6 +1546,27 @@ handshake_grace = "10 s"
 # shortest one, 1 s after its last rewrite. "0" turns the delay off.
 # Otherwise at least 64 MiB, what one long-term segment holds.
 #long_term_backlog_limit = "1 GiB"
+# The most bytes of messages one shard holds for sends to geo topics that have
+# not reached their partitions yet: in the open upload window, in the fresh
+# objects that upload or wait for a slot, and in stored objects whose partition
+# has no room yet. It bounds the memory a shard spends when the store or a
+# partition stops answering. A send past it is refused for a moment with
+# TransientNotAccepted, and the client sends it again. A send larger than it
+# still gets in while nothing waits on the shard. The uploads of
+# 'jobs.fresh_uploads' hold part of it, so more slots take no more memory. At
+# most a node spends this times its shards on such sends. At least 4 MiB, the
+# size of one fresh object.
+#fresh_pending_bytes = "32 MiB"
+# The most of 'fresh_pending_bytes' that the waiting sends of one partition
+# hold, so a partition that stops answering leaves the rest to the other
+# partitions of the shard. A send past it is refused the same way, and a send
+# larger than it still gets in while nothing of its partition waits. Raise both
+# when producers send batches of several MiB to the same partition at once:
+# with batches of 10 KB to 10 MB from 32 producers on 64 partitions, 17 % of
+# sends were refused once at the defaults. The metrics
+# fresh_sends_denied_partition_share and fresh_sends_denied_shard_cap count the
+# refusals. At least 4 MiB, and at most 'fresh_pending_bytes'.
+#fresh_partition_pending_bytes = "8 MiB"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
 # alone. Polls that read from the store are demand fetches. Nothing uses the

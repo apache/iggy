@@ -25,8 +25,8 @@ mod partition_io;
 pub use partition_io::{DEFAULT_PARTITION_IO_CAPACITY, PartitionIoLimits, PartitionIoLimitsError};
 mod fresh_writes;
 pub use fresh_writes::{
-    FRESH_CONFIRM_AFTER, FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL,
-    FRESH_UPLOADS, FinishedFreshUpload,
+    FRESH_CONFIRM_AFTER, FRESH_OBJECT_BYTES, FRESH_PARTITION_PENDING_BYTES_MAX,
+    FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS, FinishedFreshUpload,
 };
 mod fresh_sweeps;
 pub mod geo_commits;
