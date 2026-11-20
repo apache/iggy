@@ -1,0 +1,117 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Cargo deny advisories nightly
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  advisories:
+    name: Check RustSec advisories
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    outputs:
+      advisory_ids: ${{ steps.check.outputs.advisory_ids }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: master
+      - name: Setup Rust
+        uses: ./.github/actions/utils/setup-rust
+        with:
+          install-system-dependencies: false
+          free-disk-space: false
+          read-cache: false
+          save-cache: false
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - name: Check advisories
+        id: check
+        shell: bash
+        run: |
+          status=0
+          ./scripts/ci/cargo-deny.sh advisories 2>&1 | tee advisory-output.log || status=$?
+          advisory_ids=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]+' advisory-output.log | sort -u | paste -sd ',' - | sed 's/,/, /g' || true)
+          echo "advisory_ids=$advisory_ids" >> "$GITHUB_OUTPUT"
+          exit "$status"
+
+  report:
+    name: Report advisory failure
+    needs: advisories
+    if: ${{ !cancelled() && needs.advisories.result != 'success' }}
+    concurrency: cargo-deny-advisories-report
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the issue
+        uses: actions/github-script@v9
+        env:
+          ADVISORY_IDS: ${{ needs.advisories.outputs.advisory_ids }}
+        with:
+          script: |
+            const title = 'Cargo deny nightly advisories failed';
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+            const advisoryIds = process.env.ADVISORY_IDS || 'Unavailable (see workflow logs)';
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
+              state: 'open',
+              creator: 'github-actions[bot]',
+              per_page: 100,
+            });
+            const existing = openIssues.find(issue => issue.title === title);
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: existing.number,
+                body: [
+                  'The advisory check failed again.',
+                  '',
+                  `**Advisory IDs:** ${advisoryIds}`,
+                  `**Workflow run:** ${runUrl}`,
+                ].join('\n'),
+              });
+              return;
+            }
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title,
+              labels: ['bug'],
+              body: [
+                'The daily `cargo-deny` advisory check failed.',
+                '',
+                `**Advisory IDs:** ${advisoryIds}`,
+                `**Workflow run:** ${runUrl}`,
+                '',
+                'The check monitors RustSec vulnerabilities and unmaintained dependencies.',
+                'Advisory findings are non-blocking on PRs but tracked here for follow-up.',
+              ].join('\n'),
+            });

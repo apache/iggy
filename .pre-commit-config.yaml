@@ -190,6 +190,14 @@ repos:
         files: (^|/)Cargo\.toml$
         pass_filenames: false
 
+      - id: cargo-deny
+        name: cargo deny
+        entry: ./scripts/ci/cargo-deny.sh
+        language: system
+        files: (^|/)Cargo\.(toml|lock)$|^deny\.toml$
+        pass_filenames: false
+        stages: [pre-push]
+
       - id: cargo-clippy
         name: cargo clippy
         entry: cargo clippy
