@@ -105,6 +105,9 @@ mod message_retrieval;
 // The full restart matrix (consumer variants included) runs under the server:
 // a restarted replica rejoins via the view probe + journal repair.
 mod delete_segments;
+// A crash restart after `delete_segments` removed the segment that the WAL checkpoint
+// cursor ends must serve the data written past it.
+mod delete_segments_crash_recovery;
 mod external_auth;
 pub(crate) mod scenarios;
 mod specific;
