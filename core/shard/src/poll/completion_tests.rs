@@ -2497,9 +2497,11 @@ async fn given_a_pending_wal_trim_when_metadata_prepares_arrive_should_keep_them
 
 /// A WAL trim can leave many kept prepares. Handed back ahead of the inbox,
 /// they made each frame that arrived meanwhile wait for all of them, the
-/// replies to the heartbeats of this replica included.
+/// replies to the heartbeats of this replica included. One per frame is too
+/// few: a prepare that arrives behind kept ones is kept too, so the queue
+/// would not get shorter under a stream of prepares.
 #[compio::test]
-async fn given_kept_metadata_prepares_when_inbox_frames_arrive_should_hand_back_one_prepare_per_frame()
+async fn given_kept_metadata_prepares_when_inbox_frames_arrive_should_hand_back_two_prepares_per_frame()
  {
     const KEPT: u64 = 3;
     let mut backup = MetadataBackup::with_prepares(KEPT).await;
@@ -2550,8 +2552,8 @@ async fn given_kept_metadata_prepares_when_inbox_frames_arrive_should_hand_back_
     );
     assert_eq!(
         acked_at_second,
-        [1],
-        "one kept prepare runs between two frames, and no more"
+        [1, 2],
+        "two kept prepares run between two frames, and no more"
     );
 }
 

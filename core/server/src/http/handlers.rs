@@ -1816,7 +1816,7 @@ pub(in crate::http) async fn send_messages(
                 )
             }
             ProduceAck::None => {
-                require_local_primary(&state, namespace)
+                require_local_primary(&state, namespace, request.deadline)
                     .await
                     .map_err(PartitionWriteError::Rejected)?;
                 produce_unacked(

@@ -1071,7 +1071,8 @@ async fn given_held_poll_when_its_partition_is_built_after_the_hold_ended_should
 
 /// The hop target of an HTTP relay stops its wait at the end of its budget.
 /// The hold of its read must end one reply margin before that, and never
-/// later than a hold without a budget.
+/// later than a hold without a budget. The wait for the reply ends with the
+/// budget, and never later than a read without one.
 #[compio::test]
 async fn given_a_requester_budget_when_reading_an_unbuilt_partition_should_end_the_hold_before_it()
 {
@@ -1079,11 +1080,22 @@ async fn given_a_requester_budget_when_reading_an_unbuilt_partition_should_end_t
     let namespace = IggyNamespace::new(0, 0, 0);
     let build_hold = u64::try_from(PARTITION_BUILD_HOLD.as_micros()).unwrap();
     let short_hold = u64::try_from(SHORT_BUDGET.as_micros()).unwrap() - FETCH_REPLY_MARGIN_US;
-    for (budget, hold) in [
-        (SHORT_BUDGET, short_hold),
-        (PARTITION_BUILD_HOLD * 2, build_hold),
+    for (budget, hold, reply_wait) in [
+        (SHORT_BUDGET, short_hold, SHORT_BUDGET),
+        (
+            PARTITION_BUILD_HOLD * 2,
+            build_hold,
+            PARTITION_BUILD_HOLD * 2,
+        ),
+        (
+            PARTITION_READ_TIMEOUT * 2,
+            build_hold,
+            PARTITION_READ_TIMEOUT,
+        ),
     ] {
         let bus = PollTestBus::default();
+        // The bus refuses a reply timer of another duration.
+        bus.read_budget.set(Some(reply_wait));
         let (mut owner, _) = owner_with_unbuilt_partition(&bus, namespace, &[]);
         let (senders, mut inboxes, _reply_inboxes) = shard_mesh_channels(1, 1, 1);
         owner.attach_senders(senders);

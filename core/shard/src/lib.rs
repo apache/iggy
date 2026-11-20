@@ -2858,14 +2858,16 @@ where
     where
         M: StreamsFrontend,
     {
-        self.partition_read_held(namespace, read, None).await
+        self.partition_read_held(namespace, read, None, PARTITION_READ_TIMEOUT)
+            .await
     }
 
     /// [`Self::partition_read`] of a requester that stops its own wait
     /// `budget` from now, as the hop target of an HTTP relay does. An owner
     /// that holds the read for a partition that cannot serve yet ends the
     /// hold one reply margin before that, so its answer still reaches the
-    /// requester, and after [`PARTITION_BUILD_HOLD`] at the latest.
+    /// requester, and after [`PARTITION_BUILD_HOLD`] at the latest. The wait
+    /// for the reply of a read that is not deferred ends with the budget too.
     #[allow(clippy::future_not_send)]
     pub async fn partition_read_budgeted(
         &self,
@@ -2881,18 +2883,25 @@ where
         let hold =
             micros(PARTITION_BUILD_HOLD).min(micros(budget).saturating_sub(FETCH_REPLY_MARGIN_US));
         let hold_deadline = self.bus.monotonic_micros().saturating_add(hold);
-        self.partition_read_held(namespace, read, Some(hold_deadline))
-            .await
+        self.partition_read_held(
+            namespace,
+            read,
+            Some(hold_deadline),
+            PARTITION_READ_TIMEOUT.min(budget),
+        )
+        .await
     }
 
     /// [`Self::partition_read`] with the end of a hold of `read`, see
-    /// [`LifecycleFrame::PartitionRead`].
+    /// [`LifecycleFrame::PartitionRead`], and the reply budget of a read that
+    /// is not deferred.
     #[allow(clippy::future_not_send)]
     async fn partition_read_held(
         &self,
         namespace: IggyNamespace,
         mut read: PartitionRead,
         hold_deadline: Option<u64>,
+        reply_timeout: std::time::Duration,
     ) -> Option<PartitionReadReply>
     where
         M: StreamsFrontend,
@@ -2912,7 +2921,7 @@ where
             request.request_deadline = request_deadline;
             request.options.request_timeout.get_duration()
         } else {
-            PARTITION_READ_TIMEOUT
+            reply_timeout
         };
         self.partition_read_within(namespace, read, timeout, hold_deadline)
             .await

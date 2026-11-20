@@ -52,6 +52,12 @@ pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
 
 pub const COOPERATIVE_EVENT_BUDGET: usize = 64;
 
+/// How many kept metadata frames the pump hands back per main-lane frame.
+/// More than one: a metadata frame that arrives behind kept ones is kept too,
+/// so one per frame never shortens the queue under a steady stream of them,
+/// and the repair of a gap waits behind it.
+const GATED_METADATA_FRAMES_PER_MAIN_FRAME: usize = 2;
+
 #[derive(Default)]
 pub struct LoopbackRound {
     pub(super) entries: VecDeque<(Option<PartitionIncarnation>, Message<GenericHeader>)>,
@@ -613,9 +619,13 @@ where
                                 self.process_frame(reply).await;
                             }
                             self.process_one_poll_completion(&mut loopback_buf).await;
-                            // One per main frame, as the reply lane above: the
-                            // arm below never runs while the main lane is busy.
-                            if let Some(frame) = self.pop_gated_metadata_frame() {
+                            // A bounded turn per main frame, as the reply lane
+                            // above: the arm below never runs while the main
+                            // lane is busy.
+                            for _ in 0..GATED_METADATA_FRAMES_PER_MAIN_FRAME {
+                                let Some(frame) = self.pop_gated_metadata_frame() else {
+                                    break;
+                                };
                                 self.replay_gated_metadata_frame(frame, &mut loopback_buf).await;
                             }
                         }
