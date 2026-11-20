@@ -2723,6 +2723,88 @@ async fn given_accepted_descriptor_when_install_fails_should_exhaust_its_generat
     );
 }
 
+/// A peer can pair its snapshot with a commit op that is still behind it. The
+/// install refused such an offer after the whole fetch and charged the
+/// generation, so the offers of the same generation that followed once the
+/// commit op caught up were refused too.
+#[compio::test]
+async fn given_a_descriptor_whose_commit_trails_its_snapshot_when_it_arrives_should_refuse_it_without_charging_the_generation()
+ {
+    const GENERATION: u64 = 37;
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let dir = tempfile::tempdir().unwrap();
+    let journal = PrepareJournal::open(&dir.path().join("metadata.wal"), 0)
+        .await
+        .unwrap();
+    let consensus = VsrConsensus::new(
+        1,
+        0,
+        1,
+        server_common::sharding::METADATA_GROUP,
+        bus.clone(),
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let metadata = IggyMetadata::new(
+        Some(consensus),
+        Some(journal),
+        None,
+        None,
+        PollTestMetadata::default(),
+        None,
+    );
+    let (owner, _sender) = owner_with_metadata_plane(
+        &bus,
+        partitions_config(),
+        IggyNamespace::new(0, 0, 0),
+        metadata,
+    );
+    let consensus = owner.plane.metadata().consensus.as_ref().unwrap();
+    consensus.set_state_transfer_stage(StateTransferStage::AwaitingTarget);
+    owner.arm_metadata_transfer(consensus, 0).await;
+    let nonce = owner.metadata_transfer.borrow().as_ref().unwrap().nonce;
+    let descriptor = || {
+        metadata_descriptor(
+            nonce,
+            GENERATION,
+            &[
+                StateArtifact::for_bytes(artifact_kind::METADATA_SNAPSHOT, GENERATION, b"snapshot"),
+                StateArtifact::for_bytes(artifact_kind::CLIENT_TABLE, GENERATION, b"client table"),
+            ],
+        )
+    };
+    let trailing = descriptor().transmute_header(|old, header: &mut StateTransferTargetHeader| {
+        *header = old;
+        header.commit_op = GENERATION - 1;
+        header.seal();
+    });
+
+    owner.on_state_transfer_target(&trailing).await;
+
+    assert!(
+        !owner
+            .metadata_transfer
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .target_accepted,
+        "the descriptor must be refused before the fetch"
+    );
+    assert_eq!(
+        consensus.state_transfer_stage(),
+        StateTransferStage::AwaitingTarget
+    );
+    assert_eq!(owner.metadata_transfer_decode_failures.get(), None);
+
+    owner.on_state_transfer_target(&descriptor()).await;
+
+    assert_eq!(
+        consensus.state_transfer_stage(),
+        StateTransferStage::Fetching,
+        "a coherent descriptor of the same generation must still be accepted"
+    );
+}
+
 /// The checksums match and the client table decodes, so only the install can
 /// refuse this transfer: an empty snapshot does not decode.
 #[compio::test]
@@ -2909,6 +2991,7 @@ async fn given_a_descriptor_when_its_tail_exceeds_the_journal_slots_should_reque
     owner.arm_metadata_transfer(consensus, PEER).await;
     let nonce = owner.metadata_transfer.borrow().as_ref().unwrap().nonce;
     sent.borrow_mut().clear();
+    // The peer committed up to the frontier of its table.
     let descriptor = |tail: u64| {
         metadata_descriptor(
             nonce,
@@ -2922,6 +3005,11 @@ async fn given_a_descriptor_when_its_tail_exceeds_the_journal_slots_should_reque
                 ),
             ],
         )
+        .transmute_header(|old, header: &mut StateTransferTargetHeader| {
+            *header = old;
+            header.commit_op = GENERATION + tail;
+            header.seal();
+        })
     };
     let target_accepted = || {
         owner

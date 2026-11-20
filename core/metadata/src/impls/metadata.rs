@@ -706,6 +706,31 @@ where
         .unwrap_or((floor, 0))
 }
 
+/// Refuses state transfer frontiers that no caught-up primary offers.
+///
+/// `commit_op` and `table_frontier` come from the serving peer and would move
+/// the frontiers of this replica. A peer cannot have committed less than its
+/// own snapshot contains, nor encode a table outside the range from the
+/// snapshot to its commit point: `state_transfer_offer` builds all three from
+/// one caught-up-primary read.
+///
+/// # Errors
+/// [`SnapshotError::IncoherentManifest`].
+pub const fn verify_state_transfer_manifest(
+    snapshot_seq: u64,
+    commit_op: u64,
+    table_frontier: u64,
+) -> Result<(), SnapshotError> {
+    if commit_op < snapshot_seq || table_frontier < snapshot_seq || table_frontier > commit_op {
+        return Err(SnapshotError::IncoherentManifest {
+            snapshot_seq,
+            commit_op,
+            table_frontier,
+        });
+    }
+    Ok(())
+}
+
 impl Snapshot for IggySnapshot {
     type Error = SnapshotError;
     type SequenceNumber = u64;
@@ -2934,27 +2959,11 @@ where
             "decoded a transferred metadata snapshot"
         );
 
-        // Manifest coherence. `commit_op` and `table_frontier` arrive from the
-        // serving peer and are applied to THIS replica's frontiers, so a
-        // malformed descriptor would move them somewhere the artifacts do not
-        // justify. A peer cannot have committed less than its own snapshot
-        // contains, nor have encoded a table below its commit point: both are
-        // built from one caught-up-primary read in `state_transfer_offer`.
-        // Refuse rather than install, which drops the caller back to journal
-        // repair with the local state untouched.
-        if commit_op < snapshot_seq || table_frontier < snapshot_seq || table_frontier > commit_op {
-            tracing::error!(
-                snapshot_seq,
-                commit_op,
-                table_frontier,
-                "incoherent state transfer manifest; refusing to install"
-            );
-            return Err(SnapshotError::IncoherentManifest {
-                snapshot_seq,
-                commit_op,
-                table_frontier,
-            });
-        }
+        // The descriptor gate checked the frontier that the manifest declares
+        // for the snapshot, not the op of the decoded snapshot. Refuse rather
+        // than install, which drops the caller back to journal repair with the
+        // local state untouched.
+        verify_state_transfer_manifest(snapshot_seq, commit_op, table_frontier)?;
 
         // Checkpoints are node-local, so a healthy serving primary can offer
         // a snapshot BEHIND this replica's own applied frontier (each node

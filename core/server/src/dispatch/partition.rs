@@ -294,16 +294,37 @@ where
         .await;
         return PartitionAdmission::Denied;
     }
-    // The drain takes an offset write without its progress lane while this
-    // node has not applied the partition. The waits above let it resolve, and
-    // a read of the offset that the connection sent behind the write must
-    // still wait for it. The key comes from the request as the client sent
-    // it, as the drain keys the frames behind it.
+    // The waits above end inside the admission budget, but the queue of the
+    // connection can spend it first. A write submitted then can get its reply
+    // after its client gave up.
+    if admission_left().is_zero() {
+        warn!(
+            transport_client_id,
+            namespace,
+            operation = ?header.operation,
+            "partition request spent its admission budget before the submit; replying transient"
+        );
+        send_deny_reply(
+            shard,
+            origin,
+            &header,
+            IggyError::TransientNotAccepted.as_code(),
+        )
+        .await;
+        return PartitionAdmission::Denied;
+    }
+    // The drain picks the lane of an offset write from the metadata of this
+    // node before the waits above. The write can resolve only after them, or
+    // to another key: a group created again under its name gets a new id. A
+    // read of the offset that the connection sent behind the write must still
+    // wait for it. The key comes from the request as the client sent it, as
+    // the drain keys the frames behind it.
     if matches!(
         header.operation,
         Operation::StoreConsumerOffset | Operation::DeleteConsumerOffset
     ) && let Some(in_flight) = in_flight.as_mut()
-        && !in_flight.claim_progress(|| progress_key(shard, request.as_generic()))
+        && let Some(key) = progress_key(shard, request.as_generic())
+        && !in_flight.claim_progress(key)
     {
         warn!(
             transport_client_id,
@@ -4662,10 +4683,12 @@ mod tests {
         );
     }
 
-    /// The admission budget bounds the waits of the admission, not the write:
-    /// a write that needs no wait is submitted however late it is.
+    /// A write that spent its admission budget in the queue of its connection
+    /// and needs no wait took the fast path to the owner. Its reply wait could
+    /// then end after its client gave up.
     #[compio::test]
-    async fn given_no_admission_time_left_when_a_write_needs_no_wait_should_submit_it() {
+    async fn given_no_admission_time_left_when_a_write_needs_no_wait_should_refuse_it_before_the_owner()
+     {
         const LOCAL_FRONTIER: u64 = 10;
         let bus = SpyBus::default();
         bus.frozen_timers.set(true);
@@ -4684,13 +4707,15 @@ mod tests {
         let admission =
             dispatch_write_from(&shard, namespace, LOCAL_FRONTIER, None, None, origin).await;
 
-        assert_eq!(admission, PartitionAdmission::Admitted);
-        assert!(matches!(
-            owner_inbox.try_recv(),
-            Ok(ShardFrame::Lifecycle(
-                LifecycleFrame::PartitionSubmit { .. }
-            ))
-        ));
+        assert_eq!(admission, PartitionAdmission::Denied);
+        assert_eq!(
+            write_statuses(&bus),
+            [IggyError::TransientNotAccepted.as_code()]
+        );
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "the owner must not get the write"
+        );
     }
 
     /// A session that ended is told so at once, whatever the frontier is.
