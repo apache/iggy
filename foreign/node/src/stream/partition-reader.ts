@@ -895,6 +895,12 @@ export class PartitionReader implements AsyncIterable<PolledBatch> {
       state.delivered = { offset: checkpoint.offset, context: checkpoint.context };
   }
 
+  /** @internal Whether a consumer may still hand over the unread messages of a batch. */
+  keepsBatch(batch: PolledBatch): boolean {
+    const stamp = batch.checkpoint()?.stamp;
+    return stamp?.reader === this.id && this.keeps(batch.partitionId, stamp.generation);
+  }
+
   /**
    * @internal Takes back a batch that `next` returned and nobody read, so a
    * close under `CommitPolicy.OnRead` moves the offset back before it.

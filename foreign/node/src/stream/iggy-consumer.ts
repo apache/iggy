@@ -200,7 +200,8 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   }
 
   private async nextBatch(): Promise<PolledBatch | undefined> {
-    if (this.current && this.index < this.current.messages.length) return this.current;
+    if (this.current && this.index < this.current.messages.length && this.reader.keepsBatch(this.current))
+      return this.current;
     this.current = undefined;
     while (true) {
       try {

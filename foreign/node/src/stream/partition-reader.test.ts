@@ -3974,6 +3974,79 @@ describe('partition reader', () => {
 
 describe('consumer', () => {
   for (const commit of [CommitPolicy.Manual, CommitPolicy.OnRead,
+    CommitPolicy.Auto({ interval: 3_600_000, after: CommitAfter.Delivery })]) {
+    for (const handler of [false, true]) {
+      it(`checks a retained batch after revocation before ${handler ? 'a handler' : 'iteration'} with ${commit.kind}`,
+        async () => {
+          const topic = new FakeTopic(6n);
+          topic.assigned = [1];
+          const client = topic.client();
+          const reader = await PartitionReader.open(async () => client, {
+            streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 },
+            options: { maxWait: 100, commit }, retryInterval: 20
+          });
+          const consumer = new IggyConsumer(reader, commit.kind === 'auto' ? CommitAfter.Delivery : undefined);
+          const received: Array<[number, bigint]> = [];
+          try {
+            for await (const { partitionId, message } of consumer) {
+              received.push([partitionId, message.headers.offset]);
+              break;
+            }
+            topic.assigned = [3];
+            await waitFor(() => consumer.partitions().length === 1 && consumer.partitions()[0] === 3,
+              'the assignment did not move to partition 3', 2 * GROUP_REFRESH_MS);
+
+            if (handler) {
+              const stop = new Error('handler stopped');
+              await assert.rejects(consumer.consume(({ partitionId, message }) => {
+                received.push([partitionId, message.headers.offset]);
+                throw stop;
+              }), (error: unknown) => error === stop);
+            } else {
+              for await (const { partitionId, message } of consumer) {
+                received.push([partitionId, message.headers.offset]);
+                break;
+              }
+            }
+            assert.deepEqual(received, [[1, 0n], commit.kind === 'onRead' ? [1, 1n] : [3, 0n]]);
+          } finally {
+            await consumer.shutdown();
+          }
+        });
+    }
+  }
+
+  it('drops a retained batch from an earlier assignment of the same partition', async () => {
+    const topic = new FakeTopic(6n);
+    topic.assigned = [1];
+    const client = topic.client();
+    const reader = await PartitionReader.open(async () => client, {
+      streamId: 1, topicId: 2, consumer: { kind: ConsumerKind.Group, id: 5 },
+      options: { maxWait: 100, commit: CommitPolicy.Manual }, retryInterval: 20
+    });
+    const consumer = new IggyConsumer(reader);
+    const received: bigint[] = [];
+    try {
+      for await (const { message } of consumer) {
+        received.push(message.headers.offset);
+        break;
+      }
+      for (const partition of [3, 1]) {
+        topic.assigned = [partition];
+        await waitFor(() => consumer.partitions().length === 1 && consumer.partitions()[0] === partition,
+          `the assignment did not move to partition ${partition}`, 2 * GROUP_REFRESH_MS);
+      }
+      for await (const { message } of consumer) {
+        received.push(message.headers.offset);
+        break;
+      }
+      assert.deepEqual(received, [0n, 0n]);
+    } finally {
+      await consumer.shutdown();
+    }
+  });
+
+  for (const commit of [CommitPolicy.Manual, CommitPolicy.OnRead,
     CommitPolicy.Auto({ interval: 3_600_000, after: CommitAfter.Processing })]) {
     for (const take of [1, 2]) {
       it(`resumes an iteration after taking ${take} messages with ${commit.kind}`, async () => {
