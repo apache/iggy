@@ -300,7 +300,7 @@ internal sealed class VsrCluster : IAsyncDisposable
         environment["IGGY_MESSAGE_BUS_RECONNECT_PERIOD"] = "100ms";
         // The metadata primary seeds a new partition group seconds after its backups when the whole suite runs
         // at once, and at the default 5s the backups read that as a dead primary and elect a new one.
-        environment["IGGY_CLUSTER_HEARTBEAT_TIMEOUT"] = "15s";
+        environment["IGGY_CLUSTER_COMMIT_BUSY_HEARTBEAT_TIMEOUT"] = "15s";
         // A partition primary can move off the node HTTP clients talk to. Without a JWT secret every node
         // verifies, that node cannot forward to the new primary and refuses the partition until the budget
         // runs out.

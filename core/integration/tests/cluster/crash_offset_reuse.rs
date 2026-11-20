@@ -20,16 +20,24 @@
 //! `SendMessagesResponse::confirmations` hands clients concrete base offsets,
 //! which makes offset reuse client-visible: a client that recorded offset N for
 //! its message must never see the server confirm a DIFFERENT message at N
-//! later. A solo node acks below the flush thresholds from RAM only, so nothing
-//! in the segments says those offsets were ever handed out. What keeps them
-//! from being re-minted is the offset RESERVATION in the partition superblock,
-//! claimed by the append fence before any of them exist and read back by boot.
+//! later. A solo node acks below the flush thresholds before any barrier covers
+//! the write, so a crash can leave nothing in the segments that says those
+//! offsets were ever handed out. What keeps them from being re-minted is the
+//! offset RESERVATION in the partition superblock, claimed by the append fence
+//! before any of them exist and read back by boot.
+//!
+//! A kill of the process alone does not lose those writes: the OS still holds
+//! them, and the restart keeps them. A power loss does, so the crash in these
+//! cases also cuts the WAL back to its published frontier.
 
 use std::path::Path;
 use std::time::Duration;
 
 use iggy::prelude::*;
 use integration::harness::TestHarness;
+use integration::harness::disk::{
+    drop_unpublished_partition_wal_tail, read_partition_wal_frontier,
+};
 use integration::iggy_harness;
 use tokio::time::sleep;
 
@@ -39,6 +47,10 @@ const PARTITION_ID: u32 = 0;
 /// Confirmed sends before the crash; small enough to stay far below the
 /// 1024-message / 1 MiB flush thresholds, so nothing reaches the segments.
 const PRE_CRASH_SENDS: u32 = 5;
+const CONSUMER_ID: u32 = 7;
+/// A payload no earlier send used, so a poll cannot pass by matching something
+/// the pre-crash range already held.
+const POST_CRASH_PAYLOAD: &str = "across-the-hole-000";
 
 /// Bounds the restarted node's boot and its consensus groups settling.
 const SERVE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -168,11 +180,83 @@ async fn wait_for_stored_offset_on_disk(harness: &TestHarness, expected: u64, bu
     }
 }
 
-/// Kill the node, bring it back, and return a client onto the restarted one.
+/// Kill the node, cut its WAL back to the published frontier, bring it back,
+/// and return a client onto the restarted one.
 async fn crash_and_recover(harness: &mut TestHarness) -> IggyClient {
     harness.kill_node(0).expect("SIGKILL the only node");
+    drop_unpublished_partition_wal_tail(&harness.node(0).data_path())
+        .expect("cut the WAL back to its published frontier");
     harness.restart_node(0).expect("restart it");
     wait_until_serving(harness, SERVE_TIMEOUT).await
+}
+
+/// Confirm the pre-crash sends and store `consumer` one below the last of
+/// them, returning that position once it is on disk.
+async fn store_position_below_the_tail(harness: &TestHarness, consumer: &Consumer) -> u64 {
+    let client = harness.tcp_root_client().await.unwrap();
+    create_topic(&client, None).await;
+    let acked = produce_acked(&client, "pre-crash", PRE_CRASH_SENDS).await;
+    // Positioned one BELOW the last confirmed offset, so the pre-crash tail is
+    // still ahead of the consumer when the node dies. A position at the tail
+    // would make the first post-crash poll indistinguishable from a fresh read.
+    let stored = *acked.last().expect("confirmed sends") - 1;
+    client
+        .store_consumer_offset(
+            consumer,
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+            stored,
+        )
+        .await
+        .expect("store the pre-crash consumer position");
+    // Gated on the position reaching DISK before the SIGKILL. The ack is granted
+    // at commit and the consumer-offset write is threshold-gated like any other,
+    // so without this the crash can legitimately take the position with it and
+    // the assertions on it race.
+    wait_for_stored_offset_on_disk(harness, stored, SERVE_TIMEOUT).await;
+    stored
+}
+
+async fn assert_position_survived(client: &IggyClient, consumer: &Consumer, stored: u64) {
+    assert_eq!(
+        client
+            .get_consumer_offset(
+                consumer,
+                &Identifier::named(STREAM_NAME).unwrap(),
+                &Identifier::named(TOPIC_NAME).unwrap(),
+                Some(PARTITION_ID),
+            )
+            .await
+            .expect("read the consumer offset back")
+            .expect("the stored position survived the crash")
+            .stored_offset,
+        stored,
+        "the position a consumer committed before the crash must mean the same \
+         offset after it, or every consumer silently re-reads or skips"
+    );
+}
+
+/// The one message `Next` serves `consumer` from its stored position.
+async fn poll_next(client: &IggyClient, consumer: &Consumer) -> IggyMessage {
+    client
+        .poll_messages(
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            PARTITION_ID,
+            consumer,
+            &PollingStrategy::next(),
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
+        )
+        .await
+        .expect("poll forward from the stored position")
+        .messages
+        .into_iter()
+        .next()
+        .expect("`Next` from the stored position served nothing at all")
 }
 
 #[iggy_harness(cluster_nodes = 1)]
@@ -343,72 +427,20 @@ async fn given_a_flushed_crash_restarted_node_when_stopped_cleanly_should_still_
 async fn given_a_stored_consumer_position_when_polling_across_a_reservation_hole_should_not_miss(
     harness: &mut TestHarness,
 ) {
-    const CONSUMER_ID: u32 = 7;
-    const POST_CRASH_PAYLOAD: &str = "across-the-hole-000";
-
-    let stream = Identifier::named(STREAM_NAME).unwrap();
-    let topic = Identifier::named(TOPIC_NAME).unwrap();
-    let client = harness.tcp_root_client().await.unwrap();
-    create_topic(&client, None).await;
-
-    let acked = produce_acked(&client, "pre-crash", PRE_CRASH_SENDS).await;
-    let highest_confirmed = *acked.last().expect("confirmed sends");
-    // Positioned one BELOW the last confirmed offset, so the pre-crash tail is
-    // still ahead of the consumer when the node dies. A position at the tail
-    // would make the first post-crash poll indistinguishable from a fresh read.
-    let stored = highest_confirmed - 1;
     let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
-    client
-        .store_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID), stored)
-        .await
-        .expect("store the pre-crash consumer position");
-    // Gated on the position reaching DISK before the SIGKILL. The ack is granted
-    // at commit and the consumer-offset write is threshold-gated like any other,
-    // so without this the crash can legitimately take the position with it and
-    // the assertion below races.
-    wait_for_stored_offset_on_disk(harness, stored, SERVE_TIMEOUT).await;
-    drop(client);
+    let stored = store_position_below_the_tail(harness, &consumer).await;
+    let highest_confirmed = stored + 1;
 
     let client = crash_and_recover(harness).await;
-    assert_eq!(
-        client
-            .get_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
-            .await
-            .expect("read the consumer offset back")
-            .expect("the stored position survived the crash")
-            .stored_offset,
-        stored,
-        "the position a consumer committed before the crash must mean the same \
-         offset after it, or every consumer silently re-reads or skips"
-    );
+    assert_position_survived(&client, &consumer, stored).await;
 
-    // One message above the hole, with a payload no earlier send used, so the
-    // poll cannot pass by matching something the pre-crash range already held.
     let post_crash = produce_acked(&client, "across-the-hole", 1).await[0];
     assert!(
         post_crash > highest_confirmed,
         "the premise: the restart must mint above the confirmed range"
     );
 
-    let polled = client
-        .poll_messages(
-            &stream,
-            &topic,
-            PARTITION_ID,
-            &consumer,
-            &PollingStrategy::next(),
-            PollOptions {
-                count: 1,
-                ..PollOptions::default()
-            },
-        )
-        .await
-        .expect("poll forward from the stored position");
-
-    let message = polled
-        .messages
-        .first()
-        .unwrap_or_else(|| panic!("`Next` from offset {stored} served nothing at all"));
+    let message = poll_next(&client, &consumer).await;
     assert_eq!(
         String::from_utf8_lossy(&message.payload),
         POST_CRASH_PAYLOAD,
@@ -420,6 +452,71 @@ async fn given_a_stored_consumer_position_when_polling_across_a_reservation_hole
         "and it must be served at the offset the producer was confirmed at: the hole \
          between {highest_confirmed} and {post_crash} is unwritten offset space, not \
          messages a consumer may be handed"
+    );
+}
+
+/// The same consumer when only the process dies. The OS still holds the
+/// confirmed records, the restart keeps them, and the chain below the hole is
+/// not empty. So the consumer first reads the message it had not reached, where
+/// it was confirmed, and only then crosses the hole.
+#[iggy_harness(cluster_nodes = 1)]
+async fn given_a_stored_consumer_position_when_a_killed_node_keeps_its_tail_should_read_it_before_the_hole(
+    harness: &mut TestHarness,
+) {
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).unwrap());
+    let stored = store_position_below_the_tail(harness, &consumer).await;
+    let highest_confirmed = stored + 1;
+
+    harness.kill_node(0).expect("SIGKILL the only node");
+    let published = read_partition_wal_frontier(&harness.node(0).data_path()).unwrap_or(0);
+    assert!(
+        published <= highest_confirmed,
+        "the premise: no publication covers the last confirmed message, so only the \
+         records the OS still holds can bring it back; the frontier ends at {published}"
+    );
+    harness.restart_node(0).expect("restart it");
+    let client = wait_until_serving(harness, SERVE_TIMEOUT).await;
+    assert_position_survived(&client, &consumer, stored).await;
+
+    let post_crash = produce_acked(&client, "across-the-hole", 1).await[0];
+    assert!(
+        post_crash > highest_confirmed,
+        "the premise: the restart must mint above the confirmed range"
+    );
+
+    let kept = poll_next(&client, &consumer).await;
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&kept.payload).into_owned(),
+            kept.header.offset
+        ),
+        (
+            format!("pre-crash-{:03}", PRE_CRASH_SENDS - 1),
+            highest_confirmed
+        ),
+        "a kill of the process alone must not take a confirmed message the consumer \
+         had not read, nor move it"
+    );
+    client
+        .store_consumer_offset(
+            &consumer,
+            &Identifier::named(STREAM_NAME).unwrap(),
+            &Identifier::named(TOPIC_NAME).unwrap(),
+            Some(PARTITION_ID),
+            highest_confirmed,
+        )
+        .await
+        .expect("store the position at the kept message");
+
+    let message = poll_next(&client, &consumer).await;
+    assert_eq!(
+        (
+            String::from_utf8_lossy(&message.payload).into_owned(),
+            message.header.offset
+        ),
+        (POST_CRASH_PAYLOAD.to_owned(), post_crash),
+        "from the kept tail the consumer must cross the hole onto the post-crash \
+         message, not onto a phantom offset inside it"
     );
 }
 

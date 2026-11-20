@@ -771,10 +771,8 @@ where
             let request = FinalizeSessionRequest::decode_from(prepare.body()).map_err(|_| {
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
-            if mux_stm.namespace_revision() == request.namespace_revision {
-                client_table.finalize_session(request.identity);
-                mux_stm.record_retirement_debt(&request.debt, header.op);
-            }
+            client_table.finalize_sessions_through(request.retired_through);
+            mux_stm.record_retirement_debt(&request.debt, header.op);
             change_log.append(header, Vec::new())?;
             last_applied_op = Some(header.op);
             continue;
@@ -1960,15 +1958,14 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_retirement_evidence_when_replaying_after_namespace_change_should_keep_the_session()
-     {
+    async fn given_finalization_when_replaying_should_release_only_sessions_ended_at_or_below_it() {
         const CLIENT: u128 = 7;
         const USER: u32 = 0;
         const SNAPSHOT_OP: u64 = 2;
         const CURRENT_REVISION: u64 = 2;
         type SessionStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
 
-        for reported_revision in [CURRENT_REVISION - 1, CURRENT_REVISION] {
+        for below_end in [1, 0] {
             let dir = tempdir().unwrap();
             let metadata_dir = dir.path().join("metadata");
             std::fs::create_dir_all(&metadata_dir).unwrap();
@@ -2006,9 +2003,9 @@ mod tests {
                 .await
                 .unwrap();
 
+            let retired_through = identity.metadata_watermark - below_end;
             let body = FinalizeSessionRequest {
-                identity,
-                namespace_revision: reported_revision,
+                retired_through,
                 debt: Vec::new(),
             }
             .to_bytes();
@@ -2039,8 +2036,8 @@ mod tests {
             assert_eq!(recovered.last_applied_op, Some(SNAPSHOT_OP + 1));
             assert_eq!(
                 recovered.client_table.ended_sessions().next(),
-                (reported_revision != CURRENT_REVISION).then_some(identity),
-                "WAL replay must preserve protection when the report covered an older partition set"
+                (retired_through < identity.metadata_watermark).then_some(identity),
+                "WAL replay must keep a session that ended above the watermark"
             );
         }
     }

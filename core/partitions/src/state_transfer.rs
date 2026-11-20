@@ -183,6 +183,27 @@ pub struct PartitionTransferSession {
     pub seed: Option<PrefixSeed>,
     /// Chunk payload bytes that crossed the network in this session.
     pub pulled_len: u64,
+    pub slot: TransferSlot,
+}
+
+/// Counts one live transfer session against the shard's transfer cap. The
+/// session owns it, so every path that drops a session frees the slot, a
+/// partition dropped during its transfer included.
+#[derive(Debug)]
+pub struct TransferSlot(Rc<Cell<usize>>);
+
+impl TransferSlot {
+    #[must_use]
+    pub fn new(inflight: &Rc<Cell<usize>>) -> Self {
+        inflight.set(inflight.get() + 1);
+        Self(Rc::clone(inflight))
+    }
+}
+
+impl Drop for TransferSlot {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 /// The local copy of the leading bytes of one offered segment artifact.
@@ -1670,7 +1691,8 @@ pub(crate) enum TransferPlanSlot {
     /// A request waits for the flush that has to come before the capture.
     Wanted,
     Pinned(Rc<TransferPlan>),
-    Failed(PartitionTransferUnavailable),
+    /// Boxed: the error takes 80 bytes, and every partition holds a slot.
+    Failed(Box<PartitionTransferUnavailable>),
 }
 
 /// Why a partition cannot serve a state transfer right now.
@@ -2481,6 +2503,15 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    /// The first op past a pinned transfer plan. The offer for that plan needs
+    /// every body from this op on in memory.
+    pub(crate) fn pinned_transfer_tail(&self) -> Option<u64> {
+        match &*self.transfer_plan.borrow() {
+            Some(TransferPlanSlot::Pinned(plan)) => Some(plan.commit_op.saturating_add(1)),
+            _ => None,
+        }
+    }
+
     /// Pin before building the manifest: flushing and hashing can span several
     /// rounds while writes keep evicting the suffix the receiver will need.
     pub fn retain_transfer_tail(&self, peer: u8, nonce: u128, tick: u64) -> bool {
@@ -2576,6 +2607,15 @@ where
         }
     }
 
+    /// Whether a served repair tail holds a lease that
+    /// [`Self::expire_transfer_tails`] must end on a later tick.
+    pub(crate) fn holds_transfer_tail_lease(&self) -> bool {
+        self.served_repair_tails
+            .borrow()
+            .values()
+            .any(|tail| tail.lease.is_some())
+    }
+
     pub fn expire_transfer_tails(&self, tick: u64, idle_ticks_max: u64) {
         for tail in self.served_repair_tails.borrow_mut().values_mut() {
             if tick.saturating_sub(tail.last_active_tick) >= idle_ticks_max {
@@ -2639,7 +2679,7 @@ where
             .as_ref()
             .is_err_and(PartitionTransferUnavailable::resumable)
         {
-            self.transfer_plan.borrow_mut().take();
+            self.drop_transfer_plan();
         }
         offer
     }
@@ -2675,7 +2715,7 @@ where
             // simulator models partition state transfer.
             return Err(PartitionTransferUnavailable::NoPartitionDir);
         }
-        if self.repair.is_some() {
+        if self.repair().is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
         // A primary by index over an empty log passes every gate above yet can
@@ -2757,7 +2797,7 @@ where
         // awaits, and the yields inside `hash_segment_range` move the reactor,
         // not this shard's consensus ticks. A cold pass over multi-GiB
         // retention therefore silences every group on this core for its whole
-        // duration, past `heartbeat_timeout`, on the node that by construction
+        // duration, past `commit_busy_heartbeat_timeout`, on the node that by construction
         // is the primary of those groups.
         //
         // Bounded per round instead. The memo carries partial progress, so a
@@ -2846,6 +2886,7 @@ where
                 .memory_retained_from()
                 .is_none_or(|retained_from| retained_from > plan.commit_op.saturating_add(1))
         {
+            self.drop_transfer_plan();
             *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
             self.notify_io();
             return Err(PartitionTransferUnavailable::FlushPending);
@@ -3082,7 +3123,7 @@ where
     /// name segments that retention may be about to unlink.
     pub fn clear_state_transfer_offer_cache(&self) {
         self.transfer_offer_cache.borrow_mut().take();
-        self.transfer_plan.borrow_mut().take();
+        self.drop_transfer_plan();
     }
 
     fn validate_consumer_offset_transfer_counts(&self) -> Result<(), PartitionTransferUnavailable> {
@@ -3113,11 +3154,11 @@ where
     /// store commits them, so neither can be promoted by state transfer.
     fn offsets_wire_snapshot(&self) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
         self.validate_consumer_offset_transfer_counts()?;
-        let consumer_map = self.consumer_offsets.pin();
+        let consumer_map = self.consumer_offsets.borrow();
         let consumers = self.snapshot_offset_kind(ConsumerKind::Consumer, |id| {
             consumer_map.contains_key(&(id as usize))
         })?;
-        let group_map = self.consumer_group_offsets.pin();
+        let group_map = self.consumer_group_offsets.borrow();
         let groups = self.snapshot_offset_kind(ConsumerKind::ConsumerGroup, |id| {
             group_map.contains_key(&ConsumerGroupId(id as usize))
         })?;
@@ -3305,18 +3346,14 @@ where
     /// while the scan runs, because the pull waits for it. The call that
     /// finds the scan landed returns what it reused.
     pub fn drive_reuse_scan(&mut self) -> Poll<Option<ReusedSegments>> {
-        let Some(scan) = self
-            .transfer
-            .as_ref()
-            .and_then(|session| session.scan.as_ref())
-        else {
+        let Some(scan) = self.transfer().and_then(|session| session.scan.as_ref()) else {
             return Poll::Ready(None);
         };
         let Some(scanned) = scan.result.borrow_mut().take() else {
             return Poll::Pending;
         };
         let reused = self.accept_reuse_scan(scanned);
-        let Some(session) = self.transfer.as_mut() else {
+        let Some(session) = self.transfer_mut() else {
             return Poll::Ready(None);
         };
         let segments = ReusedSegments::new(&session.artifacts, &reused);
@@ -3325,10 +3362,9 @@ where
             session.artifacts[index as usize] = TransferArtifact::Staged(meta);
         }
         let seed = self
-            .transfer
-            .as_ref()
+            .transfer()
             .and_then(|session| self.plan_prefix_seed(&session.artifacts));
-        if let Some(session) = self.transfer.as_mut() {
+        if let Some(session) = self.transfer_mut() {
             session.seed = seed;
         }
         // The I/O turn that reports a landed scan leaves the ready queue ahead
@@ -3457,7 +3493,7 @@ where
     /// pump. A failed read leaves the artifact to a whole pull.
     pub fn drive_prefix_seed(&mut self) -> bool {
         let namespace_raw = self.namespace().inner();
-        let Some(session) = self.transfer.as_mut() else {
+        let Some(session) = self.transfer_mut() else {
             return false;
         };
         let next = session
@@ -3487,7 +3523,7 @@ where
                     self.spawn_local_work(prefix_read_stopped, move |cancelled| async move {
                         read_segment_prefix(&log_path, entry, len, &cancelled).await
                     });
-                if let Some(session) = self.transfer.as_mut() {
+                if let Some(session) = self.transfer_mut() {
                     session.seed = Some(PrefixSeed::Reading { artifact, read });
                 }
                 true
@@ -4456,9 +4492,9 @@ where
 
     /// Clear the offset table for the installed one, which keeps `emptied_at`.
     fn clear_install_offsets(&mut self, emptied_at: u64) {
-        self.consumer_offsets.pin().clear();
-        self.consumer_group_offsets.pin().clear();
-        self.last_polled_offsets.pin().clear();
+        self.consumer_offsets.get_mut().clear();
+        self.consumer_group_offsets.get_mut().clear();
+        self.last_polled_offsets.get_mut().clear();
         self.durable_consumer_offsets.clear();
         self.durable_consumer_offsets.set_emptied_at(emptied_at);
         self.explicit_offset_stores
@@ -4482,11 +4518,13 @@ where
         let entry = ConsumerOffset::new(kind, id, value, path);
         match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(id as usize, entry);
+                self.consumer_offsets
+                    .borrow_mut()
+                    .insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.
@@ -4628,6 +4666,7 @@ where
             self.log.journal().inner.restore_checkpoint_prepare(
                 install.commit_op,
                 Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare).into(),
+                None,
             );
             self.consensus().note_journal_mutation();
         }
@@ -4638,7 +4677,7 @@ where
         self.pending_owner_install.set(None);
         self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
-        self.repair = None;
+        self.set_repair(None);
         self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
     }
@@ -4666,7 +4705,7 @@ where
         self.stats.zero_out_all();
         self.stats.increment_segments_count(1);
         self.stats.set_current_offset(end);
-        self.repair = None;
+        self.set_repair(None);
         self.transfer_offer_cache.borrow_mut().take();
     }
 
@@ -5101,7 +5140,7 @@ pub(crate) const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 ///
 /// A BYTE budget standing in for a time bound, so the margin is storage-class
 /// specific: 256 MiB is roughly a quarter second on commodity `NVMe` against
-/// the shipped 5 s `heartbeat_timeout`, but about 2 s on a throttled cloud
+/// the shipped 5 s `commit_busy_heartbeat_timeout`, but about 2 s on a throttled cloud
 /// volume at 125 MB/s baseline, which is most of that window. Sized for the
 /// slower case still leaving room, and large enough that ordinary retention
 /// finishes in one round. An elapsed-time clamp would bound it properly on

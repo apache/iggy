@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release, with a minimum binary protocol version of 0.12.1. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-1`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+Use matching SDK and server builds from the coordinated VSR release, with a minimum binary protocol version of 0.12.1. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-2`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -465,7 +465,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Mutations share one FIFO lane per partition history, with a separate metadata
