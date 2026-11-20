@@ -29,11 +29,12 @@ use crate::vsr::{decode_reply_for, reply_commit};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt, TryStreamExt};
 use iggy_binary_protocol::codes::{
-    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE,
-    DELETE_CONSUMER_OFFSET_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_OFFSET_CODE,
-    GET_PARTITION_ROUTE_CODE, LOGIN_REGISTER_CODE, LOGIN_REGISTER_WITH_PAT_CODE,
-    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SEND_MESSAGES_CODE,
-    STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
+    BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, CHANGE_PASSWORD_CODE, CREATE_PARTITIONS_CODE,
+    CREATE_TOPIC_CODE, DELETE_CONSUMER_OFFSET_CODE, DELETE_PARTITIONS_CODE, DELETE_STREAM_CODE,
+    DELETE_TOPIC_CODE, FETCH_MESSAGES_CODE, GET_CONSUMER_OFFSET_CODE, GET_PARTITION_ROUTE_CODE,
+    GET_PARTITIONS_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE, LOGIN_REGISTER_CODE,
+    LOGIN_REGISTER_WITH_PAT_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+    SEND_MESSAGES_CODE, STORE_CONSUMER_OFFSET_CODE, SYNC_CONSUMER_GROUP_CODE, UPDATE_RESOURCE_CODE,
 };
 use iggy_binary_protocol::consensus::{Operation, RequestHeader, operation_for_code};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
@@ -52,8 +53,8 @@ use iggy_binary_protocol::responses::messages::{
 };
 use iggy_binary_protocol::responses::users::LoginRegisterResponse;
 use iggy_binary_protocol::{
-    MAX_PARTITIONS_PER_REQUEST, STATUS_OK, WireDecode, WireEncode, WireOptions, WirePartitioning,
-    WirePollingStrategy,
+    MAX_PARTITIONS_PER_REQUEST, STATUS_OK, WireDecode, WireEncode, WireIdentifier, WireOptions,
+    WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
     BinaryOperationLineage, ClientState, CommitErrorScope, Credentials, DeferredPollOptions,
@@ -82,6 +83,391 @@ tokio::task_local! {
     pub(crate) static DEFERRED_CONSUMER_CAPACITY: Arc<Semaphore>;
 }
 
+#[cfg(test)]
+mod extractor_tests {
+    use super::{
+        Call, PartitionTarget, RequestErrorContext, RequestTarget, enrich_error,
+        extract_from_retained_frame,
+    };
+    use bytes::Bytes;
+    use iggy_binary_protocol::WireEncode;
+    use iggy_binary_protocol::codes::{
+        CREATE_PARTITIONS_CODE, CREATE_TOPIC_CODE, DELETE_PARTITIONS_CODE, DELETE_STREAM_CODE,
+        DELETE_TOPIC_CODE, GET_PARTITIONS_CODE, GET_STREAM_CODE, GET_TOPIC_CODE, GET_TOPICS_CODE,
+        SEND_MESSAGES_CODE, UPDATE_RESOURCE_CODE,
+    };
+    use iggy_binary_protocol::requests::partitions::{
+        CreatePartitionsRequest, DeletePartitionsRequest, GetPartitionsRequest,
+    };
+    use iggy_binary_protocol::requests::streams::{DeleteStreamRequest, GetStreamRequest};
+    use iggy_binary_protocol::requests::system::{
+        ResourceTarget, UpdateResourceRequest, WireResetKeys,
+    };
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
+    };
+    use iggy_binary_protocol::{
+        WireIdentifier, WireName, WireOptions, primitives::page::WirePageQuery,
+    };
+    use iggy_common::{IdKind, Identifier, IggyError};
+    use tokio::time::Instant;
+
+    const UNKNOWN_OPERATION_CODE: u32 = 255;
+
+    struct ExtractorTestFixture {
+        stream_id: Identifier,
+        topic_id: Identifier,
+    }
+
+    impl ExtractorTestFixture {
+        fn new() -> Self {
+            Self {
+                stream_id: Identifier::numeric(42).unwrap(),
+                topic_id: Identifier::numeric(99).unwrap(),
+            }
+        }
+
+        fn stream_wire_id(&self) -> WireIdentifier {
+            WireIdentifier::numeric(42)
+        }
+
+        fn topic_wire_id(&self) -> WireIdentifier {
+            WireIdentifier::numeric(99)
+        }
+
+        fn get_stream_body(&self) -> Bytes {
+            GetStreamRequest {
+                stream_id: self.stream_wire_id(),
+            }
+            .to_bytes()
+        }
+
+        fn delete_stream_body(&self) -> Bytes {
+            DeleteStreamRequest {
+                stream_id: self.stream_wire_id(),
+            }
+            .to_bytes()
+        }
+
+        fn get_topic_body(&self) -> Bytes {
+            GetTopicRequest {
+                stream_id: self.stream_wire_id(),
+                topic_id: self.topic_wire_id(),
+            }
+            .to_bytes()
+        }
+
+        fn delete_topic_body(&self) -> Bytes {
+            DeleteTopicRequest {
+                stream_id: self.stream_wire_id(),
+                topic_id: self.topic_wire_id(),
+            }
+            .to_bytes()
+        }
+
+        fn get_topics_body(&self) -> Bytes {
+            GetTopicsRequest {
+                stream_id: self.stream_wire_id(),
+                page: WirePageQuery::default(),
+            }
+            .to_bytes()
+        }
+
+        fn create_topic_body(&self) -> Bytes {
+            CreateTopicRequest {
+                stream_id: self.stream_wire_id(),
+                partitions_count: 3,
+                name: WireName::new("events").unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes()
+        }
+    }
+
+    fn assert_stream_only(code: u32, body: &Bytes, fixture: &ExtractorTestFixture) {
+        let context = extract_from_retained_frame(code, body).expect("supported operation");
+        assert_eq!(context.stream, fixture.stream_id);
+        assert_eq!(context.topic, None);
+    }
+
+    fn assert_stream_and_topic(code: u32, body: &Bytes, fixture: &ExtractorTestFixture) {
+        let context = extract_from_retained_frame(code, body).expect("supported operation");
+        assert_eq!(context.stream, fixture.stream_id);
+        assert_eq!(context.topic, Some(fixture.topic_id.clone()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_supported_stream_operations() {
+        let fixture = ExtractorTestFixture::new();
+        assert_stream_only(GET_STREAM_CODE, &fixture.get_stream_body(), &fixture);
+        assert_stream_only(DELETE_STREAM_CODE, &fixture.delete_stream_body(), &fixture);
+    }
+
+    #[test]
+    fn extract_from_retained_frame_supported_topic_operations() {
+        let fixture = ExtractorTestFixture::new();
+        assert_stream_and_topic(GET_TOPIC_CODE, &fixture.get_topic_body(), &fixture);
+        assert_stream_and_topic(DELETE_TOPIC_CODE, &fixture.delete_topic_body(), &fixture);
+    }
+
+    #[test]
+    fn extract_from_retained_frame_supported_stream_only_topic_operations() {
+        let fixture = ExtractorTestFixture::new();
+        assert_stream_only(GET_TOPICS_CODE, &fixture.get_topics_body(), &fixture);
+        assert_stream_only(CREATE_TOPIC_CODE, &fixture.create_topic_body(), &fixture);
+    }
+
+    #[test]
+    fn extract_from_retained_frame_string_identifiers() {
+        let body = GetTopicRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+        }
+        .to_bytes();
+
+        let context = extract_from_retained_frame(GET_TOPIC_CODE, &body).unwrap();
+
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_partitions_keeps_named_identifiers() {
+        let body = GetPartitionsRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            page: WirePageQuery::default(),
+        }
+        .to_bytes();
+
+        let context = extract_from_retained_frame(GET_PARTITIONS_CODE, &body).unwrap();
+
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_partition_mutations_keeps_identifiers() {
+        let body = CreatePartitionsRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partitions_count: 1,
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(CREATE_PARTITIONS_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+
+        let body = DeletePartitionsRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+            partitions_count: 1,
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(DELETE_PARTITIONS_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_resource_updates_keeps_identifiers() {
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: WireIdentifier::named("events").unwrap(),
+                topic_id: WireIdentifier::named("orders").unwrap(),
+            },
+            reset: WireResetKeys::try_from(vec![WireName::new("key").unwrap()]).unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(UPDATE_RESOURCE_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, Some(Identifier::named("orders").unwrap()));
+        let call = Call::new(
+            UPDATE_RESOURCE_CODE,
+            body,
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+        assert_eq!(
+            call.enrich_error(IggyError::TopicIdNotFound(
+                Identifier::numeric(1).unwrap(),
+                Identifier::numeric(2).unwrap(),
+            )),
+            IggyError::TopicIdNotFound(
+                Identifier::named("orders").unwrap(),
+                Identifier::named("events").unwrap(),
+            )
+        );
+
+        let body = UpdateResourceRequest {
+            target: ResourceTarget::Stream {
+                stream_id: WireIdentifier::named("events").unwrap(),
+            },
+            reset: WireResetKeys::try_from(vec![WireName::new("key").unwrap()]).unwrap(),
+            options: WireOptions::empty(),
+        }
+        .to_bytes();
+        let context = extract_from_retained_frame(UPDATE_RESOURCE_CODE, &body).unwrap();
+        assert_eq!(context.stream, Identifier::named("events").unwrap());
+        assert_eq!(context.topic, None);
+    }
+
+    #[test]
+    fn call_decodes_context_only_for_namespace_errors() {
+        let stream = Identifier::named("events").unwrap();
+        let topic = Identifier::named("orders").unwrap();
+        let body = GetTopicRequest {
+            stream_id: WireIdentifier::named("events").unwrap(),
+            topic_id: WireIdentifier::named("orders").unwrap(),
+        }
+        .to_bytes();
+        let call = Call::new(
+            GET_TOPIC_CODE,
+            body,
+            RequestTarget::Metadata,
+            Instant::now(),
+        );
+
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+        assert_eq!(
+            call.enrich_error(original),
+            IggyError::TopicIdNotFound(topic, stream)
+        );
+
+        let original = IggyError::InvalidCommand;
+        assert_eq!(call.enrich_error(original.clone()), original);
+    }
+
+    #[test]
+    fn extract_from_retained_frame_rejects_invalid_utf8_string_identifier() {
+        let body = Bytes::from(vec![IdKind::String.as_code(), 1, 0xff]);
+
+        assert!(extract_from_retained_frame(GET_STREAM_CODE, &body).is_none());
+    }
+
+    #[test]
+    fn extract_from_retained_frame_unsupported_operations_and_unknown_code() {
+        let fixture = ExtractorTestFixture::new();
+        let body = fixture.get_stream_body();
+        assert!(extract_from_retained_frame(13, &body).is_none());
+        assert!(extract_from_retained_frame(UNKNOWN_OPERATION_CODE, &body).is_none());
+    }
+
+    #[test]
+    fn extract_from_retained_frame_rejects_empty_and_malformed_payloads() {
+        let fixture = ExtractorTestFixture::new();
+        assert!(extract_from_retained_frame(GET_STREAM_CODE, &Bytes::new()).is_none());
+        assert!(
+            extract_from_retained_frame(GET_STREAM_CODE, &Bytes::from_static(&[1, 2, 3])).is_none()
+        );
+        assert!(
+            extract_from_retained_frame(GET_TOPIC_CODE, &fixture.get_stream_body()).is_none(),
+            "topic operation is missing its topic identifier"
+        );
+    }
+
+    #[test]
+    fn extract_from_retained_frame_reconstructs_resumed_call_context() {
+        let fixture = ExtractorTestFixture::new();
+        let retained_body = fixture.get_topic_body();
+        let resumed_context = extract_from_retained_frame(GET_TOPIC_CODE, &retained_body)
+            .expect("retained request identifiers are reconstructed");
+        assert_eq!(resumed_context.stream, fixture.stream_id);
+        assert_eq!(resumed_context.topic, Some(fixture.topic_id));
+    }
+
+    #[test]
+    fn extract_from_retained_frame_retry_preserves_request_body_context() {
+        let fixture = ExtractorTestFixture::new();
+        let original_body = fixture.delete_topic_body();
+        let retry_body = original_body.clone();
+        let original_context = extract_from_retained_frame(DELETE_TOPIC_CODE, &original_body);
+        let retry_context = extract_from_retained_frame(DELETE_TOPIC_CODE, &retry_body);
+        assert_eq!(retry_context, original_context);
+        assert_eq!(retry_body, original_body);
+    }
+
+    fn context() -> RequestErrorContext {
+        RequestErrorContext {
+            stream: Identifier::named("events").unwrap(),
+            topic: Some(Identifier::named("orders").unwrap()),
+        }
+    }
+
+    #[test]
+    fn enrich_error_1009_uses_retained_stream_identifier() {
+        let stream = Identifier::named("events").unwrap();
+        let original = IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap());
+
+        assert_eq!(
+            enrich_error(original, Some(&context()), None),
+            IggyError::StreamIdNotFound(stream)
+        );
+    }
+
+    #[test]
+    fn enrich_error_2010_uses_topic_then_stream_identifiers() {
+        let topic = Identifier::named("orders").unwrap();
+        let stream = Identifier::named("events").unwrap();
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+
+        assert_eq!(
+            enrich_error(original, Some(&context()), None),
+            IggyError::TopicIdNotFound(topic, stream)
+        );
+    }
+
+    #[test]
+    fn enrich_error_without_topic_context_preserves_original() {
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+        let context = RequestErrorContext {
+            stream: Identifier::named("events").unwrap(),
+            topic: None,
+        };
+
+        assert_eq!(
+            enrich_error(original.clone(), Some(&context), None),
+            original
+        );
+    }
+
+    #[test]
+    fn partition_call_uses_partition_key_for_error_context() {
+        let stream = Identifier::named("events").unwrap();
+        let topic = Identifier::named("orders").unwrap();
+        let call = Call::new(
+            SEND_MESSAGES_CODE,
+            Bytes::new(),
+            RequestTarget::Partition(PartitionTarget {
+                stream_id: &stream,
+                topic_id: &topic,
+                partition_id: 1,
+                context: None,
+            }),
+            Instant::now(),
+        );
+        let original = IggyError::TopicIdNotFound(
+            Identifier::numeric(1).unwrap(),
+            Identifier::numeric(2).unwrap(),
+        );
+
+        assert_eq!(
+            call.enrich_error(original),
+            IggyError::TopicIdNotFound(topic, stream)
+        );
+    }
+}
+
 pub(crate) use route_cache::PartitionKey;
 
 pub(crate) use iggy_common::{
@@ -92,6 +478,78 @@ pub(crate) use iggy_common::{
 pub(crate) struct DeferredLease<'a> {
     _client: SemaphorePermit<'a>,
     _consumer: Option<OwnedSemaphorePermit>,
+}
+
+/// Stream and topic identifiers decoded from a retained request body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RequestErrorContext {
+    stream: Identifier,
+    topic: Option<Identifier>,
+}
+
+fn decode_retained_identifier(raw: &[u8]) -> Option<(Identifier, usize)> {
+    let (identifier, consumed) = WireIdentifier::decode(raw).ok()?;
+    Some((Identifier::try_from(&identifier).ok()?, consumed))
+}
+
+fn extract_from_retained_frame(code: u32, body: &Bytes) -> Option<RequestErrorContext> {
+    let raw = body.as_ref();
+    if code == UPDATE_RESOURCE_CODE {
+        let (target, _) = ResourceTarget::decode(raw).ok()?;
+        return match target {
+            ResourceTarget::Topic {
+                stream_id,
+                topic_id,
+            } => Some(RequestErrorContext {
+                stream: Identifier::try_from(&stream_id).ok()?,
+                topic: Some(Identifier::try_from(&topic_id).ok()?),
+            }),
+            ResourceTarget::Stream { stream_id } => Some(RequestErrorContext {
+                stream: Identifier::try_from(&stream_id).ok()?,
+                topic: None,
+            }),
+            ResourceTarget::User { .. } => None,
+        };
+    }
+    let has_topic = match code {
+        GET_TOPIC_CODE
+        | DELETE_TOPIC_CODE
+        | GET_PARTITIONS_CODE
+        | CREATE_PARTITIONS_CODE
+        | DELETE_PARTITIONS_CODE => true,
+        GET_TOPICS_CODE | CREATE_TOPIC_CODE | GET_STREAM_CODE | DELETE_STREAM_CODE => false,
+        _ => return None,
+    };
+    let (stream, consumed) = decode_retained_identifier(raw)?;
+    let topic = if has_topic {
+        let (topic, _) = decode_retained_identifier(raw.get(consumed..)?)?;
+        Some(topic)
+    } else {
+        None
+    };
+    Some(RequestErrorContext { stream, topic })
+}
+
+fn enrich_error(
+    error: IggyError,
+    context: Option<&RequestErrorContext>,
+    partition: Option<&PartitionKey>,
+) -> IggyError {
+    let (stream, topic) = match context {
+        Some(context) => (&context.stream, context.topic.as_ref()),
+        None => match partition {
+            Some(partition) => (&partition.stream_id, Some(&partition.topic_id)),
+            None => return error,
+        },
+    };
+    match error.as_code() {
+        1009 => IggyError::StreamIdNotFound(stream.clone()),
+        2010 => match topic {
+            Some(topic) => IggyError::TopicIdNotFound(topic.clone(), stream.clone()),
+            None => error,
+        },
+        _ => error,
+    }
 }
 
 impl<'a> DeferredLease<'a> {
@@ -889,7 +1347,10 @@ impl OperationDriver {
         };
         match self.route(&partition.key, lineage, call.deadline).await {
             Ok(route) => Ok(Some(route)),
-            Err(error) => Err(call.lookup_failed(error)),
+            Err(error) => {
+                let error = call.enrich_error(error);
+                Err(call.lookup_failed(error))
+            }
         }
     }
 
@@ -922,7 +1383,10 @@ impl OperationDriver {
             .await;
         let routes = match routes {
             Ok(routes) => routes,
-            Err(error) => return Err(call.lookup_failed(error)),
+            Err(error) => {
+                let error = call.enrich_error(error);
+                return Err(call.lookup_failed(error));
+            }
         };
         for (target, route) in request
             .targets
@@ -1117,6 +1581,7 @@ impl OperationDriver {
             }
             Err(error) => error,
         };
+        let error = call.enrich_error(error);
         if call.committing() && sent && fetch_error_is_uncertain(&error) {
             call.uncertain = true;
             return Err(Next::Fail(error));
@@ -1889,6 +2354,21 @@ impl Call {
         }
     }
 
+    /// Adds the identifiers of this call to a binary namespace error.
+    fn enrich_error(&self, error: IggyError) -> IggyError {
+        let partition = self.partition.as_ref().map(|partition| &partition.key);
+        let context = if partition.is_none() && matches!(error.as_code(), 1009 | 2010) {
+            let body = self
+                .frame
+                .as_ref()
+                .map_or(&self.payload, |frame| &frame.body);
+            extract_from_retained_frame(self.code, body)
+        } else {
+            None
+        };
+        enrich_error(error, context.as_ref(), partition)
+    }
+
     /// The next step after a route lookup of the call failed with `error`.
     fn lookup_failed(&mut self, error: IggyError) -> Next {
         if retries_lookup(&error) {
@@ -2324,6 +2804,36 @@ mod tests {
         assert_eq!(sends[0].endpoint, endpoint(PRIMARY));
         assert_eq!(sends[0].body, payload);
         assert_eq!(sends[0].header.partition_incarnation, ROUTE.incarnation);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_route_lookup_reports_missing_namespace_should_enrich_identifiers() {
+        for topic_missing in [false, true] {
+            let mut fixture = Fixture::new().await;
+            fixture.stream_id = Identifier::named("events").unwrap();
+            fixture.topic_id = Identifier::named("orders").unwrap();
+            let missing = if topic_missing {
+                IggyError::TopicIdNotFound(
+                    Identifier::numeric(1).unwrap(),
+                    Identifier::numeric(2).unwrap(),
+                )
+            } else {
+                IggyError::StreamIdNotFound(Identifier::numeric(1).unwrap())
+            };
+            let expected = if topic_missing {
+                IggyError::TopicIdNotFound(fixture.topic_id.clone(), fixture.stream_id.clone())
+            } else {
+                IggyError::StreamIdNotFound(fixture.stream_id.clone())
+            };
+            fixture.cluster.script(
+                &endpoint(0),
+                GET_PARTITION_ROUTE_CODE,
+                [Answer::Refuse(missing)],
+            );
+
+            assert_eq!(fixture.send_messages().await.unwrap_err(), expected);
+            assert!(fixture.sends().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]
