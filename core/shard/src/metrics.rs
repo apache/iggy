@@ -1064,7 +1064,7 @@ impl ShardMetrics {
     }
 
     /// A read of the fresh objects of the geo peer `origin`, `request` as
-    /// [`Self::geo_peer_fresh_requests_total`] names them, and whether it
+    /// `Self::geo_peer_fresh_requests_total` names them, and whether it
     /// succeeded.
     pub fn record_peer_fresh_request(&self, origin: &str, request: &'static str, succeeded: bool) {
         let label = GeoPeerRequestLabel {

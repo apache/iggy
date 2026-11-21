@@ -773,7 +773,7 @@ impl BucketWatch {
     }
 
     /// The passes in which something read the bucket so far: runs of reads
-    /// with no gap longer than [`READ_PASS_GAP`] inside.
+    /// with no gap longer than `READ_PASS_GAP` inside.
     #[must_use]
     pub fn read_passes(&self) -> usize {
         let mut passes = 0;
