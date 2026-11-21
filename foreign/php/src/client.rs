@@ -323,7 +323,7 @@ impl IggyClient {
     /// active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
     /// segments by size alone. The server refuses a duration together with
     /// `preallocate_segments`. It follows `raw`, so positional calls written before it existed
-    /// keep their meaning, and so do the three options below.
+    /// keep their meaning, and so do the options below.
     ///
     /// `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
     /// server refuses true with `Feature is unavailable` until it tiers topics.
@@ -331,6 +331,14 @@ impl IggyClient {
     /// disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
     /// there, unlimited when null. The server refuses an age above a finite message expiry and a
     /// size above a finite `max_topic_size`.
+    ///
+    /// `topic_type` is `normal` or `geo`, and null creates a normal topic. A geo topic's messages
+    /// also become readable in the other datacenters through the object store. A geo topic needs
+    /// an object store on every node of the cluster: while one is not ready, the server refuses
+    /// `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
+    /// stream, and keeps its name, options and partition count. `geo_mode` says how a geo topic
+    /// writes its messages, `geo` or `geo_tiered`, and null resolves to `geo` there. The server
+    /// refuses `geo_tiered` with `Feature is unavailable` for now, and any mode on a normal topic.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -353,6 +361,8 @@ impl IggyClient {
         tiered_storage: Option<bool>,
         local_retention_age_micros: Option<&Zval>,
         local_retention_size: Option<&Zval>,
+        topic_type: Option<String>,
+        geo_mode: Option<String>,
     ) -> PhpResult {
         let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
         let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
@@ -381,6 +391,16 @@ impl IggyClient {
             .map_err(|_| {
                 to_php_exception("'partition_resize_policy' must be 'mutable' or 'fixed'")
             })?;
+        let topic_type = topic_type
+            .as_deref()
+            .map(TopicType::from_str)
+            .transpose()
+            .map_err(|_| to_php_exception("'topic_type' must be 'normal' or 'geo'"))?;
+        let geo_mode = geo_mode
+            .as_deref()
+            .map(GeoMode::from_str)
+            .transpose()
+            .map_err(|_| to_php_exception("'geo_mode' must be 'geo' or 'geo_tiered'"))?;
         let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
         let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
         let segment_max_age =
@@ -416,6 +436,8 @@ impl IggyClient {
                 .then_some(local_retention_age),
             local_retention_size: (local_retention_size != MaxTopicSize::ServerDefault)
                 .then_some(local_retention_size),
+            topic_type,
+            geo_mode,
             raw: raw.unwrap_or_default(),
         };
 

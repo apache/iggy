@@ -179,7 +179,7 @@ namespace Iggy {
          * active segment's first batch, at least 10 minutes. 18446744073709551615 and null roll
          * segments by size alone. The server refuses a duration together with
          * `preallocate_segments`. It follows `raw`, so positional calls written before it existed
-         * keep their meaning, and so do the three options below.
+         * keep their meaning, and so do the options below.
          *
          * `tiered_storage` moves sealed segments to the object store. Null leaves it off, and the
          * server refuses true with `Feature is unavailable` until it tiers topics.
@@ -187,6 +187,14 @@ namespace Iggy {
          * disk, one day when null, and `local_retention_size` caps the uploaded segments it keeps
          * there, unlimited when null. The server refuses an age above a finite message expiry and a
          * size above a finite `max_topic_size`.
+         *
+         * `topic_type` is `normal` or `geo`, and null creates a normal topic. A geo topic's messages
+         * also become readable in the other datacenters through the object store. A geo topic needs
+         * an object store on every node of the cluster: while one is not ready, the server refuses
+         * `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
+         * stream, and keeps its name, options and partition count. `geo_mode` says how a geo topic
+         * writes its messages, `geo` or `geo_tiered`, and null resolves to `geo` there. The server
+         * refuses `geo_tiered` with `Feature is unavailable` for now, and any mode on a normal topic.
          *
          * @param mixed $stream
          * @param string $name
@@ -207,9 +215,11 @@ namespace Iggy {
          * @param bool|null $tiered_storage
          * @param mixed $local_retention_age_micros
          * @param mixed $local_retention_size
+         * @param string|null $topic_type
+         * @param string|null $geo_mode
          * @return void
          */
-        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null): void {}
+        public function createTopic(mixed $stream, string $name, int $partitions_count, ?string $compression_algorithm = null, mixed $message_expiry_micros = null, mixed $max_topic_size = null, mixed $segment_size = null, ?\Iggy\Durability $durability = null, ?\Iggy\Durability $consumer_offset_durability = null, mixed $messages_required_to_save = null, mixed $size_of_messages_required_to_save = null, ?bool $preallocate_segments = null, ?string $partition_resize_policy = null, mixed $replication_factor = null, ?array $raw = null, mixed $segment_max_age_micros = null, ?bool $tiered_storage = null, mixed $local_retention_age_micros = null, mixed $local_retention_size = null, ?string $topic_type = null, ?string $geo_mode = null): void {}
 
         /**
          * Deletes the offset stored on `partition_id` for a standalone consumer, or for a consumer
@@ -3050,6 +3060,8 @@ namespace Iggy {
       case TieredStorage = 'tiered_storage';
       case LocalRetentionAge = 'local_retention_age';
       case LocalRetentionSize = 'local_retention_size';
+      case TopicType = 'topic_type';
+      case GeoMode = 'geo_mode';
     }
 
     /**

@@ -300,7 +300,10 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
         // Turning tiered storage on is refused until the server tiers topics.
         .SetTieredStorage(false)
         .SetLocalRetentionAge(iggy::Expiry::Duration(1800000000))
-        .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(1ULL << 30));
+        .SetLocalRetentionSize(iggy::MaxTopicSize::FromBytes(1ULL << 30))
+        // A geo topic is refused while the server has no object store, and
+        // a normal topic refuses any geo mode.
+        .SetTopicType(iggy::TopicType::Normal);
 
     ASSERT_NO_THROW(client.CreateTopic(iggy::Identifier::String(stream_name), topic_name, options));
 
@@ -319,6 +322,7 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     EXPECT_EQ(explicit_options.count("tiered_storage"), 1u);
     EXPECT_EQ(explicit_options.count("local_retention_age"), 1u);
     EXPECT_EQ(explicit_options.count("local_retention_size"), 1u);
+    EXPECT_EQ(explicit_options.count("topic_type"), 1u);
 
     auto check_kind = [&](const std::string &key, iggy::HeaderKind expected) {
         auto it = explicit_options.find(key);
@@ -336,6 +340,7 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
     check_kind("tiered_storage", iggy::HeaderKind::Bool);
     check_kind("local_retention_age", iggy::HeaderKind::Uint64);
     check_kind("local_retention_size", iggy::HeaderKind::Uint64);
+    check_kind("topic_type", iggy::HeaderKind::String);
 
     EXPECT_EQ(explicit_options.at("segment_size").Value(),
               (std::vector<std::uint8_t>{0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00}));
@@ -352,8 +357,9 @@ TEST_F(E2E_Topic, CreateTopicWithTypedOptionHelpersReportsThemAsExplicitOptions)
               (std::vector<std::uint8_t>{0x00, 0xD2, 0x49, 0x6B, 0x00, 0x00, 0x00, 0x00}));
     EXPECT_EQ(explicit_options.at("local_retention_size").Value(),
               (std::vector<std::uint8_t>{0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00}));
+    EXPECT_EQ(explicit_options.at("topic_type").Value(), (std::vector<std::uint8_t>{'n', 'o', 'r', 'm', 'a', 'l'}));
 
-    EXPECT_EQ(explicit_options.size(), 11u);
+    EXPECT_EQ(explicit_options.size(), 12u);
     EXPECT_EQ(topic_details.Options().Derived().count("segment_size"), 0u)
         << "segment_size was set explicitly, so it cannot be derived";
 }

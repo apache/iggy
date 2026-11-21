@@ -81,10 +81,12 @@ pub fn sample(
             })
         }
         // Not targeted (absent from `OUTCOMES`): the sim client sends only valid
-        // catalog keys, the slab ceiling needs `MAX_TOPICS` creates under one
-        // stream, and the primary mints dense 0-based partition ids, so neither
-        // partition guard is reachable from the wire.
-        Outcome::InvalidOptionValue
+        // catalog keys and creates no geo topic, the slab ceiling needs
+        // `MAX_TOPICS` creates under one stream, and the primary mints dense
+        // 0-based partition ids, so neither partition guard is reachable from
+        // the wire.
+        Outcome::FeatureUnavailable
+        | Outcome::InvalidOptionValue
         | Outcome::InvalidReplicationFactor
         | Outcome::TooManyTopics
         | Outcome::InvalidPartitionsCount

@@ -100,11 +100,11 @@ use iggy_binary_protocol::{
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
-    CompressionAlgorithm, DeferredPollOptions, Durability, IggyByteSize, IggyDuration, IggyError,
-    IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
+    CompressionAlgorithm, DeferredPollOptions, Durability, GeoMode, IggyByteSize, IggyDuration,
+    IggyError, IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
     RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
-    StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
-    stream_key_fingerprint,
+    StreamUpdateOptions, TopicCreateOptions, TopicType, TopicUpdateOptions, UserStatus,
+    UserUpdateOptions, stream_key_fingerprint,
 };
 use secrecy::SecretString;
 use serde::Serialize;
@@ -1925,6 +1925,8 @@ fn main() {
             1_800,
         ))),
         local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
+        topic_type: Some(TopicType::Geo),
+        geo_mode: Some(GeoMode::GeoTiered),
         raw: BTreeMap::new(),
     };
     add(

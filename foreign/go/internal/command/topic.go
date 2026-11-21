@@ -150,6 +150,12 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.LocalRetentionSize != nil && *options.LocalRetentionSize != 0 {
 		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionSize), *options.LocalRetentionSize))
 	}
+	if options.TopicType != nil {
+		typed = append(typed, iggcon.TopicTypeOption(*options.TopicType))
+	}
+	if options.GeoMode != nil {
+		typed = append(typed, iggcon.GeoModeOption(*options.GeoMode))
+	}
 	return typed, nil
 }
 

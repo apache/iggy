@@ -76,6 +76,8 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::TieredStorage,
     iggy::TopicOptionKey::LocalRetentionAge,
     iggy::TopicOptionKey::LocalRetentionSize,
+    iggy::TopicOptionKey::TopicType,
+    iggy::TopicOptionKey::GeoMode,
 };
 
 constexpr iggy::UserOptionKey kUserOptionKeys[] = {

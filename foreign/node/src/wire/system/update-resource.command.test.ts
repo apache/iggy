@@ -34,7 +34,8 @@ import { deserializeToStream, type Stream } from '../stream/stream.utils.js';
 import { CREATE_TOPIC } from '../topic/create-topic.command.js';
 import { UPDATE_TOPIC } from '../topic/update-topic.command.js';
 import {
-  CompressionAlgorithm, compressionAlgorithmName, deserializeTopic, Durability, PartitionResizePolicy
+  CompressionAlgorithm, compressionAlgorithmName, deserializeTopic, Durability, GeoMode, PartitionResizePolicy,
+  TopicType
 } from '../topic/topic.utils.js';
 import { CREATE_USER } from '../user/create-user.command.js';
 import { translateErrorCode } from '../error.code.js';
@@ -368,7 +369,9 @@ describe('given shared vectors when encoding should match server contract', () =
         segment_max_age: () => topicBlock({ segmentMaxAge: 1n }),
         tiered_storage: () => topicBlock({ tieredStorage: false }),
         local_retention_age: () => topicBlock({ localRetentionAge: 1n }),
-        local_retention_size: () => topicBlock({ localRetentionSize: 1n })
+        local_retention_size: () => topicBlock({ localRetentionSize: 1n }),
+        topic_type: () => topicBlock({ topicType: TopicType.Geo }),
+        geo_mode: () => topicBlock({ geoMode: GeoMode.GeoTiered })
       },
       user: {}
     };

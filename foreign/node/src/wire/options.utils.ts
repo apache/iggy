@@ -72,7 +72,9 @@ export const TopicOptionKey = {
   SegmentMaxAge: 'segment_max_age',
   TieredStorage: 'tiered_storage',
   LocalRetentionAge: 'local_retention_age',
-  LocalRetentionSize: 'local_retention_size'
+  LocalRetentionSize: 'local_retention_size',
+  TopicType: 'topic_type',
+  GeoMode: 'geo_mode'
 } as const;
 
 export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
@@ -127,6 +129,8 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['tiered_storage', { scopes: [Topic], flags: Updatable | Critical, internal: false, enableOnly: true }],
   ['local_retention_age', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
   ['local_retention_size', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
+  ['topic_type', { scopes: [Topic], flags: Critical, internal: false }],
+  ['geo_mode', { scopes: [Topic], flags: Critical, internal: false }],
   ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
 ]);
 

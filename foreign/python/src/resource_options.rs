@@ -16,10 +16,10 @@
 // under the License.
 
 use iggy::prelude::{
-    CompressionAlgorithm, IggyByteSize, IggyError, IggyExpiry as RustIggyExpiry,
-    MaxTopicSize as RustMaxTopicSize, OptionKey as RustOptionKey,
+    CompressionAlgorithm, GeoMode as RustGeoMode, IggyByteSize, IggyError,
+    IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize, OptionKey as RustOptionKey,
     PartitionResizePolicy as RustPartitionResizePolicy, StreamCreateOptions, StreamEncryptionKey,
-    TopicCreateOptions, UserCreateOptions,
+    TopicCreateOptions, TopicType as RustTopicType, UserCreateOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -114,6 +114,10 @@ pub enum OptionKey {
     /// Cap on the uploaded segments a tiered topic keeps on local disk,
     /// resettable to unlimited.
     LocalRetentionSize,
+    /// Topic type, normal or geo, fixed at creation.
+    TopicType,
+    /// How a geo topic writes its messages, fixed at creation.
+    GeoMode,
 }
 
 /// Whether partitions can be added to or deleted from a topic after creation.
@@ -125,6 +129,29 @@ pub enum PartitionResizePolicy {
     Mutable,
     /// The partition set is fixed at topic creation.
     Fixed,
+}
+
+/// What a topic is, fixed at creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[gen_stub_pyclass_enum]
+#[pyclass(eq, from_py_object)]
+pub enum TopicType {
+    /// Its messages stay in this cluster.
+    Normal,
+    /// Its messages also become readable in the other datacenters, through
+    /// the object store.
+    Geo,
+}
+
+/// How a geo topic writes its messages, fixed at creation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[gen_stub_pyclass_enum]
+#[pyclass(eq, from_py_object)]
+pub enum GeoMode {
+    /// A batch goes to the object store before it commits.
+    Geo,
+    /// A batch is replicated first, and sealed segments are uploaded later.
+    GeoTiered,
 }
 
 #[derive(FromPyObject)]
@@ -261,6 +288,17 @@ impl TopicOptions {
     ///         unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
     ///         same as `None`. The server refuses a size above a finite
     ///         `max_topic_size`.
+    ///     topic_type: `TopicType.Geo` also makes the topic's messages
+    ///         readable in the other datacenters, through the object store.
+    ///         `None` creates a normal topic. A geo topic needs an object
+    ///         store on every node of the cluster: while one is not ready,
+    ///         the server refuses `TopicType.Geo` with `FeatureUnavailable`.
+    ///         A geo topic refuses tiered storage and an encrypted stream,
+    ///         and keeps its name, options and partition count.
+    ///     geo_mode: How a geo topic writes its messages, as `GeoMode | None`.
+    ///         `None` resolves to `GeoMode.Geo` on a geo topic. The server
+    ///         refuses `GeoMode.GeoTiered` with `FeatureUnavailable` for now,
+    ///         and any mode on a normal topic.
     ///     raw: Additional option keys as `dict[str, str]`, sent as string
     ///         values so a key newer than this build can be set. A typed field
     ///         wins on collision.
@@ -273,7 +311,7 @@ impl TopicOptions {
     ///     TypeError: If a durability is not a `Durability`.
     #[new]
     #[pyo3(
-        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, segment_max_age = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, raw = None)
+        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, segment_max_age = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, topic_type = None, geo_mode = None, raw = None)
     )]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -315,6 +353,8 @@ impl TopicOptions {
         #[gen_stub(override_type(type_repr = "MaxTopicSize | None"))] local_retention_size: Option<
             &MaxTopicSize,
         >,
+        #[gen_stub(override_type(type_repr = "TopicType | None"))] topic_type: Option<TopicType>,
+        #[gen_stub(override_type(type_repr = "GeoMode | None"))] geo_mode: Option<GeoMode>,
         #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
         raw: Option<BTreeMap<String, String>>,
     ) -> PyResult<Self> {
@@ -363,6 +403,8 @@ impl TopicOptions {
                 tiered_storage,
                 local_retention_age,
                 local_retention_size,
+                topic_type: topic_type.map(RustTopicType::from),
+                geo_mode: geo_mode.map(RustGeoMode::from),
                 raw: raw.unwrap_or_default(),
             },
         })
@@ -446,6 +488,8 @@ impl From<OptionKey> for RustOptionKey {
             OptionKey::TieredStorage => Self::TieredStorage,
             OptionKey::LocalRetentionAge => Self::LocalRetentionAge,
             OptionKey::LocalRetentionSize => Self::LocalRetentionSize,
+            OptionKey::TopicType => Self::TopicType,
+            OptionKey::GeoMode => Self::GeoMode,
         }
     }
 }
@@ -455,6 +499,24 @@ impl From<PartitionResizePolicy> for RustPartitionResizePolicy {
         match policy {
             PartitionResizePolicy::Mutable => Self::Mutable,
             PartitionResizePolicy::Fixed => Self::Fixed,
+        }
+    }
+}
+
+impl From<TopicType> for RustTopicType {
+    fn from(topic_type: TopicType) -> Self {
+        match topic_type {
+            TopicType::Normal => Self::Normal,
+            TopicType::Geo => Self::Geo,
+        }
+    }
+}
+
+impl From<GeoMode> for RustGeoMode {
+    fn from(mode: GeoMode) -> Self {
+        match mode {
+            GeoMode::Geo => Self::Geo,
+            GeoMode::GeoTiered => Self::GeoTiered,
         }
     }
 }

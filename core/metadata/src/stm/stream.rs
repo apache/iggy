@@ -82,7 +82,7 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, MaxTopicSize, NodeStats,
     NodeStatsSample, OptionKey, OptionValue, OptionsProvenance, OptionsScope,
     PartitionResizePolicy, PartitionStats, ResourceOptions, StreamStats, TopicCreateOptions,
-    TopicResolvedOptions, TopicStats, WrapSet, public_options, stream_wrap_set,
+    TopicResolvedOptions, TopicStats, TopicType, WrapSet, public_options, stream_wrap_set,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -3583,6 +3583,19 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         let Ok(resolved_map) = resolved.to_option_map() else {
             return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
         };
+        // A geo topic's primary uploads a send before its partition encrypts
+        // it, so the topic would store an encrypted stream's messages in the
+        // clear. A stream gets its key at creation only, so a topic create is
+        // the one place to refuse the pair, and only here does the stream's
+        // committed state decide it.
+        if resolved.is_geo()
+            && state
+                .items
+                .get(stream_id)
+                .is_some_and(|stream| !matches!(stream_wrap_set(&stream.options), Ok(None)))
+        {
+            return ApplyReply::err(CreateTopicResult::FeatureUnavailable);
+        }
 
         // Explicit wins on collision. `partitions_count` cannot appear here at
         // all: it is a fixed field of the command, not an option key.
@@ -3800,6 +3813,12 @@ impl StateHandler for UpdateTopicResolvedRequest {
         let Some(topic) = stream.topics.get(topic_id) else {
             return ApplyReply::err(UpdateTopicResult::TopicNotFound);
         };
+        // A geo topic keeps the name and options it was created with. The
+        // edge refuses such a patch by key when it can read the topic, and
+        // this refuses one that reached the primary without that read.
+        if topic.resolved.topic_type == TopicType::Geo {
+            return ApplyReply::err(UpdateTopicResult::OptionNotUpdatable);
+        }
         // Every check runs before any mutation, so a refused patch leaves the
         // topic exactly as it was: no half-applied rename or option change.
         // The blocks are read leniently, a key this build does not know is
@@ -4604,9 +4623,9 @@ mod tests {
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
     use iggy_common::{
-        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, HeaderKey, HeaderKind, OptionKey, OptionValue,
-        OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, WrappedStreamKey,
-        topic_option_keys,
+        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, HeaderKey, HeaderKind, IggyError, OptionKey,
+        OptionValue, OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin,
+        WrappedStreamKey, derived_defaults, topic_option_keys,
     };
     use std::str::FromStr;
     use std::time::Duration;
@@ -5471,6 +5490,152 @@ mod tests {
         let mut expected = before;
         expected.extend(explicit);
         assert_eq!(topic.options, expected);
+    }
+
+    /// Apply the create of a one-partition topic in `stream_id` with the
+    /// `explicit` options, and the defaults the primary derives from them.
+    fn apply_create_topic(
+        inner: &mut StreamsInner,
+        stream_id: u32,
+        name: &str,
+        explicit: &TopicCreateOptions,
+        consensus_group_id: u64,
+    ) -> ApplyReply {
+        let derived =
+            derived_defaults(OptionsScope::Topic, &explicit.to_option_map().unwrap()).unwrap();
+        let request = CreateTopicWithAssignmentsRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(stream_id),
+                partitions_count: 1,
+                name: WireName::new(name).unwrap(),
+                options: explicit.to_wire().unwrap(),
+            },
+            derived_options: resource_options_to_wire(&derived, OptionsProvenance::All).unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
+                partition_id: 0,
+                consensus_group_id,
+                members: Vec::new(),
+            }],
+        };
+        StateHandler::apply(&request, inner, IggyTimestamp::now())
+    }
+
+    fn geo_topic() -> TopicCreateOptions {
+        TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            ..TopicCreateOptions::default()
+        }
+    }
+
+    #[test]
+    fn given_an_encrypted_stream_when_applying_a_geo_topic_create_should_refuse_it_as_unavailable()
+    {
+        let context = key_context(OLD_CONFIG_KEY, &[]);
+        let mut inner = StreamsInner::new();
+        let set = WrapSet::from(envelope(&context, 1, StreamKeyOrigin::Server));
+        create_encrypted_stream(&mut inner, "sealed", &set, 5);
+        create_stream(&mut inner, "plain");
+        let revision = inner.revision;
+
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "geo", &geo_topic(), 1).code,
+            IggyError::FeatureUnavailable.as_code()
+        );
+        assert!(inner.items[0].topics.is_empty());
+        assert_eq!(inner.revision, revision);
+
+        let normal = TopicCreateOptions::default();
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "normal", &normal, 2).code,
+            0
+        );
+        assert_eq!(
+            apply_create_topic(&mut inner, 1, "geo", &geo_topic(), 3).code,
+            0
+        );
+        let topic = &inner.items[1].topics[0];
+        assert_eq!(topic.resolved.topic_type, TopicType::Geo);
+        assert_eq!(
+            topic.resolved.partition_resize_policy,
+            PartitionResizePolicy::Fixed
+        );
+        assert!(topic.resolved.runtime.places_batches);
+    }
+
+    #[test]
+    fn given_a_geo_topic_when_applying_a_patch_or_a_resize_should_refuse_it_and_keep_the_topic() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "geo", &geo_topic(), 1).code,
+            0
+        );
+        let normal = TopicCreateOptions::default();
+        assert_eq!(
+            apply_create_topic(&mut inner, 0, "normal", &normal, 2).code,
+            0
+        );
+        let before = inner.items[0].topics[0].options.clone();
+        let revision = inner.revision;
+        let mut expiry = ResourceOptions::new();
+        expiry.insert(
+            HeaderKey::from(OptionKey::MessageExpiry),
+            OptionValue::explicit(IggyExpiry::from(9_000_000u64).encode().unwrap()),
+        );
+        let patch = |topic_id: u32, name: Option<&str>, explicit: &ResourceOptions| {
+            UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(topic_id),
+                name: name.map(|name| WireName::new(name).unwrap()),
+                explicit_options: resource_options_to_wire(explicit, OptionsProvenance::All)
+                    .unwrap(),
+                derived_options: WireOptions::empty(),
+            }
+        };
+
+        for refused in [
+            patch(0, None, &expiry),
+            patch(0, Some("renamed"), &ResourceOptions::new()),
+        ] {
+            assert_eq!(
+                StateHandler::apply(&refused, &mut inner, IggyTimestamp::now()).code,
+                IggyError::OptionNotUpdatable(String::new()).as_code()
+            );
+        }
+        let resize = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+            },
+            partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
+                partition_id: 0,
+                consensus_group_id: 3,
+                members: Vec::new(),
+            }],
+        };
+        assert_eq!(
+            crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &resize,
+                &mut inner,
+                IggyTimestamp::now()
+            )
+            .code,
+            IggyError::PartitionResizeDisabled.as_code()
+        );
+        let topic = &inner.items[0].topics[0];
+        assert_eq!(topic.name.as_ref(), "geo");
+        assert_eq!(topic.options, before);
+        assert_eq!(topic.partitions.len(), 1);
+        assert_eq!(inner.revision, revision);
+
+        assert_eq!(
+            StateHandler::apply(&patch(1, None, &expiry), &mut inner, IggyTimestamp::now()).code,
+            0,
+            "a normal topic takes the same patch"
+        );
     }
 
     #[test]

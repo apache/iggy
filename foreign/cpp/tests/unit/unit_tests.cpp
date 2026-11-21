@@ -137,6 +137,8 @@ TEST(TopicCreateOptionsTest, DefaultHasNoValues) {
     EXPECT_FALSE(options.TieredStorage().has_value());
     EXPECT_FALSE(options.LocalRetentionAge().has_value());
     EXPECT_FALSE(options.LocalRetentionSize().has_value());
+    EXPECT_FALSE(options.TopicType().has_value());
+    EXPECT_FALSE(options.GeoMode().has_value());
     EXPECT_TRUE(options.RawEntries().empty());
 }
 
@@ -407,6 +409,12 @@ TEST(OptionKeyTest, ReturnsCatalogNames) {
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TieredStorage), "tiered_storage");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LocalRetentionAge), "local_retention_age");
     EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::LocalRetentionSize), "local_retention_size");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::TopicType), "topic_type");
+    EXPECT_EQ(iggy::to_string(iggy::TopicOptionKey::GeoMode), "geo_mode");
+    EXPECT_EQ(iggy::to_string(iggy::TopicType::Normal), "normal");
+    EXPECT_EQ(iggy::to_string(iggy::TopicType::Geo), "geo");
+    EXPECT_EQ(iggy::to_string(iggy::GeoMode::Geo), "geo");
+    EXPECT_EQ(iggy::to_string(iggy::GeoMode::GeoTiered), "geo_tiered");
     EXPECT_EQ(iggy::to_string(iggy::UserOptionKey::Status), "status");
     EXPECT_EQ(iggy::to_string(iggy::OptionsScope::User), "user");
     EXPECT_EQ(iggy::to_string(iggy::StreamEncryptionSource::Server), "server");

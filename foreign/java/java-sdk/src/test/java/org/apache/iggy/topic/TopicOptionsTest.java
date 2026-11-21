@@ -59,6 +59,8 @@ class TopicOptionsTest {
                 .tieredStorage(false)
                 .localRetentionAge(BigInteger.valueOf(21_600_000_000L))
                 .localRetentionSize(BigInteger.valueOf(10_737_418_240L))
+                .topicType(TopicType.GEO)
+                .geoMode(GeoMode.GEO_TIERED)
                 .build()
                 .entries();
 
@@ -74,7 +76,9 @@ class TopicOptionsTest {
                         "segment_max_age",
                         "tiered_storage",
                         "local_retention_age",
-                        "local_retention_size");
+                        "local_retention_size",
+                        "topic_type",
+                        "geo_mode");
         assertThat(options.get("segment_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint32);
         assertThat(options.get("size_of_messages_required_to_save").kind()).isEqualTo(HeaderKind.Uint64);
@@ -89,6 +93,10 @@ class TopicOptionsTest {
         assertThat(options.get("local_retention_age").asUint64()).isEqualTo(BigInteger.valueOf(21_600_000_000L));
         assertThat(options.get("local_retention_size").kind()).isEqualTo(HeaderKind.Uint64);
         assertThat(options.get("local_retention_size").asUint64()).isEqualTo(BigInteger.valueOf(10_737_418_240L));
+        assertThat(options.get("topic_type").kind()).isEqualTo(HeaderKind.String);
+        assertThat(options.get("topic_type").toStringValue()).isEqualTo("geo");
+        assertThat(options.get("geo_mode").kind()).isEqualTo(HeaderKind.String);
+        assertThat(options.get("geo_mode").toStringValue()).isEqualTo("geo_tiered");
         // Little-endian, so the low byte of 128 MiB leads and the high bytes are zero.
         assertThat(options.get("segment_size").value()).containsExactly(0, 0, 0, 8, 0, 0, 0, 0);
     }

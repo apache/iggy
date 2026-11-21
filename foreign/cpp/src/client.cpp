@@ -371,6 +371,14 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.segment_max_age_kind  = std::string(value->Kind());
             ffi_options.segment_max_age_value = value->Value();
         }
+        if (auto value = options.TopicType()) {
+            ffi_options.has_topic_type = true;
+            ffi_options.topic_type     = std::string(iggy::to_string(*value));
+        }
+        if (auto value = options.GeoMode()) {
+            ffi_options.has_geo_mode = true;
+            ffi_options.geo_mode     = std::string(iggy::to_string(*value));
+        }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });
 }
