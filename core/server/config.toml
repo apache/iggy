@@ -1541,7 +1541,7 @@ handshake_grace = "10 s"
 # producer that waits for each answer then sends less, and the rewrites catch
 # up. Sends to other partitions are not slowed. The next rewrite of a
 # partition past the limit does not wait out its usual interval, only the
-# shortest one, 250 ms after its last rewrite. "0" turns the delay off.
+# shortest one, 1 s after its last rewrite. "0" turns the delay off.
 # Otherwise at least 64 MiB, what one long-term segment holds.
 #long_term_backlog_limit = "1 GiB"
 # Per shard: how many jobs of each class run at once, and the bytes that
@@ -1556,7 +1556,7 @@ handshake_grace = "10 s"
 #demand_fetch_bytes = "64 MiB"
 #uploads = 2
 #upload_bytes = "2 GiB"
-#fresh_uploads = 4
+#fresh_uploads = 16
 #speculative_fetches = 4
 #speculative_fetch_bytes = "32 MiB"
 #deletes = 2
@@ -1621,6 +1621,16 @@ handshake_grace = "10 s"
 # stays about this far behind its peer. One listing per peer stream and one
 # read per changed manifest go to the peer's store each time.
 #manifest_poll_interval = "5 s"
+# The longest wait between two rewrites of the committed messages of a geo
+# partition into long-term segments. Each partition adjusts its wait between
+# 1 s and this value, toward the wait at which a segment comes out 80% full.
+# A partition with little load waits the longest, so its shadow topics in
+# other datacenters are about this plus manifest_poll_interval behind. A
+# lower value brings messages there sooner, and leaves more and smaller
+# long-term segments on quiet partitions: more merges and more manifest
+# stores, still at most one a second per partition. At least 1 s. "1 s"
+# rewrites every second.
+#long_term_rewrite_max_interval = "10 s"
 # How often a node stores the positions of the consumer groups of its geo and
 # shadow topics in its bucket, one object per log in which it leads a
 # partition, when they changed. It carries the commits of polls with

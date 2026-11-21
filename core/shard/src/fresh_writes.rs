@@ -120,7 +120,7 @@ pub const FRESH_PARTITION_PENDING_BYTES_MAX: u64 = FRESH_PENDING_BYTES_MAX / 4;
 pub const FRESH_UPLOAD_INTERVAL: Duration = Duration::from_millis(10);
 
 /// The uploads a shard that was given no number runs at once.
-pub const FRESH_UPLOADS: usize = 4;
+pub const FRESH_UPLOADS: usize = 16;
 
 /// The most attempts at storing one object, the first one included.
 const FRESH_UPLOAD_ATTEMPTS: u32 = 3;

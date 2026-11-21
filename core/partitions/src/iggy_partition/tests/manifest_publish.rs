@@ -17,13 +17,17 @@
 
 use super::eviction::{reboot, tiered_partition_on_disk};
 use super::floor_eviction::{advance_over, apply};
+use super::placed_batches::{
+    commit_long_term_request, leader_with_three_long_term_segments, merged_of,
+};
 use super::remote_poll::layout;
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::tiered_floor::AdvanceTieredFloor;
 use crate::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
-    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher, upload_segment,
+    MANIFEST_RETRY_AFTER_MAX, MANIFEST_STORE_INTERVAL, ManifestPublishOutcome, ManifestPublisher,
+    upload_segment,
 };
 use iggy_object_store::{
     InlineTierExecutor, MemoryStore, ObjectStore, ObjectStoreError, PartitionManifest, SegmentKey,
@@ -550,6 +554,107 @@ async fn given_a_publish_in_flight_or_a_backup_when_asking_should_owe_no_pass() 
         "a new view owes its first pass instead"
     );
     assert!(partition.manifest_awaits_first_pass());
+}
+
+/// A leader of three whose long-term log holds three segments, which stored
+/// the manifest of them at `stored_at` and then committed a replace of the
+/// first two and a trim of what replaced them. Returns the segment left.
+async fn changed_twice_after_a_store(
+    stored_at: IggyTimestamp,
+) -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    iggy_object_store::ManifestSegment,
+) {
+    let (directory, mut partition, [first, second, third]) =
+        Box::pin(leader_with_three_long_term_segments()).await;
+    assert!(pass(&mut partition, stored_at, &STORED).is_some());
+    let merged = merged_of(&first, &second);
+    let replace = partition.replace_segments_request(&merged, 10).unwrap();
+    Box::pin(commit_long_term_request(&mut partition, replace, false)).await;
+    assert!(
+        pass(
+            &mut partition,
+            after(stored_at, Duration::from_millis(100)),
+            &STORED
+        )
+        .is_none(),
+        "the replace waits"
+    );
+    let trim = partition
+        .trim_segments_request(merged.end_offset, 11)
+        .unwrap();
+    Box::pin(commit_long_term_request(&mut partition, trim, false)).await;
+    assert!(
+        pass(
+            &mut partition,
+            after(stored_at, Duration::from_millis(900)),
+            &STORED
+        )
+        .is_none(),
+        "the trim waits"
+    );
+    (directory, partition, third)
+}
+
+/// Changes of the long-term log within the store interval share one store,
+/// which lists the latest of them, owed once the interval passed with no
+/// further change to ask for it.
+#[compio::test]
+async fn given_changes_of_the_long_term_log_within_the_store_interval_when_passes_run_should_store_one_manifest_of_the_latest_state()
+ {
+    let stored_at = IggyTimestamp::now();
+    let (_directory, mut partition, third) = Box::pin(changed_twice_after_a_store(stored_at)).await;
+
+    assert_eq!(owed_after(&partition, stored_at), MANIFEST_STORE_INTERVAL);
+    let later = after(stored_at, MANIFEST_STORE_INTERVAL);
+    let manifest = pass(&mut partition, later, &STORED).expect("the interval passed");
+
+    assert_eq!(manifest.segments, [third]);
+    assert_eq!(manifest.trim_point, Some(third.start_offset - 1));
+    assert_eq!(manifest.floor, Some(third.end_offset));
+    assert!(
+        pass(
+            &mut partition,
+            after(later, MANIFEST_STORE_INTERVAL),
+            &STORED
+        )
+        .is_none(),
+        "no change, no store"
+    );
+    assert_eq!(
+        owed_after(&partition, stored_at),
+        MANIFEST_REPEAT_AFTER,
+        "only the repeat is owed"
+    );
+}
+
+/// A store that the interval held back and that then failed is retried
+/// after its backoff, and the retry lists the latest state.
+#[compio::test]
+async fn given_a_held_store_that_fails_when_asking_should_retry_it_after_its_backoff() {
+    let stored_at = IggyTimestamp::now();
+    let (_directory, mut partition, third) = Box::pin(changed_twice_after_a_store(stored_at)).await;
+    let failed_at = after(stored_at, MANIFEST_STORE_INTERVAL);
+    assert!(pass(&mut partition, failed_at, &REFUSED).is_some());
+
+    assert_eq!(owed_after(&partition, failed_at), MANIFEST_RETRY_AFTER);
+    assert!(
+        pass(
+            &mut partition,
+            after(failed_at, MANIFEST_RETRY_AFTER / 2),
+            &STORED
+        )
+        .is_none(),
+        "the backoff runs"
+    );
+    let retried = pass(
+        &mut partition,
+        after(failed_at, MANIFEST_RETRY_AFTER),
+        &STORED,
+    )
+    .expect("the retry is due");
+    assert_eq!(retried.segments, [third]);
 }
 
 /// The segment cleaner runs the passes of a tiered partition.

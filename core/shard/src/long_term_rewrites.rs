@@ -35,7 +35,8 @@
 //!
 //! A commit to the long-term log also stages a publish of the partition's
 //! manifest, so a reader of the bucket finds the segment without waiting
-//! for the segment cleaner.
+//! for the segment cleaner. The commits within one
+//! [`partitions::MANIFEST_STORE_INTERVAL`] share one publish.
 //!
 //! A segment is stored before its command commits. A pass that finds such
 //! a segment sends its command again and starts no rewrite, so a command
@@ -69,6 +70,7 @@ use partitions::{IggyPartition, LONG_TERM_SEGMENT_BYTES, LongTermWriter, Rewrite
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
+use std::time::Duration;
 
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
@@ -132,6 +134,13 @@ where
     /// segment holds. Zero turns the delay off.
     pub fn set_long_term_backlog_limit(&self, bytes: u64) {
         self.rewrite_pacing.borrow_mut().set_backlog_limit(bytes);
+    }
+
+    /// Set the longest wait between two rewrites of a partition this shard
+    /// leads, which a partition with little load waits. A wait below
+    /// [`crate::rewrite_pacing::REWRITE_INTERVAL_MIN`] counts as it.
+    pub fn set_long_term_rewrite_max_interval(&self, interval: Duration) {
+        self.rewrite_pacing.borrow_mut().set_max_interval(interval);
     }
 
     /// Stage the first rewrite pass for `namespace` on this shard's pump,
@@ -233,8 +242,9 @@ where
         for plan in plans {
             self.settle_segment_plan(plan).await;
         }
-        let partitions = self.plane.partitions();
         let manifest_now = IggyTimestamp::now();
+        self.stage_held_manifest_passes(manifest_now);
+        let partitions = self.plane.partitions();
         if self.rewrite_pacing.borrow_mut().take_sweep_wanted() {
             for namespace in partitions.namespaces() {
                 if let Some(partition) = partitions.get_by_ns(namespace) {

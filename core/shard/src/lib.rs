@@ -40,7 +40,6 @@ mod long_term_retention;
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
-mod peer_fresh_follows;
 mod peer_manifest_follows;
 pub mod peers;
 mod poll;
@@ -54,7 +53,6 @@ pub mod shards_table;
 mod test_support;
 pub mod tier_service;
 mod topic_object_checks;
-pub use peer_fresh_follows::PeerFreshFound;
 pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest};
 mod upload_pacing;
 
@@ -1357,9 +1355,9 @@ pub enum LifecycleFrame {
     /// started, sent by the task that ran it.
     PeerManifestRead(Box<FinishedPeerManifestRead>),
     /// Per-shard pass over a shadow partition whose origin retired: every
-    /// replica stops serving the fresh batches it found, and the primary
-    /// commits what the retention of the topic in the peer removes from the
-    /// committed manifest.
+    /// replica forgets what it knew of the partition's manifests, and the
+    /// primary commits what the retention of the topic in the peer removes
+    /// from the committed manifest.
     RetainRetiredPeer {
         namespace: IggyNamespace,
         /// The incarnation the retention was read for.
@@ -1368,10 +1366,6 @@ pub enum LifecycleFrame {
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
     },
-    /// What reads of a geo peer's fresh objects found for the shadow
-    /// partitions the shard owns: from shard 0, which follows the peer's
-    /// writers, or from a read that the shard started for a proof.
-    PeerFreshFound(Box<PeerFreshFound>),
     /// Shard 0 asks the shard for the consumer group positions of its geo
     /// and shadow partitions, for the round `round`, of the topics in
     /// `scope` by stream and topic id, or of every log. The primaries here
@@ -2292,6 +2286,12 @@ where
     /// so the next manifest pass takes them from here.
     undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
 
+    /// The partitions whose changed manifest waits out
+    /// [`partitions::MANIFEST_STORE_INTERVAL`], by namespace and incarnation.
+    /// The pump's tick stages each one's pass once it passed, whether the
+    /// shard paces the partition or not, and whether it sleeps.
+    manifests_held: RefCell<BTreeSet<(IggyNamespace, u64)>>,
+
     /// The upload-first produce path of the partitions here that place their
     /// batches.
     fresh_writes: fresh_writes::FreshWrites,
@@ -2320,9 +2320,6 @@ where
     /// manifests.
     peer_manifest_follows: peer_manifest_follows::PeerManifestFollows,
 
-    /// What the shadow partitions here wait for of their peers' fresh
-    /// objects.
-    peer_fresh_follows: peer_fresh_follows::PeerFreshFollows,
     /// What this shard does with the consumer group positions of its geo
     /// and shadow partitions.
     geo_positions: geo_positions::ShardGeoPositions,
@@ -2703,6 +2700,7 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
             long_term_writer: RefCell::new(None),
@@ -2710,7 +2708,6 @@ where
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
-            peer_fresh_follows: peer_fresh_follows::PeerFreshFollows::default(),
             geo_positions: geo_positions::ShardGeoPositions::default(),
             geo_commits: geo_commits::ShardGeoCommits::default(),
             peer_stores: RefCell::default(),
@@ -3698,6 +3695,7 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
             long_term_writer: RefCell::new(None),
@@ -3705,7 +3703,6 @@ where
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
-            peer_fresh_follows: peer_fresh_follows::PeerFreshFollows::default(),
             geo_positions: geo_positions::ShardGeoPositions::default(),
             geo_commits: geo_commits::ShardGeoCommits::default(),
             peer_stores: RefCell::default(),

@@ -57,6 +57,11 @@ pub const MAX_ORIGIN_LEN: usize = 32;
 /// late.
 pub const CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(1);
 
+/// The shortest `long_term_rewrite_max_interval`. It is the shortest wait
+/// between two rewrites of a partition, as its manifest is stored at most
+/// once a second and a rewrite more often publishes nothing sooner.
+pub const LONG_TERM_REWRITE_MAX_INTERVAL_MIN: Duration = Duration::from_secs(1);
+
 #[serde_as]
 #[derive(Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
@@ -94,6 +99,14 @@ pub struct GeoConfig {
     #[serde(default = "default_manifest_poll_interval")]
     #[config_env(leaf)]
     pub manifest_poll_interval: IggyDuration,
+    /// The longest wait between two rewrites of the committed messages of a
+    /// geo partition into long-term segments, which a partition with little
+    /// load waits. A shadow topic of such a partition is about this plus
+    /// `manifest_poll_interval` behind. At least 1 s.
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_long_term_rewrite_max_interval")]
+    #[config_env(leaf)]
+    pub long_term_rewrite_max_interval: IggyDuration,
     /// How often a node stores the positions of the consumer groups of its
     /// geo and shadow topics in its store, when they changed. A group that
     /// commits on read re-reads at most this much more in another
@@ -135,6 +148,7 @@ impl Default for GeoConfig {
             recover_cluster_uid: String::new(),
             recover_unproven: default_recover_unproven(),
             manifest_poll_interval: default_manifest_poll_interval(),
+            long_term_rewrite_max_interval: default_long_term_rewrite_max_interval(),
             positions_publish_interval: default_positions_publish_interval(),
             consumer_offset_upload_interval: default_consumer_offset_upload_interval(),
             positions_poll_interval: default_positions_poll_interval(),
@@ -242,11 +256,13 @@ impl Display for GeoConfig {
         }
         write!(
             f,
-            "], tombstone_grace: {}, manifest_poll_interval: {}, positions_publish_interval: {}, \
+            "], tombstone_grace: {}, manifest_poll_interval: {}, \
+             long_term_rewrite_max_interval: {}, positions_publish_interval: {}, \
              consumer_offset_upload_interval: {}, positions_poll_interval: {}, \
              positions_resume_timeout: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
             self.tombstone_grace,
             self.manifest_poll_interval,
+            self.long_term_rewrite_max_interval,
             self.positions_publish_interval,
             self.consumer_offset_upload_interval,
             self.positions_poll_interval,
@@ -305,6 +321,12 @@ impl Validatable<ConfigurationError> for GeoConfig {
         }
         if self.manifest_poll_interval.is_zero() {
             return refuse("manifest_poll_interval must be longer than zero");
+        }
+        if self.long_term_rewrite_max_interval.get_duration() < LONG_TERM_REWRITE_MAX_INTERVAL_MIN {
+            return refuse(&format!(
+                "long_term_rewrite_max_interval must be at least {}",
+                IggyDuration::new(LONG_TERM_REWRITE_MAX_INTERVAL_MIN)
+            ));
         }
         if self.positions_publish_interval.is_zero() {
             return refuse("positions_publish_interval must be longer than zero");
@@ -497,6 +519,13 @@ fn default_consumer_offset_upload_interval() -> IggyDuration {
     IggyDuration::new(Duration::from_millis(50))
 }
 
+/// Ten seconds: a partition with little load stores one small long-term
+/// segment and one manifest every 10 s, and its shadow topics stay seconds
+/// behind.
+fn default_long_term_rewrite_max_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(10)
+}
+
 /// A second, as the publishing: a listing of each peer's positions a second.
 fn default_positions_poll_interval() -> IggyDuration {
     IggyDuration::new_from_secs(1)
@@ -654,6 +683,52 @@ mod tests {
         .unwrap();
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_no_long_term_rewrite_max_interval_when_loading_should_rewrite_at_least_every_10_s() {
+        let config: GeoConfig = serde_json::from_str(r#"{"origin":"dc-a"}"#).unwrap();
+        let tuned: GeoConfig =
+            serde_json::from_str(r#"{"origin":"dc-a","long_term_rewrite_max_interval":"2 s"}"#)
+                .unwrap();
+
+        assert_eq!(
+            config.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            GeoConfig::default().long_term_rewrite_max_interval,
+            config.long_term_rewrite_max_interval
+        );
+        assert_eq!(
+            tuned.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(2)
+        );
+        assert!(config.validate().is_ok());
+        assert!(tuned.validate().is_ok());
+        assert!(
+            tuned
+                .to_string()
+                .contains("long_term_rewrite_max_interval: 2s,"),
+            "{tuned}"
+        );
+    }
+
+    #[test]
+    fn given_a_long_term_rewrite_max_interval_below_a_second_when_validating_should_refuse() {
+        let config = |value: &str| -> GeoConfig {
+            serde_json::from_str(&format!(
+                r#"{{"origin":"dc-a","long_term_rewrite_max_interval":"{value}"}}"#
+            ))
+            .unwrap()
+        };
+
+        for refused in ["0", "disabled", "1 ms", "999 ms"] {
+            assert!(config(refused).validate().is_err(), "{refused}");
+        }
+        for accepted in ["1 s", "1001 ms", "1 h"] {
+            assert!(config(accepted).validate().is_ok(), "{accepted}");
+        }
     }
 
     #[test]

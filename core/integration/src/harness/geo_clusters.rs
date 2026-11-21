@@ -30,14 +30,19 @@
 //! let shadow = pair.b().wait_for_shadow_topic(&client_b, "orders", topic.id).await?;
 //! assert!(pair.changes_while_stopped(GeoSide::A).await?.is_empty());
 //! ```
+//!
+//! A cluster can also read its peer's bucket through a [`BucketMirror`], so a
+//! watch on the mirror sees that cluster's reads alone.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::future::Future;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures::channel::oneshot;
 use futures::executor::block_on;
@@ -89,6 +94,14 @@ const BUCKET_PREFIX: &str = "iggy";
 /// Reads of a bucket further apart than this belong to separate passes.
 const READ_PASS_GAP: Duration = Duration::from_secs(2);
 
+/// How often a [`BucketMirror`] copies what changed in its bucket.
+const MIRROR_INTERVAL: Duration = Duration::from_millis(20);
+
+/// The suffix of the scratch file a [`BucketMirror`] writes before it
+/// renames it over a copy. Its name starts with a dot, which a listing
+/// skips.
+const MIRROR_SCRATCH: &str = ".mirror";
+
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// One of the two clusters of a [`GeoClusterPair`].
@@ -129,6 +142,7 @@ pub struct GeoClusterPairBuilder {
     geo_mode: GeoMode,
     tombstone_grace: String,
     extra_envs: HashMap<String, String>,
+    mirrored: Option<GeoSide>,
 }
 
 impl Default for GeoClusterPairBuilder {
@@ -155,6 +169,7 @@ impl Default for GeoClusterPairBuilder {
                     "5s".to_owned(),
                 ),
             ]),
+            mirrored: None,
         }
     }
 }
@@ -206,6 +221,14 @@ impl GeoClusterPairBuilder {
         self
     }
 
+    /// Let cluster `side` read its peer's bucket through a [`BucketMirror`]
+    /// in place of the bucket. See [`GeoCluster::peer_mirror`].
+    #[must_use]
+    pub const fn peer_reads_through_mirror(mut self, side: GeoSide) -> Self {
+        self.mirrored = Some(side);
+        self
+    }
+
     /// Build both clusters and create their buckets.
     ///
     /// # Errors
@@ -223,11 +246,25 @@ impl GeoClusterPairBuilder {
                 .unwrap_or("geo_cluster_pair")
                 .replace("::", "_")
         });
-        let mut a = self.cluster(&test_name, GeoSide::A)?;
-        let mut b = self.cluster(&test_name, GeoSide::B)?;
-        a.point_at_buckets(b.bucket.path());
-        b.point_at_buckets(a.bucket.path());
-        Ok(GeoClusterPair { clusters: [a, b] })
+        let mut clusters = [
+            self.cluster(&test_name, GeoSide::A)?,
+            self.cluster(&test_name, GeoSide::B)?,
+        ];
+        for side in GeoSide::BOTH {
+            let peer_bucket = clusters[side.peer().index()].bucket.path.clone();
+            let cluster = &mut clusters[side.index()];
+            let read_from = if self.mirrored == Some(side) {
+                let mirror =
+                    BucketMirror::start(&peer_bucket, &cluster.harness.test_dir().join("mirror"))?;
+                let path = mirror.path().to_owned();
+                cluster.peer_mirror = Some(mirror);
+                path
+            } else {
+                peer_bucket
+            };
+            cluster.point_at_buckets(&read_from);
+        }
+        Ok(GeoClusterPair { clusters })
     }
 
     /// The cluster of `side`, with its bucket created and every setting but
@@ -257,6 +294,7 @@ impl GeoClusterPairBuilder {
             peer_origin: self.origins[side.peer().index()].clone(),
             geo_mode: self.geo_mode,
             bucket,
+            peer_mirror: None,
             harness,
         })
     }
@@ -344,6 +382,7 @@ pub struct GeoCluster {
     peer_origin: String,
     geo_mode: GeoMode,
     bucket: Bucket,
+    peer_mirror: Option<BucketMirror>,
     harness: TestHarness,
 }
 
@@ -381,6 +420,14 @@ impl GeoCluster {
     #[must_use]
     pub const fn bucket(&self) -> &Bucket {
         &self.bucket
+    }
+
+    /// The mirror through which this cluster reads its peer's bucket, `None`
+    /// unless the builder asked for one with
+    /// [`GeoClusterPairBuilder::peer_reads_through_mirror`].
+    #[must_use]
+    pub const fn peer_mirror(&self) -> Option<&BucketMirror> {
+        self.peer_mirror.as_ref()
     }
 
     #[must_use]
@@ -499,6 +546,7 @@ impl GeoCluster {
 }
 
 /// The `fs` bucket of one cluster, read the way a peer reads it.
+#[derive(Debug, Clone)]
 pub struct Bucket {
     path: PathBuf,
     layout: KeyLayout,
@@ -838,6 +886,190 @@ impl From<Event> for BucketEvent {
                 paths: event.paths,
             },
         }
+    }
+}
+
+/// A copy of a bucket that a thread keeps in step with it while it lives,
+/// which one cluster reads in place of its peer's bucket. The cluster that
+/// owns the bucket reads it too, for its own sweeps and rewrites, so a watch
+/// on the bucket cannot tell whose reads it saw. A watch on the mirror can.
+///
+/// Every `MIRROR_INTERVAL` the thread copies each file that is new or was
+/// replaced, through a scratch file that it renames over the copy, and
+/// removes the copies of files that left the bucket. It opens nothing under
+/// the mirror but its scratch files, whose names start with a dot.
+pub struct BucketMirror {
+    path: PathBuf,
+    stop: Arc<AtomicBool>,
+    copies: Arc<Mutex<Vec<MirrorCopy>>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+/// A file a [`BucketMirror`] copied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MirrorCopy {
+    pub at: Instant,
+    /// The path of the copy under the mirror.
+    pub path: PathBuf,
+}
+
+impl BucketMirror {
+    /// Mirror the bucket at `bucket` into the directory `path`.
+    ///
+    /// # Errors
+    /// The directory cannot be created or the thread cannot start.
+    pub fn start(bucket: &Path, path: &Path) -> Result<Self, TestBinaryError> {
+        fs::create_dir_all(path).map_err(|source| TestBinaryError::FileSystemError {
+            path: path.to_owned(),
+            source,
+        })?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let copies = Arc::new(Mutex::new(Vec::new()));
+        let mut step = MirrorStep {
+            bucket: bucket.to_owned(),
+            mirror: path.to_owned(),
+            copies: Arc::clone(&copies),
+            seen: HashMap::new(),
+            directories: HashSet::new(),
+        };
+        let stopped = Arc::clone(&stop);
+        let thread = thread::Builder::new()
+            .name("geo-bucket-mirror".to_owned())
+            .spawn(move || {
+                while !stopped.load(Ordering::Acquire) {
+                    step.run();
+                    thread::sleep(MIRROR_INTERVAL);
+                }
+            })
+            .map_err(TestBinaryError::Io)?;
+        Ok(Self {
+            path: path.to_owned(),
+            stop,
+            copies,
+            thread: Some(thread),
+        })
+    }
+
+    /// The directory the reading cluster takes for its peer's bucket.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Start recording every read and change under the mirror.
+    ///
+    /// # Errors
+    /// The watch cannot start.
+    pub fn watch(&self) -> Result<BucketWatch, TestBinaryError> {
+        BucketWatch::start(&self.path)
+    }
+
+    /// Every file copied so far, oldest first.
+    #[must_use]
+    pub fn copies(&self) -> Vec<MirrorCopy> {
+        self.copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl Drop for BucketMirror {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// What the thread of a [`BucketMirror`] knows between two passes.
+struct MirrorStep {
+    bucket: PathBuf,
+    mirror: PathBuf,
+    copies: Arc<Mutex<Vec<MirrorCopy>>>,
+    /// Each file copied, by its path under the bucket, with the inode, the
+    /// length and the modification time it had.
+    seen: HashMap<PathBuf, (u64, u64, SystemTime)>,
+    /// The directories created under the mirror.
+    directories: HashSet<PathBuf>,
+}
+
+impl MirrorStep {
+    /// Copy what changed and remove what left. A file that changes or goes
+    /// while it is copied is taken again by the next pass.
+    fn run(&mut self) {
+        let mut present = HashSet::new();
+        let mut pending = vec![PathBuf::new()];
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(self.bucket.join(&directory)) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with('.') {
+                    continue;
+                }
+                let relative = directory.join(entry.file_name());
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => pending.push(relative),
+                    Ok(kind) if kind.is_file() => {
+                        present.insert(relative.clone());
+                        self.copy_if_changed(&relative);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mirror = &self.mirror;
+        self.seen.retain(|relative, _| {
+            present.contains(relative) || {
+                let _ = fs::remove_file(mirror.join(relative));
+                false
+            }
+        });
+    }
+
+    fn copy_if_changed(&mut self, relative: &Path) {
+        let source = self.bucket.join(relative);
+        let Ok(metadata) = fs::metadata(&source) else {
+            return;
+        };
+        let Ok(modified) = metadata.modified() else {
+            return;
+        };
+        let version = (metadata.ino(), metadata.len(), modified);
+        if self.seen.get(relative) == Some(&version) {
+            return;
+        }
+        let Ok(bytes) = fs::read(&source) else {
+            return;
+        };
+        let target = self.mirror.join(relative);
+        let Some(parent) = target.parent().map(Path::to_owned) else {
+            return;
+        };
+        if !self.directories.contains(&parent) {
+            if fs::create_dir_all(&parent).is_err() {
+                return;
+            }
+            self.directories.insert(parent.clone());
+        }
+        let Some(name) = target.file_name() else {
+            return;
+        };
+        let scratch = parent.join(format!(".{}{MIRROR_SCRATCH}", name.to_string_lossy()));
+        if fs::write(&scratch, &bytes).is_err() || fs::rename(&scratch, &target).is_err() {
+            let _ = fs::remove_file(&scratch);
+            return;
+        }
+        self.seen.insert(relative.to_owned(), version);
+        self.copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(MirrorCopy {
+                at: Instant::now(),
+                path: target,
+            });
     }
 }
 

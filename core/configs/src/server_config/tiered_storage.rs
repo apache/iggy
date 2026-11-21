@@ -674,7 +674,7 @@ fn default_upload_bytes() -> IggyByteSize {
 }
 
 const fn default_fresh_uploads() -> u32 {
-    4
+    16
 }
 
 const fn default_speculative_fetches() -> u32 {
@@ -941,7 +941,7 @@ mod tests {
         let config: TieredStorageConfig =
             serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
 
-        assert_eq!(config.jobs.fresh_uploads, 4);
+        assert_eq!(config.jobs.fresh_uploads, 16);
         assert_eq!(
             config.fresh_upload_interval.get_duration(),
             Duration::from_millis(10)

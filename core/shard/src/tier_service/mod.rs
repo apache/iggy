@@ -33,8 +33,7 @@
 //! uploads of fresh objects are a class apart from them, because producers
 //! wait for those and a segment upload can take minutes. Deletes
 //! have their own quota and never wait either, so deletion keeps pace with
-//! uploads. The reads that follow another cluster's fresh objects have their
-//! own quota and never wait, since a shadow partition's lag waits for them.
+//! uploads.
 //!
 //! Jobs reach the store through [`TierStore`], which retries the calls that
 //! are safe to repeat and fails a put that stops making progress.
@@ -68,15 +67,6 @@ pub use store::{StoreCallPolicy, TierStore};
 
 const MIB: u64 = 1024 * 1024;
 
-/// The reads of another cluster's fresh objects that run at once.
-///
-/// Each one reads an index, at most a few MiB, and a node follows a few
-/// writers per peer, so a handful keeps the probes on time.
-pub const FRESH_FOLLOW_LIMITS: ClassLimits = ClassLimits {
-    jobs: 4,
-    bytes: None,
-};
-
 /// How many jobs of one class run at once, and how many bytes they hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassLimits {
@@ -97,7 +87,6 @@ pub struct TierServiceConfig {
     pub speculative_fetch: ClassLimits,
     pub delete: ClassLimits,
     pub housekeeping: ClassLimits,
-    pub fresh_follow: ClassLimits,
     pub calls: StoreCallPolicy,
 }
 
@@ -111,7 +100,6 @@ impl TierServiceConfig {
             TierJobClass::SpeculativeFetch => self.speculative_fetch,
             TierJobClass::Delete => self.delete,
             TierJobClass::Housekeeping => self.housekeeping,
-            TierJobClass::FreshFollow => self.fresh_follow,
         }
     }
 }
@@ -132,7 +120,7 @@ impl Default for TierServiceConfig {
             // No byte cap: the shard that fills the objects bounds the bytes
             // it holds in them.
             fresh_upload: ClassLimits {
-                jobs: 4,
+                jobs: crate::FRESH_UPLOADS,
                 bytes: None,
             },
             speculative_fetch: ClassLimits {
@@ -147,7 +135,6 @@ impl Default for TierServiceConfig {
                 jobs: 1,
                 bytes: None,
             },
-            fresh_follow: FRESH_FOLLOW_LIMITS,
             calls: StoreCallPolicy::default(),
         }
     }
@@ -315,7 +302,7 @@ struct Inner<S, B> {
     bus: B,
     store: Rc<TierStore<S, B>>,
     /// Indexed by [`slot`].
-    classes: RefCell<[ClassState; 7]>,
+    classes: RefCell<[ClassState; 6]>,
 }
 
 impl<S, B> Inner<S, B> {
@@ -416,14 +403,13 @@ impl<S, B> Drop for HeldSlot<S, B> {
 
 /// Whether the queue of `class` may start a job while the other classes wait
 /// as they do.
-fn may_start(classes: &[ClassState; 7], class: TierJobClass) -> bool {
+fn may_start(classes: &[ClassState; 6], class: TierJobClass) -> bool {
     let waits = |other| classes[slot(other)].waits();
     match class {
         TierJobClass::DemandFetch
         | TierJobClass::Upload
         | TierJobClass::FreshUpload
-        | TierJobClass::Delete
-        | TierJobClass::FreshFollow => true,
+        | TierJobClass::Delete => true,
         TierJobClass::SpeculativeFetch => !waits(TierJobClass::DemandFetch),
         TierJobClass::Housekeeping => {
             !waits(TierJobClass::DemandFetch)
@@ -442,6 +428,5 @@ const fn slot(class: TierJobClass) -> usize {
         TierJobClass::SpeculativeFetch => 3,
         TierJobClass::Delete => 4,
         TierJobClass::Housekeeping => 5,
-        TierJobClass::FreshFollow => 6,
     }
 }

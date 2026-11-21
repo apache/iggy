@@ -22,10 +22,11 @@
 //! so a short wait between two rewrites keeps that cluster close. Every
 //! rewrite stores one segment, so a short wait at a low load also leaves
 //! many small objects. Each partition therefore has its own wait, between
-//! [`REWRITE_INTERVAL_MIN`] and [`REWRITE_INTERVAL_MAX`]. After every
-//! rewrite it moves toward the wait at which a segment comes out
-//! [`REWRITE_FILL_TARGET_PERMILLE`] full: quickly when that wait is
-//! shorter, slowly when it is longer.
+//! [`REWRITE_INTERVAL_MIN`] and the ceiling of its shard,
+//! `[geo] long_term_rewrite_max_interval`, [`REWRITE_INTERVAL_MAX`] by
+//! default. After every rewrite it moves toward the wait at which a segment
+//! comes out [`REWRITE_FILL_TARGET_PERMILLE`] full: quickly when that wait
+//! is shorter, slowly when it is longer.
 //!
 //! A segment that ended at its byte cap left committed messages behind.
 //! The pass for them starts when the segment's command commits, since a
@@ -50,11 +51,15 @@ use std::rc::Rc;
 use std::time::Duration;
 
 /// The shortest wait between two rewrites of one partition.
-pub const REWRITE_INTERVAL_MIN: Duration = Duration::from_millis(250);
+///
+/// It is the shortest time between two stores of the partition's manifest,
+/// through which another cluster finds each segment. A segment cut at its
+/// byte cap does not wait for it.
+pub const REWRITE_INTERVAL_MIN: Duration = partitions::MANIFEST_STORE_INTERVAL;
 
-/// The longest wait between two rewrites of one partition, and so how far
-/// behind its committed messages the long-term segments of a partition with
-/// little load are.
+/// The longest wait between two rewrites of one partition when the shard was
+/// given no other, and so how far behind its committed messages the
+/// long-term segments of a partition with little load are.
 pub const REWRITE_INTERVAL_MAX: Duration = Duration::from_secs(10);
 
 /// The wait before the second rewrite of a partition.
@@ -174,6 +179,8 @@ struct Pace {
 #[derive(Debug)]
 pub struct RewritePacing {
     partitions: HashMap<RewriteKey, Pace>,
+    /// The longest wait, never below [`REWRITE_INTERVAL_MIN`].
+    max_interval_micros: u64,
     /// The backlog past which the sends to a partition are delayed, zero
     /// when they are not.
     backlog_limit: u64,
@@ -190,6 +197,7 @@ impl Default for RewritePacing {
     fn default() -> Self {
         Self {
             partitions: HashMap::new(),
+            max_interval_micros: micros(REWRITE_INTERVAL_MAX),
             backlog_limit: LONG_TERM_BACKLOG_LIMIT,
             backlog_counts: Rc::default(),
             plans: Rc::default(),
@@ -203,10 +211,11 @@ fn micros(duration: Duration) -> u64 {
 }
 
 /// The wait after a rewrite that stored `bytes` of a segment of at most
-/// `cap` bytes, when the wait before it was `interval_micros`. Zero bytes
-/// is a pass that found nothing.
-fn paced_interval(interval_micros: u64, bytes: u64, cap: u64) -> u64 {
-    let (min, max) = (micros(REWRITE_INTERVAL_MIN), micros(REWRITE_INTERVAL_MAX));
+/// `cap` bytes, when the wait before it was `interval_micros`, up to
+/// `max_micros`. Zero bytes is a pass that found nothing.
+fn paced_interval(interval_micros: u64, bytes: u64, cap: u64, max_micros: u64) -> u64 {
+    let min = micros(REWRITE_INTERVAL_MIN);
+    let max = max_micros.max(min);
     let interval = u128::from(interval_micros);
     let ideal = if bytes == 0 {
         u128::from(max)
@@ -285,6 +294,7 @@ impl RewritePacing {
     /// segment's command committed. The wait set here then only covers a
     /// command that got lost.
     pub fn settle(&mut self, key: RewriteKey, result: RewriteResult, now: u64) {
+        let max = self.max_interval_micros;
         let pace = self.pace(key);
         pace.settled_at = now;
         pace.failed = result == RewriteResult::Unchanged;
@@ -294,7 +304,7 @@ impl RewritePacing {
                 cap,
                 reached_commit,
             } => {
-                pace.interval_micros = paced_interval(pace.interval_micros, bytes, cap);
+                pace.interval_micros = paced_interval(pace.interval_micros, bytes, cap, max);
                 pace.awaits_commit = !reached_commit;
                 if reached_commit {
                     pace.lag = 0;
@@ -302,7 +312,7 @@ impl RewritePacing {
                 pace.interval_micros
             }
             RewriteResult::Idle => {
-                pace.interval_micros = paced_interval(pace.interval_micros, 0, 0);
+                pace.interval_micros = paced_interval(pace.interval_micros, 0, 0, max);
                 pace.awaits_commit = false;
                 pace.lag = 0;
                 pace.interval_micros
@@ -344,6 +354,19 @@ impl RewritePacing {
             let soonest = pace.settled_at.saturating_add(micros(REWRITE_INTERVAL_MIN));
             pace.due_at = Some(due_at.min(now.max(soonest)));
         }
+    }
+
+    /// Set the longest wait between two rewrites of a partition. A wait
+    /// below [`REWRITE_INTERVAL_MIN`] counts as it. A partition keeps the
+    /// wait it has until its next pass settles.
+    pub fn set_max_interval(&mut self, interval: Duration) {
+        self.max_interval_micros = micros(interval).max(micros(REWRITE_INTERVAL_MIN));
+    }
+
+    /// See [`Self::set_max_interval`].
+    #[must_use]
+    pub const fn max_interval(&self) -> Duration {
+        Duration::from_micros(self.max_interval_micros)
     }
 
     /// Set the backlog past which the sends to a partition are delayed.
@@ -481,11 +504,13 @@ mod tests {
     #[test]
     fn given_a_full_segment_when_settling_should_move_nine_tenths_of_the_way_to_the_shorter_wait() {
         let mut pacing = RewritePacing::default();
+        pacing.settle(key(), RewriteResult::Idle, 0);
+        assert_eq!(pacing.interval(&key()), Some(Duration::from_millis(4600)));
 
         pacing.settle(key(), stored(CAP), 0);
 
-        // The ideal wait is 800 ms: 100 ms of the old wait, 720 ms of it.
-        assert_eq!(pacing.interval(&key()), Some(Duration::from_millis(820)));
+        // The ideal wait is 3.68 s: 460 ms of the old wait, 3.312 s of it.
+        assert_eq!(pacing.interval(&key()), Some(Duration::from_millis(3772)));
     }
 
     #[test]
@@ -522,8 +547,8 @@ mod tests {
 
     #[test]
     fn given_a_steady_load_when_the_wait_starts_above_its_target_should_converge_to_it() {
-        // The target fills in half a second.
-        let rate = TARGET * 2;
+        // The target fills in two seconds.
+        let rate = TARGET / 2;
         let mut pacing = RewritePacing::default();
         for _ in 0..20 {
             pacing.settle(key(), RewriteResult::Idle, 0);
@@ -532,7 +557,7 @@ mod tests {
 
         let wait = wait_at_a_steady_load(&mut pacing, rate, 40);
 
-        assert!((499_000..=501_000).contains(&wait), "{wait}");
+        assert!((1_999_000..=2_001_000).contains(&wait), "{wait}");
     }
 
     #[test]
@@ -587,13 +612,13 @@ mod tests {
     }
 
     #[test]
-    fn given_extreme_sizes_and_waits_when_pacing_should_stay_between_the_bounds() {
-        let (min, max) = (micros(REWRITE_INTERVAL_MIN), micros(REWRITE_INTERVAL_MAX));
+    fn given_extreme_sizes_and_waits_when_pacing_should_stay_between_one_and_ten_seconds() {
+        let (min, max) = (1_000_000, 10_000_000);
 
         for interval in [0, 1, min, max, u64::MAX] {
             for bytes in [0, 1, CAP, u64::MAX] {
                 for cap in [0, 1, CAP, u64::MAX] {
-                    let paced = paced_interval(interval, bytes, cap);
+                    let paced = paced_interval(interval, bytes, cap, max);
                     assert!(
                         (min..=max).contains(&paced),
                         "{interval} {bytes} {cap}: {paced}"
@@ -601,8 +626,83 @@ mod tests {
                 }
             }
         }
-        assert_eq!(paced_interval(u64::MAX, 1, u64::MAX), max);
-        assert_eq!(paced_interval(min, u64::MAX, 1), min);
+        assert_eq!(paced_interval(u64::MAX, 1, u64::MAX, max), max);
+        assert_eq!(paced_interval(min, u64::MAX, 1, max), min);
+    }
+
+    #[test]
+    fn given_a_ceiling_of_two_seconds_when_pacing_should_stay_between_one_and_two_seconds() {
+        let (min, max) = (1_000_000, 2_000_000);
+        let mut pacing = RewritePacing::default();
+        pacing.set_max_interval(Duration::from_secs(2));
+
+        for interval in [0, 1, min, max, 10_000_000, u64::MAX] {
+            for bytes in [0, 1, CAP, u64::MAX] {
+                for cap in [0, 1, CAP, u64::MAX] {
+                    let paced = paced_interval(interval, bytes, cap, max);
+                    assert!(
+                        (min..=max).contains(&paced),
+                        "{interval} {bytes} {cap}: {paced}"
+                    );
+                }
+            }
+        }
+        pacing.settle(key(), stored(1), 0);
+        assert_eq!(pacing.interval(&key()), Some(Duration::from_secs(2)));
+        for _ in 0..40 {
+            pacing.settle(key(), RewriteResult::Idle, 0);
+        }
+        assert_eq!(pacing.interval(&key()), Some(Duration::from_secs(2)));
+        assert_eq!(pacing.take_due(1_999_999), []);
+        assert_eq!(pacing.take_due(2_000_000), [key()]);
+        for _ in 0..8 {
+            pacing.settle(key(), stored(CAP), 0);
+        }
+        assert_eq!(pacing.interval(&key()), Some(REWRITE_INTERVAL_MIN));
+    }
+
+    #[test]
+    fn given_a_ceiling_of_one_second_when_settling_any_pass_should_wait_one_second() {
+        let mut pacing = RewritePacing::default();
+        pacing.set_max_interval(Duration::from_secs(1));
+        let passes = [
+            stored(1),
+            RewriteResult::Idle,
+            stored(CAP),
+            stored(TARGET / 2),
+            RewriteResult::Unchanged,
+            RewriteResult::Resent,
+            RewriteResult::Registering,
+            stored(TARGET),
+        ];
+
+        for (index, pass) in (0_u64..).zip(passes) {
+            let now = index * 10_000_000;
+            pacing.settle(key(), pass, now);
+            assert_eq!(
+                pacing.interval(&key()),
+                Some(Duration::from_secs(1)),
+                "{pass:?}"
+            );
+            assert_eq!(pacing.take_due(now + 999_999), [], "{pass:?}");
+            assert_eq!(pacing.take_due(now + 1_000_000), [key()], "{pass:?}");
+        }
+    }
+
+    #[test]
+    fn given_a_ceiling_below_a_second_when_setting_it_should_take_a_second() {
+        let mut pacing = RewritePacing::default();
+        assert_eq!(pacing.max_interval(), REWRITE_INTERVAL_MAX);
+
+        pacing.set_max_interval(Duration::from_millis(500));
+        pacing.settle(key(), stored(1), 0);
+
+        assert_eq!(pacing.max_interval(), REWRITE_INTERVAL_MIN);
+        assert_eq!(pacing.interval(&key()), Some(REWRITE_INTERVAL_MIN));
+        assert_eq!(
+            paced_interval(u64::MAX, 1, CAP, 0),
+            micros(REWRITE_INTERVAL_MIN)
+        );
     }
 
     #[test]
@@ -809,6 +909,10 @@ mod tests {
         let other = (IggyNamespace::new(1, 1, 1), 7);
         let running = (IggyNamespace::new(1, 1, 2), 7);
         let mut pacing = RewritePacing::default();
+        // Waits long enough that a hurry would bring them forward.
+        for key in [key(), other] {
+            pacing.settle(key, stored(1), 0);
+        }
         pacing.settle(key(), RewriteResult::Unchanged, 0);
         pacing.settle(other, cut_at_the_cap(), 0);
         pacing.started(running, 10);

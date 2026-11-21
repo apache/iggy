@@ -139,7 +139,6 @@ macro_rules! contract_cases {
             given_keys_when_listing_should_return_byte_order,
             given_many_keys_when_paging_should_visit_each_once_in_order,
             given_keys_changing_between_pages_when_paging_should_resume_after_last_key,
-            given_a_key_when_listing_after_it_should_start_past_it,
             given_no_match_when_listing_should_return_one_empty_page,
             given_batch_when_deleting_should_remove_only_its_keys,
             given_invalid_key_in_batch_when_deleting_should_report_it_and_delete_the_rest,
@@ -765,69 +764,6 @@ pub async fn given_keys_changing_between_pages_when_paging_should_resume_after_l
         continuation = Some(next);
     }
     panic!("listing {prefix:?} did not end");
-}
-
-/// A reader that remembers the last key it saw lists from there with a key
-/// of its own, which may name no object.
-pub async fn given_a_key_when_listing_after_it_should_start_past_it(
-    store: &impl ObjectStore,
-    root: &str,
-) {
-    let key = |name: &str| format!("{root}/after/{name}");
-    for name in ["a/1", "a/2", "b/1", "c/1"] {
-        put(store, &key(name), pattern(1, 19), &PutOptions::default()).await;
-    }
-    let prefix = format!("{root}/after/");
-
-    assert_eq!(
-        keys_after(store, &prefix, &key("a/1")).await,
-        [key("a/2"), key("b/1"), key("c/1")]
-    );
-    assert_eq!(
-        keys_after(store, &prefix, &key("a/~")).await,
-        [key("b/1"), key("c/1")],
-        "a key that names no object"
-    );
-    assert_eq!(
-        keys_after(store, &prefix, &key("c/1")).await,
-        Vec::<String>::new()
-    );
-    assert_eq!(
-        keys_after(store, &prefix, &format!("{root}/aaa")).await,
-        [key("a/1"), key("a/2"), key("b/1"), key("c/1")],
-        "a key before the prefix"
-    );
-    let page = store
-        .list(
-            &ListRequest::new(&prefix)
-                .starting_after(&key("a/1"))
-                .with_max_keys(1),
-        )
-        .await
-        .expect("list");
-    assert_eq!(keys(&page.objects), [key("a/2")]);
-    let next = page.next.expect("more keys follow");
-    let resumed = store
-        .list(
-            &ListRequest::new(&prefix)
-                .starting_after(&key("a/1"))
-                .after(&next),
-        )
-        .await
-        .expect("list");
-    assert_eq!(
-        keys(&resumed.objects),
-        [key("b/1"), key("c/1")],
-        "a continuation takes the place of the key"
-    );
-}
-
-async fn keys_after(store: &impl ObjectStore, prefix: &str, after: &str) -> Vec<String> {
-    let page = store
-        .list(&ListRequest::new(prefix).starting_after(after))
-        .await
-        .unwrap_or_else(|error| panic!("list after {after:?}: {error}"));
-    keys(&page.objects)
 }
 
 pub async fn given_no_match_when_listing_should_return_one_empty_page(

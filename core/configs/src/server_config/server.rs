@@ -433,6 +433,7 @@ mod tests {
     use figment::Figment;
     use figment::providers::Serialized;
     use iggy_common::IggyByteSize;
+    use std::time::Duration;
 
     /// The embedded default TOML deserializes into a fully populated
     /// [`ServerConfig`] and passes validation. Exercises the
@@ -716,7 +717,34 @@ mod tests {
         assert!(cfg.geo.origin.is_empty());
         assert!(cfg.geo.peers.is_empty());
         assert_eq!(cfg.geo.tombstone_grace.get_duration().as_secs(), 24 * 3600);
+        assert_eq!(
+            cfg.geo.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(10)
+        );
         cfg.validate().expect("a config without geo validates");
+    }
+
+    #[test]
+    fn given_a_long_term_rewrite_max_interval_in_the_file_when_loading_should_take_it() {
+        let load = |value: &str| -> ServerConfig {
+            Figment::new()
+                .merge(Toml::string(include_str!("../../../server/config.toml")))
+                .merge(Toml::string(&format!(
+                    "[geo]\nlong_term_rewrite_max_interval = \"{value}\"\n"
+                )))
+                .extract()
+                .expect("TOML with a rewrite ceiling deserializes")
+        };
+
+        let tuned = load("2 s");
+        let too_short = load("500 ms");
+
+        assert_eq!(
+            tuned.geo.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(2)
+        );
+        tuned.validate().expect("a ceiling of 2 s validates");
+        assert!(too_short.validate().is_err());
     }
 
     #[test]
@@ -725,6 +753,7 @@ mod tests {
         let vars = [
             ("IGGY_GEO_ORIGIN", "dc-a"),
             ("IGGY_GEO_TOMBSTONE_GRACE", "2 h"),
+            ("IGGY_GEO_LONG_TERM_REWRITE_MAX_INTERVAL", "3 s"),
             ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b"),
             ("IGGY_GEO_PEERS_0_BACKEND", "s3"),
             ("IGGY_GEO_PEERS_0_BUCKET", "iggy-dc-b"),
@@ -752,6 +781,10 @@ mod tests {
         let cfg = cfg.expect("config with the env overrides deserializes");
         assert_eq!(cfg.geo.origin, "dc-a");
         assert_eq!(cfg.geo.tombstone_grace.get_duration().as_secs(), 2 * 3600);
+        assert_eq!(
+            cfg.geo.long_term_rewrite_max_interval.get_duration(),
+            Duration::from_secs(3)
+        );
         let [peer] = cfg.geo.peers.as_slice() else {
             panic!("one peer: {}", cfg.geo);
         };

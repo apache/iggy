@@ -18,6 +18,7 @@
 //! The upload-first produce path on a shard that hosts a primary which
 //! places its batches.
 
+use super::object_deletes::Shared;
 use super::segment_uploads::{namespace, pumped, staged_revision, until};
 use super::*;
 use crate::fresh_writes::{FRESH_PARTITION_PENDING_BYTES_MAX, FRESH_UPLOAD_DEADLINE};
@@ -27,12 +28,14 @@ use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_object_store::{
     FreshIndex, FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore,
-    ObjectStoreError, TierScopeToken, is_fresh_object,
+    ObjectStoreError, PartitionManifest, RecordingStore, StoreCall, StoreCalls, TierScopeToken,
+    is_fresh_object,
 };
 use partitions::{
-    ExecutorFreshUploader, FRESH_DELETES_PER_BATCH, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
-    FreshListOutcome, FreshListRequest, FreshObjectSweeper, FreshObjectUploader,
-    FreshUploadOutcome,
+    ExecutorFreshUploader, ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects,
+    FRESH_DELETES_PER_BATCH, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome, FreshListOutcome,
+    FreshListRequest, FreshObjectSweeper, FreshObjectUploader, FreshUploadOutcome,
+    MANIFEST_STORE_INTERVAL, ManifestPublishOutcome, ManifestPublisher, RemoteSegments,
 };
 
 pub(super) fn layout() -> KeyLayout {
@@ -4148,15 +4151,13 @@ async fn given_a_merge_that_commits_when_its_sources_are_deleted_should_report_t
     let revision = super::segment_uploads::staged_revision(&owner);
     let manifest_key = layout().manifest_key(&partitions::object_prefix(namespace(), revision));
     let store = executor.0.store();
-    let manifest_segments = async || {
+    // The floor and the segments of the stored manifest. The one of the
+    // first rewrite lists one segment too, at a lower floor.
+    let stored_manifest = async || {
         let meta = store.head(&manifest_key).await.ok()?;
         let object = store.get_range(&manifest_key, 0..meta.size).await.ok()?;
-        Some(
-            PartitionManifest::decode(&object.bytes)
-                .ok()?
-                .segments
-                .len(),
-        )
+        let manifest = PartitionManifest::decode(&object.bytes).ok()?;
+        Some((manifest.floor, manifest.segments.len()))
     };
     let metrics = owner.metrics();
 
@@ -4173,7 +4174,7 @@ async fn given_a_merge_that_commits_when_its_sources_are_deleted_should_report_t
         assert_eq!(metrics.long_term_deleted_objects_value(), 0);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while manifest_segments().await != Some(1) {
+        while stored_manifest().await != Some((Some(1), 1)) {
             assert!(
                 std::time::Instant::now() < deadline,
                 "no manifest of the merged segment was stored"
@@ -4215,6 +4216,249 @@ async fn given_a_merge_that_commits_when_its_sources_are_deleted_should_report_t
         1,
         "the merged segment is the one long-term log left"
     );
+}
+
+/// What one manifest that a [`TimedPublisher`] stored lists: when it was
+/// built, in microseconds since the Unix epoch, its floor, and how many
+/// segments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StoredManifest {
+    published_at: u64,
+    floor: Option<u64>,
+    segments: usize,
+}
+
+/// Publishes into a recording memory store, and notes every manifest it
+/// stores. A manifest carries the time its pass started, so the notes say
+/// when each put started on the clock that the interval between them
+/// keeps to.
+struct TimedPublisher {
+    publisher: ExecutorManifestPublisher<InlineTierExecutor<RecordingStore<MemoryStore>>>,
+    stored: RefCell<Vec<StoredManifest>>,
+}
+
+impl TimedPublisher {
+    /// A publisher, and the calls that its store gets.
+    fn new() -> (Rc<Self>, StoreCalls) {
+        let store = RecordingStore::new(MemoryStore::new());
+        let calls = store.calls();
+        let publisher = Rc::new(Self {
+            publisher: ExecutorManifestPublisher::new(InlineTierExecutor::new(store), layout()),
+            stored: RefCell::default(),
+        });
+        (publisher, calls)
+    }
+
+    fn stored(&self) -> Vec<StoredManifest> {
+        self.stored.borrow().clone()
+    }
+
+    /// The segments of the last manifest it stored.
+    fn last_segments(&self) -> Option<usize> {
+        self.stored.borrow().last().map(|stored| stored.segments)
+    }
+}
+
+impl ManifestPublisher for TimedPublisher {
+    fn publish(
+        &self,
+        manifest: PartitionManifest,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, ManifestPublishOutcome> {
+        self.stored.borrow_mut().push(StoredManifest {
+            published_at: manifest.published_at,
+            floor: manifest.floor,
+            segments: manifest.segments.len(),
+        });
+        self.publisher.publish(manifest, scope)
+    }
+}
+
+/// [`merging_owner`] without a merger, whose manifests go to a
+/// [`TimedPublisher`]. Returns the calls of its store and the key of the
+/// fixture's manifest too.
+#[allow(clippy::future_not_send)]
+async fn timed_manifest_owner(
+    directory: &Path,
+) -> (IoTestShard, Rc<TimedPublisher>, StoreCalls, String) {
+    let owner = Box::pin(placing_owner(directory)).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(executor)),
+            layout(),
+        )));
+    let (publisher, calls) = TimedPublisher::new();
+    owner.set_manifest_publisher(Some(publisher.clone()));
+    let manifest_key = layout().manifest_key(&partitions::object_prefix(
+        namespace(),
+        staged_revision(&owner),
+    ));
+    (owner, publisher, calls, manifest_key)
+}
+
+/// The puts of `key` that `calls` holds.
+fn puts_of(calls: &StoreCalls, key: &str) -> usize {
+    calls
+        .all()
+        .iter()
+        .filter(|call| matches!(call, StoreCall::Put { key: put, .. } if put == key))
+        .count()
+}
+
+fn micros_of(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap()
+}
+
+/// A change of the long-term log right after a store waits out the store
+/// interval. Nothing else commits and the shard paces no rewrite of the
+/// partition, so the pump's tick is what stores it.
+#[compio::test]
+async fn given_a_long_term_change_right_after_a_manifest_store_when_nothing_else_happens_should_store_it_once_the_interval_passed()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, publisher, calls, manifest_key) =
+        Box::pin(timed_manifest_owner(directory.path())).await;
+    let revision = staged_revision(&owner);
+
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        until(&owner, |_| publisher.last_segments() == Some(1)).await;
+        owner
+            .rewrite_pacing
+            .borrow_mut()
+            .forget(&(namespace(), revision));
+
+        publish_healthy_segments(&owner, 2).await;
+
+        until(&owner, |_| publisher.last_segments() == Some(2)).await;
+    })
+    .await;
+
+    let stored = publisher.stored();
+    let [.., before, last] = stored.as_slice() else {
+        panic!("a manifest before the change and one after it: {stored:?}");
+    };
+    let waited = last.published_at - before.published_at;
+    assert!(
+        waited >= micros_of(MANIFEST_STORE_INTERVAL)
+            && waited < micros_of(MANIFEST_STORE_INTERVAL + Duration::from_millis(500)),
+        "stored {waited} us after the one before"
+    );
+    assert_eq!(puts_of(&calls, &manifest_key), stored.len());
+}
+
+/// A pass that the store interval held back leaves the partition among the
+/// held ones. The tick stages its pass once the interval passed and not
+/// before, whether or not the shard paces the partition or wakes it.
+#[compio::test]
+async fn given_a_pass_held_by_the_store_interval_when_the_tick_runs_should_stage_it_only_once_the_interval_passed()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, publisher, _calls, _manifest_key) =
+        Box::pin(timed_manifest_owner(directory.path())).await;
+    let revision = staged_revision(&owner);
+    pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        until(&owner, |_| publisher.last_segments() == Some(1)).await;
+        publish_healthy_segments(&owner, 2).await;
+        compio::time::sleep(TASK_POLL_INTERVAL).await;
+    })
+    .await;
+    // The pump stopped: settle the publish it left, and drop the rest.
+    while let Ok(frame) = owner.inbox.try_recv() {
+        if let ShardFrame::Lifecycle(LifecycleFrame::ManifestPublishFinished(finished)) = frame {
+            owner.on_manifest_publish_finished(&finished);
+        }
+    }
+    assert_eq!(publisher.last_segments(), Some(1), "the change waits");
+    let started = publisher.stored().last().unwrap().published_at;
+    let at = |micros: u64| IggyTimestamp::from(started + micros);
+    owner.manifests_held.borrow_mut().clear();
+
+    owner.on_publish_manifest(namespace(), revision, at(1));
+
+    assert_eq!(publisher.last_segments(), Some(1));
+    assert!(
+        owner
+            .manifests_held
+            .borrow()
+            .contains(&(namespace(), revision))
+    );
+    owner.stage_held_manifest_passes(at(micros_of(MANIFEST_STORE_INTERVAL) - 1));
+    assert!(
+        owner.inbox.try_recv().is_err(),
+        "no pass before the interval"
+    );
+    owner.stage_held_manifest_passes(at(micros_of(MANIFEST_STORE_INTERVAL)));
+    assert!(matches!(
+        owner.inbox.try_recv(),
+        Ok(ShardFrame::Lifecycle(LifecycleFrame::PublishManifest { namespace: staged, .. }))
+            if staged == namespace()
+    ));
+    assert!(owner.manifests_held.borrow().is_empty());
+}
+
+/// Long-term segments commit every few milliseconds for seconds. The
+/// manifest is put at most once a second, each put lists the log as it was
+/// then, and the last one lists every segment once the changes stop.
+#[compio::test]
+async fn given_long_term_changes_every_few_milliseconds_for_seconds_when_storing_manifests_should_put_each_at_most_once_a_second()
+ {
+    const BUSY_FOR: Duration = Duration::from_secs(4);
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, publisher, calls, manifest_key) =
+        Box::pin(timed_manifest_owner(directory.path())).await;
+
+    let (changes, busy) = pumped(&owner, async {
+        send_and_rewrite(&owner, 1).await;
+        let started = std::time::Instant::now();
+        let mut segments = 1;
+        while started.elapsed() < BUSY_FOR {
+            segments += 1;
+            publish_healthy_segments(&owner, segments).await;
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let busy = started.elapsed();
+        until(&owner, |_| publisher.last_segments() == Some(segments)).await;
+        (segments - 1, busy)
+    })
+    .await;
+
+    let stored = publisher.stored();
+    eprintln!(
+        "{changes} long-term changes in {busy:?}: {} manifest puts",
+        stored.len()
+    );
+    assert_eq!(puts_of(&calls, &manifest_key), stored.len());
+    for pair in stored.windows(2) {
+        assert!(
+            pair[1].published_at - pair[0].published_at >= micros_of(MANIFEST_STORE_INTERVAL),
+            "two puts less than the interval apart: {pair:?}"
+        );
+    }
+    let mut per_second = BTreeMap::new();
+    for manifest in &stored {
+        *per_second
+            .entry(manifest.published_at / 1_000_000)
+            .or_insert(0) += 1;
+    }
+    assert!(per_second.values().all(|puts| *puts == 1), "{per_second:?}");
+    assert!(
+        stored.windows(2).all(|pair| pair[0].floor <= pair[1].floor),
+        "{stored:?}"
+    );
+    assert!(changes > 50 && stored.len() < changes / 10, "{stored:?}");
 }
 
 /// Starts every rewrite and ends none, so the long-term floor stays where
@@ -4494,4 +4738,53 @@ async fn given_a_backlog_past_the_limit_when_the_partition_waits_out_its_interva
     .await;
 
     assert!(rewritten_in < REWRITE_INTERVAL_MAX / 4, "{rewritten_in:?}");
+}
+
+/// The ceiling the shard was given bounds the wait that a small segment
+/// lengthens, as `[geo] long_term_rewrite_max_interval` sets it.
+#[compio::test]
+async fn given_a_rewrite_ceiling_of_two_seconds_when_a_small_segment_settles_should_wait_two_seconds()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let executor = Shared(Rc::new(InlineTierExecutor::new(MemoryStore::new())));
+    owner.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner.set_long_term_writer(Some(Rc::new(ExecutorLongTermWriter::new(
+        executor.clone(),
+        layout(),
+    ))));
+    owner
+        .plane
+        .partitions()
+        .set_remote_segments(Rc::new(RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(executor.clone())),
+            layout(),
+        )));
+    owner.set_long_term_rewrite_max_interval(Duration::from_secs(2));
+    let revision = staged_revision(&owner);
+    let floor = |owner: &IoTestShard| {
+        owner
+            .plane
+            .partitions()
+            .get_by_ns(&namespace())
+            .unwrap()
+            .long_term_floor()
+    };
+
+    let wait = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        owner.request_rewrite_segments(namespace(), revision);
+        until(&owner, |owner| floor(owner) == Some(0)).await;
+        owner
+            .rewrite_pacing
+            .borrow()
+            .interval(&(namespace(), revision))
+    })
+    .await;
+
+    assert_eq!(wait, Some(Duration::from_secs(2)));
 }
