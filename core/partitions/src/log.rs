@@ -104,10 +104,14 @@ where
         self.inner.remaining_capacity()
     }
 
+    fn slot_count(&self) -> Option<usize> {
+        self.inner.slot_count()
+    }
+
     fn drain(
         &self,
         ops: std::ops::RangeInclusive<u64>,
-    ) -> impl Future<Output = std::io::Result<Vec<Self::Entry>>> {
+    ) -> impl Future<Output = std::io::Result<usize>> {
         self.inner.drain(ops)
     }
 

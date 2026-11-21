@@ -1493,7 +1493,13 @@ async fn poll_messages_impl(
                 metadata,
             }
         };
-        let reply = state.shard.partition_read(namespace, read).await;
+        let budget = request
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let reply = state
+            .shard
+            .partition_read_budgeted(namespace, read, budget)
+            .await;
         // The owner may already have auto-committed. At-most-once polls can
         // lose a batch here, but revoked credentials must never receive it.
         authorize_read(&state, &identity, consistency, rule)?;
@@ -1632,7 +1638,13 @@ pub(in crate::http) async fn get_consumer_offset(
         let (namespace, partition_id, read) =
             resolve_primary_consumer_offset_request(&state.shard, &wire, context)
                 .map_err(ReadError::Rejected)?;
-        let reply = state.shard.partition_read(namespace, read).await;
+        let budget = request
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        let reply = state
+            .shard
+            .partition_read_budgeted(namespace, read, budget)
+            .await;
         authorize_read(&state, &identity, consistency, rule)?;
         check_partition_incarnation(&state, namespace, context.incarnation)?;
         consumer_offset_reply(partition_id, reply).map(IntoResponse::into_response)
@@ -1804,7 +1816,7 @@ pub(in crate::http) async fn send_messages(
                 )
             }
             ProduceAck::None => {
-                require_local_primary(&state, namespace)
+                require_local_primary(&state, namespace, request.deadline)
                     .await
                     .map_err(PartitionWriteError::Rejected)?;
                 produce_unacked(

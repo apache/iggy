@@ -30,8 +30,8 @@ const WRITERS: usize = 3;
 const STREAMS_PER_WRITER: usize = 5;
 const STREAMS: [MetadataChangeGroup; 1] = [MetadataChangeGroup::Streams];
 const SESSIONS: [MetadataChangeGroup; 1] = [MetadataChangeGroup::Sessions];
-// With `journal_slots = 256` and the checkpoint margin, every node
-// checkpoints and drains its journal once 192 operations committed.
+// With `journal_slots = 256`, every node checkpoints and drains its
+// journal once 128 operations committed.
 const STREAMS_PAST_CHECKPOINT: usize = 220;
 const CHECKPOINT_MARKER: &str = "forced checkpoint completed";
 const INSTALL_MARKER: &str = "metadata state transfer installed";
