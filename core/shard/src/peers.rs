@@ -21,7 +21,8 @@
 //! Every shard holds one [`PeerStore`] per peer, each with a tier service of
 //! its own over a [`ReadOnlyStore`]. A slow peer therefore never takes the
 //! job slots of this cluster's store or of another peer, and no write
-//! reaches a peer, whatever job runs on its service.
+//! reaches a peer, whatever job runs on its service. A partition that follows
+//! a peer's log reads it through [`PeerObjects`].
 //!
 //! What the node knows about a peer's identity is one [`SharedPeerStatus`]
 //! for the whole node. Shard 0 reads the peer's store identity object at
@@ -35,12 +36,17 @@
     reason = "every peer store runs on the shard that owns it and never crosses threads"
 )]
 
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use iggy_object_store::{KeyLayout, ReadOnlyStore};
+use consensus::PartitionsHandle;
+use futures::FutureExt;
+use futures::future::LocalBoxFuture;
+use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError, ReadOnlyStore};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
+use partitions::{ExecutorObjects, RemoteObjects, RemoteSegments};
 
 use crate::IggyShard;
 use crate::shards_table::ShardsTable;
@@ -123,6 +129,39 @@ pub struct PeerStore<B> {
 /// The peers of one shard, in the order of the configuration.
 pub struct PeerStores<B> {
     peers: Vec<PeerStore<B>>,
+}
+
+/// The ranged reads of one peer's store, for the polls of the partitions
+/// that follow its logs. They run in the demand fetch class of the peer's
+/// own tier service.
+///
+/// Each read asks the node's status of the peer first, as a job that takes
+/// [`PeerStore::service`] does. A peer the node does not read gets no
+/// request, and the read fails in a way a later poll can get past.
+pub struct PeerObjects<B> {
+    origin: String,
+    reads: ExecutorObjects<PeerService<B>>,
+    status: SharedPeerStatus,
+}
+
+impl<B> RemoteObjects for PeerObjects<B>
+where
+    B: MessageBus + Clone + Unpin + 'static,
+{
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        if self.status.get().identity.readable().is_none() {
+            let unread = ObjectStoreError::Unavailable(format!(
+                "this node reads nothing from geo peer {} until a check verifies its store",
+                self.origin
+            ));
+            return async move { Err(unread) }.boxed_local();
+        }
+        self.reads.get_range(key, range)
+    }
 }
 
 impl PeerIdentity {
@@ -256,6 +295,26 @@ impl<B> PeerStore<B> {
     }
 }
 
+impl<B> PeerStore<B>
+where
+    B: MessageBus + Clone + Unpin + 'static,
+{
+    /// Where the partitions that follow this peer's logs read them: the
+    /// peer's tier service, under the peer's root.
+    #[must_use]
+    pub fn remote_segments(&self) -> RemoteSegments {
+        RemoteSegments::new(Rc::new(self.objects()), self.layout.clone())
+    }
+
+    fn objects(&self) -> PeerObjects<B> {
+        PeerObjects {
+            origin: self.origin.clone(),
+            reads: ExecutorObjects::new(self.service.clone()),
+            status: self.status.clone(),
+        }
+    }
+}
+
 impl<B> Default for PeerStores<B> {
     fn default() -> Self {
         Self { peers: Vec::new() }
@@ -296,8 +355,18 @@ where
     SB: SuperblockStore,
 {
     /// Give this shard the stores of its geo peers, in place of the ones it
-    /// had. A job in flight ends on the service that started it.
-    pub fn set_peer_stores(&self, stores: PeerStores<B>) {
+    /// had, and hand each partition that follows a peer's log the store of
+    /// its peer. A job in flight ends on the service that started it.
+    pub fn set_peer_stores(&self, stores: PeerStores<B>)
+    where
+        B: Clone + Unpin,
+    {
+        self.plane.partitions().set_peer_remote_segments(
+            stores
+                .iter()
+                .map(|peer| (peer.origin().to_owned(), Rc::new(peer.remote_segments())))
+                .collect(),
+        );
         *self.peer_stores.borrow_mut() = Rc::new(stores);
     }
 
@@ -558,5 +627,54 @@ mod tests {
             3 * TierJobClass::ALL.len(),
             "a list, a head and a ranged get per job"
         );
+    }
+
+    /// The reads of a partition that follows the peer's log ask the node's
+    /// status of the peer each time, so no request leaves for a peer whose
+    /// store the node does not read.
+    #[compio::test]
+    async fn given_a_peer_the_node_does_not_read_when_a_poll_reads_its_objects_should_send_no_request()
+     {
+        let key =
+            KeyLayout::new("iggy")
+                .unwrap()
+                .incarnation_prefix(&iggy_object_store::ObjectPrefix {
+                    stream_id: 1,
+                    topic_id: 1,
+                    partition_id: 0,
+                    created_revision: 4,
+                })
+                + "00000000000000000000.log";
+        let stored = claimed(PEER);
+        stored
+            .put(&key, PutBody::from_bytes("batch"), &PutOptions::default())
+            .await
+            .unwrap();
+        let provider = RecordingStore::new(stored);
+        let calls = provider.calls();
+        let peer = peer("dc-b", provider);
+        let objects = peer.objects();
+
+        let unverified = objects.get_range(&key, 0..5).await;
+        assert!(
+            matches!(unverified, Err(ObjectStoreError::Unavailable(_))),
+            "{unverified:?}"
+        );
+        assert_eq!(calls.all(), Vec::new());
+
+        peer.status
+            .set(PeerStatus::default().after(PeerRead::Found(PEER)));
+        let verified = objects.get_range(&key, 0..5).await.unwrap();
+        assert_eq!(verified.bytes.as_ref(), b"batch");
+        assert_eq!(calls.all().len(), 1);
+
+        peer.status.set(peer.status().after(PeerRead::Found(OTHER)));
+        let changed = objects.get_range(&key, 0..5).await;
+        assert!(
+            matches!(changed, Err(ObjectStoreError::Unavailable(_))),
+            "{changed:?}"
+        );
+        assert_eq!(calls.all().len(), 1, "a changed peer gets no request");
+        assert_eq!(calls.mutations(), Vec::new());
     }
 }

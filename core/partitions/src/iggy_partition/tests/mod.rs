@@ -461,6 +461,7 @@ fn poll_read_result<B: MessageBus>(
                 PollingConsumer::Consumer(..) => None,
             },
             _group_poll: None,
+            peer_first_segment: None,
         },
         fragments,
         commit_offset: partition.offsets().commit_offset,
@@ -2049,6 +2050,7 @@ mod offset_replication;
 mod offset_reservations;
 mod offset_storage;
 mod offsets;
+mod peer_log;
 mod persistence_checkpoint;
 mod placed_batches;
 mod quiet;

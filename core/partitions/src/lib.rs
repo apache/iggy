@@ -32,6 +32,11 @@ mod messages_writer;
 mod offset_recovery;
 pub mod offset_storage;
 mod partition_storage;
+mod peer_log;
+pub use peer_log::{
+    AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestRefusal,
+    remove_retired_indexes,
+};
 mod persistence;
 mod poll_plan;
 pub mod producer_state;
