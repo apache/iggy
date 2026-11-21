@@ -1,0 +1,188 @@
+---
+title: Connection Strings
+description: "The canonical reference for Iggy connection strings, covering every scheme, credential form and option."
+---
+
+A connection string configures an Iggy client in a single line: transport, credentials, server address, and options. This page is the canonical reference for every scheme, credential form, and option key.
+
+The tables below describe the Rust SDK and its Python, C++ and PHP bindings. Native Go, Node.js, C# and Swift clients also accept TCP connection strings. Java supports a smaller subset, described below.
+
+## Format
+
+```text
+iggy[+transport]://credentials@host:port[?option=value&option=value]
+```
+
+The host and port are **always required**. Use a hostname, IPv4 address or bracketed IPv6 address such as `[::1]:8090`. Options are appended as `key=value` pairs separated by `&`. Scheme names and option keys are case-sensitive.
+
+The parser does not percent-decode credentials or option values. Reserved separators such as `:` and `@` cannot be escaped inside a username or password. Use a PAT for credentials that contain them. Duplicate option keys use the last value. Boolean options enable only for the literal `true`. Use `false` to disable them.
+
+**Unknown option keys are hard errors.** The parser rejects the whole string with `InvalidConnectionString` instead of ignoring the key, so a typo fails fast rather than silently falling back to a default.
+
+## Transport selection
+
+The scheme picks the transport. Each transport has its own default server port:
+
+| Scheme | Transport | Default server port |
+|--------|-----------|---------------------|
+| `iggy://` | TCP (default) | 8090 |
+| `iggy+tcp://` | TCP | 8090 |
+| `iggy+quic://` | QUIC | 8080 |
+| `iggy+http://` | HTTP | 3000 |
+| `iggy+ws://` | WebSocket | 8092 |
+
+## Credentials
+
+Two forms are accepted:
+
+**Username and password**, separated by a colon. Both parts must be non-empty:
+
+```text
+iggy://username:password@127.0.0.1:8090
+```
+
+**Personal Access Token**: any credential without a colon is treated as a PAT. Server-minted tokens are plain base64 strings with no prefix, so paste the token exactly as the server returned it:
+
+```text
+iggy://<personal-access-token>@127.0.0.1:8090
+```
+
+**Do not prepend anything** to the token. Strings like `iggypat-...` appear only in Iggy's own test code. A real token with a prefix added will fail to log in.
+
+The examples use `iggy`/`iggy`. For a new local development instance, with no `IGGY_ROOT_USERNAME` or `IGGY_ROOT_PASSWORD` overrides, use:
+
+```bash
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+The environment takes precedence over the flag. Stored or recovered root credentials are not replaced by bootstrap settings. `--fresh` deletes this replica's local data. In a cluster it can recover committed state, including credentials, from another replica. Use this reset only for disposable development data. A fresh standalone server requires credentials. Provision root credentials on every replica for a new cluster.
+
+TCP, QUIC, and WebSocket apply connection-string credentials during `connect()`. HTTP requires an explicit login, as described below.
+
+## Duration values
+
+Options typed as durations take human-readable values such as `5s`, `500ms`, or `1m`, unless a table below says the value is a plain number. Heartbeat and reconnection intervals must be greater than zero. The reconnection cooldown can be zero.
+
+## TCP options
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `tls` | Enable TLS (`true`/`false`) | `false` |
+| `tls_domain` | Name for TLS validation. When empty, use the dialed hostname or IP | empty |
+| `tls_ca_file` | PEM file of trusted CA certificates, replacing the built-in roots | none |
+| `reconnection_retries` | Retry passes over known endpoints after the initial pass, or `unlimited` | `unlimited` |
+| `reconnection_interval` | Base of exponential backoff with full jitter, capped at ten seconds | `1s` |
+| `reestablish_after` | Stable connection duration that resets retry backoff | `5s` |
+| `heartbeat_interval` | Duration between heartbeats | `5s` |
+| `nodelay` | Enable `TCP_NODELAY` (`true`/`false`) | `false` |
+
+```text
+iggy://iggy:iggy@127.0.0.1:8090?tls=true&tls_domain=localhost&tls_ca_file=core/certs/iggy_ca_cert.pem&reconnection_retries=5&heartbeat_interval=3s&nodelay=true
+```
+
+With `tls=true`, TCP always validates the server certificate. Without `tls_ca_file`, it uses the built-in Mozilla roots. An explicit CA file can trust a private CA. The example above runs from the repository root against a TLS-enabled listener using the test certificate and key in `core/certs/iggy_cert.pem` and `core/certs/iggy_key.pem`. Those certificates are for local testing. See [Security](/docs/server/security) for TLS configuration.
+
+## QUIC options
+
+The QUIC reconnection keys **differ from TCP**: `reconnection_max_retries` (not `reconnection_retries`) and `reconnection_reestablish_after` (not `reestablish_after`). Using the TCP names in a QUIC string is a hard error.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `response_buffer_size` | Maximum bytes read for one response | Protocol maximum record reply size |
+| `max_concurrent_bidi_streams` | Maximum concurrent peer-initiated bidirectional streams | `10000` |
+| `datagram_send_buffer_size` | Datagram send buffer size in bytes | `100000` |
+| `initial_mtu` | Initial UDP payload size in bytes, clamped to at least `1200` | `1200` |
+| `send_window` | Send window size in bytes | `100000` |
+| `receive_window` | Connection receive window size in bytes | `100000` |
+| `keep_alive_interval` | Keep-alive interval in milliseconds. `0` disables it | `5000` |
+| `max_idle_timeout` | Idle timeout in milliseconds. `0` leaves Quinn's `30000` ms default | `10000` |
+| `validate_certificate` | Validate the server certificate (`true`/`false`) | `false` |
+| `heartbeat_interval` | Duration between heartbeats | `5s` |
+| `reconnection_max_retries` | Number of reconnection attempts, or `unlimited` | `unlimited` |
+| `reconnection_interval` | Duration between reconnection attempts | `1s` |
+| `reconnection_reestablish_after` | Stable connection duration that resets retry backoff | `5s` |
+
+```text
+iggy+quic://iggy:iggy@127.0.0.1:8080?validate_certificate=false&reconnection_max_retries=5
+```
+
+QUIC certificate validation is disabled by default. When enabled, it uses the platform verifier and the connection-string configuration's server name, `localhost`. For a different certificate name, use the Rust QUIC configuration builder's `with_server_name()` method. Values above QUIC's 62-bit limit for `max_concurrent_bidi_streams`, `receive_window`, or `max_idle_timeout` are rejected with `InvalidConfiguration`.
+
+## WebSocket options
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `heartbeat_interval` | Duration between heartbeats | `5s` |
+| `reconnection_retries` | Number of reconnection attempts, or `unlimited` | `unlimited` |
+| `reconnection_interval` | Duration between reconnection attempts | `1s` |
+| `reestablish_after` | Stable connection duration that resets retry backoff | `5s` |
+| `read_buffer_size` | Read buffer size in bytes | `131072` |
+| `write_buffer_size` | Target write buffer size in bytes | `131072` |
+| `max_write_buffer_size` | Maximum write buffer size in bytes. Must exceed `write_buffer_size` | `usize::MAX` |
+| `max_message_size` | Maximum incoming WebSocket message size in bytes | `67108864` |
+| `max_frame_size` | Maximum incoming frame payload size in bytes | `16777216` |
+| `accept_unmasked_frames` | Has no effect on client connections | `false` |
+| `tls` | Enable TLS (`true`/`false`) | `false` |
+| `tls_domain` | Name for TLS validation. When empty, use the connected IP | empty |
+| `tls_ca_file` | PEM file of trusted CA certificates when validation is enabled | none |
+| `tls_validate_certificate` | Validate the server certificate (`true`/`false`) | `false` |
+
+```text
+iggy+ws://iggy:iggy@127.0.0.1:8092?heartbeat_interval=5s&max_message_size=1048576
+```
+
+WebSocket TLS does not validate the server certificate unless `tls_validate_certificate=true`. With validation enabled, `tls_ca_file` replaces the built-in Mozilla roots. Size limits cannot be removed through connection strings. Use the WebSocket configuration object for an unlimited message or frame size.
+
+## HTTP options
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `heartbeat_interval` | Duration between heartbeats | `5s` |
+| `retries` | Maximum retries for transient request failures | `3` |
+
+```text
+iggy+http://iggy:iggy@127.0.0.1:3000?retries=5
+```
+
+The HTTP scheme constructs a plain `http://` API URL. Use the Rust HTTP builder's `with_api_url()` for HTTPS. HTTP parses the credential field but does not log in with it. In Rust, call `login_user()` or `login_with_personal_access_token()` explicitly before protected requests.
+
+## Usage
+
+In Rust, construct clients inside a Tokio runtime, which QUIC needs even before `connect()`. The following snippet assumes an async function returning `Result<_, IggyError>` and the matching [Rust SDK setup](/docs/sdk/rust/intro).
+
+```rust
+use iggy::prelude::*;
+
+// TCP with default options
+let client = IggyClient::from_connection_string("iggy://iggy:iggy@127.0.0.1:8090")?;
+
+// QUIC
+let client = IggyClient::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080")?;
+
+// WebSocket
+let client = IggyClient::from_connection_string("iggy+ws://iggy:iggy@127.0.0.1:8092")?;
+
+// HTTP
+let client = IggyClient::from_connection_string("iggy+http://iggy:iggy@127.0.0.1:3000")?;
+client.login_user("iggy", "iggy").await?;
+```
+
+```python
+from apache_iggy import IggyClient
+
+client = IggyClient.from_connection_string("iggy://iggy:iggy@127.0.0.1:8090")
+```
+
+When you need settings a connection string cannot express (client-side encryption, a custom `Partitioner`, and similar), start from `IggyClientBuilder::from_connection_string()` and extend the builder on top.
+
+## Pending-operation limits
+
+Rust binary transport strings accept `max_pending_operations` and `max_pending_operation_bytes`. Defaults are 256 operations and 67108864 bytes. Both must be positive. The byte budget includes frozen headers and bodies, so it must fit the largest mutation you need to send.
+
+Committing fetches use a separate pool with the same configured limits. That pool stores target metadata, not reply bodies, and retains unknown progress across sessions. Exhausting a limit rejects or delays further work according to the operation path. See [Client failover](/docs/clustering/client-failover).
+
+## Native SDK differences
+
+Java accepts only TCP schemes, username/password credentials, `tls` and `tls_ca_file`. It rejects PAT connection strings and other options. Go's `client.ParseConnectionString` returns options for `client.WithTcp`. Node.js constructors accept a string except `SimpleClient`, which wraps an existing raw client. C# exposes its connection-string factory described in the [C# guide](/docs/sdk/csharp/guide).
+
+Swift accepts the TCP option names, but checks and then ignores pending mutation limits because it has no retained mutation pool. Its reconnect interval is a full pause between endpoint rounds. Node.js accepts `reestablish_after` for format compatibility without applying a Node equivalent. Do not assume one SDK's parser and timing behavior across all languages.

@@ -20,6 +20,7 @@ mod artifacts;
 mod cache;
 mod config;
 mod dedicated_thread;
+mod embed_cache;
 mod error;
 mod github;
 mod handlers;
@@ -38,6 +39,7 @@ use actix_web::{
 use args::IggyBenchDashboardServerArgs;
 use bench_dashboard_shared::config::DashboardConfig;
 use cache::{BenchmarkCache, SeriesBuilder};
+use embed_cache::{BYTES_PER_GIB, EMBED_CACHE_DIR, EmbedCache};
 use github::StarCount;
 use handlers::AppState;
 use handlers::omb::OmbState;
@@ -45,7 +47,7 @@ use omb::OmbCache;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, format::Format},
@@ -59,6 +61,7 @@ struct ServerState {
     _watcher: Arc<CacheWatcher>,
     series_builder: Arc<SeriesBuilder>,
     render_pool: Arc<render::PngRenderPool>,
+    embed_cache: Arc<EmbedCache>,
     cache_dir: PathBuf,
     config: Arc<DashboardConfig>,
     omb_cache: Option<Arc<OmbCache>>,
@@ -125,10 +128,30 @@ async fn main() -> Result<(), std::io::Error> {
         }
     };
 
-    let render_pool = match render::PngRenderPool::default_pool() {
+    let render_pool = match render::PngRenderPool::new() {
         Ok(pool) => Arc::new(pool),
         Err(e) => {
             error!("Failed to start the PNG render thread: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let build = embed_cache::build_stamp().unwrap_or_else(|e| {
+        let stamp = embed_cache::start_stamp();
+        warn!(
+            "Failed to hash the server binary for the embed cache: {e}. The cache uses the stamp \
+             {stamp} of this start, so after a restart every embed file is built again"
+        );
+        stamp
+    });
+    let embed_cache = match EmbedCache::open(
+        args.cache_dir.join(EMBED_CACHE_DIR),
+        args.embed_cache_max_gib.saturating_mul(BYTES_PER_GIB),
+        build,
+    ) {
+        Ok(cache) => Arc::new(cache),
+        Err(e) => {
+            error!("Failed to open the embed cache: {}", e);
             std::process::exit(1);
         }
     };
@@ -141,6 +164,7 @@ async fn main() -> Result<(), std::io::Error> {
         _watcher: Arc::clone(&watcher),
         series_builder,
         render_pool,
+        embed_cache,
         cache_dir: args.cache_dir.clone(),
         config,
         omb_cache,
@@ -155,6 +179,7 @@ async fn main() -> Result<(), std::io::Error> {
         None => info!("OMB results directory: not set"),
     }
     info!("Cache directory: {}", args.cache_dir.display());
+    info!("Embed cache limit: {} GiB", args.embed_cache_max_gib);
     info!("Config file: {}", args.config.display());
     info!("Log level: {}", args.log_level);
     info!("CORS origins: {}", args.cors_origins);
@@ -193,6 +218,7 @@ async fn main() -> Result<(), std::io::Error> {
                 cache: Arc::clone(&state.cache),
                 series_builder: Arc::clone(&state.series_builder),
                 render_pool: Arc::clone(&state.render_pool),
+                embed_cache: Arc::clone(&state.embed_cache),
                 cache_dir: state.cache_dir.clone(),
                 config: Arc::clone(&state.config),
             }))

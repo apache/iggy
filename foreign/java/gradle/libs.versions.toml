@@ -23,8 +23,8 @@ flink = "2.3.0"
 pinot = "1.6.0"
 
 # Jackson
-jackson = "3.2.4"
-jackson2 = "2.22.4"
+jackson = "3.3.0"
+jackson2 = "2.23.0"
 
 # Apache Commons
 commons-lang3 = "3.21.0"
@@ -51,7 +51,7 @@ netty = "4.2.20.Final"
 spotbugs = "4.10.5"
 
 # Config
-typesafe-config = "1.4.9"
+typesafe-config = "1.4.10"
 picocli = "4.7.7"
 
 # Build plugins
