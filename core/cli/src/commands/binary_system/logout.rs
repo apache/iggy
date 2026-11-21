@@ -40,6 +40,10 @@ impl CliCommand for LogoutCmd {
         "logout command".to_owned()
     }
 
+    fn may_end_session(&self) -> bool {
+        true
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         if self.server_session.is_active() {
             client

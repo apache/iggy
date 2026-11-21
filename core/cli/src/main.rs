@@ -490,7 +490,7 @@ async fn run() -> Result<(), IggyCmdError> {
     command.execute_with_iggy_client(&client).await?;
 
     tokio::select! {
-        logout = credentials.logout_user() => logout?,
+        logout = credentials.logout_user(command.may_end_session()) => logout?,
         _ = tokio::signal::ctrl_c() => std::process::exit(130),
     }
 

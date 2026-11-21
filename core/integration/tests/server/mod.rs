@@ -107,5 +107,10 @@ mod message_retrieval;
 mod delete_segments;
 mod external_auth;
 pub(crate) mod scenarios;
+// Stream and topic lists return exactly the entries the caller may read.
+mod scoped_lists;
+// A password change, a deactivation and a token delete or expiry end exactly
+// the sessions and tokens they revoke, on every transport.
+mod credential_revocation;
 mod specific;
 mod telemetry;

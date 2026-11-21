@@ -4571,6 +4571,7 @@ impl StreamsInner {
             placement_index,
             catalog_counts,
             recent_partition_changes: RecentPartitionChanges::after(snapshot.revision),
+            installed_snapshot_op: 0,
             last_result: None,
             apply_context: ApplyContext::default(),
             stats_registry,

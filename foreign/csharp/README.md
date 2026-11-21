@@ -247,7 +247,7 @@ await client.ConnectAsync();
   table. The client closes that link and binds the session again on a new link. If the session ended, that bind
   fails with `Unauthenticated` and the client signs in again. Otherwise the session, its retained operations and
   its consumer-group memberships stay.
-  Password changes and PAT changes or expiry do not end an established session.
+  With server 0.10.1-edge.2, a password change keeps only the binary session that submitted it. A valid PAT can open a new session after a password change. Deleting or expiring it ends access for sessions opened with it.
   A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
   retains the identity while that replica's background reconnect retries the bind. An unresolved mutation
   cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.

@@ -143,7 +143,7 @@ where
     // consensus and applies as a committed InvalidCredentials no-op, so the only
     // Err returned is a malformed body.
     let request =
-        maybe_rewrite_user_password_request(shard, request).map_err(|error| RewriteDeny {
+        maybe_rewrite_user_password_request(shard, request, true).map_err(|error| RewriteDeny {
             stage: RewriteStage::UserPassword,
             error,
         })?;
@@ -195,7 +195,7 @@ where
     SB: SuperblockStore + 'static,
 {
     let (request, raw_token) = rewrite_pat_request_for_user(user_id, request)?;
-    let request = maybe_rewrite_user_password_request(shard, request)?;
+    let request = maybe_rewrite_user_password_request(shard, request, false)?;
     let bounded = static_bounds(shard, Some(user_id), request)?;
     let key_context = shard.plane.partitions().key_context();
     let request = maybe_rewrite_secret_options_request(&key_context, bounded, || {

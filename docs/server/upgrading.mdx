@@ -13,7 +13,7 @@ Do not use a rolling upgrade between server versions. Every cluster node must ru
 
 ## Upgrade clients and tools
 
-Server 0.10.0 uses protocol 0.12.0. The server rejects incompatible binary clients at login. Use the versions in [Server compatibility](/docs/sdk/introduction#server-compatibility). The [0.9 documentation](/docs/0.9) remains available for the old deployment.
+Server 0.10.0 uses client protocol 0.12.2. The server rejects incompatible binary clients at login. Use the versions in [Server compatibility](/docs/sdk/introduction#server-compatibility). The [0.9 documentation](/docs/0.9) remains available for the old deployment.
 
 Review API changes before recompiling applications. Resource creation uses typed options. Updates change only the fields supplied through set/reset patches. Stream and topic purge, flush unsaved buffer, and the old UpdateStream, UpdateTopic and UpdateUser wire commands are removed. The SDK update methods use UpdateResource internally.
 

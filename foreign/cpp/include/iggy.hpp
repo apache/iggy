@@ -7386,10 +7386,10 @@ class IggyBlockingClient final {
      * one reply. GetStreamsPage() reads one page.
      *
      * @return Stream summaries visible to the authenticated user.
-     * @throws IggyException if the client is unavailable, the caller lacks
-     *         permission to read streams, or the request fails. Over TCP,
-     *         QUIC, and WebSocket it also throws when the server answers a
-     *         page with the cursor it was sent.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         or the request fails. Over TCP, QUIC, and WebSocket it also
+     *         throws when the server answers a page with the cursor it was
+     *         sent.
      */
     std::vector<Stream> GetStreams();
 
@@ -7397,11 +7397,11 @@ class IggyBlockingClient final {
      * @brief Reads one page of the stream summaries.
      *
      * @param query Order, direction, limit, cursor, and name filter of the page.
-     * @return One page of stream summaries.
+     * @return One page of the stream summaries the caller may read.
      * @throws IggyException with Kind() invalid_command before anything is
      *         sent when NamedPageQuery refuses @p query. Also if the client is
-     *         unavailable or unauthenticated; the caller lacks permission to
-     *         read streams; the server refuses the query; or the request fails.
+     *         unavailable or unauthenticated; the server refuses the query; or
+     *         the request fails.
      */
     StreamsPage GetStreamsPage(const NamedPageQuery &query);
 
@@ -7488,34 +7488,36 @@ class IggyBlockingClient final {
      * topics. Over HTTP the server builds the list from its pages and sends
      * one reply. GetTopicsPage() reads one page.
      *
-     * A stream that does not exist gives an empty list. If the stream goes
-     * missing after the first page, the read fails as GetTopicsPage() does.
+     * A stream that does not exist, or one the caller may read no topic of,
+     * gives an empty list. If the stream goes missing after the first page,
+     * the read fails as GetTopicsPage() does.
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @return Topic summaries visible to the authenticated user.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the caller lacks read permission; or the metadata read fails.
-     *         Over TCP, QUIC, and WebSocket it also throws when the server
-     *         answers a page with the cursor it was sent.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         or the metadata read fails. Over TCP, QUIC, and WebSocket it
+     *         also throws when the server answers a page with the cursor it
+     *         was sent.
      */
     std::vector<Topic> GetTopics(const Identifier &stream);
 
     /**
      * @brief Reads one page of the topic summaries in a stream.
      *
-     * For a stream that does not exist, the first page is empty and has no
-     * Next(). A page read with a cursor fails instead, because the stream was
-     * deleted during the walk. Over TCP, QUIC, and WebSocket the error is
-     * stream_id_not_found (1009). Over HTTP it is resource_not_found (20).
+     * For a stream that does not exist, or one the caller may read no topic
+     * of, the first page is empty and has no Next(). For a caller with a
+     * global read grant, a page read with a cursor fails instead, because the
+     * stream was deleted during the walk. Over TCP, QUIC, and WebSocket the
+     * error is stream_id_not_found (1009). Over HTTP it is resource_not_found
+     * (20).
      *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param query Order, direction, limit, cursor, and name filter of the page.
-     * @return One page of topic summaries.
+     * @return One page of the topic summaries the caller may read.
      * @throws IggyException with Kind() invalid_command before anything is
      *         sent when NamedPageQuery refuses @p query. Also if the client is
      *         unavailable or unauthenticated; the identifier is invalid; the
-     *         caller lacks read permission; the server refuses the query; or
-     *         the request fails.
+     *         server refuses the query; or the request fails.
      */
     TopicsPage GetTopicsPage(const Identifier &stream, const NamedPageQuery &query);
 

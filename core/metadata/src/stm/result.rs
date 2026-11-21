@@ -50,6 +50,15 @@ pub enum DeletedResource {
     Topic { stream_id: usize, topic_id: usize },
 }
 
+/// A personal access token a committed delete removed, so the sessions it
+/// opened end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RevokedToken {
+    pub user: WireUserKey,
+    /// The op that created the token.
+    pub token_id: u64,
+}
+
 /// Outcome of applying one committed metadata op.
 ///
 /// `code == 0` is success, `body` the typed reply payload. Nonzero `code` is a
@@ -64,6 +73,9 @@ pub struct ApplyReply {
     /// committed operation on every replay and never part of the client reply
     /// or persisted receipt.
     pub(crate) revoked_user: Option<WireUserKey>,
+    pub(crate) kept_session_client: Option<u128>,
+    /// Local apply effect, like `revoked_user`: the sessions this token opened end.
+    pub(crate) revoked_token: Option<RevokedToken>,
     /// Local apply effect, like `revoked_user`: the grants on this resource must go.
     pub(crate) deleted_resource: Option<DeletedResource>,
     /// Public results for the change log, in canonical order. Like
@@ -79,6 +91,8 @@ impl ApplyReply {
             code: 0,
             body,
             revoked_user: None,
+            kept_session_client: None,
+            revoked_token: None,
             deleted_resource: None,
             changes: Vec::new(),
         }
@@ -92,6 +106,8 @@ impl ApplyReply {
             code: code.into(),
             body: Bytes::new(),
             revoked_user: None,
+            kept_session_client: None,
+            revoked_token: None,
             deleted_resource: None,
             changes: Vec::new(),
         }

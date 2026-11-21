@@ -1393,6 +1393,31 @@ impl Simulator {
         );
     }
 
+    fn raw_change_password(
+        &self,
+        client: &SimClient,
+        target: u8,
+        user: &str,
+        current_password: &str,
+        new_password: &str,
+    ) -> Message<RoutedRequestHeader> {
+        let user_id =
+            iggy_binary_protocol::WireIdentifier::named(user).expect("valid fixture username");
+        self.replicas[usize::from(target)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .users()
+            .read(|users| {
+                client.raw_change_password(
+                    user_id,
+                    users.user_by_name(user),
+                    current_password,
+                    new_password,
+                )
+            })
+    }
+
     /// Model discovery before creating requests, never while delivering or retrying them.
     pub fn discover_partition_contexts(&self, client: &SimClient) {
         let Some((replica, _)) = self
@@ -2416,6 +2441,29 @@ mod tests {
     use server_common::sharding::{IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, METADATA_GROUP};
     use std::cell::Cell;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn given_stale_fixture_password_when_building_a_raw_change_should_encode_a_refusal() {
+        let (sim, client) = cluster(0x5057);
+        client.bind_session(1);
+        for (current, expected) in [("stale", ""), ("hash", "replacement")] {
+            let message = sim.raw_change_password(
+                &client,
+                0,
+                replica::SHELL_ROOT_USERNAME,
+                current,
+                "replacement",
+            );
+            let change =
+                metadata::stm::user::ChangePasswordRequest::decode_from(message.body()).unwrap();
+            assert_eq!(change.user_id, WireIdentifier::numeric(0));
+            assert_eq!(
+                change.access_revision,
+                metadata::stm::user::ROOT_USER_ACCESS_REVISION
+            );
+            assert_eq!(change.password_hash, expected);
+        }
+    }
 
     struct RootInitialization {
         shutdown: Shutdown,
@@ -4154,7 +4202,7 @@ mod tests {
         )]);
         let mut workload = crate::workload::Workload::new(options);
         let (target, delete) = workload
-            .build_request(&client)
+            .build_request_on(&client, &sim)
             .expect("the fixture must take a delete");
         assert_eq!(delete.header().operation, Operation::DeleteTopic);
         sim.submit_request(client.client_id(), target, delete.into_generic());
@@ -8346,7 +8394,7 @@ mod tests {
         // the per-reply loop so a multi-reply tick at `replies_seen=49` cannot leak a
         // 50th into the hash.
         'outer: for _tick in 0..5_000u32 {
-            if let Some((target, msg)) = wl.build_request(&client) {
+            if let Some((target, msg)) = wl.build_request_on(&client, &sim) {
                 sim.submit_request(client.client_id(), target, msg.into_generic());
             }
             for reply in sim.step() {
@@ -11235,7 +11283,7 @@ mod tests {
             options.weights = ActionWeights::new(&[(Action::CreateStream, 100)]);
             let mut workload = Workload::new(options);
             let (target, request) = (0..SAMPLE_ATTEMPTS)
-                .find_map(|_| workload.build_request(&client))
+                .find_map(|_| workload.build_request_on(&client, &sim))
                 .expect("a fresh stream can be created without existing metadata");
             let request_id = request.header().request;
 

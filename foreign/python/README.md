@@ -179,10 +179,9 @@ asyncio.run(main())
 transport. `examples/python/getting-started/producer.py` shows each swap in
 context.
 
-Established binary sessions survive transport loss. Password/PAT changes and
-PAT expiry do not end these sessions; logout, session lease expiry and account
-deactivation do. Reconnection binds the retained session before attempting a
-fresh login.
+Binary sessions survive transport loss. Reconnection binds the retained session before attempting a fresh login.
+
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 `HttpConfig` differs from TCP in two ways. There is no reconnection policy and no
 `AutoLogin`: `connect()` does not dial over HTTP, but it does start the
