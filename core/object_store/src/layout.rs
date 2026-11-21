@@ -30,6 +30,9 @@ const FRESH_REPLICA_DIGITS: usize = 2;
 /// Hexadecimal digits of the shard in a fresh object's key.
 const FRESH_SHARD_DIGITS: usize = 4;
 const TOPICS: &str = "topics";
+const RECOVERY: &str = "recovery";
+const RECOVERY_RECORD: &str = "record";
+const RECOVERY_REPORT: &str = "report.json";
 /// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
 /// a zero-padded offset.
 const U64_DIGITS: usize = 20;
@@ -341,6 +344,54 @@ impl KeyLayout {
             .then(|| u128::from_str_radix(id, 16).ok())
             .flatten()?;
         (self.fresh_key(id) == key).then_some(id)
+    }
+
+    /// The listing prefix of what the recovery of the cluster
+    /// `retired_cluster_uid` stored under the root, with a trailing `/`. No
+    /// id of a stream is `recovery`, so no manifest key is under it.
+    #[must_use]
+    pub fn recovery_prefix(&self, retired_cluster_uid: u128) -> String {
+        format!(
+            "{}/{META}/{RECOVERY}/{retired_cluster_uid:0width$x}/",
+            self.root,
+            width = FRESH_ID_DIGITS
+        )
+    }
+
+    /// The key of the record that retires the cluster `retired_cluster_uid`,
+    /// see [`crate::RecoveryRecord`].
+    #[must_use]
+    pub fn recovery_key(&self, retired_cluster_uid: u128) -> String {
+        format!(
+            "{}{RECOVERY_RECORD}",
+            self.recovery_prefix(retired_cluster_uid)
+        )
+    }
+
+    /// The key of what the recovery of `retired_cluster_uid` took of the
+    /// partition incarnation `prefix`. Its four ids share one segment, so
+    /// the key is no longer and has no more segments than a long-term
+    /// segment's.
+    #[must_use]
+    pub fn recovery_plan_key(&self, retired_cluster_uid: u128, prefix: &ObjectPrefix) -> String {
+        format!(
+            "{}{}-{}-{}-{}",
+            self.recovery_prefix(retired_cluster_uid),
+            prefix.stream_id,
+            prefix.topic_id,
+            prefix.partition_id,
+            prefix.created_revision
+        )
+    }
+
+    /// The key of the summary that the recovery of `retired_cluster_uid`
+    /// wrote for operators.
+    #[must_use]
+    pub fn recovery_report_key(&self, retired_cluster_uid: u128) -> String {
+        format!(
+            "{}{RECOVERY_REPORT}",
+            self.recovery_prefix(retired_cluster_uid)
+        )
     }
 
     /// The listing prefix of every geo topic object under the root, with a
@@ -875,7 +926,7 @@ mod tests {
         root
     }
 
-    fn widest_keys(layout: &KeyLayout) -> [String; 3] {
+    fn widest_keys(layout: &KeyLayout) -> [String; 5] {
         let index = layout.long_term_key(&LongTermKey {
             prefix: WIDEST,
             start_offset: u64::MAX,
@@ -887,7 +938,13 @@ mod tests {
             topic_id: u64::MAX,
             created_revision: u64::MAX,
         });
-        [index, layout.manifest_key(&WIDEST), topic]
+        [
+            index,
+            layout.manifest_key(&WIDEST),
+            topic,
+            layout.recovery_plan_key(u128::MAX, &WIDEST),
+            layout.recovery_report_key(u128::MAX),
+        ]
     }
 
     #[test]
@@ -933,12 +990,12 @@ mod tests {
         assert_eq!(root.len(), MAX_ROOT_LEN);
         let layout = KeyLayout::new(root).unwrap();
 
-        let [index, manifest, topic] = widest_keys(&layout);
+        let keys = widest_keys(&layout);
 
-        assert_eq!(index.len(), MAX_KEY_LEN);
-        assert!(validate_key(&index).is_ok());
-        assert!(validate_key(&manifest).is_ok());
-        assert!(validate_key(&topic).is_ok());
+        assert_eq!(keys[0].len(), MAX_KEY_LEN);
+        for key in keys {
+            assert!(validate_key(&key).is_ok(), "{key}");
+        }
     }
 
     #[test]
@@ -956,12 +1013,12 @@ mod tests {
         let root = format!("{}r", "r/".repeat(MAX_ROOT_SEGMENTS - 1));
         let layout = KeyLayout::new(root).unwrap();
 
-        let [index, manifest, topic] = widest_keys(&layout);
+        let keys = widest_keys(&layout);
 
-        assert_eq!(manifest.split('/').count(), MAX_KEY_SEGMENTS);
-        assert!(validate_key(&index).is_ok());
-        assert!(validate_key(&manifest).is_ok());
-        assert!(validate_key(&topic).is_ok());
+        assert_eq!(keys[1].split('/').count(), MAX_KEY_SEGMENTS);
+        for key in keys {
+            assert!(validate_key(&key).is_ok(), "{key}");
+        }
     }
 
     #[test]

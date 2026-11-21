@@ -1445,6 +1445,9 @@ where
             LifecycleFrame::PeerManifestRead(finished) => {
                 self.on_peer_manifest_read(*finished).await;
             }
+            LifecycleFrame::PeerFreshFound(found) => {
+                self.on_peer_fresh_found(*found);
+            }
             LifecycleFrame::SegmentMergeFinished(finished) => {
                 self.on_segment_merge_finished(*finished).await;
             }

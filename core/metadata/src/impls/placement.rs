@@ -390,13 +390,15 @@ impl PlacementState {
                     .map_err(|_| IggyError::InvalidCommand)?
                     .partitions
             }
-            // Only an adoption adds partitions. Every other shadow op takes
-            // an empty reservation, since the pipeline lists each of them.
+            // Only an adoption or a restore adds partitions. Every other
+            // shadow op takes an empty reservation, since the pipeline lists
+            // each of them.
             Operation::ShadowTopic => {
                 match ShadowTopicRequest::decode_from(prepare.body())
                     .map_err(|_| IggyError::InvalidCommand)?
                 {
-                    ShadowTopicRequest::AdoptTopic { create, .. } => create.partitions,
+                    ShadowTopicRequest::AdoptTopic { create, .. }
+                    | ShadowTopicRequest::RestoreTopic { create, .. } => create.partitions,
                     _ => Vec::new(),
                 }
             }

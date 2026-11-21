@@ -28,10 +28,16 @@
 //! [16..24] position        where the blob starts in the object
 //! [24..32] length          the blob's length
 //! [32..40] blob_checksum   XXH3 of the blob
-//! [40..44] version         1
-//! [44..56] zero
+//! [40..44] version         2
+//! [44..48] zero
+//! [48..56] proven_below    see Placement::proven_below
 //! [56..64] checksum        XXH3 of the batch header and of bytes 0..56
 //! ```
+//!
+//! Version 1 has zero in bytes 44..56 and decodes with a `proven_below` of
+//! zero. Both decode because the placed batches of version 1 stay in the
+//! journals and segments of a running cluster until they are rewritten into
+//! long-term segments. Only version 2 is written.
 //!
 //! The batch header is the one of the batch the blob belongs to, with the
 //! fields the server stamps. Its `batch_checksum` is zero: that checksum
@@ -62,13 +68,15 @@ pub const PLACED_BATCH_SIZE: usize = BATCH_HEADER_SIZE + PLACEMENT_SIZE;
 /// The bit of the batch header's flags byte that marks a placed batch.
 pub const BATCH_PLACED: u8 = 1 << 1;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+const VERSION_WITHOUT_PROOFS: u32 = 1;
 const OBJECT_ID_OFFSET: usize = 0;
 const POSITION_OFFSET: usize = 16;
 const LENGTH_OFFSET: usize = 24;
 const BLOB_CHECKSUM_OFFSET: usize = 32;
 const VERSION_OFFSET: usize = 40;
 const RESERVED_OFFSET: usize = 44;
+const PROVEN_BELOW_OFFSET: usize = 48;
 const CHECKSUM_OFFSET: usize = 56;
 
 /// Where the blob of a batch sits in the object store.
@@ -84,6 +92,12 @@ pub struct Placement {
     pub length: u64,
     /// XXH3 of the blob.
     pub blob_checksum: u64,
+    /// Every committed batch of the partition whose base offset is below
+    /// this one has a proof in a fresh object that the store holds, or is
+    /// held by a long-term segment that the partition committed. So a
+    /// replica that becomes primary resumes proving from here without
+    /// reading the store. Zero claims nothing.
+    pub proven_below: u64,
 }
 
 /// A decoded placed batch.
@@ -95,14 +109,16 @@ pub struct PlacedBatch {
 
 impl Placement {
     /// The placement of `blob`, stored at `position` of the object
-    /// `object_id`.
+    /// `object_id`, by a writer that knows the batches below `proven_below`
+    /// to be proven.
     #[must_use]
-    pub fn of(object_id: u128, position: u64, blob: &[u8]) -> Self {
+    pub fn of(object_id: u128, position: u64, blob: &[u8], proven_below: u64) -> Self {
         Self {
             object_id,
             position,
             length: blob.len() as u64,
             blob_checksum: blob_checksum(blob),
+            proven_below,
         }
     }
 
@@ -122,6 +138,10 @@ impl PlacedBatch {
 
     /// Write the placed batch into the first [`PLACED_BATCH_SIZE`] bytes of
     /// `out`, with a zero `batch_checksum` and a fresh checksum of its own.
+    ///
+    /// It always writes version 2, so a placed batch of version 1 that is
+    /// decoded and written again gets another checksum. Code that must keep
+    /// the checksum a replica agreed on copies the bytes instead.
     ///
     /// # Panics
     /// When `out` is shorter than [`PLACED_BATCH_SIZE`].
@@ -144,16 +164,20 @@ impl PlacedBatch {
         placement[BLOB_CHECKSUM_OFFSET..VERSION_OFFSET]
             .copy_from_slice(&self.placement.blob_checksum.to_le_bytes());
         placement[VERSION_OFFSET..RESERVED_OFFSET].copy_from_slice(&VERSION.to_le_bytes());
+        placement[PROVEN_BELOW_OFFSET..CHECKSUM_OFFSET]
+            .copy_from_slice(&self.placement.proven_below.to_le_bytes());
         seal(out);
     }
 
+    /// Decodes both versions. One of version 1 has a `proven_below` of zero.
+    ///
     /// # Errors
     /// [`WireError::UnexpectedEof`] on a short buffer.
     /// [`WireError::Validation`] on a checksum that does not match, a batch
     /// header without the placed flag, a version this build does not read,
-    /// nonzero reserved bytes, a nonzero `batch_checksum`, or a length other
-    /// than the batch header's blob length. Whatever [`BatchHeader::decode`]
-    /// refuses of the header without its placed flag.
+    /// nonzero reserved bytes of its version, a nonzero `batch_checksum`, or
+    /// a length other than the batch header's blob length. Whatever
+    /// [`BatchHeader::decode`] refuses of the header without its placed flag.
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
         if bytes.len() < PLACED_BATCH_SIZE {
             return Err(WireError::UnexpectedEof {
@@ -167,11 +191,12 @@ impl PlacedBatch {
         if u64_at(placement, CHECKSUM_OFFSET) != checksum(bytes) {
             return Err(invalid("placed batch checksum does not match"));
         }
-        let version = u32::from_le_bytes(field(placement, VERSION_OFFSET));
-        if version != VERSION {
-            return Err(invalid("placed batch version is not supported"));
-        }
-        if placement[RESERVED_OFFSET..CHECKSUM_OFFSET]
+        let reserved_end = match u32::from_le_bytes(field(placement, VERSION_OFFSET)) {
+            VERSION => PROVEN_BELOW_OFFSET,
+            VERSION_WITHOUT_PROOFS => CHECKSUM_OFFSET,
+            _ => return Err(invalid("placed batch version is not supported")),
+        };
+        if placement[RESERVED_OFFSET..reserved_end]
             .iter()
             .any(|byte| *byte != 0)
         {
@@ -186,6 +211,8 @@ impl PlacedBatch {
             position: u64_at(placement, POSITION_OFFSET),
             length: u64_at(placement, LENGTH_OFFSET),
             blob_checksum: u64_at(placement, BLOB_CHECKSUM_OFFSET),
+            // Zero in version 1, whose reserved bytes cover it.
+            proven_below: u64_at(placement, PROVEN_BELOW_OFFSET),
         };
         if header.blob_len()? as u64 != placement.length {
             return Err(invalid("placed batch length differs from its batch header"));
@@ -312,13 +339,41 @@ mod tests {
         header.batch_length = (BATCH_HEADER_SIZE + BLOB.len()) as u64;
         header.base_offset = 40;
         header.base_timestamp = 1_700_000_000_000_500;
-        PlacedBatch::new(header, Placement::of(0x0123_4567_89ab_cdef, 4096, BLOB))
+        PlacedBatch::new(
+            header,
+            Placement::of(0x0123_4567_89ab_cdef, 4096, BLOB, 0x1122_3344_5566_7788),
+        )
     }
 
     fn encoded(placed: &PlacedBatch) -> [u8; PLACED_BATCH_SIZE] {
         let mut bytes = [0xff; PLACED_BATCH_SIZE];
         placed.encode_into(&mut bytes);
         bytes
+    }
+
+    /// `bytes` with `value` written at `offset` of the placement, sealed
+    /// again so that only the placement's own rules can refuse them.
+    fn resealed(
+        mut bytes: [u8; PLACED_BATCH_SIZE],
+        offset: usize,
+        value: &[u8],
+    ) -> [u8; PLACED_BATCH_SIZE] {
+        let start = BATCH_HEADER_SIZE + offset;
+        bytes[start..start + value.len()].copy_from_slice(value);
+        seal(&mut bytes);
+        bytes
+    }
+
+    /// The bytes a writer of version 1 wrote for `placed`, which has no
+    /// `proven_below`.
+    fn version_1(placed: &PlacedBatch) -> [u8; PLACED_BATCH_SIZE] {
+        let mut placed = *placed;
+        placed.placement.proven_below = 0;
+        resealed(
+            encoded(&placed),
+            VERSION_OFFSET,
+            &VERSION_WITHOUT_PROOFS.to_le_bytes(),
+        )
     }
 
     #[test]
@@ -434,12 +489,106 @@ mod tests {
     }
 
     #[test]
-    fn given_a_later_version_when_decoding_should_refuse_it() {
-        let mut bytes = encoded(&placed());
-        bytes[BATCH_HEADER_SIZE + VERSION_OFFSET] = 2;
-        let checksum = checksum(&bytes);
-        bytes[BATCH_HEADER_SIZE + CHECKSUM_OFFSET..].copy_from_slice(&checksum.to_le_bytes());
+    fn given_a_version_this_build_does_not_read_when_decoding_should_refuse_it() {
+        for version in [0, 3, u32::MAX] {
+            let bytes = resealed(encoded(&placed()), VERSION_OFFSET, &version.to_le_bytes());
 
-        assert!(PlacedBatch::decode(&bytes).is_err());
+            assert_eq!(
+                PlacedBatch::decode(&bytes),
+                Err(invalid("placed batch version is not supported")),
+                "version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_placed_batch_when_encoding_should_write_version_2_with_its_proven_below() {
+        let bytes = encoded(&placed());
+        let placement = &bytes[BATCH_HEADER_SIZE..];
+
+        assert_eq!(u32::from_le_bytes(field(placement, VERSION_OFFSET)), 2);
+        assert_eq!(
+            u64_at(placement, PROVEN_BELOW_OFFSET),
+            0x1122_3344_5566_7788
+        );
+        assert!(
+            placement[RESERVED_OFFSET..PROVEN_BELOW_OFFSET]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn given_a_version_1_placed_batch_when_decoding_should_give_it_with_a_proven_below_of_zero() {
+        let placed = placed();
+
+        let decoded = PlacedBatch::decode(&version_1(&placed)).unwrap();
+
+        assert_eq!(decoded.header, placed.header);
+        assert_eq!(
+            decoded.placement,
+            Placement {
+                proven_below: 0,
+                ..placed.placement
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_version_1_placed_batch_with_bytes_where_version_2_keeps_proven_below_when_decoding_should_refuse_it()
+     {
+        for byte in PROVEN_BELOW_OFFSET..CHECKSUM_OFFSET {
+            let bytes = resealed(version_1(&placed()), byte, &[1]);
+
+            assert_eq!(
+                PlacedBatch::decode(&bytes),
+                Err(invalid("placed batch reserved bytes are not zero")),
+                "byte {byte}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_nonzero_reserved_bytes_when_decoding_either_version_should_refuse_them() {
+        for byte in RESERVED_OFFSET..PROVEN_BELOW_OFFSET {
+            for bytes in [encoded(&placed()), version_1(&placed())] {
+                let bytes = resealed(bytes, byte, &[0x80]);
+
+                assert_eq!(
+                    PlacedBatch::decode(&bytes),
+                    Err(invalid("placed batch reserved bytes are not zero")),
+                    "byte {byte}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_changed_proven_below_when_decoding_should_refuse_it_until_sealed_again() {
+        let mut bytes = encoded(&placed());
+        let start = BATCH_HEADER_SIZE + PROVEN_BELOW_OFFSET;
+        bytes[start..start + 8].copy_from_slice(&7_u64.to_le_bytes());
+
+        assert_eq!(
+            PlacedBatch::decode(&bytes),
+            Err(invalid("placed batch checksum does not match"))
+        );
+        seal(&mut bytes);
+        assert_eq!(
+            PlacedBatch::decode(&bytes).unwrap().placement.proven_below,
+            7
+        );
+    }
+
+    #[test]
+    fn given_one_batch_with_two_proven_below_values_when_sealing_should_give_two_checksums() {
+        let placed = placed();
+        let mut other = placed;
+        other.placement.proven_below += 1;
+
+        assert_ne!(
+            checksum_of(&encoded(&placed)),
+            checksum_of(&encoded(&other))
+        );
     }
 }

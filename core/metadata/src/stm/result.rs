@@ -262,8 +262,10 @@ result_enum!(ShadowTopicResult {
     StreamNameAlreadyExists = 1012,
     InvalidStreamName = 1013,
     TooManyStreams = 1020,
+    InvalidStreamId = 1014,
     TopicNotFound = 2010,
     TopicNameAlreadyExists = 2013,
+    InvalidTopicId = 2016,
     InvalidReplicationFactor = 2018,
     InvalidPartitionsCount = 2019,
     TooManyTopics = 2021,
@@ -620,6 +622,14 @@ mod tests {
         assert_eq!(
             u32::from(ShadowTopicResult::StreamNotEmpty),
             IggyError::InvalidCommand.as_code()
+        );
+        assert_eq!(
+            u32::from(ShadowTopicResult::InvalidStreamId),
+            IggyError::InvalidStreamId.as_code()
+        );
+        assert_eq!(
+            u32::from(ShadowTopicResult::InvalidTopicId),
+            IggyError::InvalidTopicId.as_code()
         );
     }
 

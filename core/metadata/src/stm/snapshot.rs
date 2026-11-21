@@ -78,7 +78,11 @@ use crate::stm::user::UsersSnapshot;
 /// Version 17: `StreamSnapshot` and `TopicSnapshot` gained `shadow`, the peer
 /// stream or topic incarnation that a shadow stream or topic serves, as
 /// trailing, defaulted fields.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 17;
+///
+/// Version 18: `TopicSnapshot` gained `recovered_from`, the cluster that lost
+/// every disk whose geo topic a recovery restored, as a trailing, defaulted
+/// field.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 18;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
@@ -667,7 +671,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 17;
+        const PINNED_VERSION: u32 = 18;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -690,7 +694,7 @@ mod tests {
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 11;
+        const TOPIC_FIELD_COUNT: u32 = 12;
         const STREAM_FIELD_COUNT: u32 = 8;
         const STREAMS_FIELD_COUNT: u32 = 4;
         const USER_FIELD_COUNT: u32 = 7;
@@ -732,6 +736,7 @@ mod tests {
             consumer_group_catalog_op: 0,
             created_op: 0,
             shadow: None,
+            recovered_from: None,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -1136,6 +1141,10 @@ mod tests {
                             consumer_group_catalog_op: 7,
                             created_op: 8,
                             shadow: None,
+                            // A restored geo topic's marker survives the
+                            // roundtrip, as every replica that builds its
+                            // partitions later reads it.
+                            recovered_from: Some(0x0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a),
                         },
                     )],
                     options: ResourceOptions::default(),
@@ -1172,6 +1181,10 @@ mod tests {
         assert_eq!(topic.next_consumer_group_id, 5);
         assert_eq!(topic.consumer_group_catalog_op, 7);
         assert_eq!(topic.created_op, 8);
+        assert_eq!(
+            topic.recovered_from,
+            Some(0x0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a)
+        );
     }
 
     fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {

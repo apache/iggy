@@ -822,6 +822,26 @@ fn take_part(bytes: &[u8], size: usize, count_max: usize) -> Option<(ChunksExact
 }
 
 impl LongTermLog {
+    /// The log that lists `segments` and registers nothing, as a partition
+    /// rebuilt from its manifest starts. `None` when they are no run of
+    /// offsets or more than a log holds.
+    pub(crate) fn listing(segments: &[ManifestSegment]) -> Option<Self> {
+        let mut log = Self::default();
+        if segments.len() > LONG_TERM_SEGMENTS_MAX {
+            return None;
+        }
+        for segment in segments {
+            let continues = log
+                .floor()
+                .is_none_or(|floor| floor.checked_add(1) == Some(segment.start_offset));
+            if !continues || segment.end_offset < segment.start_offset {
+                return None;
+            }
+            log.segments.push(*segment);
+        }
+        Some(log)
+    }
+
     fn decode(snapshot: &[u8]) -> Option<Self> {
         let (segments, rest) = take_part(snapshot, SEGMENT_PAYLOAD_SIZE, LONG_TERM_SEGMENTS_MAX)?;
         let (registered, rest) =

@@ -30,12 +30,15 @@
 //! keys after it found or deleted something.
 //!
 //! A sweep lists the objects, and then asks every shard which objects its
-//! partitions name above their long-term floors or a send still waits on.
-//! Each shard reads that after the listing ended, so an object the listing
-//! holds and no answer names was already unnamed when it was listed. Such
-//! an object is deleted once the sweeps found it so for a grace period. The
-//! sweep deletes all that are due, one delete job after another, and each
-//! job's result passes through the pump's inbox before the next starts.
+//! partitions name above their long-term floors or a send still waits on,
+//! and where those floors are. Each shard reads that after the listing
+//! ended, so an object the listing holds and no answer names was already
+//! unnamed when it was listed. Such an object is deleted once the sweeps
+//! found it so for a grace period, unless it holds a proof row of a batch
+//! above its partition's floor, which the delete job reads from its index.
+//! The sweep deletes all that are due, one delete job after another, and
+//! each job's result passes through the pump's inbox before the next
+//! starts.
 //!
 //! A shard answers that it cannot tell while a placing partition that is
 //! still committed may be missing batches its group holds: one outside
@@ -57,7 +60,7 @@ use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::{
     FRESH_DELETES_PER_BATCH, FRESH_OBJECT_GRACE, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
-    FreshListOutcome, FreshListing, FreshObjectSweeper, FreshSweep,
+    FreshDeleted, FreshListOutcome, FreshListing, FreshObjectSweeper, FreshSweep, ProofFloors,
 };
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
@@ -90,6 +93,8 @@ pub struct FreshObjectsReport {
     pub shard: u16,
     /// `None` when the shard cannot tell.
     pub in_use: Option<BTreeSet<u128>>,
+    /// The long-term floors of its placing partitions.
+    pub floors: ProofFloors,
 }
 
 /// What the task deleting fresh objects hands back to the pump.
@@ -107,6 +112,8 @@ struct Sweep {
     listing: Option<FreshListing>,
     /// The answer of each shard, by its id.
     reports: Vec<Option<BTreeSet<u128>>>,
+    /// The floors the answers gave.
+    floors: ProofFloors,
     /// Timer ticks since it started.
     ticks: u32,
 }
@@ -115,8 +122,12 @@ struct Sweep {
 struct Deleting {
     /// The objects that are due and in no delete job yet.
     due: VecDeque<u128>,
+    /// What keeps a due object for its proof rows.
+    floors: Rc<ProofFloors>,
     /// Objects of this sweep that a delete job left in the store.
     failed: usize,
+    /// Objects of this sweep kept for their proof rows.
+    kept: usize,
     deleted: usize,
     /// Scopes whose listing did not reach their last key.
     truncated: usize,
@@ -294,6 +305,7 @@ where
                 now,
                 listing: None,
                 reports: vec![None; self.senders.len()],
+                floors: ProofFloors::default(),
                 ticks: 0,
             });
         }
@@ -341,7 +353,7 @@ where
             let now = sweep.now;
             *slot = None;
             drop(slot);
-            self.settle_fresh_sweep(&listing, &BTreeSet::new(), now);
+            self.settle_fresh_sweep(&listing, &BTreeSet::new(), ProofFloors::default(), now);
             return;
         }
         sweep.listing = Some(listing);
@@ -379,6 +391,7 @@ where
         } else {
             None
         };
+        let floors = self.plane.partitions().proof_floors();
         let certain = reads.is_some();
         let reads = reads.unwrap_or_default();
         self.bus.spawn(async move {
@@ -396,6 +409,7 @@ where
                 sweep,
                 shard,
                 in_use,
+                floors,
             });
             let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::FreshObjectsReported(
                 report,
@@ -452,6 +466,7 @@ where
             return;
         };
         *answer = Some(in_use);
+        sweep.floors.extend(report.floors);
         if sweep.reports.iter().any(Option::is_none) {
             return;
         }
@@ -463,7 +478,7 @@ where
             return;
         };
         let in_use: BTreeSet<u128> = sweep.reports.into_iter().flatten().flatten().collect();
-        self.settle_fresh_sweep(&listing, &in_use, sweep.now);
+        self.settle_fresh_sweep(&listing, &in_use, sweep.floors, sweep.now);
     }
 
     /// `shard` cannot tell which fresh objects it needs, so the sweep at
@@ -493,11 +508,12 @@ where
     }
 
     /// Take a sweep into the state the sweeps keep, and start deleting what
-    /// is due.
+    /// is due and `floors` does not keep for its proof rows.
     fn settle_fresh_sweep(
         &self,
         listing: &FreshListing,
         in_use: &BTreeSet<u128>,
+        floors: ProofFloors,
         now: IggyTimestamp,
     ) {
         let sweeps = &self.fresh_sweeps;
@@ -517,7 +533,9 @@ where
         sweeps.settled.set(sweeps.settled.get() + 1);
         *sweeps.deleting.borrow_mut() = Some(Box::new(Deleting {
             due: settled.due.into(),
+            floors: Rc::new(floors),
             failed: 0,
+            kept: 0,
             deleted: 0,
             truncated: listing.truncated(),
             found_unnamed: settled.found_unnamed,
@@ -529,13 +547,16 @@ where
     /// is left for one.
     fn delete_due_fresh_objects(&self) {
         let sweeps = &self.fresh_sweeps;
-        let batch: Vec<u128> = {
+        let (batch, floors): (Vec<u128>, _) = {
             let mut deleting = sweeps.deleting.borrow_mut();
             let Some(deleting) = deleting.as_mut() else {
                 return;
             };
             let batch = deleting.due.len().min(FRESH_DELETES_PER_BATCH);
-            deleting.due.drain(..batch).collect()
+            (
+                deleting.due.drain(..batch).collect(),
+                Rc::clone(&deleting.floors),
+            )
         };
         let sweeper = sweeps.sweeper.borrow().clone();
         let sender = self.senders.get(self.id as usize).cloned();
@@ -551,7 +572,7 @@ where
         let running = Rc::clone(&sweeps.running);
         running.set(true);
         self.bus.spawn(async move {
-            let outcome = sweeper.delete(batch.clone(), scope).await;
+            let outcome = sweeper.delete(batch.clone(), floors, scope).await;
             running.set(false);
             let finished = Box::new(FinishedFreshDelete {
                 objects: batch,
@@ -565,22 +586,23 @@ where
 
     /// Forget the objects a delete removed, and go on with the next job of
     /// the sweep. One that is still there is found by the next sweep, as is
-    /// one whose result never arrived.
+    /// one whose result never arrived and one kept for its proof rows.
     pub(crate) fn on_fresh_objects_deleted(&self, finished: FinishedFreshDelete) {
         let sweeps = &self.fresh_sweeps;
         let sent = finished.objects.len();
-        let deleted: Vec<u128> = match &finished.outcome {
-            Ok(failed) => finished
-                .objects
-                .into_iter()
-                .filter(|object| !failed.contains(object))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-        if deleted.len() < sent {
+        let FreshDeleted { failed, kept } = finished.outcome.unwrap_or_else(|_| FreshDeleted {
+            failed: finished.objects.clone(),
+            kept: Vec::new(),
+        });
+        let deleted: Vec<u128> = finished
+            .objects
+            .into_iter()
+            .filter(|object| !failed.contains(object) && !kept.contains(object))
+            .collect();
+        if !failed.is_empty() {
             tracing::warn!(
                 shard = self.id,
-                failed = sent - deleted.len(),
+                failed = failed.len(),
                 "some fresh objects were not deleted; the next sweep sends them again"
             );
         }
@@ -588,9 +610,10 @@ where
         self.metrics.record_fresh_objects_deleted(deleted.len());
         if let Some(deleting) = sweeps.deleting.borrow_mut().as_mut() {
             deleting.deleted += deleted.len();
-            deleting.failed += sent - deleted.len();
+            deleting.kept += kept.len();
+            deleting.failed += sent - deleted.len() - kept.len();
         }
-        if deleted.is_empty() {
+        if deleted.is_empty() && kept.len() < sent {
             // A store that deleted nothing of a whole job is not asked for
             // the next one.
             self.end_fresh_sweep(0);
@@ -608,7 +631,7 @@ where
         };
         let due = deleting.due.len() + deleting.failed + unsent;
         self.metrics
-            .set_fresh_sweep_backlog(deleting.truncated, due);
+            .set_fresh_sweep_backlog(deleting.truncated, due, deleting.kept);
         // Only a sweep that got something done is followed at once, so a
         // store that refuses deletes is not asked without a pause.
         let more_to_delete = due > 0 && deleting.deleted > 0;

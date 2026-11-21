@@ -34,7 +34,7 @@ use crate::server::scenarios::geo_mode_faults_scenario::{
     SettledBucket, Topics, assert_settled, geo_manifest, produce_around, read_indexes,
 };
 
-const NODES: usize = 3;
+pub(super) const NODES: usize = 3;
 /// Sends acknowledged before the primary dies, and after it did.
 const SENDS_BEFORE: usize = 30;
 const SENDS_AFTER: usize = 30;
@@ -50,7 +50,7 @@ const TRIGGER_POLL: Duration = Duration::from_millis(1);
 const FOREIGN_ROOT_MARKER: &str = "the store identity object names another cluster";
 /// How long a view change that a restart of the metadata leader starts may
 /// take to settle.
-const LEADER_RESTART_PAUSE: Duration = Duration::from_secs(5);
+pub(super) const LEADER_RESTART_PAUSE: Duration = Duration::from_secs(5);
 
 #[tokio::test]
 async fn given_a_geo_topic_on_three_nodes_when_its_primary_dies_during_an_upload_should_read_each_acknowledged_send_once_in_order()
@@ -261,7 +261,7 @@ async fn given_a_geo_topic_on_three_nodes_when_every_node_loses_its_disk_should_
     );
 }
 
-fn cluster_with_fs_store(store: &Path) -> TestHarness {
+pub(super) fn cluster_with_fs_store(store: &Path) -> TestHarness {
     let extra_envs = HashMap::from([
         // A geo topic takes messages once the metadata primary stored its
         // object, and a node without an origin stores none.
@@ -291,7 +291,7 @@ fn cluster_with_fs_store(store: &Path) -> TestHarness {
 /// metadata, and on a busy host the lead can move away while the cluster
 /// boots. The server README's way out is to restart the leader until
 /// replica 0 leads.
-async fn await_store_claim(harness: &mut TestHarness, store: &Path) {
+pub(super) async fn await_store_claim(harness: &mut TestHarness, store: &Path) {
     let identity = store.join(STORE_PREFIX).join("meta").join("identity");
     let deadline = Instant::now() + SETTLE_DEADLINE;
     while !identity.exists() {
@@ -312,7 +312,7 @@ async fn await_store_claim(harness: &mut TestHarness, store: &Path) {
 }
 
 /// The node that leads metadata, as the first node that answers says.
-async fn metadata_leader(harness: &TestHarness) -> Option<usize> {
+pub(super) async fn metadata_leader(harness: &TestHarness) -> Option<usize> {
     for node in 0..NODES {
         let Ok(client) = harness.root_client_for_node(node).await else {
             continue;
@@ -340,7 +340,7 @@ async fn metadata_leader(harness: &TestHarness) -> Option<usize> {
 /// that an upload lasts long enough to be caught. Cargo makes the target tmp
 /// directory only when it builds, and CI runs these tests from an archive
 /// restored without it.
-fn store_on_disk() -> TempDir {
+pub(super) fn store_on_disk() -> TempDir {
     let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
     fs::create_dir_all(parent).expect("the target tmp directory");
     tempfile::tempdir_in(parent).expect("a directory for the object store")

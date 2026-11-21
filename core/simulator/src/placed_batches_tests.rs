@@ -32,22 +32,26 @@
 //! their log in memory, and a transfer copies segment files.
 
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, Sequencer};
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
+use iggy_binary_protocol::placement::PlacedBatch;
 use iggy_binary_protocol::{Command, GenericHeader, Operation, ReplyHeader, RoutedRequestHeader};
 use iggy_common::{IggyTimestamp, PollingStrategy};
 use iggy_object_store::{
-    FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore, PutBody, PutOptions,
-    SegmentObject, TierExecutor, TierJobHandle, TierJobRequest, TierScopeToken,
+    FreshIndex, FreshObjectId, FreshProofRow, InlineTierExecutor, KeyLayout, MemoryStore,
+    ObjectStore, PutBody, PutOptions, SegmentObject, TierExecutor, TierJobHandle, TierJobRequest,
+    TierScopeToken,
 };
 use partitions::{
     ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermWriter, ExecutorObjects,
-    FRESH_OBJECT_GRACE, IggyPartition, LongTermWriter, PollingArgs, PollingConsumer,
+    FRESH_OBJECT_GRACE, IggyPartition, LongTermWriter, PollingArgs, PollingConsumer, ProvenBatch,
     RemoteSegments, RewriteOutcome, SegmentRewrite,
 };
 use server_common::Message;
@@ -138,10 +142,15 @@ fn placing_cluster_of(
     (sim, client, store)
 }
 
+/// A wait for proof rows longer than any scenario, so that the store holds
+/// only the objects that the sends of a scenario fill.
+const NO_CONFIRMATION: Duration = Duration::from_secs(3600);
+
 /// Give every shard of `replica` the store: for its uploads, its sweeps and
 /// the reads of its polls.
 fn wire_store(sim: &Simulator, replica: u8, store: &Shared) {
     for shard in &sim.replicas[usize::from(replica)].shards {
+        shard.set_fresh_confirm_after(NO_CONFIRMATION);
         shard.set_fresh_uploader(Some(Rc::new(ExecutorFreshUploader::new(
             store.clone(),
             layout(),
@@ -1249,5 +1258,277 @@ fn given_a_backup_cut_off_for_longer_than_the_grace_when_the_writer_sweeps_shoul
                 "replica {replica}, seed {seed:#x}"
             );
         }
+    }
+}
+
+/// A fresh object in the store, read whole and decoded under its key, as a
+/// reader of the store alone finds it.
+struct Stored {
+    id: FreshObjectId,
+    index: FreshIndex,
+    bytes: Bytes,
+}
+
+fn stored_objects(store: &Shared) -> Vec<Stored> {
+    fresh_objects(store)
+        .into_iter()
+        .map(|id| {
+            let key = layout().fresh_key(id);
+            let memory = store.0.store();
+            let size = memory
+                .head(&key)
+                .now_or_never()
+                .expect("a memory store answers at once")
+                .expect("the object is there")
+                .size;
+            let bytes = memory
+                .get_range(&key, 0..size)
+                .now_or_never()
+                .expect("a memory store answers at once")
+                .expect("the object is there")
+                .bytes;
+            let id = FreshObjectId::from_raw(id);
+            let index = FreshIndex::decode(&bytes, id).expect("every object decodes");
+            Stored { id, index, bytes }
+        })
+        .collect()
+}
+
+/// The distinct proof rows of the partition across `objects`, by the offset
+/// of their batch. Panics on two different rows for one batch.
+fn proven(objects: &[Stored]) -> BTreeMap<u64, FreshProofRow> {
+    let mut rows = BTreeMap::new();
+    for object in objects {
+        let Some(row) = object.index.partition(namespace().inner()) else {
+            continue;
+        };
+        for proof in object.index.proofs_of(row) {
+            if let Some(earlier) = rows.insert(proof.base_offset, *proof) {
+                assert_eq!(
+                    earlier, *proof,
+                    "two rows for the batch at {}",
+                    proof.base_offset
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// The messages of the batch that `proof` names, from the object that
+/// holds them, once the rows rebuild the batch the partition committed.
+fn proven_blob<'a>(objects: &'a [Stored], proof: &FreshProofRow) -> &'a [u8] {
+    let source = objects
+        .iter()
+        .find(|object| object.id == proof.object_id)
+        .expect("the object a row names is in the store");
+    let row = source
+        .index
+        .partition(namespace().inner())
+        .expect("the object holds the partition");
+    let placed = PlacedBatch::try_from(
+        ProvenBatch::find(proof, row, &source.index).expect("the row names a batch of it"),
+    )
+    .expect("the rows rebuild the committed placed batch");
+    let start = usize::try_from(placed.placement.position).expect("a position fits");
+    let end = start + usize::try_from(placed.placement.length).expect("a length fits");
+    let blob = &source.bytes[start..end];
+    assert!(placed.placement.matches(blob));
+    blob
+}
+
+/// Every replica proves at the pace of a server.
+fn confirm_proofs(sim: &Simulator) {
+    for replica in &sim.replicas {
+        for shard in &replica.shards {
+            shard.set_fresh_confirm_after(shard::FRESH_CONFIRM_AFTER);
+        }
+    }
+}
+
+/// A primary cut off from its backups takes more sends and stores their
+/// messages in objects of its own, which never commit. The backups elect a
+/// successor that commits more. No proof row in the store names a batch
+/// that did not commit, and once the cut heals the store proves every
+/// committed batch exactly once, so a reader of the store alone finds each
+/// committed message and no other.
+#[test]
+fn given_a_primary_cut_off_while_it_uploads_when_a_successor_takes_over_should_prove_only_and_all_of_what_committed()
+ {
+    const BEFORE: usize = 4;
+    const ORPHANS: usize = 3;
+    const AFTER: usize = 4;
+    for seed in SCENARIO_SEEDS {
+        let (mut sim, client, store) = placing_cluster(seed);
+        confirm_proofs(&sim);
+        for index in 0..BEFORE {
+            send_until_committed(&mut sim, &client, index);
+        }
+        settle_everywhere(&mut sim);
+
+        cut_off(&mut sim, PRIMARY, true);
+        let before_cut = fresh_objects(&store);
+        let _orphans: Vec<Answer> = (BEFORE..BEFORE + ORPHANS)
+            .map(|index| {
+                let answer = submit_send(&mut sim, &client, PRIMARY, &payload(index));
+                for _ in 0..50 {
+                    sim.step();
+                }
+                answer
+            })
+            .collect();
+        let uploaded_while_cut = fresh_objects(&store)
+            .into_iter()
+            .filter(|id| {
+                !before_cut.contains(id) && FreshObjectId::from_raw(*id).replica() == PRIMARY
+            })
+            .count();
+        assert!(
+            uploaded_while_cut > 0,
+            "the cut-off primary stored objects of its own, seed {seed:#x}"
+        );
+
+        let mut successor = None;
+        for _ in 0..SETTLE_TICKS {
+            successor = (0..REPLICAS)
+                .filter(|replica| *replica != PRIMARY)
+                .find(|replica| {
+                    with_partition(&sim, *replica, |partition| {
+                        partition.consensus().is_primary() && partition.consensus().is_normal()
+                    })
+                });
+            if successor.is_some() {
+                break;
+            }
+            sim.step();
+        }
+        let successor = successor.expect("a backup takes over");
+        for index in BEFORE + ORPHANS..BEFORE + ORPHANS + AFTER {
+            let committed = (0..50).any(|_| {
+                let answer = submit_send(&mut sim, &client, successor, &payload(index));
+                wait_for(&mut sim, &answer) && sent_was_committed(&answer)
+            });
+            assert!(committed, "send {index} commits, seed {seed:#x}");
+        }
+        cut_off(&mut sim, PRIMARY, false);
+        let last = settle_everywhere(&mut sim);
+
+        let committed: Vec<usize> = (0..BEFORE)
+            .chain(BEFORE + ORPHANS..BEFORE + ORPHANS + AFTER)
+            .collect();
+        assert_eq!(last + 1, committed.len() as u64, "seed {seed:#x}");
+        let mut rows = BTreeMap::new();
+        for _ in 0..SETTLE_TICKS {
+            rows = proven(&stored_objects(&store));
+            if rows.len() as u64 > last {
+                break;
+            }
+            sim.step();
+        }
+        let objects = stored_objects(&store);
+        assert_eq!(
+            rows.keys().copied().collect::<Vec<_>>(),
+            (0..=last).collect::<Vec<_>>(),
+            "every committed batch is proven, seed {seed:#x}"
+        );
+        let served = polled(&mut sim, successor);
+        for (offset, proof) in &rows {
+            let blob = proven_blob(&objects, proof);
+            let matching: Vec<usize> = (0..BEFORE + ORPHANS + AFTER)
+                .filter(|index| holds(blob, &payload(*index)) == 1)
+                .collect();
+            assert_eq!(matching.len(), 1, "the batch at {offset}, seed {seed:#x}");
+            assert!(
+                committed.contains(&matching[0]),
+                "the row at {offset} names send {}, which never committed, seed {seed:#x}",
+                matching[0]
+            );
+            assert_eq!(holds(&served, &payload(matching[0])), 1, "seed {seed:#x}");
+        }
+    }
+}
+
+/// The proof rows `replica` holds, by the offset of their batch, once they
+/// hold every committed batch that may lack a stored proof.
+fn covering_rows(sim: &Simulator, replica: u8) -> Option<BTreeMap<u64, FreshProofRow>> {
+    with_partition(sim, replica, |partition| {
+        let committed_end = partition.offset.load(std::sync::atomic::Ordering::Acquire) + 1;
+        partition
+            .fresh_proofs()
+            .filter(|proofs| proofs.covers(committed_end, partition.long_term_floor()))
+            .map(|proofs| {
+                proofs
+                    .rows_from(0)
+                    .map(|row| (row.base_offset, *row))
+                    .collect()
+            })
+    })
+}
+
+/// The primary restarts with batches it committed whose proofs it may not
+/// have stored, and no commit of them runs again. It rebuilds their rows
+/// from what it holds, the same rows the replicas that stayed up hold, and
+/// once it leads again the store proves every committed batch.
+#[test]
+fn given_a_primary_that_restarts_with_unproven_batches_when_it_leads_again_should_prove_every_committed_batch()
+ {
+    const SENDS: usize = 4;
+    for seed in SCENARIO_SEEDS {
+        let (mut sim, client, store) = placing_cluster(seed);
+        for index in 0..SENDS {
+            send_until_committed(&mut sim, &client, index);
+        }
+        let last = settle_everywhere(&mut sim);
+
+        sim.replica_crash(PRIMARY);
+        restart(&mut sim, PRIMARY, &store);
+        confirm_proofs(&sim);
+        assert!(
+            with_partition(&sim, PRIMARY, |partition| partition
+                .fresh_proofs()
+                .is_none()),
+            "the restart lost the rows, seed {seed:#x}"
+        );
+        assert_eq!(settle_everywhere(&mut sim), last, "seed {seed:#x}");
+        let mut rebuilt = None;
+        for _ in 0..SETTLE_TICKS {
+            rebuilt = covering_rows(&sim, PRIMARY);
+            if rebuilt.is_some() {
+                break;
+            }
+            sim.step();
+        }
+        let rebuilt = rebuilt.expect("the restarted replica rebuilds its rows");
+        let others = (0..REPLICAS)
+            .filter(|replica| *replica != PRIMARY)
+            .filter_map(|replica| covering_rows(&sim, replica));
+        for held in others {
+            for (offset, row) in &rebuilt {
+                if let Some(other) = held.get(offset) {
+                    assert_eq!(row, other, "the batch at {offset}, seed {seed:#x}");
+                }
+            }
+        }
+
+        for replica in (0..REPLICAS).filter(|replica| *replica != PRIMARY) {
+            sim.replica_crash(replica);
+            restart(&mut sim, replica, &store);
+        }
+        confirm_proofs(&sim);
+        await_primary(&mut sim);
+        settle_everywhere(&mut sim);
+        let mut rows = BTreeMap::new();
+        for _ in 0..SETTLE_TICKS {
+            rows = proven(&stored_objects(&store));
+            if rows.len() as u64 > last {
+                break;
+            }
+            sim.step();
+        }
+        assert_eq!(
+            rows.keys().copied().collect::<Vec<_>>(),
+            (0..=last).collect::<Vec<_>>(),
+            "every committed batch is proven, seed {seed:#x}"
+        );
     }
 }
