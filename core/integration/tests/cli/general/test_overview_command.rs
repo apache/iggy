@@ -57,6 +57,7 @@ Commands:
   user             user operations [alias: u]
   client           client operations [alias: c]
   cluster          cluster operations [alias: cl]
+  geo              geo peer operations
   consumer-group   consumer group operations [alias: g]
   consumer-offset  consumer offset operations [alias: o]
   message          message operations [alias: m]

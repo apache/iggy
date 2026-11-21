@@ -47,6 +47,7 @@ const replicated = new Map<number, number>([
   [COMMAND_CODE.JoinGroup, Operation.JoinConsumerGroup],
   [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup],
   [COMMAND_CODE.UpdateResource, Operation.UpdateResource],
+  [COMMAND_CODE.RetireGeoOrigin, Operation.RetireGeoOrigin],
   [COMMAND_CODE.SendMessages, Operation.SendMessages],
   [COMMAND_CODE.StoreOffset, Operation.StoreConsumerOffset],
   [COMMAND_CODE.DeleteConsumerOffset, Operation.DeleteConsumerOffset]
@@ -87,13 +88,15 @@ describe('VSR operation classification', () => {
     assert.equal(isMetadata(Operation.DeleteSegments), false);
     assert.equal(isMetadata(Operation.UpdateResource), true);
     assert.equal(isResultFramed(Operation.UpdateResource), true);
+    assert.equal(isMetadata(Operation.RetireGeoOrigin), true);
+    assert.equal(isResultFramed(Operation.RetireGeoOrigin), true);
     for (const resolved of [Operation.UpdateStreamResolved, Operation.UpdateTopicResolved,
       Operation.UpdateUserResolved, Operation.RewrapStreamKeys, Operation.ShadowTopic]) {
       assert.equal(isInternal(resolved), true);
       assert.equal(isMetadata(resolved), true);
       assert.equal(isResultFramed(resolved), true);
     }
-    assert.equal(isMetadata(151), false);
+    assert.equal(isMetadata(152), false);
     assert.equal(isResultFramed(Operation.StoreConsumerOffset), true);
     assert.equal(isResultFramed(Operation.DeleteConsumerOffset), true);
     assert.equal(isResultFramed(Operation.SendMessages), false);
@@ -123,7 +126,7 @@ describe('VSR operation classification', () => {
     assert.equal(isInternal(Operation.RetireConsumerGroupOwners), true);
     assert.equal(isKnownOperation(Operation.StateMachineCommand), true);
     assert.equal(isInternal(Operation.StateMachineCommand), true);
-    for (const undeclared of [69, 77, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 171, 255])
+    for (const undeclared of [69, 77, 127, 129, 131, 133, 135, 142, 152, 159, 163, 164, 165, 171, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });

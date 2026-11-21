@@ -36,12 +36,14 @@
 //! starts to follow its peer.
 
 use iggy_binary_protocol::RoutedRequestHeader;
+use iggy_common::{IggyExpiry, IggyTimestamp};
 use iggy_object_store::{ManifestSegment, ObjectPrefix, PartitionManifest};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use server_common::Message;
 
 use crate::IggyPartition;
+use crate::iggy_partition::retention_end;
 use crate::long_term::{SEGMENT_PAYLOAD_SIZE, decode_segment, encode_segment};
 use crate::peer_log::{PeerLog, PeerManifestRefusal};
 use crate::state_machine::{
@@ -404,6 +406,49 @@ where
                     .map_err(PeerManifestCommitError::from)
             })
             .collect()
+    }
+
+    /// What the retention of its topic leaves of the manifest that this
+    /// partition committed, once the origin it follows retired and no newer
+    /// manifest comes: the committed manifest without its leading segments
+    /// that expired, or that push the bytes of those before the last one
+    /// past `max_bytes`, held at the consumer barrier. The last segment
+    /// stays. The primary commits it as one more manifest, so every replica
+    /// drops the same segments, and nothing reaches the origin's store.
+    ///
+    /// `None` when retention removes nothing, on a partition that follows no
+    /// peer, and on every replica but a primary that applied the view it
+    /// started.
+    #[must_use]
+    pub fn retired_peer_retention(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<PartitionManifest> {
+        if self.peer_log().is_none() || !self.state_machines_current() {
+            return None;
+        }
+        let committed = self.committed_peer_manifest()?;
+        let trim_point = retention_end(
+            &committed.segments,
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )?;
+        if committed
+            .trim_point
+            .is_some_and(|applied| applied >= trim_point)
+        {
+            return None;
+        }
+        let mut trimmed = committed.clone();
+        trimmed
+            .segments
+            .retain(|segment| segment.end_offset > trim_point);
+        trimmed.trim_point = Some(trim_point);
+        Some(trimmed)
     }
 
     /// Bring the peer log to the committed manifest. Every replica runs it

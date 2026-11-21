@@ -30,6 +30,11 @@
 //! the cluster that the first claim of another cluster names. A later check
 //! that finds another claim latches the peer as changed, and the node reads
 //! nothing from it again while it runs.
+//!
+//! Once committed metadata retires a peer's origin, shard 0 marks its status
+//! retired. The node then checks it no more and runs no job on its store.
+//! Only the polls of consumers still read the segments that its shadow
+//! partitions committed, until their retention removes them.
 
 #![allow(
     clippy::future_not_send,
@@ -100,14 +105,19 @@ pub enum PeerRead {
     Refused,
 }
 
-/// What the node knows about a peer: its identity, and whether its store
-/// answered the last check.
+/// What the node knows about a peer: its identity, whether its store
+/// answered the last check, and whether committed metadata retired it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeerStatus {
     pub identity: PeerIdentity,
     /// The last check got no answer. A verified peer stays verified through
     /// an outage, and the node still reads what the store returns.
     pub unreachable: bool,
+    /// Committed metadata retired the peer's origin. The node checks it no
+    /// more and runs no job on its store. Only a consumer's poll still reads
+    /// the segments that its shadow partitions committed, see
+    /// [`PeerStatus::serves_polls`].
+    pub retired: bool,
 }
 
 /// The status of one peer, shared by every shard of the node. Shard 0 sets
@@ -142,6 +152,8 @@ pub struct PeerObjects<B> {
     origin: String,
     reads: ExecutorObjects<PeerService<B>>,
     status: SharedPeerStatus,
+    /// The reads of consumers' polls, which go on after the origin retired.
+    polls: bool,
 }
 
 impl<B> RemoteObjects for PeerObjects<B>
@@ -153,11 +165,24 @@ where
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        if self.status.get().identity.readable().is_none() {
-            let unread = ObjectStoreError::Unavailable(format!(
-                "this node reads nothing from geo peer {} until a check verifies its store",
-                self.origin
-            ));
+        let status = self.status.get();
+        let served = if self.polls {
+            status.serves_polls()
+        } else {
+            status.serves_jobs()
+        };
+        if !served {
+            let unread = ObjectStoreError::Unavailable(if status.retired {
+                format!(
+                    "geo peer {} retired, so this node follows nothing of it",
+                    self.origin
+                )
+            } else {
+                format!(
+                    "this node reads nothing from geo peer {} until a check verifies its store",
+                    self.origin
+                )
+            });
             return async move { Err(unread) }.boxed_local();
         }
         self.reads.get_range(key, range)
@@ -219,7 +244,25 @@ impl PeerStatus {
         Self {
             identity: self.identity.after(read),
             unreachable: matches!(read, PeerRead::Unreachable),
+            retired: self.retired,
         }
+    }
+
+    /// Whether the node runs jobs on the peer's store: it verified the
+    /// cluster that owns the root, and the origin did not retire.
+    #[must_use]
+    pub const fn serves_jobs(&self) -> bool {
+        !self.retired && self.identity.readable().is_some()
+    }
+
+    /// Whether a consumer's poll may read the peer's store. A retired peer
+    /// is checked no more, so a node that restarted since it retired never
+    /// verified it, and its polls read what its partitions committed unless
+    /// a check found another cluster first.
+    #[must_use]
+    pub const fn serves_polls(&self) -> bool {
+        self.identity.readable().is_some()
+            || (self.retired && !matches!(self.identity, PeerIdentity::Changed { .. }))
     }
 }
 
@@ -291,7 +334,13 @@ impl<B> PeerStore<B> {
     /// started it.
     #[must_use]
     pub fn service(&self) -> Option<&PeerService<B>> {
-        self.cluster_uid().map(|_| &self.service)
+        self.status().serves_jobs().then_some(&self.service)
+    }
+
+    /// Whether committed metadata retired the peer's origin.
+    #[must_use]
+    pub fn retired(&self) -> bool {
+        self.status().retired
     }
 }
 
@@ -315,6 +364,7 @@ where
             origin: self.origin.clone(),
             reads: ExecutorObjects::with_class(self.service.clone(), TierJobClass::Housekeeping),
             status: self.status.clone(),
+            polls: false,
         })
     }
 
@@ -327,6 +377,7 @@ where
             origin: self.origin.clone(),
             reads: ExecutorObjects::with_class(self.service.clone(), TierJobClass::FreshFollow),
             status: self.status.clone(),
+            polls: false,
         })
     }
 
@@ -335,6 +386,7 @@ where
             origin: self.origin.clone(),
             reads: ExecutorObjects::new(self.service.clone()),
             status: self.status.clone(),
+            polls: true,
         }
     }
 }
@@ -542,6 +594,7 @@ mod tests {
             PeerStatus {
                 identity: PeerIdentity::Verified { cluster_uid: PEER },
                 unreachable: true,
+                retired: false,
             },
             "a verified peer stays readable through an outage"
         );
@@ -718,5 +771,77 @@ mod tests {
         );
         assert_eq!(calls.all().len(), 1, "a changed peer gets no request");
         assert_eq!(calls.mutations(), Vec::new());
+    }
+
+    #[test]
+    fn given_a_retired_peer_when_asking_should_run_no_job_and_serve_polls_unless_another_cluster_claimed_it()
+     {
+        let retired = |identity| PeerStatus {
+            identity,
+            unreachable: false,
+            retired: true,
+        };
+        let verified = PeerIdentity::Verified { cluster_uid: PEER };
+
+        assert!(!retired(verified).serves_jobs());
+        assert!(retired(verified).serves_polls());
+        assert!(
+            retired(PeerIdentity::Unverified).serves_polls(),
+            "a node that restarted since the retirement checks no more"
+        );
+        assert!(
+            !retired(PeerIdentity::Changed {
+                cluster_uid: PEER,
+                found: Some(OTHER),
+            })
+            .serves_polls()
+        );
+        assert!(
+            PeerStatus::default()
+                .after(PeerRead::Found(PEER))
+                .serves_jobs()
+        );
+        assert!(retired(verified).after(PeerRead::Found(PEER)).retired);
+    }
+
+    /// Once its origin retired, a peer takes the reads of polls alone: no
+    /// job, no listing of its manifests and no follow of its fresh objects.
+    #[compio::test]
+    async fn given_a_retired_peer_when_reading_should_send_only_the_reads_of_polls() {
+        let key = KeyLayout::new("iggy")
+            .unwrap()
+            .manifest_key(&iggy_object_store::ObjectPrefix {
+                stream_id: 1,
+                topic_id: 1,
+                partition_id: 0,
+                created_revision: 4,
+            });
+        let stored = claimed(PEER);
+        stored
+            .put(&key, PutBody::from_bytes("bytes"), &PutOptions::default())
+            .await
+            .unwrap();
+        let provider = RecordingStore::new(stored);
+        let calls = provider.calls();
+        let peer = peer("dc-b", provider);
+        peer.status.set(PeerStatus {
+            retired: true,
+            ..PeerStatus::default()
+        });
+
+        assert!(peer.service().is_none());
+        assert!(peer.retired());
+        for objects in [peer.manifest_objects(), peer.follow_objects()] {
+            let refused = objects.get_range(&key, 0..5).await;
+            assert!(
+                matches!(&refused, Err(ObjectStoreError::Unavailable(reason)) if reason.contains("retired")),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(calls.all(), Vec::new());
+
+        let polled = peer.objects().get_range(&key, 0..5).await.unwrap();
+        assert_eq!(polled.bytes.as_ref(), b"bytes");
+        assert_eq!(calls.all().len(), 1);
     }
 }

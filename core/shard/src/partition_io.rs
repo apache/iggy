@@ -12401,6 +12401,7 @@ mod tests {
     mod fresh_proofs;
     mod fresh_writes;
     mod geo_commits;
+    mod geo_positions_resume;
     mod manifest_publishes;
     mod object_deletes;
     mod peer_manifest_follows;

@@ -15,11 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::traits::binary_auth::fail_if_not_authenticated;
 use crate::wire_conversions::cluster_metadata_from_wire;
 use crate::{BinaryClient, ClusterClient, ClusterMetadata, IggyError};
+use iggy_binary_protocol::WireName;
 use iggy_binary_protocol::codec::WireEncode;
-use iggy_binary_protocol::codes::GET_CLUSTER_METADATA_CODE;
-use iggy_binary_protocol::requests::system::GetClusterMetadataRequest;
+use iggy_binary_protocol::codes::{GET_CLUSTER_METADATA_CODE, RETIRE_GEO_ORIGIN_CODE};
+use iggy_binary_protocol::requests::system::{GetClusterMetadataRequest, RetireGeoOriginRequest};
 use iggy_binary_protocol::responses::system::get_cluster_metadata::ClusterMetadataResponse;
 
 #[async_trait::async_trait]
@@ -33,5 +35,16 @@ impl<B: BinaryClient> ClusterClient for B {
             .await?;
         let wire_resp = super::decode_response::<ClusterMetadataResponse>(&response)?;
         cluster_metadata_from_wire(wire_resp)
+    }
+
+    async fn retire_geo_origin(&self, origin: &str) -> Result<(), IggyError> {
+        fail_if_not_authenticated(self).await?;
+        let origin = WireName::new(origin).map_err(|_| IggyError::InvalidFormat)?;
+        self.send_raw_with_response(
+            RETIRE_GEO_ORIGIN_CODE,
+            RetireGeoOriginRequest { origin }.to_bytes(),
+        )
+        .await?;
+        Ok(())
     }
 }
