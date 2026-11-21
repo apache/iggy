@@ -1,0 +1,95 @@
+---
+title: Durability
+description: "What a completed write guarantees, how to select topic durability, and what survives a single-node crash."
+---
+
+A successful write has the guarantee selected by the topic's `durability` option. The default, `replicated`, waits for consensus commit and local application without an additional stable-storage barrier. `persisted` also requires a recoverable copy on stable storage at the replication quorum.
+
+**Both policies write data to disk.** The difference is what must have completed before the server reports success. On a single node the quorum is one, so `replicated` provides no second copy and can acknowledge messages that exist only in the server process's memory. For multiple replicas, see [Cluster Durability](/docs/clustering/durability).
+
+## Select the policy when creating the topic
+
+| Topic option | Default | Controls |
+| --- | --- | --- |
+| `durability` | `replicated` | Message production |
+| `consumer_offset_durability` | `replicated` | Explicit consumer-offset stores and deletes |
+
+Both accept `replicated` or `persisted`. They default **independently**: setting `durability=persisted` leaves consumer offsets at `replicated` unless that option is also supplied. Neither inherits the other.
+
+For persisted messages and consumer offsets, create a topic in an existing stream:
+
+```bash
+iggy topic create my-stream my-topic 1 none \
+  --durability persisted \
+  --consumer-offset-durability persisted
+```
+
+These are [topic creation options](/docs/server/topic-options), not `config.toml` settings or server environment overrides. `GetTopic` reports the effective values. Both policies are create-only. Resource updates cannot change them on an existing topic.
+
+The former `enforce_fsync` topic option is rejected. Use `durability` for messages and `consumer_offset_durability` for offsets. The old server-wide `consumer_offset_enforce_fsync` setting has also been removed.
+
+## The single-node write path
+
+With `replicated`, the server commits and applies the operation locally. Message batches can remain in the in-memory partition journal after success. Ordinary segment writes still happen when a flush trigger fires, and a write that triggers a flush can wait for that I/O, but success does not require stable-storage synchronization.
+
+With `persisted`, successful message completion follows this path:
+
+```text
+local commit
+  -> write committed batches to .log and .index
+  -> synchronize both files and any newly created segment names
+  -> reply to the producer
+```
+
+The committed batches are flushed even below the ordinary flush thresholds. **Setting `durability=persisted` is sufficient. Setting `messages_required_to_save=1` is not required.** A single-replica partition does not use the cluster's prepare WAL.
+
+For explicit offset changes, `consumer_offset_durability=persisted` similarly waits for the required local file and directory synchronization before success. On a singleton, persisting an offset does not force earlier `replicated` messages to be flushed. Select both policies as `persisted` when both messages and their stored offsets need that protection.
+
+## Flush scheduling is separate
+
+| Topic option | Default | Effect |
+| --- | --- | --- |
+| `messages_required_to_save` | `1024` | Message-count trigger for ordinary segment writes |
+| `size_of_messages_required_to_save` | `1 MiB` | Byte-count trigger for ordinary segment writes |
+| `segment_size` | `1 GiB` | Soft segment limit. A whole batch can cross it |
+
+A count or byte trigger, or a full active segment, can flush the committed journal prefix. Required persistence, capacity pressure, and lifecycle work can flush earlier. These thresholds are not a maximum data-loss guarantee and do not specify a periodic flush interval. A quiet `replicated` topic can retain messages in process memory while waiting for a trigger.
+
+Reducing the thresholds changes batching and I/O frequency. It does not give `replicated` the stable-storage guarantee of `persisted`.
+
+## What survives a failure
+
+This table describes acknowledged messages on one node, with no later retention or deletion:
+
+| Failure | `replicated` | `persisted` |
+| --- | --- | --- |
+| Process crash, `SIGKILL`, panic, or OOM kill | Unflushed messages can be lost | Acknowledged messages are recoverable from local storage |
+| Machine crash, kernel panic, or power loss | Unflushed messages and unsynchronized file writes can be lost | Acknowledged messages are recoverable if the storage honors synchronization |
+| Storage device lost or irreparably damaged | No surviving local copy is guaranteed | No surviving local copy is guaranteed |
+
+Completed buffered file writes normally remain in Linux's page cache after the server process dies. Messages still in the process's journal do not. Page cache alone does not protect against machine or power failure.
+
+A graceful shutdown drains work and forces a final flush of committed messages, regardless of the thresholds. This depends on the shutdown finishing and its I/O succeeding. A container or service termination that expires its grace period and sends `SIGKILL` is a process crash, not a completed graceful shutdown.
+
+## Which responses prove completion
+
+The policy applies to the completed server operation, not merely to enqueueing a request in a producer or receiving an early dispatch response.
+
+For HTTP production:
+
+| Request | Response | Meaning |
+| --- | --- | --- |
+| Default, or `?ack=replicated` | `201 Created`, `Iggy-Durability: replicated` or `persisted` | The write completed under the topic's message policy |
+| `?ack=none` | `202 Accepted`, `Iggy-Durability: none` | Dispatch was accepted. Commit and persistence were not awaited |
+
+The query value `ack=replicated` selects the awaited path even when the topic uses `persisted`. It does not override the topic policy.
+
+**Poll auto-commit is asynchronous.** A successful poll does not confirm that its offset write committed or became durable, even with `consumer_offset_durability=persisted`. When processing needs an explicit offset completion guarantee, store the offset explicitly and await success.
+
+## Recovery and cost
+
+Recovery validates segment batches and partition identity. It can truncate an incomplete tail and rebuild a missing or torn sparse index. Interior damage, gaps, or intact records beyond damaged data can require refusal or peer repair instead of truncation. A single node cannot fetch a missing copy from another replica. See [Storage Engine](/docs/server/storage-engine).
+
+`persisted` adds synchronization to the completion path. Its latency and throughput depend on storage, filesystem, batching, and concurrency. Measure both policies on the intended hardware rather than applying results from the removed `enforce_fsync` configuration. The [benchmarking guide](/docs/server/benchmarking) explains how to reproduce a workload.
+
+The implementation references are the [topic policy definitions](https://github.com/apache/iggy/blob/server-0.10.0/core/common/src/types/options/durability.rs), [partition completion paths](https://github.com/apache/iggy/blob/server-0.10.0/core/partitions/src/iggy_partition.rs), and [HTTP response handling](https://github.com/apache/iggy/blob/server-0.10.0/core/server/src/http/handlers.rs).

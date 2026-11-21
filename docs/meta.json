@@ -1,0 +1,19 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "introduction",
+    "tutorials",
+    "troubleshooting",
+    "server",
+    "clustering",
+    "binary-protocol",
+    "gateways",
+    "connectors",
+    "sdk",
+    "cli",
+    "web_ui",
+    "ai",
+    "faq"
+  ]
+}
