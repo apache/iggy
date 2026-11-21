@@ -31,7 +31,8 @@
 
 use crate::shards_table::ShardsTable;
 use crate::{
-    COLD_POLL_BUDGET, ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender,
+    COLD_POLL_BUDGET, ConsumerOffsetRead, ExternalGroupRead, IggyShard, PartitionRead,
+    PartitionReadReply, Sender,
 };
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
@@ -195,10 +196,9 @@ where
                 return;
             }
         }
-        let rejection = self.partition_read_rejection(namespace, &read).or_else(|| {
-            read.polling_consumer()
-                .and_then(|consumer| self.geo_position_refusal(namespace, consumer))
-        });
+        let rejection = self
+            .partition_read_rejection(namespace, &read)
+            .or_else(|| self.geo_read_refusal(namespace, &read));
         if let Some(error) = rejection {
             let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
@@ -370,14 +370,20 @@ where
                     current_offset: 0,
                 }
             }
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
-                .external_group_offset_read(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
-                    PartitionReadReply::ConsumerOffset {
-                        stored,
-                        current_offset,
-                    }
-                }),
+            PartitionRead::ExternalGroupOffsetOnPrimary { group, .. } => match group {
+                ExternalGroupRead::Group(group_id) => {
+                    partitions.external_group_offset_read(&namespace, group_id)
+                }
+                ExternalGroupRead::Missing(name) => {
+                    partitions.external_position_read(&namespace, name)
+                }
+            }
+            .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                PartitionReadReply::ConsumerOffset {
+                    stored,
+                    current_offset,
+                }
+            }),
             PartitionRead::GroupOffsetState { group_id } => partitions
                 .group_offset_state(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {

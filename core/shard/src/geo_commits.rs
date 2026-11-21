@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The offsets that consumer groups of geo and shadow partitions store
-//! themselves, which are answered only once the node's store holds their
-//! positions.
+//! The offsets that consumers of geo and shadow partitions store themselves,
+//! which are answered only once the node's store holds their positions.
+//!
+//! The consumers are consumer groups, the external offsets of consumer
+//! groups, as the Kafka gateway sends them, and plain consumers.
 //!
 //! Such a `StoreConsumerOffset` commits through the partition's consensus
 //! as any other. Its reply then waits on the shard, and the shard asks
 //! shard 0 for a round of the commit's topic, see
 //! [`crate::geo_positions`]. In the round the primary folds the commit into
-//! the group's position, and shard 0 stores the node's object of the log.
+//! the consumer's position, and shard 0 stores the node's object of the log.
 //! The reply goes out once the store took an object that holds the
 //! position. Only one round runs at a time, and a round of held commits
 //! starts at least `[geo] consumer_offset_upload_interval` after the last
@@ -38,7 +40,8 @@
 //! answered `TransientNotCommitted`. Its commit stands, and the client sends
 //! the same request again: the partition answers it from its dedup table,
 //! and the reply waits again, on the new primary. A commit whose group was
-//! deleted meanwhile has no position to carry and gets its reply.
+//! deleted meanwhile has no position to carry and gets its reply. A plain
+//! consumer is never deleted.
 //!
 //! Only the stores on a log that the rounds store wait, see
 //! [`crate::geo_positions::topic_log`]. A store on a detached shadow topic
@@ -54,10 +57,10 @@ use std::time::Duration;
 use consensus::{MetadataHandle, PartitionsHandle, build_deny_reply_from_request_header};
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::{
-    AckLevel, GenericHeader, KIND_CONSUMER_GROUP, Operation, ReplyHeader, RoutedRequestHeader,
-    WireDecode, WireIdentifier,
+    AckLevel, GenericHeader, KIND_CONSUMER, KIND_CONSUMER_GROUP, KIND_EXTERNAL_GROUP, Operation,
+    ReplyHeader, RoutedRequestHeader, WireDecode, WireIdentifier,
 };
-use iggy_common::{GeoTopicDurations, IggyError};
+use iggy_common::{ConsumerKind, GeoTopicDurations, IggyError, calculate_32};
 use iggy_object_store::GeoLog;
 use journal::superblock::SuperblockStore;
 use message_bus::{MessageBus, is_auto_commit_client};
@@ -121,9 +124,17 @@ impl<R> Default for HeldCommits<R> {
     }
 }
 
+/// The local reader whose offset a held commit stored: the kind of its
+/// offsets, and the id of its group or of the plain consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeldReader {
+    pub kind: ConsumerKind,
+    pub id: u32,
+}
+
 struct Held<R> {
     reply: R,
-    group_id: u32,
+    reader: HeldReader,
     created_revision: u64,
     /// The bus's monotonic clock when the commit was held.
     since: u64,
@@ -133,19 +144,19 @@ struct Held<R> {
 }
 
 impl<R> HeldCommits<R> {
-    /// Hold the reply of a commit of the group `group_id` on the partition
-    /// of `namespace`, in its incarnation `created_revision`.
+    /// Hold the reply of a commit of `reader` on the partition of
+    /// `namespace`, in its incarnation `created_revision`.
     pub fn hold(
         &mut self,
         namespace: IggyNamespace,
-        group_id: u32,
+        reader: HeldReader,
         created_revision: u64,
         since: u64,
         reply: R,
     ) {
         self.partitions.entry(namespace).or_default().push(Held {
             reply,
-            group_id,
+            reader,
             created_revision,
             since,
             covered: None,
@@ -185,7 +196,7 @@ impl<R> HeldCommits<R> {
             .collect()
     }
 
-    /// Mark the commits of the partition of `namespace` whose groups'
+    /// Mark the commits of the partition of `namespace` whose readers'
     /// positions folded what they committed as covered by `round`, whose
     /// report carries those positions to the object of `log`. A commit that
     /// an earlier round covered and that got no answer from it is weighed
@@ -197,7 +208,7 @@ impl<R> HeldCommits<R> {
         created_revision: u64,
         round: u64,
         log: &GeoLog,
-        folded: impl Fn(u32) -> bool,
+        folded: impl Fn(HeldReader) -> bool,
     ) -> usize {
         let Some(held) = self.partitions.get_mut(&namespace) else {
             return 0;
@@ -210,7 +221,7 @@ impl<R> HeldCommits<R> {
             if commit.covered.as_ref().is_some_and(|(at, _)| *at >= round) {
                 continue;
             }
-            commit.covered = folded(commit.group_id).then(|| (round, log.clone()));
+            commit.covered = folded(commit.reader).then(|| (round, log.clone()));
             covered += usize::from(commit.covered.is_some());
         }
         covered
@@ -256,13 +267,13 @@ impl<R> HeldCommits<R> {
         &mut self,
         now: u64,
         timeout: u64,
-        mut check: impl FnMut(IggyNamespace, u64, u32) -> CommitCheck,
+        mut check: impl FnMut(IggyNamespace, u64, HeldReader) -> CommitCheck,
     ) -> Vec<(R, CommitAnswer)> {
         let mut answers = Vec::new();
         self.partitions.retain(|namespace, held| {
             let mut kept = Vec::with_capacity(held.len());
             for commit in held.drain(..) {
-                let answer = match check(*namespace, commit.created_revision, commit.group_id) {
+                let answer = match check(*namespace, commit.created_revision, commit.reader) {
                     CommitCheck::NotLed => Some(CommitAnswer::Uncertain),
                     CommitCheck::GroupGone | CommitCheck::LogGone => Some(CommitAnswer::Committed),
                     CommitCheck::Waiting if now.saturating_sub(commit.since) >= timeout => {
@@ -575,26 +586,32 @@ impl HeldReply {
     }
 }
 
-/// A committed group offset store that the shard's pump holds, see
+/// A committed offset store that the shard's pump holds, see
 /// [`LifecycleFrame::GeoCommitHeld`].
 pub struct HeldGeoCommit {
     namespace: IggyNamespace,
-    group_id: u32,
+    reader: HeldReader,
     created_revision: u64,
     reply: HeldReply,
 }
 
-/// A group offset store whose reply waits for its position, decided before
-/// the store reaches its partition.
+/// An offset store whose reply waits for its position, decided before the
+/// store reaches its partition.
 pub struct GeoCommitHold {
     namespace: IggyNamespace,
-    group_id: u32,
+    reader: HeldReader,
     created_revision: u64,
     request: RoutedRequestHeader,
     own: TaggedSender,
 }
 
 impl GeoCommitHold {
+    /// The reader whose store the hold waits for.
+    #[cfg(test)]
+    pub(crate) const fn reader(&self) -> HeldReader {
+        self.reader
+    }
+
     /// Hand the committed reply of the store to the shard's pump to hold. A
     /// pump that takes no frame cannot hold it, so the store is answered as
     /// uncertain, and the client replays it.
@@ -606,7 +623,7 @@ impl GeoCommitHold {
         let refused = reply.clone();
         let frame = ShardFrame::lifecycle(LifecycleFrame::GeoCommitHeld(Box::new(HeldGeoCommit {
             namespace: self.namespace,
-            group_id: self.group_id,
+            reader: self.reader,
             created_revision: self.created_revision,
             reply: HeldReply {
                 request: self.request,
@@ -640,9 +657,10 @@ where
     SB: SuperblockStore,
 {
     /// Whether the reply of `request` waits for the position it stores: a
-    /// `StoreConsumerOffset` that a consumer group sent itself, with a
-    /// quorum ack, on a partition here of a log that the rounds store, while
-    /// commits are held and this node stores positions.
+    /// `StoreConsumerOffset` that a consumer sent itself, with a quorum ack,
+    /// on a partition here of a log that the rounds store, while commits are
+    /// held and this node stores positions. The consumer is a group, the
+    /// external offsets of a group or a plain consumer.
     pub(crate) fn geo_commit_hold(
         &self,
         request: &Message<RoutedRequestHeader>,
@@ -671,11 +689,29 @@ where
         }
         self.topic_objects()?;
         let store = StoreConsumerOffsetRequest::decode_from(request.body()).ok()?;
-        if store.consumer.kind != KIND_CONSUMER_GROUP || store.ack != AckLevel::Quorum {
+        if store.ack != AckLevel::Quorum {
             return None;
         }
-        let WireIdentifier::Numeric(group_id) = store.consumer.id else {
-            return None;
+        // The server gave a group's store the group's numeric id. A plain
+        // consumer keeps its own, and a name stands for its hash.
+        let reader = match (store.consumer.kind, &store.consumer.id) {
+            (KIND_CONSUMER_GROUP, WireIdentifier::Numeric(id)) => HeldReader {
+                kind: ConsumerKind::ConsumerGroup,
+                id: *id,
+            },
+            (KIND_EXTERNAL_GROUP, WireIdentifier::Numeric(id)) => HeldReader {
+                kind: ConsumerKind::ExternalGroup,
+                id: *id,
+            },
+            (KIND_CONSUMER, WireIdentifier::Numeric(id)) => HeldReader {
+                kind: ConsumerKind::Consumer,
+                id: *id,
+            },
+            (KIND_CONSUMER, WireIdentifier::String(name)) => HeldReader {
+                kind: ConsumerKind::Consumer,
+                id: calculate_32(name.as_str().as_bytes()),
+            },
+            _ => return None,
         };
         self.plane
             .metadata()
@@ -693,7 +729,7 @@ where
             .flatten()?;
         Some(GeoCommitHold {
             namespace,
-            group_id,
+            reader,
             created_revision,
             request: *header,
             own: self.senders.get(self.id as usize)?.clone(),
@@ -706,7 +742,7 @@ where
     pub(crate) fn on_geo_commit_held(&self, commit: HeldGeoCommit) {
         let HeldGeoCommit {
             namespace,
-            group_id,
+            reader,
             created_revision,
             reply,
         } = commit;
@@ -724,7 +760,7 @@ where
         }
         self.geo_commits.held.borrow_mut().hold(
             namespace,
-            group_id,
+            reader,
             created_revision,
             self.bus.monotonic_micros(),
             reply,
@@ -773,7 +809,7 @@ where
                 partition.created_revision(),
                 round,
                 &reported.log,
-                |group_id| partition.geo_group_folded(group_id),
+                |reader| partition.geo_folded(reader.kind, reader.id),
             );
         }
         let uncovered = held.uncovered(round);
@@ -823,11 +859,11 @@ where
         let answers = {
             let partitions = self.plane.partitions();
             let mut led = BTreeMap::new();
-            let mut groups = BTreeMap::new();
+            let mut readers = BTreeMap::new();
             self.geo_commits.held.borrow_mut().expire(
                 now,
                 micros(COMMIT_HOLD_TIMEOUT),
-                |namespace, created_revision, group_id| {
+                |namespace, created_revision, reader| {
                     let led = *led.entry((namespace, created_revision)).or_insert_with(|| {
                         partitions.get_by_ns(&namespace).is_some_and(|partition| {
                             partition.created_revision() == created_revision
@@ -837,9 +873,14 @@ where
                     if !led {
                         return CommitCheck::NotLed;
                     }
-                    *groups
-                        .entry((namespace.stream_id(), namespace.topic_id(), group_id))
-                        .or_insert_with(|| self.geo_commit_check(namespace, group_id, origin))
+                    *readers
+                        .entry((
+                            namespace.stream_id(),
+                            namespace.topic_id(),
+                            reader.kind.index(),
+                            reader.id,
+                        ))
+                        .or_insert_with(|| self.geo_commit_check(namespace, reader, origin))
                 },
             )
         };
@@ -851,7 +892,7 @@ where
             tracing::warn!(
                 shard = self.id,
                 commits = uncertain,
-                "consumer group offset stores whose positions were not stored in time, or whose \
+                "consumer offset stores whose positions were not stored in time, or whose \
                  partitions are no longer led here, are answered as uncertain"
             );
         }
@@ -860,19 +901,25 @@ where
         }
     }
 
-    /// Where a held commit of the group `group_id` on the partition of
-    /// `namespace` stands in the metadata.
-    fn geo_commit_check(&self, namespace: IggyNamespace, group_id: u32, origin: &str) -> CommitCheck
+    /// Where a held commit of `reader` on the partition of `namespace` stands
+    /// in the metadata.
+    fn geo_commit_check(
+        &self,
+        namespace: IggyNamespace,
+        reader: HeldReader,
+        origin: &str,
+    ) -> CommitCheck
     where
         M: StreamsFrontend,
     {
         self.plane.metadata().mux_stm.streams().read(|inner| {
-            let group_exists = inner
-                .items
-                .get(namespace.stream_id())
-                .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .is_some_and(|topic| topic.consumer_groups.contains_key(&u64::from(group_id)));
-            if !group_exists {
+            let reader_exists = reader.kind == ConsumerKind::Consumer
+                || inner
+                    .items
+                    .get(namespace.stream_id())
+                    .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                    .is_some_and(|topic| topic.consumer_groups.contains_key(&u64::from(reader.id)));
+            if !reader_exists {
                 CommitCheck::GroupGone
             } else if partition_log(inner, namespace, origin).is_none() {
                 CommitCheck::LogGone
@@ -940,12 +987,19 @@ mod tests {
         IggyNamespace::new(1, 1, partition_id)
     }
 
+    fn group(id: u32) -> HeldReader {
+        HeldReader {
+            kind: ConsumerKind::ConsumerGroup,
+            id,
+        }
+    }
+
     fn held(commits: &[(usize, u32, u64, &'static str)]) -> HeldCommits<&'static str> {
         let mut held = HeldCommits::default();
         for (partition_id, group_id, held_at, reply) in commits {
             held.hold(
                 partition(*partition_id),
-                *group_id,
+                group(*group_id),
                 REVISION,
                 *held_at,
                 *reply,
@@ -954,7 +1008,7 @@ mod tests {
         held
     }
 
-    fn all_folded(_: u32) -> bool {
+    fn all_folded(_: HeldReader) -> bool {
         true
     }
 
@@ -1000,8 +1054,8 @@ mod tests {
     fn given_a_commit_its_group_has_not_folded_when_a_round_stores_should_wait_for_the_next() {
         let mut held = held(&[(0, BILLING, 0, "late"), (0, AUDIT, 0, "folded")]);
 
-        let covered = held.cover(partition(0), REVISION, ROUND_ONE, &log(1), |group_id| {
-            group_id == AUDIT
+        let covered = held.cover(partition(0), REVISION, ROUND_ONE, &log(1), |reader| {
+            reader == group(AUDIT)
         });
         let (released, _) = held.published(ROUND_ONE, &BTreeSet::from([log(1)]));
         held.cover(partition(0), REVISION, ROUND_TWO, &log(1), all_folded);

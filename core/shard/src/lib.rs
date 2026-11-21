@@ -535,7 +535,7 @@ pub enum PartitionRead {
     },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffsetOnPrimary {
-        group_id: u32,
+        group: ExternalGroupRead,
         metadata: metadata::stm::stream::PollMetadata,
     },
     /// Cooperative-rebalance classification: the group's last-polled and
@@ -551,6 +551,17 @@ pub enum PartitionRead {
     ResolveSegmentDeleteOffset {
         count: u32,
     },
+}
+
+/// The group whose external offset an [`PartitionRead::ExternalGroupOffsetOnPrimary`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalGroupRead {
+    /// A group of this cluster, by its id.
+    Group(u32),
+    /// A group that this cluster does not have, by its name. On a geo or
+    /// shadow topic, a position that another datacenter published for its
+    /// external offsets answers it.
+    Missing(String),
 }
 
 impl PartitionRead {

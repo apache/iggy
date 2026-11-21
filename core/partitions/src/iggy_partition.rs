@@ -6704,11 +6704,7 @@ where
 
     fn get_consumer_offset(&self, consumer: PollingConsumer) -> Option<u64> {
         match consumer {
-            PollingConsumer::Consumer(id, _) => self
-                .consumer_offsets
-                .borrow()
-                .get(&id)
-                .map(|co| co.offset.load(Ordering::Relaxed)),
+            PollingConsumer::Consumer(id, _) => self.geo_consumer_offset(id),
             PollingConsumer::ConsumerGroup(group_id, _) => self.geo_group_offset(group_id),
         }
     }

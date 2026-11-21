@@ -44,8 +44,8 @@ use configs::geo::GeoConfig;
 use consensus::MetadataHandle;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    GeoLog, GeoPosition, KeyLayout, MAX_POSITIONS_OBJECT_LEN, ObjectStore, PositionsObject,
-    TierExecutor, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
+    GeoLog, GeoPosition, KeyLayout, MAX_POSITIONS_OBJECT_LEN, ObjectStore, PositionHolder,
+    PositionsObject, TierExecutor, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -82,8 +82,8 @@ struct State {
 
 type Objects = BTreeMap<String, (String, PositionsObject)>;
 
-/// The positions of one partition of a log, by group name.
-type PartitionPositions = BTreeMap<String, GeoPosition>;
+/// The positions of one partition of a log, by holder.
+type PartitionPositions = BTreeMap<PositionHolder, GeoPosition>;
 
 /// What every shard of a node needs to carry its groups' positions, `None`
 /// on a node without an origin.
@@ -322,17 +322,17 @@ impl State {
     }
 }
 
-/// The highest position of each group across the objects of a peer's nodes,
-/// by log and partition id.
+/// The highest position of each holder across the objects of a peer's
+/// nodes, by log and partition id.
 fn merged(objects: &Objects) -> HashMap<&GeoLog, BTreeMap<u32, PartitionPositions>> {
     let mut merged: HashMap<&GeoLog, BTreeMap<u32, PartitionPositions>> = HashMap::new();
     for (_, object) in objects.values() {
         let log = merged.entry(&object.key.log).or_default();
-        for (partition_id, groups) in &object.partitions {
+        for (partition_id, holders) in &object.partitions {
             let partition = log.entry(*partition_id).or_default();
-            for (name, position) in groups {
+            for (holder, position) in holders {
                 partition
-                    .entry(name.clone())
+                    .entry(holder.clone())
                     .and_modify(|held| *held = (*held).max(*position))
                     .or_insert(*position);
             }
@@ -437,7 +437,7 @@ mod tests {
                     (
                         *partition_id,
                         BTreeMap::from([(
-                            "billing".to_owned(),
+                            PositionHolder::Group("billing".to_owned()),
                             GeoPosition {
                                 reset: *reset,
                                 value: PositionValue::Offset(*offset),
@@ -461,7 +461,7 @@ mod tests {
 
         let log = &objects["a"].1.key.log;
         assert_eq!(
-            merged[log][&0]["billing"],
+            merged[log][&0][&PositionHolder::Group("billing".to_owned())],
             GeoPosition {
                 reset: 1,
                 value: PositionValue::Offset(10)
@@ -489,7 +489,12 @@ mod tests {
         let log = &objects["a"].1.key.log;
         let offsets: Vec<(u32, PositionValue)> = merged[log]
             .iter()
-            .map(|(partition_id, groups)| (*partition_id, groups["billing"].value))
+            .map(|(partition_id, groups)| {
+                (
+                    *partition_id,
+                    groups[&PositionHolder::Group("billing".to_owned())].value,
+                )
+            })
             .collect();
         assert_eq!(
             offsets,

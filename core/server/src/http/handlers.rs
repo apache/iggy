@@ -1633,7 +1633,12 @@ pub(in crate::http) async fn get_consumer_offset(
     let wire =
         consumer_offset_wire_request(&stream_id, &topic_id, &query).map_err(ReadError::Rejected)?;
     let namespace = match resolve_consumer_offset_request(&state.shard, &wire) {
-        Ok((namespace, _, target)) if !matches!(target, ConsumerOffsetTarget::MissingGroup) => {
+        Ok((namespace, _, target))
+            if !matches!(
+                target,
+                ConsumerOffsetTarget::MissingGroup | ConsumerOffsetTarget::MissingExternalGroup(_)
+            ) =>
+        {
             namespace
         }
         _ => return Err(ReadError::NotFound),
