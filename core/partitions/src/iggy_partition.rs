@@ -14490,7 +14490,7 @@ where
     /// its job.
     ///
     /// A partition that places its batches has no objects of this kind. Its
-    /// jobs are those of [`Self::begin_long_term_delete`], which no
+    /// jobs are those of `Self::begin_long_term_delete`, which no
     /// watermark bounds.
     pub fn begin_object_delete(
         &mut self,

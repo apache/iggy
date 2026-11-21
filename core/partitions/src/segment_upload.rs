@@ -152,10 +152,10 @@ impl<E: TierExecutor> SegmentUploader for ExecutorUploader<E> {
 
 /// Store the `.log` and then the `.index` of `upload` under the keys of a
 /// segment that starts at the record's first offset, as
-/// [`upload_segment_under`] does.
+/// `upload_segment_under` does.
 ///
 /// # Errors
-/// Those of [`upload_segment_under`].
+/// Those of `upload_segment_under`.
 pub async fn upload_segment<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
