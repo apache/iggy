@@ -1797,6 +1797,44 @@ where
         partition.on_request(message, reply).await;
     }
 
+    /// [`Self::on_request_with_reply`] for the request that commits where a
+    /// client's batch sits in the object store, see
+    /// [`IggyPartition::on_placed_request`]. Only the shard's own upload path
+    /// calls it, once the object is stored.
+    pub async fn on_placed_request_with_reply(
+        &self,
+        message: <VsrConsensus<B> as Consensus>::Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) {
+        let namespace = IggyNamespace::from_raw(message.header().group);
+        let partition = (!self.is_tombstoned(&namespace))
+            .then(|| self.get_mut_by_ns(&namespace))
+            .flatten();
+        let Some(partition) = partition else {
+            warn!(
+                target: "iggy.partitions.diag",
+                plane = "partitions",
+                namespace_raw = namespace.inner(),
+                "dropping a placed request: its partition is gone"
+            );
+            Self::answer_waiter(
+                reply,
+                message.header(),
+                IggyError::TransientNotAccepted.as_code(),
+            );
+            return;
+        };
+        partition.on_placed_request(message, reply).await;
+    }
+
+    /// Whether the partition of `namespace` is here and places its batches,
+    /// so a client's send goes to the object store before it is committed.
+    #[must_use]
+    pub fn places_batches(&self, namespace: &IggyNamespace) -> bool {
+        self.get_by_ns(namespace)
+            .is_some_and(IggyPartition::places_batches)
+    }
+
     /// Deny a request that never reached its partition on the submit channel
     /// it arrived with, if any. The bus path has no waiter to answer and keeps
     /// its drop-and-warn behaviour.

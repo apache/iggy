@@ -1513,16 +1513,28 @@ handshake_grace = "10 s"
 #max_attempts = 3
 #retry_delay = "200 ms"
 #max_retry_delay = "5 s"
+# The shortest time between the starts of two uploads of fresh objects on one
+# shard, so a shard creates at most one object per interval, plus the objects
+# that fill up to their size before it passes. A send that finds no upload in
+# flight and the last one started at least this long ago is uploaded at once,
+# so a lone producer does not wait. "0" uploads as soon as a slot of
+# 'jobs.fresh_uploads' is free. A producer that waits for each answer before
+# its next send completes one send per max(interval, upload + commit). A longer
+# interval means fewer and larger objects, so fewer store requests, and a
+# longer wait for every producer. Up to 10 s.
+#fresh_upload_interval = "10 ms"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
 # alone. Only segment uploads and object deletes go through these caps so
 # far, so the fetch caps take no effect yet. They take effect once cold reads
-# go through the tier service.
+# go through the tier service. 'fresh_uploads' are the uploads that producers
+# wait for. They have slots of their own and never wait behind 'uploads'.
 #[tiered_storage.jobs]
 #demand_fetches = 16
 #demand_fetch_bytes = "64 MiB"
 #uploads = 2
 #upload_bytes = "2 GiB"
+#fresh_uploads = 4
 #speculative_fetches = 4
 #speculative_fetch_bytes = "32 MiB"
 #deletes = 2

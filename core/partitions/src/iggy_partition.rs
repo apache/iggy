@@ -62,6 +62,7 @@ use consensus::{
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::batch::BatchProducer;
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch, stored_header};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_offsets::{
@@ -3890,7 +3891,7 @@ where
         let body = message
             .as_slice()
             .get(std::mem::size_of::<RoutedRequestHeader>()..message.header().size as usize)?;
-        let count = BatchHeader::decode(body).ok()?.message_count;
+        let count = stored_header(body).ok()?.message_count;
         // The batch's LAST offset, not one past it: the claim adds the exclusive
         // successor and the lease itself, so a ceiling one too high wastes an
         // offset on every claim and overstates what a crash can lose.
@@ -5295,7 +5296,7 @@ where
         let batch = message
             .as_slice()
             .get(std::mem::size_of::<RoutedRequestHeader>()..)
-            .and_then(|body| BatchHeader::decode(body).ok())
+            .and_then(|body| stored_header(body).ok())
             .ok_or(IggyError::InvalidCommand)?;
         let Some(producer) = batch.producer else {
             return Ok(ProducerAdmission::Append);
@@ -5326,7 +5327,7 @@ where
             let batch = entry
                 .as_slice()
                 .get(std::mem::size_of::<PrepareHeader>()..)
-                .and_then(|body| BatchHeader::decode(body).ok())
+                .and_then(|body| stored_header(body).ok())
                 .ok_or(IggyError::TransientNotAccepted)?;
             if let Some(producer) = batch
                 .producer
@@ -8098,8 +8099,75 @@ where
         message: Message<RoutedRequestHeader>,
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
-        self.admit_request(message, reply).await;
+        self.admit_request(message, reply, false).await;
         self.release_send_space();
+    }
+
+    /// [`Self::on_request`] for the `SendMessages` request of a client whose
+    /// batch this node stored in the object store: the request carries the
+    /// client's header and a placed batch in place of its messages.
+    ///
+    /// Only the node's own upload path may call it. A request from a client
+    /// goes through [`Self::on_request`], which takes no placed batch.
+    ///
+    /// # Panics
+    /// As [`Self::on_request`].
+    #[allow(clippy::future_not_send)]
+    pub async fn on_placed_request(
+        &mut self,
+        message: Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) {
+        self.admit_request(message, reply, true).await;
+        self.release_send_space();
+    }
+
+    /// Whether this replica answers every client request as not accepted for
+    /// now: it is not a primary in normal status, or it is on its way out.
+    fn refuses_requests(&self) -> bool {
+        let consensus = self.consensus();
+        self.fatal.is_some()
+            || self.maintenance.shutdown.is_some()
+            || self.io_active.is_retiring()
+            || self.transition.is_some()
+            || self.materialization_missing
+            || consensus.is_follower()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+    }
+
+    /// Whether a send may go to the object store for this partition now: the
+    /// partition places its batches, and this replica would not refuse the
+    /// request that commits where they sit. The node's upload path asks
+    /// before it stores a send's messages, and again before it hands the
+    /// request over.
+    #[must_use]
+    pub fn takes_placed_sends(&self) -> bool {
+        self.places_batches() && !self.refuses_requests()
+    }
+
+    /// Whether [`Self::on_placed_request`] has room for one more request. A
+    /// request handed over without room is answered as not accepted.
+    #[must_use]
+    pub fn has_request_room(&self) -> bool {
+        self.consensus()
+            .with_pipeline(|pipeline| !pipeline.request_queue_full())
+    }
+
+    /// Whether `message` is a request [`Self::on_placed_request`] takes: a
+    /// `SendMessages` whose body is one placed batch for this partition.
+    fn is_placed_request(&self, message: &Message<RoutedRequestHeader>) -> bool {
+        let header = message.header();
+        header.operation == Operation::SendMessages
+            && header.size as usize == size_of::<RoutedRequestHeader>() + PLACED_BATCH_SIZE
+            && message
+                .as_slice()
+                .get(size_of::<RoutedRequestHeader>()..header.size as usize)
+                .and_then(|body| PlacedBatch::decode(body).ok())
+                .is_some_and(|placed| {
+                    placed.header.message_count > 0
+                        && placed.header.partition_id == self.namespace().partition_id() as u64
+                })
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -8107,6 +8175,7 @@ where
         &mut self,
         message: Message<RoutedRequestHeader>,
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+        placed: bool,
     ) {
         // Taken by whichever arm answers: the deny paths, the NoAck fast path,
         // or the pipeline entry that fires it at commit. Exactly one runs.
@@ -8128,7 +8197,9 @@ where
                 },
             );
 
-            let message = if message.header().operation == Operation::SendMessages {
+            let message = if placed {
+                message
+            } else if message.header().operation == Operation::SendMessages {
                 // Skip the batch-checksum pass: on the partition ingest path
                 // nothing reads it before `stamp_prepare_for_persistence`
                 // recomputes it over the stamped header. An already-canonical
@@ -8179,16 +8250,24 @@ where
                 .await;
                 return;
             }
-            if self.fatal.is_some()
-                || self.maintenance.shutdown.is_some()
-                || self.io_active.is_retiring()
-                || self.transition.is_some()
-                || self.materialization_missing
-                || consensus.is_follower()
-                || !consensus.is_normal()
-                || consensus.is_transferring()
-                || committed_history_pending
+            // A partition takes what its segments hold. One that places its
+            // batches gets them from the node's upload path, and a send that
+            // reached it any other way was stored nowhere.
+            if placed
+                != (self.places_batches() && message.header().operation == Operation::SendMessages)
+                || (placed && !self.is_placed_request(&message))
             {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::FeatureUnavailable.as_code(),
+                    "send does not carry what the partition's segments hold",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            if self.refuses_requests() || committed_history_pending {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
