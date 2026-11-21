@@ -127,6 +127,7 @@ struct StagedSend {
     reply: SubmitReply,
     /// The number of the object that holds the messages.
     object: u64,
+    object_id: FreshObjectId,
     /// Bytes of the messages, which count against
     /// [`FRESH_PENDING_BYTES_MAX`] until the request leaves.
     bytes: u64,
@@ -219,6 +220,12 @@ pub struct FreshWrites {
     started_at: u64,
     /// Results of uploads whose frame the inbox refused, for the next tick.
     undelivered: Rc<RefCell<Vec<FinishedFreshUpload>>>,
+    /// The objects that hold the messages of a send that is not answered,
+    /// each with how many such sends: from the moment a send joins the open
+    /// window until it is refused or its request commits. A send in between
+    /// may be in no journal yet, so nothing else says that its object is
+    /// needed.
+    awaited: Rc<RefCell<BTreeMap<u128, usize>>>,
 }
 
 impl Default for FreshWrites {
@@ -240,11 +247,42 @@ impl Default for FreshWrites {
             sequence: Cell::new(0),
             started_at: IggyTimestamp::now().as_micros(),
             undelivered: Rc::default(),
+            awaited: Rc::default(),
         }
     }
 }
 
 impl FreshWrites {
+    /// The fresh objects of this shard that the sweep must keep whatever
+    /// the partitions name: the open window, every object that is not
+    /// stored yet, and every object with a send that is not answered,
+    /// whether the send waits for its partition or for its commit.
+    pub(crate) fn awaited_objects(&self) -> BTreeSet<u128> {
+        let mut objects: BTreeSet<u128> = self.awaited.borrow().keys().copied().collect();
+        objects.extend(self.window.borrow().as_ref().map(|window| window.id.get()));
+        objects.extend(self.closed.borrow().values().map(|object| object.id.get()));
+        objects
+    }
+
+    /// Keep `send` at the end of the queue of `namespace`, its bytes in the
+    /// share of its partition, and its object among the awaited ones.
+    fn stage_send(&self, namespace: IggyNamespace, send: StagedSend) {
+        *self
+            .awaited
+            .borrow_mut()
+            .entry(send.object_id.get())
+            .or_default() += 1;
+        self.pending_bytes
+            .set(self.pending_bytes.get() + send.bytes);
+        self.hold_in_share(namespace, send.bytes);
+        self.staged_sends.set(self.staged_sends.get() + 1);
+        self.staged
+            .borrow_mut()
+            .entry(namespace)
+            .or_default()
+            .push_back(send);
+    }
+
     /// Whether the object `sequence` still takes sends or is not stored.
     fn is_unsettled(&self, sequence: u64) -> bool {
         self.closed.borrow().contains_key(&sequence)
@@ -510,21 +548,17 @@ where
         window.object.push(blob);
         window.partitions.insert(namespace);
         let full = window.object.len() >= FRESH_OBJECT_BYTES;
-        fresh
-            .staged
-            .borrow_mut()
-            .entry(namespace)
-            .or_default()
-            .push_back(StagedSend {
+        fresh.stage_send(
+            namespace,
+            StagedSend {
                 request: placed,
                 reply,
                 object: window.sequence,
+                object_id: window.id,
                 bytes,
-            });
+            },
+        );
         drop(slot);
-        fresh.pending_bytes.set(fresh.pending_bytes.get() + bytes);
-        fresh.hold_in_share(namespace, bytes);
-        fresh.staged_sends.set(fresh.staged_sends.get() + 1);
         if full {
             fresh.close_window();
         }
@@ -920,6 +954,7 @@ where
             let Some(StagedSend {
                 request,
                 reply,
+                object_id,
                 bytes,
                 ..
             }) = send
@@ -933,11 +968,14 @@ where
                 .await;
             // Awaited off the pump, as for any other submit: the commit that
             // fires the receiver needs the pump to keep draining acks.
+            let awaited = Rc::clone(&fresh.awaited);
+            let object = object_id.get();
             let commit_latency = self.metrics.fresh_commit_latency();
             let handed_at = Instant::now();
             self.bus.spawn(async move {
                 let committed = receiver.await.ok().map(Message::into_generic);
                 commit_latency.observe(handed_at.elapsed().as_secs_f64());
+                settle_awaited(&awaited, object);
                 let _ = reply.try_send(committed);
             });
             // An object can hold thousands of sends, and the tasks and
@@ -990,6 +1028,7 @@ where
 
     fn deny_staged_send(&self, namespace: IggyNamespace, send: StagedSend) {
         self.release_staged_send(namespace, send.bytes);
+        settle_awaited(&self.fresh_writes.awaited, send.object_id.get());
         self.metrics.record_fresh_send_denied();
         Self::answer_partition_submit_deny(
             send.request.header(),
@@ -1007,6 +1046,17 @@ where
             fresh.partition_pending(namespace),
             fresh.pending_bytes.get(),
         )
+    }
+}
+
+/// One send of `object` was answered.
+fn settle_awaited(awaited: &RefCell<BTreeMap<u128, usize>>, object: u128) {
+    let mut awaited = awaited.borrow_mut();
+    if let Some(sends) = awaited.get_mut(&object) {
+        *sends -= 1;
+        if *sends == 0 {
+            awaited.remove(&object);
+        }
     }
 }
 
