@@ -1,0 +1,331 @@
+---
+title: Server-to-server
+description: "Replica links, consensus commands, history fences and the header layouts used by Apache Iggy 0.10.0."
+---
+
+Replicas use dedicated TCP listeners and 256-byte headers. Client listeners reject replica control commands. The replica protocol has no mixed-version upgrade path. Run the same server version and `replica_connections_per_peer` on every node.
+
+## Transport
+
+The roster supplies each node's `tcp_replica` port and literal IP address. Lower replica IDs dial higher IDs. Each pair can use several links, which distribute traffic across shards. The default frame limit is 64 MiB through `message_bus.max_message_size`.
+
+Each connection starts with an eight-byte placement preamble before TLS and the replica handshake:
+
+```text
+[magic: IGRL, 4 bytes][version: u8 = 1][dialer_replica: u8][link_index: u16]
+```
+
+The preamble selects a shard and is not authentication. ReplicaHello repeats the peer and link identity and supplies the link count. The acceptor rejects a mismatch. With authentication enabled, placement fields participate in the handshake MAC. Shard counts can differ between nodes.
+
+## Handshake
+
+ReplicaHello, ReplicaChallenge and ReplicaFinish establish the connection. `[cluster.auth]` enables the shared-key BLAKE3 MAC. `[cluster.tls]` encrypts traffic with TLS 1.3 and ALPN `iggy-replica`. TLS requires replica authentication. See [Cluster security](/docs/clustering/security) for configuration and key rotation.
+
+## Command discriminants
+
+The `command` byte is at offset 60. This is the complete registry, including client commands:
+
+| Value | Command |
+| --- | --- |
+| 0 | `Reserved` |
+| 1 | `Ping` |
+| 2 | `Pong` |
+| 3 | `PingClient` |
+| 4 | `PongClient` |
+| 5 | `Request` |
+| 6 | `Prepare` |
+| 7 | `PrepareOk` |
+| 8 | `Reply` |
+| 9 | `Commit` |
+| 10 | `StartViewChange` |
+| 11 | `DoViewChange` |
+| 12 | `StartView` |
+| 13 | `Eviction` |
+| 14 | `ReplicaHello` |
+| 15 | `ReplicaChallenge` |
+| 16 | `ReplicaFinish` |
+| 17 | `RequestStartView` |
+| 18 | `RequestPrepares` |
+| 19 | `RepairPrepare` |
+| 20 | `RepairDone` |
+| 21 | `RangeEvicted` |
+| 22 | `RequestStateTransfer` |
+| 23 | `StateTransferTarget` |
+| 24 | `RequestStateChunk` |
+| 25 | `StateChunk` |
+| 26 | `ForwardRegister` |
+| 27 | `ForwardRegisterResult` |
+| 28 | `ForwardLogout` |
+| 29 | `ForwardLogoutResult` |
+| 30 | `ConsumerSessionHeartbeat` |
+| 31 | `SessionRetirementProgress` |
+| 32 | `ForwardCompletion` |
+| 33 | `PrimaryRebalance` |
+| 34 | `SegmentDelete` |
+| 35 | `CommitReply` |
+| 36 | `PrepareProgress` |
+
+Reserved and unused ping/pong forms do not establish a session. Reply and Eviction are client-bound and rejected on replica ingress. A replica Request uses the internal routed-request header, including its group and metadata watermark.
+
+## Consensus and history
+
+The metadata group orders resources, users and sessions. Every partition has its own group for messages and offsets. The `group` field identifies the target. The metadata group uses `1 << 63`, while partition groups use packed stream, topic and partition IDs.
+
+Prepare carries an operation and its body. PrepareOk acknowledges the required replication and persistence work. Commit broadcasts the commit point and a liveness token. CommitReply proves that peers still respond. A primary that cannot reach a quorum relinquishes leadership.
+
+StartViewChange, DoViewChange and StartView establish a new view. DoViewChange includes an untrusted-log flag so a replica without proven history cannot vote as an authoritative empty log. RequestStartView probes for the current view after recovery.
+
+Partition incarnation fields fence an old partition history. Consumer ownership generations separately fence old group members. PrimaryRebalance moves a partition primary under metadata coordination. PrepareProgress lets a slow replica report received, held and committed progress while it catches up.
+
+## Frame integrity
+
+Replica control frames use an XxHash3-64 frame seal widened to u128. Prepare and RepairPrepare use a prepare identity hash, and a parent identity links the history. Metadata prepare bodies have their own seal. Message batches carry their batch checksums. These unkeyed hashes detect corruption, not a malicious peer. Authentication and TLS provide separate protection.
+
+## Header layouts
+
+Every header begins with the common 128-byte frame prefix shown in [Framing](/docs/binary-protocol/framing). The tables below list the remaining fields in wire order. Multi-byte integers are little-endian. Reserved fields are not extension space for clients. RepairPrepare uses the PrepareHeader layout with its repair command value.
+
+### PrepareHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `client` |
+| 144 | 16 | `parent` |
+| 160 | 16 | `request_checksum` |
+| 176 | 8 | `op` |
+| 184 | 8 | `commit` |
+| 192 | 8 | `timestamp` |
+| 200 | 8 | `request` |
+| 208 | 1 | `operation` |
+| 209 | 7 | `operation_padding` |
+| 216 | 8 | `group` |
+| 224 | 4 | `user_id` |
+| 228 | 4 | `retry_capacity` |
+| 232 | 8 | `partition_incarnation` |
+| 240 | 8 | `reserved` |
+| 248 | 8 | `session` |
+
+### PrepareOkHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `parent` |
+| 144 | 16 | `prepare_checksum` |
+| 160 | 8 | `op` |
+| 168 | 8 | `commit` |
+| 176 | 8 | `timestamp` |
+| 184 | 8 | `request` |
+| 192 | 1 | `operation` |
+| 193 | 7 | `operation_padding` |
+| 200 | 8 | `group` |
+| 208 | 48 | `reserved` |
+
+### CommitHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `commit_checksum` |
+| 144 | 8 | `timestamp_monotonic` |
+| 152 | 8 | `commit` |
+| 160 | 8 | `checkpoint_op` |
+| 168 | 8 | `group` |
+| 176 | 8 | `partition_incarnation` |
+| 184 | 72 | `reserved` |
+
+### CommitReplyHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 8 | `timestamp_monotonic` |
+| 136 | 8 | `group` |
+| 144 | 8 | `partition_incarnation` |
+| 152 | 104 | `reserved` |
+
+### PrepareProgressHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 8 | `nonce` |
+| 136 | 8 | `group` |
+| 144 | 8 | `partition_incarnation` |
+| 152 | 8 | `observed_op` |
+| 160 | 8 | `received_op` |
+| 168 | 8 | `held_op` |
+| 176 | 8 | `commit_op` |
+| 184 | 1 | `kind` |
+| 185 | 1 | `ready` |
+| 186 | 70 | `reserved` |
+
+### StartViewChangeHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 8 | `group` |
+| 136 | 8 | `partition_incarnation` |
+| 144 | 112 | `reserved` |
+
+### DoViewChangeHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 8 | `op` |
+| 136 | 8 | `commit` |
+| 144 | 8 | `group` |
+| 152 | 4 | `log_view` |
+| 156 | 1 | `flags` |
+| 157 | 59 | `reserved` |
+| 216 | 8 | `partition_incarnation` |
+| 224 | 16 | `nack_bitset` |
+| 240 | 16 | `present_bitset` |
+
+### StartViewHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 8 | `op` |
+| 136 | 8 | `commit` |
+| 144 | 8 | `group` |
+| 152 | 8 | `partition_incarnation` |
+| 160 | 80 | `reserved` |
+| 240 | 16 | `incarnation` |
+
+### RequestStartViewHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 8 | `group` |
+| 136 | 8 | `partition_incarnation` |
+| 144 | 96 | `reserved` |
+| 240 | 16 | `incarnation` |
+
+### RequestPreparesHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 8 | `from_op` |
+| 152 | 8 | `to_op` |
+| 160 | 8 | `group` |
+| 168 | 8 | `partition_incarnation` |
+| 176 | 80 | `reserved` |
+
+### RepairRangeReplyHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 8 | `op` |
+| 152 | 8 | `group` |
+| 160 | 8 | `partition_incarnation` |
+| 168 | 88 | `reserved` |
+
+### RequestStateTransferHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 8 | `group` |
+| 152 | 8 | `partition_incarnation` |
+| 160 | 96 | `reserved` |
+
+### StateTransferTargetHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 8 | `commit_op` |
+| 152 | 8 | `group` |
+| 160 | 1 | `available` |
+| 161 | 1 | `unavailable_transient` |
+| 162 | 6 | `reserved_alignment` |
+| 168 | 8 | `commit_max` |
+| 176 | 8 | `partition_incarnation` |
+| 184 | 72 | `reserved` |
+
+### RequestStateChunkHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 8 | `offset` |
+| 152 | 8 | `group` |
+| 160 | 4 | `len` |
+| 164 | 4 | `artifact` |
+| 168 | 8 | `partition_incarnation` |
+| 176 | 80 | `reserved` |
+
+### StateChunkHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 8 | `offset` |
+| 152 | 8 | `group` |
+| 160 | 4 | `artifact` |
+| 164 | 84 | `reserved` |
+| 248 | 8 | `partition_incarnation` |
+
+### ForwardRegisterHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `client` |
+| 144 | 16 | `nonce` |
+| 160 | 4 | `user_id` |
+| 164 | 92 | `reserved` |
+
+### ForwardRegisterResultHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 16 | `client` |
+| 160 | 8 | `epoch` |
+| 168 | 8 | `watermark` |
+| 176 | 79 | `reserved` |
+| 255 | 1 | `outcome` |
+
+### ForwardLogoutHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `client` |
+| 144 | 16 | `nonce` |
+| 160 | 8 | `session` |
+| 168 | 8 | `request` |
+| 176 | 80 | `reserved` |
+
+### ForwardLogoutResultHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 16 | `nonce` |
+| 144 | 16 | `client` |
+| 160 | 8 | `commit` |
+| 168 | 87 | `reserved` |
+| 255 | 1 | `outcome` |
+
+### ForwardCompletionHeader
+
+| Offset | Bytes | Field |
+| --- | --- | --- |
+| 128 | 2 | `reporter` |
+| 130 | 1 | `operation` |
+| 131 | 125 | `reserved` |
+
+## Repair and state transfer
+
+RequestPrepares asks for a retained operation range. RepairPrepare sends the original prepares. RepairDone terminates the stream, and RangeEvicted reports history that is no longer retained. Requests are bounded by `repair_chunk_max` and the peer queue capacity.
+
+State transfer handles larger gaps. RequestStateTransfer obtains a manifest, then RequestStateChunk and StateChunk transfer artifacts. The receiver checks each complete artifact against its manifest length and checksum before using it. The manifest has magic `ISM1`, a u32 entry count, a u8 entry length and a trailing XxHash3-64 checksum. Entries contain kind, frontier, length and checksum.
+
+| Kind | Artifact | Current format |
+| --- | --- | --- |
+| 0 | Metadata snapshot | MessagePack version 15, readers accept 14 and 15 |
+| 1 | Client table | `ICT5` |
+| 2 | Segment log | Canonical batch records |
+| 3 | Consumer offsets and partition state | `ICO1` version 9, readers accept 8 and 9 |
+
+The offset artifact also retains partition history, retry state and producer state. These internal readability windows do not provide migration from a 0.9 data directory. Use the [upgrade procedure](/docs/server/upgrading).
+
+The [header definitions](https://github.com/apache/iggy/blob/server-0.10.0/core/binary_protocol/src/consensus/header.rs) and [command registry](https://github.com/apache/iggy/blob/server-0.10.0/core/binary_protocol/src/consensus/command.rs) define the layouts. The [replica transport](https://github.com/apache/iggy/tree/server-0.10.0/core/message_bus/src/replica) implements preamble admission and authentication.

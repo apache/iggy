@@ -1,0 +1,455 @@
+---
+title: Commands
+description: "The catalog of command codes, their operation bytes, and which commands are replicated."
+---
+
+## Catalog
+
+The u32 command codes. Replicated commands are identified on the wire by their `operation` byte (see [Operation discriminants](/docs/binary-protocol/framing#operation-discriminants)). The code column below is the protocol-level registry and, for non-replicated commands, the value carried in header bytes 196..200.
+
+```text
+# System
+PING = 1                                  # non-replicated; works without login
+GET_STATS = 10                            # non-replicated
+GET_SNAPSHOT_FILE = 11                    # non-replicated
+GET_CLUSTER_METADATA = 12                 # non-replicated
+DESCRIBE_OPTIONS = 13                     # non-replicated
+BIND_SESSION = 15                         # non-replicated
+UPDATE_RESOURCE = 16                      # operation 150
+GET_METADATA_CHANGES = 17                 # non-replicated
+GET_ME = 20                               # non-replicated
+GET_CLIENT = 21                           # non-replicated
+GET_CLIENTS = 22                          # non-replicated
+
+# Users
+GET_USER = 31                             # non-replicated
+GET_USERS = 32                            # non-replicated
+CREATE_USER = 33                          # operation 141
+DELETE_USER = 34                          # operation 143
+UPDATE_PERMISSIONS = 36                   # operation 145
+CHANGE_PASSWORD = 37                      # operation 144
+LOGIN_USER = 38                           # legacy; server rejects with MalformedLogin eviction
+LOGOUT_USER = 39                          # operation 3 (Logout)
+LOGIN_REGISTER = 40                       # operation 1 (Register)
+LOGIN_REGISTER_WITH_PAT = 45              # operation 1 (Register)
+
+# Personal access tokens
+GET_PERSONAL_ACCESS_TOKENS = 41           # non-replicated
+CREATE_PERSONAL_ACCESS_TOKEN = 42         # operation 146
+DELETE_PERSONAL_ACCESS_TOKEN = 43         # operation 147
+LOGIN_WITH_PERSONAL_ACCESS_TOKEN = 44     # legacy; server rejects with MalformedLogin eviction
+
+# Messages
+POLL_MESSAGES = 100                       # non-replicated
+SEND_MESSAGES = 101                       # operation 160
+GET_PARTITION_ROUTE = 105                 # non-replicated
+POLL_MESSAGES_DEFERRED = 106              # non-replicated
+CANCEL_DEFERRED_REQUEST = 108             # non-replicated
+FETCH_MESSAGES = 109                     # non-replicated
+
+# Consumer offsets
+GET_CONSUMER_OFFSET = 120                 # non-replicated
+STORE_CONSUMER_OFFSET = 121               # operation 161
+DELETE_CONSUMER_OFFSET = 122              # operation 162
+
+# Streams
+GET_STREAM = 200                          # non-replicated
+GET_STREAMS = 201                         # non-replicated
+CREATE_STREAM = 202                       # operation 128
+DELETE_STREAM = 203                       # operation 130
+
+# Topics
+GET_TOPIC = 300                           # non-replicated
+GET_TOPICS = 301                          # non-replicated
+CREATE_TOPIC = 302                        # operation 132
+DELETE_TOPIC = 303                        # operation 134
+
+# Partitions
+CREATE_PARTITIONS = 402                   # operation 136
+DELETE_PARTITIONS = 403                   # operation 137
+
+# Segments
+DELETE_SEGMENTS = 503                     # operation 138
+
+# Consumer groups
+GET_CONSUMER_GROUP = 600                  # non-replicated
+GET_CONSUMER_GROUPS = 601                 # non-replicated
+CREATE_CONSUMER_GROUP = 602               # operation 139
+DELETE_CONSUMER_GROUP = 603               # operation 140
+JOIN_CONSUMER_GROUP = 604                 # operation 148
+LEAVE_CONSUMER_GROUP = 605                # operation 149
+SYNC_CONSUMER_GROUP = 606                 # non-replicated
+```
+
+Codes 14, 35, 102, 103, 104, 107, 123, 124, 204, 205, 304 and 305 are retired. They are not alternate names for current commands. Use UpdateResource for resource patches and topic durability for persistence requirements.
+
+## Payloads
+
+Payloads below are the request **body** (the bytes after the 256-byte header). Types reference the [shared encodings](/docs/binary-protocol/encodings). Empty payload means the body has zero bytes.
+
+### System
+
+**Ping. Code: 1.** Empty payload. The only command accepted before login.
+
+**Get stats. Code: 10.** Empty payload.
+
+**Get snapshot. Code: 11.**
+
+```text
+[compression: u8][types_count: u8][snapshot_type: u8] x types_count
+```
+
+Compression codes: 1 = Stored, 2 = Deflated, 3 = Bzip2, 4 = Zstd, 5 = Lzma, 6 = Xz. Snapshot type codes: 1 = FilesystemOverview, 2 = ProcessList, 3 = ResourceUsage, 4 = Test, 5 = ServerLogs, 6 = ServerConfig, 100 = All.
+
+**Get cluster metadata. Code: 12.** Empty payload.
+
+**Describe options. Code: 13.**
+
+```text
+[scope: u8]
+```
+
+Scope: 1 = topic, 2 = stream, 3 = user. Returns the option catalog for the scope: keys, value kinds, defaults, and descriptions. See [Options block](/docs/binary-protocol/encodings#options-block).
+
+**Get me. Code: 20.** Empty payload.
+
+**Get client. Code: 21.**
+
+```text
+[client_id: u32]
+```
+
+**Get clients. Code: 22.** Empty payload.
+
+### Streams
+
+**Get stream. Code: 200.**
+
+```text
+[stream_id: Identifier]
+```
+
+**Get streams. Code: 201.** Empty payload.
+
+**Create stream. Code: 202.**
+
+```text
+[name_len: u8][name: N][options block to end]
+```
+
+The stream catalog accepts a create-only, write-only `encryption_key`. An omitted key uses the server creation default. See [Stream options](/docs/server/stream-options).
+
+**Delete stream. Code: 203.**
+
+```text
+[stream_id: Identifier]
+```
+
+### Topics
+
+**Get topic. Code: 300.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier]
+```
+
+**Get topics. Code: 301.**
+
+```text
+[stream_id: Identifier]
+```
+
+**Create topic. Code: 302.**
+
+```text
+[stream_id: Identifier][partitions_count: u32][name_len: u8][name: N][options block to end]
+```
+
+The fixed fields are the shape of the operation: which stream, how many partitions, what name. Every topic setting (`compression_algorithm`, `message_expiry`, `max_topic_size`, `segment_size`, `durability`, `consumer_offset_durability`, `messages_required_to_save`, `size_of_messages_required_to_save`, `preallocate_segments`, `partition_resize_policy`, `replication_factor`) rides the options block. See [Topic options](/docs/server/topic-options). `partitions_count` is an argument, not a setting: it is consumed at admission and never persisted as an option.
+
+**Delete topic. Code: 303.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier]
+```
+
+### Partitions
+
+**Create partitions. Code: 402.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][partitions_count: u32]
+```
+
+**Delete partitions. Code: 403.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][partitions_count: u32]
+```
+
+### Segments
+
+**Delete segments. Code: 503.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][partition_id: u32][segments_count: u32]
+```
+
+Deletes up to `segments_count` oldest sealed segments of the partition. The active segment is retained.
+
+### Messages
+
+**Poll messages. Code: 100.**
+
+```text
+[consumer: Consumer][stream_id: Identifier][topic_id: Identifier]
+[partition_flag: u8][partition_id: u32]
+[strategy: 9 bytes][count: u32][auto_commit: u8]
+```
+
+`strategy` is a [polling strategy](/docs/binary-protocol/encodings#polling-strategy). `count` is the requested number of messages. `auto_commit = 1` asks the server to advance the consumer offset. A primary submits a quorum offset write before replying, but the poll does not wait for that write to commit. Partition reads route to their current primary. See [Client failover](/docs/clustering/client-failover#where-requests-are-served).
+
+The response body:
+
+```text
+[partition_id: u32][current_offset: u64][messages_count: u32]
+[incarnation: u64][owner_generation: u64][metadata_op: u64]
+[batch records to end]
+```
+
+The 40-byte prefix is followed by a stream of [batch records](/docs/binary-protocol/messages): each record's header carries the stamped `base_offset` and `base_timestamp`, and each frame's deltas resolve against them. A record may be a server-sliced view of a larger stored batch, so the first polled offset is `base_offset + offset_delta` of the first frame, not necessarily `base_offset` itself. `current_offset` is the partition's newest offset at poll time. The server rebuilds records when decrypting encrypted payloads.
+
+**Send messages. Code: 101.**
+
+```text
+[metadata_length: u32]
+[stream_id: Identifier][topic_id: Identifier][partitioning: Partitioning]
+[messages_count: u32]
+[batch: 256-byte batch header + frames]
+```
+
+`metadata_length` counts the bytes from `stream_id` through `messages_count` inclusive, so a reader can skip straight to the batch. The producer leaves `partition_id`, `base_offset`, and `base_timestamp` zero in the [batch header](/docs/binary-protocol/messages), and the server stamps them. Every checksum is producer-computed and verified at admission. The reserved regions must be zero.
+
+A committed append returns offset confirmations without a metadata result section:
+
+```text
+[confirmations_count: u32]
+[stream_id: u32][topic_id: u32][partition_id: u32][base_offset: u64] x confirmations_count
+```
+
+Each confirmation is 20 bytes. The server reports one partition per append. A zero count or an empty successful body supplies no offset information. A retry can return the retained result rather than append again. Retry coverage is [bounded](/docs/binary-protocol/framing#request-numbering), and crash durability depends on the topic's [durability policy](/docs/server/durability).
+
+### Consumer offsets
+
+**Get consumer offset. Code: 120.**
+
+```text
+[consumer: Consumer][stream_id: Identifier][topic_id: Identifier]
+[partition_flag: u8][partition_id: u32]
+```
+
+When an offset is stored, the response body is 20 bytes. When none is stored, a successful reply has an empty body.
+
+```text
+[partition_id: u32][current_offset: u64][stored_offset: u64]
+```
+
+**Store consumer offset. Code: 121.**
+
+```text
+[consumer: Consumer][stream_id: Identifier][topic_id: Identifier]
+[partition_flag: u8][partition_id: u32][offset: u64][ack: u8]
+```
+
+**Delete consumer offset. Code: 122.**
+
+```text
+[consumer: Consumer][stream_id: Identifier][topic_id: Identifier]
+[partition_flag: u8][partition_id: u32][ack: u8]
+```
+
+The trailing `ack` byte is mandatory on both write commands. A payload without it fails to decode. Ack levels:
+
+| Value | Level | Meaning |
+|-------|-------|---------|
+| 0 | `NoAck` | Local write on a single-replica partition. Replicated partitions use the same consensus path as `Quorum` |
+| 1 | `Quorum` | Replicate through partition consensus. Respond after a quorum commit (default for explicit writes) |
+
+### Consumer groups
+
+**Get consumer group. Code: 600.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][group_id: Identifier]
+```
+
+**Get consumer groups. Code: 601.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier]
+```
+
+**Create consumer group. Code: 602.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][name_len: u8][name: N]
+```
+
+**Delete consumer group. Code: 603.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][group_id: Identifier]
+```
+
+**Join consumer group. Code: 604.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][group_id: Identifier]
+```
+
+**Leave consumer group. Code: 605.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][group_id: Identifier]
+```
+
+**Sync consumer group. Code: 606.**
+
+```text
+[stream_id: Identifier][topic_id: Identifier][group_id: Identifier]
+```
+
+Read-only: a member asks for its current partition assignment and the group generation, so it can select partitions to poll client-side.
+
+### Users
+
+**Get user. Code: 31.**
+
+```text
+[user_id: Identifier]
+```
+
+**Get users. Code: 32.** Empty payload.
+
+**Create user. Code: 33.**
+
+```text
+[username_len: u8][username: N][password_len: u8][password: N][status: u8]
+[has_permissions: u8][permissions_len: u32, only when has_permissions = 1][permissions: M bytes]
+[options block to end]
+```
+
+`permissions_len` and the permissions bytes are present **only** when `has_permissions = 1`. When it is 0 the options block follows immediately. The user catalog includes `username` and `status` for updates. Creation carries those values in its fixed fields. `status`: 1 = active, 2 = inactive.
+
+**Delete user. Code: 34.**
+
+```text
+[user_id: Identifier]
+```
+
+**Update permissions. Code: 36.**
+
+```text
+[user_id: Identifier][has_permissions: u8]
+[permissions_len: u32, only when has_permissions = 1][permissions: M bytes, only when 1]
+```
+
+As in `CreateUser`, the length field is conditional: with `has_permissions = 0` the payload ends at the flag.
+
+**Change password. Code: 37.**
+
+```text
+[user_id: Identifier]
+[current_password_len: u8][current_password: N]
+[new_password_len: u8][new_password: N]
+```
+
+### Authentication
+
+Login and logout are part of the [connection lifecycle](/docs/binary-protocol/connection-lifecycle):
+
+- **Login register. Code: 40.** `Operation::Register`. The body is `ClientVersionInfo` + credentials, described in [Login-register](/docs/binary-protocol/connection-lifecycle#login-register).
+- **Login register with PAT. Code: 45.** `Operation::Register`. The body is `ClientVersionInfo` + token.
+- **Logout user. Code: 39.** `Operation::Logout`. Empty payload.
+- Codes **38** and **44** are the pre-register login shapes. The server rejects both with a `MalformedLogin` eviction.
+
+### Personal access tokens
+
+**Get personal access tokens. Code: 41.** Empty payload.
+
+**Create personal access token. Code: 42.**
+
+```text
+[name_len: u8][name: N][expiry: u64]
+```
+
+`expiry` is a duration in **microseconds**. Two sentinel values exist: `0` (server default, which currently means no expiry) and `u64::MAX` (never expires).
+
+**Delete personal access token. Code: 43.**
+
+```text
+[name_len: u8][name: N]
+```
+
+### Resource patches
+
+UpdateResource is code 16, operation 150:
+
+```text
+[scope: u8][identifiers][reset_count: u8][reset_key: Name] x reset_count
+[options block to end]
+```
+
+Scope 1 selects a topic with stream and topic identifiers. Scope 2 selects a stream. Scope 3 selects a user. Empty patches, duplicate keys and keys that are both set and reset are rejected. The catalog defines update and reset permissions for each key.
+
+### Partition routes
+
+GetPartitionRoute is code 105. Its request contains stream and topic identifiers followed by a u32 partition ID. The response is exactly 25 bytes:
+
+```text
+[incarnation: u64][metadata_op: u64][view: u32]
+[partitions_count: u32][primary_replica: u8]
+```
+
+The primary value is a configured replica ID, not a roster position. Retain the incarnation and metadata operation when constructing a request. Group ownership adds its own generation.
+
+### Deferred polls
+
+PollMessagesDeferred is code 106. It extends the PollMessages body:
+
+```text
+[PollMessages body]
+[wait_us: u64][min_count: u32][max_bytes: u32][request_timeout_us: u64]
+```
+
+The response uses the same 40-byte prefix as PollMessages. Waiting requests need a positive count, `min_count` from 1 through count and a byte budget of at least 344. A positive wait requires at least one second of reply margin. Waits cannot exceed 600 seconds, and request timeouts cannot exceed 630 seconds. The server can shorten waits through its configuration.
+
+CancelDeferredRequest is code 108. It has an empty body and identifies the original request through the header request number on the same authenticated connection. The cancel command has no success reply. A committing deferred read still has one terminal reply that tells the caller whether the cancel won or an offset was stored.
+
+### Grouped fetches
+
+FetchMessages is code 109:
+
+```text
+[consumer][stream_id][topic_id][wait_us: u64][request_timeout_us: u64]
+[min_count: u32][count: u32][max_bytes: u32][auto_commit: u8]
+[targets_count: u32]
+[partition_id: u32][strategy: 9 bytes][max_bytes: u32]
+[incarnation: u64][owner_generation: u64] x targets_count
+```
+
+Targets have unique partition IDs and use offset or next strategies. The request applies its count, minimum count and byte limit across all targets. Each target also has a byte limit no greater than the request limit. A fetch requires the one-second reply margin even when its wait is zero.
+
+The response starts with a u32 section count, followed by a table of 56-byte section headers:
+
+```text
+[partition_id: u32][status: u32][current_offset: u64][messages_count: u32]
+[incarnation: u64][owner_generation: u64][metadata_op: u64]
+[next_offset: u64][records_len: u32]
+```
+
+All section headers precede the records. Records follow in table order. A failed section has no records. Inspect every section status before accepting progress. See [Deferred polling](/docs/sdk/deferred-polling) for SDK use.
+
+### Metadata changes
+
+GetMetadataChanges is code 17. It supports Earliest, Latest, After and Current starts, group selection, bounded result counts and optional time bounds. The [request codec](https://github.com/apache/iggy/blob/server-0.10.0/core/binary_protocol/src/requests/system/get_metadata_changes.rs) defines its flags and position encodings. See [Metadata changes](/docs/sdk/metadata-changes) for the follow and rebuild contract.
