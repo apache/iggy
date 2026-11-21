@@ -2435,6 +2435,103 @@ async fn given_fresh_bytes_at_the_cap_when_a_send_arrives_should_answer_it_and_k
     assert_eq!(committed_sends(&owner), 0);
 }
 
+/// Two sends of 6 MiB: the first to [`namespace`], and the second, while the
+/// upload of the first waits, to the same partition or to another one. The
+/// shard keeps `bounds` as its cap and share, or its defaults without them.
+/// Returns how many of the two sends committed, and the denials of the share
+/// and of the cap.
+#[allow(clippy::future_not_send)]
+async fn two_large_sends(
+    bounds: Option<(u64, u64)>,
+    to_another_partition: bool,
+) -> (u64, (u64, u64)) {
+    let send_bytes = 6 * 1024 * 1024;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let second_partition = if to_another_partition {
+        place_other_partition(&owner)
+    } else {
+        namespace()
+    };
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 1);
+    if let Some((shard_bytes, partition_bytes)) = bounds {
+        owner.set_fresh_pending_bytes(shard_bytes, partition_bytes);
+    }
+    let committed_of_both = |owner: &IoTestShard| {
+        if to_another_partition {
+            committed(owner, namespace()) + committed(owner, second_partition)
+        } else {
+            committed(owner, namespace())
+        }
+    };
+
+    pumped(&owner, async {
+        let _first = submit_send_when_room(&owner, 1, send_bytes).await;
+        until(&owner, |_| uploader.started() == 1).await;
+        let _second = submit_send_to_when_room(&owner, second_partition, 2, send_bytes).await;
+        until(&owner, |owner| {
+            let (_, denied, _, staged) = owner.metrics().fresh_load_value();
+            denied + u64::try_from(staged).unwrap() == 2
+        })
+        .await;
+        let taken = u64::try_from(owner.metrics().fresh_load_value().3).unwrap();
+        for attempt in 0..usize::try_from(taken).unwrap() {
+            until(&owner, |_| uploader.started() == attempt + 1).await;
+            uploader.settle(attempt, true);
+        }
+        until(&owner, |owner| committed_of_both(owner) == taken).await;
+        (
+            committed_of_both(&owner),
+            owner.metrics().fresh_cap_denials_value(),
+        )
+    })
+    .await
+}
+
+/// Sends of several MiB to one partition pass its default share of 8 MiB.
+/// A share raised above both takes them, and the default turns the second
+/// away.
+#[compio::test]
+async fn given_a_raised_partition_share_when_two_sends_to_one_partition_pass_the_default_should_take_both()
+ {
+    let raised = (
+        4 * FRESH_PENDING_BYTES_MAX,
+        2 * FRESH_PARTITION_PENDING_BYTES_MAX,
+    );
+
+    assert_eq!(
+        Box::pin(two_large_sends(None, false)).await,
+        (1, (1, 0)),
+        "the default share"
+    );
+    assert_eq!(
+        Box::pin(two_large_sends(Some(raised), false)).await,
+        (2, (0, 0)),
+        "a share of 16 MiB"
+    );
+}
+
+/// The cap of the shard holds at the value it was given: a send to a
+/// partition that has nothing waiting is turned away once the waiting sends
+/// of the shard would pass it, where the default takes it.
+#[compio::test]
+async fn given_a_lowered_shard_cap_when_sends_to_two_partitions_pass_it_should_answer_the_second() {
+    let lowered = (10 * 1024 * 1024, FRESH_PARTITION_PENDING_BYTES_MAX);
+
+    assert_eq!(
+        Box::pin(two_large_sends(None, true)).await,
+        (2, (0, 0)),
+        "the default cap"
+    );
+    assert_eq!(
+        Box::pin(two_large_sends(Some(lowered), true)).await,
+        (1, (0, 1)),
+        "a cap of 10 MiB"
+    );
+}
+
 /// A primary that commits nothing keeps the sends that wait for its room.
 /// They fill its share of the shard's bytes and no more, so the other
 /// partitions of the shard keep sending. The share is free again once the

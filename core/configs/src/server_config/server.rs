@@ -575,6 +575,11 @@ mod tests {
             ("IGGY_TIERED_STORAGE_JOBS_FRESH_UPLOADS", "8"),
             ("IGGY_TIERED_STORAGE_FRESH_UPLOAD_INTERVAL", "25 ms"),
             ("IGGY_TIERED_STORAGE_LONG_TERM_BACKLOG_LIMIT", "512 MiB"),
+            ("IGGY_TIERED_STORAGE_FRESH_PENDING_BYTES", "96 MiB"),
+            (
+                "IGGY_TIERED_STORAGE_FRESH_PARTITION_PENDING_BYTES",
+                "24 MiB",
+            ),
         ];
         let known = ServerConfig::all_env_var_names();
         for (name, value) in vars {
@@ -607,6 +612,11 @@ mod tests {
             tiered.long_term_backlog_limit.as_bytes_u64(),
             512 * 1024 * 1024
         );
+        assert_eq!(tiered.fresh_pending_bytes.as_bytes_u64(), 96 * 1024 * 1024);
+        assert_eq!(
+            tiered.fresh_partition_pending_bytes.as_bytes_u64(),
+            24 * 1024 * 1024
+        );
         assert_eq!(
             tiered.jobs.upload_bytes.as_bytes_u64(),
             4 * 1024 * 1024 * 1024
@@ -614,6 +624,35 @@ mod tests {
         cfg.validate()
             .expect("an s3 section from the environment validates");
         assert!(!cfg.to_string().contains("wJalrXUtnFEMI"));
+    }
+
+    #[test]
+    fn given_fresh_pending_bytes_in_the_file_when_loading_should_take_them() {
+        let load = |shard: &str, partition: &str| -> ServerConfig {
+            Figment::new()
+                .merge(Toml::string(include_str!("../../../server/config.toml")))
+                .merge(Toml::string(&format!(
+                    "[tiered_storage]\nbackend = \"fs\"\npath = \"/var/lib/iggy-tiered\"\n\
+                     fresh_pending_bytes = \"{shard}\"\n\
+                     fresh_partition_pending_bytes = \"{partition}\"\n"
+                )))
+                .extract()
+                .expect("TOML with fresh pending bytes deserializes")
+        };
+
+        let tuned = load("64 MiB", "32 MiB");
+        let share_above_cap = load("16 MiB", "32 MiB");
+
+        let tiered = &tuned.tiered_storage;
+        assert_eq!(tiered.fresh_pending_bytes.as_bytes_u64(), 64 * 1024 * 1024);
+        assert_eq!(
+            tiered.fresh_partition_pending_bytes.as_bytes_u64(),
+            32 * 1024 * 1024
+        );
+        tuned
+            .validate()
+            .expect("a share of 32 MiB under a cap of 64 MiB validates");
+        assert!(share_above_cap.validate().is_err());
     }
 
     #[test]

@@ -104,8 +104,8 @@ use std::time::{Duration, Instant};
 /// never split, so an object is larger only when one send is.
 pub const FRESH_OBJECT_BYTES: u64 = FRESH_OBJECT_DATA_BYTES_MAX;
 
-/// The most bytes of messages the shard holds for sends that have not
-/// reached their partitions.
+/// The most bytes of messages a shard that was given no other cap holds for
+/// sends that have not reached their partitions.
 ///
 /// They are in the open window, in the objects that upload or wait to, and
 /// stored for a partition that has no room yet. A send past the cap is
@@ -113,11 +113,12 @@ pub const FRESH_OBJECT_BYTES: u64 = FRESH_OBJECT_DATA_BYTES_MAX;
 /// answering costs the shard this much memory and no more.
 pub const FRESH_PENDING_BYTES_MAX: u64 = 8 * FRESH_OBJECT_BYTES;
 
-/// The most of [`FRESH_PENDING_BYTES_MAX`] that the sends of one partition
-/// hold. A partition that stopped draining its requests fills its own share
-/// and leaves the rest of the cap to the other partitions of the shard. A
-/// send larger than the share still gets in while nothing of its partition
-/// waits.
+/// The most of the cap that the sends of one partition hold, on a shard
+/// that was given no other share.
+///
+/// A partition that stopped draining its requests fills its own share and
+/// leaves the rest of the cap to the other partitions of the shard. A send
+/// larger than the share still gets in while nothing of its partition waits.
 pub const FRESH_PARTITION_PENDING_BYTES_MAX: u64 = FRESH_PENDING_BYTES_MAX / 4;
 
 /// The upload interval of a shard that was given none.
@@ -164,8 +165,8 @@ struct StagedSend {
     /// The number of the object that holds the messages.
     object: u64,
     object_id: FreshObjectId,
-    /// Bytes of the messages, which count against
-    /// [`FRESH_PENDING_BYTES_MAX`] until the request leaves.
+    /// Bytes of the messages, which count against the cap of the shard and
+    /// the share of the partition until the request leaves.
     bytes: u64,
     /// The header of its batch, as admitted.
     batch: BatchHeader,
@@ -320,6 +321,10 @@ pub struct FreshWrites {
     pending_bytes: Cell<u64>,
     /// [`Self::pending_bytes`] of each partition that has a waiting send.
     partition_pending_bytes: RefCell<BTreeMap<IggyNamespace, u64>>,
+    /// The cap of [`Self::pending_bytes`].
+    pending_bytes_max: Cell<u64>,
+    /// The share of the cap that the waiting sends of one partition hold.
+    partition_pending_bytes_max: Cell<u64>,
     staged_sends: Cell<usize>,
     /// Objects that hold an upload slot.
     uploads_in_flight: Cell<usize>,
@@ -372,6 +377,8 @@ impl Default for FreshWrites {
             delayed: RefCell::default(),
             pending_bytes: Cell::new(0),
             partition_pending_bytes: RefCell::default(),
+            pending_bytes_max: Cell::new(FRESH_PENDING_BYTES_MAX),
+            partition_pending_bytes_max: Cell::new(FRESH_PARTITION_PENDING_BYTES_MAX),
             staged_sends: Cell::new(0),
             uploads_in_flight: Cell::new(0),
             uploads_max: Cell::new(FRESH_UPLOADS),
@@ -656,6 +663,16 @@ where
     pub fn set_fresh_upload_pace(&self, interval: Duration, uploads: usize) {
         self.fresh_writes.interval_micros.set(micros(interval));
         self.fresh_writes.uploads_max.set(uploads.max(1));
+    }
+
+    /// Set the most bytes of messages this shard holds for sends that have
+    /// not reached their partitions, and the most of them that the sends of
+    /// one partition hold.
+    pub fn set_fresh_pending_bytes(&self, shard_bytes: u64, partition_bytes: u64) {
+        self.fresh_writes.pending_bytes_max.set(shard_bytes);
+        self.fresh_writes
+            .partition_pending_bytes_max
+            .set(partition_bytes);
     }
 
     /// Whether `request` is a send that goes to the object store before its
@@ -1199,21 +1216,21 @@ where
     }
 
     /// Whether a send of `size` bytes to `namespace` would take the waiting
-    /// sends of its partition past [`FRESH_PARTITION_PENDING_BYTES_MAX`], or
-    /// those of the shard past [`FRESH_PENDING_BYTES_MAX`]. Counts the bound
-    /// it passes. A send larger than a bound still gets in while nothing
-    /// that counts against it waits.
+    /// sends of its partition past their share, or those of the shard past
+    /// the cap, as [`Self::set_fresh_pending_bytes`] set them. Counts the
+    /// bound it passes. A send larger than a bound still gets in while
+    /// nothing that counts against it waits.
     fn fresh_send_over_pending_bytes(&self, namespace: IggyNamespace, size: u64) -> bool {
         let fresh = &self.fresh_writes;
         let partition_pending = fresh.partition_pending(namespace);
         if partition_pending > 0
-            && partition_pending.saturating_add(size) > FRESH_PARTITION_PENDING_BYTES_MAX
+            && partition_pending.saturating_add(size) > fresh.partition_pending_bytes_max.get()
         {
             self.metrics.record_fresh_send_over_partition_share();
             return true;
         }
         let pending = fresh.pending_bytes.get();
-        if pending > 0 && pending.saturating_add(size) > FRESH_PENDING_BYTES_MAX {
+        if pending > 0 && pending.saturating_add(size) > fresh.pending_bytes_max.get() {
             self.metrics.record_fresh_send_over_shard_cap();
             return true;
         }
