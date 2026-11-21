@@ -41,10 +41,10 @@
 use super::COMPONENT;
 use crate::ConfigurationError;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::num::NonZeroU32;
 use std::time::Duration;
 
@@ -325,14 +325,14 @@ pub struct PartitionConfig {
     /// checkpoint, whichever comes first. A boot then loads the ops above the
     /// checkpoint only. Must be > 0 and at most the max delay.
     #[serde(default = "default_checkpoint_idle_delay")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub checkpoint_idle_delay: IggyDuration,
 
     /// The longest a partition that never goes quiet waits for a checkpoint
     /// after its first op since its last one. Must be > 0.
     #[serde(default = "default_checkpoint_max_delay")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub checkpoint_max_delay: IggyDuration,
 
