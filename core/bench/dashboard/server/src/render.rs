@@ -18,15 +18,13 @@
 use crate::cache::read_report;
 use crate::dedicated_thread::{DedicatedThread, ThreadStopped};
 use crate::error::IggyBenchDashboardServerError;
+use bench_dashboard_shared::embed::ChartType;
 use bench_report::report::BenchmarkReport;
 use charming::Chart;
 use charming::renderer::image_renderer::{ImageFormat, ImageRenderer};
 use charming::theme::Theme;
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::str::FromStr;
-use tokio::sync::{Mutex, MutexGuard};
 use tracing::info;
 
 /// charming writes the text between two of these marks as JavaScript, and keeps its own copy of
@@ -35,39 +33,6 @@ pub(crate) const RAW_MARK: &str = "#*#*#*#";
 
 const RENDER_THREAD: &str = "png-render";
 const CHART_THREAD: &str = "embed-chart";
-
-/// The chart of a run that an embed shows, named as in the `type` query parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChartType {
-    Latency,
-    Throughput,
-    Distribution,
-}
-
-impl FromStr for ChartType {
-    type Err = IggyBenchDashboardServerError;
-
-    fn from_str(chart_type: &str) -> Result<Self, Self::Err> {
-        match chart_type {
-            "latency" => Ok(Self::Latency),
-            "throughput" => Ok(Self::Throughput),
-            "distribution" => Ok(Self::Distribution),
-            _ => Err(IggyBenchDashboardServerError::BadRequest(format!(
-                "Invalid chart type: '{chart_type}'. Must be 'latency', 'throughput', or 'distribution'"
-            ))),
-        }
-    }
-}
-
-impl fmt::Display for ChartType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Latency => "latency",
-            Self::Throughput => "throughput",
-            Self::Distribution => "distribution",
-        })
-    }
-}
 
 /// A run's chart with the line that names its machine and server version.
 pub struct EmbedChart {
@@ -98,7 +63,6 @@ pub fn without_raw_mark(text: &str) -> String {
 pub struct PngRenderPool {
     thread: DedicatedThread<RenderJob, Result<Vec<u8>, String>>,
     charts: DedicatedThread<ChartJob, Result<EmbedChart, IggyBenchDashboardServerError>>,
-    cache_turn: Mutex<()>,
 }
 
 impl PngRenderPool {
@@ -116,22 +80,7 @@ impl PngRenderPool {
         let charts = DedicatedThread::start(CHART_THREAD, EmbedChart::load)?;
 
         info!("PNG render and embed chart threads started");
-        Ok(Self {
-            thread,
-            charts,
-            cache_turn: Mutex::new(()),
-        })
-    }
-
-    pub fn default_pool() -> io::Result<Self> {
-        Self::new()
-    }
-
-    /// The turn to build, render and store a PNG for the disk cache. One request at a time holds
-    /// it, so the requests that missed the cache during the first render of a PNG can read its file
-    /// in their turn instead of queuing the same render.
-    pub async fn cache_turn(&self) -> MutexGuard<'_, ()> {
-        self.cache_turn.lock().await
+        Ok(Self { thread, charts })
     }
 
     /// The `chart_type` chart of the report at `report`, with `subtext` in place of the report's
