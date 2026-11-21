@@ -49,6 +49,10 @@ const RETRY_DELAY_BOUNDS: RangeInclusive<Duration> =
 /// before its messages are stored, so a longer one would only answer late.
 const FRESH_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(10);
 
+/// The JSON API of Google Cloud Storage, which an empty `gcs.endpoint`
+/// names.
+pub const GCS_ENDPOINT: &str = "https://storage.googleapis.com";
+
 /// The smallest `long_term_backlog_limit` other than zero: what one
 /// long-term segment holds at most. A rewrite stores one segment at a time,
 /// so a lower limit would slow the sends to a partition whose rewrites keep
@@ -66,6 +70,8 @@ pub enum TieredStorageBackend {
     Fs,
     /// S3, or a store with the same API, such as MinIO, Ceph RGW or R2.
     S3,
+    /// Google Cloud Storage, over its JSON API, set up in `[tiered_storage.gcs]`.
+    Gcs,
     /// The memory of the server, with the latency of `mock_s3`. Every
     /// object is lost when the server stops. For benchmarks and tests only.
     MockS3,
@@ -77,6 +83,7 @@ impl Display for TieredStorageBackend {
             Self::None => "none",
             Self::Fs => "fs",
             Self::S3 => "s3",
+            Self::Gcs => "gcs",
             Self::MockS3 => "mock_s3",
         })
     }
@@ -103,6 +110,87 @@ impl Display for S3UrlStyle {
             Self::Path => "path",
             Self::VirtualHosted => "virtual_hosted",
         })
+    }
+}
+
+/// How the `gcs` backend authorizes its requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GcsAuth {
+    /// An access token from the first source that the node has, in the
+    /// order of Google's application default credentials: the key file of
+    /// `service_account_key`, then the one that
+    /// `GOOGLE_APPLICATION_CREDENTIALS` names, then the metadata server of a
+    /// Compute Engine instance or a GKE node.
+    #[default]
+    Auto,
+    /// No credentials, for an emulator such as fake-gcs-server.
+    None,
+}
+
+impl Display for GcsAuth {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::None => "none",
+        })
+    }
+}
+
+/// Where the objects of the `gcs` backend are, and how it gets its access
+/// tokens. `[[geo.peers]]` entries take the same table.
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, Eq, ConfigEnv)]
+#[serde(deny_unknown_fields)]
+pub struct GcsConfig {
+    #[serde(default)]
+    pub bucket: String,
+    /// The URL of the JSON API, empty for Google Cloud Storage. An emulator
+    /// takes its own URL, such as `http://localhost:4443`.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub auth: GcsAuth,
+    /// The path of a service account JSON key file, which `auto` takes
+    /// before any other source. The file holds a key, so only the server
+    /// may read it.
+    #[serde(default)]
+    pub service_account_key: String,
+}
+
+impl GcsConfig {
+    /// Why this section cannot reach a bucket, as a key of the section and
+    /// what is wrong with it, or `None`.
+    #[must_use]
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.bucket.trim().is_empty() {
+            return Some("gcs.bucket must be set for the gcs backend");
+        }
+        if self.bucket.contains('/') {
+            return Some("gcs.bucket must be a bucket name, without '/'");
+        }
+        None
+    }
+
+    /// The endpoint, or Google Cloud Storage when it is empty.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        let endpoint = self.endpoint.trim();
+        if endpoint.is_empty() {
+            GCS_ENDPOINT
+        } else {
+            endpoint
+        }
+    }
+}
+
+impl Display for GcsConfig {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{{ bucket: {}, endpoint: {}, auth: {}, service_account_key: {} }}",
+            self.bucket, self.endpoint, self.auth, self.service_account_key
+        )
     }
 }
 
@@ -147,6 +235,9 @@ pub struct TieredStorageConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub secret_access_key: String,
+    /// The bucket and the access tokens of the `gcs` backend.
+    #[serde(default)]
+    pub gcs: GcsConfig,
     #[serde(default)]
     pub jobs: TierJobsConfig,
     /// The latency of the `mock_s3` backend.
@@ -279,6 +370,7 @@ impl Default for TieredStorageConfig {
             url_style: S3UrlStyle::default(),
             access_key_id: String::new(),
             secret_access_key: String::new(),
+            gcs: GcsConfig::default(),
             jobs: TierJobsConfig::default(),
             mock_s3: MockS3Config::default(),
             request_timeout: default_request_timeout(),
@@ -332,9 +424,9 @@ impl Display for TieredStorageConfig {
         write!(
             f,
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
-             url_style: {}, credentials: {}, jobs: {}, mock_s3: {}, request_timeout: {}, \
-             progress_timeout: {}, max_attempts: {}, retry_delay: {}, max_retry_delay: {}, \
-             fresh_upload_interval: {}, long_term_backlog_limit: {} }}",
+             url_style: {}, credentials: {}, gcs: {}, jobs: {}, mock_s3: {}, \
+             request_timeout: {}, progress_timeout: {}, max_attempts: {}, retry_delay: {}, \
+             max_retry_delay: {}, fresh_upload_interval: {}, long_term_backlog_limit: {} }}",
             self.backend,
             self.prefix,
             self.path,
@@ -343,6 +435,7 @@ impl Display for TieredStorageConfig {
             self.region,
             self.url_style,
             self.credentials(),
+            self.gcs,
             self.jobs,
             self.mock_s3,
             self.request_timeout,
@@ -402,6 +495,11 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
             }
             TieredStorageBackend::S3 if self.region.trim().is_empty() => {
                 return refuse("region must be set for the s3 backend");
+            }
+            TieredStorageBackend::Gcs => {
+                if let Some(fault) = self.gcs.fault() {
+                    return refuse(fault);
+                }
             }
             TieredStorageBackend::Fs | TieredStorageBackend::S3 | TieredStorageBackend::MockS3 => {}
         }
@@ -666,6 +764,64 @@ mod tests {
         assert!(no_bucket.validate().is_err());
         assert!(no_region.validate().is_err());
         assert!(s3_config().validate().is_ok());
+    }
+
+    fn gcs_config() -> TieredStorageConfig {
+        TieredStorageConfig {
+            backend: TieredStorageBackend::Gcs,
+            gcs: GcsConfig {
+                bucket: "segments".to_owned(),
+                ..GcsConfig::default()
+            },
+            ..TieredStorageConfig::default()
+        }
+    }
+
+    #[test]
+    fn given_gcs_backend_without_a_bucket_when_validating_should_refuse() {
+        let no_bucket = TieredStorageConfig {
+            gcs: GcsConfig::default(),
+            ..gcs_config()
+        };
+        let a_path = TieredStorageConfig {
+            gcs: GcsConfig {
+                bucket: "segments/iggy".to_owned(),
+                ..GcsConfig::default()
+            },
+            ..gcs_config()
+        };
+        let s3_keys_unused = TieredStorageConfig {
+            bucket: String::new(),
+            region: String::new(),
+            ..gcs_config()
+        };
+
+        assert!(no_bucket.validate().is_err());
+        assert!(a_path.validate().is_err());
+        assert!(gcs_config().validate().is_ok());
+        assert!(s3_keys_unused.validate().is_ok());
+    }
+
+    #[test]
+    fn given_gcs_section_when_reading_should_take_its_keys_and_default_to_google() {
+        let config: TieredStorageConfig = serde_json::from_str(
+            r#"{"backend": "gcs", "gcs": {"bucket": "segments", "auth": "none",
+                "endpoint": "http://localhost:4443", "service_account_key": "/etc/iggy/key.json"}}"#,
+        )
+        .unwrap();
+        let unknown = serde_json::from_str::<TieredStorageConfig>(
+            r#"{"backend": "gcs", "gcs": {"bucket": "segments", "region": "eu"}}"#,
+        );
+
+        assert_eq!(config.backend, TieredStorageBackend::Gcs);
+        assert_eq!(config.gcs.auth, GcsAuth::None);
+        assert_eq!(config.gcs.endpoint(), "http://localhost:4443");
+        assert_eq!(config.gcs.service_account_key, "/etc/iggy/key.json");
+        assert_eq!(GcsConfig::default().endpoint(), GCS_ENDPOINT);
+        assert_eq!(GcsConfig::default().auth, GcsAuth::Auto);
+        assert!(config.validate().is_ok());
+        assert!(unknown.is_err());
+        assert!(config.to_string().contains("gcs: { bucket: segments"));
     }
 
     #[test]

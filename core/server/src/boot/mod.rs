@@ -59,6 +59,7 @@ use crate::boot::threads::{
 use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
+use crate::geo_peers::PeerAuth;
 use crate::server_error::ServerError;
 use crate::shell::{
     ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
@@ -309,6 +310,7 @@ pub fn bootstrap(
         crate::tiered_storage::probe(&config.tiered_storage, &tiered_store)?;
     crate::geo_peers::preflight(&config.geo)?;
     let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
+    let geo_peer_auth = crate::geo_peers::auth(&config.geo)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -470,6 +472,7 @@ pub fn bootstrap(
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
         let tiered_store_for_shard = tiered_store.clone();
         let geo_peer_statuses_for_shard = geo_peer_statuses.clone();
+        let geo_peer_auth_for_shard = geo_peer_auth.clone();
         let primary_handoff_for_shard = Arc::clone(&primary_handoff);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -495,6 +498,7 @@ pub fn bootstrap(
                     shutdown_deadline_for_shard,
                     tiered_store_for_shard,
                     geo_peer_statuses_for_shard,
+                    geo_peer_auth_for_shard,
                     primary_handoff_for_shard,
                 )
             }) {
@@ -574,6 +578,7 @@ async fn shard_main(
     shutdown_deadline: Arc<ShutdownDeadline>,
     tiered_store: SharedStore,
     geo_peer_statuses: Vec<SharedPeerStatus>,
+    geo_peer_auth: PeerAuth,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -1052,6 +1057,7 @@ async fn shard_main(
         &bus,
         &shard,
         &geo_peer_statuses,
+        &geo_peer_auth,
     );
     shard.set_geo_positions(crate::peer_positions::settings(&config.geo));
 

@@ -29,7 +29,8 @@
 //! uploads, cold reads and deletes hand work to the tier service of a shard.
 //!
 //! [`FsStore`] keeps objects as files in a directory, [`s3::S3Store`] keeps
-//! them in an S3 bucket, and [`MockS3Store`] keeps them in memory and answers
+//! them in an S3 bucket, [`gcs::GcsStore`] keeps them in a Google Cloud
+//! Storage bucket, and [`MockS3Store`] keeps them in memory and answers
 //! after the latency of a remote store, for benchmarks. [`Backend`] is the
 //! one of them that a configuration names. [`ReadOnlyStore`] reads another
 //! cluster's store and refuses every write. [`MemoryStore`] and
@@ -42,10 +43,13 @@
 
 mod backend;
 pub mod contract;
+pub mod credentials;
 mod error;
 mod fresh;
 mod fresh_index;
 mod fs;
+pub mod gcs;
+mod http;
 mod identity;
 mod inline;
 mod layout;

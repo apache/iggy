@@ -21,19 +21,22 @@
 //!
 //! Each shard gets its own store and service, because a provider holds
 //! files and connections of the shard that owns it. What the shards share,
-//! the credentials of an `s3` store and the objects of a `mock_s3` store,
-//! is in [`SharedStore`].
+//! the credentials of an `s3` store, the access token of a `gcs` store and
+//! the objects of a `mock_s3` store, is in [`SharedStore`].
 
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::time::Duration;
 
-use configs::tiered_storage::{S3UrlStyle, TieredStorageBackend, TieredStorageConfig};
+use configs::tiered_storage::{
+    GcsConfig as GcsSection, S3UrlStyle, TieredStorageBackend, TieredStorageConfig,
+};
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::IggyByteSize;
+use iggy_object_store::gcs::{GcsAuth, GcsConfig, GcsStore};
 use iggy_object_store::s3::{S3Config, S3Store, SharedCredentials, UrlStyle};
 use iggy_object_store::{
-    Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, MockS3Latency, MockS3Store,
+    Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, MockS3Latency, MockS3Store, ObjectStore,
     ObjectStoreError, StoreIdentity,
 };
 use message_bus::IggyMessageBus;
@@ -68,10 +71,12 @@ pub struct S3Location<'a> {
 }
 
 /// What every shard of a node shares to reach the store: the credentials
-/// that an `s3` store signs with, and the objects of a `mock_s3` store.
+/// that an `s3` store signs with, how a `gcs` store authorizes its
+/// requests, and the objects of a `mock_s3` store.
 #[derive(Clone, Default)]
 pub struct SharedStore {
     credentials: Option<SharedCredentials>,
+    gcs: Option<GcsAuth>,
     mock_s3: Option<MockS3Store>,
 }
 
@@ -79,10 +84,14 @@ impl SharedStore {
     /// What the shards of a node with `config` share, built once per node.
     ///
     /// # Errors
-    /// What [`crate::s3_credentials::credentials`] returns.
+    /// What [`crate::s3_credentials::credentials`] and
+    /// [`crate::gcs_credentials::backend_auth`] return.
     pub fn new(config: &TieredStorageConfig) -> Result<Self, ServerError> {
         Ok(Self {
             credentials: crate::s3_credentials::credentials(config)?,
+            gcs: (config.backend == TieredStorageBackend::Gcs)
+                .then(|| crate::gcs_credentials::backend_auth(&config.gcs))
+                .transpose()?,
             mock_s3: (config.backend == TieredStorageBackend::MockS3)
                 .then(|| MockS3Store::new(mock_s3_latency(config))),
         })
@@ -93,7 +102,16 @@ impl From<SharedCredentials> for SharedStore {
     fn from(credentials: SharedCredentials) -> Self {
         Self {
             credentials: Some(credentials),
-            mock_s3: None,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<GcsAuth> for SharedStore {
+    fn from(auth: GcsAuth) -> Self {
+        Self {
+            gcs: Some(auth),
+            ..Self::default()
         }
     }
 }
@@ -104,8 +122,9 @@ impl From<SharedCredentials> for SharedStore {
 pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
     match config.backend {
         TieredStorageBackend::None => return Ok(()),
-        // The credentials of the s3 backend come from `crate::s3_credentials`.
-        TieredStorageBackend::S3 | TieredStorageBackend::MockS3 => {}
+        // The credentials of the s3 and gcs backends come from
+        // `crate::s3_credentials` and `crate::gcs_credentials`.
+        TieredStorageBackend::S3 | TieredStorageBackend::Gcs | TieredStorageBackend::MockS3 => {}
         TieredStorageBackend::Fs => {
             let metadata = std::fs::metadata(&config.path).map_err(|source| {
                 ServerError::TieredStoragePath {
@@ -129,15 +148,23 @@ pub fn preflight(config: &TieredStorageConfig) -> Result<(), ServerError> {
 /// work. A ranged read gets an error body where a HEAD gets none, so a store
 /// can tell a missing bucket from a missing object.
 ///
-/// Returns whether the store answered in time. Only a missing bucket or
-/// rejected credentials stop the boot. The store identity check judges any
-/// other answer, and a store that does not answer is an outage that the
-/// node waits out.
+/// When the object is there, the probe also sends a conditional create of
+/// the same bytes, which the store must refuse, see
+/// [`StoreIdentity::check_conditional_create`]. A store that takes it ignores
+/// the condition that uploads rely on. A root that no cluster claimed yet
+/// gets the same check from the store identity check, before any upload.
+///
+/// Returns whether the store answered in time. Only a missing bucket,
+/// rejected credentials or a store that ignores conditional creates stop
+/// the boot. The store identity check judges any other answer, and a store
+/// that does not answer is an outage that the node waits out.
 ///
 /// # Errors
 /// [`ServerError::TieredStorageProbe`] when the bucket is missing or the
-/// store refuses the credentials. [`ServerError::TieredStorageProbeRuntime`]
-/// when the runtime for the read cannot start.
+/// store refuses the credentials.
+/// [`ServerError::TieredStorageConditionalCreate`] when the store took the
+/// conditional create. [`ServerError::TieredStorageProbeRuntime`] when the
+/// runtime for the read cannot start.
 pub fn probe(config: &TieredStorageConfig, shared: &SharedStore) -> Result<bool, ServerError> {
     if config.backend == TieredStorageBackend::None {
         return Ok(true);
@@ -152,13 +179,61 @@ pub fn probe(config: &TieredStorageConfig, shared: &SharedStore) -> Result<bool,
         let Some(store) = store(config, shared)? else {
             return Ok(true);
         };
-        let read = compio::time::timeout(
-            identity_timeout(config),
-            StoreIdentity::read(&store, &layout),
-        )
-        .await;
-        probe_verdict(layout.identity_key(), read.ok())
+        let timeout = identity_timeout(config);
+        let read = compio::time::timeout(timeout, StoreIdentity::read(&store, &layout))
+            .await
+            .ok();
+        let found = match &read {
+            Some(Ok(IdentityRead::Found(identity))) => Some(*identity),
+            _ => None,
+        };
+        let answered = probe_verdict(layout.identity_key(), read)?;
+        if let Some(identity) = found {
+            probe_conditional_create(&store, &layout, identity, timeout, config.backend).await?;
+        }
+        Ok(answered)
     })
+}
+
+/// The conditional create of the boot probe, over the identity object that
+/// the probe found. Only a store that took it stops the boot: any other
+/// answer leaves the check to the store identity check.
+async fn probe_conditional_create<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    identity: StoreIdentity,
+    timeout: Duration,
+    backend: TieredStorageBackend,
+) -> Result<(), ServerError> {
+    let check =
+        compio::time::timeout(timeout, identity.check_conditional_create(store, layout)).await;
+    match check {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(source @ ObjectStoreError::Unsupported(_))) => {
+            Err(ServerError::TieredStorageConditionalCreate {
+                key: layout.identity_key(),
+                backend,
+                source,
+            })
+        }
+        Ok(Err(error)) => {
+            warn!(
+                key = layout.identity_key(),
+                %error,
+                "the object store failed the conditional create of the boot probe, so the store \
+                 identity check sends it again before any upload"
+            );
+            Ok(())
+        }
+        Err(_) => {
+            warn!(
+                key = layout.identity_key(),
+                "the object store did not answer the conditional create of the boot probe in \
+                 time, so the store identity check sends it again before any upload"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Give `shard` a tier service over the configured store, and run the store
@@ -280,9 +355,9 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
 /// `shared`.
 ///
 /// # Errors
-/// [`ServerError::TieredStorage`] for an `s3` endpoint that cannot address a
-/// bucket, an `s3` backend without credentials, or a `mock_s3` backend
-/// without its store.
+/// [`ServerError::TieredStorage`] for an `s3` or `gcs` endpoint that cannot
+/// address a bucket, an `s3` or `gcs` backend without its credentials, or a
+/// `mock_s3` backend without its store.
 fn store(
     config: &TieredStorageConfig,
     shared: &SharedStore,
@@ -306,13 +381,35 @@ fn store(
                     .map_err(|error| refuse(error.to_string()))?,
             ))
         }
+        TieredStorageBackend::Gcs => {
+            let auth = shared
+                .gcs
+                .clone()
+                .ok_or_else(|| refuse("the gcs backend has no credentials".to_owned()))?;
+            Some(Backend::Gcs(
+                GcsStore::new(gcs_config(&config.gcs, auth))
+                    .map_err(|error| refuse(error.to_string()))?,
+            ))
+        }
     })
+}
+
+/// The bucket of a `[tiered_storage.gcs]` or `[geo.peers.gcs]` table, in the
+/// form the provider takes. An empty endpoint is Google Cloud Storage.
+#[must_use]
+pub fn gcs_config(section: &GcsSection, auth: GcsAuth) -> GcsConfig {
+    GcsConfig {
+        endpoint: section.endpoint().to_owned(),
+        bucket: section.bucket.trim().to_owned(),
+        auth,
+    }
 }
 
 /// Where the store keeps objects, for the log.
 fn store_location(config: &TieredStorageConfig) -> String {
     match config.backend {
         TieredStorageBackend::S3 => S3Location::from(config).to_string(),
+        TieredStorageBackend::Gcs => format!("{}/{}", config.gcs.endpoint(), config.gcs.bucket),
         TieredStorageBackend::MockS3 => "memory".to_owned(),
         TieredStorageBackend::Fs | TieredStorageBackend::None => config.path.clone(),
     }
@@ -436,9 +533,10 @@ fn probe_verdict(
 mod tests {
     use std::path::Path;
 
-    use iggy_object_store::{ObjectStore, PutBody, PutOptions};
+    use iggy_object_store::{MemoryStore, PutBody, PutOptions};
 
     use super::*;
+    use crate::store_identity::test_stores::IgnoresCondition;
 
     fn fs_config(path: &Path) -> TieredStorageConfig {
         TieredStorageConfig {
@@ -586,6 +684,77 @@ mod tests {
         assert!(probe(&fs_config(directory.path()), &SharedStore::default()).unwrap());
     }
 
+    #[test]
+    fn given_claimed_fs_root_when_probing_should_pass_the_conditional_create_and_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = fs_config(directory.path());
+        let identity = StoreIdentity { cluster_uid: 7 };
+        server_common::create_shard_executor()
+            .unwrap()
+            .block_on(async {
+                let store = FsStore::new(directory.path());
+                assert!(
+                    identity
+                        .claim(&store, &layout(&config).unwrap())
+                        .await
+                        .unwrap()
+                );
+            });
+
+        assert!(probe(&config, &SharedStore::default()).unwrap());
+    }
+
+    #[test]
+    fn given_store_that_ignores_conditional_creates_when_probing_should_refuse_the_boot() {
+        let layout = KeyLayout::new("iggy").unwrap();
+        let identity = StoreIdentity { cluster_uid: 7 };
+        let ignoring = IgnoresCondition(MemoryStore::new());
+        let honoring = MemoryStore::new();
+
+        let (refused, passed) = server_common::create_shard_executor()
+            .unwrap()
+            .block_on(async {
+                identity.claim(&ignoring, &layout).await.unwrap();
+                identity.claim(&honoring, &layout).await.unwrap();
+                let timeout = Duration::from_secs(5);
+                (
+                    probe_conditional_create(
+                        &ignoring,
+                        &layout,
+                        identity,
+                        timeout,
+                        TieredStorageBackend::S3,
+                    )
+                    .await,
+                    probe_conditional_create(
+                        &honoring,
+                        &layout,
+                        identity,
+                        timeout,
+                        TieredStorageBackend::S3,
+                    )
+                    .await,
+                )
+            });
+
+        let error = refused.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ServerError::TieredStorageConditionalCreate {
+                    source: ObjectStoreError::Unsupported(_),
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains("tiered_storage.endpoint"),
+            "{error}"
+        );
+        assert!(passed.is_ok());
+    }
+
     /// A file that no node wrote fails the store identity check, but it
     /// must not stop the boot of every node on the store.
     #[test]
@@ -722,6 +891,79 @@ mod tests {
 
         assert!(
             !probe(&s3_section(&endpoint), &keys().into()).unwrap(),
+            "the store did not answer"
+        );
+    }
+
+    fn gcs_section(endpoint: &str) -> TieredStorageConfig {
+        TieredStorageConfig {
+            backend: TieredStorageBackend::Gcs,
+            gcs: GcsSection {
+                bucket: "segments".to_owned(),
+                endpoint: endpoint.to_owned(),
+                ..GcsSection::default()
+            },
+            ..TieredStorageConfig::default()
+        }
+    }
+
+    #[test]
+    fn given_gcs_sections_when_mapping_should_default_to_google_and_keep_the_auth() {
+        let google = gcs_config(&gcs_section(" ").gcs, GcsAuth::Anonymous);
+        let emulator = gcs_config(
+            &gcs_section("http://localhost:4443").gcs,
+            GcsAuth::Anonymous,
+        );
+
+        assert_eq!(google.endpoint, "https://storage.googleapis.com");
+        assert_eq!(google.bucket, "segments");
+        assert!(matches!(google.auth, GcsAuth::Anonymous));
+        assert_eq!(emulator.endpoint, "http://localhost:4443");
+        assert_eq!(
+            store_location(&gcs_section("")),
+            "https://storage.googleapis.com/segments"
+        );
+    }
+
+    #[test]
+    fn given_gcs_backend_when_building_stores_should_need_its_credentials() {
+        let config = gcs_section("http://localhost:4443");
+
+        let built = store(&config, &GcsAuth::Anonymous.into()).unwrap();
+        let without = store(&config, &SharedStore::default());
+
+        assert!(matches!(built, Some(Backend::Gcs(_))));
+        assert!(
+            matches!(&without, Err(ServerError::TieredStorage { reason }) if reason.contains("gcs")),
+            "{:?}",
+            without.err()
+        );
+    }
+
+    #[test]
+    fn given_gcs_endpoint_that_cannot_address_a_bucket_when_probing_should_refuse_the_boot() {
+        let error = probe(
+            &gcs_section("http://store/with-a-path"),
+            &GcsAuth::Anonymous.into(),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, ServerError::TieredStorage { .. }),
+            "{error}"
+        );
+    }
+
+    /// A store that refuses the connection is an outage, which never stops
+    /// the boot.
+    #[test]
+    fn given_gcs_store_that_does_not_answer_when_probing_should_accept() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        assert!(
+            !probe(&gcs_section(&endpoint), &GcsAuth::Anonymous.into()).unwrap(),
             "the store did not answer"
         );
     }
