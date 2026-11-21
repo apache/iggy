@@ -1,0 +1,42 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# Fluent Bit as a Kafka producer: tail the matrix's records (one JSON object per line) from the
+# head, and send each to out_kafka keyed by its "key" field. The value is the record as JSON;
+# out_kafka sets no headers. BOOTSTRAP and TOPIC come from the environment.
+service:
+  flush: 1
+  grace: 10
+  log_level: warn
+parsers:
+  - name: record
+    format: json
+pipeline:
+  inputs:
+    - name: tail
+      path: /records.jsonl
+      read_from_head: true
+      exit_on_eof: true
+      parser: record
+  outputs:
+    - name: kafka
+      match: "*"
+      brokers: ${BOOTSTRAP}
+      topics: ${TOPIC}
+      message_key_field: key
+      format: json
+      timestamp_key: "@ts"

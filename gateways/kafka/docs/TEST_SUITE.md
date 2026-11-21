@@ -159,6 +159,32 @@ reports its logs. The `ci` profile does not retry a failed one, since a retry hi
 fails one run in a few. At its start, a test prints where its logs go. A failed test keeps the logs
 of its nodes, gateways and clients.
 
+## Client compatibility matrix
+
+`client_matrix_tests.rs` runs real Kafka clients and frameworks against both the gateway and an
+Apache Kafka container, and compares what each observed fact by fact. It is the suite that turns
+"I read that client's source" into a measured pass or fail. The probes and configurations live in
+[`tests/clients/`](../tests/clients/); [its README](../tests/clients/README.md) describes each
+step and [MATRIX.md](../tests/clients/MATRIX.md) records the latest results.
+
+Every pull request runs the smoke clients (kcat, confluent-kafka-python, franz-go, the Java client
+3.9 and 4.3) as part of the Rust test job. The nightly workflow,
+[`kafka-client-matrix-nightly.yml`](../../../.github/workflows/kafka-client-matrix-nightly.yml),
+adds Vector, Fluent Bit, RisingWave, Flink and Kafka Connect with Debezium. A difference fails the
+run unless [`tests/clients/allowed_differences.toml`](../tests/clients/allowed_differences.toml)
+declares it with the issue that owns it, and a declared difference that no longer occurs fails too.
+
+```bash
+cargo build --bin iggy-server
+docker pull apache/kafka:4.3.1   # the oracle, plus each client image the suite names
+KAFKA_E2E_REQUIRED=1 cargo test -p iggy-gateway-kafka --test client_matrix_tests
+KAFKA_CLIENT_MATRIX_FULL=1 KAFKA_E2E_REQUIRED=1 \
+  cargo test -p iggy-gateway-kafka --test client_matrix_tests   # the nightly clients as well
+```
+
+It needs Linux, Docker (or `KAFKA_ORACLE_CONTAINER_CLI=podman`), a host JDK 17+ (`javac`), `curl`
+and `sha256sum`, and it runs in its own `kafka_client_matrix` nextest group, one test at a time.
+
 ## Adding new tests
 
 1. **New API key or version range** — update `SUPPORTED_RANGES` in `api.rs`, `SCOPE.md`, and add
