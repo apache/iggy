@@ -43,8 +43,8 @@ public interface IIggyTopic
     Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default);
 
     /// <summary>
-    ///     Reads one page of the topics of a stream. For a stream that does not exist, a read without a cursor returns
-    ///     an empty last page.
+    ///     Reads one page of the topics of a stream. For a stream that does not exist, or one the caller may read no
+    ///     topic of, a read without a cursor returns an empty last page.
     /// </summary>
     /// <remarks>
     ///     The query is checked before anything is sent. To read the next page, send the same query with the
@@ -56,8 +56,8 @@ public interface IIggyTopic
     /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
     /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
     ///     Invalid command (code 3) for a query the page rules refuse, or for a cursor the server cannot use. Stream
-    ///     not found (code 1009) for a read with a cursor when the stream does not exist: the stream was deleted
-    ///     during the walk.
+    ///     not found (code 1009) for a caller with a global read grant that reads with a cursor when the stream does
+    ///     not exist: the stream was deleted during the walk.
     /// </exception>
     Task<Page<TopicResponse>> GetTopicsPageAsync(Identifier streamId, NamedPageQuery query,
         CancellationToken token = default);

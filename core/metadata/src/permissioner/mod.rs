@@ -18,7 +18,89 @@
 pub mod permissioner_rules;
 
 use ahash::{AHashMap, AHashSet};
-use iggy_common::{GlobalPermissions, Permissions, StreamPermissions, UserId};
+use iggy_common::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions, UserId};
+
+pub struct ReadGrants<'a> {
+    global: Option<&'a GlobalPermissions>,
+    stream: Option<&'a StreamPermissions>,
+}
+
+impl<'a> ReadGrants<'a> {
+    #[must_use]
+    pub fn for_stream(permissions: Option<&'a Permissions>, stream_id: Option<usize>) -> Self {
+        Self {
+            global: permissions.map(|permissions| &permissions.global),
+            stream: permissions
+                .and_then(|permissions| permissions.streams.as_ref()?.get(&stream_id?)),
+        }
+    }
+
+    /// Whether `permissions` let their holder read at least one stream.
+    #[must_use]
+    pub fn reads_some_stream(permissions: &'a Permissions) -> bool {
+        Self::for_stream(Some(permissions), None).reads_stream()
+            || permissions.streams.as_ref().is_some_and(|streams| {
+                streams.values().any(|stream| {
+                    Self {
+                        global: None,
+                        stream: Some(stream),
+                    }
+                    .reads_stream()
+                })
+            })
+    }
+
+    #[must_use]
+    pub fn reads_stream(&self) -> bool {
+        self.global
+            .is_some_and(|global| global.read_streams || global.manage_streams)
+            || self
+                .stream
+                .is_some_and(|stream| stream.read_stream || stream.manage_stream)
+    }
+
+    #[must_use]
+    pub fn reads_topics_globally(&self) -> bool {
+        self.global.is_some_and(|global| {
+            global.read_streams
+                || global.manage_streams
+                || global.manage_topics
+                || global.read_topics
+        })
+    }
+
+    #[must_use]
+    pub fn reads_some_topic(&self) -> bool {
+        self.reads_every_topic()
+            || self
+                .stream
+                .and_then(|stream| stream.topics.as_ref())
+                .is_some_and(|topics| topics.values().any(Self::reads_topic_grant))
+    }
+
+    #[must_use]
+    pub fn reads_topic(&self, topic_id: usize) -> bool {
+        self.reads_every_topic()
+            || self
+                .stream
+                .and_then(|stream| stream.topics.as_ref()?.get(&topic_id))
+                .is_some_and(Self::reads_topic_grant)
+    }
+
+    fn reads_every_topic(&self) -> bool {
+        self.reads_topics_globally()
+            || self.stream.is_some_and(|stream| {
+                stream.manage_stream
+                    || stream.read_stream
+                    || stream.manage_topics
+                    || stream.read_topics
+            })
+    }
+
+    const fn reads_topic_grant(grant: &TopicPermissions) -> bool {
+        grant.read_topic || grant.manage_topic
+    }
+}
 
 #[derive(Debug, Default, Clone)]
 pub struct Permissioner {
@@ -91,5 +173,12 @@ impl Permissioner {
             .retain(|(id, _)| *id != user_id);
         self.users_that_can_send_messages_to_specific_streams
             .retain(|(id, _)| *id != user_id);
+    }
+
+    fn read_grants(&self, user_id: UserId, stream_id: usize) -> ReadGrants<'_> {
+        ReadGrants {
+            global: self.users_permissions.get(&user_id),
+            stream: self.users_streams_permissions.get(&(user_id, stream_id)),
+        }
     }
 }

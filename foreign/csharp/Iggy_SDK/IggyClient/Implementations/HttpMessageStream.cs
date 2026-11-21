@@ -1276,10 +1276,16 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    ///     A token the server refuses has no session left to end, as after a password change, so the logout
+    ///     holds and the token is dropped too. A client that holds no token still gets the refusal.
+    /// </remarks>
     public async Task LogoutUserAsync(CancellationToken token = default)
     {
+        var signedIn = _httpClient.DefaultRequestHeaders.Authorization is not null;
         var response = await _httpClient.DeleteAsync("users/logout", token);
-        if (!response.IsSuccessStatusCode)
+        var alreadyLoggedOut = signedIn && response.StatusCode == HttpStatusCode.Unauthorized;
+        if (!response.IsSuccessStatusCode && !alreadyLoggedOut)
         {
             await HandleResponseAsync(response);
         }

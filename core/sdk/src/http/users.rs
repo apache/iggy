@@ -165,8 +165,16 @@ impl UserClient for HttpClient {
         Ok(identity_info)
     }
 
+    /// A token the server refuses has no session left to end, as after a
+    /// password change, so the logout holds and the token is dropped too.
     async fn logout_user(&self) -> Result<(), IggyError> {
-        self.delete(&format!("{PATH}/logout")).await?;
+        if !self.is_authenticated().await {
+            return Err(IggyError::Unauthenticated);
+        }
+        match self.delete(&format!("{PATH}/logout")).await {
+            Ok(_) | Err(IggyError::Unauthenticated) => {}
+            Err(error) => return Err(error),
+        }
         self.set_access_token(None).await;
         Ok(())
     }
@@ -235,6 +243,50 @@ mod tests {
                 Err(IggyError::InvalidUsername)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn given_refused_token_when_logging_out_should_succeed_and_drop_it() {
+        let server =
+            ScriptedServer::start(vec![Reply::error(401, &IggyError::Unauthenticated)]).await;
+        let client = server.client();
+
+        client.logout_user().await.unwrap();
+
+        assert_eq!(server.requests().len(), 1);
+        assert!(matches!(
+            client.delete_user(&Identifier::numeric(1).unwrap()).await,
+            Err(IggyError::Unauthenticated)
+        ));
+        assert!(server.requests().is_empty(), "no token is left to send");
+    }
+
+    #[tokio::test]
+    async fn given_no_token_when_logging_out_should_refuse_before_sending() {
+        let server = ScriptedServer::start(vec![Reply::empty(204)]).await;
+        let client = server.client();
+        client.set_access_token(None).await;
+
+        assert!(matches!(
+            client.logout_user().await,
+            Err(IggyError::Unauthenticated)
+        ));
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_server_failure_when_logging_out_should_keep_the_token() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(500, &IggyError::Error),
+            Reply::empty(204),
+        ])
+        .await;
+        let client = server.client();
+
+        assert!(client.logout_user().await.is_err());
+        client.logout_user().await.unwrap();
+
+        assert_eq!(server.requests().len(), 2);
     }
 
     #[tokio::test]

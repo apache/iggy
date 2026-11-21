@@ -589,10 +589,25 @@ async fn setup_test_resources(client: &IggyClient) {
         .expect("create topic");
 }
 
+/// The client is signed in with `auth-test-pat`, so deleting it ends this
+/// session and comes last.
 async fn cleanup_test_resources(client: &IggyClient) {
-    let _ = client.delete_personal_access_token("auth-test-pat").await;
     client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .expect("delete stream");
+    client
+        .delete_personal_access_token("auth-test-pat")
+        .await
+        .expect("delete the token of this session");
+    let refused = client.get_streams().await;
+    assert!(
+        matches!(
+            refused,
+            Err(IggyError::Unauthenticated
+                | IggyError::InvalidCredentials
+                | IggyError::InvalidPersonalAccessToken)
+        ),
+        "deleting the token must end the session it opened, got {refused:?}"
+    );
 }

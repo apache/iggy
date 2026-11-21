@@ -57,6 +57,10 @@ pub trait CliCommand: Send {
     fn prefer_explicit_credentials(&self) -> bool {
         false
     }
+    /// Whether the command can end its own session, so the sign-out after it may find none.
+    fn may_end_session(&self) -> bool {
+        false
+    }
     async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
     async fn execute_with_iggy_client(&mut self, client: &IggyClient) -> Result<(), Error> {
         self.execute_cmd(client).await

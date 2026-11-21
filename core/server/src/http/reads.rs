@@ -32,7 +32,7 @@ use iggy_binary_protocol::primitives::page::{MAX_PAGE_LIMIT, WirePageQuery};
 use iggy_binary_protocol::responses::PageResponse;
 use iggy_binary_protocol::{WireDecode, WireIdentifier};
 use iggy_common::wire_conversions::identifier_to_wire;
-use iggy_common::{Identifier, IggyError};
+use iggy_common::{Identifier, IggyError, IggyTimestamp};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
@@ -79,7 +79,8 @@ pub(in crate::http) fn authorize_read(
         .mux_stm
         .users()
         .read(|users| {
-            if !users.is_active_account(identity.user_id, identity.user_created_at.as_micros()) {
+            let now = IggyTimestamp::from(state.shard.bus.realtime_micros());
+            if !users.accepts_credential_at(identity.user_id, &identity.credential, now) {
                 return Err(IggyError::Unauthenticated);
             }
             users.authorize(|permissioner| rule(permissioner, identity.user_id))
@@ -654,6 +655,7 @@ pub(in crate::http) mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
     };
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
     };
@@ -700,8 +702,8 @@ pub(in crate::http) mod tests {
         create_one_partition_in, create_reader_request, prepare_message, recreate_topic_in,
         register_reply,
     };
-    use crate::http::error::{ConsistencyQuery, WriteError};
-    use crate::http::extractor::{Authenticated, Identity};
+    use crate::http::error::{AuthError, ConsistencyQuery, WriteError};
+    use crate::http::extractor::{Authenticated, Identity, resolve_credential};
     use crate::http::handlers::{
         create_pat, get_client, get_clients, get_metadata_changes, get_metrics, get_stats, get_user,
     };
@@ -714,15 +716,24 @@ pub(in crate::http) mod tests {
     use crate::shell::{ServerMetadata, ServerMuxStateMachine, ServerShard};
 
     #[compio::test]
-    async fn given_authenticated_read_when_account_replaced_while_held_should_reject() {
+    async fn given_authenticated_read_when_account_replaced_or_password_changed_while_held_should_reject()
+     {
         const ACCOUNT_ID: u32 = 1;
         const CREATED_AT: u64 = 10;
         const DELETED_AT: u64 = 20;
         const REPLACED_AT: u64 = 30;
         const READ_FLOOR: u64 = 1;
 
-        // The metrics scrape waits on the recovery barrier only.
-        for (recovery_barrier, scrape_metrics) in [(true, false), (false, false), (true, true)] {
+        // The metrics scrape waits on the recovery barrier only. A password
+        // change keeps the account and moves only its access revision.
+        for (recovery_barrier, scrape_metrics, rotated) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+        ] {
             let state = read_state();
             let mut account = CreateUserRequest {
                 username: WireName::new("original").unwrap(),
@@ -768,6 +779,28 @@ pub(in crate::http) mod tests {
                 "the authenticated read must wait before account replacement"
             );
 
+            if rotated {
+                commit_user_request(
+                    &state,
+                    DELETED_AT,
+                    Operation::ChangePassword,
+                    &metadata::stm::user::ChangePasswordRequest {
+                        user_id: WireIdentifier::numeric(ACCOUNT_ID),
+                        access_revision: CREATED_AT,
+                        keep_session: false,
+                        password_hash: "new-hash".to_owned(),
+                    }
+                    .to_bytes(),
+                );
+                consensus.set_recovery_barrier(0);
+                metadata.applied_frontier().advance(READ_FLOOR);
+                assert_eq!(
+                    read.await.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "a read held at recovery={recovery_barrier}, metrics={scrape_metrics} must reject a token from before the password change"
+                );
+                continue;
+            }
             commit_user_request(
                 &state,
                 DELETED_AT,
@@ -1003,7 +1036,11 @@ pub(in crate::http) mod tests {
                 );
                 let token = state
                     .jwt
-                    .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+                    .generate(
+                        READER_ID,
+                        CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                        u64::MAX,
+                    )
                     .unwrap();
                 let service = TowerToHyperService::new(router(
                     state.clone(),
@@ -1106,6 +1143,95 @@ pub(in crate::http) mod tests {
     }
 
     #[compio::test]
+    async fn given_token_issued_before_password_change_when_presented_should_refuse_it() {
+        const CHANGED_AT: u64 = READER_CREATED_AT + 5;
+        let state = read_state();
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        let issued = CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT);
+        let before = state
+            .jwt
+            .generate(READER_ID, issued, u64::MAX)
+            .unwrap()
+            .access_token;
+        assert!(resolve_credential(&state, &before).await.is_ok());
+
+        commit_user_request(
+            &state,
+            CHANGED_AT,
+            Operation::ChangePassword,
+            &metadata::stm::user::ChangePasswordRequest {
+                user_id: WireIdentifier::numeric(READER_ID),
+                access_revision: READER_CREATED_AT,
+                keep_session: true,
+                password_hash: "new-hash".to_owned(),
+            }
+            .to_bytes(),
+        );
+
+        assert!(
+            resolve_credential(&state, &before).await.is_err(),
+            "a token issued before the change must be refused"
+        );
+        assert!(
+            state.issuable_credential(READER_ID, &issued).is_err(),
+            "a refresh of that token must be refused"
+        );
+        let current = CredentialProof::account(READER_CREATED_AT, CHANGED_AT);
+        let after = state
+            .jwt
+            .generate(READER_ID, current, u64::MAX)
+            .unwrap()
+            .access_token;
+        assert!(resolve_credential(&state, &after).await.is_ok());
+    }
+
+    #[compio::test]
+    async fn given_token_issued_at_an_op_this_node_has_not_applied_when_presented_should_ask_for_a_retry()
+     {
+        const CHANGED_AT: u64 = READER_CREATED_AT + 5;
+        let state = read_state();
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        let ahead = state
+            .jwt
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, CHANGED_AT),
+                u64::MAX,
+            )
+            .unwrap()
+            .access_token;
+        assert!(matches!(
+            resolve_credential(&state, &ahead).await,
+            Err(AuthError::SessionNotAccepted)
+        ));
+
+        commit_user_request(
+            &state,
+            CHANGED_AT,
+            Operation::ChangePassword,
+            &metadata::stm::user::ChangePasswordRequest {
+                user_id: WireIdentifier::numeric(READER_ID),
+                access_revision: READER_CREATED_AT,
+                keep_session: true,
+                password_hash: "new-hash".to_owned(),
+            }
+            .to_bytes(),
+        );
+
+        assert!(resolve_credential(&state, &ahead).await.is_ok());
+    }
+
+    #[compio::test]
     #[allow(clippy::too_many_lines)]
     async fn given_a_partition_read_when_freshness_expires_before_retry_should_not_read_again() {
         for uri in [
@@ -1130,7 +1256,11 @@ pub(in crate::http) mod tests {
             );
             let token = state
                 .jwt
-                .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+                .generate(
+                    READER_ID,
+                    CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                    u64::MAX,
+                )
                 .unwrap();
             let service = TowerToHyperService::new(router(
                 state.clone(),
@@ -1232,7 +1362,11 @@ pub(in crate::http) mod tests {
         );
         let token = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                u64::MAX,
+            )
             .unwrap();
         let service = TowerToHyperService::new(router(
             state.clone(),
@@ -1668,13 +1802,19 @@ pub(in crate::http) mod tests {
     /// name the caller and the cap itself.
     #[compio::test]
     async fn given_user_at_token_cap_when_creating_over_http_should_name_the_user_and_the_cap() {
-        const OWNER: u32 = 7;
+        const OWNER: u32 = READER_ID;
         const CLIENT: u128 = 9;
         const SESSION: u64 = 1;
         const TOKEN_CAP: u32 = 1;
         let state = read_state();
         let metadata = state.shard.plane.metadata();
         metadata.set_max_tokens_per_user(TOKEN_CAP);
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
         let token = CreatePersonalAccessTokenRequest {
             user_id: OWNER,
             name: WireName::new("taken").unwrap(),
@@ -1696,14 +1836,18 @@ pub(in crate::http) mod tests {
         };
         let session = HttpSession {
             attachment: RefCell::new(attachment),
-            activity: Rc::new(SessionActivity::new(ConsumerSession {
-                client_id: CLIENT,
-                session: SESSION,
-            })),
+            activity: Rc::new(SessionActivity::new(
+                ConsumerSession {
+                    client_id: CLIENT,
+                    session: SESSION,
+                },
+                u64::MAX,
+            )),
             key: String::new(),
             client_id: CLIENT,
             session: SESSION,
             user_id: OWNER,
+            credential: CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
             expiry: u64::MAX,
             gate: Mutex::new(FIRST_REQUEST_ID),
             data_gate: Mutex::new(FIRST_REQUEST_ID),
@@ -1843,7 +1987,11 @@ pub(in crate::http) mod tests {
     async fn authenticated_identity(state: &HttpState, user_id: u32, created_at: u64) -> Identity {
         let token = state
             .jwt
-            .generate(user_id, IggyTimestamp::from(created_at))
+            .generate(
+                user_id,
+                CredentialProof::account(created_at, created_at),
+                u64::MAX,
+            )
             .unwrap();
         let (mut parts, ()) = Request::builder()
             .uri("/users/me")

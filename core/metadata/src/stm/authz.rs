@@ -40,7 +40,7 @@ use crate::permissioner::Permissioner;
 use crate::stm::consumer_group::{JoinConsumerGroupRequest, LeaveConsumerGroupRequest};
 use crate::stm::result::{ApplyReply, CreateUserResult, UpdatePermissionsResult};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
-use crate::stm::user::Users;
+use crate::stm::user::{ChangePasswordRequest, Users};
 use crate::stm::{ApplyContext, StateMachine};
 use consensus::ClientTable;
 use iggy_binary_protocol::primitives::metadata_changes::WireUserKey;
@@ -55,9 +55,8 @@ use iggy_binary_protocol::requests::system::RetirementDebt;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest, UpdateTopicResolvedRequest,
 };
-use iggy_binary_protocol::requests::users::{
-    ChangePasswordRequest, CreateUserRequest, UpdatePermissionsRequest,
-};
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
+use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, WireName};
 use iggy_common::{IggyError, IggyTimestamp, variadic};
 use server_common::Message;
@@ -149,7 +148,14 @@ pub trait GatedApply:
     /// Records the retirement debt a replayed `FinalizeSession` carried.
     fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64);
 
-    fn is_active_account(&self, user_id: u32, created_at: u64) -> bool;
+    /// Whether a committed Register with `credential` may open a session for
+    /// `user_id` at the prepare timestamp `now`.
+    fn accepts_registration(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        now: IggyTimestamp,
+    ) -> bool;
 
     /// Rebinds the consumer group memberships of the client a replayed
     /// Register committed to `session`, returning the handover records.
@@ -174,8 +180,14 @@ pub trait GatedApply:
 }
 
 impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
-    fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
-        self.users().is_active_account(user_id, created_at)
+    fn accepts_registration(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        now: IggyTimestamp,
+    ) -> bool {
+        self.users()
+            .read(|users| users.accepts_credential_at(user_id, credential, now))
     }
 
     fn refresh_session(
@@ -596,7 +608,12 @@ fn topic_scoped(
 /// gate. Production always uses the `variadic!(Users, Streams)` machine above.
 #[cfg(test)]
 impl GatedApply for MuxStateMachine<()> {
-    fn is_active_account(&self, _user_id: u32, _created_at: u64) -> bool {
+    fn accepts_registration(
+        &self,
+        _user_id: u32,
+        _credential: &CredentialProof,
+        _now: IggyTimestamp,
+    ) -> bool {
         true
     }
 
@@ -618,7 +635,7 @@ impl GatedApply for MuxStateMachine<()> {
         Vec::new()
     }
 
-    /// Every account exists here, as [`Self::is_active_account`] says.
+    /// Every account exists here, as [`Self::accepts_registration`] says.
     fn user_key(&self, user_id: u32) -> Option<WireUserKey> {
         Some(WireUserKey {
             user_id,
@@ -745,8 +762,9 @@ mod tests {
     fn change_password_body(target: &str) -> bytes::Bytes {
         ChangePasswordRequest {
             user_id: WireIdentifier::named(target).unwrap(),
-            current_password: String::new(),
-            new_password: "new-hash".to_string(),
+            access_revision: 1,
+            keep_session: true,
+            password_hash: "new-hash".to_string(),
         }
         .to_bytes()
     }

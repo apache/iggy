@@ -84,7 +84,7 @@ The name is missing from the message because of a known bug where error details 
 
 ## Client cannot complete login
 
-Make sure that the client matches the server's protocol. Server 0.10.0 uses protocol 0.12.0 and rejects incompatible clients during login. A malformed old client can report a disconnect rather than a useful compatibility error.
+Make sure that the client matches the server's protocol. Server 0.10.0 uses client protocol 0.12.2 and rejects incompatible clients during login. A malformed old client can report a disconnect rather than a useful compatibility error.
 
 Use Rust SDK 0.12.0 or Python SDK 0.10.0 with this server. See [Server compatibility](/docs/sdk/introduction#server-compatibility) for the other languages. Also make sure that credentials match the stored account, not just the current bootstrap environment.
 

@@ -1659,11 +1659,10 @@ class IggyClient:
         not appear. `get_streams_page` reads one page.
 
         Returns:
-            A list of `Stream` summaries.
+            A list of `Stream` summaries, the streams the user may read.
 
         Raises:
-            RuntimeError: If the client is not authenticated, the user lacks global
-                `read_streams` or `manage_streams` permission, or the request fails.
+            RuntimeError: If the client is not authenticated or the request fails.
         """
     def get_streams_page(
         self,
@@ -1699,9 +1698,9 @@ class IggyClient:
                 anything is sent. The server refuses a cursor that it cannot
                 use, such as the cursor of another order, with the same code.
                 Over HTTP, a refusal from the server has code 300 (HTTP response
-                error), and its message holds the server error body. A user
-                without the permission to read the streams gets the
-                unauthorized code.
+                error), and its message holds the server error body. The page
+                holds the streams the user may read, so a user without a
+                grant gets an empty page.
         """
     def update_stream(
         self,
@@ -1849,8 +1848,8 @@ class IggyClient:
         Raises:
             ValueError: If the identifier is invalid.
             OverflowError: If `limit` is outside the unsigned 32-bit range.
-            IggyError: As for `get_streams_page`. A user without the permission
-                to read the topics gets the unauthorized code.
+            IggyError: As for `get_streams_page`. The page holds the topics
+                the user may read.
         """
     def update_topic(
         self,

@@ -22,16 +22,22 @@ use std::time::Duration;
 use super::*;
 use consensus::{ClientTable, PartitionsHandle, build_reply_message_with};
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
-use iggy_binary_protocol::{AckLevel, Operation, PrepareHeader};
+use iggy_binary_protocol::{
+    AckLevel, Command, Operation, PrepareHeader, WireEncode, WireIdentifier,
+};
 use iggy_common::{
     ConsumerGroupId, ConsumerKind, ConsumerOffset, DEFAULT_POLL_MAX_BYTES, IggyByteSize,
     IggyTimestamp,
 };
 use metadata::IggyMetadata;
+use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember};
 use metadata::stm::stream::{Partition as MetadataPartition, Stream, StreamsInner, Topic};
-use metadata::stm::user::Users;
+use metadata::stm::user::{
+    ChangePasswordRequest, ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS, Users,
+};
 use partitions::{Fragment, IggyPartitions};
+use server_common::Message;
 use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::{PartitionLocation, ShardId};
 
@@ -172,7 +178,7 @@ fn request(owner: &TestShard, count: u32, group: bool, auto_commit: bool) -> Def
         DeferredPollContext {
             session: None,
             user_id: 0,
-            user_created_at: None,
+            credential: None,
             quota: PollQuotaIdentity::Session(CLIENT),
             primary: false,
         },
@@ -1580,7 +1586,7 @@ fn readiness_caller() -> DeferredPollContext {
     DeferredPollContext {
         session: None,
         user_id: 0,
-        user_created_at: None,
+        credential: None,
         quota: PollQuotaIdentity::Session(CLIENT),
         primary: true,
     }
@@ -1938,6 +1944,112 @@ async fn stale_session_rejects_parked_readiness_on_a_commit() {
     assert!(matches!(
         replies.try_recv(),
         Ok(PartitionReadReply::Rejected(IggyError::StaleClient))
+    ));
+    assert_released(&owner);
+}
+
+#[compio::test]
+async fn given_session_credential_expiring_while_parked_when_a_commit_wakes_it_should_reject() {
+    const LIFETIME_MICROS: u64 = 200_000;
+    let owner = owner(&["first"]).await;
+    let mut table = ClientTable::new(1);
+    let registration = PrepareHeader {
+        client: CLIENT,
+        operation: Operation::Register,
+        op: 1,
+        ..Default::default()
+    };
+    table
+        .commit_register(
+            CLIENT,
+            0,
+            [0x5a; 32],
+            build_reply_message_with(&registration, 0, |_| {}),
+        )
+        .unwrap();
+    let expires_at = owner.bus.realtime_micros() + LIFETIME_MICROS;
+    let session = table
+        .attach_session(CLIENT, 1, 0)
+        .unwrap()
+        .expiring_at(expires_at);
+    let (reply, replies) = channel(2);
+    owner.admit_readiness_wait(
+        ReadinessWait {
+            context: DeferredPollContext {
+                session: Some(session),
+                ..readiness_caller()
+            },
+            targets: vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+            deadline: DEADLINE,
+            min_count: ANY_MESSAGE,
+        },
+        &reply,
+        None,
+    );
+    assert!(answer(&replies).0.is_some());
+    while owner.bus.realtime_micros() < expires_at {
+        compio::time::sleep(Duration::from_millis(1)).await;
+    }
+    commit(&owner, &["second"], 2).await;
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(IggyError::StaleClient))
+    ));
+    assert_released(&owner);
+    drop(table);
+}
+
+#[compio::test]
+async fn given_a_parked_poll_without_a_session_when_its_password_changes_should_reject() {
+    const CHANGE_OP: u64 = 2;
+    let owner = owner(&["first"]).await;
+    let (reply, replies) = channel(2);
+    owner.admit_readiness_wait(
+        ReadinessWait {
+            context: DeferredPollContext {
+                credential: Some(CredentialProof::account(
+                    ROOT_USER_CREATED_AT_MICROS,
+                    ROOT_USER_ACCESS_REVISION,
+                )),
+                ..readiness_caller()
+            },
+            targets: vec![readiness_target(&owner, 0, PollingStrategy::offset(1))],
+            deadline: DEADLINE,
+            min_count: ANY_MESSAGE,
+        },
+        &reply,
+        None,
+    );
+    assert!(answer(&replies).0.is_some());
+
+    let body = ChangePasswordRequest {
+        user_id: WireIdentifier::numeric(0),
+        access_revision: ROOT_USER_ACCESS_REVISION,
+        keep_session: true,
+        password_hash: "new-hash".to_owned(),
+    }
+    .to_bytes();
+    let size = size_of::<PrepareHeader>() + body.len();
+    let mut change = Message::<PrepareHeader>::new(size);
+    change.as_mut_slice()[size_of::<PrepareHeader>()..].copy_from_slice(&body);
+    let change = change.transmute_header::<PrepareHeader>(|_, header| {
+        *header = PrepareHeader {
+            command: Command::Prepare,
+            op: CHANGE_OP,
+            operation: Operation::ChangePassword,
+            size: u32::try_from(size).expect("a small prepare"),
+            ..Default::default()
+        };
+    });
+    let changed = owner.plane.metadata().mux_stm.update(change);
+    assert_eq!(changed.expect("the change applies").code, 0);
+
+    commit(&owner, &["second"], 2).await;
+    owner.service_deferred_polls().await;
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(IggyError::Unauthenticated))
     ));
     assert_released(&owner);
 }

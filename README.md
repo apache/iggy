@@ -146,7 +146,7 @@ The server, SDKs and CLI are versioned independently. For example, server 0.9.0 
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
 
-This checkout moves the binary protocol to 0.12.0 and the metadata snapshot format to 14. Both are breaking: older clients and servers do not interoperate with it, and data directories written by older releases are refused. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
+This checkout uses client protocol 0.12.3, replica wire revision 4 and metadata snapshot format 17. Upgrade all replicas together using fresh storage. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
