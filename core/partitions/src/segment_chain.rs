@@ -116,6 +116,16 @@ fn decode_header(header: &[u8; HEADER_SIZE]) -> Option<ObjectPrefix> {
     (reader.u64() == state_artifact_checksum(&header[..HEADER_CHECKSUM_AT])).then_some(prefix)
 }
 
+/// What a partition asks of the objects under a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefixAccess {
+    /// Ranged gets, as a poll makes them.
+    Read,
+    /// Anything that can change the store: a put, a conditional create or a
+    /// delete.
+    Write,
+}
+
 /// How a segment's hash was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HashSource {
@@ -1346,8 +1356,41 @@ where
         Ok(())
     }
 
-    /// Whether `prefix` names this partition and its incarnation.
+    /// Whether this partition may send `access` requests for the objects
+    /// under `prefix`: any request under its own incarnation's prefix, and
+    /// reads only under the origin's incarnation that its peer log follows.
+    /// A partition that follows another cluster's log owns no prefix, so it
+    /// writes nothing anywhere.
+    pub(crate) fn admits_prefix(&self, prefix: &ObjectPrefix, access: PrefixAccess) -> bool {
+        self.peer_log.as_deref().map_or_else(
+            || self.names_own_incarnation(prefix),
+            |peer| access == PrefixAccess::Read && peer.prefix() == *prefix,
+        )
+    }
+
+    /// Whether `prefix` names this partition and its incarnation, and the
+    /// partition writes under it: the only prefix its chain may record.
     pub(crate) fn owns_chain_prefix(&self, prefix: &ObjectPrefix) -> bool {
+        self.admits_prefix(prefix, PrefixAccess::Write)
+    }
+
+    /// The prefix that names the objects of this partition's remote
+    /// segments: the one its chain records, or the origin's incarnation that
+    /// its peer log follows.
+    pub(crate) fn read_prefix(&self) -> Option<ObjectPrefix> {
+        let prefix = self
+            .peer_log
+            .as_deref()
+            .map(crate::PeerLog::prefix)
+            .or_else(|| self.object_prefix());
+        debug_assert!(
+            prefix.is_none_or(|prefix| self.admits_prefix(&prefix, PrefixAccess::Read)),
+            "a partition reads only under a prefix it admits"
+        );
+        prefix
+    }
+
+    fn names_own_incarnation(&self, prefix: &ObjectPrefix) -> bool {
         let namespace = self.namespace();
         (prefix.stream_id, prefix.topic_id, prefix.partition_id)
             == (

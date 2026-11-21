@@ -289,6 +289,10 @@ pub struct PollContext {
         Option<iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner>,
     /// Keeps drain evidence incomplete until this read is accepted or dropped.
     pub(crate) _group_poll: Option<Arc<AtomicBool>>,
+    /// The first segment the read walks, on a partition that follows another
+    /// cluster's log. A trim that drops it before the read completes may have
+    /// let the origin delete its objects, so the owner refuses the read.
+    pub(crate) peer_first_segment: Option<u64>,
 }
 
 /// An owned read result awaiting validation by the partition owner.
@@ -1956,6 +1960,7 @@ mod tests {
                         auto_commit: true,
                         owner: None,
                         _group_poll: None,
+                        peer_first_segment: None,
                     },
                     commit_offset: 99,
                     tier: PollTier::Resident {
@@ -2362,6 +2367,7 @@ mod tests {
             context: PollContext {
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
                 history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -2392,6 +2398,7 @@ mod tests {
             context: PollContext {
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
                 history: PollHistoryId::default(),
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -2424,6 +2431,7 @@ mod tests {
                     auto_commit: true,
                     owner: None,
                     _group_poll: None,
+                    peer_first_segment: None,
                 },
                 commit_offset: 9,
                 tier: PollTier::Disk {
@@ -2558,6 +2566,7 @@ mod tests {
                 auto_commit: true,
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
             },
             commit_offset: u64::from(BATCHES) - 1,
             tier: PollTier::Disk {
@@ -2783,6 +2792,7 @@ mod tests {
                 auto_commit: true,
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
             },
             commit_offset: u64::MAX,
             tier: PollTier::Disk {
@@ -2830,6 +2840,7 @@ mod tests {
                 auto_commit: true,
                 owner: None,
                 _group_poll: None,
+                peer_first_segment: None,
             },
             commit_offset: 0,
             tier: PollTier::Resident {
