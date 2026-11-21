@@ -229,17 +229,18 @@ where
     /// the primary.
     pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
     /// The rewrite of this partition's placed batches into long-term
-    /// segments, while this replica is the primary.
-    pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
+    /// segments, while this replica is the primary. Behind a pointer, as the
+    /// merges are.
+    pub(crate) long_term_rewrites: Box<crate::long_term_rewrite::LongTermRewrites>,
     /// What this replica found of its geo topic's object while it is the
     /// primary. Boxed to keep the partition small on the stack.
     pub(crate) topic_object_check: Box<crate::topic_object::TopicObjectCheck>,
     /// The merges of this partition's small long-term segments, while this
     /// replica is the primary. Behind a pointer, as the deletes are.
     pub(crate) long_term_merges: Box<crate::long_term_merge::LongTermMerges>,
-    /// Number of the last long-term rewrite this partition started. It
-    /// outlives the view, so the late result of an earlier view's rewrite is
-    /// never taken for the one in flight.
+    /// Number of the last long-term plan or rewrite this partition started.
+    /// It outlives the view, so the late result of an earlier view's plan or
+    /// rewrite is never taken for the one in flight.
     pub(crate) long_term_rewrite_jobs: u64,
     /// What this partition committed above its long-term floor.
     pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
@@ -1184,7 +1185,7 @@ where
             long_term_deletes: Box::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
-            long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
+            long_term_rewrites: Box::default(),
             topic_object_check: Box::default(),
             long_term_merges: Box::default(),
             long_term_rewrite_jobs: 0,

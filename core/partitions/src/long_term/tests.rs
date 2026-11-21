@@ -18,8 +18,10 @@
 use iggy_object_store::{ManifestSegment, SEGMENT_HASH_LEN};
 
 use super::{
-    LONG_TERM_SEGMENTS_MAX, LongTermLog, PUBLISH_SEGMENT, PublishSegment, REPLACE_SEGMENTS,
-    REPLACE_SOURCES_MAX, ReplaceSegments, SEGMENT_PAYLOAD_SIZE, TRIM_PAYLOAD_SIZE, TRIM_SEGMENTS,
+    EXPIRE_PAYLOAD_SIZE, EXPIRE_REGISTRATIONS, ExpireRegistrations, LONG_TERM_REGISTRATIONS_MAX,
+    LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration, PUBLISH_SEGMENT, PublishSegment,
+    REGISTER_OBJECT, REGISTRATION_PAYLOAD_SIZE, REPLACE_SEGMENTS, REPLACE_SOURCES_MAX,
+    RegisterObject, ReplaceSegments, SEGMENT_PAYLOAD_SIZE, TRIM_PAYLOAD_SIZE, TRIM_SEGMENTS,
     TrimSegments,
 };
 use crate::state_machine::{Applied, MachineCommand, PartitionStateMachine};
@@ -46,6 +48,33 @@ fn publish(log: &mut LongTermLog, op: u64, segment: ManifestSegment) -> Applied 
             payload: &payload,
         },
     )
+}
+
+/// Bytes of the count in front of each part of a snapshot.
+const COUNT: usize = size_of::<u32>();
+
+/// A snapshot written by hand, part by part, so a test can write one that
+/// no log would.
+fn raw_snapshot(
+    segments: &[ManifestSegment],
+    registrations: &[ObjectRegistration],
+    expired: &[(u64, u64)],
+) -> Vec<u8> {
+    let mut snapshot = Vec::new();
+    snapshot.extend_from_slice(&u32::try_from(segments.len()).unwrap().to_le_bytes());
+    for segment in segments {
+        snapshot.extend_from_slice(&PublishSegment(*segment).encode());
+    }
+    snapshot.extend_from_slice(&u32::try_from(registrations.len()).unwrap().to_le_bytes());
+    for registration in registrations {
+        snapshot.extend_from_slice(&RegisterObject(*registration).encode());
+    }
+    snapshot.extend_from_slice(&u32::try_from(expired.len()).unwrap().to_le_bytes());
+    for (start_offset, end_offset) in expired {
+        snapshot.extend_from_slice(&start_offset.to_le_bytes());
+        snapshot.extend_from_slice(&end_offset.to_le_bytes());
+    }
+    snapshot
 }
 
 fn log_of(segments: &[(u64, u64)]) -> LongTermLog {
@@ -136,13 +165,21 @@ fn given_a_log_when_snapshotting_and_restoring_should_give_it_back() {
     let log = log_of(&[(0, 9), (10, 19), (20, 20)]);
     let mut snapshot = vec![0xff; 3];
     log.snapshot_into(&mut snapshot);
-    assert_eq!(snapshot.len(), 3 + 3 * SEGMENT_PAYLOAD_SIZE);
+    assert_eq!(snapshot.len(), 3 + 3 * COUNT + 3 * SEGMENT_PAYLOAD_SIZE);
+    assert_eq!(snapshot[3..], raw_snapshot(log.segments(), &[], &[]));
 
     let mut restored = log_of(&[(0, 4)]);
     restored.restore(&snapshot[3..]).unwrap();
 
     assert_eq!(restored, log);
-    restored.restore(&[]).unwrap();
+    assert!(
+        restored.restore(&[]).is_err(),
+        "a log without state writes no part, and one with state writes its counts"
+    );
+    assert_eq!(restored, log);
+    let mut empty = Vec::new();
+    LongTermLog::default().snapshot_into(&mut empty);
+    restored.restore(&empty).unwrap();
     assert_eq!(restored, LongTermLog::default());
     let mut reset = log;
     reset.reset();
@@ -153,11 +190,7 @@ fn given_a_log_when_snapshotting_and_restoring_should_give_it_back() {
 /// anywhere. It still has no gap after its first segment.
 #[test]
 fn given_a_snapshot_that_starts_past_zero_when_restoring_should_take_it() {
-    let mut snapshot = Vec::new();
-    for bytes in [segment(30, 39), segment(40, 49)].map(|segment| PublishSegment(segment).encode())
-    {
-        snapshot.extend_from_slice(&bytes);
-    }
+    let snapshot = raw_snapshot(&[segment(30, 39), segment(40, 49)], &[], &[]);
     let mut log = LongTermLog::default();
 
     log.restore(&snapshot).unwrap();
@@ -169,13 +202,13 @@ fn given_a_snapshot_that_starts_past_zero_when_restoring_should_take_it() {
 #[test]
 fn given_a_malformed_snapshot_when_restoring_should_refuse_it_and_keep_the_log() {
     let log = log_of(&[(0, 9)]);
-    let gap: Vec<u8> = [segment(0, 9), segment(11, 19)]
-        .iter()
-        .flat_map(|segment| PublishSegment(*segment).encode())
-        .collect();
-    let cut = &gap[..=SEGMENT_PAYLOAD_SIZE];
+    let gap = raw_snapshot(&[segment(0, 9), segment(11, 19)], &[], &[]);
+    let whole = raw_snapshot(&[segment(0, 9), segment(10, 19)], &[], &[]);
+    let cut = &whole[..whole.len() - 1];
+    let mut trailing = whole.clone();
+    trailing.push(0);
 
-    for snapshot in [&gap[..], cut] {
+    for snapshot in [&gap[..], cut, &trailing[..]] {
         let mut restored = log.clone();
         assert!(restored.restore(snapshot).is_err());
         assert_eq!(restored, log);
@@ -626,7 +659,7 @@ fn given_a_log_after_a_replace_and_a_trim_when_snapshotting_and_restoring_should
     assert_eq!(log.segments(), [run, segment(30, 39)]);
     let mut snapshot = Vec::new();
     log.snapshot_into(&mut snapshot);
-    assert_eq!(snapshot.len(), 2 * SEGMENT_PAYLOAD_SIZE);
+    assert_eq!(snapshot.len(), 3 * COUNT + 2 * SEGMENT_PAYLOAD_SIZE);
 
     let mut restored = LongTermLog::default();
     restored.restore(&snapshot).unwrap();
@@ -643,4 +676,447 @@ fn given_a_log_after_a_replace_and_a_trim_when_snapshotting_and_restoring_should
     }
     assert_eq!(restored, log);
     assert_eq!(restored.segments(), [segment(40, 49)]);
+}
+
+fn registration(start_offset: u64, end_offset: u64, registered_at: u64) -> ObjectRegistration {
+    ObjectRegistration {
+        start_offset,
+        end_offset,
+        registered_at,
+    }
+}
+
+fn register(log: &mut LongTermLog, op: u64, registration: ObjectRegistration) -> Applied {
+    let payload = RegisterObject(registration).encode();
+    log.apply(
+        op,
+        MachineCommand {
+            kind: REGISTER_OBJECT,
+            payload: &payload,
+        },
+    )
+}
+
+fn expire(log: &mut LongTermLog, op: u64, before: u64) -> Applied {
+    let payload = ExpireRegistrations { before }.encode();
+    log.apply(
+        op,
+        MachineCommand {
+            kind: EXPIRE_REGISTRATIONS,
+            payload: &payload,
+        },
+    )
+}
+
+fn keys(log: &LongTermLog) -> Vec<(u64, u64)> {
+    log.registrations()
+        .iter()
+        .map(ObjectRegistration::key)
+        .collect()
+}
+
+#[test]
+fn given_the_next_segment_or_a_run_when_registering_should_hold_each_in_offset_order() {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29)]);
+
+    for (op, (start_offset, end_offset)) in (4..).zip([(30, 35), (10, 29), (0, 19)]) {
+        assert_eq!(
+            register(&mut log, op, registration(start_offset, end_offset, op)),
+            Applied::Changed
+        );
+    }
+
+    assert_eq!(keys(&log), [(0, 19), (10, 29), (30, 35)]);
+    assert_eq!(log.segments().len(), 3, "a registration lists nothing");
+    let mut empty = LongTermLog::default();
+    assert_eq!(
+        register(&mut empty, 1, registration(0, 4, 1)),
+        Applied::Changed
+    );
+    assert!(empty.holds_state());
+}
+
+#[test]
+fn given_offsets_no_command_lists_when_registering_should_refuse_them() {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29)]);
+    let refused = [
+        ((31, 40), "past the next segment"),
+        ((30, 29), "ends before it starts"),
+        ((5, 19), "starts inside a segment"),
+        ((0, 15), "ends inside a segment"),
+        ((10, 19), "a listed segment"),
+        ((0, 35), "from a start to past the floor"),
+    ];
+
+    for ((start_offset, end_offset), what) in refused {
+        assert_eq!(
+            register(&mut log, 4, registration(start_offset, end_offset, 1)),
+            Applied::Refused,
+            "{what}"
+        );
+    }
+    assert_eq!(log.registrations(), []);
+
+    let sources = REPLACE_SOURCES_MAX as u64;
+    let mut many = log_of_single_offsets(sources + 1);
+    assert_eq!(
+        register(&mut many, sources + 2, registration(0, sources, 1)),
+        Applied::Refused,
+        "more sources than one replace takes"
+    );
+    assert_eq!(
+        register(&mut many, sources + 3, registration(0, sources - 1, 1)),
+        Applied::Changed
+    );
+}
+
+/// A primary that never learned its registration committed sends it again,
+/// and the next primary registers what an earlier one stored to take it as
+/// its own. Either way the later time stands.
+#[test]
+fn given_a_registered_object_when_registering_it_again_should_keep_the_later_time() {
+    let mut log = log_of(&[(0, 9), (10, 19)]);
+    assert_eq!(
+        register(&mut log, 3, registration(0, 19, 100)),
+        Applied::Changed
+    );
+    let registered = log.clone();
+
+    assert_eq!(
+        register(&mut log, 4, registration(0, 19, 100)),
+        Applied::Changed
+    );
+    assert_eq!(log, registered);
+    assert_eq!(
+        register(&mut log, 5, registration(0, 19, 50)),
+        Applied::Changed
+    );
+    assert_eq!(log, registered, "an earlier time changes nothing");
+
+    assert_eq!(
+        register(&mut log, 6, registration(0, 19, 200)),
+        Applied::Changed
+    );
+    assert_eq!(log.registration(0, 19), Some(&registration(0, 19, 200)));
+}
+
+/// Three primaries registered the next segment, each with its own end. The
+/// publish of one clears its registration. One that ends below the new
+/// floor is dead by the segments, and one that ends above it waits for its
+/// expiry.
+#[test]
+fn given_registrations_of_the_next_segment_when_one_is_published_should_clear_it_and_drop_the_dead()
+{
+    let mut log = log_of(&[(0, 9)]);
+    for (op, end_offset) in (2..).zip([14, 19, 25]) {
+        assert_eq!(
+            register(&mut log, op, registration(10, end_offset, op)),
+            Applied::Changed
+        );
+    }
+
+    assert_eq!(publish(&mut log, 5, segment(10, 19)), Applied::Changed);
+
+    assert_eq!(keys(&log), [(10, 25)]);
+    assert_eq!(
+        publish(&mut log, 6, segment(10, 19)),
+        Applied::Changed,
+        "sent again"
+    );
+    assert_eq!(keys(&log), [(10, 25)]);
+}
+
+#[test]
+fn given_registered_runs_when_a_replace_commits_should_clear_its_own_and_drop_those_it_cuts() {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29), (30, 39)]);
+    for (op, (start_offset, end_offset)) in (5..).zip([(0, 19), (10, 29), (20, 39)]) {
+        assert_eq!(
+            register(&mut log, op, registration(start_offset, end_offset, op)),
+            Applied::Changed
+        );
+    }
+
+    let front = merged(&[segment(0, 9), segment(10, 19)]);
+    assert_eq!(replace(&mut log, 8, front), Applied::Changed);
+
+    assert_eq!(keys(&log), [(20, 39)]);
+}
+
+/// The registration of the next segment outlives any time: the rewrite of an
+/// idle partition picks the same offsets again and must still publish them.
+/// Once the floor passes its first offset, it expires like any other.
+#[test]
+fn given_registrations_older_than_an_expiry_when_it_applies_should_expire_them_but_that_of_the_next_segment()
+ {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29)]);
+    for (op, registered) in (4..).zip([
+        registration(0, 19, 100),
+        registration(10, 29, 300),
+        registration(30, 39, 50),
+    ]) {
+        assert_eq!(register(&mut log, op, registered), Applied::Changed);
+    }
+    assert!(log.expires_any(200));
+    assert!(!log.expires_any(100), "a registration at the time stays");
+
+    assert_eq!(expire(&mut log, 7, 200), Applied::Changed);
+
+    assert_eq!(log.expired(), [(0, 19)]);
+    assert_eq!(keys(&log), [(10, 29), (30, 39)]);
+    let expired_once = log.clone();
+    assert_eq!(expire(&mut log, 8, 200), Applied::Changed);
+    assert_eq!(log, expired_once, "applied again, it changes nothing");
+    assert!(!log.expires_any(200));
+
+    assert_eq!(expire(&mut log, 9, 400), Applied::Changed);
+    assert_eq!(log.expired(), [(0, 19), (10, 29)]);
+    assert_eq!(keys(&log), [(30, 39)]);
+}
+
+/// An expired object may be deleted by any primary, so no command names its
+/// offsets again.
+#[test]
+fn given_an_expired_registration_when_registering_or_replacing_its_offsets_should_refuse_both() {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29)]);
+    assert_eq!(
+        register(&mut log, 4, registration(0, 19, 100)),
+        Applied::Changed
+    );
+    assert_eq!(expire(&mut log, 5, 200), Applied::Changed);
+
+    assert_eq!(
+        register(&mut log, 6, registration(0, 19, 300)),
+        Applied::Refused
+    );
+    let run = merged(&[segment(0, 9), segment(10, 19)]);
+    assert_eq!(replace(&mut log, 7, run), Applied::Refused);
+    assert_eq!(log.expired(), [(0, 19)]);
+    assert_eq!(
+        log.classify(0, 19),
+        crate::long_term_delete::LongTermObject::Dead
+    );
+    // A run past it is another object.
+    let longer = merged(&[segment(0, 9), segment(10, 19), segment(20, 29)]);
+    assert_eq!(replace(&mut log, 8, longer), Applied::Changed);
+    assert_eq!(log.expired(), [], "the segments make it dead now");
+}
+
+/// A primary stored the next segment and lost primacy, and the next primary
+/// stored a shorter one and published it, then one that ends where the
+/// first did. The first object starts and ends where segments do, so the
+/// segments alone never make it dead: its registration does, once expired.
+#[test]
+fn given_the_next_segment_of_a_deposed_primary_when_another_ends_where_it_did_should_expire_it_once_the_floor_is_past_its_start()
+ {
+    let mut log = log_of(&[(0, 9)]);
+    assert_eq!(
+        register(&mut log, 2, registration(10, 29, 100)),
+        Applied::Changed
+    );
+    assert_eq!(expire(&mut log, 3, 1_000), Applied::Changed);
+    assert_eq!(log.expired(), [], "it is still the next segment");
+
+    assert_eq!(publish(&mut log, 4, segment(10, 19)), Applied::Changed);
+    assert_eq!(publish(&mut log, 5, segment(20, 29)), Applied::Changed);
+    assert_eq!(
+        log.classify(10, 29),
+        crate::long_term_delete::LongTermObject::Registered
+    );
+    assert_eq!(expire(&mut log, 6, 1_000), Applied::Changed);
+
+    assert_eq!(log.expired(), [(10, 29)]);
+    assert_eq!(
+        log.classify(10, 29),
+        crate::long_term_delete::LongTermObject::Dead
+    );
+}
+
+#[test]
+fn given_a_trim_past_where_registrations_start_when_it_applies_should_drop_them() {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29), (30, 39)]);
+    assert_eq!(
+        register(&mut log, 5, registration(0, 19, 100)),
+        Applied::Changed
+    );
+    assert_eq!(
+        register(&mut log, 6, registration(10, 29, 100)),
+        Applied::Changed
+    );
+    assert_eq!(
+        register(&mut log, 7, registration(20, 39, 300)),
+        Applied::Changed
+    );
+    assert_eq!(expire(&mut log, 8, 200), Applied::Changed);
+
+    assert_eq!(trim(&mut log, 9, 19), Applied::Changed);
+
+    assert_eq!(log.expired(), []);
+    assert_eq!(keys(&log), [(20, 39)]);
+}
+
+/// The registrations and the expired objects together never pass the limit,
+/// so the snapshot stays bounded. An expiry needs no room of its own, and a
+/// registration the log holds is still renewed.
+#[test]
+fn given_a_log_that_holds_the_most_registrations_when_registering_another_should_refuse_it() {
+    let most = LONG_TERM_REGISTRATIONS_MAX as u64;
+    let mut log = log_of_single_offsets(most + 2);
+    let mut op = most + 3;
+    for start_offset in 0..most {
+        op += 1;
+        assert_eq!(
+            register(
+                &mut log,
+                op,
+                registration(start_offset, start_offset + 1, 100)
+            ),
+            Applied::Changed
+        );
+    }
+    assert!(log.registrations_full());
+
+    assert_eq!(
+        register(&mut log, op + 1, registration(most, most + 1, 100)),
+        Applied::Refused
+    );
+    assert_eq!(
+        register(&mut log, op + 2, registration(most + 2, most + 2, 100)),
+        Applied::Refused,
+        "the next segment too"
+    );
+    assert_eq!(
+        register(&mut log, op + 3, registration(0, 1, 500)),
+        Applied::Changed
+    );
+    assert_eq!(expire(&mut log, op + 4, 200), Applied::Changed);
+    assert_eq!(log.expired().len(), LONG_TERM_REGISTRATIONS_MAX - 1);
+    assert!(log.registrations_full());
+
+    let mut snapshot = Vec::new();
+    log.snapshot_into(&mut snapshot);
+    let mut restored = LongTermLog::default();
+    restored.restore(&snapshot).unwrap();
+    assert_eq!(restored, log);
+}
+
+#[test]
+fn given_a_log_with_registered_and_expired_objects_when_snapshotting_and_restoring_should_give_it_back()
+ {
+    let mut log = log_of(&[(0, 9), (10, 19), (20, 29)]);
+    for (op, registered) in (4..).zip([
+        registration(0, 19, 100),
+        registration(10, 29, 300),
+        registration(30, 39, 50),
+    ]) {
+        assert_eq!(register(&mut log, op, registered), Applied::Changed);
+    }
+    assert_eq!(expire(&mut log, 7, 200), Applied::Changed);
+    let mut snapshot = Vec::new();
+    log.snapshot_into(&mut snapshot);
+    assert_eq!(
+        snapshot.len(),
+        3 * COUNT + 3 * SEGMENT_PAYLOAD_SIZE + 2 * REGISTRATION_PAYLOAD_SIZE + 2 * size_of::<u64>()
+    );
+
+    let mut restored = LongTermLog::default();
+    restored.restore(&snapshot).unwrap();
+
+    assert_eq!(restored, log);
+    for log in [&mut log, &mut restored] {
+        assert_eq!(publish(log, 8, segment(30, 39)), Applied::Changed);
+        assert_eq!(expire(log, 9, 400), Applied::Changed);
+    }
+    assert_eq!(restored, log);
+    assert_eq!(restored.expired(), [(0, 19), (10, 29)]);
+    assert_eq!(restored.registrations(), []);
+}
+
+#[test]
+fn given_a_snapshot_whose_registrations_no_log_holds_when_restoring_should_refuse_it() {
+    let segments = [segment(0, 9), segment(10, 19), segment(20, 29)];
+    let held = log_of(&[(0, 9)]);
+    let mut over: Vec<ObjectRegistration> = (0..=LONG_TERM_REGISTRATIONS_MAX as u64)
+        .map(|offset| registration(30, 30 + offset, 1))
+        .collect();
+    over.truncate(LONG_TERM_REGISTRATIONS_MAX);
+    let refused = [
+        (
+            raw_snapshot(
+                &segments,
+                &[registration(10, 29, 1), registration(0, 19, 1)],
+                &[],
+            ),
+            "registrations out of order",
+        ),
+        (
+            raw_snapshot(&segments, &[registration(5, 19, 1)], &[]),
+            "a registration the segments make dead",
+        ),
+        (
+            raw_snapshot(&segments, &[registration(31, 40, 1)], &[]),
+            "a registration past the next segment",
+        ),
+        (
+            raw_snapshot(&segments, &[registration(10, 19, 1)], &[]),
+            "a registration of a listed segment",
+        ),
+        (
+            raw_snapshot(&segments, &[], &[(30, 39)]),
+            "an expired next segment",
+        ),
+        (
+            raw_snapshot(&segments, &[registration(0, 19, 1)], &[(0, 19)]),
+            "an object both registered and expired",
+        ),
+        (
+            raw_snapshot(&segments, &[], &[(10, 29), (0, 19)]),
+            "expired objects out of order",
+        ),
+        (
+            raw_snapshot(&segments, &over, &[(0, 19)]),
+            "more registrations and expired objects than the log holds",
+        ),
+    ];
+
+    for (snapshot, what) in refused {
+        let mut restored = held.clone();
+        assert!(restored.restore(&snapshot).is_err(), "{what}");
+        assert_eq!(restored, held, "{what}");
+    }
+}
+
+/// The snapshot of a log of segments alone carried no counts. A build that
+/// reads counts refuses it rather than take its bytes for others.
+#[test]
+fn given_a_snapshot_of_segments_alone_when_restoring_should_refuse_it() {
+    for segments in [&[segment(0, 9)][..], &[segment(0, 9), segment(10, 19)]] {
+        let uncounted: Vec<u8> = segments
+            .iter()
+            .flat_map(|segment| PublishSegment(*segment).encode())
+            .collect();
+        let mut log = LongTermLog::default();
+
+        assert!(log.restore(&uncounted).is_err());
+        assert_eq!(log, LongTermLog::default());
+    }
+}
+
+#[test]
+fn given_a_payload_of_another_size_when_registering_or_expiring_should_refuse_it() {
+    let mut log = log_of(&[(0, 9), (10, 19)]);
+    let whole = RegisterObject(registration(0, 19, 1)).encode();
+    let time = ExpireRegistrations { before: 1 }.encode();
+
+    for (kind, payload) in [
+        (REGISTER_OBJECT, &whole[..REGISTRATION_PAYLOAD_SIZE - 1]),
+        (REGISTER_OBJECT, &[0; REGISTRATION_PAYLOAD_SIZE + 1][..]),
+        (EXPIRE_REGISTRATIONS, &time[..EXPIRE_PAYLOAD_SIZE - 1]),
+        (EXPIRE_REGISTRATIONS, &[]),
+    ] {
+        assert_eq!(
+            log.apply(3, MachineCommand { kind, payload }),
+            Applied::Refused
+        );
+    }
+    assert_eq!(log.registrations(), []);
 }

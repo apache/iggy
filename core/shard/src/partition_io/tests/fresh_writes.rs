@@ -509,6 +509,11 @@ async fn given_committed_sends_when_nothing_stages_a_pass_should_store_and_publi
     assert_eq!(segments.len(), 1);
     assert_eq!((segments[0].start_offset, segments[0].end_offset), (0, 1));
     assert_eq!(partition.unpublished_segment(), None);
+    assert_eq!(
+        partition.long_term_log().unwrap().registrations(),
+        [],
+        "the publish cleared the registration the rewrite made"
+    );
     let store = executor.0.store();
     let log_key = layout().long_term_key(&LongTermKey {
         prefix: partitions::object_prefix(namespace(), revision),

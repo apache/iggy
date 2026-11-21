@@ -35,11 +35,23 @@
 //! offsets, and a trim removes segments from the front. Neither moves the
 //! floor, so both commute with the publish of the next segment.
 //!
+//! A primary registers every object it stores before it stores it: the
+//! segment the next publish lists, or the merged one a replace lists. The
+//! command that lists the segment clears the registration. A registration
+//! that nothing cleared within [`LONG_TERM_REGISTRATION_TTL`] expires once
+//! the floor is past its first offset, and from then on no command
+//! registers or lists those offsets again, so its object can be deleted by
+//! any primary, however stale its view. An object stored under a primary
+//! that lost primacy before its command committed is deleted that way when
+//! the next primary lists other offsets.
+//!
 //! Every partition registers the machine. Only the primary of a partition
 //! that places its batches proposes a command, so the log of any other
 //! partition stays empty and adds nothing to its checkpoint or transfer.
 
 use std::fmt;
+use std::slice::ChunksExact;
+use std::time::Duration;
 
 use iggy_binary_protocol::RoutedRequestHeader;
 use iggy_object_store::{ManifestSegment, SEGMENT_HASH_LEN};
@@ -48,6 +60,7 @@ use message_bus::MessageBus;
 use server_common::Message;
 
 use crate::IggyPartition;
+use crate::long_term_delete::{LongTermNames, LongTermObject, SegmentSpan};
 use crate::manifest_publish::ManifestProgress;
 use crate::state_machine::{
     Applied, CommandEncodeError, CommandKind, MachineCommand, MachineId, MachineRestoreError,
@@ -88,6 +101,30 @@ pub const REPLACE_SOURCES_MAX: usize = 1024;
 
 /// The offset of a [`TrimSegments`], a little-endian `u64`.
 pub const TRIM_PAYLOAD_SIZE: usize = size_of::<u64>();
+
+/// The command kind of [`RegisterObject`].
+pub const REGISTER_OBJECT: CommandKind = CommandKind(5);
+
+/// The command kind of [`ExpireRegistrations`].
+pub const EXPIRE_REGISTRATIONS: CommandKind = CommandKind(6);
+
+/// `start_offset | end_offset | registered_at`, all `u64`, little-endian.
+pub const REGISTRATION_PAYLOAD_SIZE: usize = 3 * size_of::<u64>();
+
+/// The time of an [`ExpireRegistrations`], a little-endian `u64`.
+pub const EXPIRE_PAYLOAD_SIZE: usize = size_of::<u64>();
+
+/// Registered and expired objects the log holds at most, together.
+///
+/// Each one past the few of the jobs in flight is left by a job whose
+/// primary lost primacy before its command committed, so the limit bounds
+/// the snapshot and is never reached by a partition that works.
+pub const LONG_TERM_REGISTRATIONS_MAX: usize = 4096;
+
+/// How long after its registration the object of a rewrite or a merge may
+/// wait for the command that lists it, by the clock of the primary that
+/// registered it.
+pub const LONG_TERM_REGISTRATION_TTL: Duration = Duration::from_hours(1);
 
 /// Append one stored segment to the long-term log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +206,139 @@ impl TryFrom<&[u8]> for TrimSegments {
                 length: payload.len(),
             })
     }
+}
+
+/// An object a primary is about to store, named by the offsets its key
+/// carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectRegistration {
+    pub start_offset: u64,
+    pub end_offset: u64,
+    /// When the primary registered it, in microseconds of its own clock.
+    pub registered_at: u64,
+}
+
+impl ObjectRegistration {
+    /// The first and the last offset, which name the object.
+    #[must_use]
+    pub const fn key(&self) -> (u64, u64) {
+        (self.start_offset, self.end_offset)
+    }
+}
+
+impl SegmentSpan for ObjectRegistration {
+    fn start_offset(&self) -> u64 {
+        self.start_offset
+    }
+
+    fn end_offset(&self) -> u64 {
+        self.end_offset
+    }
+}
+
+/// Register the object of the segment the next publish or a replace will
+/// list, before it is stored. Registering it again keeps the later time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterObject(pub ObjectRegistration);
+
+impl RegisterObject {
+    /// The command payload.
+    #[must_use]
+    pub fn encode(&self) -> [u8; REGISTRATION_PAYLOAD_SIZE] {
+        let mut payload = [0; REGISTRATION_PAYLOAD_SIZE];
+        encode_u64s(
+            [self.0.start_offset, self.0.end_offset, self.0.registered_at],
+            &mut payload,
+        );
+        payload
+    }
+}
+
+impl TryFrom<&[u8]> for RegisterObject {
+    type Error = PayloadSizeError;
+
+    fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
+        let [start_offset, end_offset, registered_at] =
+            decode_u64s(payload).ok_or(PayloadSizeError {
+                length: payload.len(),
+                expected: REGISTRATION_PAYLOAD_SIZE,
+            })?;
+        Ok(Self(ObjectRegistration {
+            start_offset,
+            end_offset,
+            registered_at,
+        }))
+    }
+}
+
+/// Expire every registration made before `before`, but that of the next
+/// segment.
+///
+/// The time is in microseconds of the clocks that made the registrations.
+/// The primary picks it with its own clock, so every replica expires the
+/// same ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpireRegistrations {
+    pub before: u64,
+}
+
+impl ExpireRegistrations {
+    /// The command payload.
+    #[must_use]
+    pub const fn encode(&self) -> [u8; EXPIRE_PAYLOAD_SIZE] {
+        self.before.to_le_bytes()
+    }
+}
+
+impl TryFrom<&[u8]> for ExpireRegistrations {
+    type Error = PayloadSizeError;
+
+    fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
+        let [before] = decode_u64s(payload).ok_or(PayloadSizeError {
+            length: payload.len(),
+            expected: EXPIRE_PAYLOAD_SIZE,
+        })?;
+        Ok(Self { before })
+    }
+}
+
+/// A command payload of another size than its kind has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadSizeError {
+    pub length: usize,
+    pub expected: usize,
+}
+
+impl fmt::Display for PayloadSizeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "long-term command of {} bytes, expected {}",
+            self.length, self.expected
+        )
+    }
+}
+
+impl std::error::Error for PayloadSizeError {}
+
+fn encode_u64s<const N: usize>(values: [u64; N], out: &mut [u8]) {
+    for (field, value) in out
+        .as_chunks_mut::<{ size_of::<u64>() }>()
+        .0
+        .iter_mut()
+        .zip(values)
+    {
+        *field = value.to_le_bytes();
+    }
+}
+
+/// `N` little-endian `u64`s, when `bytes` is exactly that long.
+fn decode_u64s<const N: usize>(bytes: &[u8]) -> Option<[u64; N]> {
+    let (fields, []) = bytes.as_chunks::<{ size_of::<u64>() }>() else {
+        return None;
+    };
+    let fields: &[[u8; size_of::<u64>()]; N] = fields.try_into().ok()?;
+    Some(fields.map(u64::from_le_bytes))
 }
 
 /// A command payload that is not one long-term segment.
@@ -259,16 +429,89 @@ fn decode_segment(bytes: &[u8]) -> Option<ManifestSegment> {
 }
 
 /// The segments of the partition that the object store holds, in offset
-/// order and without a gap from the first one on.
+/// order and without a gap from the first one on, and the objects stored
+/// for segments that a later command may come to list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LongTermLog {
     segments: Vec<ManifestSegment>,
+    /// Ascending by offsets, none listed and none that the segments alone
+    /// make dead. Each one starts where the next segment starts or where a
+    /// segment starts.
+    registered: Vec<ObjectRegistration>,
+    /// The first and the last offset of each object whose registration
+    /// expired, ascending, none that the segments alone make dead. Each one
+    /// starts where a segment starts. None is registered, and no command
+    /// lists one.
+    expired: Vec<(u64, u64)>,
 }
 
 impl LongTermLog {
     #[must_use]
     pub fn segments(&self) -> &[ManifestSegment] {
         &self.segments
+    }
+
+    /// The objects registered for a replace that has not listed them, in
+    /// offset order.
+    #[must_use]
+    pub fn registrations(&self) -> &[ObjectRegistration] {
+        &self.registered
+    }
+
+    /// The registration of the object from `start_offset` to `end_offset`.
+    #[must_use]
+    pub fn registration(&self, start_offset: u64, end_offset: u64) -> Option<&ObjectRegistration> {
+        self.registered
+            .binary_search_by_key(&(start_offset, end_offset), ObjectRegistration::key)
+            .ok()
+            .map(|index| &self.registered[index])
+    }
+
+    /// The first and the last offset of each object whose registration
+    /// expired, ascending.
+    #[must_use]
+    pub fn expired(&self) -> &[(u64, u64)] {
+        &self.expired
+    }
+
+    /// Whether the log takes no registration of an object it does not hold
+    /// one for already.
+    #[must_use]
+    pub const fn registrations_full(&self) -> bool {
+        self.registered.len() + self.expired.len() >= LONG_TERM_REGISTRATIONS_MAX
+    }
+
+    /// Whether an [`ExpireRegistrations`] at `before` would expire a
+    /// registration.
+    #[must_use]
+    pub fn expires_any(&self, before: u64) -> bool {
+        let next_start = self.next_start();
+        self.registered
+            .iter()
+            .any(|registration| expires(registration, before, next_start))
+    }
+
+    /// What the log says of an object keyed by two offsets.
+    #[must_use]
+    pub fn classify(&self, start_offset: u64, end_offset: u64) -> LongTermObject {
+        LongTermObject::named(
+            &self.segments,
+            &self.registered,
+            &self.expired,
+            start_offset,
+            end_offset,
+        )
+    }
+
+    /// The offsets of everything the log names, for a classification away
+    /// from the partition.
+    #[must_use]
+    pub fn names(&self) -> LongTermNames {
+        LongTermNames {
+            segments: spans_of(&self.segments),
+            registered: spans_of(&self.registered),
+            expired: self.expired.clone(),
+        }
     }
 
     /// The last offset a long-term segment holds, `None` before the first
@@ -288,7 +531,8 @@ impl LongTermLog {
     }
 
     /// The first offset the next segment must start at.
-    fn next_start(&self) -> u64 {
+    #[must_use]
+    pub fn next_start(&self) -> u64 {
         self.floor().map_or(0, |floor| floor.saturating_add(1))
     }
 
@@ -307,6 +551,7 @@ impl LongTermLog {
             return Applied::Refused;
         }
         self.segments.push(segment);
+        self.forget_settled();
         Applied::Changed
     }
 
@@ -332,10 +577,17 @@ impl LongTermLog {
         if last <= first || last - first >= REPLACE_SOURCES_MAX {
             return Applied::Refused;
         }
+        let key = (merged.start_offset, merged.end_offset);
+        // Its object may be deleted already, by a primary that saw the
+        // registration expire.
+        if self.expired.binary_search(&key).is_ok() {
+            return Applied::Refused;
+        }
         if concatenated(&self.segments[first..=last], merged.hash) != Some(merged) {
             return Applied::Refused;
         }
         self.segments.splice(first..=last, [merged]);
+        self.forget_settled();
         Applied::Changed
     }
 
@@ -346,8 +598,93 @@ impl LongTermLog {
         let ended = self.segments[..removable]
             .partition_point(|segment| segment.end_offset <= up_to_offset);
         self.segments.drain(..ended);
+        self.forget_settled();
         Applied::Changed
     }
+
+    /// A rewrite stores the next segment and a merge the run it replaces.
+    /// Nothing else is ever listed, so nothing else is registered.
+    fn register(&mut self, registration: ObjectRegistration) -> Applied {
+        let key = registration.key();
+        if let Ok(index) = self
+            .registered
+            .binary_search_by_key(&key, ObjectRegistration::key)
+        {
+            let registered = &mut self.registered[index];
+            registered.registered_at = registered.registered_at.max(registration.registered_at);
+            return Applied::Changed;
+        }
+        let (start_offset, end_offset) = key;
+        let next = start_offset == self.next_start() && end_offset >= start_offset;
+        if !(next || replaceable(&self.segments, key))
+            || self.expired.binary_search(&key).is_ok()
+            || self.registrations_full()
+        {
+            return Applied::Refused;
+        }
+        let index = self
+            .registered
+            .partition_point(|registered| registered.key() < key);
+        self.registered.insert(index, registration);
+        Applied::Changed
+    }
+
+    /// An expiry moves registrations to the expired ones and nothing else,
+    /// so it never needs room of its own.
+    fn expire(&mut self, before: u64) -> Applied {
+        let next_start = self.next_start();
+        let (expired, open): (Vec<_>, Vec<_>) = self
+            .registered
+            .iter()
+            .partition(|registration| expires(registration, before, next_start));
+        if !expired.is_empty() {
+            self.registered = open;
+            self.expired
+                .extend(expired.iter().map(ObjectRegistration::key));
+            self.expired.sort_unstable();
+        }
+        Applied::Changed
+    }
+
+    /// Drop the registrations the segments list, which are fulfilled, and
+    /// the registrations and the expired objects the segments alone make
+    /// dead: no later state lists them, and every primary deletes them by
+    /// the segments.
+    fn forget_settled(&mut self) {
+        let segments = &self.segments;
+        self.registered
+            .retain(|registration| may_be_listed(segments, registration.key()));
+        self.expired.retain(|&key| may_be_listed(segments, key));
+    }
+}
+
+/// Whether an expiry at `before` expires `registration`. The registration of
+/// the next segment waits for the publish that moves the floor: a rewrite
+/// that picks the same offsets again, as one of an idle partition does,
+/// lists them, and any other publish leaves the object dead or expirable.
+const fn expires(registration: &ObjectRegistration, before: u64, next_start: u64) -> bool {
+    registration.registered_at < before && registration.start_offset < next_start
+}
+
+/// Whether `segments` hold a run of two segments or more, and at most
+/// [`REPLACE_SOURCES_MAX`], from where `key` starts to where it ends.
+fn replaceable(segments: &[ManifestSegment], (start, end): (u64, u64)) -> bool {
+    let first = segments.binary_search_by_key(&start, |segment| segment.start_offset);
+    let last = segments.binary_search_by_key(&end, |segment| segment.end_offset);
+    matches!((first, last), (Ok(first), Ok(last)) if last > first && last - first < REPLACE_SOURCES_MAX)
+}
+
+/// Whether a later state of `segments` can still list the object `key`
+/// that they do not list now.
+fn may_be_listed(segments: &[ManifestSegment], (start, end): (u64, u64)) -> bool {
+    end >= start && LongTermObject::classify(segments, start, end) == LongTermObject::Unannounced
+}
+
+fn spans_of<S: SegmentSpan>(spans: &[S]) -> Vec<(u64, u64)> {
+    spans
+        .iter()
+        .map(|span| (span.start_offset(), span.end_offset()))
+        .collect()
 }
 
 /// What a segment that holds the bytes of `sources` back to back records,
@@ -381,7 +718,13 @@ impl PartitionStateMachine for LongTermLog {
     }
 
     fn command_kinds(&self) -> &[CommandKind] {
-        &[PUBLISH_SEGMENT, REPLACE_SEGMENTS, TRIM_SEGMENTS]
+        &[
+            PUBLISH_SEGMENT,
+            REPLACE_SEGMENTS,
+            TRIM_SEGMENTS,
+            REGISTER_OBJECT,
+            EXPIRE_REGISTRATIONS,
+        ]
     }
 
     fn apply(&mut self, _: u64, command: MachineCommand<'_>) -> Applied {
@@ -396,53 +739,133 @@ impl PartitionStateMachine for LongTermLog {
                 }),
             TRIM_SEGMENTS => TrimSegments::try_from(command.payload)
                 .map_or(Applied::Refused, |trim| self.trim(trim.up_to_offset)),
+            REGISTER_OBJECT => RegisterObject::try_from(command.payload)
+                .map_or(Applied::Refused, |RegisterObject(registration)| {
+                    self.register(registration)
+                }),
+            EXPIRE_REGISTRATIONS => ExpireRegistrations::try_from(command.payload)
+                .map_or(Applied::Refused, |expiry| self.expire(expiry.before)),
             _ => Applied::Refused,
         }
     }
 
+    /// Three parts, each a little-endian `u32` count and then that many
+    /// entries: the segments as their commands carry them, the
+    /// registrations as theirs do, and the first and the last offset of
+    /// each expired object. A snapshot of the segments alone, without the
+    /// counts, is another format, and [`Self::restore`] refuses it.
     fn snapshot_into(&self, out: &mut Vec<u8>) {
-        let start = out.len();
-        out.resize(start + self.segments.len() * SEGMENT_PAYLOAD_SIZE, 0);
-        for (segment, bytes) in self
-            .segments
-            .iter()
-            .zip(out[start..].chunks_mut(SEGMENT_PAYLOAD_SIZE))
-        {
-            encode_segment(segment, bytes);
+        out.reserve(
+            3 * SNAPSHOT_COUNT_SIZE
+                + self.segments.len() * SEGMENT_PAYLOAD_SIZE
+                + self.registered.len() * REGISTRATION_PAYLOAD_SIZE
+                + self.expired.len() * EXPIRED_SNAPSHOT_SIZE,
+        );
+        put_count(out, self.segments.len());
+        for segment in &self.segments {
+            let start = out.len();
+            out.resize(start + SEGMENT_PAYLOAD_SIZE, 0);
+            encode_segment(segment, &mut out[start..]);
+        }
+        put_count(out, self.registered.len());
+        for registration in &self.registered {
+            out.extend_from_slice(&RegisterObject(*registration).encode());
+        }
+        put_count(out, self.expired.len());
+        for &(start_offset, end_offset) in &self.expired {
+            out.extend_from_slice(&start_offset.to_le_bytes());
+            out.extend_from_slice(&end_offset.to_le_bytes());
         }
     }
 
     fn holds_state(&self) -> bool {
-        !self.segments.is_empty()
+        !self.segments.is_empty() || !self.registered.is_empty() || !self.expired.is_empty()
     }
 
     fn restore(&mut self, snapshot: &[u8]) -> Result<(), MachineRestoreError> {
-        let malformed = MachineRestoreError {
-            reason: "a long-term log snapshot is whole segments in offset order without a gap",
-        };
-        if !snapshot.len().is_multiple_of(SEGMENT_PAYLOAD_SIZE)
-            || snapshot.len() / SEGMENT_PAYLOAD_SIZE > LONG_TERM_SEGMENTS_MAX
-        {
-            return Err(malformed);
-        }
-        let mut restored = Self::default();
-        for bytes in snapshot.chunks(SEGMENT_PAYLOAD_SIZE) {
-            let segment = decode_segment(bytes).ok_or(malformed)?;
-            // The first segment starts wherever a trim left the front.
-            let continues = restored
-                .floor()
-                .is_none_or(|floor| floor.checked_add(1) == Some(segment.start_offset));
-            if !continues || segment.end_offset < segment.start_offset {
-                return Err(malformed);
-            }
-            restored.segments.push(segment);
-        }
+        let restored = Self::decode(snapshot).ok_or(MachineRestoreError {
+            reason: "a long-term log snapshot is its segments in offset order without a gap, \
+                     then the registered and the expired objects the segments may still \
+                     list, each part counted and ascending",
+        })?;
         *self = restored;
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.segments.clear();
+        *self = Self::default();
+    }
+}
+
+/// Bytes of the count in front of each part of a snapshot.
+const SNAPSHOT_COUNT_SIZE: usize = size_of::<u32>();
+
+/// Bytes of an expired object in a snapshot: its first and its last offset.
+const EXPIRED_SNAPSHOT_SIZE: usize = 2 * size_of::<u64>();
+
+fn put_count(out: &mut Vec<u8>, count: usize) {
+    // Every part is bounded far below `u32::MAX` by what apply accepts.
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    out.extend_from_slice(&count.to_le_bytes());
+}
+
+/// The counted entries of `size` bytes each at the front of `bytes`, and
+/// the bytes after them.
+fn take_part(bytes: &[u8], size: usize, count_max: usize) -> Option<(ChunksExact<'_, u8>, &[u8])> {
+    let (count, rest) = bytes.split_first_chunk::<SNAPSHOT_COUNT_SIZE>()?;
+    let count = usize::try_from(u32::from_le_bytes(*count)).ok()?;
+    if count > count_max {
+        return None;
+    }
+    let (entries, rest) = rest.split_at_checked(count.checked_mul(size)?)?;
+    Some((entries.chunks_exact(size), rest))
+}
+
+impl LongTermLog {
+    fn decode(snapshot: &[u8]) -> Option<Self> {
+        let (segments, rest) = take_part(snapshot, SEGMENT_PAYLOAD_SIZE, LONG_TERM_SEGMENTS_MAX)?;
+        let (registered, rest) =
+            take_part(rest, REGISTRATION_PAYLOAD_SIZE, LONG_TERM_REGISTRATIONS_MAX)?;
+        let (expired, rest) = take_part(rest, EXPIRED_SNAPSHOT_SIZE, LONG_TERM_REGISTRATIONS_MAX)?;
+        if !rest.is_empty() || registered.len() + expired.len() > LONG_TERM_REGISTRATIONS_MAX {
+            return None;
+        }
+        let mut log = Self::default();
+        for bytes in segments {
+            let segment = decode_segment(bytes)?;
+            // The first segment starts wherever a trim left the front.
+            let continues = log
+                .floor()
+                .is_none_or(|floor| floor.checked_add(1) == Some(segment.start_offset));
+            if !continues || segment.end_offset < segment.start_offset {
+                return None;
+            }
+            log.segments.push(segment);
+        }
+        let next_start = log.next_start();
+        for bytes in registered {
+            let RegisterObject(registration) = RegisterObject::try_from(bytes).ok()?;
+            let key = registration.key();
+            let ascending = log.registered.last().is_none_or(|last| last.key() < key);
+            if !ascending || key.0 > next_start || !may_be_listed(&log.segments, key) {
+                return None;
+            }
+            log.registered.push(registration);
+        }
+        for bytes in expired {
+            let [start_offset, end_offset] = decode_u64s(bytes)?;
+            let key = (start_offset, end_offset);
+            let ascending = log.expired.last().is_none_or(|last| *last < key);
+            if !ascending
+                || start_offset >= next_start
+                || !may_be_listed(&log.segments, key)
+                || log.registration(start_offset, end_offset).is_some()
+            {
+                return None;
+            }
+            log.expired.push(key);
+        }
+        Some(log)
     }
 }
 
@@ -451,12 +874,28 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    /// The long-term log of this partition, `None` on a partition that does
+    /// not register the machine.
+    #[must_use]
+    pub fn long_term_log(&self) -> Option<&LongTermLog> {
+        self.state_machine::<LongTermLog>(LONG_TERM_LOG_MACHINE)
+    }
+
     /// The long-term segments of this partition, in offset order. Empty on a
     /// partition that does not register the machine or published none.
     #[must_use]
     pub fn long_term_segments(&self) -> &[ManifestSegment] {
-        self.state_machine::<LongTermLog>(LONG_TERM_LOG_MACHINE)
-            .map_or(&[], LongTermLog::segments)
+        self.long_term_log().map_or(&[], LongTermLog::segments)
+    }
+
+    /// What the long-term log says of the object from `start_offset` to
+    /// `end_offset`.
+    #[must_use]
+    pub fn long_term_object(&self, start_offset: u64, end_offset: u64) -> LongTermObject {
+        self.long_term_log().map_or_else(
+            || LongTermObject::classify::<ManifestSegment>(&[], start_offset, end_offset),
+            |log| log.classify(start_offset, end_offset),
+        )
     }
 
     /// The last offset a long-term segment holds, `None` before the first
@@ -540,6 +979,43 @@ where
         self.command_request(
             TRIM_SEGMENTS,
             &TrimSegments { up_to_offset }.encode(),
+            request,
+        )
+    }
+
+    /// A request registering the object of a segment the next publish or a
+    /// replace will list, for the primary's `on_request`.
+    ///
+    /// # Errors
+    /// Returns an error when the command exceeds the command size limit,
+    /// which a registration never does.
+    pub fn register_object_request(
+        &self,
+        registration: &ObjectRegistration,
+        request: u64,
+    ) -> Result<Message<RoutedRequestHeader>, CommandEncodeError> {
+        self.command_request(
+            REGISTER_OBJECT,
+            &RegisterObject(*registration).encode(),
+            request,
+        )
+    }
+
+    /// A request expiring every registration of the long-term log made
+    /// before `before`, but that of the next segment, for the primary's
+    /// `on_request`.
+    ///
+    /// # Errors
+    /// Returns an error when the command exceeds the command size limit,
+    /// which a time never does.
+    pub fn expire_registrations_request(
+        &self,
+        before: u64,
+        request: u64,
+    ) -> Result<Message<RoutedRequestHeader>, CommandEncodeError> {
+        self.command_request(
+            EXPIRE_REGISTRATIONS,
+            &ExpireRegistrations { before }.encode(),
             request,
         )
     }
