@@ -200,6 +200,7 @@ impl BenchmarkConsumerClient for LowLevelConsumerClient {}
 mod tests {
     use super::{BenchmarkConsumerConfig, ConsumerClient, LowLevelConsumerClient, PARTITION_ID};
     use crate::utils::client_factory::TcpClientFactory;
+    use crate::utils::warmup::BenchmarkWarmup;
     use bench_report::numeric_parameter::BenchmarkNumericParameter;
     use iggy::prelude::{
         ClientWrapper, CommitPolicy, Consumer, Identifier, IggyClient, IggyDuration,
@@ -237,7 +238,7 @@ mod tests {
                     consumer_group_id: None,
                     stream_id: "bench-stream-1".to_owned(),
                     messages_per_batch: BenchmarkNumericParameter::Value(1),
-                    warmup_time: IggyDuration::default(),
+                    warmup: BenchmarkWarmup::start(IggyDuration::default()),
                     polling_kind: polling_strategy.kind,
                     poll_options: PollOptions::default(),
                     origin_timestamp_latency_calculation: false,

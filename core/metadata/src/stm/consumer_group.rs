@@ -565,6 +565,7 @@ impl StateHandler for CreateConsumerGroupRequest {
         topic.consumer_group_index.insert(name, id);
         let partitions_count = topic.partitions.len() as u32;
         let consumer_groups_count = topic.consumer_groups.len() as u32;
+        state.catalog_counts.consumer_groups += 1;
         let changes = state
             .topic_key(stream_id, topic_id)
             .map(|topic| {
@@ -649,6 +650,8 @@ impl StateHandler for DeleteConsumerGroupRequest {
         };
         topic.consumer_group_index.remove(&group.name);
         let consumer_groups_count = u32::try_from(topic.consumer_groups.len()).ok();
+        state.catalog_counts.consumer_groups =
+            state.catalog_counts.consumer_groups.saturating_sub(1);
         // A finalized deletion applies at its completion op. A sibling group
         // created after the intent can hold a later op than the intent.
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;

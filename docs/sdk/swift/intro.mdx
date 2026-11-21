@@ -1,0 +1,73 @@
+---
+title: Swift SDK
+description: "Use Swift concurrency to produce, read and manage Iggy resources over TCP with optional TLS."
+---
+
+The Swift SDK 0.2.0 provides an async TCP client with optional TLS, resource management, producers, partition readers and consumers. It routes partition requests to their primaries and reconnects with heartbeat support.
+
+## Requirements and installation
+
+The SDK requires Swift 6.0 or later. Supported platforms are macOS 13, iOS 16, tvOS 16, watchOS 9, visionOS 1 and Linux. The runnable examples require Swift 6.1 or later.
+
+The repository root contains the Swift Package Manager manifest and exports the `Iggy` product. The package dependency below names the 0.10.0 release tag:
+
+```swift
+.package(url: "https://github.com/apache/iggy.git", revision: "server-0.10.0")
+```
+
+Add `.product(name: "Iggy", package: "iggy")` to your target dependencies. Build the server and client from the same release source.
+
+## Connect and create resources
+
+Start the [development server](/docs/introduction/getting-started) with `iggy`/`iggy` credentials. Run these calls from an async Swift context:
+
+```swift
+import Iggy
+
+let client = try IggyClient(connectionString: "iggy://iggy:iggy@localhost:8090")
+try await client.connect()
+let stream = try await client.createStream(name: "orders")
+let topic = try await client.createTopic(
+    streamID: "orders", name: "created", options: .init(partitionsCount: 3))
+var messages: [IggyMessage] = ["placed"]
+try await client.sendMessages(
+    streamID: "orders", topicID: "created", partitioning: .partition(0), messages: &messages)
+let batch = try await client.pollMessages(
+    streamID: "orders", topicID: "created", partitionID: 0,
+    consumer: .consumer(1), strategy: .first, options: PollOptions(count: 100))
+for message in batch.messages {
+    print(message.offset, message.payloadString)
+}
+await client.shutdown()
+```
+
+Use new resource names when running this creation example again. `disconnect()` closes the current connection and permits a later `connect()`. `shutdown()` is final.
+
+Connection strings accept `iggy://` and `iggy+tcp://`. TLS uses system roots or the configured CA file. `tls_domain` overrides the name checked in the certificate. The parser accepts pending-operation limits, but does not implement retained mutation limits.
+
+## Readers and consumers
+
+`client.reader` returns batches from explicit partitions or a group assignment. `client.consumerGroup` yields individual messages. A consumer needs `initialize()` before iteration:
+
+```swift
+let consumer = try client.consumerGroup(
+    name: "billing", streamID: "orders", topicID: "created",
+    configuration: ConsumerConfiguration(
+        pollOptions: PollOptions(maxWait: .seconds(5), commit: .manual)))
+try await consumer.initialize()
+for try await received in consumer {
+    print(received.message.payloadString)
+    try await consumer.commit(received.checkpoint)
+}
+await consumer.shutdown()
+```
+
+This fragment uses an existing connected client. Commit after processing. Automatic commits use `.auto(.default)`, which counts processing and stores every 10,000 messages or five seconds. `.onRead` stores with the read. Close readers and shut down consumers to finish offset work and leave groups.
+
+## Options, metadata and recovery
+
+Creation and updates use `StreamCreateOptions`, `TopicCreateOptions`, `StreamUpdateOptions`, `TopicUpdateOptions` and `UserUpdateOptions`. `EncryptionKey` accepts exactly 32 bytes. The server must have a wrapping key configured. Only fingerprints return in resource details.
+
+`getMetadataChanges` exposes the metadata log. `sendRawRequest(code:payload:replica:)` targets a replica for supported non-replicated commands. See [Metadata changes](/docs/sdk/metadata-changes).
+
+Swift does not expose retained mutation resolution or mutation lanes. It does track uncertain committing reads. `fetchProgressUncertain` carries an operation ID, and affected progress calls fail with `partitionLaneBlocked` until `abandonOperation` releases it. Abandonment does not undo a committed offset. A `ReadError` can stop a partition until `seek` selects a new position.

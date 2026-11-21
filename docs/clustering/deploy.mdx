@@ -1,0 +1,175 @@
+---
+title: Deploy a Cluster
+description: Build the binaries and run a three-node Apache Iggy cluster
+---
+
+Build `iggy-server` and the `iggy` CLI, run a single development node, then bring up a three-node cluster on one machine. See [Configuration](/docs/clustering/configuration) for the full `[cluster]` reference.
+
+## Build from source
+
+Build the server and CLI from the repository root:
+
+```bash
+cargo build --bin iggy-server --bin iggy
+```
+
+The binaries are:
+
+```text
+target/debug/iggy-server
+target/debug/iggy
+```
+
+The server uses Linux `io_uring`. Use a recent Linux kernel and a sufficient locked-memory limit.
+
+## Run one development node
+
+The default `core/server/config.toml` has clustering disabled, so a plain run starts a single node:
+
+```bash
+cargo run --bin iggy-server -- --with-default-root-credentials
+```
+
+`--with-default-root-credentials` sets the root user to `iggy`/`iggy` unless `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` are already exported. These values initialize the root user **only on its first creation**. Later starts recover the stored user. Supplied environment values are still validated at boot.
+
+When clustering is disabled, `--replica-id 0` is still accepted. Any other id is rejected because it would have to match a `cluster.nodes` entry.
+
+## Run a three-node cluster
+
+Every node loads the same configuration. Nodes are told apart *only* by `--replica-id`, which selects that node's own entry in the `cluster.nodes` roster.
+
+Save this as `/tmp/iggy-vsr.toml`:
+
+```toml
+[cluster]
+enabled = true
+name = "iggy-vsr-dev"
+
+[cluster.auth]
+enabled = true
+shared_secret = ""
+
+[[cluster.nodes]]
+name = "iggy-node-1"
+ip = "127.0.0.1"
+replica_id = 0
+ports = { tcp = 8090, quic = 8080, http = 3000, websocket = 8093, tcp_replica = 9090 }
+
+[[cluster.nodes]]
+name = "iggy-node-2"
+ip = "127.0.0.1"
+replica_id = 1
+ports = { tcp = 8091, quic = 8081, http = 3001, websocket = 8094, tcp_replica = 9091 }
+
+[[cluster.nodes]]
+name = "iggy-node-3"
+ip = "127.0.0.1"
+replica_id = 2
+ports = { tcp = 8092, quic = 8082, http = 3002, websocket = 8095, tcp_replica = 9092 }
+```
+
+> `cluster.name` is a **permanent on-disk identity**. It is hashed into the cluster id stamped into every metadata and partition superblock on first boot. Changing the name later makes the server **refuse to start** against the existing data, so renaming a cluster means starting from an empty data directory.
+
+Export the settings shared by all three processes:
+
+```bash
+export IGGY_CONFIG_PATH=/tmp/iggy-vsr.toml
+export IGGY_ROOT_USERNAME=iggy
+export IGGY_ROOT_PASSWORD=iggy
+export IGGY_CLUSTER_AUTH_SHARED_SECRET="replace-with-at-least-32-random-bytes"
+```
+
+Root credentials are **mandatory on the first boot of each replica** when clustering is enabled. Restarts recover the stored root user. The shared secret must be **at least 32 bytes**. See [Security](/docs/clustering/security) for how it's used and rotated.
+
+Start each replica in a separate terminal. Use a different data path for every process:
+
+```bash
+# Replica 0
+IGGY_PATH=local_data/node-0 ./target/debug/iggy-server --replica-id 0
+
+# Replica 1
+IGGY_PATH=local_data/node-1 ./target/debug/iggy-server --replica-id 1
+
+# Replica 2
+IGGY_PATH=local_data/node-2 ./target/debug/iggy-server --replica-id 2
+```
+
+The exported settings must be present in all three terminals.
+
+In cluster mode:
+
+- `--replica-id` is required and must match exactly one `cluster.nodes` entry
+- `replica_id` values must be unique and contiguous from `0`
+- `ports` is the single source of listener ports: every enabled transport needs an explicit per-node port, otherwise the server **refuses to start**
+- `tcp` and `tcp_replica` ports are **always required**, even when client TCP is disabled. `tcp_replica` carries replica-to-replica consensus traffic
+- `ip` must be a **literal IP address**. Use `advertised_address` when clients can't reach it (see [Configuration](/docs/clustering/configuration))
+- use a different root `path` for each process on the same host
+
+## Spanning multiple hosts
+
+The roster `ip` is the address other replicas dial. It's **not the bind interface** for the client transports: `tcp`, `quic`, `http`, and `websocket` bind whatever their own `address` settings say, and the roster supplies only the port. The defaults listen on loopback, so a cluster spread across hosts needs each transport's `address` set to `0.0.0.0` or the routable interface. The server warns at startup when a bind cannot serve the advertised `ip`.
+
+## Containers
+
+Every roster field can be provided through typed environment variables instead of TOML, which suits container deployments:
+
+```text
+IGGY_CLUSTER_ENABLED=true
+IGGY_CLUSTER_NAME=my-cluster
+IGGY_CLUSTER_NODES_0_NAME=node-1
+IGGY_CLUSTER_NODES_0_IP=172.28.0.101
+IGGY_CLUSTER_NODES_0_REPLICA_ID=0
+IGGY_CLUSTER_NODES_0_PORTS_TCP=8090
+IGGY_CLUSTER_NODES_0_PORTS_QUIC=8080
+IGGY_CLUSTER_NODES_0_PORTS_HTTP=3000
+IGGY_CLUSTER_NODES_0_PORTS_WEBSOCKET=8093
+IGGY_CLUSTER_NODES_0_PORTS_TCP_REPLICA=9090
+IGGY_CLUSTER_NODES_1_NAME=node-2
+IGGY_CLUSTER_NODES_1_IP=172.28.0.102
+IGGY_CLUSTER_NODES_1_REPLICA_ID=1
+IGGY_CLUSTER_NODES_1_PORTS_TCP=8090
+IGGY_CLUSTER_NODES_1_PORTS_QUIC=8080
+IGGY_CLUSTER_NODES_1_PORTS_HTTP=3000
+IGGY_CLUSTER_NODES_1_PORTS_WEBSOCKET=8093
+IGGY_CLUSTER_NODES_1_PORTS_TCP_REPLICA=9090
+IGGY_TCP_ADDRESS=0.0.0.0:8090
+IGGY_QUIC_ADDRESS=0.0.0.0:8080
+IGGY_HTTP_ADDRESS=0.0.0.0:3000
+IGGY_WEBSOCKET_ADDRESS=0.0.0.0:8093
+IGGY_CLUSTER_AUTH_ENABLED=true
+IGGY_CLUSTER_AUTH_SHARED_SECRET=replace-with-at-least-32-random-bytes
+IGGY_ROOT_USERNAME=iggy
+IGGY_ROOT_PASSWORD=iggy
+```
+
+Give each container a static IP and put that IP in the roster: `cluster.nodes[*].ip` does **not** accept hostnames or Docker service names. The repository ships a working reference in [`bdd/docker-compose.cluster.yml`](https://github.com/apache/iggy/blob/server-0.10.0/bdd/docker-compose.cluster.yml), a real two-node cluster used by the BDD suites.
+
+## Check cluster metadata
+
+Ask any node for the cluster state with the CLI:
+
+```bash
+./target/debug/iggy \
+  --tcp-server-address 127.0.0.1:8090 \
+  -u iggy \
+  -p iggy \
+  cluster metadata
+```
+
+The response lists the cluster name, nodes, client endpoints, and current roles. `cluster m` is a shorthand for `cluster metadata`.
+
+## Reset a replica
+
+`iggy-server --fresh` deletes the configured data directory before boot. In cluster mode this wipes **that replica only**: it rejoins the cluster and refills its state by transfer from the other replicas. Wiping a quorum of replicas at the same time **destroys committed data**, and a service unit that always passes `--fresh` re-transfers the whole dataset on every restart.
+
+## Run the cluster test suites
+
+The cross-SDK BDD suites use a standalone server for basic features and add the two-node cluster from `bdd/docker-compose.cluster.yml` for `leader_redirection` or `all`:
+
+```bash
+./scripts/run-bdd-tests.sh rust
+./scripts/run-bdd-tests.sh rust basic_messaging
+./scripts/run-bdd-tests.sh rust leader_redirection
+```
+
+The first argument selects the SDK (`rust`, `python`, `php`, `go`, `go-race`, `node`, `csharp`, `java`, `cpp`, `swift`, or `all`) and the optional second argument selects one feature (`basic_messaging`, `leader_redirection`, `raw_command`, `session_contract`, `stream_crud`, `stream_options`, `resource_options_patch`, `metadata_changes`, `deferred_polling`, or `all`). `leader_redirection` is the clustered feature. Coverage depends on the selected SDK and feature. Use `--help` for the runner's current selections.

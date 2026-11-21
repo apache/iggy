@@ -123,8 +123,8 @@ die () {
 #
 ##############################################################################
 
-GRADLE_WRAPPER_JAR_TAG=v9.8.0
-GRADLE_WRAPPER_JAR_SHA256=238e777fcddd7e34f9708186085def2abd6e08e658505b38718d79d74c21abd5
+GRADLE_WRAPPER_JAR_TAG=v9.9.1
+GRADLE_WRAPPER_JAR_SHA256=621008afc4f5d59357fcf06ffa644dd5aade5e091bdc363742710445f73cdaf8
 GRADLE_WRAPPER_JAR_URL=https://raw.githubusercontent.com/gradle/gradle/$GRADLE_WRAPPER_JAR_TAG/gradle/wrapper/gradle-wrapper.jar
 WRAPPER_JAR=$APP_HOME/gradle/wrapper/gradle-wrapper.jar
 

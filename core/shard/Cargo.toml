@@ -34,6 +34,7 @@ poll-diagnostics = ["partitions/poll-diagnostics"]
 simulator = ["partitions/simulator"]
 
 [dependencies]
+bytemuck = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
 crossfire = { workspace = true }

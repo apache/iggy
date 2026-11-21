@@ -33,7 +33,7 @@ use bench_report::{
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use human_repr::HumanCount;
 use iggy::prelude::*;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tokio::time::Instant;
 use tracing::info;
 
@@ -90,11 +90,11 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
         // a step rather than a burst far above the rate being measured.
         let mut rate_limiter = self.limit_bytes_per_second.map(BenchmarkRateLimiter::new);
 
-        if self.config.warmup_time.get_duration() != Duration::from_millis(0) {
+        let warmup = self.config.warmup;
+        if warmup.is_enabled() {
             self.log_warmup_info();
-            let warmup_end = Instant::now() + self.config.warmup_time.get_duration();
 
-            while Instant::now() < warmup_end {
+            while !warmup.is_over() {
                 if let Some(batch) = self.client.produce_batch(&mut batch_generator).await?
                     && let Some(rate_limiter) = &mut rate_limiter
                 {
@@ -197,7 +197,8 @@ impl<P: BenchmarkProducerClient> BenchmarkProducer<P> {
     fn log_warmup_info(&self) {
         info!(
             "Producer #{} → warming up for {}...",
-            self.config.producer_id, self.config.warmup_time,
+            self.config.producer_id,
+            self.config.warmup.duration(),
         );
     }
 

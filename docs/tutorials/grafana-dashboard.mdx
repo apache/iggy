@@ -1,0 +1,272 @@
+---
+title: A Grafana dashboard for the broker
+description: "Run an Iggy server with Prometheus and Grafana in Docker Compose, and watch the broker on a dashboard."
+---
+
+You will run an Iggy server with Prometheus and Grafana, and watch the broker on a dashboard as you send it messages.
+
+## Before we start
+
+All you need is Docker with Compose, since everything else runs in containers.
+
+## The stack
+
+Create a directory with these files.
+
+`compose.yml`:
+
+```yaml
+services:
+  iggy:
+    image: apache/iggy:0.10.0
+    cap_add:
+      - SYS_NICE
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    environment:
+      - IGGY_ROOT_USERNAME=iggy
+      - IGGY_ROOT_PASSWORD=iggy
+      - IGGY_TCP_ADDRESS=0.0.0.0:8090
+      - IGGY_HTTP_ADDRESS=0.0.0.0:3000
+      - IGGY_NODE_ADVERTISED_ADDRESS=localhost
+      - IGGY_QUIC_ENABLED=false
+      - IGGY_WEBSOCKET_ENABLED=false
+Apache Iggy 0.10.0 skips memory binding on a single-NUMA-node topology. The older Docker Desktop workaround is no longer required for that case. Use `IGGY_SHARDING_CPU_ALLOCATION=all` when you explicitly want CPU pinning without NUMA memory binding.
+      - IGGY_SHARDING_CPU_ALLOCATION=all
+    ports:
+      - "8090:8090"
+      - "3000:3000"
+
+  prometheus:
+    image: prom/prometheus:v3.13.3
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - iggy
+
+  grafana:
+    image: grafana/grafana:13.2.2
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+```
+
+The server flags are explained on [Docker & Helm](/docs/server/docker), and metrics are on by default. Grafana is on port 3001 because the server already uses 3000.
+
+`prometheus/prometheus.yml`:
+
+```yaml
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: iggy
+    metrics_path: /metrics
+    # /metrics needs a token. Prometheus reads this file every few
+    # seconds, so you can fill it in later without a restart.
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/token
+    static_configs:
+      - targets: ["iggy:3000"]
+```
+
+Create an empty token file:
+
+```bash
+touch prometheus/token
+```
+
+`grafana/provisioning/datasources/prometheus.yaml`:
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+```
+
+`grafana/provisioning/dashboards/iggy.yaml`:
+
+```yaml
+apiVersion: 1
+providers:
+  - name: iggy
+    folder: Iggy
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards
+```
+
+`grafana/dashboards/iggy.json`:
+
+```json
+{
+  "title": "Apache Iggy broker",
+  "uid": "iggy-broker",
+  "schemaVersion": 39,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Scrape health",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "up{job=\"iggy\"}", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Messages stored",
+      "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "messages", "refId": "A" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Connected clients",
+      "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "clients", "refId": "A" } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Streams / topics / partitions / segments",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "streams", "refId": "A", "legendFormat": "streams" },
+        { "expr": "topics", "refId": "B", "legendFormat": "topics" },
+        { "expr": "partitions", "refId": "C", "legendFormat": "partitions" },
+        { "expr": "segments", "refId": "D", "legendFormat": "segments" }
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "HTTP requests / s",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "rate(http_requests_total[1m])", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Messages added per minute",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "delta(messages[1m])", "refId": "A", "legendFormat": "{{instance}}" } ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Client requests denied (queue full) / s, per shard",
+      "gridPos": { "x": 0, "y": 12, "w": 18, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "rate(client_requests_denied_queue_full_total[1m])", "refId": "A", "legendFormat": "shard {{shard}}" } ]
+    },
+    {
+      "id": 9, "type": "stat", "title": "Stats rollup underflows",
+      "gridPos": { "x": 18, "y": 12, "w": 6, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "stats_rollup_underflows_total", "refId": "A" } ],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] } } }
+    }
+  ]
+}
+```
+
+## Start it
+
+```bash
+docker compose up -d
+```
+
+Prometheus starts scraping straight away, but the server turns it away because it has no token. You get the same answer from curl:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:3000/metrics
+```
+
+```
+401
+```
+
+The [Prometheus targets page](http://localhost:9090/targets) also shows the `iggy` job as down.
+
+## Create a token for Prometheus
+
+Create a personal access token with the CLI and write it to the file Prometheus reads:
+
+```bash
+docker compose exec -T iggy iggy --username iggy --password iggy \
+  pat create metrics-scraper 2>/dev/null | sed -n 's/^Token: //p' > prometheus/token
+```
+
+Check that the token works:
+
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" \
+  -H "Authorization: Bearer $(cat prometheus/token)" http://localhost:3000/metrics
+```
+
+```
+200
+```
+
+Within a few seconds the Prometheus targets page shows the `iggy` job as up.
+
+## Send some messages
+
+Use the CLI to create a stream and topic, then send 60 messages to it:
+
+```bash
+I="docker compose exec -T iggy iggy --username iggy --password iggy"
+$I stream create shop 2>/dev/null
+$I topic create shop orders 3 none 2>/dev/null
+for i in $(seq 1 60); do
+  $I message send --partition-id $((i % 3)) shop orders "{\"order_id\":$i,\"total\":$((i*3)).50}" > /dev/null 2>&1
+done
+```
+
+Check the message count in Prometheus:
+
+```bash
+curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=messages' | jq -r '.data.result[0].value[1]'
+```
+
+```
+60
+```
+
+## Open Grafana
+
+Open [http://localhost:3001](http://localhost:3001), sign in as `admin` with password `admin`, and find the "Apache Iggy broker" dashboard in the Iggy folder. Messages stored reads 60 and the rate panels show the burst, so send another and watch them move.
+
+## What the server exports
+
+The server exports about forty metrics, including `http_requests_total`, `streams`, `topics`, `partitions`, `segments`, `messages`, `users` and `clients`. To list them all:
+
+```bash
+curl -s -H "Authorization: Bearer $(cat prometheus/token)" \
+  http://localhost:3000/metrics | grep '^# HELP'
+```
+
+## Running it again
+
+To stop everything:
+
+```bash
+docker compose down
+```
+
+Your files stay in the directory, so `docker compose up -d` starts it all again. The server starts empty each time, so create a new token and send some messages before you open the dashboard.
+
+To add a panel, edit `grafana/dashboards/iggy.json` and Grafana picks up the change within a few seconds. Watch the denied requests panel: if it starts to climb, the server is too busy to take more requests. The server's metrics settings are under [`[http.metrics]`](/docs/server/configuration#httpmetrics) in the configuration reference.

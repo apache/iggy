@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use iggy::prelude::IggyError;
+use tokio::time::{Instant, sleep_until};
 
 use crate::actors::consumer::client::BenchmarkConsumerClient;
 use crate::actors::consumer::client::interface::ConsumerClient;
@@ -37,7 +38,23 @@ pub struct FakeConsumer {
     pub blocked: bool,
 }
 
+/// Delivers one batch at `ready_at`, then blocks like a group member with drained partitions.
+/// A poll dropped before it delivers leaves the batch for the next poll.
+pub struct FakeLateConsumer {
+    ready_at: Instant,
+    delivered: bool,
+}
+
 pub struct FakeProducer;
+
+impl FakeLateConsumer {
+    pub const fn new(ready_at: Instant) -> Self {
+        Self {
+            ready_at,
+            delivered: false,
+        }
+    }
+}
 
 impl ConsumerClient for FakeConsumer {
     async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
@@ -64,6 +81,33 @@ impl ApiLabel for FakeConsumer {
 }
 
 impl BenchmarkConsumerClient for FakeConsumer {}
+
+impl ConsumerClient for FakeLateConsumer {
+    async fn consume_batch(&mut self) -> Result<Option<BatchMetrics>, IggyError> {
+        if self.delivered {
+            return pending().await;
+        }
+        sleep_until(self.ready_at).await;
+        self.delivered = true;
+        Ok(Some(batch()))
+    }
+
+    fn reset_offsets(&mut self) -> impl Future<Output = Result<(), IggyError>> {
+        ready(Ok(()))
+    }
+}
+
+impl BenchmarkInit for FakeLateConsumer {
+    fn setup(&mut self) -> impl Future<Output = Result<(), IggyError>> {
+        ready(Ok(()))
+    }
+}
+
+impl ApiLabel for FakeLateConsumer {
+    const API_LABEL: &'static str = "fake";
+}
+
+impl BenchmarkConsumerClient for FakeLateConsumer {}
 
 impl ProducerClient for FakeProducer {
     fn produce_batch(

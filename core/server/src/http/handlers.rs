@@ -111,6 +111,7 @@ use iggy_common::{
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::permissioner::Permissioner;
+use metadata::stm::stream::StreamsInner;
 use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
@@ -707,64 +708,24 @@ pub(in crate::http) async fn get_metrics(
         .users()
         .authorize(|permissioner| permissioner.get_stats(identity.user_id))
         .is_ok();
-    let (
-        (streams_count, topics_count, partitions_count, segments_count, messages_count),
-        topic_usage,
-    ) = state
+    let topic_gauges = exports_stats && state.server_config.http.metrics.topic_gauges;
+    let (counts, segments_count, messages_count, topic_usage) = state
         .shard
         .plane
         .metadata()
         .mux_stm
         .streams()
         .read(|streams| {
-            let mut topics_count = 0u64;
-            let mut partitions_count = 0u64;
-            let mut segments_count = 0u64;
-            let mut messages_count = 0u64;
-            let mut topic_usage = if exports_stats {
-                Vec::with_capacity(
-                    streams
-                        .items
-                        .iter()
-                        .map(|(_, stream)| stream.topics.len())
-                        .sum(),
-                )
-            } else {
-                Vec::new()
-            };
-            for (_, stream) in &streams.items {
-                topics_count = topics_count.saturating_add(stream.topics.len() as u64);
-                segments_count = segments_count
-                    .saturating_add(u64::from(stream.stats.segments_count_inconsistent()));
-                messages_count =
-                    messages_count.saturating_add(stream.stats.messages_count_inconsistent());
-                for (_, topic) in &stream.topics {
-                    partitions_count =
-                        partitions_count.saturating_add(topic.partitions.len() as u64);
-                    if !exports_stats {
-                        continue;
-                    }
-                    topic_usage.push(TopicUsageSample {
-                        stream: Arc::clone(&stream.name),
-                        topic: Arc::clone(&topic.name),
-                        size_bytes: topic.stats.size_bytes_inconsistent(),
-                        messages: topic.stats.messages_count_inconsistent(),
-                        max_size_bytes: topic
-                            .resolved
-                            .max_topic_size
-                            .resolve(DEFAULT_MAX_TOPIC_SIZE),
-                    });
-                }
-            }
+            let node = streams.stats_registry.node();
             (
-                (
-                    streams.items.len() as u64,
-                    topics_count,
-                    partitions_count,
-                    segments_count,
-                    messages_count,
-                ),
-                topic_usage,
+                streams.resource_counts(),
+                node.segments_count_inconsistent(),
+                node.messages_count_inconsistent(),
+                if topic_gauges {
+                    topic_usage_samples(streams)
+                } else {
+                    Vec::new()
+                },
             )
         });
     let users_count = state
@@ -776,15 +737,38 @@ pub(in crate::http) async fn get_metrics(
         .read(|users| users.items.len() as u64);
 
     let metrics = &state.metrics;
-    metrics.streams.set(gauge_value(streams_count));
-    metrics.topics.set(gauge_value(topics_count));
-    metrics.partitions.set(gauge_value(partitions_count));
+    metrics.streams.set(gauge_value(counts.streams as u64));
+    metrics.topics.set(gauge_value(counts.topics as u64));
+    metrics
+        .partitions
+        .set(gauge_value(counts.partitions as u64));
     metrics.segments.set(gauge_value(segments_count));
     metrics.messages.set(gauge_value(messages_count));
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
     Ok(metrics.formatted_output(exports_stats))
+}
+
+/// One sample per topic for the per-topic series, the only part of a scrape
+/// that walks the topics.
+fn topic_usage_samples(streams: &StreamsInner) -> Vec<TopicUsageSample> {
+    let mut samples = Vec::with_capacity(streams.resource_counts().topics);
+    for (_, stream) in &streams.items {
+        for (_, topic) in &stream.topics {
+            samples.push(TopicUsageSample {
+                stream: Arc::clone(&stream.name),
+                topic: Arc::clone(&topic.name),
+                size_bytes: topic.stats.size_bytes_inconsistent(),
+                messages: topic.stats.messages_count_inconsistent(),
+                max_size_bytes: topic
+                    .resolved
+                    .max_topic_size
+                    .resolve(DEFAULT_MAX_TOPIC_SIZE),
+            });
+        }
+    }
+    samples
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP

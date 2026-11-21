@@ -22,5 +22,4 @@
 pub mod common;
 pub mod compare;
 pub mod list;
-pub mod quantile;
 pub mod run;
