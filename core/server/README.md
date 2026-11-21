@@ -675,6 +675,34 @@ After the restart, the node remembers the cluster that it finds then.
 A node also reads nothing from a peer whose identity object names this cluster.
 Then the peer's store and prefix are this cluster's own.
 
+### Geo topic objects
+
+The cluster publishes one object for each of its geo topics in its own
+`[tiered_storage]` store, under
+`<prefix>/meta/topics/<stream_id>/<topic_id>/<created_revision>`. A peer reads
+these objects to find the geo topics of this cluster. One listing of
+`<prefix>/meta/topics/` finds all of them. An object holds the origin, the
+`cluster_uid`, the stream and topic names and ids, and the partition count. It
+also holds the compression algorithm, the largest message size, the retention
+limits and the geo mode.
+
+The caught-up metadata primary stores the object of a new geo topic within
+about a second of its creation. When the content of the object changes, for
+example after a stream rename, it stores the object again. The primary of each
+partition of a geo topic reads the object before it takes messages, and again
+after each change of primary. Until then, the partition refuses messages with
+`TransientNotAccepted`, which the SDKs retry. A store that does not answer
+therefore delays the first messages of a new geo topic, but the topic stays.
+
+When a client deletes a geo topic, the metadata primary replaces its object
+with a tombstone. A tombstone tells the peers that the topic is gone. The
+primary lists the topic objects once a minute. After `tombstone_grace` (24
+hours by default), it deletes the segments and manifests of the topic, and then
+the tombstone. The tombstone records the time of its write. A restart or a new
+metadata primary therefore does not restart the grace.
+
+Clients cannot create geo topics yet, as the resource options below describe.
+
 ## Resource options
 
 Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.

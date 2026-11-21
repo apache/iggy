@@ -168,6 +168,9 @@ async fn given_a_geo_topic_when_changing_it_should_keep_its_partitions_and_optio
 
 fn server_with_fs_store(store: &Path) -> TestHarness {
     let extra_envs = HashMap::from([
+        // A geo topic takes messages once the metadata primary stored its
+        // object, and a node without an origin stores none.
+        ("IGGY_GEO_ORIGIN".to_owned(), "dc-a".to_owned()),
         ("IGGY_TIERED_STORAGE_BACKEND".to_owned(), "fs".to_owned()),
         (
             "IGGY_TIERED_STORAGE_PATH".to_owned(),

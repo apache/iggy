@@ -1411,6 +1411,10 @@ pub struct TopicRuntimeOptions {
     /// and keeps where the messages of a batch sit in the object store, not
     /// the messages. A geo topic in the `geo` mode does.
     pub places_batches: bool,
+    /// Whether the topic is a geo topic. The primary of each of its
+    /// partitions takes no produce before it reads the topic's object from
+    /// the store, which is what other clusters adopt the topic from.
+    pub geo_topic: bool,
 }
 
 impl TopicRuntimeOptions {
@@ -1454,6 +1458,7 @@ impl From<&TopicCreateOptions> for TopicRuntimeOptions {
             segment_max_age: parsed.segment_max_age,
             tiered_storage: parsed.tiered_storage == Some(true),
             places_batches: parsed.is_geo() && parsed.geo_mode.unwrap_or_default() == GeoMode::Geo,
+            geo_topic: parsed.is_geo(),
         }
     }
 }

@@ -29,6 +29,10 @@
 //! topic is gone from metadata by then, so every removed incarnation is
 //! queued and the listing of one that never uploaded finds nothing.
 //!
+//! The partitions of a geo topic are left out: their objects wait for the
+//! tombstone of the topic, and the sweep of [`crate::geo_topics`] deletes
+//! them once its grace ends.
+//!
 //! The queue is memory only and holds what this node saw commit while it was
 //! the metadata primary. A restart, a primary change, a change feed that
 //! overflowed and a full queue each leave objects in the store, for a sweep
@@ -66,6 +70,7 @@ impl IncarnationDeletes {
         let mut left_out = 0_usize;
         for change in changes {
             if change.kind == PartitionChangeKind::Removed
+                && !change.geo_topic
                 && !queue.queue(
                     object_prefix(change.namespace, change.created_revision),
                     now,

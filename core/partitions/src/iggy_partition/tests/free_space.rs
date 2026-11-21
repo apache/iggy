@@ -46,7 +46,9 @@ fn short_reserve() -> Arc<FreeSpaceReserve> {
     reserve_with(RESERVE_BYTES - 1)
 }
 
-fn send_request<B: MessageBus>(partition: &IggyPartition<B>) -> Message<RoutedRequestHeader> {
+pub(super) fn send_request<B: MessageBus>(
+    partition: &IggyPartition<B>,
+) -> Message<RoutedRequestHeader> {
     let namespace = partition.namespace();
     let mut send = checksumless_send_request(namespace, 1).transmute_header(
         |header, next: &mut RoutedRequestHeader| {

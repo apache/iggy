@@ -22,6 +22,11 @@
 //! The section is optional. Without it the origin is empty and there are no
 //! peers, so existing configuration files keep working.
 //!
+//! The cluster publishes an object for each of its geo topics in its own
+//! `[tiered_storage]` store, and a deleted geo topic leaves a tombstone
+//! there. `tombstone_grace` is how long the tombstone and the topic's
+//! objects stay before the cluster deletes them.
+//!
 //! A peer's store is the `[tiered_storage]` store of another cluster, and its
 //! keys repeat the keys of that section. The server never writes to a peer's
 //! store, so read-only credentials are enough. The tier service of a peer
@@ -30,9 +35,10 @@
 use super::COMPONENT;
 use super::tiered_storage::{S3UrlStyle, TieredStorageBackend};
 use crate::ConfigurationError;
-use configs::ConfigEnv;
-use iggy_common::Validatable;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
+use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use std::fmt::{self, Debug, Display, Formatter};
 
 /// The most peers that one cluster reads. It matches the
@@ -45,7 +51,8 @@ pub const MAX_PEERS: usize = 16;
 /// so a short origin leaves room for the name of the stream.
 pub const MAX_ORIGIN_LEN: usize = 32;
 
-#[derive(Deserialize, Serialize, Clone, Default, ConfigEnv)]
+#[serde_as]
+#[derive(Deserialize, Serialize, Clone, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct GeoConfig {
     /// The name of this cluster among the datacenters. Shadow stream names
@@ -57,6 +64,23 @@ pub struct GeoConfig {
     #[serde(default)]
     #[config_env(max_elements = 16)]
     pub peers: Vec<GeoPeerConfig>,
+    /// How long a deleted geo topic keeps its tombstone and its objects in
+    /// this cluster's store, so that each peer sees the tombstone before the
+    /// objects go.
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_tombstone_grace")]
+    #[config_env(leaf)]
+    pub tombstone_grace: IggyDuration,
+}
+
+impl Default for GeoConfig {
+    fn default() -> Self {
+        Self {
+            origin: String::new(),
+            peers: Vec::new(),
+            tombstone_grace: default_tombstone_grace(),
+        }
+    }
 }
 
 /// One peer: its origin name and how to read its store.
@@ -142,7 +166,7 @@ impl Display for GeoConfig {
             }
             Display::fmt(peer, f)?;
         }
-        f.write_str("] }")
+        write!(f, "], tombstone_grace: {} }}", self.tombstone_grace)
     }
 }
 
@@ -176,6 +200,9 @@ impl Validatable<ConfigurationError> for GeoConfig {
             && let Err(reason) = check_origin(&self.origin)
         {
             return refuse(&format!("origin {:?} {reason}", self.origin));
+        }
+        if self.tombstone_grace.is_zero() {
+            return refuse("tombstone_grace must be longer than zero");
         }
         if self.peers.is_empty() {
             return Ok(());
@@ -294,6 +321,11 @@ fn default_prefix() -> String {
     "iggy".to_owned()
 }
 
+/// A day: a peer that is down for less still sees the tombstone.
+fn default_tombstone_grace() -> IggyDuration {
+    IggyDuration::new_from_secs(24 * 3600)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,6 +355,7 @@ mod tests {
         GeoConfig {
             origin: "dc-a".to_owned(),
             peers,
+            ..GeoConfig::default()
         }
     }
 
@@ -332,10 +365,35 @@ mod tests {
     }
 
     #[test]
+    fn given_no_tombstone_grace_when_loading_should_keep_tombstones_for_a_day() {
+        let config: GeoConfig = serde_json::from_str(r#"{"origin":"dc-a"}"#).unwrap();
+        let hour: GeoConfig =
+            serde_json::from_str(r#"{"origin":"dc-a","tombstone_grace":"1 h"}"#).unwrap();
+
+        assert_eq!(hour.tombstone_grace.get_duration().as_secs(), 3600);
+        assert_eq!(config.tombstone_grace.get_duration().as_secs(), 24 * 3600);
+        assert_eq!(GeoConfig::default().tombstone_grace, config.tombstone_grace);
+        assert!(
+            config.to_string().ends_with("tombstone_grace: 1day }"),
+            "{config}"
+        );
+    }
+
+    #[test]
+    fn given_a_zero_tombstone_grace_when_validating_should_refuse() {
+        let config = GeoConfig {
+            tombstone_grace: IggyDuration::new_from_secs(0),
+            ..GeoConfig::default()
+        };
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn given_an_origin_without_peers_when_validating_should_accept() {
         let config = GeoConfig {
             origin: "dc-a".to_owned(),
-            peers: Vec::new(),
+            ..GeoConfig::default()
         };
 
         assert!(config.validate().is_ok());
@@ -381,7 +439,7 @@ mod tests {
     fn given_an_invalid_origin_when_validating_should_refuse() {
         let config = GeoConfig {
             origin: "dc_a".to_owned(),
-            peers: Vec::new(),
+            ..GeoConfig::default()
         };
 
         assert!(config.validate().is_err());
@@ -390,8 +448,8 @@ mod tests {
     #[test]
     fn given_peers_without_an_origin_when_validating_should_refuse() {
         let config = GeoConfig {
-            origin: String::new(),
             peers: vec![s3_peer("dc-b")],
+            ..GeoConfig::default()
         };
 
         assert!(config.validate().is_err());

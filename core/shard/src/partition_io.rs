@@ -12403,4 +12403,5 @@ mod tests {
     mod object_deletes;
     mod segment_uploads;
     mod tier_service_uploads;
+    mod topic_object_checks;
 }

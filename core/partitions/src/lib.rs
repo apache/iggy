@@ -72,6 +72,7 @@ pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
     MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
 };
+mod topic_object;
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
     ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
@@ -82,6 +83,10 @@ mod long_term_rewrite;
 pub use long_term_rewrite::{
     BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError,
     RewriteOutcome, SegmentRewrite,
+};
+pub use topic_object::{
+    ExecutorTopicObjects, TOPIC_OBJECT_RETRY, TopicObjectOutcome, TopicObjects, delete_topic,
+    list_topic_keys,
 };
 mod segment_recovery;
 pub mod state_machine;

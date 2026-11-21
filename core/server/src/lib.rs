@@ -69,6 +69,7 @@ pub(crate) mod http;
 
 // background: per-shard maintenance loops.
 pub(crate) mod geo_peers;
+pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
 pub(crate) mod partition_reconciler;
 pub use partition_reconciler::{

@@ -541,6 +541,12 @@ impl Topic {
         self.options = options;
     }
 
+    /// Whether the topic is a geo topic.
+    #[must_use]
+    pub fn is_geo(&self) -> bool {
+        self.resolved.topic_type == TopicType::Geo
+    }
+
     pub fn rebalance_consumer_groups(&mut self, metadata_op: u64, timestamp: IggyTimestamp) {
         for group in self.consumer_groups.values_mut() {
             group.rebalance_members(&self.partitions, metadata_op, timestamp.as_micros());
@@ -1320,6 +1326,10 @@ pub struct PartitionChange {
     pub namespace: IggyNamespace,
     pub created_revision: u64,
     pub kind: PartitionChangeKind,
+    /// Whether the partition belongs to a geo topic. The objects of a geo
+    /// topic's removed partition wait for the tombstone of the topic, so the
+    /// deletes of removed incarnations leave them alone.
+    pub geo_topic: bool,
 }
 
 /// Partition changes of recent commits, each stamped with the `revision` its
@@ -1426,7 +1436,7 @@ impl StateHandler for TruncatePartitionRequest {
         // target commits as a rejection, so the outcome is recorded against
         // the client's request id (its retry dedups) while surfacing the
         // typed error an empty ack would swallow.
-        let (namespace, created_revision) = {
+        let (namespace, created_revision, geo_topic) = {
             let Some(stream_id) = state.resolve_stream_id(&self.stream_id) else {
                 return ApplyReply::err(TruncatePartitionResult::StreamNotFound);
             };
@@ -1443,6 +1453,7 @@ impl StateHandler for TruncatePartitionRequest {
             let Some(topic) = stream.topics.get_mut(topic_id) else {
                 return ApplyReply::err(TruncatePartitionResult::TopicNotFound);
             };
+            let geo_topic = topic.is_geo();
             let Some(partition) = topic
                 .partitions
                 .iter_mut()
@@ -1463,6 +1474,7 @@ impl StateHandler for TruncatePartitionRequest {
             (
                 IggyNamespace::new(stream_id, topic_id, partition.id),
                 partition.created_revision,
+                geo_topic,
             )
         };
         // Bump and record on every applied truncate (partition resolved), even
@@ -1479,6 +1491,7 @@ impl StateHandler for TruncatePartitionRequest {
                 namespace,
                 created_revision,
                 kind: PartitionChangeKind::Truncated,
+                geo_topic,
             },
         );
         ApplyReply::ok(Bytes::new())
@@ -1588,7 +1601,13 @@ impl StreamsInner {
 
     /// Takes partitions a commit removed out of the placement indexes, after
     /// that commit bumped `revision`.
-    fn retire_partitions(&mut self, stream_id: usize, topic_id: usize, partitions: &[Partition]) {
+    fn retire_partitions(
+        &mut self,
+        stream_id: usize,
+        topic_id: usize,
+        partitions: &[Partition],
+        geo_topic: bool,
+    ) {
         for partition in partitions {
             self.placement_index.remove(partition);
             self.recent_partition_changes.push(
@@ -1597,6 +1616,7 @@ impl StreamsInner {
                     namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
                     created_revision: partition.created_revision,
                     kind: PartitionChangeKind::Removed,
+                    geo_topic,
                 },
             );
         }
@@ -1624,6 +1644,7 @@ impl StreamsInner {
                     namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
                     created_revision: partition.created_revision,
                     kind,
+                    geo_topic: topic.is_geo(),
                 },
             );
         }
@@ -3516,7 +3537,7 @@ impl StateHandler for DeleteStreamRequest {
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
         for (topic_id, topic) in &removed.topics {
-            state.retire_partitions(stream_id, topic_id, &topic.partitions);
+            state.retire_partitions(stream_id, topic_id, &topic.partitions, topic.is_geo());
             state.catalog_counts.remove_topic(topic);
         }
         // The dropped stream may have held groups with pending revocations.
@@ -3662,6 +3683,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
         debug_assert_eq!(inserted, topic_id, "vacant_key must match the insert slot");
         state.catalog_counts.topics += 1;
         if let Some(topic) = stream.topics.get_mut(inserted) {
+            let geo_topic = topic.is_geo();
             for (partition, members) in self.partitions.iter().zip(members) {
                 let partition = Partition {
                     id: partition.partition_id as usize,
@@ -3681,6 +3703,7 @@ impl StateHandler for CreateTopicWithAssignmentsRequest {
                         namespace: IggyNamespace::new(stream_id, inserted, partition.id),
                         created_revision: new_revision,
                         kind: PartitionChangeKind::Created,
+                        geo_topic,
                     },
                 );
                 topic.partitions.push(partition);
@@ -4060,7 +4083,7 @@ impl StateHandler for DeleteTopicRequest {
             .remove_topic(stream_id, topic_id, &partition_ids);
         state.revision = state.revision.wrapping_add(1);
         state.namespace_revision = state.revision;
-        state.retire_partitions(stream_id, topic_id, &removed.partitions);
+        state.retire_partitions(stream_id, topic_id, &removed.partitions, removed.is_geo());
         state.catalog_counts.remove_topic(&removed);
         // The dropped topic may have held groups with pending revocations.
         state.recompute_consumer_group_metadata();
@@ -4161,6 +4184,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
         let Some(topic) = stream.topics.get_mut(topic_id) else {
             return ApplyReply::err(CreatePartitionsResult::TopicNotFound);
         };
+        let geo_topic = topic.is_geo();
         for ((resolved_id_usize, partition), members) in resolved
             .into_iter()
             .zip(self.partitions.iter())
@@ -4184,6 +4208,7 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                     namespace: IggyNamespace::new(stream_id, topic_id, partition.id),
                     created_revision: new_revision,
                     kind: PartitionChangeKind::Created,
+                    geo_topic,
                 },
             );
             topic.partitions.push(partition);
@@ -4266,6 +4291,7 @@ impl StateHandler for DeletePartitionsRequest {
             // only a primary that minted dense ids makes it double as an id
             // threshold.
             let removed = topic.partitions.split_off(retained);
+            let geo_topic = topic.is_geo();
             let removed_ids: Vec<usize> = removed.iter().map(|partition| partition.id).collect();
             // Members assigned the removed partitions must give them up.
             topic.rebalance_consumer_groups(state.apply_context.metadata_op, timestamp);
@@ -4277,7 +4303,7 @@ impl StateHandler for DeletePartitionsRequest {
                 .remove_partitions(stream_id, topic_id, &removed_ids);
             state.revision = state.revision.wrapping_add(1);
             state.namespace_revision = state.revision;
-            state.retire_partitions(stream_id, topic_id, &removed);
+            state.retire_partitions(stream_id, topic_id, &removed, geo_topic);
             let (requested_op, actor) = state.deletion_origin();
             let mut removed_ids: Vec<u32> = removed_ids
                 .iter()
@@ -4623,9 +4649,9 @@ mod tests {
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
     use iggy_common::{
-        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, HeaderKey, HeaderKind, IggyError, OptionKey,
-        OptionValue, OptionValueCodec, ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin,
-        WrappedStreamKey, derived_defaults, topic_option_keys,
+        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, GeoMode, HeaderKey, HeaderKind, IggyError,
+        OptionKey, OptionValue, OptionValueCodec, ServerKeyContext, StreamEncryptionKey,
+        StreamKeyOrigin, WrappedStreamKey, derived_defaults, topic_option_keys,
     };
     use std::str::FromStr;
     use std::time::Duration;
@@ -6533,6 +6559,7 @@ mod tests {
                     namespace: IggyNamespace::new(0, 0, partition_id),
                     created_revision: created,
                     kind: PartitionChangeKind::TieringEnabled,
+                    geo_topic: false,
                 },
             )
         };
@@ -6593,6 +6620,7 @@ mod tests {
                     namespace,
                     created_revision: created,
                     kind,
+                    geo_topic: false,
                 },
             )
         };
@@ -6645,6 +6673,92 @@ mod tests {
         );
     }
 
+    /// The deletes of removed incarnations leave the objects of a geo topic to
+    /// the sweep of its tombstone, so every change names the topic's type.
+    #[test]
+    fn given_a_geo_and_a_normal_topic_when_their_partitions_change_should_mark_only_the_geo_ones() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let start = inner.revision;
+        let geo = TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            geo_mode: Some(GeoMode::Geo),
+            ..TopicCreateOptions::default()
+        };
+        for (topic_id, name, options) in [
+            (0, "geo", geo.to_wire().unwrap()),
+            (1, "normal", WireOptions::empty()),
+        ] {
+            let create_topic = CreateTopicWithAssignmentsRequest {
+                request: WireCreateTopicRequest {
+                    options,
+                    ..make_topic_request(0, 2, name)
+                },
+                derived_options: WireOptions::empty(),
+                partitions: (0..2)
+                    .map(|partition_id| CreatedPartitionAssignment {
+                        initial_view: 0,
+                        partition_id,
+                        consensus_group_id: 10 * topic_id + u64::from(partition_id) + 1,
+                        members: Vec::new(),
+                    })
+                    .collect(),
+            };
+            let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+                &create_topic,
+                &mut inner,
+                IggyTimestamp::now(),
+            );
+            assert_eq!(apply.code, 0);
+        }
+        assert!(inner.items[0].topics[0].is_geo());
+        assert!(!inner.items[0].topics[1].is_geo());
+        for topic_id in 0..2 {
+            let truncate = TruncatePartitionRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(topic_id),
+                partition_id: 0,
+                up_to_offset: 10,
+                expected_history: None,
+            };
+            let apply = StateHandler::apply(&truncate, &mut inner, IggyTimestamp::now());
+            assert_eq!(apply.code, 0);
+        }
+        let delete_stream = DeleteStreamRequest {
+            stream_id: WireIdentifier::numeric(0),
+        };
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete_stream,
+            &mut inner,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, 0);
+
+        let changes = changes_since(&inner, start);
+        for kind in [
+            PartitionChangeKind::Created,
+            PartitionChangeKind::Truncated,
+            PartitionChangeKind::Removed,
+        ] {
+            for geo_topic in [true, false] {
+                assert!(
+                    changes
+                        .iter()
+                        .any(|(_, change)| change.kind == kind && change.geo_topic == geo_topic),
+                    "{kind:?} of a {} topic: {changes:?}",
+                    if geo_topic { "geo" } else { "normal" }
+                );
+            }
+        }
+        for (_, change) in changes {
+            assert_eq!(
+                change.geo_topic,
+                change.namespace.topic_id() == 0,
+                "{change:?}"
+            );
+        }
+    }
+
     /// A reader the feed cannot serve must rebuild from the tree: after an
     /// eviction, after a restore, and with a cursor from a newer state.
     #[test]
@@ -6653,6 +6767,7 @@ mod tests {
             namespace: IggyNamespace::new(0, 0, 0),
             created_revision: 1,
             kind: PartitionChangeKind::Truncated,
+            geo_topic: false,
         };
         let mut changes = RecentPartitionChanges::default();
         let mut revision = 0;
