@@ -34,6 +34,7 @@ use iggy_binary_protocol::{
     RoutedRequestHeader,
 };
 use iggy_common::{EncryptorKind, IggyError, ServerKeyContext, StreamEncryption};
+use iggy_object_store::PositionHolder;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
 use server_common::Message;
@@ -1710,7 +1711,24 @@ where
     ) -> Option<(Option<u64>, u64)> {
         self.with_partition(namespace, |partition| {
             (
-                partition.external_group_offset(group_id),
+                partition.geo_external_group_offset(group_id),
+                partition.offsets().commit_offset,
+            )
+        })
+    }
+
+    /// [`Self::external_group_offset_read`] for a group that this cluster
+    /// does not have, by its name: the position that another datacenter
+    /// published for its external offsets, if any.
+    pub fn external_position_read(
+        &self,
+        namespace: &IggyNamespace,
+        name: String,
+    ) -> Option<(Option<u64>, u64)> {
+        let holder = PositionHolder::ExternalGroup(name);
+        self.with_partition(namespace, |partition| {
+            (
+                partition.geo_position_offset(&holder),
                 partition.offsets().commit_offset,
             )
         })

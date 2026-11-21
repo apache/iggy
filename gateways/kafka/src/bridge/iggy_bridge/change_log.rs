@@ -30,7 +30,8 @@ use std::time::Duration;
 use iggy::prelude::{
     IggyClient, IggyError, MAX_METADATA_CHANGES_LIMIT, MetadataChange, MetadataChangeCursor,
     MetadataChangeGroup, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
-    MetadataChangesQuery, MetadataCurrentItem, MetadataUserChange, SystemClient, UserStatus,
+    MetadataChangesQuery, MetadataCurrentItem, MetadataOptions, MetadataUserChange, SystemClient,
+    TopicCreateOptions, UserStatus,
 };
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, sleep};
@@ -76,6 +77,9 @@ pub struct TopicShape {
     /// Iggy's numeric ids of the stream and the topic, which permission grants name.
     pub stream_id: u32,
     pub topic_id: u32,
+    /// Whether the topic is geo, which a shadow topic of another datacenter's geo topic reads as.
+    /// Another datacenter can move the offsets of its groups, so only Iggy holds them.
+    pub geo: bool,
 }
 
 /// A Kafka topic that the change log shows deleted.
@@ -610,6 +614,7 @@ struct TopicEntry {
     key: TopicKey,
     name: String,
     partitions: u32,
+    geo: bool,
 }
 
 /// One incarnation of a topic, in one incarnation of its stream.
@@ -692,7 +697,12 @@ impl Mirror {
                 Changed::ALL
             }
             MetadataChange::TopicCreated(topic) | MetadataChange::TopicUpdated(topic) => {
-                self.put_topic(topic_key!(topic), &topic.name, Some(topic.partitions_count));
+                self.put_topic(
+                    topic_key!(topic),
+                    &topic.name,
+                    Some(topic.partitions_count),
+                    geo_of(&topic.options),
+                );
                 Changed::ALL
             }
             MetadataChange::TopicDeleted(topic) => {
@@ -742,7 +752,7 @@ impl Mirror {
                 self.put_stream(stream.stream_id, stream.stream_created_op, &stream.name);
             }
             MetadataCurrentItem::Topic(topic) => {
-                self.put_topic(topic_key!(topic), &topic.name, None);
+                self.put_topic(topic_key!(topic), &topic.name, None, geo_of(&topic.options));
             }
             MetadataCurrentItem::Partitions(partitions) => {
                 self.set_partitions(topic_key!(partitions), partitions.partitions_count);
@@ -790,6 +800,7 @@ impl Mirror {
                     partitions: topic.partitions,
                     stream_id: topic.key.stream_id,
                     topic_id: topic.key.topic_id,
+                    geo: topic.geo,
                 };
                 Some((kafka_topic.to_owned(), shape))
             })
@@ -857,18 +868,18 @@ impl Mirror {
     }
 
     /// As [`Self::put_stream`], by the op that created the topic. Without `partitions`, the topic
-    /// keeps the count it had.
-    fn put_topic(&mut self, key: TopicKey, name: &str, partitions: Option<u32>) {
+    /// keeps the count it had, and without `geo`, whether it was geo.
+    fn put_topic(&mut self, key: TopicKey, name: &str, partitions: Option<u32>, geo: Option<bool>) {
         let slot = (key.stream_id, key.topic_id);
-        let mut known_partitions = 0;
+        let (mut known_partitions, mut known_geo) = (0, false);
         match self
             .topics
             .get(&slot)
-            .map(|topic| (topic.key, topic.partitions))
+            .map(|topic| (topic.key, topic.partitions, topic.geo))
         {
-            Some((known, _)) if known.topic_created_op > key.topic_created_op => return,
-            Some((older, _)) if older != key => self.drop_topic(older),
-            Some((_, partitions)) => known_partitions = partitions,
+            Some((known, _, _)) if known.topic_created_op > key.topic_created_op => return,
+            Some((older, _, _)) if older != key => self.drop_topic(older),
+            Some((_, partitions, geo)) => (known_partitions, known_geo) = (partitions, geo),
             None => {}
         }
         self.topics.insert(
@@ -877,6 +888,7 @@ impl Mirror {
                 key,
                 name: name.to_owned(),
                 partitions: partitions.unwrap_or(known_partitions),
+                geo: geo.unwrap_or(known_geo),
             },
         );
     }
@@ -911,6 +923,16 @@ impl Mirror {
     }
 }
 
+/// Whether `options` make a topic geo, `None` when the change log could not read them.
+fn geo_of(options: &MetadataOptions) -> Option<bool> {
+    match options {
+        MetadataOptions::Readable(options) => {
+            Some(TopicCreateOptions::from_resource_options(options).is_geo())
+        }
+        MetadataOptions::Unreadable => None,
+    }
+}
+
 fn deleted_topic(key: TopicKey, kafka_topic: &str) -> DeletedTopic {
     DeletedTopic {
         name: kafka_topic.to_owned(),
@@ -932,7 +954,7 @@ mod tests {
         MetadataConsumerGroupDeleted, MetadataConsumerGroupItem, MetadataOptions,
         MetadataPartitionsChanged, MetadataPermissionsUpdatedReason, MetadataStreamChange,
         MetadataStreamDeleted, MetadataTopicChange, MetadataTopicDeleted, MetadataTopicItem,
-        MetadataUserIdentity, MetadataUserPermissionsUpdated, Permissions,
+        MetadataUserIdentity, MetadataUserPermissionsUpdated, Permissions, TopicType,
     };
 
     use super::super::ScannedGroups;
@@ -1378,7 +1400,36 @@ mod tests {
                 partitions: 5,
                 stream_id: KAFKA,
                 topic_id: 1,
+                geo: false,
             })
+        );
+    }
+
+    /// Another datacenter can move the offsets of a geo topic, so the coordinator log does not
+    /// answer them (`OffsetFetch`).
+    #[test]
+    fn given_a_geo_topic_should_show_it_geo_also_after_options_it_cannot_read() {
+        let (mut mirror, _) = seeded();
+        let mut geo = topic(KAFKA, 1, 10, "orders");
+        geo.options = MetadataOptions::Readable(
+            TopicCreateOptions {
+                topic_type: Some(TopicType::Geo),
+                ..TopicCreateOptions::default()
+            }
+            .to_option_map()
+            .unwrap(),
+        );
+
+        apply_all(&mut mirror, &[MetadataChange::TopicUpdated(geo)]);
+        assert!(mirror.kafka_topic_shapes(&mapping())["orders"].geo);
+
+        apply_all(
+            &mut mirror,
+            &[MetadataChange::TopicUpdated(topic(KAFKA, 1, 10, "orders"))],
+        );
+        assert!(
+            mirror.kafka_topic_shapes(&mapping())["orders"].geo,
+            "unreadable options change nothing"
         );
     }
 

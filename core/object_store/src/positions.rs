@@ -15,16 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The positions of the consumer groups of one log, as one node of the
-//! cluster that reads the log holds them: what carries consumer positions
-//! between datacenters.
+//! The positions of the consumers of one log, as one node of the cluster
+//! that reads the log holds them: what carries consumer positions between
+//! datacenters.
 //!
 //! A log is the messages of a geo topic as its origin wrote them, named by
 //! [`GeoLog`]. Each node of each cluster that holds a topic of the log, the
 //! geo topic itself or a shadow topic of it, writes one object for it into
 //! its own store under [`KeyLayout::positions_key`]. Every other cluster
-//! reads those objects and takes, for each group and partition, the highest
-//! [`GeoPosition`].
+//! reads those objects and takes, for each holder and partition, the highest
+//! [`GeoPosition`]. A holder is a consumer group, the external offsets of a
+//! consumer group, or a plain consumer, see [`PositionHolder`].
 //!
 //! All integers are little-endian. A name is its length in one byte and as
 //! many bytes of UTF-8, and it is never empty:
@@ -34,12 +35,15 @@
 //! replica u8 | published_at u64 | partition_count u32
 //! per partition, ids ascending:
 //!   partition_id u32 | entry_count u32
-//!   per entry, names ascending:
-//!     group name | reset u64 | kind u8 | offset u64
+//!   per entry, holders ascending:
+//!     holder u8 | group name, or consumer_id u32 for a plain consumer
+//!     reset u64 | kind u8 | offset u64
 //! crc32c of every byte before it u32
 //! ```
 //!
-//! The magic names the version. A reader refuses a magic it does not know.
+//! The holder byte is 0 for a consumer group, 1 for the external offsets of
+//! a consumer group and 2 for a plain consumer. The magic names the version.
+//! A reader refuses a magic it does not know.
 
 use std::collections::BTreeMap;
 
@@ -47,14 +51,18 @@ use crate::error::ObjectStoreError;
 use crate::layout::KeyLayout;
 use crate::store::{ObjectStore, PutBody, PutOptions};
 
-const MAGIC: u64 = u64::from_le_bytes(*b"IGGYPOS1");
+const MAGIC: u64 = u64::from_le_bytes(*b"IGGYPOS2");
 const CHECKSUM_LEN: usize = size_of::<u32>();
 
 /// The longest group name, in bytes: the most that its one-byte length says.
 pub const MAX_GROUP_NAME_LEN: usize = u8::MAX as usize;
 
-/// The most groups one partition of one object names.
-pub const POSITIONS_PER_PARTITION_MAX: usize = 4_096;
+/// The most holders of one kind that one partition holds positions for.
+pub const POSITIONS_PER_KIND_MAX: usize = 4_096;
+
+/// The most holders one partition of one object names: those of the three
+/// kinds of [`PositionHolder`].
+pub const POSITIONS_PER_PARTITION_MAX: usize = 3 * POSITIONS_PER_KIND_MAX;
 
 /// The most bytes a positions object takes.
 pub const MAX_POSITIONS_OBJECT_LEN: usize = 16 * 1024 * 1024;
@@ -62,6 +70,9 @@ pub const MAX_POSITIONS_OBJECT_LEN: usize = 16 * 1024 * 1024;
 const KIND_DELETED: u8 = 0;
 const KIND_UNSET: u8 = 1;
 const KIND_OFFSET: u8 = 2;
+const HOLDER_GROUP: u8 = 0;
+const HOLDER_EXTERNAL_GROUP: u8 = 1;
+const HOLDER_CONSUMER: u8 = 2;
 
 /// One log, as its origin names it. The ids and the revision are the
 /// origin's, which a shadow topic keeps, so every cluster names a log the
@@ -84,7 +95,35 @@ pub struct PositionsKey {
     pub replica: u8,
 }
 
-/// What a group's position on a partition is. The order is the merge order
+/// Who holds a position on a log, as every cluster that reads the log names
+/// it.
+///
+/// Group ids belong to one cluster, so a group goes by its name. A plain
+/// consumer's id is the one its client chose, or the hash of its name, the
+/// same in every cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum PositionHolder {
+    /// The offsets that a consumer group stores as itself.
+    Group(String),
+    /// The external offsets of a consumer group: those of a group that
+    /// another system manages, as the Kafka gateway keeps a Kafka group's.
+    ExternalGroup(String),
+    /// A plain consumer.
+    Consumer(u32),
+}
+
+impl PositionHolder {
+    /// The group name of a group's holder, `None` for a plain consumer.
+    #[must_use]
+    pub fn group_name(&self) -> Option<&str> {
+        match self {
+            Self::Group(name) | Self::ExternalGroup(name) => Some(name),
+            Self::Consumer(_) => None,
+        }
+    }
+}
+
+/// What a holder's position on a partition is. The order is the merge order
 /// within one reset: a tombstone is below a deleted offset, which is below
 /// any offset.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -97,7 +136,7 @@ pub enum PositionValue {
     Offset(u64),
 }
 
-/// A group's position on one partition.
+/// A holder's position on one partition.
 ///
 /// Of two positions the one with the higher reset wins, and within one reset
 /// the higher value. A reset counts the times that a cluster moved the group
@@ -109,14 +148,14 @@ pub struct GeoPosition {
     pub value: PositionValue,
 }
 
-/// The positions of the groups of one log on one node.
+/// The positions of the holders of one log on one node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionsObject {
     pub key: PositionsKey,
     /// When the node built the object, in microseconds since the Unix epoch.
     pub published_at: u64,
-    /// By partition id, then by group name.
-    pub partitions: BTreeMap<u32, BTreeMap<String, GeoPosition>>,
+    /// By partition id, then by holder.
+    pub partitions: BTreeMap<u32, BTreeMap<PositionHolder, GeoPosition>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -139,8 +178,8 @@ pub enum PositionsObjectError {
     InvalidField(&'static str),
     #[error("the positions object lists {0} out of order or twice")]
     Unordered(&'static str),
-    #[error("a partition of the positions object names {0} groups, more than the most one holds")]
-    TooManyGroups(usize),
+    #[error("a partition of the positions object names {0} holders, more than the most one holds")]
+    TooManyHolders(usize),
     #[error("the positions object under the key of {expected:?} describes {found:?}")]
     KeyMismatch {
         expected: Box<PositionsKey>,
@@ -166,7 +205,7 @@ impl PositionValue {
         }
     }
 
-    /// The value of a group whose stored offset is `offset`.
+    /// The value of a holder whose stored offset is `offset`.
     #[must_use]
     pub const fn of_offset(offset: Option<u64>) -> Self {
         match offset {
@@ -180,8 +219,8 @@ impl PositionsObject {
     /// # Errors
     /// [`PositionsObjectError::InvalidName`] for an empty origin or group
     /// name or one longer than 255 bytes,
-    /// [`PositionsObjectError::TooManyGroups`] for a partition with more
-    /// than [`POSITIONS_PER_PARTITION_MAX`] groups, and
+    /// [`PositionsObjectError::TooManyHolders`] for a partition with more
+    /// than [`POSITIONS_PER_PARTITION_MAX`] holders, and
     /// [`PositionsObjectError::TooLarge`] past
     /// [`MAX_POSITIONS_OBJECT_LEN`].
     pub fn encode(&self) -> Result<Vec<u8>, PositionsObjectError> {
@@ -200,16 +239,16 @@ impl PositionsObject {
         let partitions = u32::try_from(self.partitions.len())
             .map_err(|_| PositionsObjectError::TooLarge(usize::MAX))?;
         bytes.extend_from_slice(&partitions.to_le_bytes());
-        for (partition_id, groups) in &self.partitions {
-            if groups.len() > POSITIONS_PER_PARTITION_MAX {
-                return Err(PositionsObjectError::TooManyGroups(groups.len()));
+        for (partition_id, holders) in &self.partitions {
+            if holders.len() > POSITIONS_PER_PARTITION_MAX {
+                return Err(PositionsObjectError::TooManyHolders(holders.len()));
             }
             bytes.extend_from_slice(&partition_id.to_le_bytes());
-            let count = u32::try_from(groups.len())
-                .map_err(|_| PositionsObjectError::TooManyGroups(groups.len()))?;
+            let count = u32::try_from(holders.len())
+                .map_err(|_| PositionsObjectError::TooManyHolders(holders.len()))?;
             bytes.extend_from_slice(&count.to_le_bytes());
-            for (name, position) in groups {
-                put_name(&mut bytes, "group name", name)?;
+            for (holder, position) in holders {
+                put_holder(&mut bytes, holder)?;
                 let (kind, offset) = position.value.code();
                 bytes.extend_from_slice(&position.reset.to_le_bytes());
                 bytes.push(kind);
@@ -266,24 +305,25 @@ impl PositionsObject {
             last_partition = Some(partition_id);
             let count = reader.u32()? as usize;
             if count > POSITIONS_PER_PARTITION_MAX {
-                return Err(PositionsObjectError::TooManyGroups(count));
+                return Err(PositionsObjectError::TooManyHolders(count));
             }
-            let mut groups = BTreeMap::new();
-            let mut last_name: Option<String> = None;
+            let mut holders = BTreeMap::new();
             for _ in 0..count {
-                let name = utf8("group name", reader.name()?)?;
-                if last_name.as_ref().is_some_and(|last| *last >= name) {
-                    return Err(PositionsObjectError::Unordered("groups"));
+                let holder = reader.holder()?;
+                if holders
+                    .last_key_value()
+                    .is_some_and(|(last, _)| *last >= holder)
+                {
+                    return Err(PositionsObjectError::Unordered("holders"));
                 }
                 let reset = reader.u64()?;
                 let kind = reader.u8()?;
                 let offset = reader.u64()?;
                 let value = PositionValue::from_code(kind, offset)
                     .ok_or(PositionsObjectError::InvalidField("kind"))?;
-                last_name = Some(name.clone());
-                groups.insert(name, GeoPosition { reset, value });
+                holders.insert(holder, GeoPosition { reset, value });
             }
-            partitions.insert(partition_id, groups);
+            partitions.insert(partition_id, holders);
         }
         if reader.left() != 0 {
             return Err(PositionsObjectError::WrongLength {
@@ -348,6 +388,24 @@ impl PositionsObject {
             });
         }
         Ok(object)
+    }
+}
+
+fn put_holder(bytes: &mut Vec<u8>, holder: &PositionHolder) -> Result<(), PositionsObjectError> {
+    match holder {
+        PositionHolder::Group(name) => {
+            bytes.push(HOLDER_GROUP);
+            put_name(bytes, "group name", name)
+        }
+        PositionHolder::ExternalGroup(name) => {
+            bytes.push(HOLDER_EXTERNAL_GROUP);
+            put_name(bytes, "group name", name)
+        }
+        PositionHolder::Consumer(consumer_id) => {
+            bytes.push(HOLDER_CONSUMER);
+            bytes.extend_from_slice(&consumer_id.to_le_bytes());
+            Ok(())
+        }
     }
 }
 
@@ -424,11 +482,27 @@ impl<'a> Reader<'a> {
         }
         self.take(usize::from(len))
     }
+
+    fn holder(&mut self) -> Result<PositionHolder, PositionsObjectError> {
+        match self.u8()? {
+            HOLDER_GROUP => Ok(PositionHolder::Group(utf8("group name", self.name()?)?)),
+            HOLDER_EXTERNAL_GROUP => Ok(PositionHolder::ExternalGroup(utf8(
+                "group name",
+                self.name()?,
+            )?)),
+            HOLDER_CONSUMER => self.u32().map(PositionHolder::Consumer),
+            _ => Err(PositionsObjectError::InvalidField("holder")),
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn group(name: &str) -> PositionHolder {
+        PositionHolder::Group(name.to_owned())
+    }
 
     fn object() -> PositionsObject {
         PositionsObject {
@@ -447,24 +521,38 @@ mod tests {
                     0,
                     BTreeMap::from([
                         (
-                            "billing".to_owned(),
+                            group("billing"),
                             GeoPosition {
                                 reset: 1,
                                 value: PositionValue::Offset(99),
                             },
                         ),
                         (
-                            "gone".to_owned(),
+                            group("gone"),
                             GeoPosition {
                                 reset: 4,
                                 value: PositionValue::Deleted,
                             },
                         ),
                         (
-                            "restart".to_owned(),
+                            group("restart"),
                             GeoPosition {
                                 reset: 2,
                                 value: PositionValue::Unset,
+                            },
+                        ),
+                        (
+                            PositionHolder::ExternalGroup("kafka.cg.billing".to_owned()),
+                            GeoPosition {
+                                reset: 0,
+                                value: PositionValue::Offset(120),
+                            },
+                        ),
+                        (
+                            PositionHolder::Consumer(7),
+                            GeoPosition {
+                                reset: 3,
+                                value: PositionValue::Offset(15),
                             },
                         ),
                     ]),
@@ -521,7 +609,7 @@ mod tests {
     #[test]
     fn given_another_magic_when_decoding_should_name_the_version() {
         let mut bytes = object().encode().unwrap();
-        bytes[..8].copy_from_slice(b"IGGYPOS2");
+        bytes[..8].copy_from_slice(b"IGGYPOS1");
         assert!(matches!(
             PositionsObject::decode(&bytes),
             Err(PositionsObjectError::UnsupportedVersion(_))
@@ -536,7 +624,7 @@ mod tests {
             .partitions
             .get_mut(&0)
             .unwrap()
-            .retain(|name, _| name == "billing");
+            .retain(|holder, _| *holder == group("billing"));
         let mut bytes = object.encode().unwrap();
         let kind_at = bytes.len() - CHECKSUM_LEN - size_of::<u64>() - 1;
         bytes[kind_at] = 9;
@@ -548,6 +636,53 @@ mod tests {
             PositionsObject::decode(&bytes),
             Err(PositionsObjectError::InvalidField("kind"))
         );
+    }
+
+    #[test]
+    fn given_an_unknown_holder_when_decoding_should_refuse_it() {
+        let mut object = object();
+        object.partitions.retain(|id, _| *id == 0);
+        object
+            .partitions
+            .get_mut(&0)
+            .unwrap()
+            .retain(|holder, _| *holder == PositionHolder::Consumer(7));
+        let mut bytes = object.encode().unwrap();
+        let holder_at = bytes.len()
+            - CHECKSUM_LEN
+            - size_of::<u64>()
+            - 1
+            - size_of::<u64>()
+            - size_of::<u32>()
+            - 1;
+        assert_eq!(bytes[holder_at], HOLDER_CONSUMER);
+        bytes[holder_at] = 3;
+        let body_len = bytes.len() - CHECKSUM_LEN;
+        let checksum = crc32c::crc32c(&bytes[..body_len]);
+        bytes[body_len..].copy_from_slice(&checksum.to_le_bytes());
+
+        assert_eq!(
+            PositionsObject::decode(&bytes),
+            Err(PositionsObjectError::InvalidField("holder"))
+        );
+    }
+
+    #[test]
+    fn given_holders_when_ordering_should_put_groups_then_external_groups_then_consumers() {
+        let ordered = [
+            group("a"),
+            group("z"),
+            PositionHolder::ExternalGroup("a".to_owned()),
+            PositionHolder::Consumer(0),
+            PositionHolder::Consumer(9),
+        ];
+        for pair in ordered.windows(2) {
+            assert!(pair[0] < pair[1], "{pair:?}");
+        }
+        let bytes = object().encode().unwrap();
+        let decoded = PositionsObject::decode(&bytes).unwrap();
+        let holders: Vec<_> = decoded.partitions[&0].keys().cloned().collect();
+        assert_eq!(holders.last(), Some(&PositionHolder::Consumer(7)));
     }
 
     #[test]
@@ -565,12 +700,12 @@ mod tests {
     }
 
     #[test]
-    fn given_too_many_groups_when_encoding_should_refuse_the_partition() {
+    fn given_too_many_holders_when_encoding_should_refuse_the_partition() {
         let mut object = object();
-        let groups = (0..=POSITIONS_PER_PARTITION_MAX)
+        let holders = (0..=POSITIONS_PER_PARTITION_MAX)
             .map(|index| {
                 (
-                    format!("group-{index:05}"),
+                    group(&format!("group-{index:05}")),
                     GeoPosition {
                         reset: 0,
                         value: PositionValue::Offset(1),
@@ -578,10 +713,10 @@ mod tests {
                 )
             })
             .collect();
-        object.partitions.insert(9, groups);
+        object.partitions.insert(9, holders);
         assert_eq!(
             object.encode(),
-            Err(PositionsObjectError::TooManyGroups(
+            Err(PositionsObjectError::TooManyHolders(
                 POSITIONS_PER_PARTITION_MAX + 1
             ))
         );

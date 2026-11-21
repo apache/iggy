@@ -85,8 +85,9 @@ pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
 pub use mock_s3::{MockS3Latency, MockS3Store};
 pub use positions::{
-    GeoLog, GeoPosition, MAX_GROUP_NAME_LEN, MAX_POSITIONS_OBJECT_LEN, POSITIONS_PER_PARTITION_MAX,
-    PositionValue, PositionsKey, PositionsObject, PositionsObjectError,
+    GeoLog, GeoPosition, MAX_GROUP_NAME_LEN, MAX_POSITIONS_OBJECT_LEN, POSITIONS_PER_KIND_MAX,
+    POSITIONS_PER_PARTITION_MAX, PositionHolder, PositionValue, PositionsKey, PositionsObject,
+    PositionsObjectError,
 };
 pub use read_only::ReadOnlyStore;
 pub use recording::{RecordingStore, StoreCall, StoreCalls};

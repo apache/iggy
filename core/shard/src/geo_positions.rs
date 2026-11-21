@@ -15,32 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The consumer group positions of the geo and shadow partitions here, which
+//! The consumer positions of the geo and shadow partitions here, which
 //! travel between datacenters through the buckets.
 //!
-//! Each partition keeps its groups' positions in a state machine, see
+//! They are those of consumer groups, of the external offsets of consumer
+//! groups and of plain consumers.
+//!
+//! Each partition keeps its consumers' positions in a state machine, see
 //! [`partitions::geo_positions`]. This module moves them:
 //!
 //! - **Fold and publish.** Shard 0 starts a round every publish interval: it
 //!   asks every shard for the positions of the partitions whose primary is
 //!   here. Before it answers, a shard has those primaries fold what their
-//!   groups committed, see [`IggyPartition::geo_notes`]. Shard 0 then stores
+//!   consumers committed, see [`IggyPartition::geo_notes`]. Shard 0 then stores
 //!   one object per log in the node's store, [`PositionsObject`], when the
 //!   positions of a partition it leads changed since the last one it stored.
 //!   The backups commit the same positions after their primary, so only the
 //!   primary publishes them, as only the primary uploads the messages.
-//!   Between those rounds, shard 0 runs rounds of the topics whose groups
+//!   Between those rounds, shard 0 runs rounds of the topics whose consumers
 //!   stored offsets themselves, whose replies wait for them, see
 //!   [`crate::geo_commits`].
 //! - **Adopt.** Shard 0 lists the positions that each geo peer publishes and
 //!   hands every shard those of the partitions it owns, see
 //!   [`PeerPositions`]. The primaries here commit the ones that win over
 //!   their own, see [`IggyPartition::geo_adoptions`].
-//! - **Resume.** After the node starts, the group polls of geo and shadow
-//!   partitions wait until the positions of every peer that did not retire
-//!   were handed out once and the adoptions they made committed, or until a
-//!   timeout. A group created
-//!   here after a peer's position for its name arrived waits until the
+//! - **Resume.** After the node starts, the polls of geo and shadow
+//!   partitions, and the reads of external offsets there, wait until the
+//!   positions of every peer that did not retire were handed out once and the
+//!   adoptions they made committed, or until a timeout. A consumer whose
+//!   position a peer published before it was bound here waits until the
 //!   position is bound to it.
 //!
 //! [`IggyPartition::geo_notes`]: partitions::IggyPartition::geo_notes
@@ -54,9 +57,9 @@ use std::time::Duration;
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::future::join_all;
 use iggy_binary_protocol::PrepareHeader;
-use iggy_common::{IggyError, IggyTimestamp};
+use iggy_common::{ConsumerKind, IggyError, IggyTimestamp};
 use iggy_object_store::{
-    GeoLog, GeoPosition, PositionsKey, PositionsObject, TierScope, TierScopeToken,
+    GeoLog, GeoPosition, PositionHolder, PositionsKey, PositionsObject, TierScope, TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
@@ -74,8 +77,8 @@ use crate::geo_commits::{RoundPacing, RoundStart, TopicPace};
 use crate::peers::PeerStore;
 use crate::shards_table::ShardsTable;
 use crate::{
-    IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, TaggedSender, bus_timeout,
-    channel,
+    ExternalGroupRead, IggyShard, LifecycleFrame, PartitionRead, RestorableMetadataStm, ShardFrame,
+    TaggedSender, bus_timeout, channel,
 };
 
 /// How long a round may wait for the answers of the shards and the store
@@ -119,7 +122,7 @@ pub struct PartitionPositions {
     pub log: GeoLog,
     pub partition_id: u32,
     pub namespace: IggyNamespace,
-    pub positions: BTreeMap<String, GeoPosition>,
+    pub positions: BTreeMap<PositionHolder, GeoPosition>,
 }
 
 /// A shard's answer to a round.
@@ -146,8 +149,8 @@ pub struct FinishedPositionsStore {
     pub deleted: Vec<PositionsKey>,
 }
 
-/// The positions of one log by partition id, then by group name.
-pub type LogPositions = BTreeMap<u32, BTreeMap<String, GeoPosition>>;
+/// The positions of one log by partition id, then by holder.
+pub type LogPositions = BTreeMap<u32, BTreeMap<PositionHolder, GeoPosition>>;
 
 /// What a round found of one log: the partitions this node leads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,8 +169,8 @@ struct RoundSummary {
 pub struct PeerPositions {
     pub origin: String,
     /// `(namespace, created revision, positions)` of each partition, the
-    /// highest of the peer's nodes for each group.
-    pub partitions: Vec<(IggyNamespace, u64, BTreeMap<String, GeoPosition>)>,
+    /// highest of the peer's nodes for each holder.
+    pub partitions: Vec<(IggyNamespace, u64, BTreeMap<PositionHolder, GeoPosition>)>,
 }
 
 /// What a shard does with the positions of its partitions.
@@ -475,10 +478,7 @@ where
     }
 
     /// Why a poll of `consumer` on the partition of `namespace` must wait,
-    /// if it must: it is a group poll of a geo or shadow partition while the
-    /// node waits for its peers' positions, or while a position that a peer
-    /// published for the group's name is not bound to the group yet. The
-    /// latter asks the pump for the bind.
+    /// if it must, see [`Self::geo_reader_refusal`].
     pub(crate) fn geo_position_refusal(
         &self,
         namespace: IggyNamespace,
@@ -487,11 +487,28 @@ where
     where
         M: StreamsFrontend,
     {
-        let PollingConsumer::ConsumerGroup(group_id, _) = consumer else {
-            return None;
+        let (kind, id) = match consumer {
+            PollingConsumer::ConsumerGroup(group_id, _) => (ConsumerKind::ConsumerGroup, group_id),
+            PollingConsumer::Consumer(consumer_id, _) => (ConsumerKind::Consumer, consumer_id),
         };
+        self.geo_reader_refusal(namespace, kind, u32::try_from(id).ok()?)
+    }
+
+    /// Why the local reader `id` of `kind` must wait to read its offset on
+    /// the partition of `namespace`, if it must: the partition is a geo or
+    /// shadow partition, and the node waits for its peers' positions, or a
+    /// position that a peer published for the reader's holder is not bound
+    /// to the reader yet. The latter asks the pump for the bind.
+    pub(crate) fn geo_reader_refusal(
+        &self,
+        namespace: IggyNamespace,
+        kind: ConsumerKind,
+        id: u32,
+    ) -> Option<IggyError>
+    where
+        M: StreamsFrontend,
+    {
         self.geo_settings()?;
-        let group_id = u32::try_from(group_id).ok()?;
         let (geo, unbound) = self
             .plane
             .partitions()
@@ -499,10 +516,10 @@ where
                 let geo = partition.places_batches() || partition.peer_log().is_some();
                 let unbound = partition
                     .geo_positions()
-                    .filter(|positions| positions.bound_to(group_id).is_none())
+                    .filter(|positions| positions.bound_to(kind, id).is_none())
                     .and_then(|positions| {
-                        let name = self.group_name(namespace, group_id)?;
-                        positions.get(&name).map(|_| ())
+                        let holder = self.local_holder(namespace, kind, id)?;
+                        positions.get(&holder).map(|_| ())
                     })
                     .is_some();
                 (geo, unbound)
@@ -522,6 +539,73 @@ where
             return Some(IggyError::TransientNotAccepted);
         }
         None
+    }
+
+    /// Why `read` of the partition of `namespace` must wait for the
+    /// positions of its readers, if it must: a poll, see
+    /// [`Self::geo_position_refusal`], or a read of a group's external
+    /// offsets, which the Kafka gateway sends where a Kafka group starts.
+    pub(crate) fn geo_read_refusal(
+        &self,
+        namespace: IggyNamespace,
+        read: &PartitionRead,
+    ) -> Option<IggyError>
+    where
+        M: StreamsFrontend,
+    {
+        match read {
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group: ExternalGroupRead::Group(group_id),
+                ..
+            } => self.geo_reader_refusal(namespace, ConsumerKind::ExternalGroup, *group_id),
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group: ExternalGroupRead::Missing(_),
+                ..
+            } => self.geo_missing_reader_refusal(namespace),
+            _ => read
+                .polling_consumer()
+                .and_then(|consumer| self.geo_position_refusal(namespace, consumer)),
+        }
+    }
+
+    /// [`Self::geo_reader_refusal`] for a read of the external offsets of a
+    /// group that this cluster does not have: only the wait for the peers'
+    /// positions holds it.
+    pub(crate) fn geo_missing_reader_refusal(&self, namespace: IggyNamespace) -> Option<IggyError>
+    where
+        M: StreamsFrontend,
+    {
+        self.geo_settings()?;
+        let geo = self
+            .plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.places_batches() || partition.peer_log().is_some()
+            })?;
+        (geo && self.geo_positions_resume_waiting(namespace))
+            .then_some(IggyError::TransientNotAccepted)
+    }
+
+    /// The holder of the local reader `id` of `kind` on the partition of
+    /// `namespace`: the name of its group, or the plain consumer itself.
+    fn local_holder(
+        &self,
+        namespace: IggyNamespace,
+        kind: ConsumerKind,
+        id: u32,
+    ) -> Option<PositionHolder>
+    where
+        M: StreamsFrontend,
+    {
+        match kind {
+            ConsumerKind::Consumer => Some(PositionHolder::Consumer(id)),
+            ConsumerKind::ConsumerGroup => {
+                self.group_name(namespace, id).map(PositionHolder::Group)
+            }
+            ConsumerKind::ExternalGroup => self
+                .group_name(namespace, id)
+                .map(PositionHolder::ExternalGroup),
+        }
     }
 
     fn group_name(&self, namespace: IggyNamespace, group_id: u32) -> Option<String>
@@ -796,7 +880,7 @@ where
                     positions: positions
                         .entries()
                         .iter()
-                        .map(|(name, entry)| (name.clone(), entry.position))
+                        .map(|(holder, entry)| (holder.clone(), entry.position))
                         .collect(),
                 });
             }
@@ -865,7 +949,7 @@ where
         let Some(settings) = self.geo_settings() else {
             return;
         };
-        let handed: BTreeMap<IggyNamespace, (u64, BTreeMap<String, GeoPosition>)> = found
+        let handed: BTreeMap<IggyNamespace, (u64, BTreeMap<PositionHolder, GeoPosition>)> = found
             .partitions
             .into_iter()
             .map(|(namespace, created_revision, positions)| {
@@ -1351,9 +1435,9 @@ mod tests {
         }
     }
 
-    fn billing_at(offset: u64) -> BTreeMap<String, GeoPosition> {
+    fn billing_at(offset: u64) -> BTreeMap<PositionHolder, GeoPosition> {
         BTreeMap::from([(
-            "billing".to_owned(),
+            PositionHolder::Group("billing".to_owned()),
             GeoPosition {
                 reset: 0,
                 value: PositionValue::Offset(offset),
