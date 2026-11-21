@@ -1,0 +1,56 @@
+---
+title: Deferred Polling
+description: "Wait for messages, read several partitions and choose when to store consumer offsets."
+---
+
+Deferred polling lets the server wait for messages before answering a read. The read returns when enough messages are available or its wait ends. A quiet partition does not need a repeated request loop.
+
+## Choose read limits
+
+`PollOptions` separates read limits from the polling strategy and consumer identity. A strategy selects the starting position, such as a specific offset or the next stored offset.
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `count` | 1000 | Maximum messages in one read |
+| `max_wait` | Zero | Zero returns immediately. A positive duration enables waiting |
+| `min_count` | 1 | Messages needed to finish the wait early, from 1 through `count` |
+| `max_bytes` | 1 MiB | Reply budget, including binary metadata and batch framing |
+| `commit` | Manual | When to store the returned position |
+
+These are the shared poll defaults. High-level consumers can select a positive wait by default. The SDK derives a request timeout from the wait plus 10 seconds. The wire protocol permits waits up to 600 seconds, but the server caps them at `sharding.deferred_poll_max_wait`, 30 seconds by default.
+
+A reply can contain fewer than `min_count` messages when the wait ends. The first message can exceed `max_bytes` and return alone, so a large message does not prevent progress. Treat the byte budget as a batching limit, not an absolute allocation guarantee.
+
+## Read several partitions
+
+A partition reader groups targets by their current primary and uses FetchMessages. Each fetch applies `count`, `min_count` and `max_bytes` across its targets together. The reader can keep several fetches active. It can return a partition with messages without waiting for a quiet partition first.
+
+A group consumer uses its assigned partitions. Assignment changes and primary changes require a refresh before further reads. Use the SDK reader or consumer to manage this state. A raw fetch caller must also supply the route and ownership information required by the protocol.
+
+## Choose when to commit
+
+| Policy | Behavior |
+| --- | --- |
+| Manual | The application stores checkpoints after successful processing |
+| On read | The server submits the last returned offset as part of the read |
+| Automatic | A reader or consumer tracks progress and stores it by interval or message count |
+
+A one-shot poll rejects an automatic policy because it has no continuing processing state. On-read commits can precede application processing. A failover before offset replication can also deliver the last batch again. Use manual commits or automatic commits after processing when messages must be processed before their offsets advance.
+
+The Rust automatic policy defaults to every 10,000 messages or five seconds, whichever happens first, after processing. It also stores progress on close, shutdown and partition revocation. Processing counts when the application requests the next item, a handler succeeds, or the reader closes. Marked progress supports applications that finish work concurrently. Do not close a reader as if processing succeeded after a failed handler.
+
+## Cancellation and uncertain results
+
+Cancellation removes a parked request when the server receives it. If a committing poll loses its reply, the client cannot assume that its offset stayed unchanged. SDK recovery tracks the uncertain operation and blocks conflicting work until the application resolves or abandons it. Abandoning permits later work but does not undo an offset that already committed.
+
+## HTTP reads
+
+Use `GET /streams/{stream_id}/topics/{topic_id}/messages/deferred` for a deferred read without offset commits. A read that sets `auto_commit=true` must use `POST` on that path. The server rejects a committing `GET`.
+
+Raw HTTP defaults differ from `PollOptions`: count is 10, wait is one second, and request timeout is 11 seconds. Minimum count is one and the byte budget is 1 MiB.
+
+The query uses `wait_us`, `min_count`, `max_bytes` and `request_timeout_us` alongside the normal consumer, partition, strategy and count fields. A positive wait needs at least one second between the wait and request timeout. Configure a proxy timeout long enough to receive the reply.
+
+## Server capacity
+
+The [sharding configuration](/docs/server/configuration#sharding) bounds parked requests, per-session requests, disk reads and completion delivery. HTTP requests without a binary session count against their user. Capacity exhaustion can return a retryable error. Keep retries within a bounded application deadline.
