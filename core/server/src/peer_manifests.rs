@@ -229,7 +229,7 @@ impl State {
 
 /// The wait before the next listing of a peer after `failures` in a row
 /// that failed, in microseconds.
-fn backoff(interval: u64, failures: u32) -> u64 {
+pub fn backoff(interval: u64, failures: u32) -> u64 {
     let factor = 1_u64 << failures.min(16);
     interval
         .saturating_mul(factor)
@@ -238,7 +238,7 @@ fn backoff(interval: u64, failures: u32) -> u64 {
 }
 
 /// Every key under `prefix` in the store of `service`, page by page.
-async fn list_all<E: TierExecutor>(
+pub async fn list_all<E: TierExecutor>(
     service: E,
     token: TierScopeToken,
     prefix: String,
@@ -364,7 +364,7 @@ fn wanted(inner: &StreamsInner, place: NodePlace) -> Vec<Wanted> {
     wanted
 }
 
-fn micros(duration: Duration) -> u64 {
+pub fn micros(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 

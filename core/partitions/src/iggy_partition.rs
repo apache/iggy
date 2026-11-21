@@ -6742,11 +6742,7 @@ where
                 .borrow()
                 .get(&id)
                 .map(|co| co.offset.load(Ordering::Relaxed)),
-            PollingConsumer::ConsumerGroup(group_id, _) => self
-                .consumer_group_offsets
-                .borrow()
-                .get(&ConsumerGroupId(group_id))
-                .map(|co| co.offset.load(Ordering::Relaxed)),
+            PollingConsumer::ConsumerGroup(group_id, _) => self.geo_group_offset(group_id),
         }
     }
 

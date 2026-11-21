@@ -59,6 +59,9 @@ mod geo_two_clusters_fs;
 // A consumer of a shadow topic reads what the peer proved in its fresh
 // objects about a second behind, and goes on once a manifest lists it.
 mod geo_fresh_follow_fs;
+// A consumer group that moves between two clusters on fs resumes from about
+// where it stopped, exactly after a drain, and keeps a move backwards.
+mod geo_positions_fs;
 // A geo topic whose object store goes down: its sends are refused as
 // retryable, a normal topic keeps serving, and nothing refused is stored.
 mod geo_mode_faults_fs;

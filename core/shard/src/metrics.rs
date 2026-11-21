@@ -36,6 +36,7 @@
 //! endpoint via [`ShardMetrics::register`] (one `shard`-labelled
 //! sub-registry per shard). Drop-site tracing supplements the counters.
 
+use crate::geo_commits::CommitAnswer;
 use prometheus_client::encoding::{EncodeLabelSet, EncodeLabelValue, LabelValueEncoder};
 use prometheus_client::metrics::counter::Counter;
 use prometheus_client::metrics::family::Family;
@@ -581,6 +582,28 @@ pub struct ShardMetrics {
     /// Per geo peer, by the peer's clock, how much older the newest batch
     /// that partition serves is than the newest one it found proven.
     geo_shadow_fresh_lag_seconds: Family<GeoPeerLabel, Gauge<f64, AtomicU64>>,
+    /// Per geo peer and request, the listings and reads of its consumer
+    /// group positions that this shard sent to its store.
+    geo_peer_position_requests_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer and request, the ones of those that failed.
+    geo_peer_position_failures_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer, the positions of its consumer groups that the
+    /// partitions here proposed to take.
+    geo_peer_positions_adopted_total: Family<GeoPeerLabel, Counter>,
+    /// Objects of consumer group positions that this shard stored in the
+    /// node's store.
+    geo_positions_stored_total: Counter,
+    /// The ones of those that the store refused.
+    geo_positions_store_failures_total: Counter,
+    /// Offset stores of consumer groups on geo and shadow partitions that
+    /// were answered once the node's store held their positions.
+    geo_positions_commits_confirmed_total: Counter,
+    /// The ones answered `TransientNotCommitted` instead, as their positions
+    /// were not stored in time or their partitions stopped being led here.
+    geo_positions_commits_uncertain_total: Counter,
+    /// 1 while the group polls of geo and shadow partitions on this shard
+    /// wait for the first positions of every geo peer since the node started.
+    geo_positions_resume_waiting: Gauge,
 }
 
 impl ShardMetrics {
@@ -768,6 +791,14 @@ impl ShardMetrics {
             geo_shadow_fresh_conflicts_total: Family::default(),
             geo_shadow_fresh_lag_messages: Family::default(),
             geo_shadow_fresh_lag_seconds: Family::default(),
+            geo_peer_position_requests_total: Family::default(),
+            geo_peer_position_failures_total: Family::default(),
+            geo_peer_positions_adopted_total: Family::default(),
+            geo_positions_stored_total: Counter::default(),
+            geo_positions_store_failures_total: Counter::default(),
+            geo_positions_commits_confirmed_total: Counter::default(),
+            geo_positions_commits_uncertain_total: Counter::default(),
+            geo_positions_resume_waiting: Gauge::default(),
         }
     }
 
@@ -1048,6 +1079,59 @@ impl ShardMetrics {
                 .get_or_create(&label)
                 .inc();
         }
+    }
+
+    /// A listing or read, `request`, of the consumer group positions of the
+    /// geo peer `origin`, and whether it succeeded.
+    pub fn record_peer_position_request(
+        &self,
+        origin: &str,
+        request: &'static str,
+        succeeded: bool,
+    ) {
+        let label = GeoPeerRequestLabel {
+            origin: origin.to_owned(),
+            request,
+        };
+        self.geo_peer_position_requests_total
+            .get_or_create(&label)
+            .inc();
+        if !succeeded {
+            self.geo_peer_position_failures_total
+                .get_or_create(&label)
+                .inc();
+        }
+    }
+
+    /// `positions` positions of the geo peer `origin` proposed for adoption.
+    pub fn record_peer_positions_adopted(&self, origin: &str, positions: usize) {
+        self.geo_peer_positions_adopted_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .inc_by(u64::try_from(positions).unwrap_or(u64::MAX));
+    }
+
+    /// An object of consumer group positions that the store took or refused.
+    pub fn record_positions_stored(&self, stored: bool) {
+        if stored {
+            self.geo_positions_stored_total.inc();
+        } else {
+            self.geo_positions_store_failures_total.inc();
+        }
+    }
+
+    /// A group offset store whose reply waited for its position, answered.
+    pub fn record_geo_commit_answered(&self, answer: CommitAnswer) {
+        match answer {
+            CommitAnswer::Committed => self.geo_positions_commits_confirmed_total.inc(),
+            CommitAnswer::Uncertain => self.geo_positions_commits_uncertain_total.inc(),
+        };
+    }
+
+    /// Whether the group polls here wait for the positions of the geo peers.
+    pub fn set_positions_resume_waiting(&self, waiting: bool) {
+        self.geo_positions_resume_waiting.set(i64::from(waiting));
     }
 
     /// A shadow partition of the geo peer `origin` found two proof rows that
@@ -2886,6 +2970,46 @@ impl ShardMetrics {
             "geo_shadow_manifest_lag_seconds",
             "How long the furthest behind shadow partition on this shard has been behind the geo peer's manifest",
             self.geo_shadow_manifest_lag_seconds.clone(),
+        );
+        registry.register(
+            "geo_peer_position_requests",
+            "Listings and reads of the geo peer's consumer group positions that this shard sent to its store",
+            self.geo_peer_position_requests_total.clone(),
+        );
+        registry.register(
+            "geo_peer_position_failures",
+            "Listings and reads of the geo peer's consumer group positions that failed",
+            self.geo_peer_position_failures_total.clone(),
+        );
+        registry.register(
+            "geo_peer_positions_adopted",
+            "Consumer group positions of the geo peer that the partitions here proposed to take",
+            self.geo_peer_positions_adopted_total.clone(),
+        );
+        registry.register(
+            "geo_positions_stored",
+            "Objects of consumer group positions that this shard stored in the node's store",
+            self.geo_positions_stored_total.clone(),
+        );
+        registry.register(
+            "geo_positions_store_failures",
+            "Objects of consumer group positions that the node's store refused",
+            self.geo_positions_store_failures_total.clone(),
+        );
+        registry.register(
+            "geo_positions_commits_confirmed",
+            "Offset stores of consumer groups on geo and shadow partitions answered once the node's store held their positions",
+            self.geo_positions_commits_confirmed_total.clone(),
+        );
+        registry.register(
+            "geo_positions_commits_uncertain",
+            "Offset stores of consumer groups on geo and shadow partitions answered as uncertain, their positions not stored in time or their partitions no longer led here",
+            self.geo_positions_commits_uncertain_total.clone(),
+        );
+        registry.register(
+            "geo_positions_resume_waiting",
+            "1 while group polls of geo and shadow partitions here wait for every geo peer's positions after a start",
+            self.geo_positions_resume_waiting.clone(),
         );
         registry.register(
             "geo_peer_fresh_requests",

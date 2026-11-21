@@ -2038,6 +2038,7 @@ mod eviction;
 mod floor_eviction;
 mod free_space;
 mod fresh_proofs;
+mod geo_positions;
 mod history;
 mod journal_budget;
 mod long_term_delete;

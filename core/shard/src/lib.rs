@@ -29,6 +29,8 @@ pub use fresh_writes::{
     FRESH_UPLOADS, FinishedFreshUpload,
 };
 mod fresh_sweeps;
+pub mod geo_commits;
+pub mod geo_positions;
 pub use fresh_sweeps::{
     FRESH_SWEEP_INTERVAL, FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport,
     FreshSweeps,
@@ -563,6 +565,18 @@ impl PartitionRead {
                 | Self::ExternalGroupOffsetOnPrimary { .. }
                 | Self::ResolveSegmentDeleteOffset { .. }
         )
+    }
+
+    /// The consumer whose messages the read polls, `None` for any other
+    /// read.
+    #[must_use]
+    pub(crate) const fn polling_consumer(&self) -> Option<PollingConsumer> {
+        match self {
+            Self::PollOnPrimary { consumer, .. }
+            | Self::UnboundPollOnPrimary { consumer, .. }
+            | Self::Poll { consumer, .. } => Some(*consumer),
+            _ => None,
+        }
     }
 
     /// Whether the read returns polled messages or a stored consumer offset.
@@ -1346,6 +1360,48 @@ pub enum LifecycleFrame {
     /// partitions the shard owns: from shard 0, which follows the peer's
     /// writers, or from a read that the shard started for a proof.
     PeerFreshFound(Box<PeerFreshFound>),
+    /// Shard 0 asks the shard for the consumer group positions of its geo
+    /// and shadow partitions, for the round `round`, of the topics in
+    /// `scope` by stream and topic id, or of every log. The primaries here
+    /// propose to fold what their groups committed first.
+    ReportGeoPositions {
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    },
+    /// The folds that a [`Self::ReportGeoPositions`] proposed ended: answer
+    /// the round with the partitions' positions now.
+    ReportGeoPositionsFolded {
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    },
+    /// A shard's answer to [`Self::ReportGeoPositions`], sent to shard 0.
+    GeoPositionsReported(Box<geo_positions::GeoPositionsReport>),
+    /// What the store took of a round's objects, sent to shard 0 by the task
+    /// that stored them.
+    GeoPositionsStored(Box<geo_positions::FinishedPositionsStore>),
+    /// Shard 0 hands the shard the positions that a geo peer publishes for
+    /// the partitions it owns. The primaries here commit those that win.
+    PeerPositionsListed(Box<geo_positions::PeerPositions>),
+    /// A group poll waits for the position of its name to be bound to it:
+    /// fold the groups of the partition of `namespace` now.
+    NoteGeoPositions {
+        namespace: IggyNamespace,
+    },
+    /// A consumer group's own offset store committed on a geo or shadow
+    /// partition here: hold its reply until the node's store holds its
+    /// position. Sent by the task that waited for the commit.
+    GeoCommitHeld(Box<geo_commits::HeldGeoCommit>),
+    /// A shard holds commits of `topics`, by stream and topic id: shard 0
+    /// starts a round of them when it may.
+    GeoCommitsWaiting {
+        topics: Vec<(usize, usize)>,
+    },
+    /// Shard 0 tells a shard whose report to `round` carried held commits
+    /// which logs' objects the store took in that round.
+    GeoPositionsPublished {
+        round: u64,
+        stored: Vec<iggy_object_store::GeoLog>,
+    },
     /// The result of a merge of long-term segments that the pump's tick
     /// started, sent by the task that ran it.
     SegmentMergeFinished(Box<FinishedSegmentMerge>),
@@ -2255,6 +2311,11 @@ where
     /// What the shadow partitions here wait for of their peers' fresh
     /// objects.
     peer_fresh_follows: peer_fresh_follows::PeerFreshFollows,
+    /// What this shard does with the consumer group positions of its geo
+    /// and shadow partitions.
+    geo_positions: geo_positions::ShardGeoPositions,
+    /// The group offset stores whose replies wait for their positions.
+    geo_commits: geo_commits::ShardGeoCommits,
 
     /// Late-bound stores of the geo peers, empty on a node without peers.
     /// See [`Self::set_peer_stores`].
@@ -2638,6 +2699,8 @@ where
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
             peer_fresh_follows: peer_fresh_follows::PeerFreshFollows::default(),
+            geo_positions: geo_positions::ShardGeoPositions::default(),
+            geo_commits: geo_commits::ShardGeoCommits::default(),
             peer_stores: RefCell::default(),
             long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
@@ -3631,6 +3694,8 @@ where
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
             peer_fresh_follows: peer_fresh_follows::PeerFreshFollows::default(),
+            geo_positions: geo_positions::ShardGeoPositions::default(),
+            geo_commits: geo_commits::ShardGeoCommits::default(),
             peer_stores: RefCell::default(),
             long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
@@ -5684,6 +5749,7 @@ where
                     self.offer_fresh_send(request, reply);
                     return;
                 }
+                let hold = self.geo_commit_hold(&request);
                 let (sender, receiver) = consensus::oneshot_channel();
                 self.plane
                     .partitions()
@@ -5697,8 +5763,12 @@ where
                 // Through the bus, not the runtime directly: the simulator
                 // supplies its own executor and virtual clock.
                 self.bus.spawn(async move {
-                    let committed = receiver.await.ok().map(Message::into_generic);
-                    let _ = reply.try_send(committed);
+                    match (receiver.await.ok(), hold) {
+                        (Some(committed), Some(hold)) => hold.keep(committed, reply),
+                        (committed, _) => {
+                            let _ = reply.try_send(committed.map(Message::into_generic));
+                        }
+                    }
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
