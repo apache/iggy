@@ -1,0 +1,46 @@
+---
+title: Client Failover
+description: "Route requests to partition primaries and handle reconnects without losing an uncertain operation's identity."
+---
+
+A cluster has a metadata primary and separate partition primaries. SDKs discover both. Reaching the metadata primary does not mean that the same node owns every partition request.
+
+## Where requests are served
+
+Metadata reads can use a replica's local state. A caller that needs a known metadata change can carry a minimum metadata operation and wait for that node to catch up. Counters on other nodes can lag a successful write until a later prepare or commit broadcast.
+
+Partition requests use the partition route. It identifies the primary, view, partition incarnation and metadata progress. An incarnation identifies one history of a partition. Recreating a partition changes that identity. Consumer group operations also carry an ownership generation, so a former member cannot store progress for a new owner.
+
+The SDK retains this context with a request. A route refresh does not replace the history of an already uncertain operation. `HistoryUnavailable` requires an application decision about the new history. Readers expose a seek operation to choose a new start.
+
+## Reconnect and bind
+
+Binary login registers a logical session and a binding secret. Additional connections and reconnects bind that session. The client can therefore keep connections to several partition primaries without creating an unrelated identity for every link.
+
+A stale link does not always mean the logical session ended. The SDK closes that link and tries to bind again. A terminal session refusal requires new registration. Logout, session expiry and account deactivation end the session. A password or PAT change does not revoke a session already established with those credentials.
+
+Advertised endpoints must be reachable from the client network. The SDK uses the endpoints returned by cluster metadata. See [Configuration](/docs/clustering/configuration) for network selectors and TLS names.
+
+## Retain uncertain mutations
+
+A request rejected before admission can be retried within its deadline. A lost reply after sending is different: the operation can already be committed. Retained-operation SDKs preserve its original identity and payload instead of submitting a fresh mutation.
+
+Resolution requires a matching final committed-result proof. A successful status or a nonzero log position alone is insufficient. A committed business rejection is also a definitive result. An uncertain operation remains retained when resolution times out.
+
+`resolve_operation` and its language equivalents retry a retained mutation. `abandon_operation` frees local state without undoing or determining the server result. `OperationNotRetained` does not prove that nothing committed. Keep the same client for recovery and handle the error before retrying application work.
+
+Once the original session ends, the client cannot recover its receipt through a new login. Bounded client retention can also prevent recovery. The [SDK guides](/docs/sdk/introduction) describe each language's error types and limits. Swift does not expose retained mutation resolution.
+
+## Consumer progress
+
+Use [checkpoint commits](/docs/sdk/deferred-polling) after processing. A checkpoint retains the partition history and owner that delivered the data. Committing only a numeric offset loses that context.
+
+A committing deferred read can lose its reply after storing an offset. The client reports uncertain fetch progress and blocks affected progress calls until recovery or explicit abandonment. Stateless reads and offset inspection remain available. Abandonment does not roll back a stored offset.
+
+Readers group targets by primary and refresh routes after changes. They can stop a partition on a history change or an undecodable message. Inspect the reported error before seeking past it.
+
+## HTTP forwarding
+
+A contacted HTTP node can forward to the correct primary in one hop. The route and request carry a signed relay proof, and the destination authenticates the bearer independently. Configure shared JWT key material and synchronize clocks. Proofs expire after ten seconds.
+
+Forwarding does not make every ambiguous operation safe to replay. HTTP `ack=none` confirms dispatch only. A deferred read that commits uses POST, and a lost reply can leave its progress uncertain. See [Cluster security](/docs/clustering/security).
