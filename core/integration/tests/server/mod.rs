@@ -52,6 +52,10 @@ mod geo_peers;
 // every client write, goes stale with the peer's store, and leaves after its
 // delete.
 mod geo_shadow_fs;
+// Two clusters on fs that read each other's bucket: both take sends to the
+// same geo topic, adopt each other's, stop and return, delete it, and never
+// write to the other's bucket.
+mod geo_two_clusters_fs;
 pub(crate) mod tiered_storage_fs;
 mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.

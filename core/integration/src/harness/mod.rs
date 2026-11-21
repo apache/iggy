@@ -47,6 +47,7 @@ mod error;
 pub mod ext_auth_server;
 mod fixture;
 pub mod floci;
+pub mod geo_clusters;
 pub mod handle;
 mod helpers;
 pub mod log_capture;
@@ -63,6 +64,9 @@ pub use config::{
 
 pub use context::{TestContext, get_test_directory};
 pub use error::TestBinaryError;
+pub use geo_clusters::{
+    Bucket, BucketEvent, BucketWatch, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide,
+};
 pub use handle::{
     ClientBuilder, ClientHandle, ConnectorsRuntimeHandle, McpClient, McpHandle, ServerHandle,
     StopOutcome, common::cargo_bin_path,

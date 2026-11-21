@@ -455,7 +455,7 @@ fn uid(cluster_uid: u128) -> String {
 /// The store of `peer`, which only reads.
 fn store(peer: &GeoPeerConfig) -> Result<ReadOnlyStore, ServerError> {
     let backend = match peer.backend {
-        TieredStorageBackend::Fs => Backend::Fs(FsStore::new(&peer.path)),
+        TieredStorageBackend::Fs => Backend::Fs(FsStore::foreign(&peer.path)),
         TieredStorageBackend::S3 => {
             let credentials = Credentials {
                 access_key_id: peer.access_key_id.clone(),
@@ -506,6 +506,7 @@ mod tests {
     use std::future::{Future, pending};
     use std::ops::Range;
     use std::path::Path;
+    use std::time::SystemTime;
 
     use iggy_object_store::{
         DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, PutBody,
@@ -827,6 +828,30 @@ mod tests {
         );
         assert_eq!(calls.mutations(), Vec::new());
         assert_eq!(calls.all().len(), 4, "one ranged read per check");
+    }
+
+    /// A listing through the store of an `fs` peer leaves the scratch file
+    /// of a put of the peer, however old.
+    #[compio::test]
+    async fn given_the_scratch_file_of_a_peers_put_when_listing_its_store_should_keep_it() {
+        let directory = tempfile::tempdir().unwrap();
+        claim(directory.path(), DC_B).await;
+        let scratch = directory
+            .path()
+            .join("iggy/meta/.identity.0123456789abcdef0123456789abcdef");
+        std::fs::File::create(&scratch)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_hours(2))
+            .unwrap();
+        let store = store(&fs_peer("dc-b", directory.path())).unwrap();
+
+        let page = store.list(&ListRequest::new("iggy/")).await.unwrap();
+
+        assert_eq!(page.objects.len(), 1, "the identity object: {page:?}");
+        assert!(
+            scratch.exists(),
+            "the listing removed the peer's scratch file"
+        );
     }
 
     /// A peer whose store refuses connections never holds up the checks, and
