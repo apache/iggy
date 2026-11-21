@@ -72,6 +72,12 @@ pub struct GeoConfig {
     #[serde(default = "default_tombstone_grace")]
     #[config_env(leaf)]
     pub tombstone_grace: IggyDuration,
+    /// How often a node lists the manifests of each peer stream that a
+    /// shadow stream serves, so its shadow partitions follow the peer.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_manifest_poll_interval")]
+    #[config_env(leaf)]
+    pub manifest_poll_interval: IggyDuration,
 }
 
 impl Default for GeoConfig {
@@ -80,6 +86,7 @@ impl Default for GeoConfig {
             origin: String::new(),
             peers: Vec::new(),
             tombstone_grace: default_tombstone_grace(),
+            manifest_poll_interval: default_manifest_poll_interval(),
         }
     }
 }
@@ -167,7 +174,11 @@ impl Display for GeoConfig {
             }
             Display::fmt(peer, f)?;
         }
-        write!(f, "], tombstone_grace: {} }}", self.tombstone_grace)
+        write!(
+            f,
+            "], tombstone_grace: {}, manifest_poll_interval: {} }}",
+            self.tombstone_grace, self.manifest_poll_interval
+        )
     }
 }
 
@@ -204,6 +215,9 @@ impl Validatable<ConfigurationError> for GeoConfig {
         }
         if self.tombstone_grace.is_zero() {
             return refuse("tombstone_grace must be longer than zero");
+        }
+        if self.manifest_poll_interval.is_zero() {
+            return refuse("manifest_poll_interval must be longer than zero");
         }
         if self.peers.is_empty() {
             return Ok(());
@@ -327,6 +341,12 @@ fn default_tombstone_grace() -> IggyDuration {
     IggyDuration::new_from_secs(24 * 3600)
 }
 
+/// Five seconds: a shadow partition stays a few seconds behind its peer, and
+/// a listing of each peer stream every few seconds costs little.
+fn default_manifest_poll_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(5)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,7 +395,9 @@ mod tests {
         assert_eq!(config.tombstone_grace.get_duration().as_secs(), 24 * 3600);
         assert_eq!(GeoConfig::default().tombstone_grace, config.tombstone_grace);
         assert!(
-            config.to_string().ends_with("tombstone_grace: 1day }"),
+            config
+                .to_string()
+                .ends_with("tombstone_grace: 1day, manifest_poll_interval: 5s }"),
             "{config}"
         );
     }

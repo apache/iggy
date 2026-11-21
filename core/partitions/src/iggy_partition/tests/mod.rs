@@ -2057,6 +2057,7 @@ mod offsets;
 mod peer_log;
 mod peer_log_merges;
 mod peer_log_skips;
+mod peer_manifests;
 mod persistence_checkpoint;
 mod placed_batches;
 mod quiet;

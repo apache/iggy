@@ -4576,6 +4576,8 @@ where
                 operation: None,
             });
         }
+        // A transfer can carry a newer peer manifest than the log follows.
+        self.follow_committed_peer_manifest();
         self.restore_producers(std::mem::take(&mut install.offsets_wire.producers));
         self.required_metadata_frontier = self
             .required_metadata_frontier
@@ -5941,6 +5943,7 @@ where
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.restore_machines(wire.machines.as_ref(), through_op)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.follow_committed_peer_manifest();
         *self.dedup_mut() = table;
         self.restore_producers(wire.producers);
         self.history_transition = wire.history_transition;
