@@ -1053,6 +1053,7 @@ async fn shard_main(
         &shard,
         &geo_peer_statuses,
     );
+    shard.set_geo_positions(crate::peer_positions::settings(&config.geo));
 
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared

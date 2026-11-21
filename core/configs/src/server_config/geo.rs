@@ -40,6 +40,7 @@ use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
 use std::fmt::{self, Debug, Display, Formatter};
+use std::time::Duration;
 
 /// The most peers that one cluster reads. It matches the
 /// `#[config_env(max_elements = 16)]` cap on `peers`: an environment
@@ -50,6 +51,11 @@ pub const MAX_PEERS: usize = 16;
 /// `__shadow_{origin}_{stream}`, and a stream name holds at most 255 bytes,
 /// so a short origin leaves room for the name of the stream.
 pub const MAX_ORIGIN_LEN: usize = 32;
+
+/// The longest `consumer_offset_upload_interval`. A store of a busy log
+/// waits up to the interval before its answer, so a longer one only answers
+/// late.
+pub const CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(1);
 
 #[serde_as]
 #[derive(Deserialize, Serialize, Clone, ConfigEnv)]
@@ -88,6 +94,36 @@ pub struct GeoConfig {
     #[serde(default = "default_manifest_poll_interval")]
     #[config_env(leaf)]
     pub manifest_poll_interval: IggyDuration,
+    /// How often a node stores the positions of the consumer groups of its
+    /// geo and shadow topics in its store, when they changed. A group that
+    /// commits on read re-reads at most this much more in another
+    /// datacenter after a failover.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_positions_publish_interval")]
+    #[config_env(leaf)]
+    pub positions_publish_interval: IggyDuration,
+    /// The shortest time between two stores of positions for the offsets
+    /// that consumer groups of geo and shadow topics store themselves. Such
+    /// a store is answered only once the node's store holds its position,
+    /// and the stores that arrive within the interval share one put. Zero
+    /// or `disabled` answers them at the local commit and leaves them to
+    /// `positions_publish_interval`. Up to 1 s.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_consumer_offset_upload_interval")]
+    #[config_env(leaf)]
+    pub consumer_offset_upload_interval: IggyDuration,
+    /// How often a node lists the consumer group positions that each peer
+    /// publishes, and takes those that win over its own.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_positions_poll_interval")]
+    #[config_env(leaf)]
+    pub positions_poll_interval: IggyDuration,
+    /// How long, after a node starts, the group polls of its geo and shadow
+    /// partitions wait for the consumer group positions of every peer.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default = "default_positions_resume_timeout")]
+    #[config_env(leaf)]
+    pub positions_resume_timeout: IggyDuration,
 }
 
 impl Default for GeoConfig {
@@ -99,6 +135,10 @@ impl Default for GeoConfig {
             recover_cluster_uid: String::new(),
             recover_unproven: default_recover_unproven(),
             manifest_poll_interval: default_manifest_poll_interval(),
+            positions_publish_interval: default_positions_publish_interval(),
+            consumer_offset_upload_interval: default_consumer_offset_upload_interval(),
+            positions_poll_interval: default_positions_poll_interval(),
+            positions_resume_timeout: default_positions_resume_timeout(),
         }
     }
 }
@@ -197,9 +237,15 @@ impl Display for GeoConfig {
         }
         write!(
             f,
-            "], tombstone_grace: {}, manifest_poll_interval: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
+            "], tombstone_grace: {}, manifest_poll_interval: {}, positions_publish_interval: {}, \
+             consumer_offset_upload_interval: {}, positions_poll_interval: {}, \
+             positions_resume_timeout: {}, recover_cluster_uid: {}, recover_unproven: {} }}",
             self.tombstone_grace,
             self.manifest_poll_interval,
+            self.positions_publish_interval,
+            self.consumer_offset_upload_interval,
+            self.positions_poll_interval,
+            self.positions_resume_timeout,
             self.recover_cluster_uid,
             self.recover_unproven
         )
@@ -253,6 +299,19 @@ impl Validatable<ConfigurationError> for GeoConfig {
         }
         if self.manifest_poll_interval.is_zero() {
             return refuse("manifest_poll_interval must be longer than zero");
+        }
+        if self.positions_publish_interval.is_zero() {
+            return refuse("positions_publish_interval must be longer than zero");
+        }
+        if self.positions_poll_interval.is_zero() {
+            return refuse("positions_poll_interval must be longer than zero");
+        }
+        if self.consumer_offset_upload_interval.get_duration() > CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX
+        {
+            return refuse(&format!(
+                "consumer_offset_upload_interval must be at most {}",
+                IggyDuration::new(CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX)
+            ));
         }
         if self.peers.is_empty() {
             return Ok(());
@@ -395,6 +454,32 @@ fn default_manifest_poll_interval() -> IggyDuration {
     IggyDuration::new_from_secs(5)
 }
 
+/// A second: a group that moves to another datacenter re-reads about this
+/// much, and an object of a few groups each second costs little.
+fn default_positions_publish_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(1)
+}
+
+/// 50 ms: a commit that finds no store running is stored at once, so the
+/// interval spaces the puts of a busy log, each of which rewrites the
+/// node's whole object of that log. Five times the fresh upload interval,
+/// as an object of positions carries no messages: at most 20 puts a second
+/// for each log a node leads, while it takes commits.
+fn default_consumer_offset_upload_interval() -> IggyDuration {
+    IggyDuration::new(Duration::from_millis(50))
+}
+
+/// A second, as the publishing: a listing of each peer's positions a second.
+fn default_positions_poll_interval() -> IggyDuration {
+    IggyDuration::new_from_secs(1)
+}
+
+/// Ten seconds: a few listings of each peer, and a short wait when a peer
+/// does not answer.
+fn default_positions_resume_timeout() -> IggyDuration {
+    IggyDuration::new_from_secs(10)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,6 +533,87 @@ mod tests {
                 .contains("tombstone_grace: 1day, manifest_poll_interval: 5s,"),
             "{config}"
         );
+    }
+
+    #[test]
+    fn given_no_positions_keys_when_loading_should_publish_and_poll_each_second() {
+        let config: GeoConfig = serde_json::from_str(r#"{"origin":"dc-a"}"#).unwrap();
+        let tuned: GeoConfig = serde_json::from_str(
+            r#"{"origin":"dc-a","positions_publish_interval":"250 ms","positions_poll_interval":"2 s","positions_resume_timeout":"1 min"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.positions_publish_interval.get_duration().as_secs(),
+            1
+        );
+        assert_eq!(config.positions_poll_interval.get_duration().as_secs(), 1);
+        assert_eq!(config.positions_resume_timeout.get_duration().as_secs(), 10);
+        assert_eq!(
+            tuned.positions_publish_interval.get_duration().as_millis(),
+            250
+        );
+        assert_eq!(tuned.positions_poll_interval.get_duration().as_secs(), 2);
+        assert_eq!(tuned.positions_resume_timeout.get_duration().as_secs(), 60);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_zero_positions_interval_when_validating_should_refuse() {
+        for key in ["positions_publish_interval", "positions_poll_interval"] {
+            let config: GeoConfig =
+                serde_json::from_str(&format!(r#"{{"origin":"dc-a","{key}":"0"}}"#)).unwrap();
+            assert!(config.validate().is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn given_no_offset_upload_interval_when_loading_should_store_the_positions_of_manual_commits_every_50_ms()
+     {
+        let config: GeoConfig = serde_json::from_str(r#"{"origin":"dc-a"}"#).unwrap();
+        let tuned: GeoConfig =
+            serde_json::from_str(r#"{"origin":"dc-a","consumer_offset_upload_interval":"5 ms"}"#)
+                .unwrap();
+
+        assert_eq!(
+            config
+                .consumer_offset_upload_interval
+                .get_duration()
+                .as_millis(),
+            50
+        );
+        assert_eq!(
+            tuned
+                .consumer_offset_upload_interval
+                .get_duration()
+                .as_millis(),
+            5
+        );
+        assert!(config.validate().is_ok());
+        assert!(tuned.validate().is_ok());
+    }
+
+    #[test]
+    fn given_a_disabled_offset_upload_interval_when_validating_should_accept_it_as_zero() {
+        for value in ["0", "disabled"] {
+            let config: GeoConfig = serde_json::from_str(&format!(
+                r#"{{"origin":"dc-a","consumer_offset_upload_interval":"{value}"}}"#
+            ))
+            .unwrap();
+
+            assert!(config.consumer_offset_upload_interval.is_zero(), "{value}");
+            assert!(config.validate().is_ok(), "{value}");
+        }
+    }
+
+    #[test]
+    fn given_an_offset_upload_interval_past_a_second_when_validating_should_refuse() {
+        let config: GeoConfig = serde_json::from_str(
+            r#"{"origin":"dc-a","consumer_offset_upload_interval":"1001 ms"}"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
     }
 
     #[test]

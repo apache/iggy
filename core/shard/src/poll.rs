@@ -195,7 +195,10 @@ where
                 return;
             }
         }
-        let rejection = self.partition_read_rejection(namespace, &read);
+        let rejection = self.partition_read_rejection(namespace, &read).or_else(|| {
+            read.polling_consumer()
+                .and_then(|consumer| self.geo_position_refusal(namespace, consumer))
+        });
         if let Some(error) = rejection {
             let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;

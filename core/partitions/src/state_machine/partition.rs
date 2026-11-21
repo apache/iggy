@@ -33,6 +33,7 @@ use super::{
     state_machine_pipeline_slots,
 };
 use crate::IggyPartition;
+use crate::geo_positions::GeoPositions;
 use crate::long_term::LongTermLog;
 use crate::peer_manifests::{FOLLOW_PEER_MANIFEST, PeerManifests};
 use crate::tiered_floor::TieredFloor;
@@ -72,7 +73,8 @@ where
     pub fn register_builtin_state_machines(&mut self) -> Result<(), RegistrationError> {
         self.register_state_machine(Box::new(TieredFloor::default()))?;
         self.register_state_machine(Box::new(LongTermLog::default()))?;
-        self.register_state_machine(Box::new(PeerManifests::default()))
+        self.register_state_machine(Box::new(PeerManifests::default()))?;
+        self.register_state_machine(Box::new(GeoPositions::default()))
     }
 
     #[must_use]
