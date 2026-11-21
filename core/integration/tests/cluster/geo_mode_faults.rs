@@ -20,6 +20,7 @@
 //! long-term segments, or every node loses its disk.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -336,9 +337,13 @@ async fn metadata_leader(harness: &TestHarness) -> Option<usize> {
 }
 
 /// A store on a disk that syncs, unlike a temporary directory in memory, so
-/// that an upload lasts long enough to be caught.
+/// that an upload lasts long enough to be caught. Cargo makes the target tmp
+/// directory only when it builds, and CI runs these tests from an archive
+/// restored without it.
 fn store_on_disk() -> TempDir {
-    tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("a directory for the object store")
+    let parent = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    fs::create_dir_all(parent).expect("the target tmp directory");
+    tempfile::tempdir_in(parent).expect("a directory for the object store")
 }
 
 /// A root client whose first connection goes to a node other than replica
