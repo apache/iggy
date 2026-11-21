@@ -2050,6 +2050,7 @@ mod offset_reservations;
 mod offset_storage;
 mod offsets;
 mod persistence_checkpoint;
+mod placed_batches;
 mod quiet;
 mod reload_budget;
 mod remote_poll;
