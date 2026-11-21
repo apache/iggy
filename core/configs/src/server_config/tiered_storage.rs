@@ -66,6 +66,9 @@ pub enum TieredStorageBackend {
     Fs,
     /// S3, or a store with the same API, such as MinIO, Ceph RGW or R2.
     S3,
+    /// The memory of the server, with the latency of `mock_s3`. Every
+    /// object is lost when the server stops. For benchmarks and tests only.
+    MockS3,
 }
 
 impl Display for TieredStorageBackend {
@@ -74,6 +77,7 @@ impl Display for TieredStorageBackend {
             Self::None => "none",
             Self::Fs => "fs",
             Self::S3 => "s3",
+            Self::MockS3 => "mock_s3",
         })
     }
 }
@@ -145,6 +149,9 @@ pub struct TieredStorageConfig {
     pub secret_access_key: String,
     #[serde(default)]
     pub jobs: TierJobsConfig,
+    /// The latency of the `mock_s3` backend.
+    #[serde(default)]
+    pub mock_s3: MockS3Config,
     /// The longest wait for the answer to one attempt at a store call other
     /// than a put. From 1 s to 1 h.
     #[serde_as(as = "DisplayFromStrOrNumber")]
@@ -231,6 +238,35 @@ pub struct TierJobsConfig {
     pub housekeeping: u32,
 }
 
+/// What the `mock_s3` backend adds to the time of each store call. Its
+/// objects stay in the memory of the server, so the shards share them and a
+/// stop loses them. Each latency is shorter than the timeout of its call.
+#[serde_as]
+#[derive(Debug, Default, Deserialize, Serialize, Clone, PartialEq, ConfigEnv)]
+#[serde(deny_unknown_fields)]
+pub struct MockS3Config {
+    /// Each put, from the end of its body to its answer.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub put_latency: IggyDuration,
+    /// Each ranged read.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub get_latency: IggyDuration,
+    /// Each head, delete and listing.
+    #[serde_as(as = "DisplayFromStr")]
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub other_latency: IggyDuration,
+    /// How many bytes of a put's body or of a read move in a second, on top
+    /// of the latency. Zero is no limit.
+    #[serde(default)]
+    #[config_env(leaf)]
+    pub bytes_per_second: IggyByteSize,
+}
+
 impl Default for TieredStorageConfig {
     fn default() -> Self {
         Self {
@@ -244,6 +280,7 @@ impl Default for TieredStorageConfig {
             access_key_id: String::new(),
             secret_access_key: String::new(),
             jobs: TierJobsConfig::default(),
+            mock_s3: MockS3Config::default(),
             request_timeout: default_request_timeout(),
             progress_timeout: default_progress_timeout(),
             max_attempts: default_max_attempts(),
@@ -295,7 +332,7 @@ impl Display for TieredStorageConfig {
         write!(
             f,
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
-             url_style: {}, credentials: {}, jobs: {}, request_timeout: {}, \
+             url_style: {}, credentials: {}, jobs: {}, mock_s3: {}, request_timeout: {}, \
              progress_timeout: {}, max_attempts: {}, retry_delay: {}, max_retry_delay: {}, \
              fresh_upload_interval: {}, long_term_backlog_limit: {} }}",
             self.backend,
@@ -307,6 +344,7 @@ impl Display for TieredStorageConfig {
             self.url_style,
             self.credentials(),
             self.jobs,
+            self.mock_s3,
             self.request_timeout,
             self.progress_timeout,
             self.max_attempts,
@@ -338,6 +376,16 @@ impl Display for TierJobsConfig {
     }
 }
 
+impl Display for MockS3Config {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{{ put_latency: {}, get_latency: {}, other_latency: {}, bytes_per_second: {} }}",
+            self.put_latency, self.get_latency, self.other_latency, self.bytes_per_second,
+        )
+    }
+}
+
 impl Validatable<ConfigurationError> for TieredStorageConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
         match self.backend {
@@ -355,7 +403,7 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
             TieredStorageBackend::S3 if self.region.trim().is_empty() => {
                 return refuse("region must be set for the s3 backend");
             }
-            TieredStorageBackend::Fs | TieredStorageBackend::S3 => {}
+            TieredStorageBackend::Fs | TieredStorageBackend::S3 | TieredStorageBackend::MockS3 => {}
         }
         if self.access_key_id.is_empty() != self.secret_access_key.is_empty() {
             return refuse("access_key_id and secret_access_key must be set together");
@@ -363,7 +411,11 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
         if self.prefix.is_empty() {
             return refuse("prefix must not be empty");
         }
-        self.validate_tuning()
+        self.validate_tuning()?;
+        if self.backend == TieredStorageBackend::MockS3 {
+            self.validate_mock_s3()?;
+        }
+        Ok(())
     }
 }
 
@@ -433,6 +485,40 @@ impl TieredStorageConfig {
             ));
         }
         Ok(())
+    }
+
+    /// A latency at or past the timeout of its call would fail every call.
+    fn validate_mock_s3(&self) -> Result<(), ConfigurationError> {
+        let mock = &self.mock_s3;
+        let latencies = [
+            (
+                "put_latency",
+                mock.put_latency,
+                "progress_timeout",
+                self.progress_timeout,
+            ),
+            (
+                "get_latency",
+                mock.get_latency,
+                "request_timeout",
+                self.request_timeout,
+            ),
+            (
+                "other_latency",
+                mock.other_latency,
+                "request_timeout",
+                self.request_timeout,
+            ),
+        ];
+        match latencies
+            .iter()
+            .find(|(_, latency, _, timeout)| latency.get_duration() >= timeout.get_duration())
+        {
+            Some((name, _, timeout, _)) => {
+                refuse(&format!("mock_s3.{name} must be shorter than {timeout}"))
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -765,6 +851,57 @@ mod tests {
         assert!(limit("64 MiB").validate().is_ok());
         assert!(limit("1 B").validate().is_err());
         assert!(limit("67108863 B").validate().is_err());
+    }
+
+    #[test]
+    fn given_mock_s3_backend_without_its_section_when_reading_should_take_no_latency() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "mock_s3"}"#).unwrap();
+
+        assert_eq!(config.backend, TieredStorageBackend::MockS3);
+        assert_eq!(config.mock_s3, MockS3Config::default());
+        assert!(config.mock_s3.put_latency.is_zero());
+        assert_eq!(config.mock_s3.bytes_per_second.as_bytes_u64(), 0);
+        assert!(config.validate().is_ok(), "{config}");
+    }
+
+    #[test]
+    fn given_mock_s3_latency_at_the_timeout_of_its_call_when_validating_should_refuse() {
+        let mock = |mock_s3: MockS3Config| TieredStorageConfig {
+            backend: TieredStorageBackend::MockS3,
+            mock_s3,
+            ..TieredStorageConfig::default()
+        };
+        let just_below = mock(MockS3Config {
+            put_latency: duration("29999ms"),
+            get_latency: duration("29999ms"),
+            other_latency: duration("29999ms"),
+            bytes_per_second: "100 MiB".parse().unwrap(),
+        });
+        let refused = [
+            mock(MockS3Config {
+                put_latency: duration("30s"),
+                ..MockS3Config::default()
+            }),
+            mock(MockS3Config {
+                get_latency: duration("30s"),
+                ..MockS3Config::default()
+            }),
+            mock(MockS3Config {
+                other_latency: duration("1h"),
+                ..MockS3Config::default()
+            }),
+        ];
+        let ignored_by_fs = TieredStorageConfig {
+            mock_s3: refused[0].mock_s3.clone(),
+            ..fs_config()
+        };
+
+        assert!(just_below.validate().is_ok(), "{just_below}");
+        for config in refused {
+            assert!(config.validate().is_err(), "{config}");
+        }
+        assert!(ignored_by_fs.validate().is_ok(), "{ignored_by_fs}");
     }
 
     #[test]

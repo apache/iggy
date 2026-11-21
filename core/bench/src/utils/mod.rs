@@ -57,6 +57,7 @@ pub mod command_line;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
+pub mod readiness;
 pub mod warmup;
 
 /// Runs of one command that start within the same second get the suffixes `_2` up to this.

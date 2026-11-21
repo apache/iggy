@@ -28,10 +28,11 @@
 //! that read the store. [`TierExecutor`] is how
 //! uploads, cold reads and deletes hand work to the tier service of a shard.
 //!
-//! [`FsStore`] keeps objects as files in a directory, and [`s3::S3Store`]
-//! keeps them in an S3 bucket. [`Backend`] is the one of them that a
-//! configuration names. [`ReadOnlyStore`] reads another cluster's store and
-//! refuses every write. [`MemoryStore`] and
+//! [`FsStore`] keeps objects as files in a directory, [`s3::S3Store`] keeps
+//! them in an S3 bucket, and [`MockS3Store`] keeps them in memory and answers
+//! after the latency of a remote store, for benchmarks. [`Backend`] is the
+//! one of them that a configuration names. [`ReadOnlyStore`] reads another
+//! cluster's store and refuses every write. [`MemoryStore`] and
 //! [`InlineTierExecutor`] stand in for a provider and for the tier service in
 //! tests, [`RecordingStore`] shows which calls reach a provider, and
 //! [`contract`] holds the cases that providers pass.
@@ -50,6 +51,7 @@ mod inline;
 mod layout;
 mod manifest;
 mod memory;
+mod mock_s3;
 mod positions;
 mod read_only;
 mod recording;
@@ -77,6 +79,7 @@ pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, LongTermKey, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
+pub use mock_s3::{MockS3Latency, MockS3Store};
 pub use positions::{
     GeoLog, GeoPosition, MAX_GROUP_NAME_LEN, MAX_POSITIONS_OBJECT_LEN, POSITIONS_PER_PARTITION_MAX,
     PositionValue, PositionsKey, PositionsObject, PositionsObjectError,
