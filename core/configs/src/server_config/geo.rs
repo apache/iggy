@@ -35,10 +35,10 @@
 use super::COMPONENT;
 use super::tiered_storage::{GcsConfig, S3UrlStyle, TieredStorageBackend};
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ pub struct GeoConfig {
     /// this cluster's store, so that each peer sees the tombstone before the
     /// objects go. A cluster that reads peers also keeps a detached shadow
     /// topic this long after the peer wrote its tombstone.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_tombstone_grace")]
     #[config_env(leaf)]
     pub tombstone_grace: IggyDuration,
@@ -90,7 +90,7 @@ pub struct GeoConfig {
     pub recover_unproven: bool,
     /// How often a node lists the manifests of each peer stream that a
     /// shadow stream serves, so its shadow partitions follow the peer.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_manifest_poll_interval")]
     #[config_env(leaf)]
     pub manifest_poll_interval: IggyDuration,
@@ -98,7 +98,7 @@ pub struct GeoConfig {
     /// geo and shadow topics in its store, when they changed. A group that
     /// commits on read re-reads at most this much more in another
     /// datacenter after a failover.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_positions_publish_interval")]
     #[config_env(leaf)]
     pub positions_publish_interval: IggyDuration,
@@ -108,19 +108,19 @@ pub struct GeoConfig {
     /// and the stores that arrive within the interval share one put. Zero
     /// or `disabled` answers them at the local commit and leaves them to
     /// `positions_publish_interval`. Up to 1 s.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_consumer_offset_upload_interval")]
     #[config_env(leaf)]
     pub consumer_offset_upload_interval: IggyDuration,
     /// How often a node lists the consumer group positions that each peer
     /// publishes, and takes those that win over its own.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_positions_poll_interval")]
     #[config_env(leaf)]
     pub positions_poll_interval: IggyDuration,
     /// How long, after a node starts, the group polls of its geo and shadow
     /// partitions wait for the consumer group positions of every peer.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_positions_resume_timeout")]
     #[config_env(leaf)]
     pub positions_resume_timeout: IggyDuration,

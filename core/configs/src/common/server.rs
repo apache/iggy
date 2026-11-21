@@ -15,10 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyByteSize, IggyDuration};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 use server_common::MemoryPoolSettings;
 use server_common::log::{TelemetryEndpointSettings, TelemetrySettings};
@@ -56,7 +55,7 @@ pub struct DataMaintenanceConfig {
 pub struct MessagesMaintenanceConfig {
     pub cleaner_enabled: bool,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub interval: IggyDuration,
 }
 
@@ -71,7 +70,7 @@ pub struct PersonalAccessTokenConfig {
 pub struct PersonalAccessTokenCleanerConfig {
     pub enabled: bool,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub interval: IggyDuration,
 }
 
@@ -80,7 +79,7 @@ pub struct PersonalAccessTokenCleanerConfig {
 pub struct HeartbeatConfig {
     pub enabled: bool,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub interval: IggyDuration,
 }
 
@@ -107,10 +106,10 @@ impl HeartbeatConfig {
 #[serde(default)]
 pub struct ConsumerGroupConfig {
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub rebalancing_timeout: IggyDuration,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub heartbeat_interval: IggyDuration,
 }
 
