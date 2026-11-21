@@ -1,0 +1,19 @@
+{
+  "title": "SDK",
+  "pages": [
+    "introduction",
+    "connection-strings",
+    "deferred-polling",
+    "idempotent-producers",
+    "metadata-changes",
+    "rust",
+    "python",
+    "java",
+    "go",
+    "node",
+    "csharp",
+    "cpp",
+    "php",
+    "swift"
+  ]
+}

@@ -1,0 +1,85 @@
+---
+title: Connection lifecycle
+description: "How the protocol version is packed and checked, and the login-register handshake that authenticates a connection."
+---
+
+Server 0.10.0 uses binary protocol 0.12.0. Clients must use a compatible release.
+
+## Protocol version
+
+The protocol version is a semver packed into one u32, 10 bits per component (each must be below 1024):
+
+```text
+bits 31..30  reserved (zero)
+bits 29..20  major
+bits 19..10  minor
+bits  9..0   patch
+value = major << 20 | minor << 10 | patch
+```
+
+Integer order equals semver order. The value tracks the `iggy_binary_protocol` crate release. Under 0.x the compatibility gate is minor-scoped: the server accepts a client whose packed version is at least the server's minimum and whose `major.minor` is at most the server's. Patch releases never change the wire, so the upper bound ignores patch. The implemented minimum is the current version with its patch component zeroed. Compatibility across minor versions after 1.0.0 requires a future change to that calculation.
+
+## Login-register
+
+A new logical session authenticates through the register handshake: command code **40** (`LOGIN_REGISTER`, username and password) or **45** (`LOGIN_REGISTER_WITH_PAT`, personal access token). Both ride `operation = 1` (`Register`) with `session = 0`, `request = 0`, and a non-zero `client` id. Mint a fresh id for a new logical client. A reconnect retains its request identities and binds the existing session. A matching registration retry preserves its epoch.
+
+Both request bodies begin with the `ClientVersionInfo` prefix, so the server can gate on the version before touching credentials:
+
+```text
+[protocol_version: u32]
+[sdk_name_len: u8][sdk_name: UTF-8, 1-255 bytes]
+[sdk_version_len: u8][sdk_version: UTF-8, 1-255 bytes]
+```
+
+`protocol_version` is the packed version of the protocol the client was built against. `sdk_name` identifies the SDK (for example `rust-sdk`, `go-sdk`). `sdk_version` is the SDK's own build version.
+
+After the prefix:
+
+**`LOGIN_REGISTER` (code 40):**
+
+```text
+[ClientVersionInfo]
+[bind_secret: 32 bytes]
+[username_len: u8][username: N]
+[password_len: u8][password: N]
+[context_len: u32][context: N, only when context_len > 0]
+```
+
+**`LOGIN_REGISTER_WITH_PAT` (code 45):**
+
+```text
+[ClientVersionInfo]
+[bind_secret: 32 bytes]
+[token_len: u8][token: N]
+[context_len: u32][context: N, only when context_len > 0]
+```
+
+An incompatible protocol version is answered with a 256-byte `Eviction` frame, reason `14` (`IncompatibleProtocol`), carrying the accepted window at bytes 144 (max) and 148 (min) as packed u32 versions. A body without a decodable `ClientVersionInfo` prefix gets reason `15` (`MalformedLogin`) with a zero window. Bad credentials get reasons 9-11. See [EvictionHeader](/docs/binary-protocol/framing#evictionheader) for the frame layout.
+
+A successful login is a normal `Reply` with `status = 0`. Its body includes an empty [result section](/docs/binary-protocol/framing#result-section) before the login payload:
+
+```text
+[result_count: u32 = 0]
+[user_id: u32]
+[session: u64]
+[server_protocol_version: u32]
+[server_version_len: u8][server_version: N]
+```
+
+The client stores `session` and echoes it in every subsequent request header. Logout is command code **39** (`LOGOUT_USER`), `operation = 3` (`Logout`), empty body.
+
+The legacy login commands **38** (`LOGIN_USER`) and **44** (`LOGIN_WITH_PERSONAL_ACCESS_TOKEN`) are refused: the server answers them with an `Eviction` frame, reason `15` (`MalformedLogin`). Before authentication, a connection can ping or use the registration and binding flows. Protected commands require an authenticated session.
+
+## Bind a retained session
+
+BindSession, code 15, authenticates another connection for the same logical session without another Register:
+
+```text
+[ClientVersionInfo]
+[client_id: u128][session: u64][metadata_watermark: u64]
+[bind_secret: 32 bytes]
+```
+
+The client creates and protects the random binding secret for its session. The server stores a verifier. Session zero can resolve a lost registration reply using this retained secret. Binding supports connections to different partition primaries while preserving one session identity.
+
+Transport loss alone does not end a retained session. Logout, session expiry and account deactivation do. A password or PAT change does not revoke an already established session. Once the original session ends, unresolved operations cannot recover their old receipts through a new login.

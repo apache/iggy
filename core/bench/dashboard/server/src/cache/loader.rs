@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::{BenchmarkCache, Result, Runs};
+use super::{BenchmarkCache, LoadedReport, Result, Runs};
+use crate::embed_cache::FileStamp;
 use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::summary::BenchmarkSummary;
@@ -44,8 +45,8 @@ impl BenchmarkCache {
             // Relative path to report.json, for example `./performance_results/poll_8_1000_100_10000_tcp_no_cache_e1393367_atlas/report.json`
             let path = entry.path().join("report.json");
 
-            let light_report = match self.load_light_report(&path) {
-                Ok(report) => report,
+            let (report, stamp) = match self.load_light_report(&path) {
+                Ok(loaded) => loaded,
                 Err(e) => {
                     error!(
                         "Failed to load light report for {}: {}",
@@ -58,13 +59,19 @@ impl BenchmarkCache {
 
             info!("Loaded light benchmark report for {:?}", &entry.path());
 
-            // Store the benchmark report
-            reports.insert(light_report.uuid, (light_report, path));
+            reports.insert(
+                report.uuid,
+                LoadedReport {
+                    report,
+                    path,
+                    stamp,
+                },
+            );
         });
 
         let mut summaries: Vec<_> = reports
             .values()
-            .map(|(report, _)| BenchmarkSummary::new(report, &self.thresholds))
+            .map(|loaded| BenchmarkSummary::new(&loaded.report, &self.thresholds))
             .collect();
         summaries.sort_by(|a, b| {
             b.version_order
@@ -81,13 +88,15 @@ impl BenchmarkCache {
         Ok(())
     }
 
-    pub fn load_light_report(&self, path: &Path) -> Result<BenchmarkReportLight> {
+    /// The light report in `path`, with the stamp of the bytes that it came from.
+    pub fn load_light_report(&self, path: &Path) -> Result<(BenchmarkReportLight, FileStamp)> {
         let data = std::fs::read_to_string(path).map_err(|e| {
             error!("Failed to read benchmark file {:?}: {}", path, e);
             IggyBenchDashboardServerError::Io(e)
         })?;
+        let stamp = FileStamp::of_bytes(data.as_bytes());
 
-        serde_json::from_str(&data).map_err(|e| {
+        let report = serde_json::from_str(&data).map_err(|e| {
             error!(
                 "Failed to parse JSON from {:?}: {}. Content: {}",
                 path,
@@ -99,7 +108,8 @@ impl BenchmarkCache {
                 }
             );
             IggyBenchDashboardServerError::InvalidJson(e.to_string())
-        })
+        })?;
+        Ok((report, stamp))
     }
 }
 

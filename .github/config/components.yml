@@ -581,6 +581,13 @@ components:
       - "scripts/utils.sh"
     tasks: ["examples-swift"]
 
+  # The docs pages, which apache/iggy-website builds into iggy.apache.org/docs
+  docs:
+    paths:
+      - "docs/**"
+      - ".github/workflows/_test_docs.yml"
+    tasks: ["build"]
+
   web-ui:
     paths:
       - "web/**"

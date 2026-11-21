@@ -35,10 +35,10 @@
 use super::COMPONENT;
 use super::tiered_storage::{S3UrlStyle, TieredStorageBackend};
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::fmt::{self, Debug, Display, Formatter};
 
 /// The most peers that one cluster reads. It matches the
@@ -67,7 +67,7 @@ pub struct GeoConfig {
     /// How long a deleted geo topic keeps its tombstone and its objects in
     /// this cluster's store, so that each peer sees the tombstone before the
     /// objects go.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_tombstone_grace")]
     #[config_env(leaf)]
     pub tombstone_grace: IggyDuration,
