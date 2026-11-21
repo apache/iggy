@@ -186,6 +186,7 @@ use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
+use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -352,6 +353,9 @@ pub struct ReconcilerCtx {
     /// The objects of this cluster's geo topics in its store, which the
     /// metadata primary keeps in step with committed metadata.
     geo_topics: GeoTopics,
+    /// The shadow streams of the geo peers' topics, which the metadata
+    /// primary keeps in step with the peers' stores.
+    shadow_topics: ShadowTopics,
     /// When the next pass over the partitions of geo topics may be staged,
     /// in microseconds since the Unix epoch.
     next_topic_object_check_at: Cell<u64>,
@@ -374,6 +378,7 @@ impl ReconcilerCtx {
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
         let geo_topics = GeoTopics::new(&config.geo);
+        let shadow_topics = ShadowTopics::new(&config.geo);
         Self {
             shard,
             total_shards,
@@ -394,6 +399,7 @@ impl ReconcilerCtx {
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
             geo_topics,
+            shadow_topics,
             next_topic_object_check_at: Cell::new(0),
         }
     }
@@ -575,6 +581,7 @@ pub async fn run_reconciler(
 
     ctx.incarnation_deletes.stop();
     ctx.geo_topics.stop();
+    ctx.shadow_topics.stop(&ctx.shard);
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -664,6 +671,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     let now = IggyTimestamp::now();
     ctx.incarnation_deletes.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
+    ctx.shadow_topics.pass(&ctx.shard, now);
     stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {
@@ -1124,6 +1132,7 @@ async fn reconcile_target(
         metadata: partition_metadata,
         stream_key,
         encryption,
+        peer_log,
     }) = fetch_partition_build_inputs(ctx, ns)
     else {
         return Convergence::Pending;
@@ -1246,6 +1255,21 @@ async fn reconcile_target(
         Ok(Some(mut partition)) => {
             partition.set_encryptor(encryptor);
             partition.start_at_create_op(partition_metadata.created_op);
+            if let Some((origin, prefix)) = peer_log
+                && let Err(error) = partition.follow_peer_log(origin, prefix)
+            {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                ctx.shard.metrics().record_partition_reconcile_failure();
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "a partition of a shadow topic cannot follow its peer's log"
+                );
+                return Convergence::Pending;
+            }
             ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                 namespace: ns,
                 partition: Box::new(partition),
@@ -1984,6 +2008,8 @@ struct PartitionBuildInputs {
     metadata: Partition,
     stream_key: StreamKeyIdentity,
     encryption: StreamEncryption,
+    /// The peer's log that a partition of a shadow topic follows.
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
 }
 
 /// Everything one namespace's build needs out of committed metadata: the shared
@@ -2030,6 +2056,7 @@ fn fetch_partition_build_inputs(
                 created_op: stream.created_op,
             },
             encryption: StreamEncryption::from(&stream.options),
+            peer_log: peer_log_of(stream, topic, ns),
         })
     })
 }
@@ -4532,7 +4559,7 @@ mod tests {
                 namespace: ns,
                 created_revision: live.created_revision,
                 kind: PartitionChangeKind::Removed,
-                geo_topic: false,
+                skips_object_deletes: false,
             }],
             IggyTimestamp::now(),
         );
@@ -4578,7 +4605,7 @@ mod tests {
                     namespace: ns,
                     created_revision: 1,
                     kind: PartitionChangeKind::Removed,
-                    geo_topic: false,
+                    skips_object_deletes: false,
                 }],
                 IggyTimestamp::now(),
             );

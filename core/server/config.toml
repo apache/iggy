@@ -1570,7 +1570,9 @@ handshake_grace = "10 s"
 # the peers that the topic is gone. After this grace, it deletes the topic's
 # segments and manifests, and then the tombstone. It checks once a minute, so
 # the objects can stay up to a minute longer. Make it longer than any outage
-# of a peer after which the peer must still see the tombstone.
+# of a peer after which the peer must still see the tombstone. A cluster that
+# reads peers also keeps a detached shadow topic this long after the peer wrote
+# its tombstone.
 #tombstone_grace = "24 h"
 # One table per peer, at most 16. A peer's store is the [tiered_storage] store
 # of the other cluster, with the same keys. The server only reads it: it never

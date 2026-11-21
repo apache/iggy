@@ -396,7 +396,7 @@ where
 
     /// Drop the check state for one of `view`, keeping the read numbers.
     fn reset_topic_object_check(&mut self, view: Option<u32>) {
-        self.topic_object_check = TopicObjectCheck {
+        *self.topic_object_check = TopicObjectCheck {
             view,
             jobs: self.topic_object_check.jobs,
             ..TopicObjectCheck::default()

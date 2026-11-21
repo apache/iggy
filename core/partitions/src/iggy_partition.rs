@@ -226,8 +226,8 @@ where
     /// segments, while this replica is the primary.
     pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
     /// What this replica found of its geo topic's object while it is the
-    /// primary.
-    pub(crate) topic_object_check: crate::topic_object::TopicObjectCheck,
+    /// primary. Boxed to keep the partition small on the stack.
+    pub(crate) topic_object_check: Box<crate::topic_object::TopicObjectCheck>,
     /// Number of the last long-term rewrite this partition started. It
     /// outlives the view, so the late result of an earlier view's rewrite is
     /// never taken for the one in flight.
@@ -1175,7 +1175,7 @@ where
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
-            topic_object_check: crate::topic_object::TopicObjectCheck::default(),
+            topic_object_check: Box::default(),
             long_term_rewrite_jobs: 0,
             long_term_backlog: Box::default(),
             manifest_publish_jobs: 0,
@@ -8247,12 +8247,12 @@ where
 
     /// Whether a send may go to the object store for this partition now: the
     /// partition places its batches, and this replica would not refuse the
-    /// request that commits where they sit. The node's upload path asks
-    /// before it stores a send's messages, and again before it hands the
-    /// request over.
+    /// request that commits where they sit, which it does while its geo
+    /// topic's object is unread. The node's upload path asks before it
+    /// stores a send's messages, and again before it hands the request over.
     #[must_use]
     pub fn takes_placed_sends(&self) -> bool {
-        self.places_batches() && !self.refuses_requests()
+        self.places_batches() && !self.refuses_requests() && self.takes_messages_of_its_topic()
     }
 
     /// Whether [`Self::on_placed_request`] has room for one more request. A

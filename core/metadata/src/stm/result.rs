@@ -176,21 +176,28 @@ macro_rules! result_enum {
 // Streams.
 result_enum!(CreateStreamResult {
     NameAlreadyExists = 1012,
+    InvalidStreamName = 1013,
     TooManyStreams = 1020,
     InvalidOptionValue = 4042,
 });
 result_enum!(UpdateStreamResult {
     StreamNotFound = 1009,
     NameAlreadyExists = 1012,
+    InvalidStreamName = 1013,
+    ShadowStreamReadOnly = 1021,
     InvalidOptionValue = 4042,
     OptionsBlockTooLarge = 4043,
 });
-result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
+result_enum!(DeleteStreamResult {
+    StreamNotFound = 1009,
+    ShadowStreamReadOnly = 1021,
+});
 
 // Topics.
 result_enum!(CreateTopicResult {
     FeatureUnavailable = 5,
     StreamNotFound = 1009,
+    ShadowStreamReadOnly = 1021,
     NameAlreadyExists = 2013,
     InvalidReplicationFactor = 2018,
     InvalidPartitionsCount = 2019,
@@ -201,6 +208,7 @@ result_enum!(CreateTopicResult {
 result_enum!(UpdateTopicResult {
     StreamNotFound = 1009,
     InvalidTopicSize = 1019,
+    ShadowStreamReadOnly = 1021,
     TopicNotFound = 2010,
     NameAlreadyExists = 2013,
     InvalidOptionValue = 4042,
@@ -209,6 +217,7 @@ result_enum!(UpdateTopicResult {
 });
 result_enum!(DeleteTopicResult {
     StreamNotFound = 1009,
+    ShadowStreamReadOnly = 1021,
     TopicNotFound = 2010,
 });
 
@@ -218,6 +227,7 @@ result_enum!(DeleteTopicResult {
 // split is by REMEDY (smaller batch vs delete partitions), not by terminality.
 result_enum!(CreatePartitionsResult {
     StreamNotFound = 1009,
+    ShadowStreamReadOnly = 1021,
     TopicNotFound = 2010,
     InvalidReplicationFactor = 2018,
     InvalidPartitionsCount = 2019,
@@ -226,6 +236,7 @@ result_enum!(CreatePartitionsResult {
 });
 result_enum!(DeletePartitionsResult {
     StreamNotFound = 1009,
+    ShadowStreamReadOnly = 1021,
     TopicNotFound = 2010,
     InvalidPartitionsCount = 2019,
     PartitionResizeDisabled = 2023,
@@ -235,9 +246,29 @@ result_enum!(DeletePartitionsResult {
 // contiguous while the client still gets the typed error.
 result_enum!(TruncatePartitionResult {
     StreamNotFound = 1009,
+    ShadowStreamReadOnly = 1021,
     TopicNotFound = 2010,
     PartitionNotFound = 3007,
     HistoryChanged = 3014,
+});
+
+// The shadow pass. A stale proposal commits as a no-op with one of these
+// codes, and the pass reads committed metadata again. `StreamNotEmpty` is
+// `IggyError::InvalidCommand`: no client sends the operation, so no client
+// decodes it. The topic codes are those of a topic create.
+result_enum!(ShadowTopicResult {
+    StreamNotEmpty = 3,
+    StreamNotFound = 1009,
+    StreamNameAlreadyExists = 1012,
+    InvalidStreamName = 1013,
+    TooManyStreams = 1020,
+    TopicNotFound = 2010,
+    TopicNameAlreadyExists = 2013,
+    InvalidReplicationFactor = 2018,
+    InvalidPartitionsCount = 2019,
+    TooManyTopics = 2021,
+    PartitionIdSpaceExhausted = 3013,
+    InvalidOptionValue = 4042,
 });
 
 // Users. No dedicated user-not-found code in `IggyError`; `ResourceNotFound = 20`
@@ -364,6 +395,7 @@ pub const fn result_code_recognized(operation: Operation, code: u32) -> bool {
         }
         Operation::DeletePartitions => DeletePartitionsResult::from_u32(code).is_some(),
         Operation::TruncatePartition => TruncatePartitionResult::from_u32(code).is_some(),
+        Operation::ShadowTopic => ShadowTopicResult::from_u32(code).is_some(),
         Operation::CreateUser => CreateUserResult::from_u32(code).is_some(),
         Operation::UpdateUserResolved => UpdateUserResult::from_u32(code).is_some(),
         Operation::DeleteUser => DeleteUserResult::from_u32(code).is_some(),
@@ -403,6 +435,7 @@ const fn lifecycle_gated(operation: Operation) -> bool {
             | Operation::DeleteConsumerGroup
             | Operation::JoinConsumerGroup
             | Operation::LeaveConsumerGroup
+            | Operation::ShadowTopic
     )
 }
 
@@ -415,6 +448,7 @@ const fn begins_lifecycle(operation: Operation) -> bool {
             | Operation::DeleteTopic
             | Operation::DeletePartitions
             | Operation::DeleteConsumerGroup
+            | Operation::ShadowTopic
     )
 }
 
@@ -553,6 +587,40 @@ mod tests {
             Operation::DeleteConsumerGroup,
             IggyError::InvalidCommand.as_code()
         ));
+    }
+
+    #[test]
+    fn given_shadow_stream_results_then_match_iggy_error_codes() {
+        let read_only = IggyError::ShadowStreamReadOnly.as_code();
+        for code in [
+            u32::from(UpdateStreamResult::ShadowStreamReadOnly),
+            u32::from(DeleteStreamResult::ShadowStreamReadOnly),
+            u32::from(CreateTopicResult::ShadowStreamReadOnly),
+            u32::from(UpdateTopicResult::ShadowStreamReadOnly),
+            u32::from(DeleteTopicResult::ShadowStreamReadOnly),
+            u32::from(CreatePartitionsResult::ShadowStreamReadOnly),
+            u32::from(DeletePartitionsResult::ShadowStreamReadOnly),
+            u32::from(TruncatePartitionResult::ShadowStreamReadOnly),
+        ] {
+            assert_eq!(code, read_only);
+        }
+        let invalid_name = IggyError::InvalidStreamName.as_code();
+        assert_eq!(
+            u32::from(CreateStreamResult::InvalidStreamName),
+            invalid_name
+        );
+        assert_eq!(
+            u32::from(UpdateStreamResult::InvalidStreamName),
+            invalid_name
+        );
+        assert_eq!(
+            u32::from(ShadowTopicResult::InvalidStreamName),
+            invalid_name
+        );
+        assert_eq!(
+            u32::from(ShadowTopicResult::StreamNotEmpty),
+            IggyError::InvalidCommand.as_code()
+        );
     }
 
     // Pins every result-enum discriminant to the `IggyError` variant its doc

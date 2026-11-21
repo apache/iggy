@@ -47,6 +47,8 @@ pub fn sample(
         Outcome::StreamNotFound => Some(Input {
             name: shadow.fabricate_absent_name("stream"),
         }),
+        // The sim cluster has no geo peers, so it holds no shadow stream.
+        Outcome::ShadowStreamReadOnly => None,
     }
 }
 
@@ -70,6 +72,6 @@ pub fn predicted_effect(input: &Input, outcome: Outcome) -> Effect {
         Outcome::Ok => Effect::RemoveStream {
             name: input.name.clone(),
         },
-        Outcome::StreamNotFound => Effect::None,
+        Outcome::StreamNotFound | Outcome::ShadowStreamReadOnly => Effect::None,
     }
 }

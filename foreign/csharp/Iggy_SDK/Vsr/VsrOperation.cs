@@ -42,6 +42,7 @@ internal enum VsrOperation : byte
     UpdateTopicResolved = 73,
     UpdateUserResolved = 74,
     RewrapStreamKeys = 75,
+    ShadowTopic = 76,
 
     CreateStream = 128,
     // 129 was UpdateStream. Never reuse it.

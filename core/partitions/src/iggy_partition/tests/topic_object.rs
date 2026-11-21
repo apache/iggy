@@ -124,6 +124,22 @@ async fn given_a_geo_topic_partition_when_its_primary_has_not_read_the_topic_obj
     );
 }
 
+#[test]
+fn given_a_geo_topic_partition_that_places_batches_when_its_primary_has_not_read_the_topic_object_should_take_no_placed_send_until_it_does()
+ {
+    let mut partition = geo_partition();
+    partition.set_places_batches(true);
+    assert!(
+        !partition.takes_placed_sends(),
+        "a send uploaded now would be refused at the partition"
+    );
+
+    let (id, key, _scope) = partition.begin_topic_object_check(at(START)).unwrap();
+    partition.finish_topic_object_check(id, &Ok(Ok(TopicRead::Found(object(key)))), at(START));
+
+    assert!(partition.takes_placed_sends());
+}
+
 #[compio::test]
 async fn given_a_read_that_did_not_find_a_live_topic_when_the_next_pass_runs_should_wait_and_keep_refusing()
  {

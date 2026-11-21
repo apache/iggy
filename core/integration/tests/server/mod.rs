@@ -48,6 +48,10 @@ mod geo_topic_fs;
 // Geo peers: two verified fs peers and one whose store refuses connections,
 // against a server that keeps serving and writes nothing to a peer.
 mod geo_peers;
+// Two clusters on fs: a peer's geo topic appears as a shadow stream, refuses
+// every client write, goes stale with the peer's store, and leaves after its
+// delete.
+mod geo_shadow_fs;
 pub(crate) mod tiered_storage_fs;
 mod tiered_storage_s3;
 // /metrics carries per-topic size and message count.

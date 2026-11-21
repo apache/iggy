@@ -400,6 +400,7 @@ func TestDecodeReplyFor_ResolvedUpdate(t *testing.T) {
 				"checksum":  func(reply *[HeaderSize]byte) { reply[replyOffsetChecksum] ^= 1 },
 				"operation": func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationCreateTopicWithAssignments) },
 				"rewrap":    func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationRewrapStreamKeys) },
+				"shadow":    func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationShadowTopic) },
 			} {
 				unrelated := *header
 				mismatch(&unrelated)
@@ -411,6 +412,7 @@ func TestDecodeReplyFor_ResolvedUpdate(t *testing.T) {
 			assert.False(t, ReplyOperationMatches(OperationCreateStream, resolved))
 		}
 		assert.False(t, ReplyOperationMatches(OperationUpdateResource, OperationRewrapStreamKeys))
+		assert.False(t, ReplyOperationMatches(OperationUpdateResource, OperationShadowTopic))
 	})
 }
 

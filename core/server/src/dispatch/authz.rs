@@ -124,6 +124,7 @@ where
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
                 | Operation::RewrapStreamKeys
+                | Operation::ShadowTopic
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners

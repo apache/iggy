@@ -513,6 +513,10 @@ pub struct ShardMetrics {
     /// Per geo peer, 1 while the peer's store did not answer the last read of
     /// its identity object.
     geo_peer_unreachable: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, the shadow topics that serve what they hold because the
+    /// peer's store did not answer the last listing of its topic objects. Set
+    /// by the metadata primary.
+    geo_shadow_topics_stale: Family<GeoPeerLabel, Gauge>,
 }
 
 impl ShardMetrics {
@@ -677,6 +681,7 @@ impl ShardMetrics {
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
             geo_peer_unreachable: Family::default(),
+            geo_shadow_topics_stale: Family::default(),
         }
     }
 
@@ -823,6 +828,27 @@ impl ShardMetrics {
         self.object_store_unreachable = node.object_store_unreachable.clone();
         self.geo_peer_identity_verified = node.geo_peer_identity_verified.clone();
         self.geo_peer_unreachable = node.geo_peer_unreachable.clone();
+        self.geo_shadow_topics_stale = node.geo_shadow_topics_stale.clone();
+    }
+
+    /// Set the count of stale shadow topics of the geo peer `origin`.
+    pub fn set_geo_shadow_topics_stale(&self, origin: &str, stale: usize) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_shadow_topics_stale
+            .get_or_create(&label)
+            .set(i64::try_from(stale).unwrap_or(i64::MAX));
+    }
+
+    /// The count of stale shadow topics of the geo peer `origin`.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn geo_shadow_topics_stale_value(&self, origin: &str) -> i64 {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_shadow_topics_stale.get_or_create(&label).get()
     }
 
     /// Both gauges of the geo peer `origin`: verified, then unreachable.
@@ -2361,6 +2387,11 @@ impl ShardMetrics {
             "geo_peer_unreachable",
             "1 while the store of the geo peer did not answer the last read of its identity object",
             self.geo_peer_unreachable.clone(),
+        );
+        registry.register(
+            "geo_shadow_topics_stale",
+            "Shadow topics of the geo peer that serve what they hold, because its store did not answer the last listing",
+            self.geo_shadow_topics_stale.clone(),
         );
     }
 

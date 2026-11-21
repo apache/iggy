@@ -86,6 +86,25 @@ impl<T> IdSlab<T> {
         self.entries.len() - 1
     }
 
+    /// Inserts at `key` instead of [`Self::vacant_key`], and returns `false`
+    /// without inserting when `key` is occupied. The keys it passes over
+    /// above the high-water mark become free, as a rebuild from the same
+    /// pairs makes them, so the arena stays a function of its occupied set.
+    pub fn insert_at(&mut self, key: usize, value: T) -> bool {
+        if self.contains(key) {
+            return false;
+        }
+        if key >= self.entries.len() {
+            self.free.extend(self.entries.len()..key);
+            self.entries.resize_with(key + 1, || None);
+        } else {
+            self.free.remove(&key);
+        }
+        self.entries[key] = Some(value);
+        self.len += 1;
+        true
+    }
+
     #[must_use]
     pub fn contains(&self, key: usize) -> bool {
         self.get(key).is_some()
@@ -415,6 +434,24 @@ mod tests {
 
         assert_eq!(slab.vacant_key(), 1);
         assert_eq!(slab.insert('c'), 1);
+    }
+
+    #[test]
+    fn given_a_chosen_key_when_inserting_at_it_should_match_a_rebuild_of_the_same_pairs() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        slab.insert('a');
+
+        assert!(slab.insert_at(4, 'e'));
+        assert!(slab.insert_at(2, 'c'));
+        assert!(!slab.insert_at(4, 'x'), "an occupied key is refused");
+
+        let rebuilt: IdSlab<char> = [(0, 'a'), (2, 'c'), (4, 'e')].into_iter().collect();
+        assert_eq!(slab.len(), rebuilt.len());
+        assert_eq!(slab.get(4), Some(&'e'));
+        assert_eq!(slab.vacant_key(), rebuilt.vacant_key());
+        assert_eq!(slab.insert('b'), 1);
+        assert_eq!(slab.insert('d'), 3);
+        assert_eq!(slab.insert('f'), 5);
     }
 
     #[test]

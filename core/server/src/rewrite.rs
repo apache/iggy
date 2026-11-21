@@ -48,9 +48,10 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
 use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
-use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
     MAX_PARTITIONS_PER_REQUEST, Operation, PrepareHeader, RoutedRequestHeader, WireDecode,
@@ -68,6 +69,7 @@ use iggy_common::{
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::shadow::is_shadow_stream_name;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use server_common::Message;
@@ -374,6 +376,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    refuse_shadow_write(shard.plane.metadata().mux_stm.streams(), &request)?;
     match request.header().operation {
         Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
@@ -474,6 +477,51 @@ where
     Ok(Bounded::Request(request))
 }
 
+/// Refuse a client write to a shadow stream before it takes a replicated
+/// log entry. Apply refuses the same, for a request that reached the primary
+/// before this node learned of the stream. A body that does not decode passes,
+/// for the stage that decodes it to refuse.
+fn refuse_shadow_write(
+    streams: &Streams,
+    request: &Message<RoutedRequestHeader>,
+) -> Result<(), IggyError> {
+    let body = request_body(request);
+    let stream_id = match request.header().operation {
+        Operation::CreateTopic => CreateTopicRequest::decode_from(body)
+            .ok()
+            .map(|create| create.stream_id),
+        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(body)
+            .ok()
+            .map(|create| create.stream_id),
+        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(body)
+            .ok()
+            .map(|delete| delete.stream_id),
+        Operation::DeleteTopic => DeleteTopicRequest::decode_from(body)
+            .ok()
+            .map(|delete| delete.stream_id),
+        Operation::DeleteStream => DeleteStreamRequest::decode_from(body)
+            .ok()
+            .map(|delete| delete.stream_id),
+        Operation::DeleteSegments => DeleteSegmentsRequest::decode_from(body)
+            .ok()
+            .map(|delete| delete.stream_id),
+        Operation::UpdateResource => {
+            UpdateResourceRequest::decode_from(body)
+                .ok()
+                .and_then(|patch| match patch.target {
+                    ResourceTarget::Stream { stream_id }
+                    | ResourceTarget::Topic { stream_id, .. } => Some(stream_id),
+                    ResourceTarget::User { .. } => None,
+                })
+        }
+        _ => None,
+    };
+    if stream_id.is_some_and(|stream_id| streams.is_shadow_stream(&stream_id)) {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
+}
+
 /// Decode and admit a stream create, handed on decoded with its admitted
 /// options. A refused one has its copies of a client key erased.
 fn bound_stream_create(request: Message<RoutedRequestHeader>) -> Result<Bounded, IggyError> {
@@ -481,6 +529,10 @@ fn bound_stream_create(request: Message<RoutedRequestHeader>) -> Result<Bounded,
         erase_stream_create(request, None);
         return Err(IggyError::InvalidCommand);
     };
+    if is_shadow_stream_name(create.name.as_str()) {
+        erase_stream_create(request, Some(create));
+        return Err(IggyError::InvalidStreamName);
+    }
     let admitted = admit_create(
         OptionsScope::Stream,
         &create.options,
@@ -544,6 +596,15 @@ where
         // A rule between two keys reads the one this patch leaves alone from
         // the stored map, so a patch of either key meets it.
         validate_local_retention(&admitted.patched(&current)?)?;
+    }
+    if matches!(patch.target, ResourceTarget::Stream { .. })
+        && admitted
+            .columns
+            .name
+            .as_deref()
+            .is_some_and(is_shadow_stream_name)
+    {
+        return Err(IggyError::InvalidStreamName);
     }
     if let (Some(actor_id), ResourceTarget::User { user_id: target_id }) =
         (authorized_user_id, &patch.target)

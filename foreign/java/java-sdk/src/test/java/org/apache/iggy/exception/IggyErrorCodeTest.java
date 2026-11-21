@@ -207,6 +207,7 @@ class IggyErrorCodeTest {
         "1013, INVALID_STREAM_NAME",
         "1014, INVALID_STREAM_ID",
         "1020, TOO_MANY_STREAMS",
+        "1021, SHADOW_STREAM_READ_ONLY",
 
         // Topic errors
         "2001, CANNOT_CREATE_TOPIC_DIRECTORY",
