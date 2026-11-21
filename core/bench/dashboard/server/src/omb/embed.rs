@@ -19,8 +19,8 @@
 //! windows and the latency of each message. No chart puts an OMB number next to an iggy-bench
 //! number.
 
-use crate::error::IggyBenchDashboardServerError;
 use crate::render::{EmbedChart, without_raw_mark};
+use bench_dashboard_shared::embed::OmbChartType;
 use bench_dashboard_shared::omb::OMB_WINDOW_SECONDS;
 use bench_dashboard_shared::omb::chart::{
     END_TO_END_NAME, PUBLISH_NAME, QuantileGroup, WindowMetric, ladder_options,
@@ -31,71 +31,12 @@ use bench_dashboard_shared::omb::result::OmbPercentiles;
 use bench_dashboard_shared::omb::setup::OmbEnvironment;
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 use bench_report::plotting::chart::IggyChart;
-use std::fmt;
-use std::str::FromStr;
 
 /// The separator of the iggy-bench subtext, so the two kinds of embed read alike.
 const SEPARATOR: &str = "  •  ";
 const NO_MACHINES: &str = "Machines not recorded";
 /// The hexadecimal digits of [`setup_line_hash`], as many as the run id has.
 const SETUP_HASH_CHARS: usize = 16;
-
-/// The chart of an OMB run that an embed shows, named as in the `type` query parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OmbChartType {
-    /// The publish latency P50, P99 and P99.9 of each window.
-    Latency,
-    /// The end-to-end latency P50, P99 and P99.9 of each window.
-    EndToEndLatency,
-    /// The publish and consume throughput of each window.
-    Throughput,
-    /// The publish and end-to-end latency from P50 to the maximum, over the whole run.
-    Ladder,
-    /// The publish and end-to-end latency at every percentile of the merged histograms.
-    Quantiles,
-}
-
-impl FromStr for OmbChartType {
-    type Err = IggyBenchDashboardServerError;
-
-    fn from_str(chart_type: &str) -> Result<Self, Self::Err> {
-        match chart_type {
-            "latency" => Ok(Self::Latency),
-            "end_to_end_latency" => Ok(Self::EndToEndLatency),
-            "throughput" => Ok(Self::Throughput),
-            "ladder" => Ok(Self::Ladder),
-            "quantiles" => Ok(Self::Quantiles),
-            _ => Err(IggyBenchDashboardServerError::BadRequest(format!(
-                "Invalid chart type: '{chart_type}'. Must be 'latency', 'end_to_end_latency', \
-                 'throughput', 'ladder', or 'quantiles'"
-            ))),
-        }
-    }
-}
-
-impl fmt::Display for OmbChartType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Latency => "latency",
-            Self::EndToEndLatency => "end_to_end_latency",
-            Self::Throughput => "throughput",
-            Self::Ladder => "ladder",
-            Self::Quantiles => "quantiles",
-        })
-    }
-}
-
-impl OmbChartType {
-    const fn title(self) -> &'static str {
-        match self {
-            Self::Latency => WindowMetric::PublishLatency.title(),
-            Self::EndToEndLatency => WindowMetric::EndToEndLatency.title(),
-            Self::Throughput => WindowMetric::Throughput.title(),
-            Self::Ladder => "Latency ladder",
-            Self::Quantiles => "Latency percentiles",
-        }
-    }
-}
 
 impl EmbedChart {
     /// The `chart_type` chart of an OMB run, with the run's setup line in place of the hardware
@@ -279,14 +220,6 @@ mod tests {
     use charming::Chart;
     use chrono::Utc;
 
-    const EVERY_TYPE: [OmbChartType; 5] = [
-        OmbChartType::Latency,
-        OmbChartType::EndToEndLatency,
-        OmbChartType::Throughput,
-        OmbChartType::Ladder,
-        OmbChartType::Quantiles,
-    ];
-
     fn detail(fixture: &FixtureRun) -> OmbRunDetail {
         let json = fixture.json();
         let result = OmbResult::try_from(json.as_slice()).expect("the fixture result parses");
@@ -323,7 +256,7 @@ mod tests {
 
     #[test]
     fn given_every_chart_type_when_parsed_from_its_name_should_round_trip() {
-        for chart_type in EVERY_TYPE {
+        for chart_type in OmbChartType::ALL {
             assert_eq!(
                 chart_type.to_string().parse::<OmbChartType>().ok(),
                 Some(chart_type)
@@ -380,7 +313,7 @@ mod tests {
         );
         let edited = OmbRunDetail::new(summary, &result);
 
-        for chart_type in EVERY_TYPE {
+        for chart_type in OmbChartType::ALL {
             let before = EmbedChart::of_omb_run(&original, chart_type, true)
                 .unwrap_or_else(|| panic!("the fixture run has a {chart_type} chart"));
             let after = EmbedChart::of_omb_run(&edited, chart_type, true)
