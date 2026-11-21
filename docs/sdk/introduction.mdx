@@ -1,0 +1,152 @@
+---
+title: Introduction
+description: "The official Iggy client SDKs, their packages and registries, and the transports each one supports."
+---
+
+Iggy provides official client SDKs in multiple languages. The **Rust SDK** is the most feature-complete, offering both a high-level API (with auto-batching, consumer groups, offset management, retry logic) and a low-level API for direct protocol operations.
+
+| Language | Package | Registry | Transport | Connection string |
+|----------|---------|----------|-----------|-------------------|
+| Rust | [iggy](https://crates.io/crates/iggy) | crates.io | TCP, QUIC, HTTP, WebSocket | Yes |
+| Python | [apache-iggy](https://pypi.org/project/apache-iggy/) | PyPI | TCP, QUIC, HTTP, WebSocket | Yes (PyO3 wrapper) |
+| Java | [iggy](https://mvnrepository.com/artifact/org.apache.iggy/iggy) | Maven Central | TCP, HTTP | Yes |
+| Node.js | [apache-iggy](https://www.npmjs.com/package/apache-iggy) | npm | TCP | Yes |
+| Go | [iggy-go](https://pkg.go.dev/github.com/apache/iggy/foreign/go) | pkg.go.dev | TCP | Yes |
+| C# | [Apache.Iggy](https://www.nuget.org/packages/Apache.Iggy/) | NuGet | TCP, HTTP | Yes |
+| C++ | [iggy-cpp](https://github.com/apache/iggy/tree/server-0.10.0/foreign/cpp) | GitHub (WIP) | TCP, QUIC, HTTP, WebSocket | Yes (Rust FFI) |
+| PHP | [apache/iggy-php](https://github.com/apache/iggy/tree/server-0.10.0/foreign/php) | GitHub (source) | TCP, QUIC, HTTP, WebSocket | Yes (Rust FFI) |
+| Swift | [Iggy](https://github.com/apache/iggy/tree/server-0.10.0/foreign/swift) | Swift Package Manager | TCP with optional TLS | Yes |
+
+Python, C++, and PHP wrap the Rust SDK, so they inherit all transport protocols when using connection strings. Java and C# implement TCP and HTTP natively. Go and Node.js currently support TCP *only*.
+
+The Rust SDK is always the first to receive new features.
+
+## Server compatibility
+
+Server 0.10.0 uses binary protocol 0.12.0. Upgrade clients and server together. There is no fallback to the 0.9 protocol. The table lists the component versions released with each server version.
+
+| Component | Server 0.10.0 | Server 0.9.0 |
+| --- | --- | --- |
+| Rust SDK (`iggy`) | `0.12.0` | `0.11.0` |
+| CLI (`iggy-cli`) | `0.15.0` | `0.14.0` |
+| Python SDK (`apache-iggy`) | `0.10.0` | `0.9.0` |
+| Java SDK (`org.apache.iggy:iggy`) | `0.10.0` | `0.9.0` |
+| Node.js SDK (`apache-iggy`) | `0.11.0` | `0.10.0` |
+| Go SDK (`github.com/apache/iggy/foreign/go`) | `v0.10.0` | `v0.9.0` |
+| C# SDK (`Apache.Iggy`) | `0.10.0` | `0.9.0` |
+| Swift SDK | `0.2.0` | Not included |
+| C++ SDK | `0.2.0`, source | Source |
+| PHP SDK | `0.2.0`, source | Source |
+
+C++ and PHP are included in the source archive. Swift uses the root Swift Package Manager manifest. See [Upgrading](/docs/server/upgrading) before replacing an existing deployment.
+
+## Prerequisites
+
+The examples below use the `iggy`/`iggy` root credentials. For a new local development instance, with no `IGGY_ROOT_USERNAME` or `IGGY_ROOT_PASSWORD` overrides, use:
+
+```bash
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+`--fresh` **wipes this replica's local data directory**. In a cluster, it can recover stored credentials from another replica. The environment takes precedence over the default-credentials flag, and bootstrap settings do not replace recovered credentials. This setup is for *development only*. Use a disposable data directory. See [Connection Strings](/docs/sdk/connection-strings) for the authentication details.
+
+## Connection string
+
+Every SDK has connection-string support. Accepted schemes, credentials and options differ by language. Java currently accepts username/password TCP strings with `tls` and `tls_ca_file` only. They provide a compact way to configure the client, including the transport protocol, credentials, server address, and options.
+
+**Format:**
+
+```text
+iggy://username:password@host:port[?options]
+```
+
+**Transport selection** via scheme:
+
+| Scheme | Transport |
+|--------|-----------|
+| `iggy://` | TCP (default) |
+| `iggy+tcp://` | TCP |
+| `iggy+quic://` | QUIC |
+| `iggy+http://` | HTTP |
+| `iggy+ws://` | WebSocket |
+
+**Personal Access Token** authentication: any credential without a colon is treated as a PAT. Server-minted tokens carry no prefix, so paste the token exactly as returned:
+
+```text
+iggy://<personal-access-token>@host:port
+```
+
+**Examples:**
+
+The Rust snippets assume an async Tokio context. HTTP requires an explicit login after construction. Connection-string credentials are applied automatically only by the binary transports.
+
+```rust
+use iggy::prelude::*;
+
+// Rust - TCP with default options
+let client = IggyClient::from_connection_string("iggy://iggy:iggy@127.0.0.1:8090")?;
+
+// Rust - QUIC
+let client = IggyClient::from_connection_string("iggy+quic://iggy:iggy@127.0.0.1:8080")?;
+
+// Rust - TCP with options
+let client = IggyClient::from_connection_string(
+    "iggy://iggy:iggy@127.0.0.1:8090?nodelay=true&reconnection_retries=unlimited&heartbeat_interval=5s"
+)?;
+```
+
+```python
+from apache_iggy import IggyClient
+
+client = IggyClient.from_connection_string("iggy://iggy:iggy@127.0.0.1:8090")
+```
+
+The option keys differ per transport and unknown keys are rejected as **hard errors**. See [Connection Strings](/docs/sdk/connection-strings) for the full per-transport option tables, defaults, and default ports.
+
+## Common operations
+
+The Rust SDK exposes these operations through traits on `IggyClient`. Availability and method names vary across foreign SDKs and transports:
+
+- **SystemClient** - ping, stats, snapshot
+- **StreamClient** - create, get, list, update, delete streams
+- **TopicClient** - create, get, list, update, delete topics
+- **PartitionClient** - create, delete partitions
+- **SegmentClient** - delete segments
+- **MessageClient** - send, poll messages
+- **ConsumerOffsetClient** - get, store, delete consumer offsets
+- **ConsumerGroupClient** - create, get, list, delete consumer groups
+- **UserClient** - create, get, list, update, delete users, change password, update permissions
+- **PersonalAccessTokenClient** - create, list, delete PATs
+- **ClusterClient** - cluster metadata
+
+## Polling strategies
+
+When polling messages, you can choose from several strategies (Rust method names are shown):
+
+| Strategy | Description |
+|----------|-------------|
+| `offset(n)` | Start from a specific offset |
+| `timestamp(t)` | Start at or after the given broker append timestamp |
+| `first()` | Start from the earliest available message |
+| `last()` | Read the tail ending at the committed offset, up to the requested count |
+| `next()` | Continue after the stored consumer offset, or start at zero if none is stored |
+
+## Partitioning strategies
+
+When sending messages, you can control partition routing (Rust method names are shown):
+
+| Strategy | Description |
+|----------|-------------|
+| `partition_id(n)` | Send to a specific partition |
+| `balanced()` | Round-robin across partitions |
+| `messages_key(key)` | Hash-based routing by key |
+
+The Rust SDK resolves these strategies before sending a binary request. The HTTP API can resolve the strategy on the server. Binary clients route to the selected partition primary.
+
+## Read and recovery APIs
+
+Use [deferred polling](/docs/sdk/deferred-polling) to wait for messages. A partition reader groups partitions by primary, and a consumer hands messages to the application one at a time. `PollOptions` defines the count, wait, byte budget and commit policy. Manual commits are the shared default.
+
+Resource creation accepts typed options. Updates use patches that change only supplied fields and can reset supported defaults. See [Topic options](/docs/server/topic-options) and [Stream options](/docs/server/stream-options).
+
+SDKs also expose [metadata changes](/docs/sdk/metadata-changes) and raw requests to a selected replica. Recovery APIs differ. Swift does not expose retained mutation resolution or pending mutation limits. It has abandonment for uncertain committing reads. Read each language guide before implementing retries after an uncertain write.
