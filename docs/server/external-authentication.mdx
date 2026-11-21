@@ -1,0 +1,61 @@
+---
+title: External Authentication
+description: "Delegate unknown-user logins to an HTTP service that maps callers to existing Iggy accounts."
+---
+
+An external authentication callout delegates a login decision to an HTTP service. Iggy calls it only when the submitted username does not exist locally. A wrong password for a local user never falls back to the service. Personal access tokens and HTTP bearer validation use their existing authentication paths.
+
+## Configure the service
+
+Provision the target Iggy account first. It must be active and cannot be root. Give it the permissions that mapped callers need. The service maps identities to this account. It does not create accounts or supply permissions.
+
+```toml
+[external_auth]
+enabled = true
+url = "https://auth.example.com/iggy/verify"
+timeout = "5 s"
+max_concurrent_callouts = 64
+```
+
+`url` names the HTTPS endpoint. `IGGY_EXTERNAL_AUTH_URL` sets it from the environment and keeps it out of the file. The server sends the submitted password to this endpoint. Protect both the client connection and the callout with TLS.
+
+The concurrency cap applies per shard, so total in-flight callouts can reach the shard count multiplied by this value. There is no per-client rate limit in the callout. Apply one at the service or network boundary if required.
+
+## Request and response
+
+Iggy sends a JSON `POST`:
+
+```json
+{
+  "transport": "tcp",
+  "client_address": "127.0.0.1:50000",
+  "connection_id": "00000000-0000-0000-0000-000000000001",
+  "credentials": {
+    "type": "username_password",
+    "username": "external-user",
+    "password": "submitted-password"
+  }
+}
+```
+
+`transport` is `tcp`, `tcp_tls`, `ws`, `wss`, `quic` or `http`. Binary connections keep their connection identity across reconnect retries. HTTP creates a new UUID for each login request.
+
+The service must return a successful HTTP status and a JSON decision:
+
+```json
+{"decision": "allow", "username": "service-account"}
+```
+
+To reject the login:
+
+```json
+{"decision": "deny", "reason": "Invalid credentials"}
+```
+
+The reason is optional. An allowed username must resolve to the provisioned account at admission. The server rejects malformed decisions and refuses redirects from the callout endpoint.
+
+## Failure and replay
+
+The normal-status metadata primary performs callouts. Other nodes and view changes can produce retryable errors. Timeouts, network failures, overload, HTTP 429 and HTTP 5xx map to retryable failures. Other unsuccessful HTTP responses and invalid decisions terminate the login.
+
+The SDK can replay a login. The service must accept repeated verification of the same credentials safely. One-time passwords that become invalid after the first verification do not survive this replay model. A failed external service never grants access by default.
