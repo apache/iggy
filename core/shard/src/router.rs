@@ -546,6 +546,7 @@ where
                     self.tick_fresh_writes().await;
                     self.tick_fresh_sweeps();
                     self.tick_long_term_rewrites().await;
+                    self.tick_long_term_merges().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -810,6 +811,7 @@ where
                     let _ = self.tick_partitions(&mut namespace_scratch).await;
                     self.tick_fresh_writes().await;
                     self.tick_long_term_rewrites().await;
+                    self.tick_long_term_merges().await;
                     // After the tick: the first tick fires one interval after
                     // the stop began, so the tick at the deadline must still
                     // start its share of the reach.
@@ -1432,6 +1434,25 @@ where
             }
             LifecycleFrame::TopicObjectCheckFinished(finished) => {
                 self.on_topic_object_check_finished(&finished);
+            }
+            LifecycleFrame::SegmentMergeFinished(finished) => {
+                self.on_segment_merge_finished(*finished).await;
+            }
+            LifecycleFrame::RetainLongTerm {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_long_term(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
             }
             LifecycleFrame::TruncatePartition {
                 namespace,

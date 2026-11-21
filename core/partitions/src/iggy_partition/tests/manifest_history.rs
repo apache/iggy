@@ -442,6 +442,7 @@ impl History {
                 .map(|segment| segment.end_offset)
                 .or(trim_point),
             trim_point,
+            segments_keyed_by_both_offsets: false,
             segments: stored,
         };
         assert_eq!(manifest.as_ref(), Some(&expected), "{}", self.trace());

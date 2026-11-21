@@ -57,8 +57,8 @@ use metadata::AppliedFrontier;
 use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::{
-    FreshObjectSweeper, FreshObjectUploader, LongTermWriter, ManifestPublisher, ObjectDeleter,
-    SegmentUploader, TopicObjects,
+    FreshObjectSweeper, FreshObjectUploader, LongTermMerger, LongTermWriter, ManifestPublisher,
+    ObjectDeleter, SegmentUploader, TopicObjects,
 };
 use shard::Receiver;
 use shard::metrics::ShardMetrics;
@@ -124,15 +124,16 @@ enum Verdict {
 
 /// What a shard writes to the object store with: its segment uploader, its
 /// object deleter, its manifest publisher, the uploader of its fresh objects,
-/// the writer of its long-term segments, the sweeper of fresh objects and the
-/// jobs on geo topic objects. The shard holds them only while its node passes
-/// the store identity check.
+/// the writer and the merger of its long-term segments, the sweeper of fresh
+/// objects and the jobs on geo topic objects. The shard holds them only while
+/// its node passes the store identity check.
 pub struct TierHandlers {
     uploader: Rc<dyn SegmentUploader>,
     deleter: Rc<dyn ObjectDeleter>,
     publisher: Rc<dyn ManifestPublisher>,
     fresh_uploader: Rc<dyn FreshObjectUploader>,
     long_term_writer: Rc<dyn LongTermWriter>,
+    long_term_merger: Rc<dyn LongTermMerger>,
     fresh_sweeper: Rc<dyn FreshObjectSweeper>,
     topic_objects: Rc<dyn TopicObjects>,
     held: bool,
@@ -358,12 +359,14 @@ const fn may_claim(
 }
 
 impl TierHandlers {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         uploader: Rc<dyn SegmentUploader>,
         deleter: Rc<dyn ObjectDeleter>,
         publisher: Rc<dyn ManifestPublisher>,
         fresh_uploader: Rc<dyn FreshObjectUploader>,
         long_term_writer: Rc<dyn LongTermWriter>,
+        long_term_merger: Rc<dyn LongTermMerger>,
         fresh_sweeper: Rc<dyn FreshObjectSweeper>,
         topic_objects: Rc<dyn TopicObjects>,
     ) -> Self {
@@ -373,6 +376,7 @@ impl TierHandlers {
             publisher,
             fresh_uploader,
             long_term_writer,
+            long_term_merger,
             fresh_sweeper,
             topic_objects,
             held: false,
@@ -394,6 +398,7 @@ impl TierHandlers {
         shard.set_manifest_publisher(verified.then(|| Rc::clone(&self.publisher)));
         shard.set_fresh_uploader(verified.then(|| Rc::clone(&self.fresh_uploader)));
         shard.set_long_term_writer(verified.then(|| Rc::clone(&self.long_term_writer)));
+        shard.set_long_term_merger(verified.then(|| Rc::clone(&self.long_term_merger)));
         shard.set_fresh_sweeper(verified.then(|| Rc::clone(&self.fresh_sweeper)));
         shard.set_topic_objects(verified.then(|| Rc::clone(&self.topic_objects)));
         self.held = verified;
@@ -412,8 +417,8 @@ mod tests {
         ObjectRange, PutBody, PutOptions,
     };
     use partitions::{
-        ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermWriter,
-        ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
+        ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
+        ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
     };
 
     use super::*;
@@ -614,6 +619,10 @@ mod tests {
                 InlineTierExecutor::new(MemoryStore::new()),
                 layout(),
             )),
+            Rc::new(ExecutorLongTermMerger::new(
+                InlineTierExecutor::new(MemoryStore::new()),
+                layout(),
+            )),
             Rc::new(ExecutorFreshSweeper::new(
                 InlineTierExecutor::new(MemoryStore::new()),
                 layout(),
@@ -631,16 +640,17 @@ mod tests {
                 shard.manifest_publisher().is_some(),
                 shard.fresh_uploader().is_some(),
                 shard.long_term_writer().is_some(),
+                shard.long_term_merger().is_some(),
                 shard.fresh_sweeper().is_some(),
                 shard.topic_objects().is_some(),
             ]
         };
 
-        assert_eq!(held(&mut handlers, false), [false; 7]);
-        assert_eq!(held(&mut handlers, true), [true; 7]);
-        assert_eq!(held(&mut handlers, true), [true; 7]);
-        assert_eq!(held(&mut handlers, false), [false; 7]);
-        assert_eq!(held(&mut handlers, true), [true; 7]);
+        assert_eq!(held(&mut handlers, false), [false; 8]);
+        assert_eq!(held(&mut handlers, true), [true; 8]);
+        assert_eq!(held(&mut handlers, true), [true; 8]);
+        assert_eq!(held(&mut handlers, false), [false; 8]);
+        assert_eq!(held(&mut handlers, true), [true; 8]);
     }
 
     #[test]

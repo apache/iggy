@@ -171,14 +171,19 @@ where
         partition: &IggyPartition<B, SB>,
     ) {
         if partition.take_long_term_changed() {
-            self.long_term_changed(namespace, partition.created_revision());
+            self.long_term_changed(
+                namespace,
+                partition.created_revision(),
+                partition.merges_under_pressure(),
+            );
         }
     }
 
-    fn long_term_changed(&self, namespace: IggyNamespace, created_revision: u64) {
+    fn long_term_changed(&self, namespace: IggyNamespace, created_revision: u64, pressed: bool) {
         self.rewrite_pacing
             .borrow_mut()
             .committed(&(namespace, created_revision), self.bus.monotonic_micros());
+        self.long_term_merge_committed(&(namespace, created_revision), pressed);
         if self.manifest_publisher.borrow().is_some() {
             self.request_publish_manifest(namespace, created_revision, IggyTimestamp::now());
         }
@@ -190,7 +195,9 @@ where
     /// commands that committed outside a partition I/O step, stage the
     /// manifest passes that no commit asks for, make the pass of a partition
     /// past its backlog limit due, start the passes that are due, and report
-    /// how far the rewrites are behind, per partition and at worst.
+    /// how far the rewrites are behind, per partition and at worst, the
+    /// largest backlog, how long the longest long-term log is, and how many
+    /// objects no long-term log accounts for or wait for their delete.
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
@@ -223,20 +230,27 @@ where
             }
         }
         let limit = self.rewrite_pacing.borrow().backlog_limit();
+        let mut unannounced_objects = 0;
+        let mut dead_objects = 0;
+        let mut most_segments = 0;
         let mut changed = Vec::new();
         let mut past_limit = Vec::new();
         let mut largest_backlog = 0;
         let mut lags = self.metrics.long_term_lags_to_fill();
         for key in self.rewrite_pacing.borrow().paced() {
+            let (namespace, created_revision) = key;
             let Some(partition) = partitions
-                .get_by_ns(&key.0)
-                .filter(|partition| partition.created_revision() == key.1)
+                .get_by_ns(namespace)
+                .filter(|partition| partition.created_revision() == *created_revision)
             else {
                 continue;
             };
+            unannounced_objects += partition.long_term_unannounced_objects();
+            dead_objects += partition.queued_dead_long_term_objects();
+            most_segments = most_segments.max(partition.long_term_segments().len());
             let long_term_changed = partition.take_long_term_changed();
             if long_term_changed {
-                changed.push(*key);
+                changed.push((*key, partition.merges_under_pressure()));
             }
             if !partition.consensus().is_primary() {
                 continue;
@@ -257,8 +271,12 @@ where
             }
         }
         self.metrics.set_long_term_lags(lags);
-        for (namespace, created_revision) in changed {
-            self.long_term_changed(namespace, created_revision);
+        self.metrics
+            .set_long_term_unannounced_objects(unannounced_objects);
+        self.metrics.set_long_term_dead_objects(dead_objects);
+        self.metrics.set_long_term_segments(most_segments);
+        for ((namespace, created_revision), pressed) in changed {
+            self.long_term_changed(namespace, created_revision, pressed);
         }
         let now = self.bus.monotonic_micros();
         let due = {

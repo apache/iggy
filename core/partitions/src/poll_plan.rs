@@ -218,6 +218,19 @@ pub struct DiskSegment {
     pub(crate) source: SegmentSource,
 }
 
+impl DiskSegment {
+    /// Where the segment's `.index` is in `partition_dir`, or where the
+    /// fetched one goes.
+    fn index_path(&self, partition_dir: &str) -> String {
+        match &self.source {
+            SegmentSource::Remote(log) => format!("{partition_dir}/{}", log.index_file_name()),
+            SegmentSource::Local => {
+                format!("{partition_dir}/{:0>20}.index", self.start_offset)
+            }
+        }
+    }
+}
+
 /// Where a walk reads a segment's bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentSource {
@@ -293,6 +306,21 @@ pub struct PollContext {
     /// cluster's log. A trim that drops it before the read completes may have
     /// let the origin delete its objects, so the owner refuses the read.
     pub(crate) peer_first_segment: Option<u64>,
+    /// The remote segments the read walks, on a partition that follows
+    /// another cluster's log. The origin deletes the objects of segments it
+    /// merged into one, so the owner refuses the read once a manifest put
+    /// one segment in the place of any of these.
+    pub(crate) peer_segments: Option<PeerSegmentRun>,
+}
+
+/// Consecutive segments of a peer log, as a poll plan saw them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerSegmentRun {
+    /// The first offset of the first segment.
+    pub(crate) start_offset: u64,
+    /// The last offset of the last segment.
+    pub(crate) end_offset: u64,
+    pub(crate) segments: usize,
 }
 
 /// An owned read result awaiting validation by the partition owner.
@@ -1356,6 +1384,7 @@ impl DiskReadPlan {
                     start_offset: segment.start_offset,
                     object: SegmentObject::Log,
                 },
+                keyed_end_offset: None,
                 range: 0..segment.persisted,
             },
         ))
@@ -1452,7 +1481,7 @@ impl DiskReadPlan {
         }
         let fetched = self
             .index_fetches
-            .join(segment.start_offset, |task| {
+            .join(segment.start_offset, log.keyed_end_offset, |task| {
                 IndexFetch::start(
                     task,
                     Rc::clone(remote),
@@ -1556,7 +1585,7 @@ impl DiskReadPlan {
                 cursor.position,
             )));
         }
-        let path = format!("{partition_dir}/{:0>20}.index", segment.start_offset);
+        let path = segment.index_path(partition_dir);
         let Some((reader, entry_count)) = self.open_index(segment, partition_dir, &path).await?
         else {
             return Ok(None);
@@ -1961,6 +1990,7 @@ mod tests {
                         owner: None,
                         _group_poll: None,
                         peer_first_segment: None,
+                        peer_segments: None,
                     },
                     commit_offset: 99,
                     tier: PollTier::Resident {
@@ -2368,6 +2398,7 @@ mod tests {
                 owner: None,
                 _group_poll: None,
                 peer_first_segment: None,
+                peer_segments: None,
                 history: snapshot_history,
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -2399,6 +2430,7 @@ mod tests {
                 owner: None,
                 _group_poll: None,
                 peer_first_segment: None,
+                peer_segments: None,
                 history: PollHistoryId::default(),
                 consumer: PollingConsumer::Consumer(consumer_id, partition_id),
                 auto_commit: true,
@@ -2432,6 +2464,7 @@ mod tests {
                     owner: None,
                     _group_poll: None,
                     peer_first_segment: None,
+                    peer_segments: None,
                 },
                 commit_offset: 9,
                 tier: PollTier::Disk {
@@ -2567,6 +2600,7 @@ mod tests {
                 owner: None,
                 _group_poll: None,
                 peer_first_segment: None,
+                peer_segments: None,
             },
             commit_offset: u64::from(BATCHES) - 1,
             tier: PollTier::Disk {
@@ -2793,6 +2827,7 @@ mod tests {
                 owner: None,
                 _group_poll: None,
                 peer_first_segment: None,
+                peer_segments: None,
             },
             commit_offset: u64::MAX,
             tier: PollTier::Disk {
@@ -2841,6 +2876,7 @@ mod tests {
                 owner: None,
                 _group_poll: None,
                 peer_first_segment: None,
+                peer_segments: None,
             },
             commit_offset: 0,
             tier: PollTier::Resident {

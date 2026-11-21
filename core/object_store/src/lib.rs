@@ -62,7 +62,7 @@ pub use fresh::{FreshObject, FreshObjectId, is_fresh_object};
 pub use fs::FsStore;
 pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
-pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
+pub use layout::{KeyLayout, LongTermKey, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
 pub use read_only::ReadOnlyStore;

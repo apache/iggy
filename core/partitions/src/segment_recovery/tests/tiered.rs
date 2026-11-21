@@ -22,6 +22,7 @@ use super::segment_recovery_tests::{
     index_entry, prepare_partition_dir, test_config, write_segment,
 };
 use super::*;
+use crate::remote_segments::index_file_name;
 use crate::segment_anchor::{SegmentAnchor, anchor_path, write_anchor};
 use crate::segment_chain::{
     HEADER_SIZE, HashSource, RECORD_SIZE, append_record, chain_path, create_chain,
@@ -475,4 +476,27 @@ async fn given_records_the_trim_point_retired_when_recovering_should_drop_them()
         !Path::new(&fixture.index_path(0)).exists(),
         "the index of a retired segment is swept like any orphan"
     );
+}
+
+/// A partition that follows another cluster's log keeps no `.log` and no
+/// chain, and its polls fetch the `.index` of the peer's segments under
+/// names of one offset or of both. A manifest applied after the start lists
+/// the segments again, so what an earlier run fetched is scratch.
+#[compio::test]
+async fn given_fetched_indexes_named_by_one_offset_and_by_both_when_recovering_should_sweep_them() {
+    let fixture = fixture_at(&[]);
+    let fetched = [index_file_name(0, None), index_file_name(0, Some(9))]
+        .map(|name| format!("{}/{name}", fixture.directory));
+    for path in &fetched {
+        fs::write(path, index_entry(0, 0)).unwrap();
+    }
+
+    fixture
+        .recover(None, &PartitionStats::default())
+        .await
+        .unwrap();
+
+    for path in &fetched {
+        assert!(!Path::new(path).exists(), "{path}");
+    }
 }

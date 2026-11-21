@@ -462,6 +462,7 @@ fn poll_read_result<B: MessageBus>(
             },
             _group_poll: None,
             peer_first_segment: None,
+            peer_segments: None,
         },
         fragments,
         commit_offset: partition.offsets().commit_offset,
@@ -2037,6 +2038,9 @@ mod floor_eviction;
 mod free_space;
 mod history;
 mod journal_budget;
+mod long_term_delete;
+mod long_term_merge;
+mod long_term_retention;
 mod manifest_history;
 mod manifest_publish;
 mod materialization;
@@ -2051,6 +2055,8 @@ mod offset_reservations;
 mod offset_storage;
 mod offsets;
 mod peer_log;
+mod peer_log_merges;
+mod peer_log_skips;
 mod persistence_checkpoint;
 mod placed_batches;
 mod quiet;

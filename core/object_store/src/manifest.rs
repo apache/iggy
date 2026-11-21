@@ -35,6 +35,10 @@
 //! ```
 //!
 //! The magic names the version. A reader refuses a magic it does not know.
+//!
+//! `flags` holds one bit for each of: the floor is present, the trim point
+//! is present, and the segments are keyed by both their offsets. A reader
+//! ignores the bits it does not know.
 
 use crate::layout::ObjectPrefix;
 use crate::segment_metadata::SEGMENT_HASH_LEN;
@@ -46,6 +50,7 @@ const CHECKSUM_LEN: usize = size_of::<u32>();
 
 const HAS_FLOOR: u64 = 1;
 const HAS_TRIM_POINT: u64 = 1 << 1;
+const SEGMENTS_KEYED_BY_BOTH_OFFSETS: u64 = 1 << 2;
 
 /// A segment whose `.log` and `.index` objects the store holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +84,12 @@ pub struct PartitionManifest {
     /// Every offset at or below it is gone for good, `None` while retention
     /// removed nothing.
     pub trim_point: Option<u64>,
+    /// Whether the key of a segment's objects names its last offset as well
+    /// as its first, as [`crate::LongTermKey`] does. Otherwise the key names
+    /// the first offset alone, as [`crate::SegmentKey`] does. A manifest
+    /// written before this flag reads as `false`, which is how its segments
+    /// are keyed.
+    pub segments_keyed_by_both_offsets: bool,
     /// In offset order. Each one ends at or below the floor and above the
     /// trim point.
     pub segments: Vec<ManifestSegment>,
@@ -110,6 +121,11 @@ impl PartitionManifest {
         let flags = if self.floor.is_some() { HAS_FLOOR } else { 0 }
             | if self.trim_point.is_some() {
                 HAS_TRIM_POINT
+            } else {
+                0
+            }
+            | if self.segments_keyed_by_both_offsets {
+                SEGMENTS_KEYED_BY_BOTH_OFFSETS
             } else {
                 0
             };
@@ -220,6 +236,7 @@ impl PartitionManifest {
             published_at,
             floor,
             trim_point,
+            segments_keyed_by_both_offsets: flags & SEGMENTS_KEYED_BY_BOTH_OFFSETS != 0,
             segments,
         })
     }
@@ -278,8 +295,62 @@ mod tests {
             published_at: 1_700_000_000_000_000,
             floor: Some(29),
             trim_point: Some(9),
+            segments_keyed_by_both_offsets: false,
             segments: vec![segment(10, 19), segment(20, 29)],
         }
+    }
+
+    /// Where the `flags` word sits: after the magic, the four ids of the
+    /// prefix and `published_at`.
+    const FLAGS_AT: usize = 6 * size_of::<u64>();
+
+    fn flags_of(encoded: &[u8]) -> u64 {
+        u64::from_le_bytes(encoded[FLAGS_AT..FLAGS_AT + 8].try_into().unwrap())
+    }
+
+    /// `encoded` with `flags` in the place of its own, under a checksum that
+    /// matches.
+    fn with_flags(encoded: &[u8], flags: u64) -> Vec<u8> {
+        let mut bytes = encoded[..encoded.len() - CHECKSUM_LEN].to_vec();
+        bytes[FLAGS_AT..FLAGS_AT + 8].copy_from_slice(&flags.to_le_bytes());
+        let checksum = crc32c::crc32c(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn given_segments_keyed_by_both_offsets_when_encoding_and_decoding_should_keep_the_flag() {
+        let keyed = PartitionManifest {
+            segments_keyed_by_both_offsets: true,
+            ..manifest()
+        };
+
+        let encoded = keyed.encode();
+
+        assert_eq!(flags_of(&encoded), 0b111);
+        assert_eq!(encoded.len(), manifest().encode().len());
+        assert_eq!(PartitionManifest::decode(&encoded), Ok(keyed));
+    }
+
+    #[test]
+    fn given_bytes_written_before_the_key_flag_when_decoding_should_read_segments_keyed_by_their_first_offset()
+     {
+        let encoded = manifest().encode();
+
+        // The two bits that every earlier build wrote, and no other.
+        assert_eq!(flags_of(&encoded), 0b011);
+        let decoded = PartitionManifest::decode(&encoded).unwrap();
+        assert!(!decoded.segments_keyed_by_both_offsets);
+        assert_eq!(decoded, manifest());
+    }
+
+    #[test]
+    fn given_a_flag_bit_this_build_does_not_know_when_decoding_should_ignore_it() {
+        let encoded = manifest().encode();
+
+        let later = with_flags(&encoded, flags_of(&encoded) | 1 << 3);
+
+        assert_eq!(PartitionManifest::decode(&later), Ok(manifest()));
     }
 
     #[test]
@@ -296,6 +367,7 @@ mod tests {
             published_at: 7,
             floor: None,
             trim_point: None,
+            segments_keyed_by_both_offsets: false,
             segments: Vec::new(),
         };
 

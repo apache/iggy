@@ -46,7 +46,7 @@ use futures::{StreamExt, stream};
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
-use iggy_object_store::{ManifestSegment, ObjectPrefix, SegmentKey, SegmentObject};
+use iggy_object_store::{LongTermKey, ManifestSegment, ObjectPrefix, SegmentObject};
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
 use server_common::yield_to_reactor;
@@ -72,7 +72,7 @@ const LONG_TERM_READ_BYTES: u64 = 1024 * 1024;
 
 /// The most a read of a long-term segment's index asks for. The index of a
 /// segment is a small fraction of this.
-const LONG_TERM_INDEX_BYTES: u64 = 4 * 1024 * 1024;
+pub const LONG_TERM_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Reads of fresh objects one rewrite has in flight at once.
 pub const REWRITE_FETCHES: usize = 4;
@@ -119,6 +119,9 @@ pub struct PlacedReadPlan {
     /// The long-term segments the poll can start in, in offset order. Empty
     /// for a read that starts above the long-term floor.
     pub(crate) long_term: Vec<ManifestSegment>,
+    /// The last offset a long-term segment holds. The placed batches at or
+    /// below it name fresh objects that may be gone.
+    pub(crate) long_term_floor: Option<u64>,
 }
 
 /// What [`PlacedReadPlan::read`] returns.
@@ -126,7 +129,8 @@ pub struct PlacedRead {
     /// The batches that answer the query, each put back together as the
     /// prepare a partition of whole batches would hold, in offset order.
     pub(crate) batches: Vec<Frozen<4096>>,
-    /// A byte limit stopped the read ahead of a batch the query asks for.
+    /// A byte limit, or the end of the long-term segments the plan carries,
+    /// stopped the read ahead of a batch the query asks for.
     pub(crate) truncated: bool,
 }
 
@@ -149,6 +153,18 @@ impl PlacedReadPlan {
         let mut batches = Vec::new();
         self.collect_from_long_term(&mut wanted, &mut batches)
             .await?;
+        if let Some(floor) = self.long_term_floor {
+            // The plan carries only so many long-term segments. A read that
+            // ran out of them below the floor ends there: going on above the
+            // floor would leave a gap.
+            if !self.long_term.is_empty() && !wanted.is_past(floor) {
+                return Ok(PlacedRead {
+                    batches,
+                    truncated: wanted.limited || !wanted.is_full(),
+                });
+            }
+            wanted.skip_through(floor);
+        }
         let placed = self.collect_placed(&mut wanted).await?;
         let same_object = |one: &PlacedBatch, other: &PlacedBatch| {
             one.placement.object_id == other.placement.object_id
@@ -307,14 +323,15 @@ impl PlacedReadPlan {
             // A shard that has not connected its store yet cannot read the
             // segment now, and can once it has.
             let remote = self.remote.as_deref().ok_or(DiskFault::Retryable)?;
-            let key = |object| SegmentKey {
+            let key = |object| LongTermKey {
                 prefix: self.prefix,
                 start_offset: segment.start_offset,
+                end_offset: segment.end_offset,
                 object,
             };
             let index_key = key(SegmentObject::Index);
             let index = self
-                .wait(remote.read_segment_object(&index_key, 0..LONG_TERM_INDEX_BYTES))
+                .wait(remote.read_long_term_object(&index_key, 0..LONG_TERM_INDEX_BYTES))
                 .await?;
             let log = key(SegmentObject::Log);
             let mut position = wanted.first_position(&index, segment.size);
@@ -322,7 +339,7 @@ impl PlacedReadPlan {
             while position < segment.size && !wanted.is_full() {
                 let end = segment.size.min(position.saturating_add(len));
                 let chunk = self
-                    .wait(remote.read_segment_object(&log, position..end))
+                    .wait(remote.read_long_term_object(&log, position..end))
                     .await?;
                 if chunk.len() as u64 != end - position {
                     return Err(DiskFault::Tiered);
@@ -744,6 +761,16 @@ impl Wanted {
                 || self.held_bytes.saturating_add(held) > self.max_bytes)
     }
 
+    /// Whether the batches taken so far reach past `offset`.
+    const fn is_past(&self, offset: u64) -> bool {
+        self.next_offset > offset
+    }
+
+    /// Take no batch that starts at or below `offset` from here on.
+    fn skip_through(&mut self, offset: u64) {
+        self.next_offset = self.next_offset.max(offset.saturating_add(1));
+    }
+
     /// Whether the first message of the poll can be in a segment of these
     /// bounds or before it, so the walk has to look into it.
     const fn may_start_in(&self, start_offset: u64, end_offset: u64, max_timestamp: u64) -> bool {
@@ -1008,6 +1035,7 @@ mod tests {
                 created_revision: 0,
             },
             long_term: Vec::new(),
+            long_term_floor: None,
         }
     }
 

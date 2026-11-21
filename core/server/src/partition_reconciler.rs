@@ -5664,6 +5664,157 @@ mod tests {
         ));
     }
 
+    /// Nothing else asks a partition that places its batches to delete the
+    /// objects its long-term log stopped listing. The pass carries no
+    /// truncation watermark, which does not bound those deletes.
+    #[compio::test]
+    async fn given_a_topic_that_places_its_batches_when_the_cleaner_passes_should_stage_a_delete_pass()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        seed_topic(&mux, 2, 0, "placing-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let deletes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut deletes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                    namespace,
+                    created_revision,
+                    committed_up_to,
+                    ..
+                }) = frame
+                {
+                    deletes.push((namespace, created_revision, committed_up_to));
+                }
+            }
+            deletes
+        };
+        assert_eq!(deletes(), []);
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        assert_eq!(deletes(), [(namespace, created_revision, 0)]);
+    }
+
+    /// The segments of a partition that places its batches hold where the
+    /// messages are, so the per-replica expiry of those is not its retention:
+    /// the cleaner stages the pass over its long-term segments in its place,
+    /// with a byte budget of at least one such segment. Any other partition
+    /// keeps the per-replica pass and the budget of its own segments.
+    #[compio::test]
+    async fn given_a_retention_policy_when_the_cleaner_passes_should_stage_long_term_retention_only_for_a_topic_that_places_its_batches()
+     {
+        const EXPIRY_MICROS: u64 = 60_000_000;
+        // The smallest cap a topic takes is one of its segments. Shared
+        // between this many partitions it is below a long-term segment.
+        const TOPIC_BYTES: u64 = iggy_common::DEFAULT_SEGMENT_SIZE;
+        const PARTITIONS: u32 = 32;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        let assignments = (0..PARTITIONS)
+            .map(|partition| assignment(partition, u64::from(partition) + 1))
+            .collect();
+        seed_topic(&mux, 2, 0, "placing-topic", assignments);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 1024);
+        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let explicit: ResourceOptions = [
+            (OptionKey::MessageExpiry, HeaderValue::from(EXPIRY_MICROS)),
+            (OptionKey::MaxTopicSize, HeaderValue::from(TOPIC_BYTES)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (HeaderKey::from(key), OptionValue::explicit(value)))
+        .collect();
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &update))
+            .expect("UpdateTopic apply succeeds");
+        // The long-term retention passes the cleaner staged, and the byte
+        // budgets of the per-replica expiry passes that went with them.
+        let staged = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut long_term = Vec::new();
+            let mut expiry_budgets = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainLongTerm {
+                        namespace,
+                        created_revision,
+                        message_expiry,
+                        max_bytes,
+                        ..
+                    }) => long_term.push((namespace, created_revision, message_expiry, max_bytes)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
+                        max_bytes,
+                        ..
+                    }) => expiry_budgets.push(max_bytes),
+                    _ => {}
+                }
+            }
+            (long_term, expiry_budgets)
+        };
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(EXPIRY_MICROS));
+        let long_term_segment = partitions::LONG_TERM_SEGMENT_BYTES as u64;
+
+        let (long_term, expiry_budgets) = staged();
+        assert_eq!(long_term, []);
+        assert_eq!(expiry_budgets.len(), PARTITIONS as usize);
+        assert!(
+            expiry_budgets
+                .iter()
+                .all(|budget| budget.is_some_and(|budget| budget >= TOPIC_BYTES)),
+            "a partition of whole batches keeps at least one of its own segments: \
+             {expiry_budgets:?}"
+        );
+
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        let (long_term, expiry_budgets) = staged();
+        assert_eq!(
+            long_term,
+            [(namespace, created_revision, expiry, Some(long_term_segment))]
+        );
+        assert_eq!(expiry_budgets.len(), PARTITIONS as usize - 1);
+    }
+
     /// An evicted segment is read back from the store, so the cleaner stages
     /// an eviction only while the node reads remote segments and passes the
     /// store identity check.

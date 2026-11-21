@@ -35,9 +35,9 @@ use iggy_object_store::{
 };
 use message_bus::IggyMessageBus;
 use partitions::{
-    ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermWriter,
-    ExecutorManifestPublisher, ExecutorObjects, ExecutorTopicObjects, ExecutorUploader,
-    RemoteSegments,
+    ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
+    ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorObjects, ExecutorTopicObjects,
+    ExecutorUploader, RemoteSegments,
 };
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
@@ -174,6 +174,7 @@ pub fn start(
         )),
         Rc::new(ExecutorFreshUploader::new(service.clone(), layout.clone())),
         Rc::new(ExecutorLongTermWriter::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorLongTermMerger::new(service.clone(), layout.clone())),
         Rc::new(ExecutorFreshSweeper::new(service.clone(), layout.clone())),
         Rc::new(ExecutorTopicObjects::new(service, layout.clone())),
     );

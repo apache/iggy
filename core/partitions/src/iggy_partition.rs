@@ -29,12 +29,12 @@ use crate::persistence::{
     FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
-    DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
-    PollTier, ResidentTailSnapshot, SegmentSource,
+    DiskReadPlan, DiskSegment, PartitionDirResolution, PeerSegmentRun, PollContext, PollPlan,
+    PollReadResult, PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::remote_segments::{IndexFetches, RemoteRange};
-use crate::segment::{Segment, SegmentLocation};
+use crate::segment::{RetainedSegment, Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -206,7 +206,7 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
-    /// Set when a command of the long-term log applies on the primary, and
+    /// Set when a command changes the long-term log on the primary, and
     /// taken by the shard, which publishes the manifest and starts the
     /// rewrite that waited for the command.
     pub(crate) long_term_changed: Cell<bool>,
@@ -219,6 +219,12 @@ where
     object_deletes: ObjectDeletes,
     /// Number of the last object-delete job this partition started.
     object_delete_jobs: u64,
+    /// What this replica deletes of its long-term objects while it is the
+    /// primary of a partition that places its batches. Behind a pointer: a
+    /// partition is moved by value through the futures that set it up, and
+    /// only the cleaner's passes and a commit to the long-term log read
+    /// this.
+    pub(crate) long_term_deletes: Box<crate::long_term_delete::LongTermDeletes>,
     /// What this replica publishes of the partition's manifest while it is
     /// the primary.
     pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
@@ -228,6 +234,9 @@ where
     /// What this replica found of its geo topic's object while it is the
     /// primary. Boxed to keep the partition small on the stack.
     pub(crate) topic_object_check: Box<crate::topic_object::TopicObjectCheck>,
+    /// The merges of this partition's small long-term segments, while this
+    /// replica is the primary. Behind a pointer, as the deletes are.
+    pub(crate) long_term_merges: Box<crate::long_term_merge::LongTermMerges>,
     /// Number of the last long-term rewrite this partition started. It
     /// outlives the view, so the late result of an earlier view's rewrite is
     /// never taken for the one in flight.
@@ -1172,10 +1181,12 @@ where
             long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
+            long_term_deletes: Box::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
             topic_object_check: Box::default(),
+            long_term_merges: Box::default(),
             long_term_rewrite_jobs: 0,
             long_term_backlog: Box::default(),
             manifest_publish_jobs: 0,
@@ -4866,7 +4877,7 @@ where
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
-            || self.trimmed_under_peer_read(&result)
+            || self.peer_log_moved_under_read(&result)
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -6421,6 +6432,7 @@ where
             owner,
             _group_poll: group_poll,
             peer_first_segment: None,
+            peer_segments: None,
         };
         if !self.offset_space.committed_seeded || args.count == 0 {
             return PollPlan {
@@ -6535,7 +6547,10 @@ where
                 .segments()
                 .get(start_segment)
                 .map(|segment| segment.start_offset);
+            context.peer_segments =
+                PeerSegmentRun::of(&self.log.segments()[start_segment..start_segment + walked]);
         }
+        let keyed_by_both_offsets = self.reads_segments_keyed_by_both_offsets();
         let cut = start_segment + walked < self.log.segments().len();
         let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
@@ -6553,6 +6568,7 @@ where
                                 start_offset: segment.start_offset,
                                 object: SegmentObject::Log,
                             },
+                            keyed_end_offset: keyed_by_both_offsets.then_some(segment.end_offset),
                             range: 0..segment.size.as_bytes_u64(),
                         })
                     }
@@ -6645,6 +6661,7 @@ where
             deadline: None,
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             long_term,
+            long_term_floor: self.long_term_floor(),
         }
     }
 
@@ -13646,7 +13663,7 @@ where
     }
 
     /// Time-expiry plus size-retention in one pass, for a partition that is not
-    /// tiered: remove the leading sealed
+    /// tiered and holds whole batches: remove the leading sealed
     /// segments that have expired or that push the partition's SEALED bytes
     /// past `max_bytes`. Capped per call by
     /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
@@ -13665,6 +13682,12 @@ where
         // log of a partition that follows another cluster's.
         if self.is_tiered() || self.peer_log.is_some() {
             return SegmentRemoval::default();
+        }
+        // Its segments hold placed batches, whose size and age say nothing
+        // of the messages they name. Those are in the long-term segments,
+        // so what was trimmed there is all that goes here.
+        if self.places_batches() {
+            return self.remove_trimmed_segments().await;
         }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
@@ -13714,6 +13737,53 @@ where
         )
     }
 
+    /// What the retention policy of a topic that places its batches removes
+    /// from this partition's long-term log: the end offset of the last
+    /// leading long-term segment that expired or that pushes the bytes of
+    /// the segments before the last one past `max_bytes`, held at the
+    /// consumer barrier. The last segment is never named.
+    ///
+    /// Nothing is removed here. The caller commits the offset as a trim of
+    /// the long-term log, and every replica follows the trim point with
+    /// [`Self::remove_trimmed_segments`].
+    ///
+    /// `None` on a partition that does not place its batches, and on every
+    /// replica but a primary that applied the view it started: one decision
+    /// per partition keeps the log a function of its own commands.
+    #[must_use]
+    pub fn long_term_retention_end(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<u64> {
+        if !self.places_batches() || !self.state_machines_current() {
+            return None;
+        }
+        retention_end(
+            self.long_term_segments(),
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )
+    }
+
+    /// Remove the sealed segments of placed batches that end at or below the
+    /// trim point of the long-term log, on any replica. A segment that
+    /// reaches past the trim point stays, as does every one between it and
+    /// the long-term floor.
+    ///
+    /// Capped per call as [`Self::remove_sealed_segments_up_to`] is.
+    pub async fn remove_trimmed_segments(&mut self) -> SegmentRemoval {
+        match self.long_term_trim_point() {
+            Some(trim_point) if self.places_batches() => {
+                self.remove_sealed_segments_up_to(trim_point).await
+            }
+            _ => SegmentRemoval::default(),
+        }
+    }
+
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
     /// never the active segment and never past the consumer barrier (the
     /// minimum committed consumer/group offset). Unlinks the messages and
@@ -13737,6 +13807,18 @@ where
         if self.peer_log.is_some() {
             return SegmentRemoval::default();
         }
+        // A placed batch above the long-term floor is the only record of
+        // where its messages sit in the object store. Removing it would lose
+        // them for the rewrite, and so for every other cluster, whoever
+        // asked: retention, or a client that deletes segments.
+        let up_to_offset = if self.places_batches() {
+            match self.long_term_floor() {
+                Some(floor) => up_to_offset.min(floor),
+                None => return SegmentRemoval::default(),
+            }
+        } else {
+            up_to_offset
+        };
         self.maintenance.retention = Some(
             self.maintenance
                 .retention
@@ -14406,11 +14488,18 @@ where
     /// A replica that is not the primary drops what it queued and cancels
     /// the job it started, so a pass over a demoted replica is what stops
     /// its job.
+    ///
+    /// A partition that places its batches has no objects of this kind. Its
+    /// jobs are those of `Self::begin_long_term_delete`, which no
+    /// watermark bounds.
     pub fn begin_object_delete(
         &mut self,
         now: IggyTimestamp,
         committed_up_to: u64,
     ) -> Option<(crate::ObjectDeleteJob, iggy_object_store::TierScopeToken)> {
+        if self.places_batches() {
+            return self.begin_long_term_delete(now);
+        }
         if !self.deletes_objects() {
             self.object_deletes = ObjectDeletes::default();
             return None;
@@ -14462,7 +14551,23 @@ where
     /// grace period from `now`. A sweep that failed is repeated by a later
     /// pass. A delete forgets the segments it removed, and the ones it
     /// did not stay queued.
+    ///
+    /// Returns how many long-term objects a delete removed, which is none
+    /// on a partition that does not place its batches.
     pub fn finish_object_delete(
+        &mut self,
+        id: u64,
+        outcome: crate::ObjectDeleteOutcome,
+        now: IggyTimestamp,
+    ) -> usize {
+        if self.places_batches() {
+            return self.finish_long_term_delete(id, outcome, now);
+        }
+        self.finish_segment_object_delete(id, outcome, now);
+        0
+    }
+
+    fn finish_segment_object_delete(
         &mut self,
         id: u64,
         outcome: crate::ObjectDeleteOutcome,
@@ -16663,18 +16768,18 @@ pub fn settle_cleaned_segment(
 /// `None` when none are expired. The last element is the active segment and is
 /// never considered. `expiry` must be resolved; a `ServerDefault` expires
 /// nothing (see [`Segment::is_expired`]).
-fn leading_expired_end(
-    segments: &[Segment],
+fn leading_expired_end<S: RetainedSegment>(
+    segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,
 ) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut up_to = None;
     for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.is_expired(now, expiry) {
+        if idx == last_idx || !segment.has_expired(now, expiry) {
             break;
         }
-        up_to = Some(segment.end_offset);
+        up_to = Some(segment.last_offset());
     }
     up_to
 }
@@ -16724,20 +16829,20 @@ fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usiz
 /// evict the sealed history instead: at a budget near one segment the active
 /// one alone exceeds it, and every sealed segment is dropped no matter how
 /// small the log is.
-fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
+fn leading_oversized_end<S: RetainedSegment>(segments: &[S], max_bytes: u64) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut resident: u64 = segments
         .iter()
         .take(last_idx)
-        .map(|segment| segment.size.as_bytes_u64())
+        .map(RetainedSegment::stored_bytes)
         .sum();
     let mut up_to = None;
     for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.sealed || resident <= max_bytes {
+        if idx == last_idx || !segment.is_closed() || resident <= max_bytes {
             break;
         }
-        resident -= segment.size.as_bytes_u64();
-        up_to = Some(segment.end_offset);
+        resident -= segment.stored_bytes();
+        up_to = Some(segment.last_offset());
     }
     up_to
 }
@@ -16746,8 +16851,8 @@ fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
 /// expired and the over-budget leading runs, cut back to the last segment that
 /// ends at or below `barrier`. `None` when retention removes nothing. The
 /// active segment (last element) is never named.
-fn retention_end(
-    segments: &[Segment],
+fn retention_end<S: RetainedSegment>(
+    segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,
     max_bytes: Option<u64>,
@@ -16760,8 +16865,8 @@ fn retention_end(
     // `up_to` ends a sealed segment, so the walk stops before the active one.
     segments
         .iter()
-        .take_while(|segment| segment.end_offset <= through)
-        .map(|segment| segment.end_offset)
+        .map(RetainedSegment::last_offset)
+        .take_while(|last_offset| *last_offset <= through)
         .last()
 }
 
