@@ -1,0 +1,53 @@
+---
+title: Welcome
+description: "Apache Iggy documentation: how Iggy organizes data into streams, topics, partitions and segments, and where to start."
+---
+
+<DocsHero />
+
+These docs describe Apache Iggy 0.10.0. The [upgrade guide](/docs/server/upgrading) covers the coordinated cutover and fresh data directory. The [0.9 docs](/docs/0.9) remain available.
+
+## New in 0.10.0
+
+Partitions distribute their primaries across cluster nodes. Topics can select their replication factor. Consumers can wait for messages and fetch several partitions in one request. Streams have separate encryption keys, and resource updates use set/reset patches.
+
+Read about [multi-leader partitions](/docs/clustering/multi-leader), [deferred polling](/docs/sdk/deferred-polling), [stream options](/docs/server/stream-options), [idempotent producers](/docs/sdk/idempotent-producers), [metadata changes](/docs/sdk/metadata-changes), [external authentication](/docs/server/external-authentication) and the [Kafka gateway](/docs/gateways/kafka).
+
+
+<WhyIggy />
+
+## How Iggy organizes data
+
+Iggy uses a hierarchical model: **streams** contain **topics**, topics contain **partitions**, and partitions store messages in **segments** on disk. This gives you flexible multi-tenancy, parallel processing, and efficient storage all in one.
+
+<StreamHierarchy />
+
+## The append-only log
+
+Every partition is an append-only log. Messages are **immutable** once written, consumers can start from a chosen offset, and retained messages can be replayed. Retention removes old data, and offsets can contain gaps.
+
+<AppendOnlyLogViz />
+
+## Key capabilities
+
+| Capability | Details |
+|-----------|---------|
+| **Transport** | TCP, QUIC, WebSocket (custom binary protocol), HTTP (REST) |
+| **Performance** | Thread-per-core + io_uring on Linux, binary message views, configurable memory pool with a default 4 GiB budget |
+| **Security** | TLS on all transports, Argon2id hashing, AES-256-GCM-SIV encryption at rest, [granular permissions](/docs/server/security) with per-stream/per-topic permissions |
+| **Connectors** | [17 sink and 6 source plugins](/docs/connectors/introduction) including PostgreSQL, MongoDB, Elasticsearch, ClickHouse, Apache Iceberg, S3, with data transforms |
+| **AI Integration** | [MCP server](/docs/ai/mcp) with 40+ tools for LLM-driven message streaming management |
+| **Management** | [Web UI](/docs/web_ui/start) dashboard (embedded or standalone), [CLI](/docs/cli/start) with shell completions, Prometheus metrics. Connector OpenTelemetry export ([broker export limits](/docs/server/configuration#telemetry)) |
+| **Clustering** | Built on [Viewstamped Replication (VSR)](/docs/clustering/vsr) consensus. Single node by default, multi-node via `[cluster]` configuration |
+| **Deployment** | Single server process, [Docker & Helm](/docs/server/docker), configurable CPU/NUMA affinity on Linux |
+
+## Ecosystem
+
+Iggy is more than just a server. The project includes a full ecosystem of tools:
+
+- **[Connectors Runtime](/docs/connectors/introduction)** - dynamically loaded Rust plugins for data integration: 17 sinks and 6 sources. Ingest from PostgreSQL, Elasticsearch or InfluxDB into Iggy, or forward to MongoDB, Elasticsearch, ClickHouse, Apache Iceberg, Quickwit, S3 and more. Built-in data transforms and Prometheus metrics.
+- **[MCP Server](/docs/ai/mcp)** - Model Context Protocol server exposing 40+ tools for LLM integration. Works with Claude Desktop via stdio and HTTP transports.
+- **[Web UI](/docs/web_ui/start)** - SvelteKit dashboard for stream/topic management, message browsing with JSON/string/XML decoders, and user management.
+- **[CLI](/docs/cli/start)** - full-featured command-line interface with named connection contexts, session-based login, and shell completions.
+- **[SDKs](/docs/sdk/introduction)** - client libraries for 9 languages (Rust, Python, Java, Go, Node.js, C#, C++, PHP, Swift), most with runnable examples.
+- **[Benchmarking](/docs/server/benchmarking)** - built-in `iggy-bench` tool with a Yew/WebAssembly dashboard for performance testing.

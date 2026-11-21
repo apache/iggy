@@ -2267,24 +2267,6 @@ body.dark .family-end-to-end { --family: #b69cff; }
     cursor: help;
 }
 
-/* The embed code opens in its card, below the button that shows it. The grid spaces its parts, so
-   the code block drops its own margin, and a link stays as wide as its text. */
-.embed-code {
-    display: grid;
-    gap: 12px;
-    margin-top: 16px;
-    padding-top: 16px;
-    border-top: 1px solid var(--border);
-}
-
-.embed-code .command-block {
-    margin-top: 0;
-}
-
-.embed-code .run-action {
-    justify-self: start;
-}
-
 /* A table wider than the screen scrolls inside its card, not the page. The card is positioned, so
    it also clips the hidden column labels, which are absolute. */
 .run-table-card {
@@ -3426,4 +3408,488 @@ body.dark {
 
 .omb-compare-notes p + p {
     margin-top: 4px;
+}
+
+/* The embed button sits in the top right corner of a chart card, so the card keeps its layout with
+   or without one. */
+.card:has(> .embed-button) {
+    position: relative;
+}
+
+.card:has(> .embed-button) > h3 {
+    padding-right: 44px;
+}
+
+.embed-button {
+    position: absolute;
+    top: 14px;
+    right: 14px;
+    display: inline-grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg);
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 150ms, border-color 150ms, background 150ms;
+}
+
+.embed-button:hover,
+.embed-button:focus-visible {
+    border-color: var(--accent-dim);
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.embed-inline-icon {
+    display: inline-grid;
+    place-items: center;
+    width: 22px;
+    height: 20px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    vertical-align: -4px;
+}
+
+.embed-inline-icon svg {
+    width: 13px;
+    height: 13px;
+}
+
+.embed-dialog {
+    width: min(1180px, calc(100vw - 48px));
+    height: min(860px, calc(100dvh - 48px));
+    max-width: 100vw;
+    max-height: 100dvh;
+    padding: 0;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 18px;
+    background: var(--bg);
+    color: var(--text);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+    overscroll-behavior: contain;
+}
+
+.embed-dialog::backdrop {
+    background: rgba(7, 12, 24, 0.62);
+    backdrop-filter: blur(3px);
+}
+
+.embed-dialog[open] {
+    animation: embed-dialog-in 160ms ease-out;
+}
+
+@keyframes embed-dialog-in {
+    from {
+        opacity: 0;
+        transform: translateY(8px) scale(0.985);
+    }
+}
+
+/* The frame fills the dialog, so a click on the dialog itself can only come from the backdrop. */
+.embed-dialog-frame {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+}
+
+.embed-dialog-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 20px 24px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.embed-dialog-head h2 {
+    margin: 0;
+    font-size: 20px;
+    letter-spacing: -0.01em;
+}
+
+.embed-dialog-head p {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1.5;
+}
+
+.embed-dialog-close {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition: color 150ms, border-color 150ms;
+}
+
+.embed-dialog-close:hover,
+.embed-dialog-close:focus-visible {
+    border-color: var(--accent-dim);
+    color: var(--text);
+}
+
+/* The preview and the code on the left, where the eye lands first, and the choices on the right. */
+.embed-dialog-body {
+    flex: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 330px);
+    min-height: 0;
+}
+
+.embed-main {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    min-width: 0;
+    min-height: 0;
+    padding: 20px 24px 24px;
+    overflow-y: auto;
+}
+
+.embed-controls {
+    display: grid;
+    align-content: start;
+    gap: 20px;
+    min-height: 0;
+    padding: 20px 24px 24px;
+    overflow-y: auto;
+    border-left: 1px solid var(--border);
+}
+
+.embed-field {
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+    border: 0;
+}
+
+.embed-field legend {
+    margin-bottom: 8px;
+    padding: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+}
+
+.embed-choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.embed-choice {
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 9px;
+    background: var(--surface);
+    color: var(--muted);
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: color 150ms, border-color 150ms, background 150ms;
+}
+
+.embed-choice:hover {
+    color: var(--text);
+}
+
+.embed-choice[aria-pressed="true"] {
+    border-color: var(--accent-dim);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.embed-choice:focus-visible,
+.embed-copy:focus-visible,
+.embed-custom-size input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.embed-note {
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 12.5px;
+    line-height: 1.5;
+}
+
+.embed-note-error {
+    color: var(--worse);
+}
+
+.embed-custom-size {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.embed-custom-size label {
+    display: grid;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.embed-custom-size input {
+    width: 88px;
+    height: 32px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+}
+
+.embed-custom-size input[aria-invalid="true"] {
+    border-color: var(--worse);
+}
+
+.embed-custom-times,
+.embed-custom-unit {
+    padding-bottom: 7px;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.embed-preview {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 8px;
+    min-height: 280px;
+}
+
+.embed-stage {
+    position: relative;
+    flex: 1;
+    display: grid;
+    place-items: center;
+    min-height: 240px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: color-mix(in srgb, var(--text) 3%, transparent);
+}
+
+/* A checkerboard behind a transparent image, in the colors of a page of the image's theme, so the
+   reader sees the image as the other page will show it. */
+.embed-stage-checker-dark {
+    background: repeating-conic-gradient(#1a2130 0% 25%, #101622 0% 50%) 0 0 / 16px 16px;
+}
+
+.embed-stage-checker-light {
+    background: repeating-conic-gradient(#e5e7eb 0% 25%, #ffffff 0% 50%) 0 0 / 16px 16px;
+}
+
+.embed-preview-box {
+    position: relative;
+    overflow: hidden;
+    border-radius: 6px;
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.18);
+}
+
+.embed-stage-checker-dark .embed-preview-box,
+.embed-stage-checker-light .embed-preview-box {
+    box-shadow: none;
+}
+
+.embed-preview-box iframe {
+    position: absolute;
+    top: 0;
+    left: 0;
+    border: 0;
+    transform-origin: 0 0;
+}
+
+.embed-preview-box img {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.embed-stage-status {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    background: color-mix(in srgb, var(--bg) 55%, transparent);
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.embed-stage-failed {
+    color: var(--worse);
+}
+
+.embed-spinner {
+    width: 22px;
+    height: 22px;
+    box-sizing: border-box;
+    border: 2px solid var(--accent-dim);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: embed-spin 0.8s linear infinite;
+}
+
+@keyframes embed-spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.embed-preview-caption {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.embed-code {
+    display: grid;
+    gap: 10px;
+}
+
+.embed-code-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px 16px;
+}
+
+.embed-code-head .embed-note {
+    margin: 0;
+}
+
+/* One click selects the whole code, for a reader who copies with the keyboard. */
+.embed-code-text {
+    max-height: 104px;
+    margin: 0;
+    padding: 12px 14px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--text) 4%, transparent);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: all;
+}
+
+.embed-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.embed-copy {
+    min-width: 116px;
+    height: 36px;
+    padding: 0 16px;
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    background: var(--accent);
+    color: var(--on-accent);
+    font: inherit;
+    font-size: 13.5px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: filter 150ms;
+}
+
+.embed-copy:hover {
+    filter: brightness(1.08);
+}
+
+.embed-copy.copied {
+    border-color: var(--better);
+    background: var(--better);
+    color: #ffffff;
+}
+
+body.dark .embed-copy.copied {
+    color: var(--on-accent);
+}
+
+@media (max-width: 720px) {
+    .embed-dialog {
+        width: 100vw;
+        height: 100dvh;
+        border: 0;
+        border-radius: 0;
+    }
+
+    .embed-dialog-head {
+        padding: 16px;
+    }
+
+    /* One column that scrolls as a whole: the preview and the code, then the choices. */
+    .embed-dialog-body {
+        display: block;
+        overflow-y: auto;
+    }
+
+    .embed-main,
+    .embed-controls {
+        padding: 16px;
+        overflow: visible;
+    }
+
+    .embed-controls {
+        border-top: 1px solid var(--border);
+        border-left: 0;
+    }
+
+    .embed-preview {
+        flex: none;
+        min-height: 0;
+    }
+
+    .embed-stage {
+        flex: none;
+        height: 240px;
+        min-height: 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .embed-dialog[open] {
+        animation: none;
+    }
+
+    .embed-spinner {
+        animation-duration: 2.4s;
+    }
 }
