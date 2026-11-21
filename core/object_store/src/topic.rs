@@ -205,7 +205,7 @@ impl TopicObject {
 
     /// # Errors
     /// [`TopicObjectError::InvalidName`] for an empty name or one longer than
-    /// [`MAX_TOPIC_NAME_LEN`] bytes.
+    /// `MAX_TOPIC_NAME_LEN` bytes.
     pub fn encode(&self) -> Result<Vec<u8>, TopicObjectError> {
         let mut bytes = Vec::with_capacity(
             FIXED_LEN + self.origin.len() + self.stream_name.len() + self.topic_name.len(),
