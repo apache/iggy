@@ -24,10 +24,9 @@ namespace Apache.Iggy.Consumers;
 public partial class IggyConsumer
 {
     /// <summary>
-    ///     Receives messages as <see cref="ReceiveAsync" /> does, each a <see cref="ReceivedRentedMessage" /> that shares
-    ///     the pooled buffer of its batch and MUST be disposed by the caller when processing is complete. The buffer
-    ///     returns to the pool once every message of its batch has been disposed. The stream ends once the consumer
-    ///     shuts down.
+    ///     Receives messages as <see cref="ReceiveAsync" /> does, with payload views into the reader batch.
+    ///     The caller must dispose each <see cref="ReceivedRentedMessage" /> after processing it.
+    ///     The stream ends once the consumer shuts down.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages.</param>
     /// <exception cref="ConsumerNotInitializedException">Thrown when <see cref="InitAsync" /> has not been called.</exception>
@@ -39,38 +38,29 @@ public partial class IggyConsumer
         CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            var firstIndex = _nextMessageIndex;
-            var handle = new RentedBatchHandle(BinaryMapper.ToRentedMessages(batch, firstIndex));
-            try
+            using var handle = new RentedBatchHandle(batch.Context);
+            while (CanDeliver(batch))
             {
-                var rental = handle.Rental;
-                while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < batch.Messages.Count)
+                if (ct.IsCancellationRequested || IsDisposed)
                 {
-                    if (ct.IsCancellationRequested || IsDisposed)
-                    {
-                        yield break;
-                    }
-
-                    var index = _nextMessageIndex++;
-                    var message = rental.Messages[index - firstIndex];
-                    var checkpoint = batch.CheckpointAt(index)!;
-                    Hand(checkpoint, index == batch.Messages.Count - 1);
-                    handle.Acquire();
-                    yield return new ReceivedRentedMessage
-                    {
-                        Handle = handle,
-                        Message = message,
-                        CurrentOffset = message.Header.Offset,
-                        PartitionId = batch.PartitionId,
-                        Context = batch.Context,
-                        Checkpoint = checkpoint
-                    };
-                    CountProcessed();
+                    yield break;
                 }
-            }
-            finally
-            {
-                handle.Release();
+
+                var index = _nextMessageIndex++;
+                var message = BinaryMapper.ToRentedMessage(batch.Messages[index]);
+                var checkpoint = batch.CheckpointAt(index)!;
+                Hand(checkpoint, index == batch.Messages.Count - 1);
+                handle.Acquire();
+                yield return new ReceivedRentedMessage
+                {
+                    Handle = handle,
+                    Message = message,
+                    CurrentOffset = message.Header.Offset,
+                    PartitionId = batch.PartitionId,
+                    Context = batch.Context,
+                    Checkpoint = checkpoint
+                };
+                CountProcessed();
             }
         }
     }

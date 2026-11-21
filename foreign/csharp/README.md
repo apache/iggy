@@ -1303,8 +1303,8 @@ A join that landed keeps the member in the group until the session ends.
 - `CommitPolicy.Auto`: the consumer counts each message and stores the latest counted position at the interval
   or the event of the policy, before a rebalance takes a partition away, and on shutdown. With
   `CommitAfter.Delivery` a message counts when it is handed over. With `CommitAfter.Processing` it counts once
-  `ReceiveAsync` is read again, or once the handler of `ConsumeAsync` returns with success. A handler that throws
-  ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
+  the receive stream advances, a later loop starts, or the handler of `ConsumeAsync` returns with success. A handler
+  that throws ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
   `CommitAfter.Marked` only `Mark(checkpoint)` counts.
 
 A read error that the reader retries by itself does not end the loop, it reaches `SubscribeToErrorEvents`. An error

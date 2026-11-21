@@ -46,10 +46,14 @@ public sealed class ConsumerOnReaderTests
     private static CancellationToken Token => TestContext.Current.CancellationToken;
 
     [Theory]
-    [InlineData(CommitMode.Manual)]
-    [InlineData(CommitMode.Auto)]
-    [InlineData(CommitMode.OnRead)]
-    public async Task given_a_retained_batch_when_its_partition_is_revoked_should_follow_the_commit_policy(CommitMode mode)
+    [InlineData(CommitMode.Manual, false)]
+    [InlineData(CommitMode.Auto, false)]
+    [InlineData(CommitMode.OnRead, false)]
+    [InlineData(CommitMode.Manual, true)]
+    [InlineData(CommitMode.Auto, true)]
+    [InlineData(CommitMode.OnRead, true)]
+    public async Task given_a_retained_batch_when_its_partition_is_revoked_should_follow_the_commit_policy(
+        CommitMode mode, bool restart)
     {
         using var cluster = new ReaderCluster(1) { Limit = 6, Assignment = [1] };
         using var client = await cluster.ConnectAsync();
@@ -69,13 +73,63 @@ public sealed class ConsumerOnReaderTests
             RetryInterval = RetryInterval
         }, NullLoggerFactory.Instance);
         await consumer.InitAsync(Token);
-        Assert.Equal(0ul, (await ReceiveAsync(consumer, 1))[0].CurrentOffset);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        await using var active = consumer.ReceiveAsync(timeout.Token).GetAsyncEnumerator(timeout.Token);
+        Assert.True(await active.MoveNextAsync());
+        Assert.Equal(0ul, active.Current.CurrentOffset);
+        if (restart)
+        {
+            await active.DisposeAsync();
+        }
+
         cluster.Assignment = [2];
         await UntilAsync(() => consumer.Partitions.SequenceEqual([2u]));
-
-        var next = (await ReceiveAsync(consumer, 1))[0];
+        ReceivedMessage next;
+        if (restart)
+        {
+            next = (await ReceiveAsync(consumer, 1))[0];
+        }
+        else
+        {
+            Assert.True(await active.MoveNextAsync());
+            next = active.Current;
+        }
         Assert.Equal(mode == CommitMode.OnRead ? (1u, 1ul) : (2u, 0ul),
             (next.PartitionId, next.CurrentOffset));
+    }
+
+    [Fact]
+    public async Task given_a_batch_taken_during_a_seek_when_the_seek_finishes_should_drop_the_old_remainder()
+    {
+        using var cluster = new ReaderCluster(1) { Limit = 6 };
+        using var client = await cluster.ConnectAsync();
+        await using var consumer = await StartAsync(client, CommitPolicy.OnRead, 1);
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        cluster.HoldFetches = true;
+        cluster.HoldStores = true;
+        await using var active = consumer.ReceiveAsync(timeout.Token).GetAsyncEnumerator(timeout.Token);
+        var first = active.MoveNextAsync().AsTask();
+        await UntilAsync(() => cluster.HeldFetches == 1);
+        var seek = consumer.SeekAsync(1, PollingStrategy.Offset(4), timeout.Token);
+        try
+        {
+            cluster.HoldFetches = false;
+            await cluster.ReleaseHeldAsync();
+            await UntilAsync(() => cluster.HeldStores == 1);
+            Assert.True(await first);
+            Assert.Equal(0ul, active.Current.CurrentOffset);
+        }
+        finally
+        {
+            cluster.HoldStores = false;
+            await cluster.ReleaseHeldStoresAsync();
+            await seek.WaitAsync(PromptLimit, Token);
+        }
+
+        Assert.True(await active.MoveNextAsync());
+        Assert.Equal(4ul, active.Current.CurrentOffset);
     }
 
     [Fact]
@@ -161,23 +215,29 @@ public sealed class ConsumerOnReaderTests
     }
 
     [Fact]
-    public async Task given_a_resumed_rented_iteration_when_mapping_should_exclude_delivered_messages()
+    public async Task given_a_resumed_rented_iteration_should_keep_the_previous_message_readable()
     {
         using var cluster = new ReaderCluster(1) { Limit = 6 };
         using var client = await cluster.ConnectAsync();
         await using var consumer = await StartAsync(client, CommitPolicy.Manual, 1);
-        for (var offset = 0ul; offset < 2; offset++)
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(Token);
+        timeout.CancelAfter(PromptLimit);
+        ReceivedRentedMessage first;
+        await using (var initial = consumer.ReceiveRentedAsync(timeout.Token).GetAsyncEnumerator(timeout.Token))
         {
-            await foreach (var message in consumer.ReceiveRentedAsync(Token))
-            {
-                using (message)
-                {
-                    Assert.Equal(offset, message.CurrentOffset);
-                    Assert.Equal(Enumerable.Range((int)offset, 2 - (int)offset).Select(value => (ulong)value),
-                        message.Handle!.Rental.Messages.Select(value => value.Header.Offset));
-                }
-                break;
-            }
+            Assert.True(await initial.MoveNextAsync());
+            first = initial.Current;
+        }
+
+        using (first)
+        {
+            await using var resumed = consumer.ReceiveRentedAsync(timeout.Token).GetAsyncEnumerator(timeout.Token);
+            Assert.True(await resumed.MoveNextAsync());
+            using var second = resumed.Current;
+            Assert.Equal(0ul, first.CurrentOffset);
+            Assert.Equal(1ul, second.CurrentOffset);
+            Assert.Equal("first-payload", Encoding.UTF8.GetString(first.Message.Payload.Span));
+            Assert.Equal("second-payload", Encoding.UTF8.GetString(second.Message.Payload.Span));
         }
     }
 

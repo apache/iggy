@@ -195,7 +195,7 @@ public partial class IggyConsumer : IAsyncDisposable
         CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < batch.Messages.Count)
+            while (CanDeliver(batch))
             {
                 if (ct.IsCancellationRequested || IsDisposed)
                 {
@@ -235,7 +235,7 @@ public partial class IggyConsumer : IAsyncDisposable
         CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            while (ReferenceEquals(_currentBatch, batch) && _nextMessageIndex < batch.Messages.Count)
+            while (CanDeliver(batch))
             {
                 if (ct.IsCancellationRequested || IsDisposed)
                 {
@@ -302,9 +302,9 @@ public partial class IggyConsumer : IAsyncDisposable
     /// <summary>Sets the next read position of a partition, as <see cref="PartitionReader.SeekAsync" /> does.</summary>
     public async Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
     {
-        var current = Volatile.Read(ref _currentBatch);
         await Reader.SeekAsync(partitionId, start, ct);
-        if (current?.PartitionId == partitionId)
+        var current = Volatile.Read(ref _currentBatch);
+        if (current?.PartitionId == partitionId && !Reader.Keeps(current))
         {
             Interlocked.CompareExchange(ref _currentBatch, null, current);
         }
@@ -362,6 +362,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
     private async Task ShutdownOnceAsync(CancellationToken token)
     {
+        Volatile.Write(ref _currentBatch, null);
         await _lifetime.CancelAsync();
         // The message of a running handler counts only once the handler returns with success.
         if (!_handlerRunning.Value && Volatile.Read(ref _handling) is { } handling)
@@ -443,19 +444,26 @@ public partial class IggyConsumer : IAsyncDisposable
         {
             return null;
         }
-        if (_currentBatch is { } current && _nextMessageIndex < current.Messages.Count && Reader.Keeps(current))
+        if (Volatile.Read(ref _currentBatch) is { } current && CanDeliver(current))
         {
             return current;
         }
-        _currentBatch = null;
+        Volatile.Write(ref _currentBatch, null);
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
         while (!IsDisposed && !ct.IsCancellationRequested)
         {
             try
             {
-                _currentBatch = await Reader.NextAsync(cancellation.Token);
+                var batch = await Reader.NextAsync(cancellation.Token);
                 _nextMessageIndex = 0;
-                return _currentBatch;
+                Volatile.Write(ref _currentBatch, batch);
+                if (IsDisposed)
+                {
+                    Volatile.Write(ref _currentBatch, null);
+                    return null;
+                }
+
+                return batch;
             }
             catch (ReadException error) when (error.Skip is null && !error.StopsPartition && error.Lost is null)
             {
@@ -472,6 +480,12 @@ public partial class IggyConsumer : IAsyncDisposable
         }
 
         return null;
+    }
+
+    private bool CanDeliver(PolledMessages batch)
+    {
+        return _nextMessageIndex < batch.Messages.Count &&
+               ReferenceEquals(Volatile.Read(ref _currentBatch), batch) && Reader.Keeps(batch);
     }
 
     /// <summary>
