@@ -17,6 +17,7 @@
 
 use actix_web::{HttpResponse, ResponseError};
 use bench_dashboard_shared::config::ConfigError;
+use bench_dashboard_shared::embed::{UnknownChartType, UnknownPngSize};
 use bench_dashboard_shared::omb::id::OmbRunIdError;
 use serde_json::json;
 use std::path::PathBuf;
@@ -52,6 +53,18 @@ pub enum IggyBenchDashboardServerError {
     },
     #[error("Invalid dashboard configuration file '{}': {source}", path.display())]
     ConfigInvalid { path: PathBuf, source: ConfigError },
+}
+
+impl From<UnknownChartType> for IggyBenchDashboardServerError {
+    fn from(error: UnknownChartType) -> Self {
+        Self::BadRequest(error.to_string())
+    }
+}
+
+impl From<UnknownPngSize> for IggyBenchDashboardServerError {
+    fn from(error: UnknownPngSize) -> Self {
+        Self::BadRequest(error.to_string())
+    }
 }
 
 impl ResponseError for IggyBenchDashboardServerError {

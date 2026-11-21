@@ -1,0 +1,64 @@
+---
+title: Stream Options
+description: "Stream names, per-stream encryption keys and server key rotation."
+---
+
+A stream accepts options when it is created and when it is updated. Use `name` to rename a stream. Use `encryption_key` at creation to supply a data key for that stream. The server rejects changes or resets to an existing stream key.
+
+## Select encryption at creation
+
+Each encrypted stream uses a separate AES-256-GCM-SIV data key. The server encrypts message payloads and user headers before storage and decrypts them for reads. Metadata journals, snapshots and structural headers are not encrypted as a whole.
+
+| Creation request | Server configuration | Result |
+| --- | --- | --- |
+| No stream key | `encryption.enabled = false` | Unencrypted stream |
+| No stream key | `encryption.enabled = true` with a configured key | Server generates a stream key |
+| Explicit stream key | Server encryption key configured | Stream uses the supplied key |
+
+An explicit key must contain 32 random bytes. The API accepts raw bytes or standard padded base64. Configure a server encryption key even when the client supplies the stream key. The server wraps the data key, which means it encrypts the key before storing it. The wrapping key derives from `encryption.key`.
+
+The stream key travels in the create request. Use a transport with TLS. The server never returns the data key or its wrapped bytes. Reads report `encryption_key_source` as `stream`, `server` or `none`, and fingerprints for encrypted streams.
+
+Enabling or disabling server encryption affects creation defaults. It does not change the encryption of existing streams. Renaming a stream preserves its key and stored messages.
+
+## Create a stream with the CLI
+
+With a server encryption key configured, create a private key file and pass it to the CLI:
+
+```bash
+umask 077
+head -c 32 /dev/urandom | base64 > stream.key
+iggy stream create --stream-key-file stream.key payments
+iggy stream get payments
+```
+
+`--stream-key-file` configures server-side encryption for this stream. The CLI's separate `--encryption-key` option encrypts payloads on the client.
+
+## Read the catalog
+
+```bash
+iggy options stream
+```
+
+| Option | Access | Meaning |
+| --- | --- | --- |
+| `name` | Update | Resource name, from 1 through 255 bytes |
+| `encryption_key` | Create only, write only | Stream data key |
+| `encryption_key_source` | Read only | Origin of the key, or `none` |
+| `encryption_key_fingerprint` | Read only | Fingerprint of the data key |
+| `encryption_kek_fingerprint` | Read only | Comma-separated fingerprints of the keys that wrap the data key |
+
+A fingerprint identifies a key without exposing it. It consists of 16 lowercase hexadecimal characters. It cannot replace a key during recovery.
+
+## Rotate the server encryption key
+
+A key-encryption key (KEK) wraps stream data keys. Rotation changes the wraps and does not re-encrypt messages. The metadata primary replicates these changes. Each stream can hold up to three wraps.
+
+1. Set `encryption.key` to the new key and add the old key to `encryption.previous_keys` on every node. Restart nodes with the updated configuration. Retain the old key during this phase.
+2. Make sure that every node uses this configuration and every encrypted stream reports the new KEK fingerprint. The primary adds new wraps while preserving old ones.
+3. Empty `previous_keys` and add the old fingerprint to `retired_kek_fingerprints` on every node. The primary removes those wraps.
+4. Make sure that every stream no longer reports the retired fingerprint. Clear `retired_kek_fingerprints` on every node.
+
+`previous_keys` accepts at most two keys. Retire an old fingerprint before adding a fourth wrap. Do not discard keys needed by retained backups. Losing the only usable wrapping key makes the affected streams unreadable.
+
+See [Configuration](/docs/server/configuration#encryption) for environment variables and [Security](/docs/server/security) for transport protection.

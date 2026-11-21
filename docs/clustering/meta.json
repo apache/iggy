@@ -1,0 +1,12 @@
+{
+  "title": "Clustering",
+  "pages": [
+    "vsr",
+    "multi-leader",
+    "durability",
+    "deploy",
+    "configuration",
+    "security",
+    "client-failover"
+  ]
+}

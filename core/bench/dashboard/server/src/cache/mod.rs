@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::embed_cache::FileStamp;
 use crate::error::IggyBenchDashboardServerError;
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::Thresholds;
@@ -55,11 +56,20 @@ pub struct BenchmarkCache {
 
 #[derive(Debug, Default)]
 struct Runs {
-    /// Map benchmark identifier to benchmark light report and path
-    reports: HashMap<Uuid, (BenchmarkReportLight, PathBuf)>,
+    /// Map benchmark identifier to its light report and report file
+    reports: HashMap<Uuid, LoadedReport>,
 
     /// Summaries of `reports`, newest first
     summaries: Arc<Vec<BenchmarkSummary>>,
+}
+
+#[derive(Debug)]
+struct LoadedReport {
+    report: BenchmarkReportLight,
+    path: PathBuf,
+    /// The stamp of the bytes that `report` came from. The names of the run's embed files hold it,
+    /// so a report that changes gets new embed files after the next load.
+    stamp: FileStamp,
 }
 
 impl BenchmarkCache {

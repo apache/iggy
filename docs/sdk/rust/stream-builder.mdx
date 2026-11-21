@@ -1,0 +1,103 @@
+---
+title: Stream Builder
+description: "Configure a Rust producer and consumer by stream and topic names."
+---
+
+The stream builder creates an `IggyProducer`, an `IggyConsumer`, or both from configuration objects. It uses the same APIs described in [High-level SDK](/docs/sdk/rust/high-level-sdk). Stream and topic names identify the resources. The 0.10 API does not take stream or topic IDs in these configuration objects.
+
+## Build a producer
+
+This complete example uses a local server with the development credentials. The producer creates missing resources during initialization. Existing topics keep their configuration.
+
+```rust
+use iggy::prelude::*;
+use std::str::FromStr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = IggyProducerConfig::builder()
+        .stream_name("test_stream")
+        .topic_name("test_topic")
+        .topic_partitions_count(3)
+        .batch_length(100)
+        .linger_time(IggyDuration::from_str("5ms")?)
+        .partitioning(Partitioning::balanced())
+        .build();
+
+    let (client, producer) = IggyStreamProducer::with_client_from_url(
+        "iggy://iggy:iggy@127.0.0.1:8090",
+        &config,
+    ).await?;
+    producer.send_one(IggyMessage::from_str("Hello World")?).await?;
+    producer.shutdown().await;
+    client.shutdown().await?;
+    Ok(())
+}
+```
+
+`batch_length` limits messages in a direct request. `linger_time` sets the minimum gap between sequential direct sends. It does not buffer separate calls. Use the high-level producer's background mode when you need a buffer.
+
+`with_topic_durability(Durability::Persisted)` selects the policy when the builder creates a topic. It does not change an existing topic. Client-side `encryptor` configuration is separate from [stream encryption](/docs/server/stream-options).
+
+## Build a consumer
+
+The consumer uses a group by default. This example creates the group, reads messages and commits each checkpoint after printing its payload. Add `futures-util` to use `StreamExt`.
+
+```rust
+use futures_util::StreamExt;
+use iggy::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = IggyConsumerConfig::builder()
+        .stream_name("test_stream")
+        .topic_name("test_topic")
+        .create_stream_if_not_exists(false)
+        .create_topic_if_not_exists(false)
+        .consumer_name("test_consumer")
+        .consumer_kind(ConsumerKind::ConsumerGroup)
+        .partitions_count(3)
+        .poll_options(PollOptions::wait(IggyDuration::ONE_SECOND))
+        .polling_strategy(PollingStrategy::next())
+        .polling_retry_interval(NonZeroIggyDuration::ONE_SECOND)
+        .init_retries(5)
+        .init_interval(NonZeroIggyDuration::ONE_SECOND)
+        .build();
+    let (client, mut consumer) = IggyStreamConsumer::with_client_from_url(
+        "iggy://iggy:iggy@127.0.0.1:8090",
+        &config,
+    ).await?;
+
+    while let Some(received) = consumer.next().await {
+        let received = received?;
+        println!("{}", std::str::from_utf8(&received.message.payload)?);
+        consumer.commit(received.checkpoint()).await?;
+    }
+    consumer.shutdown().await?;
+    client.shutdown().await?;
+    Ok(())
+}
+```
+
+A standalone consumer uses `ConsumerKind::Consumer`. Select its partitions with `with_partitions`. The default configuration selects partition zero. Group consumers use the server assignment instead. `ExternalGroup` represents externally managed offsets and cannot poll.
+
+`PollOptions` defaults to manual commits. `CommitPolicy::Auto(AutoCommit::default())` stores progress after processing every 10,000 messages or five seconds. `CommitPolicy::OnRead` stores with the read, before application processing. Read the [commit contract](/docs/sdk/deferred-polling) before selecting a policy.
+
+## Share an existing client
+
+`IggyStreamProducer::build(&client, &producer_config)` and `IggyStreamConsumer::build(&client, &consumer_config)` reuse a connected client. To build both, combine the configuration:
+
+```rust
+let config = IggyStreamConfig::new(consumer_config, producer_config);
+let (producer, consumer) = IggyStream::build(&client, &config).await?;
+```
+
+`IggyStream::with_client_from_connection_string` also creates the client. Its result contains the client, producer and consumer. Resource creation flags remain explicit on the consumer configuration.
+
+## Defaults and buffering
+
+`IggyConsumerConfig::default()` names `test_stream`, `test_topic` and `test_consumer`. It uses a group, `next()`, a five-second deferred wait and manual commits. It retries initialization five times at three-second intervals. It does not create a missing stream or topic by default.
+
+The reader reserves up to 16 MiB and 16000 messages for buffered and in-flight replies. If the poll count is larger, that count is the default message reservation. Configure `prefetch_bytes` and `prefetch_messages` to bound read-ahead independently of each fetch.
+
+The [stream-builder examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/stream-builder) cover producer, consumer and combined configurations. The [source consumer configuration](https://github.com/apache/iggy/blob/server-0.10.0/core/sdk/src/stream_builder/config/config_iggy_consumer.rs) defines each builder field.

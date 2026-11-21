@@ -17,6 +17,7 @@
 
 pub mod config;
 pub mod delta;
+pub mod embed;
 pub mod github;
 pub mod identity;
 pub mod metrics;
