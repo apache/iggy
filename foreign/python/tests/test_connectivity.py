@@ -19,6 +19,7 @@ from datetime import timedelta
 
 import pytest
 
+import apache_iggy
 from apache_iggy import (
     AutoLogin,
     HttpConfig,
@@ -80,6 +81,22 @@ def binary_transport_configs(auto_login: AutoLogin | None = None) -> list:
 
 class TestConnectivity:
     """Test basic connectivity and authentication."""
+
+    @pytest.mark.unit
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("protocol", ["tcp", "quic", "ws", "http"])
+    async def test_connection_info_before_connect(self, protocol: str):
+        address = "127.0.0.1:18473"
+        client = IggyClient.from_connection_string(
+            f"iggy+{protocol}://iggy:iggy@{address}"
+        )
+
+        info = await client.get_connection_info()
+
+        assert isinstance(info, apache_iggy.ConnectionInfo)
+        assert info.protocol == protocol
+        expected_address = f"http://{address}/" if protocol == "http" else address
+        assert info.server_address == expected_address
 
     @pytest.mark.asyncio
     async def test_client_not_none(self, iggy_client: IggyClient):

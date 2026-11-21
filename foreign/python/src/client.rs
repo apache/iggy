@@ -81,6 +81,19 @@ pub struct IggyClient {
     inner: Arc<RustIggyClient>,
 }
 
+/// The transport and server address reported by the client at the time of the call.
+#[gen_stub_pyclass]
+#[pyclass(frozen)]
+pub struct ConnectionInfo {
+    /// One of `tcp`, `quic`, `http`, or `ws`.
+    #[pyo3(get)]
+    protocol: &'static str,
+    /// For binary transports, the metadata leader's address if known, otherwise
+    /// the bootstrap or configured address. For HTTP, the API URL.
+    #[pyo3(get)]
+    server_address: String,
+}
+
 /// An error of the Iggy SDK. `code` is the numeric Iggy error code, the same
 /// code that every other Iggy SDK reports for it.
 #[gen_stub_pyclass]
@@ -419,6 +432,23 @@ impl IggyClient {
             py,
             async move { inner.ping().await.map_err(to_runtime_error) },
         )
+    }
+
+    /// Get the client's current transport and server address.
+    ///
+    /// For example, after connecting through a follower, read
+    /// `(await client.get_connection_info()).server_address` to see which
+    /// endpoint the client selected.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[ConnectionInfo]", imports=("collections.abc")))]
+    fn get_connection_info<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            let info = inner.get_connection_info().await;
+            Ok(ConnectionInfo {
+                protocol: info.protocol.as_str(),
+                server_address: info.server_address,
+            })
+        })
     }
 
     /// Get the statistics and details of the server and its running process.
