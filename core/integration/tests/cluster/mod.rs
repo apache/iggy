@@ -24,6 +24,7 @@ mod crash_offset_reuse;
 mod crash_recovery_corruption;
 mod failover_client_continuity;
 mod fast_primary_rejoin;
+mod geo_mode_faults;
 mod geo_topic;
 mod heartbeat_mismatch;
 mod idempotent_producer;
