@@ -80,6 +80,7 @@ const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
+const FREE_SPACE_RESERVE_REACHED = 4109;
 const GROUP_PARTITION_NOT_OWNED = 5009;
 /** The refusals of a partition after which its route can be stale: it moved, or its history or owner changed. */
 const STALE_ROUTE_CODES = new Set([NOT_PRIMARY, HISTORY_UNAVAILABLE, GROUP_PARTITION_NOT_OWNED]);
@@ -699,9 +700,10 @@ export class CommandResponseStream extends EventEmitter {
           }
           lastRefusal = responseError(command, TRANSIENT_NOT_ACCEPTED);
           lastRefusal.fromServer = true;
-        } else if (code === DEFERRED_POLL_CAPACITY_EXCEEDED) {
+        } else if (code === DEFERRED_POLL_CAPACITY_EXCEEDED || code === FREE_SPACE_RESERVE_REACHED) {
           // The primary parks no more deferred requests of this session for
-          // now. It still leads the partition, so the call keeps its route.
+          // now, or has no room on its data disk and stored nothing. It still
+          // leads the partition, so the call keeps its route.
         } else if (code !== undefined) {
           if (operation?.uncertain)
             throw new OperationUncertainError(operation.id, error);

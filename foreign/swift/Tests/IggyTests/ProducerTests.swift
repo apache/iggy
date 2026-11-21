@@ -498,7 +498,7 @@ struct ProducerTests {
     }
 
     @Test func onlyRefusalsBeforeAnythingWasWrittenAreRetried() {
-        for code: IggyErrorCode in [.transientNotAccepted, .notConnected, .cannotEstablishConnection] {
+        for code: IggyErrorCode in [.transientNotAccepted, .freeSpaceReserveReached, .notConnected, .cannotEstablishConnection] {
             #expect(!ProducerCore.stopsSendRetries(IggyError(code)))
         }
         for code: IggyErrorCode in [

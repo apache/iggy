@@ -83,6 +83,7 @@ import { SimpleClient } from './client.js';
 const TEST_SESSION = 42n;
 const PARTITION_ID_SIZE = 4;
 const DEFERRED_POLL_CAPACITY_EXCEEDED = 90;
+const FREE_SPACE_RESERVE_REACHED = 4109;
 const INVALID_SIZE_BYTES = 80;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
@@ -743,6 +744,48 @@ describe('unified partition routing', () => {
       assert.equal(new Set(ids).size, ids.length);
       assert.ok(ids.every((id) => id > 0n));
       assert.equal(framesOf(cluster.primary, Operation.Register).length, 0);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  /** Answers the first `refusals` sends below the free-space reserve, and every later one with success. */
+  const reserveCluster = (refusals: number) => {
+    let sends = 0;
+    return startPollCluster((frame, socket) => {
+      if (frame[REQUEST_OFFSET.operation] !== Operation.SendMessages) return false;
+      sends += 1;
+      socket.write(sends <= refusals
+        ? replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), FREE_SPACE_RESERVE_REACHED)
+        : replyFrame(frame, Operation.SendMessages, Buffer.alloc(0)));
+      return true;
+    });
+  };
+
+  it('sends the same request again on its route while the primary is below its free-space reserve', async () => {
+    const cluster = await reserveCluster(2);
+    try {
+      await cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend);
+      const sends = framesOf(cluster.primary, Operation.SendMessages);
+      assert.equal(sends.length, 3);
+      for (const send of sends) assert.deepEqual(send, sends[0]);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('ends a send refused below the free-space reserve until its deadline with that refusal', async () => {
+    const cluster = await reserveCluster(Number.POSITIVE_INFINITY);
+    try {
+      await assert.rejects(
+        cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend, { deadline: Date.now() + 300 }),
+        (error: unknown) => error instanceof ResponseError &&
+          error.errorCode === FREE_SPACE_RESERVE_REACHED && error.commandCode === COMMAND_CODE.SendMessages);
+      const sends = framesOf(cluster.primary, Operation.SendMessages);
+      assert.ok(sends.length > 1, 'the send is retried before its deadline');
+      for (const send of sends) assert.deepEqual(send, sends[0]);
+      assert.equal(countCommand(cluster.coordinator, COMMAND_CODE.GetPartitionRoute), 1);
     } finally {
       await cluster.close();
     }

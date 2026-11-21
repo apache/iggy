@@ -30,6 +30,7 @@ import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.ssl.DefaultClientTlsStrategy;
 import org.apache.hc.core5.http.ClassicHttpRequest;
 import org.apache.hc.core5.http.ClassicHttpResponse;
+import org.apache.hc.core5.http.ConnectionClosedException;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.http.HttpException;
 import org.apache.hc.core5.http.HttpRequest;
@@ -71,6 +72,7 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 import tools.jackson.databind.node.ObjectNode;
 
+import javax.net.ssl.SSLException;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.File;
@@ -78,13 +80,17 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.InterruptedIOException;
 import java.math.BigInteger;
+import java.net.ConnectException;
+import java.net.NoRouteToHostException;
 import java.net.URI;
 import java.net.URISyntaxException;
+import java.net.UnknownHostException;
 import java.security.GeneralSecurityException;
 import java.time.Duration;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -637,11 +643,27 @@ final class InternalHttpClient implements Closeable {
     }
 
     /**
-     * Resends what the default strategy resends: a 429 or a 503 answer to any request, and an I/O
-     * failure of an idempotent one, which a committing poll is not. Each resend marks the request
+     * Resends what the default strategy resends, a 429 or a 503 answer to any request and an I/O
+     * failure of an idempotent one, which a committing poll is not, and a 507 answer: a send that
+     * the partition primary refused below its free-space reserve. Each resend marks the request
      * uncertain unless the server provably never took the attempt before it.
      */
     private static final class UncertainAttempts extends DefaultHttpRequestRetryStrategy {
+        // The I/O failures that the default strategy never resends.
+        private static final List<Class<? extends IOException>> NON_RETRIABLE_IO_FAILURES = List.of(
+                InterruptedIOException.class,
+                UnknownHostException.class,
+                ConnectException.class,
+                ConnectionClosedException.class,
+                NoRouteToHostException.class,
+                SSLException.class);
+        private static final List<Integer> RETRIABLE_CODES = List.of(
+                HttpStatus.SC_TOO_MANY_REQUESTS, HttpStatus.SC_SERVICE_UNAVAILABLE, HttpStatus.SC_INSUFFICIENT_STORAGE);
+
+        UncertainAttempts() {
+            // One resend after a second, as the default strategy.
+            super(1, TimeValue.ofSeconds(1), NON_RETRIABLE_IO_FAILURES, RETRIABLE_CODES);
+        }
 
         @Override
         protected boolean handleAsIdempotent(HttpRequest request) {
@@ -651,8 +673,11 @@ final class InternalHttpClient implements Closeable {
         @Override
         public boolean retryRequest(HttpResponse response, int execCount, HttpContext context) {
             boolean retry = super.retryRequest(response, execCount, context);
-            // Only an admission refusal proves the attempt was not taken. A 503 can mean either.
-            if (retry && response.getCode() != HttpStatus.SC_TOO_MANY_REQUESTS) {
+            // Only an admission refusal or a free-space refusal proves the attempt was not taken. A 503 can mean
+            // either.
+            if (retry
+                    && response.getCode() != HttpStatus.SC_TOO_MANY_REQUESTS
+                    && response.getCode() != HttpStatus.SC_INSUFFICIENT_STORAGE) {
                 context.setAttribute(UNCERTAIN_ATTEMPT, Boolean.TRUE);
             }
             return retry;

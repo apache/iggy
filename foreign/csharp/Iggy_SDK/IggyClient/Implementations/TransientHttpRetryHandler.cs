@@ -22,8 +22,9 @@ namespace Apache.Iggy.IggyClient.Implementations;
 
 /// <summary>
 ///     Replays requests the server answered with a retryable status: 503 (no caught-up primary, full
-///     pipeline, view-change cancel, shard write budget) and 429 (session write cap). The server signals
-///     both as transient with a Retry-After. The binary transports absorb the equivalent frames in their
+///     pipeline, view-change cancel, shard write budget), 429 (session write cap) and 507 (a send refused below
+///     the free-space reserve of the partition primary, which stored nothing). The server signals all three as
+///     transient with a Retry-After. The binary transports absorb the equivalent frames in their
 ///     in-client replay loop, so HTTP replays here for transport parity. A write 504 stays terminal: the
 ///     request may still commit, so its outcome is unknown and must surface to the caller. A poll with auto commit
 ///     is a GET that writes, because the server stores its offset before it answers.
@@ -77,7 +78,8 @@ internal sealed class TransientHttpRetryHandler : DelegatingHandler
 
     private static bool IsRetryable(HttpRequestMessage request, HttpStatusCode statusCode)
     {
-        if (statusCode is HttpStatusCode.ServiceUnavailable or HttpStatusCode.TooManyRequests)
+        if (statusCode is HttpStatusCode.ServiceUnavailable or HttpStatusCode.TooManyRequests
+            or HttpStatusCode.InsufficientStorage)
         {
             return true;
         }

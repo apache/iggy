@@ -1239,7 +1239,7 @@ public final class ConsensusSession {
         }
 
         /**
-         * After a 58 or 89 refusal, an 88 lifecycle refusal or a namespace miss, counts the frame as sent only while
+         * After a 58, 89 or 4109 refusal, an 88 lifecycle refusal or a namespace miss, counts the frame as sent only while
          * an earlier attempt can have taken effect, as in Rust. So a call that no node admitted starts again under a
          * new session instead of ending uncertain.
          */

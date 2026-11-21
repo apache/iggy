@@ -256,6 +256,9 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 	progress := isProgressPoll(operation.code, operation.frame.data[vsr.HeaderSize:])
 	committing := storesOnRead(operation.code, operation.frame.data[vsr.HeaderSize:])
 	possiblySent := false
+	// What an operation that runs out of time ends with: the refusal of its
+	// last attempt.
+	var refusal error = ierror.ErrTransientNotAccepted
 	defer func() {
 		if committing && possiblySent && err != nil {
 			err = ticket.retainFetch(ticket.fetch.keys)
@@ -321,8 +324,9 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			if uncertain {
 				return nil, ierror.ErrTransientNotCommitted
 			}
-			return nil, ierror.ErrTransientNotAccepted
+			return nil, refusal
 		}
+		refusal = ierror.ErrTransientNotAccepted
 		var link *tcpLink
 		var route pollRoute
 		readyLink := c.links.nextReadyLink()
@@ -371,7 +375,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				if uncertain {
 					return nil, ierror.ErrTransientNotCommitted
 				}
-				return nil, ierror.ErrTransientNotAccepted
+				return nil, refusal
 			}
 			err = nil
 			continue
@@ -401,7 +405,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 					if uncertain {
 						return nil, ierror.ErrTransientNotCommitted
 					}
-					return nil, ierror.ErrTransientNotAccepted
+					return nil, refusal
 				}
 				continue
 			}
@@ -463,7 +467,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				if uncertain {
 					return nil, ierror.ErrTransientNotCommitted
 				}
-				return nil, ierror.ErrTransientNotAccepted
+				return nil, refusal
 			}
 			if err = c.pause(ctx, nextLookupBackoff(&lookupDelay)); err != nil {
 				if uncertain && mutation {
@@ -472,7 +476,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 				if uncertain {
 					return nil, ierror.ErrTransientNotCommitted
 				}
-				return nil, ierror.ErrTransientNotAccepted
+				return nil, refusal
 			}
 			continue
 		}
@@ -559,6 +563,10 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 		case errors.Is(err, ierror.ErrDeferredPollCapacityExceeded):
 			// The primary parks as many deferred requests of the session as it
 			// admits. The route is right, so the same primary is asked again.
+		case errors.Is(err, ierror.ErrFreeSpaceReserveReached):
+			// The primary has no room on its data disk and stored nothing. The
+			// route is right, so the same primary is asked again.
+			refusal = err
 		case errors.Is(err, ierror.ErrNotPrimary) && operation.replica != nil:
 			// The caller chose the replica, so its refusal is the answer.
 			return nil, err
@@ -611,7 +619,7 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			if uncertain {
 				return nil, ierror.ErrTransientNotCommitted
 			}
-			return nil, ierror.ErrTransientNotAccepted
+			return nil, refusal
 		}
 		err = nil
 	}

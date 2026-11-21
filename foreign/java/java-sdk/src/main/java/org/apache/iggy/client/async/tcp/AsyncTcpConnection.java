@@ -1328,7 +1328,10 @@ public class AsyncTcpConnection {
         exchange.failoverState().everUncertain |= wasUncertain || nextUncertain;
         if (exchange.failoverState().ticket != null
                 && (isRefusal(serverError)
-                        || (serverError != null && serverError.getRawErrorCode() == LIFECYCLE_BUSY)
+                        || (serverError != null
+                                && (serverError.getRawErrorCode() == LIFECYCLE_BUSY
+                                        || serverError.getRawErrorCode()
+                                                == IggyErrorCode.FREE_SPACE_RESERVE_REACHED.getCode()))
                         || PollRouter.isNamespaceMiss(error))) {
             exchange.failoverState().ticket.settleSent(nextUncertain);
         }

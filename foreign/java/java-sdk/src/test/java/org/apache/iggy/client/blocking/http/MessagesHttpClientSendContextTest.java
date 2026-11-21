@@ -73,6 +73,7 @@ class MessagesHttpClientSendContextTest {
     private static final PartitionContext ZERO_INCARNATION =
             new PartitionContext(BigInteger.ZERO, BigInteger.valueOf(9), BigInteger.valueOf(100));
     private static final int TRANSIENT_NOT_COMMITTED = 57;
+    private static final int FREE_SPACE_RESERVE_REACHED = 4109;
     private static final int FETCH_PROGRESS_UNCERTAIN = 14010;
     private static final int HISTORY_UNAVAILABLE = 87;
     private static final int UNAUTHORIZED = 41;
@@ -138,6 +139,37 @@ class MessagesHttpClientSendContextTest {
 
             assertThat(server.requests)
                     .containsExactly(GET_TOPIC, POST_MESSAGES, POST_MESSAGES, POST_MESSAGES, GET_TOPIC, POST_MESSAGES);
+        }
+    }
+
+    @Test
+    void shouldResendUnderTheContextReadAgainWhenTheResendAfterAFreeSpaceRefusalIsRefused() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            send(client, Partitioning.partitionId(3L));
+            // A 507 proves the server stored nothing, so the refused resend was the only attempt.
+            server.interruptNextRequest(507);
+
+            send(client, Partitioning.partitionId(3L));
+
+            assertThat(server.requests)
+                    .containsExactly(GET_TOPIC, POST_MESSAGES, POST_MESSAGES, POST_MESSAGES, GET_TOPIC, POST_MESSAGES);
+        }
+    }
+
+    @Test
+    void shouldReturnFreeSpaceReserveReachedWhenTheResendIsRefusedBelowTheReserveToo() throws IOException {
+        try (var server = new FakeServer();
+                var client = new IggyHttpClient(server.url())) {
+            send(client, Partitioning.partitionId(3L));
+            server.refuseNextRequest(507, FREE_SPACE_RESERVE_REACHED, "free_space_reserve_reached");
+            server.refuseNextRequest(507, FREE_SPACE_RESERVE_REACHED, "free_space_reserve_reached");
+
+            assertThatThrownBy(() -> send(client, Partitioning.partitionId(3L)))
+                    .isInstanceOfSatisfying(
+                            IggyServerException.class,
+                            error -> assertThat(error.getRawErrorCode()).isEqualTo(FREE_SPACE_RESERVE_REACHED));
+            assertThat(server.requests).containsExactly(GET_TOPIC, POST_MESSAGES, POST_MESSAGES, POST_MESSAGES);
         }
     }
 
@@ -423,6 +455,11 @@ class MessagesHttpClientSendContextTest {
                 recreatePartitions();
                 reply(exchange, status, "");
             });
+        }
+
+        /** Answers the next request with {@code status} and the error {@code id} in place of the server. */
+        void refuseNextRequest(int status, int id, String code) {
+            scriptedAnswers.add(exchange -> reply(exchange, status, error(id, code)));
         }
 
         private void receive(HttpExchange exchange) throws IOException {

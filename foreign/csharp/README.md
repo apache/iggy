@@ -273,7 +273,8 @@ await client.ConnectAsync();
 
 ### Retries and failed requests
 
-HTTP retries 429 and 503 responses, including `relay_refused`, within its existing
+HTTP retries 429 and 503 responses, including `relay_refused`, and 507, a send
+refused below the free-space reserve of the partition primary, within its existing
 30-second retry budget. It uses the delta value of `Retry-After`, or 50 ms when
 that value is absent. Retained-operation recovery below applies to TCP. After a
 5xx other than 503, a lost connection, or a timeout, an HTTP offset store or
