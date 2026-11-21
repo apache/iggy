@@ -251,6 +251,34 @@ impl KeyLayout {
         )
     }
 
+    /// The listing prefix of the manifests of every partition incarnation of
+    /// one stream, with a trailing `/`. It holds no topic object, fresh
+    /// object or identity object, whose keys go on with a word, not an id.
+    #[must_use]
+    pub fn stream_manifests_prefix(&self, stream_id: u64) -> String {
+        format!("{}/{META}/{stream_id}/", self.root)
+    }
+
+    /// The partition incarnation whose manifest a listed key names, or `None`
+    /// when this layout did not build the key for a manifest. Parsing is
+    /// strict, as for [`Self::parse_segment_key`].
+    #[must_use]
+    pub fn parse_manifest_key(&self, key: &str) -> Option<ObjectPrefix> {
+        let mut parts = key
+            .strip_prefix(self.root.as_str())?
+            .strip_prefix('/')?
+            .strip_prefix(META)?
+            .strip_prefix('/')?
+            .split('/');
+        let prefix = ObjectPrefix {
+            stream_id: parse_id(parts.next()?)?,
+            topic_id: parse_id(parts.next()?)?,
+            partition_id: parse_id(parts.next()?)?,
+            created_revision: parse_id(parts.next()?)?,
+        };
+        (parts.next()? == MANIFEST && parts.next().is_none()).then_some(prefix)
+    }
+
     /// The key of the store identity object, which names the cluster that
     /// owns the root. No other root can continue with `meta`, and no id is
     /// `identity`, so no other key of any root is this key.
@@ -540,6 +568,43 @@ mod tests {
             assert!(validate_key(&key).is_ok(), "{key}");
             assert_eq!(layout.parse_topic_key(&key), Some(topic), "{key}");
             assert_eq!(layout.parse_segment_key(&key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn given_built_manifest_keys_when_parsing_should_round_trip_under_their_stream_prefix() {
+        let layout = layout();
+        for created_revision in [0, 1, 4096, u64::MAX] {
+            let prefix = ObjectPrefix {
+                created_revision,
+                ..PREFIX
+            };
+            let key = layout.manifest_key(&prefix);
+
+            assert_eq!(layout.parse_manifest_key(&key), Some(prefix), "{key}");
+            assert!(key.starts_with(&layout.stream_manifests_prefix(prefix.stream_id)));
+        }
+        let fresh = layout.fresh_key(7);
+        let topic = layout.topic_key(&TOPIC);
+        for key in [
+            layout.identity_key().as_str(),
+            topic.as_str(),
+            fresh.as_str(),
+            "tenant/iggy/meta/1/22/0/4096",
+            "tenant/iggy/meta/1/22/0/4096/manifest.bin/x",
+            "tenant/iggy/meta/1/22/0/04096/manifest.bin",
+            "tenant/iggy/meta/1/22/0/4096/manifest.binx",
+            "tenant/iggy2/meta/1/22/0/4096/manifest.bin",
+        ] {
+            assert_eq!(layout.parse_manifest_key(key), None, "{key}");
+        }
+        for key in [layout.identity_key(), topic, fresh] {
+            for stream_id in [0, 1, 7] {
+                assert!(
+                    !key.starts_with(&layout.stream_manifests_prefix(stream_id)),
+                    "{key}"
+                );
+            }
         }
     }
 

@@ -91,6 +91,14 @@ pub struct CheckpointTriggerLabel {
     pub trigger: &'static str,
 }
 
+/// Label of the geo peer request counters: the peer's origin and the
+/// request, `list` or `get`.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct GeoPeerRequestLabel {
+    pub origin: String,
+    pub request: &'static str,
+}
+
 /// Label for `partition_frames_incarnation_mismatch_total`: the dropped
 /// frame's [`Command`], spelled as the drop-site log prints it.
 #[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
@@ -524,6 +532,27 @@ pub struct ShardMetrics {
     /// peer's store did not answer the last listing of its topic objects. Set
     /// by the metadata primary.
     geo_shadow_topics_stale: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer and request, the manifest listings and reads this shard
+    /// sent to the peer's store.
+    geo_peer_manifest_requests_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer and request, the ones of those that failed.
+    geo_peer_manifest_failures_total: Family<GeoPeerRequestLabel, Counter>,
+    /// Per geo peer, the manifests that the shadow partitions here refused
+    /// to commit: the alarm of a manifest that goes back, names another
+    /// incarnation or does not check.
+    geo_peer_manifests_refused_total: Family<GeoPeerLabel, Counter>,
+    /// Per geo peer, the commands that committed its manifests, as the
+    /// primaries here proposed them.
+    geo_peer_manifest_commands_total: Family<GeoPeerLabel, Counter>,
+    /// Per geo peer, the Unix time in seconds of the last listing of its
+    /// manifests that succeeded. Set by shard 0.
+    geo_peer_manifest_listed_seconds: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, the shadow partitions whose primary is here and whose
+    /// committed manifest is behind the one the peer lists.
+    geo_shadow_partitions_behind: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, how long the furthest behind of those has been behind,
+    /// in seconds.
+    geo_shadow_manifest_lag_seconds: Family<GeoPeerLabel, Gauge>,
 }
 
 impl ShardMetrics {
@@ -696,6 +725,13 @@ impl ShardMetrics {
             geo_peer_identity_verified: Family::default(),
             geo_peer_unreachable: Family::default(),
             geo_shadow_topics_stale: Family::default(),
+            geo_peer_manifest_requests_total: Family::default(),
+            geo_peer_manifest_failures_total: Family::default(),
+            geo_peer_manifests_refused_total: Family::default(),
+            geo_peer_manifest_commands_total: Family::default(),
+            geo_peer_manifest_listed_seconds: Family::default(),
+            geo_shadow_partitions_behind: Family::default(),
+            geo_shadow_manifest_lag_seconds: Family::default(),
         }
     }
 
@@ -853,6 +889,114 @@ impl ShardMetrics {
         self.geo_shadow_topics_stale
             .get_or_create(&label)
             .set(i64::try_from(stale).unwrap_or(i64::MAX));
+    }
+
+    /// A listing of the manifests of a stream of the geo peer `origin`, which
+    /// succeeded at the Unix time `listed_at` in seconds or failed.
+    pub fn record_peer_manifest_list(&self, origin: &str, listed_at: Option<u64>) {
+        let request = GeoPeerRequestLabel {
+            origin: origin.to_owned(),
+            request: "list",
+        };
+        self.geo_peer_manifest_requests_total
+            .get_or_create(&request)
+            .inc();
+        match listed_at {
+            Some(listed_at) => {
+                self.geo_peer_manifest_listed_seconds
+                    .get_or_create(&GeoPeerLabel {
+                        origin: origin.to_owned(),
+                    })
+                    .set(i64::try_from(listed_at).unwrap_or(i64::MAX));
+            }
+            None => {
+                self.geo_peer_manifest_failures_total
+                    .get_or_create(&request)
+                    .inc();
+            }
+        }
+    }
+
+    /// A read of a manifest of the geo peer `origin`.
+    pub fn record_peer_manifest_read(&self, origin: &str) {
+        self.geo_peer_manifest_requests_total
+            .get_or_create(&GeoPeerRequestLabel {
+                origin: origin.to_owned(),
+                request: "get",
+            })
+            .inc();
+    }
+
+    /// A read of a manifest of the geo peer `origin` that failed.
+    pub fn record_peer_manifest_read_failure(&self, origin: &str) {
+        self.geo_peer_manifest_failures_total
+            .get_or_create(&GeoPeerRequestLabel {
+                origin: origin.to_owned(),
+                request: "get",
+            })
+            .inc();
+    }
+
+    /// A manifest of the geo peer `origin` that a shadow partition refused.
+    pub fn record_peer_manifest_refused(&self, origin: &str) {
+        self.geo_peer_manifests_refused_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .inc();
+    }
+
+    /// `commands` commands proposed to commit a manifest of the geo peer
+    /// `origin`.
+    pub fn record_peer_manifest_commands(&self, origin: &str, commands: usize) {
+        self.geo_peer_manifest_commands_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .inc_by(u64::try_from(commands).unwrap_or(u64::MAX));
+    }
+
+    /// The shadow partitions of the geo peer `origin` whose primary is here
+    /// and that are behind its manifests, and how long the furthest behind
+    /// has been, in microseconds.
+    pub fn set_shadow_manifest_lag(&self, origin: &str, behind: usize, lag_micros: u64) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_shadow_partitions_behind
+            .get_or_create(&label)
+            .set(i64::try_from(behind).unwrap_or(i64::MAX));
+        self.geo_shadow_manifest_lag_seconds
+            .get_or_create(&label)
+            .set(i64::try_from(lag_micros / 1_000_000).unwrap_or(i64::MAX));
+    }
+
+    /// The counts of the manifest requests to the geo peer `origin` and of
+    /// its refused manifests: lists, gets, refused.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn peer_manifest_counts(&self, origin: &str) -> (u64, u64, u64) {
+        let request = |request| GeoPeerRequestLabel {
+            origin: origin.to_owned(),
+            request,
+        };
+        // One guard at a time: a family holds its lock while a guard lives,
+        // and creating a series takes it for writing.
+        let lists = self
+            .geo_peer_manifest_requests_total
+            .get_or_create(&request("list"))
+            .get();
+        let gets = self
+            .geo_peer_manifest_requests_total
+            .get_or_create(&request("get"))
+            .get();
+        let refused = self
+            .geo_peer_manifests_refused_total
+            .get_or_create(&GeoPeerLabel {
+                origin: origin.to_owned(),
+            })
+            .get();
+        (lists, gets, refused)
     }
 
     /// The count of stale shadow topics of the geo peer `origin`.
@@ -2539,6 +2683,41 @@ impl ShardMetrics {
             "geo_shadow_topics_stale",
             "Shadow topics of the geo peer that serve what they hold, because its store did not answer the last listing",
             self.geo_shadow_topics_stale.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_requests",
+            "Listings and reads of the geo peer's manifests that this shard sent to its store",
+            self.geo_peer_manifest_requests_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_failures",
+            "Listings and reads of the geo peer's manifests that failed",
+            self.geo_peer_manifest_failures_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifests_refused",
+            "Manifests of the geo peer that a shadow partition refused: they go back, name another incarnation or do not check",
+            self.geo_peer_manifests_refused_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_commands",
+            "Commands that the shadow partitions here proposed to commit the geo peer's manifests",
+            self.geo_peer_manifest_commands_total.clone(),
+        );
+        registry.register(
+            "geo_peer_manifest_listed_seconds",
+            "Unix time of the last listing of the geo peer's manifests that succeeded",
+            self.geo_peer_manifest_listed_seconds.clone(),
+        );
+        registry.register(
+            "geo_shadow_partitions_behind",
+            "Shadow partitions whose primary is on this shard and whose committed manifest is behind the geo peer's",
+            self.geo_shadow_partitions_behind.clone(),
+        );
+        registry.register(
+            "geo_shadow_manifest_lag_seconds",
+            "How long the furthest behind shadow partition on this shard has been behind the geo peer's manifest",
+            self.geo_shadow_manifest_lag_seconds.clone(),
         );
     }
 
