@@ -45,3 +45,4 @@ mod root_credentials;
 mod staggered_bootstrap;
 mod stream_encryption;
 mod stream_key_rotation;
+mod tiered_storage_fs;

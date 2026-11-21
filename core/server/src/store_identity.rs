@@ -55,7 +55,7 @@ use journal::superblock::SuperblockStore;
 use metadata::AppliedFrontier;
 use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::StreamsFrontend;
-use partitions::{ObjectDeleter, SegmentUploader};
+use partitions::{ManifestPublisher, ObjectDeleter, SegmentUploader};
 use shard::Receiver;
 use shard::metrics::ShardMetrics;
 use tracing::{debug, error, info, warn};
@@ -118,11 +118,12 @@ enum Verdict {
     Refused,
 }
 
-/// The uploader and the object deleter of a shard. The shard holds them only
-/// while its node passes the store identity check.
+/// The uploader, the object deleter and the manifest publisher of a shard.
+/// The shard holds them only while its node passes the store identity check.
 pub struct TierHandlers {
     uploader: Rc<dyn SegmentUploader>,
     deleter: Rc<dyn ObjectDeleter>,
+    publisher: Rc<dyn ManifestPublisher>,
     held: bool,
 }
 
@@ -343,15 +344,20 @@ const fn may_claim(
 }
 
 impl TierHandlers {
-    pub fn new(uploader: Rc<dyn SegmentUploader>, deleter: Rc<dyn ObjectDeleter>) -> Self {
+    pub fn new(
+        uploader: Rc<dyn SegmentUploader>,
+        deleter: Rc<dyn ObjectDeleter>,
+        publisher: Rc<dyn ManifestPublisher>,
+    ) -> Self {
         Self {
             uploader,
             deleter,
+            publisher,
             held: false,
         }
     }
 
-    /// Hand both to `shard` when its node is `verified`, and take both back
+    /// Hand them to `shard` when its node is `verified`, and take them back
     /// when not. A job in flight ends on the handler that started it.
     fn sync<B, MJ, S, SB>(&mut self, shard: &ShellShard<B, MJ, S, SB>, verified: bool)
     where
@@ -363,6 +369,7 @@ impl TierHandlers {
         }
         shard.set_segment_uploader(verified.then(|| Rc::clone(&self.uploader)));
         shard.set_object_deleter(verified.then(|| Rc::clone(&self.deleter)));
+        shard.set_manifest_publisher(verified.then(|| Rc::clone(&self.publisher)));
         self.held = verified;
     }
 }
@@ -378,7 +385,7 @@ mod tests {
         DeleteOutcome, FsStore, InlineTierExecutor, ListPage, ListRequest, MemoryStore, ObjectMeta,
         ObjectRange, PutBody, PutOptions,
     };
-    use partitions::{ExecutorDeleter, ExecutorUploader};
+    use partitions::{ExecutorDeleter, ExecutorManifestPublisher, ExecutorUploader};
 
     use super::*;
     use crate::dispatch::test_support::{SpyBus, test_shard};
@@ -554,20 +561,25 @@ mod tests {
                 InlineTierExecutor::new(MemoryStore::new()),
                 layout(),
             )),
+            Rc::new(ExecutorManifestPublisher::new(
+                InlineTierExecutor::new(MemoryStore::new()),
+                layout(),
+            )),
         );
         let held = |handlers: &mut TierHandlers, verified| {
             handlers.sync(&shard, verified);
             (
                 shard.segment_uploader().is_some(),
                 shard.object_deleter().is_some(),
+                shard.manifest_publisher().is_some(),
             )
         };
 
-        assert_eq!(held(&mut handlers, false), (false, false));
-        assert_eq!(held(&mut handlers, true), (true, true));
-        assert_eq!(held(&mut handlers, true), (true, true));
-        assert_eq!(held(&mut handlers, false), (false, false));
-        assert_eq!(held(&mut handlers, true), (true, true));
+        assert_eq!(held(&mut handlers, false), (false, false, false));
+        assert_eq!(held(&mut handlers, true), (true, true, true));
+        assert_eq!(held(&mut handlers, true), (true, true, true));
+        assert_eq!(held(&mut handlers, false), (false, false, false));
+        assert_eq!(held(&mut handlers, true), (true, true, true));
     }
 
     #[test]

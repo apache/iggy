@@ -1368,6 +1368,16 @@ where
             LifecycleFrame::ObjectDeleteFinished(finished) => {
                 self.on_object_delete_finished(*finished);
             }
+            LifecycleFrame::PublishManifest {
+                namespace,
+                created_revision,
+                now,
+            } => {
+                self.on_publish_manifest(namespace, created_revision, now);
+            }
+            LifecycleFrame::ManifestPublishFinished(finished) => {
+                self.on_manifest_publish_finished(&finished);
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,

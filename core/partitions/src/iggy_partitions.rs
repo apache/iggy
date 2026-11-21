@@ -133,6 +133,9 @@ where
     fence_published: Rc<Cell<bool>>,
     persistence_notifier: RefCell<Option<crate::PersistenceNotifier>>,
     io_notifier: RefCell<Option<(crate::PartitionIoNotifier, usize)>>,
+    /// Where the partitions here read their remote segments from. `None` on a
+    /// shard without an object store.
+    remote_segments: RefCell<Option<Rc<crate::RemoteSegments>>>,
     repair_memory: Option<Arc<crate::RepairMemoryBudget>>,
     repair_rings: Option<Rc<crate::RepairRingBudget>>,
     /// The delays of the checkpoint rule. `None` leaves the rule off.
@@ -362,6 +365,7 @@ where
             fence_published: Rc::default(),
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
+            remote_segments: RefCell::new(None),
             repair_memory: None,
             repair_rings: None,
             checkpoint_delays: None,
@@ -971,6 +975,16 @@ where
         *self.io_notifier.borrow_mut() = Some((notifier, bytes_max));
     }
 
+    /// Give every partition here, and every one inserted later, the store
+    /// its remote segments are read from.
+    ///
+    /// A partition that is here already takes it at its next poll, on the
+    /// pump: the pump can hold a partition across a suspension, so no other
+    /// task writes to one.
+    pub fn set_remote_segments(&self, remote: Rc<crate::RemoteSegments>) {
+        *self.remote_segments.borrow_mut() = Some(remote);
+    }
+
     /// Access the physical owner through the tombstone gate for I/O settlement,
     /// shutdown, fault scans, and ticks. Admission must use the live lookup.
     #[allow(clippy::mut_from_ref)]
@@ -1132,6 +1146,9 @@ where
         partition.reset_checkpoint_stamps();
         if let Some(budget) = &self.repair_memory {
             partition.proof_walk_memory = Some(budget.reservation());
+        }
+        if let Some(remote) = self.remote_segments.borrow().as_ref() {
+            partition.set_remote_segments(Rc::clone(remote));
         }
         if let Some(budget) = &self.repair_rings {
             partition
@@ -1546,7 +1563,13 @@ where
         // inside), so no sibling task can remove the partition under it.
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
+        let remote = self.remote_segments.borrow().clone();
         let partition = self.get_mut_by_ns(namespace)?;
+        if !partition.has_remote_segments()
+            && let Some(remote) = remote
+        {
+            partition.set_remote_segments(remote);
+        }
         Some(partition.build_poll_plan_within(consumer, args, validate_checksum, byte_budget))
     }
 
@@ -1891,6 +1914,73 @@ mod tests {
 
     const TEST_CLUSTER: u128 = 1;
     const RING_OPS: RangeInclusive<u64> = 1..=4;
+
+    fn remote_segments() -> Rc<crate::RemoteSegments> {
+        Rc::new(crate::RemoteSegments::new(
+            Rc::new(iggy_object_store::MemoryStore::new()),
+            iggy_object_store::KeyLayout::new("iggy").unwrap(),
+        ))
+    }
+
+    fn partitions() -> IggyPartitions<IggyMessageBus> {
+        IggyPartitions::new(
+            ShardId::new(0),
+            PartitionsConfig {
+                messages_required_to_save: 1,
+                size_of_messages_required_to_save: IggyByteSize::from(1024 * 1024),
+                validate_checksum: false,
+                segment_size: IggyByteSize::from(1024 * 1024),
+                preallocate_segments: false,
+                key_context: Arc::default(),
+                path_layout: crate::PartitionPathLayout::default(),
+            },
+        )
+    }
+
+    #[test]
+    fn given_a_remote_store_when_a_partition_is_inserted_should_hand_it_the_store() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partitions = partitions();
+        partitions.set_remote_segments(remote_segments());
+
+        partitions.insert(namespace, build_partition());
+
+        assert!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .has_remote_segments()
+        );
+    }
+
+    #[test]
+    fn given_a_partition_inserted_before_the_remote_store_when_it_is_polled_should_take_the_store()
+    {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let partitions = partitions();
+        partitions.insert(namespace, build_partition());
+        partitions.set_remote_segments(remote_segments());
+        assert!(
+            !partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .has_remote_segments()
+        );
+
+        let plan = partitions.build_poll_snapshot(
+            &namespace,
+            PollingConsumer::Consumer(7, 0),
+            &PollingArgs::new(PollingStrategy::next(), 1, false),
+        );
+
+        assert!(plan.is_some());
+        assert!(
+            partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .has_remote_segments()
+        );
+    }
 
     fn build_partition() -> IggyPartition<IggyMessageBus> {
         let namespace = IggyNamespace::new(1, 1, 0);

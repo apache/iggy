@@ -23,6 +23,7 @@ pub mod host;
 pub mod metrics;
 mod partition_io;
 pub use partition_io::{DEFAULT_PARTITION_IO_CAPACITY, PartitionIoLimits, PartitionIoLimitsError};
+mod manifest_publishes;
 mod object_deletes;
 mod poll;
 mod primary_rebalance;
@@ -1248,6 +1249,30 @@ pub enum LifecycleFrame {
     /// The result of a job that a [`Self::DeleteObjects`] pass started, sent
     /// by the task that ran it.
     ObjectDeleteFinished(Box<FinishedObjectDelete>),
+    /// Per-shard pass over a partition of a tiered topic: store its manifest,
+    /// when this replica is the primary, no publish is in flight, and the
+    /// manifest changed. The timer task stamps `now`. Does nothing on a shard
+    /// without a publisher.
+    PublishManifest {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+        now: IggyTimestamp,
+    },
+    /// The result of a publish that a [`Self::PublishManifest`] pass started,
+    /// sent by the task that ran it.
+    ManifestPublishFinished(Box<FinishedManifestPublish>),
+}
+
+/// What the task publishing a manifest hands back to the pump.
+pub struct FinishedManifestPublish {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the publish. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the publish.
+    pub id: u64,
+    pub outcome: partitions::ManifestPublishOutcome,
 }
 
 /// What the task running an object-delete job hands back to the pump.
@@ -2058,6 +2083,15 @@ where
     /// the next delete pass takes them from here.
     undelivered_object_deletes: Rc<RefCell<Vec<FinishedObjectDelete>>>,
 
+    /// Late-bound publisher of the manifests of tiered partitions. `None` on
+    /// a shard without an object store, where every manifest pass is a no-op.
+    manifest_publisher: RefCell<Option<Rc<dyn partitions::ManifestPublisher>>>,
+
+    /// Results of manifest publishes whose frame the inbox refused. The
+    /// partition counts such a publish as in flight until it sees the result,
+    /// so the next manifest pass takes them from here.
+    undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2359,7 +2393,7 @@ where
     /// # Panics
     ///
     /// Panics if `poll_completion_capacity` is zero.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         identity: ShardIdentity,
         bus: B,
@@ -2422,6 +2456,8 @@ where
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
+            manifest_publisher: RefCell::new(None),
+            undelivered_manifest_publishes: Rc::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3402,6 +3438,8 @@ where
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
+            manifest_publisher: RefCell::new(None),
+            undelivered_manifest_publishes: Rc::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),

@@ -145,6 +145,9 @@ pub fn stage_owned_partitions(
             };
             // Staged after the loop, where the shard orders them.
             tiered.push((namespace, created_revision, committed_up_to));
+            // Staged before the deletes, which wait for a manifest that
+            // stopped listing what they remove.
+            shard.request_publish_manifest(namespace, created_revision, now);
             // Staged whatever the topic's policy is: a truncation a client
             // asked for leaves objects behind as well.
             shard.request_delete_objects(namespace, created_revision, now, committed_up_to);

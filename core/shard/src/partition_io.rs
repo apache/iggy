@@ -12377,6 +12377,7 @@ mod tests {
         assert_eq!(sent_groups, groups);
     }
 
+    mod manifest_publishes;
     mod object_deletes;
     mod segment_uploads;
     mod tier_service_uploads;

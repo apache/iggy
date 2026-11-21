@@ -51,7 +51,8 @@ public sealed class TopicUpdate
     ///     unless the update carries a raw key. Null changes nothing.
     /// </summary>
     /// <remarks>
-    ///     Not available yet: the server refuses <c>true</c> with <c>feature_unavailable</c>.
+    ///     Needs an object store on every node of the cluster: while one is not ready, the server refuses
+    ///     <c>true</c> with <c>feature_unavailable</c>.
     /// </remarks>
     public bool? TieredStorage { get; init; }
 

@@ -121,9 +121,8 @@ impl AppliedFrontier {
     }
 
     /// Record whether the partitions of this node can read their remote
-    /// segments back. False until set. No boot path hands a partition those
-    /// reads yet (`IggyPartition::set_remote_segments`), so no boot path sets
-    /// this.
+    /// segments back. False until set, which the server does once it gave
+    /// them a store to read from.
     pub fn set_tiered_storage_ready(&self, ready: bool) {
         self.tiered_storage_ready.store(ready, Ordering::Release);
     }
