@@ -1,0 +1,111 @@
+---
+title: Kafka Gateway
+description: "Run Kafka producers, consumers and admin clients against Iggy through the Kafka gateway."
+---
+
+The Kafka gateway 0.2.0 is a separate service named `iggy-gateway-kafka`. It accepts Kafka wire requests and uses the Rust SDK to store and read data in Iggy. Kafka clients connect to the gateway port, 9093 by default. Native Iggy clients continue to use Iggy listeners.
+
+## Enable the bridge
+
+The bridge is the gateway's connection to Iggy. It is disabled by default. Without it, data and topic APIs do not store data. Producer ID allocation and in-memory group coordination alone do not prove that storage is enabled.
+
+Start the Iggy server from the release source with development credentials. Then run the gateway from the same repository root:
+
+```bash
+IGGY_KAFKA_BRIDGE_ENABLED=true \
+IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+IGGY_KAFKA_IGGY_USERNAME=iggy \
+IGGY_KAFKA_IGGY_PASSWORD=iggy \
+cargo run -p iggy-gateway-kafka
+```
+
+Use these credentials only for local development. In a deployment, provision a separate bridge account with the required permissions. A transient connection failure retries at startup for up to 60 seconds. Bad credentials or missing required permissions stop startup. The gateway does not silently switch back to storage-free responses.
+
+The [Docker Compose example](https://github.com/apache/iggy/blob/server-0.10.0/gateways/kafka/docker-compose.yml) starts a local Iggy server and gateway. Review its image selection and development credentials before running it. The gateway image is `apache/iggy-kafka-gateway`.
+
+## Create, produce and consume
+
+With Kafka command-line tools installed, use the gateway as the bootstrap server:
+
+```bash
+kafka-topics.sh --bootstrap-server 127.0.0.1:9093 --create --topic orders --partitions 1 --replication-factor 1
+kafka-console-producer.sh --bootstrap-server 127.0.0.1:9093 --topic orders
+```
+
+Enter a message in the producer, then read it from another terminal:
+
+```bash
+kafka-console-consumer.sh --bootstrap-server 127.0.0.1:9093 --topic orders --from-beginning --max-messages 1
+```
+
+By default, Kafka topic `orders` maps to Iggy stream `kafka`, topic `orders`. `IGGY_KAFKA_IGGY_STREAM` changes the default stream. `IGGY_KAFKA_TOPIC_MAP_PATH` selects a TOML mapping file:
+
+```toml
+default_stream = "kafka"
+
+[topics.orders]
+stream = "billing"
+topic = "orders_v2"
+```
+
+Topic auto-creation is disabled by default. Enable `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED` only when Metadata requests are allowed to create missing topics. `IGGY_KAFKA_AUTO_CREATE_TOPICS_PARTITIONS` defaults to one and cannot exceed 1000.
+
+## Supported operations
+
+The gateway supports Produce, Fetch, ListOffsets, Metadata, topic creation and deletion, partition additions, and topic retention changes. Consumer group APIs support membership, rebalances, static membership, offset commits, group inspection and offset deletion. It also supports ApiVersions, InitProducerId and DescribeCluster.
+
+Topic configuration changes support `retention.ms`. The gateway is not a complete Kafka broker implementation. Unsupported API keys and most unsupported versions close the connection. ApiVersions has a discovery error response for unsupported versions. Use the [protocol coverage](https://github.com/apache/iggy/blob/server-0.10.0/gateways/kafka/docs/SCOPE.md) for exact API version ranges.
+
+Kafka offsets identify the next record to read. The gateway stores externally managed group offsets in Iggy. These are separate from native Iggy consumer group membership. Deleting a Kafka topic deletes its backing Iggy topic, but retains the stream.
+
+## Delivery and durability
+
+Without gateway idempotence, delivery is at-least-once. A retry after an uncertain write can append records again. Set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true` after every Iggy node, gateway and reader uses a compatible release. Idempotent batches then retain their producer ID, epoch and sequence through the gateway.
+
+Deduplication is bounded. Each partition retains five batches per producer and at most 4096 producers. It expires producers after 24 hours without writes. A retry outside retained history can duplicate a batch. Message IDs do not provide this guarantee.
+
+Transactions are unsupported. Transactional producer initialization and Produce requests are refused. Do not configure `transactional.id`.
+
+The Iggy topic's durability policy controls storage guarantees. The development stack uses `replicated`, so an acknowledgement does not prove stable-storage synchronization. Use `persisted` when acknowledged messages must survive loss of volatile copies. A named Docker volume alone does not strengthen an acknowledgement.
+
+## Authentication and authorization
+
+Listeners support `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT` and `SASL_SSL`. SASL uses PLAIN against Iggy credentials. SSL listeners can map verified client certificates to Iggy users. Configure TLS for both the Kafka listener and the separate gateway-to-Iggy connection when both hops need encryption.
+
+Data operations run as the bridge's Iggy account. Authentication does not provide complete per-principal data authorization in this release. In particular, CreateTopics does not yet apply the principal management gate. Other topic management operations and offset deletion add principal permission checks when the listener identifies a user. Do not expose an unauthenticated listener as a tenant-isolation boundary.
+
+Configure `metadata.partitions_max` on Iggy to bound topic creation. Its default is zero, which means no cap. DescribeAcls presents Iggy permissions, but CreateAcls and DeleteAcls are not supported. The [authentication reference](https://github.com/apache/iggy/blob/server-0.10.0/gateways/kafka/docs/AUTHENTICATION.md) describes the exact limits.
+
+## Listener and bridge configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `IGGY_KAFKA_BIND_ADDR` | `127.0.0.1:9093` | Single-listener bind address |
+| `IGGY_KAFKA_ADVERTISED_HOST` | Bind IP | Address clients can reach, required for a wildcard bind |
+| `IGGY_KAFKA_ADVERTISED_PORT` | Bind port | Client-facing port |
+| `IGGY_KAFKA_LISTENERS` | Unset | Comma-separated `PROTOCOL://ip:port` listeners |
+| `IGGY_KAFKA_ADVERTISED_LISTENERS` | Listener addresses | Client-facing endpoint for each protocol |
+| `IGGY_KAFKA_MAX_CONNECTIONS` | 1024 | Limit per listener |
+| `IGGY_KAFKA_MAX_FRAME_SIZE` | 8388608 | Request frame cap in bytes |
+| `IGGY_KAFKA_BRIDGE_ENABLED` | `false` | Enable Iggy storage |
+| `IGGY_KAFKA_IGGY_ADDR` | `127.0.0.1:8090` | Initial Iggy endpoint |
+| `IGGY_KAFKA_IGGY_USERNAME` | `iggy` | Bridge account |
+| `IGGY_KAFKA_IGGY_PASSWORD` | Required | Bridge password |
+| `IGGY_KAFKA_IGGY_STREAM` | `kafka` | Default stream |
+| `IGGY_KAFKA_FETCH_SLOTS` | 4 | Concurrent Iggy fetch clients |
+| `IGGY_KAFKA_PRODUCE_SESSIONS` | 256 | Dedicated producer clients. Zero shares one client |
+| `IGGY_KAFKA_IDEMPOTENT_PRODUCERS` | `false` | Pass producer batch identity to Iggy |
+
+Do not mix `LISTENERS` with the single-listener advertised host/port or SASL toggle. Use matching `ADVERTISED_LISTENERS`. TLS needs `IGGY_KAFKA_TLS_CERT_FILE` and `IGGY_KAFKA_TLS_KEY_FILE`. The bridge hop uses `IGGY_KAFKA_IGGY_TLS_ENABLED`, `IGGY_KAFKA_IGGY_TLS_DOMAIN` and `IGGY_KAFKA_IGGY_TLS_CA_FILE`.
+
+The [gateway configuration reference](https://github.com/apache/iggy/blob/server-0.10.0/gateways/kafka/README.md) also lists timeouts, TLS reload, client-certificate mapping, authentication capacity and producer session expiry.
+
+## Run several gateways
+
+Give every gateway the same `IGGY_KAFKA_BROKERS` list and a unique `IGGY_KAFKA_NODE_ID`. Put each gateway beside an Iggy node and point its bridge at that node. Clients list multiple gateways in `bootstrap.servers`. Each gateway can route requests to any Iggy partition primary.
+
+With the bridge and broker list configured, the shared coordinator log is enabled by default. It stores group generations, offset commits and deletions in Iggy. The bridge account needs `manage_servers` for metadata changes. Explicitly enabling the log with insufficient permissions stops startup. An implicitly enabled log can fall back with a warning, so inspect startup logs.
+
+The coordinator log uses 16 partitions. The owner of partition zero is the controller for topic management. Other gateways return `NOT_CONTROLLER`, and the Kafka admin client follows it. After a gateway fails, another gateway takes over its assigned groups once the Iggy session expires and ownership moves.
+
+Use consistent coordinator-log configuration across gateways. With it disabled, the gateway with the lowest node ID coordinates all groups, and groups wait while it is down. See the [multi-gateway deployment reference](https://github.com/apache/iggy/blob/server-0.10.0/gateways/kafka/README.md#several-gateways-4515) for permissions and takeover timing.
