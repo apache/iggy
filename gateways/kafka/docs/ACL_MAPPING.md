@@ -138,9 +138,10 @@ needs `manage_users` on the *Kafka client's own* Iggy user. Coherent, but it tur
 surface into one that mutates accounts, and it cannot be verified the way a read can. Left out
 deliberately rather than half-built.
 
-**Enforcement of per-stream grants.** The gateway refuses `DeleteTopics`, `AlterConfigs` and the
-auto topic creation a `Metadata` request asks for unless the principal holds `manage_topics` or
-`manage_streams` in the global projection above. A principal granted `manage_topics` on one stream
+**Enforcement of per-stream grants.** The gateway refuses `CreateTopics`, `DeleteTopics`,
+`CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs` and the auto topic creation a
+`Metadata` request asks for unless the principal holds `manage_topics` or `manage_streams` in
+the global projection above. A principal granted `manage_topics` on one stream
 alone is therefore refused, though Iggy would let it manage topics there. `OffsetCommit` reads
 stream and topic grants too. A refused auto-creation is
 answered `TOPIC_AUTHORIZATION_FAILED` (29), which Kafka clients treat as fatal (see the README's

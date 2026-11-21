@@ -17,12 +17,12 @@ Foundation layer for [apache/iggy#3421](https://github.com/apache/iggy/issues/34
 > `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` and no listener that names principals, any client
 > that reaches this port can also create topics just by naming them in a `Metadata` request. When
 > the connection has a principal (SASL, or a client certificate mapped to an Iggy user),
-> `DeleteTopics`, `CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs` and `Metadata`
+> `CreateTopics`, `DeleteTopics`, `CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs` and `Metadata`
 > auto-creation additionally require it to hold a global `manage_topics` or `manage_streams`;
-> without it every resource of a `DeleteTopics`, `CreatePartitions`, `AlterConfigs` or
+> without it every resource of a `CreateTopics`, `DeleteTopics`, `CreatePartitions`, `AlterConfigs` or
 > `IncrementalAlterConfigs` request, and every missing topic a `Metadata` request would create,
 > fails `TOPIC_AUTHORIZATION_FAILED` (29) and nothing is written, created or deleted.
-> `CreateTopics` has no such gate yet - SASL on does not protect it. Every client reads and writes
+> Produce and Fetch read and write
 > as the bridge's Iggy user. DeleteGroups and OffsetDelete also run as that user. When no listener
 > names a principal, any client can delete committed offsets. When one does (SASL, or client
 > certificates), they also require a global `manage_topics` or `manage_streams`, and without it
@@ -571,7 +571,8 @@ With `requested`, a client that presents no certificate is Kafka's `ANONYMOUS` p
 holds no permissions. Once any listener names principals (a SASL listener, or an `SSL` listener
 with client authentication), every connection that proved no identity is `ANONYMOUS`, on a
 `PLAINTEXT` listener beside it too. The requests the gateway checks against a principal are
-`DeleteTopics`, `AlterConfigs`, `DeleteGroups`, `OffsetDelete` and the auto-creation a `Metadata`
+`CreateTopics`, `DeleteTopics`, `CreatePartitions`, `AlterConfigs`, `IncrementalAlterConfigs`,
+`DeleteGroups`, `OffsetDelete` and the auto-creation a `Metadata`
 request asks for. Each needs a global `manage_topics` or `manage_streams`, so the gateway refuses
 them for `ANONYMOUS`. Everything else is served as the bridge's user. A gateway whose listeners
 name nobody serves every request as the bridge's user.
@@ -959,8 +960,8 @@ topics that rely on creation by first use then work without a `CreateTopics` cal
   `allow.auto.create.topics=false`, which keeps its lookups of a missing topic answered
   `UNKNOWN_TOPIC_OR_PARTITION` (3). A principal whose permissions could not be read is answered 3
   and nothing is created, since 29 is fatal to Java producers, consumers and Streams while Produce
-  and Fetch still work for it. An explicit `CreateTopics` is not checked against `manage_topics`
-  today, so a principal refused auto-creation can still create the same topic with `CreateTopics`.
+  and Fetch still work for it. An explicit `CreateTopics` also requires `manage_topics`,
+  answering `TOPIC_AUTHORIZATION_FAILED` (29) when the principal lacks it.
 - A topic already being created is not started twice. At most 100 creations run at once; a name
   past that is started by a later refresh. A creation Iggy refuses, for example at
   `metadata.partitions_max`, is not retried for 1 second. One Iggy refuses for the bridge user's
