@@ -50,6 +50,15 @@ You must run your code locally before submitting.
 Did you have `prek` installed? It runs automatically on commit and covers all project languages. See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).
 -->
 
+## Docs
+
+- Updated `docs/` / no user-facing change
+
+<!--
+A user-facing change, for example a new config key, CLI argument or SDK method, updates `docs/` in the same PR. The connectors docs live in apache/iggy-connectors.
+See https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#docs
+-->
+
 ## AI Usage
 
 <!--
