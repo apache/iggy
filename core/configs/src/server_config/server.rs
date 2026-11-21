@@ -18,6 +18,7 @@
 use super::COMPONENT;
 use super::cluster::ClusterConfig;
 use super::external_auth::ExternalAuthConfig;
+use super::geo::GeoConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -200,6 +201,8 @@ pub struct ServerConfig {
     pub external_auth: ExternalAuthConfig,
     #[serde(default)]
     pub tiered_storage: TieredStorageConfig,
+    #[serde(default)]
+    pub geo: GeoConfig,
 }
 
 /// One client-facing listener, as the client-facing address derivation and
@@ -424,7 +427,8 @@ impl SystemPaths for ServerConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tiered_storage::TieredStorageBackend;
+    use super::super::geo::GeoPeerConfig;
+    use super::super::tiered_storage::{S3UrlStyle, TieredStorageBackend};
     use super::*;
     use figment::Figment;
     use figment::providers::Serialized;
@@ -609,6 +613,87 @@ mod tests {
         cfg.validate()
             .expect("an s3 section from the environment validates");
         assert!(!cfg.to_string().contains("wJalrXUtnFEMI"));
+    }
+
+    /// Every file written before geo topics has no `[geo]` table.
+    #[test]
+    fn given_a_config_file_without_geo_when_loading_should_have_no_origin_or_peers() {
+        let cfg: ServerConfig = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .extract()
+            .expect("embedded TOML deserializes");
+
+        assert!(cfg.geo.origin.is_empty());
+        assert!(cfg.geo.peers.is_empty());
+        cfg.validate().expect("a config without geo validates");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_geo_env_vars_when_loading_should_set_the_origin_and_a_peer() {
+        let vars = [
+            ("IGGY_GEO_ORIGIN", "dc-a"),
+            ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b"),
+            ("IGGY_GEO_PEERS_0_BACKEND", "s3"),
+            ("IGGY_GEO_PEERS_0_BUCKET", "iggy-dc-b"),
+            ("IGGY_GEO_PEERS_0_REGION", "us-east-1"),
+            ("IGGY_GEO_PEERS_0_URL_STYLE", "path"),
+            ("IGGY_GEO_PEERS_0_ACCESS_KEY_ID", "AKIDPEEREXAMPLE"),
+            ("IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY", "peerSecretKeyExample"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        assert_eq!(cfg.geo.origin, "dc-a");
+        let [peer] = cfg.geo.peers.as_slice() else {
+            panic!("one peer: {}", cfg.geo);
+        };
+        assert_eq!(peer.origin, "dc-b");
+        assert_eq!(peer.backend, TieredStorageBackend::S3);
+        assert_eq!(peer.bucket, "iggy-dc-b");
+        assert_eq!(peer.region, "us-east-1");
+        assert_eq!(peer.prefix, "iggy", "the default prefix");
+        assert_eq!(peer.url_style, S3UrlStyle::Path);
+        assert_eq!(peer.access_key_id, "AKIDPEEREXAMPLE");
+        assert_eq!(peer.secret_access_key, "peerSecretKeyExample");
+        cfg.validate()
+            .expect("a geo section from the environment validates");
+        assert!(!cfg.to_string().contains("peerSecretKeyExample"));
+        assert!(
+            !known.contains(&"IGGY_GEO_PEERS_16_ORIGIN"),
+            "env overrides stop at geo::MAX_PEERS"
+        );
+    }
+
+    #[test]
+    fn given_peers_and_bad_tuning_without_a_backend_when_validating_should_refuse() {
+        let mut cfg = ServerConfig::default();
+        cfg.tiered_storage.max_attempts = 0;
+        assert!(cfg.validate().is_ok(), "no peer takes the tuning");
+
+        cfg.geo.origin = "dc-a".to_owned();
+        cfg.geo.peers.push(GeoPeerConfig {
+            origin: "dc-b".to_owned(),
+            backend: TieredStorageBackend::Fs,
+            path: "/mnt/dc-b".to_owned(),
+            ..GeoPeerConfig::default()
+        });
+
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

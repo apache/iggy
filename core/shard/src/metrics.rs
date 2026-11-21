@@ -79,6 +79,13 @@ pub struct ConsumerOffsetKindLabel {
     pub kind: &'static str,
 }
 
+/// Label of the geo peer gauges: the origin name of the peer, as the
+/// configuration gives it.
+#[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
+pub struct GeoPeerLabel {
+    pub origin: String,
+}
+
 #[derive(Clone, Hash, Eq, PartialEq, EncodeLabelSet, Debug)]
 pub struct CheckpointTriggerLabel {
     pub trigger: &'static str,
@@ -499,6 +506,13 @@ pub struct ShardMetrics {
     /// 1 while the object store did not answer the last read of its identity
     /// object: the boot probe, then each identity check.
     object_store_unreachable: Gauge,
+    /// Per geo peer, 1 while this node reads the peer: a check verified the
+    /// cluster that owns the peer's root. Node-wide like the object store
+    /// gauges.
+    geo_peer_identity_verified: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, 1 while the peer's store did not answer the last read of
+    /// its identity object.
+    geo_peer_unreachable: Family<GeoPeerLabel, Gauge>,
 }
 
 impl ShardMetrics {
@@ -661,6 +675,8 @@ impl ShardMetrics {
             fresh_object_size: fresh_object_size_histogram(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
+            geo_peer_identity_verified: Family::default(),
+            geo_peer_unreachable: Family::default(),
         }
     }
 
@@ -785,11 +801,41 @@ impl ShardMetrics {
         self.object_store_unreachable.set(i64::from(unreachable));
     }
 
-    /// Export the object store gauges of `node` from this shard as well.
-    /// Only the boot probe and the store identity check of shard 0 set them.
+    /// Set both gauges of the geo peer `origin`, for every shard that shares
+    /// them.
+    pub fn set_geo_peer_status(&self, origin: &str, verified: bool, unreachable: bool) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_peer_identity_verified
+            .get_or_create(&label)
+            .set(i64::from(verified));
+        self.geo_peer_unreachable
+            .get_or_create(&label)
+            .set(i64::from(unreachable));
+    }
+
+    /// Export the object store and geo peer gauges of `node` from this shard
+    /// as well. Only the boot probe and the identity checks of shard 0 set
+    /// them.
     pub fn share_object_store_gauges(&mut self, node: &Self) {
         self.object_store_identity_verified = node.object_store_identity_verified.clone();
         self.object_store_unreachable = node.object_store_unreachable.clone();
+        self.geo_peer_identity_verified = node.geo_peer_identity_verified.clone();
+        self.geo_peer_unreachable = node.geo_peer_unreachable.clone();
+    }
+
+    /// Both gauges of the geo peer `origin`: verified, then unreachable.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn geo_peer_status_value(&self, origin: &str) -> (bool, bool) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        (
+            self.geo_peer_identity_verified.get_or_create(&label).get() != 0,
+            self.geo_peer_unreachable.get_or_create(&label).get() != 0,
+        )
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -2305,6 +2351,16 @@ impl ShardMetrics {
             "object_store_unreachable",
             "1 while the object store did not answer the last read of its identity object, at boot or in the check every minute",
             self.object_store_unreachable.clone(),
+        );
+        registry.register(
+            "geo_peer_identity_verified",
+            "1 while this node reads the geo peer: a check verified the cluster that owns its root",
+            self.geo_peer_identity_verified.clone(),
+        );
+        registry.register(
+            "geo_peer_unreachable",
+            "1 while the store of the geo peer did not answer the last read of its identity object",
+            self.geo_peer_unreachable.clone(),
         );
     }
 

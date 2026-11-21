@@ -28,6 +28,7 @@ use super::cluster::{
     ClusterTlsConfig, TransportPorts,
 };
 use super::external_auth::ExternalAuthConfig;
+use super::geo::GeoConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -73,6 +74,7 @@ impl Default for ServerConfig {
             message_bus: MessageBusConfig::default(),
             external_auth: ExternalAuthConfig::default(),
             tiered_storage: TieredStorageConfig::default(),
+            geo: GeoConfig::default(),
         }
     }
 }
