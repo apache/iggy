@@ -46,6 +46,10 @@ impl CliCommand for DeletePersonalAccessTokenCmd {
         )
     }
 
+    fn may_end_session(&self) -> bool {
+        true
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
             .delete_personal_access_token(&self.delete_token.name)

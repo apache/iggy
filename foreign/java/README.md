@@ -38,7 +38,7 @@ See [Maven Central](https://central.sonatype.com/artifact/org.apache.iggy/iggy) 
 
 ### Snapshot Versions
 
-Development builds of the next release carry the version `0.9.6-SNAPSHOT`. Get them from the ASF snapshot repository:
+This checkout builds `0.10.2-SNAPSHOT`. After a snapshot is published, use the following configuration to resolve it from the ASF snapshot repository.
 
 **Gradle:**
 
@@ -51,7 +51,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'org.apache.iggy:iggy:0.9.6-SNAPSHOT'
+    implementation 'org.apache.iggy:iggy:0.10.2-SNAPSHOT'
 }
 ```
 
@@ -72,14 +72,14 @@ dependencies {
     <dependency>
         <groupId>org.apache.iggy</groupId>
         <artifactId>iggy</artifactId>
-        <version>0.9.6-SNAPSHOT</version>
+        <version>0.10.2-SNAPSHOT</version>
     </dependency>
 </dependencies>
 ```
 
-### Unreleased 0.11.1 protocol
+### Source checkout
 
-The source checkout uses protocol 0.11.1. Build it with a matching server.
+The source checkout uses client protocol 0.12.3. Build it with a matching server.
 `CommandCode.System.ATTACH_CONSUMER_SESSION` (code 14) was removed. Use
 `CommandCode.System.BIND_SESSION` (code 15), which requires the registered
 session's private bind secret. Auxiliary poll connections reuse that session
@@ -89,10 +89,9 @@ Transport loss retains the logical identity and reconnect uses `BindSession`.
 A definitive stale or unauthenticated bind reply permits a fresh Register, and
 transient replies retain the identity. A stale-client eviction during the bind
 is a lost connection, so the next connection binds the same session again. An
-unauthenticated eviction during the bind ends the session. The bind proof is an
-independent session credential: password/PAT changes or expiry do not end an
-established session. Logout, lease expiry and user deactivation end session
-access.
+unauthenticated eviction during the bind ends the session.
+
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 A reply with status 30 (`STALE_CLIENT`) means that the server no longer attaches
 the connection to the session. The client closes that connection, and the next

@@ -22,6 +22,14 @@ Or use the `--with-default-root-credentials` flag for development (sets root cre
 
 These variables initialize the root account only when it is first created. Supplied values are still validated on later starts, but they do not replace the stored credentials. Use the password-change API or `iggy user password` with the current password to change an existing account. The `--fresh` flag deletes all data. It is not needed for a password change.
 
+In server 0.10.1-edge.2, changing a password ends every session of the account except the TCP, QUIC or WebSocket session that submitted the change. It invalidates every access token Iggy issued before the change, including the caller's token and tokens exchanged from personal access tokens. An HTTP caller using one of those tokens must sign in again. A valid raw personal access token can open a fresh session.
+
+Deactivation ends every session, invalidates access tokens the server previously issued to the account, and deletes the account's personal access tokens. After reactivation, sign in again and issue new personal access tokens.
+
+A node decides from the metadata it has applied, so a node that lags behind a change serves the old credential until it applies the change. It answers an access token issued after a password change it has not applied yet with a retryable error. When two changes of one password race, the one verified against the replaced password is refused.
+
+A trusted issuer controls the lifetime of its own tokens. Each new sign-in still requires an eligible local account. If that account's credential revision changes during verification, the caller must authenticate again.
+
 The root user **cannot be deleted**, and its permissions are fixed: it always holds every permission.
 
 ### Personal Access Tokens (PAT)
@@ -36,7 +44,7 @@ IGGY_TOKEN=$(iggy --quiet -u iggy -p my-secret-password pat create my-token 7d)
 iggy -t "$IGGY_TOKEN" stream list
 ```
 
-An automatic cleaner removes expired tokens at a configurable interval.
+An automatic cleaner removes expired tokens at a configurable interval. A token stops working at its expiry, before the cleaner removes it. Deleting a token, or the cleaner removing it, ends the sessions opened with it and refuses the access tokens exchanged from it. Other tokens and sessions of the same user keep working. An access token exchanged from a personal access token never outlives it, and a refresh keeps that limit. A token created later under the same name is a new token.
 
 Broker API commands require an authenticated session or bearer credential, except for ping and the login/refresh flows that establish or prove a credential. The Prometheus `/metrics` scrape requires a JWT or personal access token. HTTP CORS preflight responses and embedded `/ui` static assets are public. The UI's broker API calls still require authentication.
 
@@ -62,9 +70,9 @@ The global permissions and the operations they unlock:
 | Create, update, delete users. Update permissions. Change passwords | `manage_users` |
 | Get user, list users | `read_users` |
 | Create, update, delete streams | `manage_streams` |
-| Get stream, list streams | `read_streams` |
+| Get stream | `read_streams` |
 | Create, update, delete topics | `manage_topics` |
-| Get topic, list topics | `read_topics` |
+| Get topic | `read_topics` |
 | Consumer groups: create, delete, join, leave, get | `read_topics` |
 | Poll messages | `poll_messages` |
 | Send messages | `send_messages` |
@@ -73,6 +81,8 @@ Two kinds of implication apply on top of the table:
 
 - **Supersets**: every `manage_*` permission includes its `read_*` counterpart. In addition `manage_streams` includes `manage_topics`, `read_streams` includes `read_topics`, and `read_topics` includes `poll_messages`. `manage_topics` also includes `send_messages`, so `manage_streams` permits sending too.
 - **Self-service**: an authenticated user can always read their own account, change their own password, and manage their own personal access tokens, without any of the user permissions above.
+
+In server 0.10.1-edge.2, an authenticated user can list streams and topics. Each list returns the entries the same user can read individually. A user without a matching grant gets an empty list.
 
 ### Scoped permissions
 
@@ -91,7 +101,7 @@ Permissions are checked from top to bottom: global, then stream, then topic. A p
 
 If a stream has no entry in the user's stream permissions, only global permissions apply to it. The same holds for topics within a stream.
 
-For example, a user that may only consume from stream 42 needs no global permissions at all: grant stream-scoped `read_stream` and `poll_messages` on stream 42, and the user can read that stream, list its topics, and poll messages from any topic in it. The read grant also permits consumer-group operations in that stream. For polling without those read and group permissions, grant only `poll_messages`.
+For example, a user that may only consume from stream 42 needs no global permissions at all: grant stream-scoped `read_stream` and `poll_messages` on stream 42, and the user can read that stream, find it in the stream list, list its topics, and poll messages from any topic in it. A user with only a topic grant finds that topic in the topic list of its stream. The stream list leaves that stream out, because a stream entry carries totals over all of its topics. The read grant also permits consumer-group operations in that stream. For polling without those read and group permissions, grant only `poll_messages`.
 
 ## Transport encryption (TLS)
 
@@ -138,7 +148,7 @@ Further keys (`valid_issuers`, `valid_audiences`, `not_before`, `use_base64_secr
 
 **Signing secrets**: `encoding_secret` and `decoding_secret` default to empty. Without `cluster.auth`, the server generates a secure random secret on every start. That's a safe single-node default with two consequences: issued tokens **die on restart**, and in a cluster each node signs with its own key, so bearers are node-local and follower-to-primary request forwarding stays disabled. For clusters, configure an identical secret on every node (prefer the `IGGY_HTTP_JWT_ENCODING_SECRET`/`IGGY_HTTP_JWT_DECODING_SECRET` environment variables over on-disk config), or enable `cluster.auth` so the JWT key derives from the cluster's shared PSK.
 
-**Refresh tokens**: `POST /users/refresh-token` re-issues an access token from a still-valid one presented in the request body, answering the same identity shape as login, so HTTP clients can extend a session without re-sending credentials.
+**Refresh tokens**: `POST /users/refresh-token` refreshes a valid access token issued by this server. The caller sends the token in the request body and receives the same identity shape as login. A trusted external issuer controls its own tokens and their renewal.
 
 **Federated issuers**: the opt-in `[[http.jwt.trusted_issuers]]` list accepts tokens minted by external identity providers for application-to-application flows. Each entry names an `issuer`, `audience`, and `jwks_url`. Signatures are verified against the issuer's JWKS (fetches are rate-limited), and every token from that issuer is remapped onto the configured non-root `username`. With no entries configured, the listener accepts only self-issued tokens. See [Configuration](/docs/server/configuration) for the key reference.
 

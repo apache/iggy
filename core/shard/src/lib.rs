@@ -305,7 +305,10 @@ pub enum MetadataSubmit {
         vsr_client_id: u128,
         session: u64,
         secret: iggy_binary_protocol::requests::users::login_register::BindSecret,
-        reply: Sender<Result<(u32, u64, consensus::client_table::SessionAttachment), IggyError>>,
+        /// The owner, the epoch, the attachment and the token the session was
+        /// opened with, see `ClientTable::bind_session`.
+        reply:
+            Sender<Result<(u32, u64, consensus::client_table::SessionAttachment, u64), IggyError>>,
     },
     /// A home shard asks for one current state page of `metadata.changes`:
     /// the client table, the token index and the only write side of the
@@ -488,7 +491,7 @@ pub enum PartitionRead {
         consumer: PollingConsumer,
         args: PollingArgs,
         user_id: u32,
-        user_created_at: u64,
+        credential: iggy_binary_protocol::requests::users::login_register::CredentialProof,
         metadata: metadata::stm::stream::PollMetadata,
     },
     /// A read with no owner check. In production only plain consumers use it.
@@ -5412,7 +5415,8 @@ where
         T: ShardsTable,
     {
         if let Some(attachment) = &attachment
-            && let Err(error) = attachment.validate_write(request.header().operation)
+            && let Err(error) =
+                attachment.validate_write(request.header().operation, self.bus.realtime_micros())
         {
             Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
             return;

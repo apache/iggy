@@ -60,8 +60,9 @@ use iggy_binary_protocol::codes::{
     BIND_SESSION_CODE, CANCEL_DEFERRED_REQUEST_CODE, DESCRIBE_OPTIONS_CODE, FETCH_MESSAGES_CODE,
     GET_CLIENT_CODE, GET_CLIENTS_CODE, GET_CLUSTER_METADATA_CODE, GET_CONSUMER_OFFSET_CODE,
     GET_ME_CODE, GET_METADATA_CHANGES_CODE, GET_PARTITION_ROUTE_CODE,
-    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, PING_CODE,
-    POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE, SYNC_CONSUMER_GROUP_CODE,
+    GET_PERSONAL_ACCESS_TOKENS_CODE, GET_SNAPSHOT_FILE_CODE, GET_STATS_CODE, GET_STREAMS_CODE,
+    GET_TOPICS_CODE, PING_CODE, POLL_MESSAGES_CODE, POLL_MESSAGES_DEFERRED_CODE,
+    SYNC_CONSUMER_GROUP_CODE,
 };
 use iggy_binary_protocol::dispatch::lookup_command;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
@@ -358,12 +359,12 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    authorize_attached(attachment, &authorize)?;
+    authorize_attached(attachment, shard.bus.realtime_micros(), &authorize)?;
     if !read_needs_metadata_frontier(code) {
         return Ok(());
     }
     if await_metadata_read_frontier(shard, watermark).await? == FrontierWait::CaughtUp {
-        authorize_attached(attachment, &authorize)?;
+        authorize_attached(attachment, shard.bus.realtime_micros(), &authorize)?;
     }
     Ok(())
 }
@@ -460,7 +461,9 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             // Shared-nothing: each shard knows only its own connections, so
             // gather across all shards (scatter-gather over the mesh).
             let infos = shard.list_all_clients().await;
-            if let Err(error) = authorize_attached(attachment, authorize) {
+            if let Err(error) =
+                authorize_attached(attachment, shard.bus.realtime_micros(), authorize)
+            {
                 send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
@@ -499,7 +502,9 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
                 .ok()
                 .map(|req| req.client_id);
             let infos = shard.list_all_clients().await;
-            if let Err(error) = authorize_attached(attachment, authorize) {
+            if let Err(error) =
+                authorize_attached(attachment, shard.bus.realtime_micros(), authorize)
+            {
                 send_non_replicated_deny(shard, &request, origin, error.as_code()).await;
                 return;
             }
@@ -555,7 +560,10 @@ pub(in crate::dispatch) async fn handle_non_replicated_request<B, MJ, S, SB>(
             // during the hop.
             let reply = metadata_changes_reply(shard, request_body(&request), user_id)
                 .await
-                .and_then(|bytes| authorize_attached(attachment, authorize).map(|()| bytes));
+                .and_then(|bytes| {
+                    authorize_attached(attachment, shard.bus.realtime_micros(), authorize)
+                        .map(|()| bytes)
+                });
             match reply {
                 Ok(bytes) => {
                     send_non_replicated_bytes(
@@ -740,7 +748,7 @@ async fn handle_deferred_request<B, MJ, S, SB>(
         (Duration::from_micros(timeout_us), commit_gate.clone()),
         async {
             let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
-            if !attachment.is_valid() {
+            if !attachment.is_valid_at(shard.bus.realtime_micros()) {
                 return Err(IggyError::StaleClient);
             }
             if !shard
@@ -1036,9 +1044,10 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
     SB: SuperblockStore + 'static,
 {
     let transport_client_id = origin.id;
-    // Gate by command code before the shared builder runs. The builder stays
-    // authz-free (it is byte-shared with the HTTP read path, which gates
-    // separately); a denial replies status!=0 with an empty body. The
+    // Gate by command code before the shared builder runs. The builder checks
+    // no grant itself, except that the stream and topic lists return only what
+    // the caller may read (it is byte-shared with the HTTP read path, which
+    // gates separately); a denial replies status!=0 with an empty body. The
     // read-your-writes hold sits INSIDE the same call, behind that denial: an
     // unauthorized read must fail now, not after the whole poll budget.
     let authorize = || authorize_default_read(shard, code, request_body(request), user_id);
@@ -1076,13 +1085,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
         let clients_count = shard.count_all_clients().await;
         (
             u32::try_from(clients_count).unwrap_or(u32::MAX),
-            authorize_attached(attachment, authorize),
+            authorize_attached(attachment, shard.bus.realtime_micros(), authorize),
         )
     } else {
         (0, Ok(()))
     };
     match gate.and_then(|()| {
-        build_non_replicated_response(
+        let response = build_non_replicated_response(
             shard,
             code,
             request_body(request),
@@ -1090,7 +1099,13 @@ async fn handle_default_non_replicated<B, MJ, S, SB>(
             roster,
             client_ip,
             clients_count,
-        )
+        )?;
+        // A list is projected with the grants of whoever holds the caller's id
+        // now, and shard 0 can delete the caller and reuse its id meanwhile.
+        if matches!(code, GET_STREAMS_CODE | GET_TOPICS_CODE) {
+            authorize_attached(attachment, shard.bus.realtime_micros(), || Ok(()))?;
+        }
+        Ok(response)
     }) {
         Ok(response) => {
             if deny_oversized_reply(shard, request, origin, code, response.body_len(), reply_cap)
@@ -1195,7 +1210,7 @@ async fn handle_get_snapshot<B, MJ, S, SB>(
 {
     let transport_client_id = origin.id;
     let authorize = || {
-        authorize_attached(attachment, || {
+        authorize_attached(attachment, shard.bus.realtime_micros(), || {
             authorize_uid(shard, user_id, Permissioner::get_snapshot)
         })
     };

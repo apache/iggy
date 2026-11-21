@@ -25,14 +25,81 @@ use bytes::{BufMut, BytesMut};
 use secrecy::{ExposeSecret, SecretBox, SecretString};
 
 pub const BIND_SECRET_BYTES: usize = 32;
-pub const REGISTER_REQUEST_BYTES: usize = BIND_SECRET_BYTES + size_of::<u64>();
+pub const CREDENTIAL_PROOF_BYTES: usize = 3 * size_of::<u64>();
+pub const REGISTER_REQUEST_BYTES: usize = CREDENTIAL_PROOF_BYTES + BIND_SECRET_BYTES;
 
-/// Server-verified account identity and binding proof replicated by Register.
-/// The timestamp prevents a delayed login from registering a reused user ID.
+/// What a verified credential proved about its account. It names a revision, a token or both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CredentialProof {
+    /// Creation time of the account, because a deleted user's id goes to the next user created.
+    pub user_created_at: u64,
+    /// Op of the account's last password change or revocation, zero for a raw personal access token.
+    pub access_revision: u64,
+    /// Op that created the personal access token the credential derives from, zero for any other.
+    pub token_id: u64,
+}
+
+/// Server-verified credential proof and binding proof replicated by Register.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegisterRequest {
-    pub user_created_at: u64,
+    pub credential: CredentialProof,
     pub bind_verifier: [u8; BIND_SECRET_BYTES],
+}
+
+impl CredentialProof {
+    /// Proof of a password, a self-issued token or an external sign-in.
+    #[must_use]
+    pub const fn account(user_created_at: u64, access_revision: u64) -> Self {
+        Self {
+            user_created_at,
+            access_revision,
+            token_id: 0,
+        }
+    }
+
+    /// Proof of a raw personal access token.
+    #[must_use]
+    pub const fn token(user_created_at: u64, token_id: u64) -> Self {
+        Self {
+            user_created_at,
+            access_revision: 0,
+            token_id,
+        }
+    }
+
+    /// Whether the proof names a revision or a token.
+    #[must_use]
+    pub const fn is_bound(&self) -> bool {
+        self.access_revision != 0 || self.token_id != 0
+    }
+}
+
+impl WireEncode for CredentialProof {
+    fn encoded_size(&self) -> usize {
+        CREDENTIAL_PROOF_BYTES
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        buf.put_u64_le(self.user_created_at);
+        buf.put_u64_le(self.access_revision);
+        buf.put_u64_le(self.token_id);
+    }
+}
+
+impl WireDecode for CredentialProof {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
+        let proof = Self {
+            user_created_at: read_u64_le(buf, 0)?,
+            access_revision: read_u64_le(buf, size_of::<u64>())?,
+            token_id: read_u64_le(buf, 2 * size_of::<u64>())?,
+        };
+        if !proof.is_bound() {
+            return Err(WireError::Validation(
+                "credential proof names neither a revision nor a token".into(),
+            ));
+        }
+        Ok((proof, CREDENTIAL_PROOF_BYTES))
+    }
 }
 
 impl WireEncode for RegisterRequest {
@@ -41,19 +108,19 @@ impl WireEncode for RegisterRequest {
     }
 
     fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u64_le(self.user_created_at);
+        self.credential.encode(buf);
         buf.put_slice(&self.bind_verifier);
     }
 }
 
 impl WireDecode for RegisterRequest {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
-        let user_created_at = read_u64_le(buf, 0)?;
+        let (credential, consumed) = CredentialProof::decode(buf)?;
         let mut bind_verifier = [0; BIND_SECRET_BYTES];
-        bind_verifier.copy_from_slice(read_bytes(buf, size_of::<u64>(), BIND_SECRET_BYTES)?);
+        bind_verifier.copy_from_slice(read_bytes(buf, consumed, BIND_SECRET_BYTES)?);
         Ok((
             Self {
-                user_created_at,
+                credential,
                 bind_verifier,
             },
             REGISTER_REQUEST_BYTES,
@@ -228,19 +295,60 @@ mod tests {
     #[test]
     fn register_preserves_account_identity_and_rejects_truncated_bodies() {
         let request = RegisterRequest {
-            user_created_at: 0x0102_0304_0506_0708,
+            credential: CredentialProof {
+                user_created_at: 0x0102_0304_0506_0708,
+                access_revision: 0x1112_1314_1516_1718,
+                token_id: 0x2122_2324_2526_2728,
+            },
             bind_verifier: [0x5a; BIND_SECRET_BYTES],
         };
         let bytes = request.to_bytes();
         assert_eq!(bytes.len(), REGISTER_REQUEST_BYTES);
         assert_eq!(
-            &bytes[..size_of::<u64>()],
-            &request.user_created_at.to_le_bytes()
+            &bytes[..8],
+            &request.credential.user_created_at.to_le_bytes()
         );
-        assert_eq!(&bytes[size_of::<u64>()..], &request.bind_verifier);
+        assert_eq!(
+            &bytes[8..16],
+            &request.credential.access_revision.to_le_bytes()
+        );
+        assert_eq!(&bytes[16..24], &request.credential.token_id.to_le_bytes());
+        assert_eq!(&bytes[CREDENTIAL_PROOF_BYTES..], &request.bind_verifier);
         assert_eq!(RegisterRequest::decode_from(&bytes).unwrap(), request);
         for length in 0..bytes.len() {
             assert!(RegisterRequest::decode_from(&bytes[..length]).is_err());
+        }
+    }
+
+    #[test]
+    fn given_proof_without_revision_or_token_when_decoding_should_refuse() {
+        let unbound = RegisterRequest {
+            credential: CredentialProof {
+                user_created_at: 7,
+                access_revision: 0,
+                token_id: 0,
+            },
+            bind_verifier: [0x5a; BIND_SECRET_BYTES],
+        };
+
+        assert!(RegisterRequest::decode_from(&unbound.to_bytes()).is_err());
+        for credential in [
+            CredentialProof::account(7, 3),
+            CredentialProof::token(7, 9),
+            CredentialProof {
+                user_created_at: 7,
+                access_revision: 3,
+                token_id: 9,
+            },
+        ] {
+            let request = RegisterRequest {
+                credential,
+                ..unbound
+            };
+            assert_eq!(
+                RegisterRequest::decode_from(&request.to_bytes()).unwrap(),
+                request
+            );
         }
     }
 

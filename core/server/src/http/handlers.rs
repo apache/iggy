@@ -61,6 +61,7 @@ use iggy_binary_protocol::requests::system::{
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, DeleteTopicRequest, GetTopicRequest, GetTopicsRequest,
 };
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, GetUserRequest, GetUsersRequest,
     UpdatePermissionsRequest,
@@ -102,7 +103,7 @@ use iggy_common::wire_conversions::{
 };
 use iggy_common::{
     ClientInfo, ClientInfoDetails, ClusterMetadata, Consumer, ConsumerGroup, ConsumerGroupDetails,
-    ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError, IggyTimestamp,
+    ConsumerOffsetInfo, DEFAULT_MAX_TOPIC_SIZE, Identifier, IdentityInfo, IggyError,
     MetadataChanges, MetadataChangesQuery, NamedPageQuery, OptionSpec, OptionStorage, OptionsScope,
     Page, PageQuery, Partition, Partitioning, PersonalAccessTokenInfo, PollMessages,
     PolledMessages, PollingStrategy, RawPersonalAccessToken, SendMessagesConfirmations, Stats,
@@ -149,6 +150,7 @@ use crate::http::reply::{
     committed_payload, decode_consumer_group_details, decode_raw_pat_token, decode_stream_details,
     decode_topic_details, decode_user_details, login_error_to_iggy, send_confirmations,
 };
+use crate::http::state::ensure_active_user;
 use crate::http::state::{DURABILITY_HEADER, HttpInner, HttpState};
 use crate::http::submit::{
     capture_partition_write, logout_session, partition_write_replicated, produce_unacked,
@@ -212,7 +214,7 @@ pub(in crate::http) async fn login_user(
         &command.username,
         command.password.expose_secret(),
     ) {
-        Ok((user_id, created_at)) => issue_identity(&state, user_id, created_at),
+        Ok((user_id, credential)) => issue_identity(&state, user_id, &credential),
         Err(LoginRegisterError::UserNotFound) if state.server_config.external_auth.enabled => {
             if state.is_normal_primary() {
                 SendWrapper::new(try_external_auth_http_login(
@@ -239,9 +241,9 @@ pub(in crate::http) async fn login_with_personal_access_token(
     SendWrapper::new(crate::http::reads::await_recovery_barrier(&state.shard))
         .await
         .map_err(|_| IggyError::TransientNotAccepted)?;
-    let (user_id, created_at) = verify_pat_credentials(&state.shard, command.token.expose_secret())
+    let (user_id, credential) = verify_pat_credentials(&state.shard, command.token.expose_secret())
         .map_err(|error| login_error_to_iggy(&error))?;
-    issue_identity(&state, user_id, created_at)
+    issue_identity(&state, user_id, &credential)
 }
 
 /// `POST /users/refresh-token` body. The route is unauthenticated, so the
@@ -270,9 +272,12 @@ pub(in crate::http) async fn refresh_token(
     // Refresh rejects trusted-issuer tokens (they keep their own lifecycle);
     // `decode_for_refresh` is `!Send` (a trusted-issuer token may await a JWKS
     // fetch), so bridge it like every other shard-0 path (see [`logout_user`]).
-    let (user_id, user_created_at) =
+    let (user_id, credential) =
         SendWrapper::new(state.jwt.decode_for_refresh(&command.token)).await?;
-    issue_identity(&state, user_id, user_created_at)
+    if state.lags_behind(user_id, &credential) {
+        return Err(IggyError::TransientNotAccepted.into());
+    }
+    issue_identity(&state, user_id, &credential)
 }
 
 /// `DELETE /users/logout`: end the caller's session and answer 204 - the status
@@ -319,8 +324,8 @@ pub(in crate::http) async fn describe_options(
     ))
 }
 
-/// `GET /streams`: every stream as the `Vec<Stream>` JSON of the legacy
-/// server, or one page of them. See [`read_list`].
+/// `GET /streams`: the streams the caller may read as the `Vec<Stream>` JSON
+/// of the legacy server, or one page of them. See [`read_list`].
 pub(in crate::http) async fn get_streams(
     State(state): State<HttpState>,
     identity: Identity,
@@ -332,7 +337,8 @@ pub(in crate::http) async fn get_streams(
         &pairs,
         GET_STREAMS_CODE,
         |page| GetStreamsRequest { page }.to_bytes(),
-        Permissioner::get_streams,
+        // The builder returns only the streams the caller may read.
+        |_, _| Ok(()),
         Stream::try_from,
     ))
     .await
@@ -377,8 +383,8 @@ pub(in crate::http) async fn get_stream(
     ))
 }
 
-/// `GET /streams/{stream_id}/topics`: every topic of a stream as the
-/// `Vec<Topic>` JSON of the legacy server, or one page of them. See
+/// `GET /streams/{stream_id}/topics`: the topics of a stream the caller may
+/// read as the `Vec<Topic>` JSON of the legacy server, or one page of them. See
 /// [`read_list`].
 pub(in crate::http) async fn get_topics(
     State(state): State<HttpState>,
@@ -400,10 +406,8 @@ pub(in crate::http) async fn get_topics(
             }
             .to_bytes()
         },
-        |permissioner, uid| {
-            resolve_gate_stream(&state, &stream_id)
-                .map_or(Ok(()), |stream_id| permissioner.get_topics(uid, stream_id))
-        },
+        // The builder returns only the topics the caller may read.
+        |_, _| Ok(()),
         Topic::try_from,
     ))
     .await
@@ -697,8 +701,7 @@ pub(in crate::http) async fn get_metrics(
     let clients_count = SendWrapper::new(state.shard.count_all_clients()).await as u64;
     // Both waits can outlast the account the token was issued for, and the
     // grant below is looked up by numeric ID alone.
-    state
-        .ensure_active_user(identity.user_id, Some(identity.user_created_at))
+    ensure_active_user(&state.shard, identity.user_id, &identity.credential)
         .map_err(ReadError::Rejected)?;
     let exports_stats = state
         .shard
@@ -1478,7 +1481,7 @@ async fn poll_messages_impl(
                 DeferredPollContext {
                     session: None,
                     user_id: identity.user_id,
-                    user_created_at: Some(identity.user_created_at.as_micros()),
+                    credential: Some(identity.credential),
                     quota: PollQuotaIdentity::User(identity.user_id),
                     primary: true,
                 },
@@ -1489,7 +1492,7 @@ async fn poll_messages_impl(
                 consumer,
                 args: args.clone(),
                 user_id: identity.user_id,
-                user_created_at: identity.user_created_at.as_micros(),
+                credential: identity.credential,
                 metadata,
             }
         };
@@ -2343,15 +2346,16 @@ pub(in crate::http) async fn delete_pat_named_login(
     delete_pat(state, identity, Path("login".to_owned())).await
 }
 
-/// Mint a token only while the account verified by login or named by the
-/// refresh token still occupies its user id.
+/// Mint a token only while what login verified, or what the refresh token
+/// proves, still holds for its account. A refreshed token keeps the revision
+/// and the source token of the one it replaces, and never outlives that source.
 fn issue_identity(
     inner: &HttpInner,
     user_id: u32,
-    expected_created_at: IggyTimestamp,
+    credential: &CredentialProof,
 ) -> Result<Json<IdentityInfo>, CustomError> {
-    let user_created_at = inner.ensure_active_user(user_id, Some(expected_created_at))?;
-    let generated = inner.jwt.generate(user_id, user_created_at)?;
+    let (credential, source_expiry) = inner.issuable_credential(user_id, credential)?;
+    let generated = inner.jwt.generate(user_id, credential, source_expiry)?;
     Ok(Json(IdentityInfo {
         user_id: generated.user_id,
         access_token: Some(TokenInfo {
@@ -2383,6 +2387,7 @@ async fn try_external_auth_http_login(
         credentials: Credentials::UsernamePassword { username, password },
     };
 
+    let started_at_op = state.shard.plane.metadata().applied_frontier().get();
     let decision = callout_external_auth(ext_config, ext_request)
         .await
         .map_err(|error| {
@@ -2398,20 +2403,22 @@ async fn try_external_auth_http_login(
         ValidatedDecision::Allow {
             username: ext_username,
         } => {
-            let (user_id, created_at) = state
+            let (user_id, credential) = state
                 .shard
                 .plane
                 .metadata()
                 .mux_stm
                 .users()
-                .read(|users| crate::external_auth::resolve_username(users, &ext_username))
+                .read(|users| {
+                    crate::external_auth::resolve_username(users, &ext_username, started_at_op)
+                })
                 .inspect_err(|_| {
                     tracing::warn!(
                         ext_username = %ext_username,
                         "ext-auth user resolution failed"
                     );
                 })?;
-            issue_identity(state, user_id, created_at)
+            issue_identity(state, user_id, &credential)
         }
         ValidatedDecision::Deny { reason } => {
             tracing::warn!(reason = %reason, "external auth denied login");

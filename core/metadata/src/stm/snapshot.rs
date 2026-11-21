@@ -74,15 +74,20 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 16: `PartitionSnapshot` gained `created_op`, the metadata op of a
 /// partition incarnation, as a trailing, defaulted field.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 16;
+///
+/// Version 17: `UserSnapshot` gained `access_revision`, each
+/// `PersonalAccessTokenSnapshot` the `id` of the op that created it, and each
+/// `ClientEntrySnapshot` the `token_id` of the token it was opened with. None
+/// has a default that could stand in for the real value.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 17;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Session protection is mandatory and its nested layout changed in version
-/// 14, so older snapshots cannot prove the current retry contract and are
-/// refused. Version 14 reads with every partition on every node and no
-/// retirement debt.
-pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
+/// Version 17 carries the access revision every credential check compares and
+/// the token each session was opened with. An older snapshot has neither, so
+/// it could only restore accounts and sessions that no credential proves, and
+/// is refused.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 17;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -378,6 +383,9 @@ impl MetadataSnapshot {
     }
 
     pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
+        if let Some(users) = &self.users {
+            users.validate_credential_ids(self.sequence_number)?;
+        }
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
             streams.validate_partition_members()?;
@@ -597,7 +605,7 @@ macro_rules! impl_fill_restore {
                         ))
                     })?;
                     self.inner
-                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap))
+                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap, snapshot.sequence_number))
                         .map_err(|err| {
                             SnapshotError::Io(std::io::Error::other(format!(
                                 "in-place restore on a reader-only state machine: {err}"
@@ -633,7 +641,7 @@ mod tests {
     use crate::stm::stream::{
         PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
     };
-    use crate::stm::user::UserSnapshot;
+    use crate::stm::user::{PersonalAccessTokenSnapshot, UserSnapshot, Users};
     use iggy_common::{
         HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue, ResourceOptions,
     };
@@ -662,7 +670,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 16;
+        const PINNED_VERSION: u32 = 17;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -688,7 +696,7 @@ mod tests {
         const TOPIC_FIELD_COUNT: u32 = 10;
         const STREAM_FIELD_COUNT: u32 = 7;
         const STREAMS_FIELD_COUNT: u32 = 4;
-        const USER_FIELD_COUNT: u32 = 7;
+        const USER_FIELD_COUNT: u32 = 8;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
         // treatment or a bump.
@@ -791,6 +799,7 @@ mod tests {
             password_hash: String::new(),
             status: iggy_common::UserStatus::Active,
             created_at: IggyTimestamp::default(),
+            access_revision: 0,
             permissions: None,
             options: ResourceOptions::new(),
         };
@@ -800,6 +809,54 @@ mod tests {
             USER_FIELD_COUNT,
             "UserSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
+    }
+
+    #[test]
+    fn given_invalid_access_revision_when_decoding_a_checkpoint_should_refuse() {
+        let users = Users::default();
+        users.ensure_root_user("root", "hash");
+        for revision in [0, 6] {
+            let mut snapshot = MetadataSnapshot::new(5);
+            let mut section = users.to_snapshot();
+            section.items[0].1.access_revision = revision;
+            snapshot.users = Some(section);
+            assert!(matches!(
+                MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+                Err(SnapshotError::InvalidState(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn given_conflicting_token_names_when_restoring_a_checkpoint_should_refuse() {
+        let users = Users::default();
+        users.ensure_root_user("root", "hash");
+        let entry = |id| {
+            let name = "build".to_owned();
+            (
+                name.clone(),
+                PersonalAccessTokenSnapshot {
+                    user_id: 0,
+                    name,
+                    token: format!("{id:064x}"),
+                    expiry_at: None,
+                    id,
+                },
+            )
+        };
+        for buckets in [
+            vec![(0, vec![entry(2), entry(3)])],
+            vec![(0, vec![entry(2)]), (0, vec![entry(3)])],
+        ] {
+            let mut section = users.to_snapshot();
+            section.personal_access_tokens = buckets;
+            let mut snapshot = MetadataSnapshot::new(5);
+            snapshot.users = Some(section);
+            assert!(matches!(
+                MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+                Err(SnapshotError::InvalidState(_))
+            ));
+        }
     }
 
     #[test]
@@ -1110,6 +1167,7 @@ mod tests {
             password_hash: password_hash.to_string(),
             status: UserStatus::Active,
             created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            access_revision: 1,
             permissions: None,
             options: ResourceOptions::default(),
         }

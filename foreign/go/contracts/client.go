@@ -57,14 +57,14 @@ type Client interface {
 	// sign-in and the deadline that the call started with. If the Next of a
 	// page is the cursor that its request sent, the call fails with
 	// ierror.ErrInvalidFormat.
-	// Authentication is required, and the permission to read the streams.
+	// Authentication is required. The list holds the streams the caller may read.
 	GetStreams(ctx context.Context) ([]Stream, error)
 
 	// GetStreamsPage get one page of the streams. Send the Next of the page
 	// as the Cursor of the next query, with the same other fields, until Next
 	// is nil. A query that breaks the page rules is refused with
 	// ierror.ErrInvalidCommand before anything is sent.
-	// Authentication is required, and the permission to read the streams.
+	// Authentication is required. The page holds the streams the caller may read.
 	GetStreamsPage(ctx context.Context, query NamedPageQuery) (*Page[Stream], error)
 
 	// CreateStream create a new stream. Nil options select the defaults.
@@ -94,15 +94,16 @@ type Client interface {
 	// sign-in and the deadline that the call started with. If the Next of a
 	// page is the cursor that its request sent, the call fails with
 	// ierror.ErrInvalidFormat.
-	// Authentication is required, and the permission to read the topics.
+	// Authentication is required. The list holds the topics the caller may read.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
 
 	// GetTopicsPage get one page of the topics of a stream, as GetStreamsPage
-	// does for the streams. If the stream does not exist, a query without a
-	// Cursor gets an empty last page. A query with a Cursor fails with
+	// does for the streams. If the stream does not exist, or the caller may
+	// read no topic of it, a query without a Cursor gets an empty last page.
+	// For a caller with a global read grant, a query with a Cursor fails with
 	// ierror.ErrStreamIdNotFound, because the stream was deleted during the
 	// walk.
-	// Authentication is required, and the permission to read the topics.
+	// Authentication is required. The page holds the topics the caller may read.
 	GetTopicsPage(ctx context.Context, streamId Identifier, query NamedPageQuery) (*Page[Topic], error)
 
 	// DescribeOptions get the option catalog for a resource scope: every key,

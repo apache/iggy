@@ -36,8 +36,9 @@ use crate::{
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyTimestamp};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -68,17 +69,21 @@ pub enum PollAttachment {
     Bound(ConsumerAttachment),
     Unbound {
         user_id: u32,
-        user_created_at: u64,
+        credential: CredentialProof,
         metadata: PollMetadata,
     },
 }
 
 impl ConsumerAttachment {
-    pub(crate) fn validate_write(&self, operation: Operation) -> Result<(), IggyError> {
+    pub(crate) fn validate_write(
+        &self,
+        operation: Operation,
+        now_micros: u64,
+    ) -> Result<(), IggyError> {
         if !is_partition_receipt_operation(operation) {
             return Err(IggyError::InvalidCommand);
         }
-        if !self.session.is_valid() {
+        if !self.session.is_valid_at(now_micros) {
             return Err(IggyError::StaleClient);
         }
         Ok(())
@@ -127,7 +132,7 @@ where
         request: &Message<RoutedRequestHeader>,
         attachment: &ConsumerAttachment,
     ) -> Result<(), IggyError> {
-        attachment.validate_write(request.header().operation)?;
+        attachment.validate_write(request.header().operation, self.bus.realtime_micros())?;
         let namespace = IggyNamespace::from_raw(request.header().group);
         if !attachment
             .metadata
@@ -217,7 +222,7 @@ where
                 consumer,
                 args,
                 user_id,
-                user_created_at,
+                credential,
                 metadata,
             } => (
                 PartitionRead::Poll {
@@ -227,7 +232,7 @@ where
                 },
                 Some(PollAttachment::Unbound {
                     user_id,
-                    user_created_at,
+                    credential,
                     metadata,
                 }),
             ),
@@ -579,21 +584,26 @@ where
             return;
         }
         if let Some(attachment) = &attachment {
+            let now_micros = self.bus.realtime_micros();
             let authorization = self.plane.metadata().mux_stm.users().read(|users| {
                 let (user_id, metadata, account_valid) = match attachment {
                     PollAttachment::Bound(attachment) => (
                         attachment.session.user_id(),
                         &attachment.metadata,
-                        attachment.session.is_valid(),
+                        attachment.session.is_valid_at(now_micros),
                     ),
                     PollAttachment::Unbound {
                         user_id,
-                        user_created_at,
+                        credential,
                         metadata,
                     } => (
                         *user_id,
                         metadata,
-                        users.is_active_account(*user_id, *user_created_at),
+                        users.accepts_credential_at(
+                            *user_id,
+                            credential,
+                            IggyTimestamp::from(now_micros),
+                        ),
                     ),
                 };
                 if !account_valid {

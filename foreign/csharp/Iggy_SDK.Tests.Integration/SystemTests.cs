@@ -175,6 +175,7 @@ public class SystemTests
     }
 
     [Test]
+    [NotInParallel(nameof(GetSnapshot_Should_Return_ValidZipData))]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task GetSnapshot_Should_Return_ValidZipData(Protocol protocol)
     {

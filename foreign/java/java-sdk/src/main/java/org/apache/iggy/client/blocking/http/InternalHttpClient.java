@@ -433,6 +433,10 @@ final class InternalHttpClient implements Closeable {
         this.token = token;
     }
 
+    boolean hasToken() {
+        return token.isPresent();
+    }
+
     <T> T execute(ClassicHttpRequest request, Class<T> clazz) {
         return execute(request, objectMapper.constructType(clazz));
     }

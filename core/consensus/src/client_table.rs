@@ -17,6 +17,7 @@
 
 use crate::le_cursor::{LeCursor, Truncated, split_verified_trailer};
 use iggy_binary_protocol::consensus::ConsensusError;
+use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
 use iggy_binary_protocol::{GenericHeader, Operation, ReplyHeader};
 use iggy_common::IggyError;
 use serde::{Deserialize, Serialize};
@@ -185,6 +186,9 @@ struct ClientEntry {
     attachment: Option<Arc<()>>,
     /// Principal that owns the registration and its retry protection.
     user_id: u32,
+    /// The op that created the personal access token the session was opened
+    /// with, zero for any other credential. Deleting that token ends it.
+    token_id: u64,
     /// Highest committed request number. `REGISTER_REQUEST_ID` (0) until the
     /// first app op commits. Survives re-register: a resumed session keeps
     /// its dedup history.
@@ -211,6 +215,8 @@ struct ClientEntry {
 pub struct SessionAttachment {
     session: Weak<()>,
     user_id: u32,
+    /// Microsecond expiry of the credential the binding proved, `u64::MAX` for none.
+    expires_at: u64,
 }
 
 impl SessionAttachment {
@@ -223,6 +229,19 @@ impl SessionAttachment {
     #[must_use]
     pub fn is_valid(&self) -> bool {
         self.session.strong_count() != 0
+    }
+
+    /// Whether the session is live and its credential unexpired at `now_micros`.
+    #[must_use]
+    pub fn is_valid_at(&self, now_micros: u64) -> bool {
+        self.is_valid() && now_micros < self.expires_at
+    }
+
+    /// The same attachment, refused from `expires_at` microseconds on.
+    #[must_use]
+    pub const fn expiring_at(mut self, expires_at: u64) -> Self {
+        self.expires_at = expires_at;
+        self
     }
 }
 
@@ -242,6 +261,8 @@ pub struct ClientEntrySnapshot {
     pub client_id: u128,
     pub epoch: u64,
     pub user_id: u32,
+    /// The op that created the token the session was opened with, zero for none.
+    pub token_id: u64,
     pub watermark: u64,
     /// Wire bytes of the latest committed reply, validated as [`Message<ReplyHeader>`]
     /// on restore. Never empty: registration seeds the ring.
@@ -621,7 +642,9 @@ impl ClientTable {
         self.index.contains_key(&client_id)
     }
 
-    /// Verify a binding credential, resolving a zero epoch to its original registration.
+    /// Verify a binding credential, resolving a zero epoch to its original
+    /// registration. Returns the owner, the epoch, the attachment and the
+    /// op that created the token the session was opened with, zero for none.
     ///
     /// # Errors
     /// Returns `TransientNotAccepted` while an uncertain registration is not visible,
@@ -632,18 +655,20 @@ impl ClientTable {
         client_id: u128,
         session: u64,
         secret: &[u8; BIND_SECRET_BYTES],
-    ) -> Result<(u32, u64, SessionAttachment), IggyError> {
+    ) -> Result<(u32, u64, SessionAttachment, u64), IggyError> {
         let missing = if session == 0 {
             IggyError::TransientNotAccepted
         } else {
             IggyError::Unauthenticated
         };
         let user_id = self.get_user_id(client_id).ok_or(missing)?;
+        let token_id = self.token_id(client_id);
         let epoch = self
             .registered_session(
                 client_id,
                 user_id,
                 bind_verifier(client_id, user_id, secret),
+                token_id,
             )?
             .ok_or(IggyError::Unauthenticated)?;
         if session != 0 && session != epoch {
@@ -652,7 +677,16 @@ impl ClientTable {
         let attachment = self
             .attach_session(client_id, epoch, user_id)
             .ok_or(IggyError::Unauthenticated)?;
-        Ok((user_id, epoch, attachment))
+        Ok((user_id, epoch, attachment, token_id))
+    }
+
+    /// The op that created the token `client_id` signed in with, zero for none or an unknown client.
+    #[must_use]
+    pub fn token_id(&self, client_id: u128) -> u64 {
+        self.index
+            .get(&client_id)
+            .and_then(|&slot| self.slots[slot].as_ref())
+            .map_or(0, |entry| entry.token_id)
     }
 
     /// Resolve an idempotent registration for the same principal and verifier.
@@ -667,12 +701,14 @@ impl ClientTable {
         client_id: u128,
         user_id: u32,
         verifier: [u8; BIND_SECRET_BYTES],
+        token_id: u64,
     ) -> Result<Option<u64>, IggyError> {
         let Some(&slot) = self.index.get(&client_id) else {
             return Ok(None);
         };
         let entry = self.slots[slot].as_ref().expect("index/slot mismatch");
         if entry.user_id != user_id
+            || entry.token_id != token_id
             || entry.ended_op.is_some()
             || blake3::Hash::from_bytes(entry.bind_verifier) != blake3::Hash::from_bytes(verifier)
         {
@@ -707,9 +743,45 @@ impl ClientTable {
         user_id: u32,
         ended_op: u64,
     ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
+        self.end_user_sessions_except(user_id, RESERVED_CLIENT_ID, ended_op)
+    }
+
+    /// [`Self::end_user_sessions`], keeping the session of `kept_client`.
+    pub fn end_user_sessions_except(
+        &mut self,
+        user_id: u32,
+        kept_client: u128,
+        ended_op: u64,
+    ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
         let mut ended = Vec::new();
         for entry in self.slots.iter_mut().flatten() {
-            if entry.user_id == user_id && entry.ended_op.is_none() {
+            if entry.user_id == user_id
+                && entry.client_id != kept_client
+                && entry.ended_op.is_none()
+            {
+                entry.ended_op = Some(ended_op);
+                entry.attachment = None;
+                ended.push(iggy_binary_protocol::requests::system::SessionIdentity {
+                    client_id: entry.client_id,
+                    session: entry.epoch,
+                    metadata_watermark: ended_op,
+                });
+            }
+        }
+        ended
+    }
+
+    /// End the live sessions `user_id` opened with the token created at op
+    /// `token_id`, retaining their receipts like [`Self::end_user_sessions`].
+    pub fn end_token_sessions(
+        &mut self,
+        user_id: u32,
+        token_id: u64,
+        ended_op: u64,
+    ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
+        let mut ended = Vec::new();
+        for entry in self.slots.iter_mut().flatten() {
+            if entry.user_id == user_id && entry.token_id == token_id && entry.ended_op.is_none() {
                 entry.ended_op = Some(ended_op);
                 entry.attachment = None;
                 ended.push(iggy_binary_protocol::requests::system::SessionIdentity {
@@ -840,6 +912,7 @@ impl ClientTable {
                         client_id: entry.client_id,
                         epoch: entry.epoch,
                         user_id: entry.user_id,
+                        token_id: entry.token_id,
                         watermark: entry.watermark,
                         reply: entry.latest().as_bytes().to_vec(),
                     },
@@ -913,6 +986,7 @@ impl ClientTable {
                 epoch: entry.epoch,
                 attachment: None,
                 user_id: entry.user_id,
+                token_id: entry.token_id,
                 watermark: entry.watermark,
                 committed_window: 0,
                 ring,
@@ -1034,9 +1108,42 @@ impl ClientTable {
         bind_verifier: [u8; BIND_SECRET_BYTES],
         reply: Message<ReplyHeader>,
     ) -> Result<(), ClientTableWireError> {
+        self.insert_registration(client_id, user_id, bind_verifier, 0, reply)
+    }
+
+    /// [`Self::commit_register`] for the committed body of a Register, which
+    /// also records the token its credential names.
+    ///
+    /// # Errors
+    /// Refuses conflicting ownership, ended identities, and exhausted capacity.
+    pub fn commit_registration(
+        &mut self,
+        client_id: u128,
+        user_id: u32,
+        registration: &RegisterRequest,
+        reply: Message<ReplyHeader>,
+    ) -> Result<(), ClientTableWireError> {
+        self.insert_registration(
+            client_id,
+            user_id,
+            registration.bind_verifier,
+            registration.credential.token_id,
+            reply,
+        )
+    }
+
+    fn insert_registration(
+        &mut self,
+        client_id: u128,
+        user_id: u32,
+        bind_verifier: [u8; BIND_SECRET_BYTES],
+        token_id: u64,
+        reply: Message<ReplyHeader>,
+    ) -> Result<(), ClientTableWireError> {
         if client_id == 0
             || client_id != reply.header().client
             || reply.header().commit == 0
+            || token_id >= reply.header().commit
             || reply.header().request != REGISTER_REQUEST_ID
             || reply.header().operation != iggy_binary_protocol::Operation::Register
         {
@@ -1047,6 +1154,7 @@ impl ClientTable {
                 .as_ref()
                 .ok_or(ClientTableWireError::InvalidWatermark { client_id })?;
             return if entry.user_id == user_id
+                && entry.token_id == token_id
                 && entry.bind_verifier == bind_verifier
                 && entry.ended_op.is_none()
             {
@@ -1075,6 +1183,7 @@ impl ClientTable {
             epoch,
             attachment: None,
             user_id,
+            token_id,
             client_id,
             latest_commit: epoch,
             watermark: REGISTER_REQUEST_ID,
@@ -1505,6 +1614,7 @@ impl ClientTable {
         Some(SessionAttachment {
             session: Arc::downgrade(attachment),
             user_id,
+            expires_at: u64::MAX,
         })
     }
 
@@ -1655,13 +1765,16 @@ impl From<Truncated> for ClientTableWireError {
 /// as raw wire bytes, so an artifact written under an older header layout must
 /// be refused, not silently misread. `ICT2`: `status` sits at offset 216 (the
 /// pre-`ICT2` layout carried a `namespace` word before it).
-pub const CLIENT_TABLE_MAGIC: [u8; 4] = *b"ICT5";
+/// `ICT6`: every entry carries the token it was opened with.
+pub const CLIENT_TABLE_MAGIC: [u8; 4] = *b"ICT6";
 
 /// Per-entry fixed fields in the wire encoding: `client(u128) epoch(u64)
-/// user_id(u32) watermark(u64) bind_verifier([u8; 32]) ended_op(u64) ring_len(u8)`.
+/// user_id(u32) token_id(u64) watermark(u64) bind_verifier([u8; 32]) ended_op(u64)
+/// ring_len(u8)`.
 const ENCODED_ENTRY_FIXED_LEN: usize = size_of::<u128>()
     + size_of::<u64>()
     + size_of::<u32>()
+    + size_of::<u64>()
     + size_of::<u64>()
     + size_of::<u8>()
     + BIND_SECRET_BYTES
@@ -1699,6 +1812,7 @@ impl ClientTable {
             out.extend_from_slice(&entry.client_id.to_le_bytes());
             out.extend_from_slice(&entry.epoch.to_le_bytes());
             out.extend_from_slice(&entry.user_id.to_le_bytes());
+            out.extend_from_slice(&entry.token_id.to_le_bytes());
             out.extend_from_slice(&entry.watermark.to_le_bytes());
             out.extend_from_slice(&entry.bind_verifier);
             out.extend_from_slice(&entry.ended_op.unwrap_or(0).to_le_bytes());
@@ -1748,6 +1862,7 @@ impl ClientTable {
             let client_id = reader.u128()?;
             let epoch = reader.u64()?;
             let user_id = reader.u32()?;
+            let token_id = reader.u64()?;
             let watermark = reader.u64()?;
             let bind_verifier = reader
                 .take(BIND_SECRET_BYTES)?
@@ -1795,6 +1910,7 @@ impl ClientTable {
                 epoch,
                 attachment: None,
                 user_id,
+                token_id,
                 watermark,
                 committed_window: 0,
                 ring,
@@ -1845,6 +1961,7 @@ impl ClientEntry {
             epoch: 0,
             attachment: None,
             user_id,
+            token_id: 0,
             watermark,
             committed_window: committed_window | 1,
             ring: VecDeque::new(),
@@ -1869,7 +1986,11 @@ impl ClientEntry {
     }
 
     fn valid_metadata_protection(&self) -> bool {
-        if self.client_id == 0 || self.epoch == 0 || self.latest_commit < self.epoch {
+        if self.client_id == 0
+            || self.epoch == 0
+            || self.token_id >= self.epoch
+            || self.latest_commit < self.epoch
+        {
             return false;
         }
         let Some(latest) = self.ring.back() else {
@@ -1886,6 +2007,8 @@ impl ClientEntry {
                             Operation::Logout
                                 | Operation::UpdateUserResolved
                                 | Operation::DeleteUser
+                                | Operation::DeletePersonalAccessToken
+                                | Operation::ChangePassword
                         ))
             })
         {
@@ -1975,6 +2098,7 @@ impl ClientEntry {
 #[allow(clippy::cast_possible_truncation)]
 mod tests {
     use super::*;
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
     use iggy_binary_protocol::{
         Command, Operation, PrepareHeader, REJECTION_SECTION_LEN, RoutedRequestHeader, result_code,
         write_rejection_section,
@@ -2279,6 +2403,26 @@ mod tests {
             );
         }
         assert!(ClientTable::from_snapshot(valid).is_ok());
+    }
+
+    #[test]
+    fn given_a_token_created_at_or_after_registration_when_restoring_should_refuse_both_formats() {
+        let (mut table, epoch) = table_with_client();
+        for (token_id, valid) in [
+            (0, true),
+            (epoch - 1, true),
+            (epoch, false),
+            (epoch + 1, false),
+        ] {
+            table.slots[0].as_mut().expect("registered client").token_id = token_id;
+            let checkpoint = ClientTable::from_snapshot(table.to_snapshot()).is_ok();
+            let transfer = ClientTable::decode(&table.encode()).is_ok();
+            assert_eq!(
+                (checkpoint, transfer),
+                (valid, valid),
+                "token op {token_id}, registration op {epoch}"
+            );
+        }
     }
 
     #[test]
@@ -3020,6 +3164,38 @@ mod tests {
     }
 
     #[test]
+    fn given_registered_client_when_retry_names_another_token_should_refuse() {
+        let mut table = ClientTable::new(1);
+        let registration = RegisterRequest {
+            credential: CredentialProof::token(1, 8),
+            bind_verifier: [0x5a; BIND_SECRET_BYTES],
+        };
+        table
+            .commit_registration(7, TEST_USER_ID, &registration, make_register_reply(7, 10))
+            .unwrap();
+        for token_id in [0, 9] {
+            let mut different = registration;
+            different.credential.token_id = token_id;
+            different.credential.access_revision = 1;
+            assert!(
+                table
+                    .commit_registration(7, TEST_USER_ID, &different, make_register_reply(7, 11))
+                    .is_err()
+            );
+            assert_eq!(
+                table.registered_session(7, TEST_USER_ID, registration.bind_verifier, token_id),
+                Err(IggyError::Unauthenticated),
+                "a retry naming token {token_id} must not resume the session of token 8"
+            );
+        }
+        assert_eq!(
+            table.registered_session(7, TEST_USER_ID, registration.bind_verifier, 8),
+            Ok(Some(10))
+        );
+        assert_eq!(table.token_id(7), 8);
+    }
+
+    #[test]
     fn login_retry_and_capacity_pressure_preserve_session_protection() {
         const CLIENT: u128 = 7;
         const EPOCH: u64 = 10;
@@ -3035,7 +3211,8 @@ mod tests {
                 make_register_reply(CLIENT, EPOCH),
             )
             .unwrap();
-        let (_, discovered, attached) = table.bind_session(CLIENT, 0, &secret).unwrap();
+        let (_, discovered, attached, token_id) = table.bind_session(CLIENT, 0, &secret).unwrap();
+        assert_eq!(token_id, 0);
         assert_eq!(discovered, EPOCH);
         let second = table.attach_session(CLIENT, EPOCH, TEST_USER_ID).unwrap();
         table.commit_reply(
@@ -3688,7 +3865,7 @@ mod tests {
         let encoded = table.encode();
 
         let mut previous_format = encoded[..encoded.len() - size_of::<u64>()].to_vec();
-        previous_format[..CLIENT_TABLE_MAGIC.len()].copy_from_slice(b"ICT4");
+        previous_format[..CLIENT_TABLE_MAGIC.len()].copy_from_slice(b"ICT5");
         assert!(matches!(
             ClientTable::decode(&reseal(previous_format)),
             Err(ClientTableWireError::BadMagic)

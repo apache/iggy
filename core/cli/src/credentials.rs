@@ -230,14 +230,19 @@ impl<'a> IggyCredentials<'a> {
         Ok(())
     }
 
-    pub(crate) async fn logout_user(&self) -> anyhow::Result<(), anyhow::Error> {
+    pub(crate) async fn logout_user(
+        &self,
+        session_may_have_ended: bool,
+    ) -> anyhow::Result<(), anyhow::Error> {
         if let Some(client) = self.iggy_client
             && self.login_required
         {
-            client
-                .logout_user()
-                .await
-                .with_context(|| "Problem with server logout".to_string())?;
+            match client.logout_user().await {
+                // A deleted token ends the sessions it opened, and the client may already know.
+                Err(IggyError::Unauthenticated | IggyError::Disconnected)
+                    if session_may_have_ended => {}
+                result => result.with_context(|| "Problem with server logout".to_string())?,
+            }
         }
 
         Ok(())
