@@ -65,10 +65,10 @@ pub async fn run_segment_cleaner(shard: Rc<ServerShard>, stop: Receiver<()>, int
     let mut reported_floors = HashSet::new();
     loop {
         // `Ok(_)`: stop signalled -> exit. `Err(_)`: interval elapsed -> pass.
-        match compio::time::timeout(interval, stop.recv()).await {
-            Ok(_) => break,
-            Err(_) => stage_owned_partitions(&shard, &mut reported_floors),
+        if compio::time::timeout(interval, stop.recv()).await.is_ok() {
+            break;
         }
+        stage_owned_partitions(&shard, &mut reported_floors);
     }
     trace!(shard = shard.id, "segment cleaner exited");
 }

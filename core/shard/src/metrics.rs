@@ -419,6 +419,14 @@ pub struct ShardMetrics {
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
     partition_long_term_rewrite_lag_messages: Gauge,
+    fresh_objects: Gauge,
+    fresh_object_bytes: Gauge,
+    fresh_object_oldest_age_seconds: Gauge,
+    fresh_objects_unnamed: Gauge,
+    fresh_objects_due: Gauge,
+    fresh_listings_truncated: Gauge,
+    fresh_sweeps_held: Gauge,
+    fresh_objects_deleted_total: Counter,
     partition_long_term_backlog_bytes: Gauge,
     partition_long_term_lags: Arc<Mutex<LongTermLags>>,
     partition_long_term_delayed_sends_total: Counter,
@@ -498,6 +506,7 @@ impl ShardMetrics {
     /// virtue of being constructed once per shard; the shard id does not
     /// appear in the label set (see [`FrameDropLabel`] doc).
     #[must_use]
+    // One line per metric, and nothing else.
     #[allow(clippy::too_many_lines)]
     pub fn for_shard() -> Self {
         let frame_drops_total: Family<FrameDropLabel, Counter> = Family::default();
@@ -596,6 +605,14 @@ impl ShardMetrics {
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
             partition_long_term_rewrite_lag_messages: Gauge::default(),
+            fresh_objects: Gauge::default(),
+            fresh_object_bytes: Gauge::default(),
+            fresh_object_oldest_age_seconds: Gauge::default(),
+            fresh_objects_unnamed: Gauge::default(),
+            fresh_objects_due: Gauge::default(),
+            fresh_listings_truncated: Gauge::default(),
+            fresh_sweeps_held: Gauge::default(),
+            fresh_objects_deleted_total: Counter::default(),
             partition_long_term_backlog_bytes: Gauge::default(),
             partition_long_term_lags: Arc::default(),
             partition_long_term_delayed_sends_total: Counter::default(),
@@ -1453,6 +1470,80 @@ impl ShardMetrics {
         self.partition_segment_upload_lag_seconds.get()
     }
 
+    /// Republished by every sweep of fresh objects: how many objects of
+    /// this replica the store holds, their bytes, the age of the oldest, and
+    /// how many of them nothing names.
+    pub fn set_fresh_objects(&self, objects: usize, bytes: u64, oldest: Duration, unnamed: usize) {
+        self.fresh_objects
+            .set(i64::try_from(objects).unwrap_or(i64::MAX));
+        self.fresh_object_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+        self.fresh_object_oldest_age_seconds
+            .set(i64::try_from(oldest.as_secs()).unwrap_or(i64::MAX));
+        self.fresh_objects_unnamed
+            .set(i64::try_from(unnamed).unwrap_or(i64::MAX));
+    }
+
+    /// Republished at the end of every sweep of fresh objects: how many of
+    /// its listings stopped before the last key of their scope, and how many
+    /// objects past their grace period it left in the store.
+    pub fn set_fresh_sweep_backlog(&self, truncated: usize, due: usize) {
+        self.fresh_listings_truncated
+            .set(i64::try_from(truncated).unwrap_or(i64::MAX));
+        self.fresh_objects_due
+            .set(i64::try_from(due).unwrap_or(i64::MAX));
+    }
+
+    /// Republished by every sweep of fresh objects that ends with the
+    /// answers of the shards: whether one could not tell which objects it
+    /// needs, so the sweep deleted nothing.
+    pub fn set_fresh_sweeps_held(&self, held: bool) {
+        self.fresh_sweeps_held.set(i64::from(held));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweeps_held_value(&self) -> i64 {
+        self.fresh_sweeps_held.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_unnamed_value(&self) -> i64 {
+        self.fresh_objects_unnamed.get()
+    }
+
+    /// Test-only read, mirroring the siblings: the listings the last sweep
+    /// cut short, and the objects it left due.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_sweep_backlog_value(&self) -> (i64, i64) {
+        (
+            self.fresh_listings_truncated.get(),
+            self.fresh_objects_due.get(),
+        )
+    }
+
+    pub fn record_fresh_objects_deleted(&self, objects: usize) {
+        self.fresh_objects_deleted_total.inc_by(objects as u64);
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_value(&self) -> i64 {
+        self.fresh_objects.get()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_objects_deleted_value(&self) -> u64 {
+        self.fresh_objects_deleted_total.get()
+    }
+
     /// Republished by the pump's tick: the most messages one partition this
     /// shard leads committed that no long-term segment holds yet, as the
     /// partition's last rewrite pass found. Zero when none waits.
@@ -1937,6 +2028,51 @@ impl ShardMetrics {
             "age of the oldest sealed segment that waits for its upload to the object store, \
              over the tiered partitions this shard leads",
             self.partition_segment_upload_lag_seconds.clone(),
+        );
+        registry.register(
+            "fresh_objects",
+            "fresh objects of this replica that its last sweep listed; fewer than the store \
+             holds while fresh_listings_truncated is not zero",
+            self.fresh_objects.clone(),
+        );
+        registry.register(
+            "fresh_object_bytes",
+            "bytes of the fresh objects of this replica in the object store",
+            self.fresh_object_bytes.clone(),
+        );
+        registry.register(
+            "fresh_object_oldest_age_seconds",
+            "age of the oldest fresh object of this replica in the object store",
+            self.fresh_object_oldest_age_seconds.clone(),
+        );
+        registry.register(
+            "fresh_objects_unnamed",
+            "fresh objects of this replica that no placed batch names and that wait out \
+             their grace period",
+            self.fresh_objects_unnamed.clone(),
+        );
+        registry.register(
+            "fresh_objects_due",
+            "fresh objects of this replica past their grace period that its last sweep left \
+             in the object store",
+            self.fresh_objects_due.clone(),
+        );
+        registry.register(
+            "fresh_listings_truncated",
+            "listings of the last sweep of fresh objects that stopped at their share of keys, \
+             of one per shard and one for the replica",
+            self.fresh_listings_truncated.clone(),
+        );
+        registry.register(
+            "fresh_sweeps_held",
+            "1 while the last sweep of fresh objects of this replica deleted nothing because \
+             a shard could not tell which objects its partitions need, else 0",
+            self.fresh_sweeps_held.clone(),
+        );
+        registry.register(
+            "fresh_objects_deleted",
+            "fresh objects this replica deleted",
+            self.fresh_objects_deleted_total.clone(),
         );
         registry.register(
             "partition_long_term_rewrite_lag_messages",

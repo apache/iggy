@@ -59,7 +59,14 @@ pub use object_delete::{
 };
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
+mod fresh_sweep;
 mod manifest_publish;
+pub use fresh_sweep::{
+    ExecutorFreshSweeper, FRESH_DELETES_PER_BATCH, FRESH_OBJECT_GRACE, FRESH_OBJECTS_PER_SWEEP,
+    FreshDeleteOutcome, FreshListCursor, FreshListEnd, FreshListOutcome, FreshListRequest,
+    FreshListScope, FreshListedScope, FreshListing, FreshObjectSweeper, FreshObjectsInUse,
+    FreshScanFailed, FreshSettled, FreshSweep, list_fresh_objects,
+};
 mod placed_read;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,

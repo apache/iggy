@@ -544,6 +544,7 @@ where
                         break;
                     }
                     self.tick_fresh_writes().await;
+                    self.tick_fresh_sweeps();
                     self.tick_long_term_rewrites().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
@@ -1410,6 +1411,21 @@ where
             }
             LifecycleFrame::SegmentRewriteFinished(finished) => {
                 self.on_segment_rewrite_finished(*finished).await;
+            }
+            LifecycleFrame::SweepFreshObjects { now } => {
+                self.on_sweep_fresh_objects(now);
+            }
+            LifecycleFrame::FreshObjectsListed(finished) => {
+                self.on_fresh_objects_listed(*finished);
+            }
+            LifecycleFrame::ReportFreshObjects { sweep } => {
+                self.on_report_fresh_objects(sweep);
+            }
+            LifecycleFrame::FreshObjectsReported(report) => {
+                self.on_fresh_objects_reported(*report);
+            }
+            LifecycleFrame::FreshObjectsDeleted(finished) => {
+                self.on_fresh_objects_deleted(*finished);
             }
             LifecycleFrame::TruncatePartition {
                 namespace,
