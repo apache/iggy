@@ -441,24 +441,6 @@ async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_shou
     assert_eq!(stored, [0, 1, 2, 3, 4]);
 }
 
-/// Reading through a placement comes later. Until then a poll says so, and
-/// does not answer as though the partition held nothing.
-#[compio::test]
-async fn given_a_placing_partition_when_a_poll_completes_should_refuse_it_as_unavailable() {
-    let (_directory, mut partition) = Box::pin(placing_partition()).await;
-    let (records, _) = placed_records(1);
-    Box::pin(commit_records(&mut partition, 1, &records)).await;
-
-    let completed = partition.complete_poll(poll_read_result(
-        &partition,
-        PollingConsumer::Consumer(7, 0),
-        false,
-        None,
-    ));
-
-    assert!(matches!(completed, Err(IggyError::FeatureUnavailable)));
-}
-
 /// A placing partition whose segments fit two placed batches.
 async fn placing_partition_of_small_segments() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>)
 {
@@ -867,6 +849,374 @@ async fn given_a_placing_primary_when_the_placed_entry_gets_another_body_should_
     }
 
     assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+}
+
+/// A store whose every read fails, so a poll that passes must not have read.
+struct NoStore;
+
+impl crate::RemoteObjects for NoStore {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        _range: std::ops::Range<u64>,
+    ) -> futures::future::LocalBoxFuture<
+        'a,
+        Result<iggy_object_store::ObjectRange, iggy_object_store::ObjectStoreError>,
+    > {
+        Box::pin(std::future::ready(Err(
+            iggy_object_store::ObjectStoreError::NotFound {
+                key: key.to_owned(),
+            },
+        )))
+    }
+}
+
+const FRESH_OBJECT: u128 = 0x51;
+
+/// The same batches for two partitions: as whole records, and as placed
+/// records whose blobs sit back to back in one fresh object.
+fn whole_and_placed(count: u64) -> (Vec<Vec<u8>>, Vec<Vec<u8>>, bytes::Bytes) {
+    let whole = segment_records(count);
+    let mut object = iggy_object_store::FreshObject::new();
+    let placed = whole
+        .iter()
+        .map(|record| {
+            let mut header = BatchHeader::decode(record).unwrap();
+            header.batch_checksum = 0;
+            let blob = &record[COMMAND_HEADER_SIZE..];
+            let placement = Placement::of(FRESH_OBJECT, object.push(blob), blob);
+            let mut placed = vec![0; PLACED_BATCH_SIZE];
+            PlacedBatch::new(header, placement).encode_into(&mut placed);
+            placed
+        })
+        .collect();
+    (whole, placed, object.into_bytes())
+}
+
+/// A store that holds `object` as the fresh object the placed records name.
+async fn store_with(object: bytes::Bytes) -> Rc<iggy_object_store::MemoryStore> {
+    use iggy_object_store::ObjectStore;
+    let store = Rc::new(iggy_object_store::MemoryStore::new());
+    store
+        .put(
+            &super::remote_poll::layout().fresh_key(FRESH_OBJECT),
+            iggy_object_store::PutBody::from_bytes(object),
+            &iggy_object_store::PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    store
+}
+
+/// What every poll of [`super::remote_poll::polled_all`] returns from a
+/// partition of whole batches that committed `records`.
+async fn polls_of_whole_batches(records: &[Vec<u8>]) -> Vec<(Option<u64>, Vec<u8>)> {
+    let config = repair_config();
+    let (_directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 3)).await;
+    let batch_len = records[0].len() as u64;
+    let segment_size = IggyByteSize::from(BATCHES_PER_SEGMENT * batch_len);
+    partition.runtime_options.segment_size = Some(segment_size);
+    partition.log.active_segment_mut().max_size = segment_size;
+    Box::pin(commit_records(&mut partition, 1, records)).await;
+    Box::pin(super::remote_poll::polled_all(&mut partition)).await
+}
+
+/// A placing partition of small segments that committed `placed`.
+async fn placing_partition_with(
+    placed: &[Vec<u8>],
+) -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    let (directory, mut partition) = Box::pin(placing_partition_of_small_segments()).await;
+    Box::pin(commit_records(&mut partition, 1, placed)).await;
+    (directory, partition)
+}
+
+/// The messages of a placed batch are in the object store, and a poll puts
+/// the batch back together byte for byte.
+#[compio::test]
+async fn given_the_same_batches_placed_when_polling_should_return_the_bytes_of_a_partition_of_whole_batches()
+ {
+    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let expected = Box::pin(polls_of_whole_batches(&whole)).await;
+    assert_eq!(expected[0].0, Some(RECEIVER_OPS - 1));
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    super::remote_poll::attach(&mut partition, Box::pin(store_with(object)).await);
+    assert_eq!(
+        partition.log.segments().len(),
+        3,
+        "the batches span segments"
+    );
+
+    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+
+    assert_eq!(polled, expected);
+}
+
+#[compio::test]
+async fn given_a_fresh_object_this_shard_stored_when_polling_should_not_ask_the_store() {
+    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let expected = Box::pin(polls_of_whole_batches(&whole)).await;
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    let remote = Rc::new(crate::RemoteSegments::new(
+        Rc::new(NoStore),
+        super::remote_poll::layout(),
+    ));
+    remote.cache_fresh_object(FRESH_OBJECT, object);
+    partition.set_remote_segments(remote);
+
+    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+
+    assert_eq!(polled, expected);
+}
+
+async fn poll_error(partition: &mut IggyPartition<IggyMessageBus>) -> IggyError {
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false);
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute()
+        .await;
+    assert_eq!(result.message_count, 0);
+    result.read_error.unwrap()
+}
+
+/// A poll that skipped the batch would hand the consumer a gap.
+#[compio::test]
+async fn given_messages_that_are_not_the_placed_ones_when_polling_should_fail_the_read() {
+    let (_whole, placed, object) = whole_and_placed(2);
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    let mut damaged = object.to_vec();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    super::remote_poll::attach(&mut partition, Box::pin(store_with(damaged.into())).await);
+
+    assert_eq!(
+        Box::pin(poll_error(&mut partition)).await,
+        IggyError::TieredReadFailed
+    );
+}
+
+#[compio::test]
+async fn given_a_missing_fresh_object_when_polling_should_fail_the_read() {
+    let (_whole, placed, _object) = whole_and_placed(2);
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    super::remote_poll::attach(&mut partition, Rc::new(NoStore));
+
+    assert_eq!(
+        Box::pin(poll_error(&mut partition)).await,
+        IggyError::TieredReadFailed
+    );
+}
+
+/// A shard connects its store a moment after it starts.
+#[compio::test]
+async fn given_no_store_yet_when_polling_should_ask_for_a_retry() {
+    let (_whole, placed, _object) = whole_and_placed(2);
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+
+    assert_eq!(
+        Box::pin(poll_error(&mut partition)).await,
+        IggyError::TransientNotAccepted
+    );
+}
+
+/// Reads `store`, and counts the reads.
+struct CountedStore {
+    store: Rc<iggy_object_store::MemoryStore>,
+    reads: std::cell::Cell<usize>,
+}
+
+impl crate::RemoteObjects for CountedStore {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: std::ops::Range<u64>,
+    ) -> futures::future::LocalBoxFuture<
+        'a,
+        Result<iggy_object_store::ObjectRange, iggy_object_store::ObjectStoreError>,
+    > {
+        self.reads.set(self.reads.get() + 1);
+        crate::RemoteObjects::get_range(&*self.store, key, range)
+    }
+}
+
+/// The batches of one poll sit back to back in one fresh object, so the
+/// poll asks the store once for all of them and not once a batch.
+#[compio::test]
+async fn given_batches_of_one_fresh_object_when_polling_them_should_ask_the_store_once() {
+    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let expected = Box::pin(polls_of_whole_batches(&whole)).await;
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    let counted = Rc::new(CountedStore {
+        store: Box::pin(store_with(object)).await,
+        reads: std::cell::Cell::new(0),
+    });
+    super::remote_poll::attach(
+        &mut partition,
+        Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
+    );
+
+    let polled = Box::pin(super::remote_poll::polled_all(&mut partition)).await;
+
+    assert_eq!(polled, expected);
+    const { assert!(RECEIVER_OPS > 2, "the poll reads several batches") };
+    assert_eq!(counted.reads.get(), 1);
+}
+
+/// The objects a busy shard stored can leave the cache no room for what a
+/// poll fetches. The poll takes its batches from its own read all the same.
+#[compio::test]
+async fn given_a_cache_without_room_when_polling_batches_of_one_fresh_object_should_ask_the_store_once()
+ {
+    let (_whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let (_directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    let counted = Rc::new(CountedStore {
+        store: Box::pin(store_with(object)).await,
+        reads: std::cell::Cell::new(0),
+    });
+    let mut remote = crate::RemoteSegments::new(
+        Rc::clone(&counted) as Rc<dyn crate::RemoteObjects>,
+        super::remote_poll::layout(),
+    );
+    remote.set_fresh_cache_bytes(0);
+    partition.set_remote_segments(Rc::new(remote));
+
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false);
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute()
+        .await;
+
+    assert_eq!(result.read_error, None);
+    assert_eq!(u64::from(result.message_count), RECEIVER_OPS);
+    assert_eq!(counted.reads.get(), 1);
+}
+
+/// Bytes of the buffer a poll holds one batch of [`whole_and_placed`] in.
+fn held_batch_bytes(whole: &[Vec<u8>]) -> usize {
+    size_of::<PrepareHeader>() + whole[0].len()
+}
+
+/// Poll from `offset` on with `max_bytes` of read buffers, and return the
+/// last offset, the bytes and whether the read was truncated.
+async fn polled_within(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    offset: u64,
+    max_bytes: usize,
+) -> (Option<u64>, Vec<u8>, bool) {
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(offset), 10, false);
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute_with_limit(max_bytes, usize::MAX)
+        .await;
+    assert_eq!(result.read_error, None);
+    let truncated = result.truncated();
+    let last_matching_offset = result.last_matching_offset;
+    let bytes = partition
+        .complete_poll(result)
+        .unwrap()
+        .fragments
+        .iter()
+        .flat_map(|fragment| fragment.as_slice().iter().copied())
+        .collect();
+    (last_matching_offset, bytes, truncated)
+}
+
+/// A placing partition that committed [`RECEIVER_OPS`] batches whose
+/// messages its store holds, with the size of the buffer of one batch and
+/// the bytes a partition of whole batches returns for a poll of all of them.
+async fn placing_partition_to_poll() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    usize,
+    Vec<u8>,
+) {
+    let (whole, placed, object) = whole_and_placed(RECEIVER_OPS);
+    let (last, expected) = Box::pin(polls_of_whole_batches(&whole))
+        .await
+        .swap_remove(0);
+    assert_eq!(last, Some(RECEIVER_OPS - 1));
+    let (directory, mut partition) = Box::pin(placing_partition_with(&placed)).await;
+    super::remote_poll::attach(&mut partition, Box::pin(store_with(object)).await);
+    (directory, partition, held_batch_bytes(&whole), expected)
+}
+
+/// A poll holds every batch it reads until it answers, so its read buffers
+/// are capped as those of a poll of whole batches are. It stops between two
+/// batches, and the next poll goes on from there.
+#[compio::test]
+async fn given_a_cap_inside_the_run_when_polling_placed_batches_should_return_the_batches_that_fit_and_continue_from_them()
+ {
+    let (_directory, mut partition, held, expected) = Box::pin(placing_partition_to_poll()).await;
+    // Two batches and half of the third.
+    let max_bytes = 2 * held + held / 2;
+
+    let mut polled = Vec::new();
+    let mut polls = Vec::new();
+    let mut offset = 0;
+    while offset < RECEIVER_OPS {
+        let (last, bytes, truncated) =
+            Box::pin(polled_within(&mut partition, offset, max_bytes)).await;
+        let last = last.expect("each poll returns a batch");
+        polls.push((last, truncated));
+        polled.extend(bytes);
+        offset = last + 1;
+    }
+
+    const { assert!(RECEIVER_OPS == 5) };
+    assert_eq!(polls, [(1, true), (3, true), (4, false)]);
+    assert_eq!(
+        polled, expected,
+        "the polls together return every batch once, in order"
+    );
+}
+
+/// The batch that holds the first message of a poll is returned whatever the
+/// cap, or the same poll would return nothing each time it is sent.
+#[compio::test]
+async fn given_a_cap_below_one_batch_when_polling_placed_batches_should_return_one_batch_a_poll() {
+    let (_directory, mut partition, held, expected) = Box::pin(placing_partition_to_poll()).await;
+
+    let mut polled = Vec::new();
+    for offset in 0..RECEIVER_OPS {
+        let (last, bytes, truncated) =
+            Box::pin(polled_within(&mut partition, offset, held - 1)).await;
+        assert_eq!(last, Some(offset));
+        assert_eq!(truncated, offset + 1 < RECEIVER_OPS, "the poll at {offset}");
+        polled.extend(bytes);
+    }
+
+    assert_eq!(polled, expected);
+}
+
+#[compio::test]
+async fn given_a_cap_that_covers_the_run_when_polling_placed_batches_should_return_them_all_untruncated()
+ {
+    let (_directory, mut partition, held, expected) = Box::pin(placing_partition_to_poll()).await;
+    let max_bytes = usize::try_from(RECEIVER_OPS).unwrap() * held;
+
+    let (last, bytes, truncated) = Box::pin(polled_within(&mut partition, 0, max_bytes)).await;
+
+    assert_eq!(last, Some(RECEIVER_OPS - 1));
+    assert!(!truncated);
+    assert_eq!(bytes, expected);
+}
+
+/// The selection of a reply is capped apart from the read buffers, and a
+/// poll that stops at it says so too.
+#[compio::test]
+async fn given_a_reply_that_is_full_when_polling_placed_batches_should_stop_and_report_truncation()
+{
+    let (_directory, mut partition, _held, expected) = Box::pin(placing_partition_to_poll()).await;
+    let args = PollingArgs::new(iggy_common::PollingStrategy::offset(0), 10, false);
+
+    let result = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute_with_limit(usize::MAX, 1)
+        .await;
+
+    assert_eq!(result.read_error, None);
+    assert_eq!(result.last_matching_offset, Some(0));
+    assert!(result.truncated());
+    assert!(result.encoded_bytes() < expected.len());
 }
 
 /// Primacy moved while the messages of a send were on their way to the

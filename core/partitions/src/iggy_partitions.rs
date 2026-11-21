@@ -985,6 +985,13 @@ where
         *self.remote_segments.borrow_mut() = Some(remote);
     }
 
+    /// The store the partitions here read their remote data from, `None` on
+    /// a shard that was given none.
+    #[must_use]
+    pub fn remote_segments(&self) -> Option<Rc<crate::RemoteSegments>> {
+        self.remote_segments.borrow().clone()
+    }
+
     /// Access the physical owner through the tombstone gate for I/O settlement,
     /// shutdown, fault scans, and ticks. Admission must use the live lookup.
     #[allow(clippy::mut_from_ref)]
