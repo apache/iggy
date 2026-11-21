@@ -40,7 +40,9 @@ mod topic;
 mod user;
 mod user_headers;
 
-use client::{IggyClient, OptionError, PendingOperationError, PyIggyError, ReadError};
+use client::{
+    ConnectionInfo, IggyClient, OptionError, PendingOperationError, PyIggyError, ReadError,
+};
 use config::{
     AutoLogin, HttpConfig, PendingOperationsConfig, QuicConfig, QuicReconnectionConfig, TcpConfig,
     TcpReconnectionConfig, WebSocketConfig, WebSocketFramingConfig, WebSocketReconnectionConfig,
@@ -105,6 +107,7 @@ fn apache_iggy(py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CommitEvery>()?;
     m.add_class::<CommitAfter>()?;
     m.add_class::<IggyClient>()?;
+    m.add_class::<ConnectionInfo>()?;
     m.add_class::<PyIggyError>()?;
     m.add_class::<PendingOperationError>()?;
     m.add_class::<OptionError>()?;
