@@ -749,12 +749,14 @@ after each change of primary. Until then, the partition refuses messages with
 `TransientNotAccepted`, which the SDKs retry. A store that does not answer
 therefore delays the first messages of a new geo topic, but the topic stays.
 
-When a client deletes a geo topic, the metadata primary replaces its object
-with a tombstone. A tombstone tells the peers that the topic is gone. The
-primary lists the topic objects once a minute. After `tombstone_grace` (24
-hours by default), it deletes the segments and manifests of the topic, and then
-the tombstone. The tombstone records the time of its write. A restart or a new
-metadata primary therefore does not restart the grace.
+When a client deletes a geo topic, the metadata primary replaces its object with
+a tombstone. A tombstone tells the peers that the topic is gone. The primary
+lists the topic objects once a minute. The grace is the topic's own
+`tombstone_grace`, which its object records, or else `[geo] tombstone_grace` (24
+hours by default). After the grace, the primary deletes the segments and
+manifests of the topic, and then the tombstone. The tombstone records the time
+of its write. A restart or a new metadata primary therefore does not restart the
+grace.
 
 ### Shadow streams
 
@@ -973,13 +975,16 @@ A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `no
 
 Only a geo topic has a `geo_mode`: `geo` or `geo_tiered`. A geo topic without one is stored with `geo`. Clients cannot pick `geo_tiered` yet, and the server refuses it with `FeatureUnavailable` (5). The server refuses a normal topic that sets a mode with `InvalidOptionValue` (4042).
 
-A geo topic keeps its name, options and partition count. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or options returns `OptionNotUpdatable` (4103).
+A geo topic keeps its name, its partition count and its options, all but its durations. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or of any other option returns `OptionNotUpdatable` (4103).
+
+A geo topic can set six durations, each of which overrides the server setting of the same name for this topic: `fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`, `tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`.
+Unset, each node applies its own setting. An update can change them, and a reset of one returns `OptionNotResettable` (4104). A normal topic that sets one returns `InvalidOptionValue` (4042). See [durations of a geo topic](docs/GEO_TOPICS.md#durations-of-a-geo-topic).
 
 A create that sets `tiered_storage` to `true`, or a `partition_resize_policy` other than `fixed`, on a geo topic returns `InvalidOptionValue` (4042). A geo topic in an encrypted stream returns `FeatureUnavailable` (5), because its sends reach the object store before the stream's encryption runs.
 
 Both keys are critical. A node on a build without them refuses a topic that sets them, and does not serve it as a normal topic.
 
-The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
+The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. The durations of a geo topic are updatable too. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 
 Only root may rename the root user or change its status. Root cannot deactivate itself. These requests return `CannotModifyRootUser` (4108), and a rejected update leaves root active with its existing username.
 

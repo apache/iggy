@@ -30,6 +30,7 @@ positions](../README.md#consumer-group-positions).
 - [Prerequisites](#prerequisites)
 - [Configure each cluster](#configure-each-cluster)
 - [Create a geo topic](#create-a-geo-topic)
+  - [Durations of a geo topic](#durations-of-a-geo-topic)
 - [Produce and consume](#produce-and-consume)
 - [Delays](#delays)
 - [What fails and what is lost](#what-fails-and-what-is-lost)
@@ -356,8 +357,9 @@ Create the stream in each cluster first. Then create the geo topic in each clust
 producers write. Adoption creates only the read-only shadow topic in the other clusters, so a
 cluster that takes writes needs its own geo topic, created there.
 
-Choose the partition count and the retention at creation. A geo topic keeps its name, its options
-and its partition count for good.
+Choose the partition count and the retention at creation. A geo topic keeps its name, its
+partition count and its options for good, all but its durations: see
+[Durations of a geo topic](#durations-of-a-geo-topic).
 
 With the CLI, against a node of `dc-a`:
 
@@ -418,19 +420,69 @@ server stores `partition_resize_policy` as `fixed` on a geo topic.
 | `geo_mode=geo_tiered`                                                | `FeatureUnavailable` (5)      |
 | A geo topic in a stream that has an encryption key                   | `FeatureUnavailable` (5)      |
 | `geo_mode` on a normal topic                                         | `InvalidOptionValue` (4042)   |
+| A duration of a geo topic on a normal topic                          | `InvalidOptionValue` (4042)   |
 | `tiered_storage=true` on a geo topic                                 | `InvalidOptionValue` (4042)   |
 | `partition_resize_policy` other than `fixed` on a geo topic          | `InvalidOptionValue` (4042)   |
 | Any topic create in a shadow stream                                  | `ShadowStreamReadOnly` (1021) |
 
-After the create, the topic refuses changes:
+After the create, the topic refuses changes, all but a change of its durations:
 
-| Request on a geo topic                 | Answer                           |
-| -------------------------------------- | -------------------------------- |
-| An update of its name or of any option | `OptionNotUpdatable` (4103)      |
-| Adding or deleting partitions          | `PartitionResizeDisabled` (2023) |
+| Request on a geo topic                                | Answer                           |
+| ----------------------------------------------------- | -------------------------------- |
+| An update of its name or of any option but a duration | `OptionNotUpdatable` (4103)      |
+| A reset of a duration                                 | `OptionNotResettable` (4104)     |
+| Adding or deleting partitions                         | `PartitionResizeDisabled` (2023) |
 
 A `FeatureUnavailable` from a cluster that is not ready is worth retrying while its nodes pass
 their store identity checks. `object_store_identity_verified` shows when each node does.
+
+### Durations of a geo topic
+
+A geo topic can set its own value for six server settings. Each one overrides the setting of the
+same name for this topic, on every node of the cluster. For a duration that the topic does not
+set, each node applies its own setting.
+
+| Topic option                      | Overrides                                | Bounds                         |
+| --------------------------------- | ---------------------------------------- | ------------------------------ |
+| `fresh_upload_interval`           | `[tiered_storage] fresh_upload_interval` | `0` to `10 s`                  |
+| `consumer_offset_upload_interval` | `[geo] consumer_offset_upload_interval`  | `0` or `disabled`, up to `1 s` |
+| `positions_publish_interval`      | `[geo] positions_publish_interval`       | longer than `0`                |
+| `tombstone_grace`                 | `[geo] tombstone_grace`                  | longer than `0`                |
+| `positions_resume_timeout`        | `[geo] positions_resume_timeout`         | `0` or longer                  |
+| `long_term_rewrite_max_interval`  | `[geo] long_term_rewrite_max_interval`   | at least `1 s`                 |
+
+A value is a number of microseconds or a duration like `50 ms`. The meaning of each one is in
+[Tunables](#tunables).
+
+- Set them in the create of the topic, or change them later with an update of the topic. No node
+  needs a restart. A send takes a new upload interval at once, and a stored offset takes a new
+  offset upload interval at once. A rewrite takes a new ceiling at its next pass. A new publish
+  interval applies from the next round of every log, within the node's
+  `positions_publish_interval`. A new resume timeout applies at the next start of a node.
+- An update cannot reset a duration to the node's setting. To follow the node again, set the
+  node's value.
+- A normal topic refuses them. A shadow topic has none: its cluster applies its own settings,
+  because the options of a topic do not go to other datacenters.
+- The topic's object records its `tombstone_grace`, so the grace still applies after the delete,
+  when the topic is gone from metadata.
+
+One fresh object carries the sends of every partition that a shard leads, of all its topics. So
+the `fresh_upload_interval` of a topic is the longest time that its sends wait for an upload to
+start, not a pace of their own. A shard uploads at the shortest interval among the sends that it
+holds. When it holds sends of a topic with a short interval, the sends of a topic with a long
+interval go with those uploads. They are answered sooner than their interval asks, and save no
+requests on that shard.
+
+With the CLI:
+
+```sh
+iggy topic create orders payments 3 none 7days --set topic_type=geo \
+  --set fresh_upload_interval=50ms --set tombstone_grace=6h
+iggy topic update orders payments --set consumer_offset_upload_interval=200ms
+```
+
+`iggy topic get` shows the durations that the topic sets. Every SDK has typed fields for them in
+its topic create options, its topic update and its topic read model.
 
 ### What happens after a create
 
@@ -553,6 +605,10 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Position stored         | Taken by another datacenter          | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                                                                   |
 | Geo topic deleted       | Shadow topic detached in each peer   | Up to a minute until the origin writes the tombstone, then up to 30 s until a peer reads it again.                                                                                                                                                                   |
 | Shadow topic detached   | Shadow topic removed                 | `[geo] tombstone_grace` of the cluster that holds the shadow, 24 hours by default, counted from the tombstone's write.                                                                                                                                               |
+
+A geo topic that sets its own duration replaces the node's setting in these rows, see
+[Durations of a geo topic](#durations-of-a-geo-topic). The detach of a shadow topic always uses the
+setting of the cluster that holds the shadow.
 
 Each partition adjusts its rewrite interval between 1 s and `[geo] long_term_rewrite_max_interval`,
 10 s by default, toward the interval at which a long-term segment comes out 80% of 64 MiB full. A
@@ -982,20 +1038,23 @@ Alert on these first:
 
 ## Tunables
 
-| Key                                        | Default | Meaning                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------------------------------ | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer.                                                                                                                                       |
-| `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 1 s after its last. `0` turns this off. Otherwise at least `64 MiB`.                                                    |
-| `[tiered_storage.jobs] fresh_uploads`      | `16`    | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads. A shard keeps to `fresh_upload_interval` only while the slots cover the time of a put: 16 slots cover puts of up to 160 ms at the default 10 ms. What the uploads hold counts in the 32 MiB of waiting sends of the shard, so more slots take no more memory.                    |
-| `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that commits on read and fails over reads again at most this long, plus the poll interval of the other datacenter.                                                                                                                                                                 |
-| `[geo] consumer_offset_upload_interval`    | `50 ms` | The shortest time between two puts of a log's positions for the offsets that groups store themselves, whose answers wait for the put. A store that finds no put running and the interval passed is stored at once. A longer interval makes fewer puts under steady stores, and answers them later. `disabled` answers them at the local commit and leaves them to `positions_publish_interval`. Up to `1 s`. |
-| `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                                                                       |
-| `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer that did not retire. A peer that does not answer delays them this long.                                                                                                                                                                                                                         |
-| `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                                                                            |
-| `[geo] long_term_rewrite_max_interval`     | `10 s`  | The longest wait between two rewrites of a geo partition into long-term segments, which a partition with little load waits. Its shadow topics are about this plus `manifest_poll_interval` behind. A lower value publishes sooner, and leaves more and smaller segments on quiet partitions: more merges and manifest stores, still at most one a second. At least `1 s`, which rewrites every second.       |
-| `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                                                            |
-| `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                                                                           |
-| `[geo] tombstone_grace`                    | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage.                                                                                                                                                                                                                     |
+| Key                                        | Default | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------------ | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[tiered_storage] fresh_upload_interval`   | `10 ms` | The shortest time between the starts of two uploads of fresh objects on one shard, unless an object fills to 4 MiB first. `0` uploads as soon as a slot is free. Up to `10 s`. A longer interval makes fewer and larger objects, and makes every producer wait longer. A geo topic can set its own.                                                                                                                                       |
+| `[tiered_storage] long_term_backlog_limit` | `1 GiB` | The bytes of messages one partition may have committed that no long-term segment holds yet. Past it, the primary holds each send to that partition for 10 ms, up to 250 ms at twice the limit, and never refuses one for it. Its next rewrite then waits only the shortest interval, 1 s after its last. `0` turns this off. Otherwise at least `64 MiB`.                                                                                 |
+| `[tiered_storage.jobs] fresh_uploads`      | `16`    | Uploads of fresh objects that run at once on one shard. They have slots of their own and never wait behind segment uploads. A shard keeps to `fresh_upload_interval` only while the slots cover the time of a put: 16 slots cover puts of up to 160 ms at the default 10 ms. What the uploads hold counts in the 32 MiB of waiting sends of the shard, so more slots take no more memory.                                                 |
+| `[geo] positions_publish_interval`         | `1 s`   | How often a node stores the consumer group positions of the partitions it leads in its bucket, when they changed. A group that commits on read and fails over reads again at most this long, plus the poll interval of the other datacenter. A geo topic can set its own.                                                                                                                                                                 |
+| `[geo] consumer_offset_upload_interval`    | `50 ms` | The shortest time between two puts of a log's positions for the offsets that groups store themselves, whose answers wait for the put. A store that finds no put running and the interval passed is stored at once. A longer interval makes fewer puts under steady stores, and answers them later. `disabled` answers them at the local commit and leaves them to `positions_publish_interval`. Up to `1 s`. A geo topic can set its own. |
+| `[geo] positions_poll_interval`            | `1 s`   | How often a node lists the positions that each peer stores, and takes those that win. A shorter interval lists the peer's bucket more often. The node lists at most once a pass of its partition reconciler, `[sharding] reconcile_periodic_interval`.                                                                                                                                                                                    |
+| `[geo] positions_resume_timeout`           | `10 s`  | How long, after a node starts, the group polls of geo and shadow topics wait for the positions of every peer that did not retire. A peer that does not answer delays them this long. A geo topic can set its own.                                                                                                                                                                                                                         |
+| `[geo] manifest_poll_interval`             | `5 s`   | How often shard 0 of each node lists the manifests of each peer stream for which the node leads a shadow partition. A shorter interval brings published messages to shadow topics sooner, and lists the peer's bucket more often.                                                                                                                                                                                                         |
+| `[geo] long_term_rewrite_max_interval`     | `10 s`  | The longest wait between two rewrites of a geo partition into long-term segments, which a partition with little load waits. Its shadow topics are about this plus `manifest_poll_interval` behind. A lower value publishes sooner, and leaves more and smaller segments on quiet partitions: more merges and manifest stores, still at most one a second. At least `1 s`, which rewrites every second. A geo topic can set its own.       |
+| `[geo] recover_cluster_uid`                | empty   | On replica 0: the `cluster_uid` of a cluster that lost every disk, whose geo topics this cluster takes back from its bucket. See [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks).                                                                                                                                                                                                                         |
+| `[geo] recover_unproven`                   | `true`  | Whether that recovery also takes the batches no proof names, at the offsets their writer expected. `false` takes back only what the bucket proves.                                                                                                                                                                                                                                                                                        |
+| `[geo] tombstone_grace`                    | `24 h`  | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage. A geo topic can set its own.                                                                                                                                                                                                                     |
+
+The keys that a geo topic can set for itself are in
+[Durations of a geo topic](#durations-of-a-geo-topic).
 
 The other `[tiered_storage]` keys apply to geo topics as they do to tiered topics: the timeouts
 and retries of store calls, and the job caps of `[tiered_storage.jobs]`. Each shard runs one tier
@@ -1027,7 +1086,9 @@ before an unlisted long-term object is deleted.
   runs.
 - **No Kafka gateway.** The Kafka gateway does not support geo topics or shadow streams.
 - **Frozen partition count and options.** A geo topic keeps its name, its options, including
-  `message_expiry` and `max_topic_size`, and its partition count.
+  `message_expiry` and `max_topic_size`, and its partition count. Only its durations can change.
+- **No reset of a duration.** An update cannot return a duration of a geo topic to the node's
+  setting. Set the node's value instead.
 - **Only the `geo` mode.** `geo_tiered` is refused, and a geo topic cannot change its mode.
 - **Each cluster's geo topic is created there.** Adoption creates only shadow topics. Nothing
   checks that the geo topics of the same name in two clusters have the same partition count or

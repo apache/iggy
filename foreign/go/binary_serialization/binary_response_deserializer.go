@@ -557,14 +557,20 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	if topicStringOption(topic, iggcon.TopicOptionTopicType) == string(iggcon.TopicTypeGeo) {
 		topic.TopicType = iggcon.TopicTypeGeo
 	}
-	// The server refuses a mode on a normal topic, so a stored one is ignored
-	// rather than trusted.
+	// The server refuses a mode and the durations on a normal topic, so stored
+	// ones are ignored rather than trusted.
 	if topic.TopicType == iggcon.TopicTypeGeo {
 		mode := iggcon.GeoModeGeo
 		if topicStringOption(topic, iggcon.TopicOptionGeoMode) == string(iggcon.GeoModeGeoTiered) {
 			mode = iggcon.GeoModeGeoTiered
 		}
 		topic.GeoMode = &mode
+		topic.FreshUploadInterval = topicDurationOption(topic, iggcon.TopicOptionFreshUploadInterval)
+		topic.ConsumerOffsetUploadInterval = topicDurationOption(topic, iggcon.TopicOptionConsumerOffsetUploadInterval)
+		topic.PositionsPublishInterval = topicDurationOption(topic, iggcon.TopicOptionPositionsPublishInterval)
+		topic.TombstoneGrace = topicDurationOption(topic, iggcon.TopicOptionTombstoneGrace)
+		topic.PositionsResumeTimeout = topicDurationOption(topic, iggcon.TopicOptionPositionsResumeTimeout)
+		topic.LongTermRewriteMaxInterval = topicDurationOption(topic, iggcon.TopicOptionLongTermRewriteMaxInterval)
 	}
 
 	return topic, readBytes, nil
@@ -609,6 +615,17 @@ func topicUint64Option(topic iggcon.Topic, key iggcon.TopicOptionKey, fallback u
 		return fallback
 	}
 	return binary.LittleEndian.Uint64(value.Value)
+}
+
+// topicDurationOption reads a Uint64 duration that has no default, nil when
+// the server reported none.
+func topicDurationOption(topic iggcon.Topic, key iggcon.TopicOptionKey) *iggcon.Duration {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.Uint64 || len(value.Value) != 8 {
+		return nil
+	}
+	duration := iggcon.Duration(binary.LittleEndian.Uint64(value.Value))
+	return &duration
 }
 
 // partitionCountersSize covers id + created_at + segments_count +

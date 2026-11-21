@@ -30,8 +30,10 @@ import static org.apache.iggy.system.OptionSpec.FLAG_UPDATABLE;
  *
  * <p>An update may set {@code name}, {@code message_expiry}, {@code max_topic_size},
  * {@code local_retention_age} and {@code local_retention_size}, and reset the last four to their
- * defaults. It may also turn {@code tiered_storage} on, never off and never back to its default. Every
- * other key is fixed at create.
+ * defaults. It may also turn {@code tiered_storage} on, never off and never back to its default. On a geo
+ * topic it may set the six durations from {@code fresh_upload_interval} to
+ * {@code long_term_rewrite_max_interval}, the only keys an update changes there. They have no default, so
+ * the server refuses a reset of them. Every other key is fixed at create.
  */
 public enum TopicOptionKey implements OptionKey {
     NAME("name", FLAG_UPDATABLE),
@@ -51,7 +53,13 @@ public enum TopicOptionKey implements OptionKey {
     LOCAL_RETENTION_AGE("local_retention_age", FLAG_UPDATABLE | FLAG_RESETTABLE),
     LOCAL_RETENTION_SIZE("local_retention_size", FLAG_UPDATABLE | FLAG_RESETTABLE),
     TOPIC_TYPE("topic_type", FLAG_CRITICAL),
-    GEO_MODE("geo_mode", FLAG_CRITICAL);
+    GEO_MODE("geo_mode", FLAG_CRITICAL),
+    FRESH_UPLOAD_INTERVAL("fresh_upload_interval", FLAG_UPDATABLE),
+    CONSUMER_OFFSET_UPLOAD_INTERVAL("consumer_offset_upload_interval", FLAG_UPDATABLE),
+    POSITIONS_PUBLISH_INTERVAL("positions_publish_interval", FLAG_UPDATABLE),
+    TOMBSTONE_GRACE("tombstone_grace", FLAG_UPDATABLE),
+    POSITIONS_RESUME_TIMEOUT("positions_resume_timeout", FLAG_UPDATABLE),
+    LONG_TERM_REWRITE_MAX_INTERVAL("long_term_rewrite_max_interval", FLAG_UPDATABLE);
 
     private final String value;
     private final int flags;

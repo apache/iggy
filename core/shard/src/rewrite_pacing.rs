@@ -160,6 +160,9 @@ pub enum RewriteResult {
 #[derive(Debug, Clone, Copy)]
 struct Pace {
     interval_micros: u64,
+    /// The longest wait that the partition's topic sets for itself, `None`
+    /// for the shard's.
+    max_interval_micros: Option<u64>,
     /// When the next pass is due, in the caller's microseconds. `None`
     /// while a rewrite runs: its result sets it.
     due_at: Option<u64>,
@@ -294,8 +297,9 @@ impl RewritePacing {
     /// segment's command committed. The wait set here then only covers a
     /// command that got lost.
     pub fn settle(&mut self, key: RewriteKey, result: RewriteResult, now: u64) {
-        let max = self.max_interval_micros;
+        let shard_max = self.max_interval_micros;
         let pace = self.pace(key);
+        let max = pace.max_interval_micros.unwrap_or(shard_max);
         pace.settled_at = now;
         pace.failed = result == RewriteResult::Unchanged;
         let wait = match result {
@@ -367,6 +371,15 @@ impl RewritePacing {
     #[must_use]
     pub const fn max_interval(&self) -> Duration {
         Duration::from_micros(self.max_interval_micros)
+    }
+
+    /// Set the longest wait of `key` alone, as the topic of the partition
+    /// sets it, or `None` to follow [`Self::set_max_interval`]. A wait below
+    /// [`REWRITE_INTERVAL_MIN`] counts as it. The partition keeps the wait it
+    /// has until its next pass settles.
+    pub fn set_ceiling(&mut self, key: RewriteKey, ceiling: Option<Duration>) {
+        self.pace(key).max_interval_micros =
+            ceiling.map(|ceiling| micros(ceiling).max(micros(REWRITE_INTERVAL_MIN)));
     }
 
     /// Set the backlog past which the sends to a partition are delayed.
@@ -445,6 +458,7 @@ impl RewritePacing {
     fn pace(&mut self, key: RewriteKey) -> &mut Pace {
         self.partitions.entry(key).or_insert_with(|| Pace {
             interval_micros: micros(REWRITE_INTERVAL_START),
+            max_interval_micros: None,
             due_at: None,
             lag: 0,
             awaits_commit: false,
@@ -659,6 +673,34 @@ mod tests {
             pacing.settle(key(), stored(CAP), 0);
         }
         assert_eq!(pacing.interval(&key()), Some(REWRITE_INTERVAL_MIN));
+    }
+
+    #[test]
+    fn given_partitions_with_their_own_ceilings_when_quiet_should_wait_each_its_own() {
+        let partition = |id: usize| (IggyNamespace::new(1, 1, id), 7);
+        let (quick, slow, unset) = (partition(0), partition(1), partition(2));
+        let mut pacing = RewritePacing::default();
+        pacing.set_ceiling(quick, Some(Duration::from_secs(2)));
+        pacing.set_ceiling(slow, Some(Duration::from_secs(30)));
+
+        for key in [quick, slow, unset] {
+            pacing.settle(key, stored(1), 0);
+            for _ in 0..8 {
+                pacing.settle(key, RewriteResult::Idle, 0);
+            }
+        }
+
+        assert_eq!(pacing.interval(&quick), Some(Duration::from_secs(2)));
+        assert_eq!(pacing.interval(&slow), Some(Duration::from_secs(30)));
+        assert_eq!(pacing.interval(&unset), Some(REWRITE_INTERVAL_MAX));
+        assert_eq!(pacing.take_due(1_999_999), []);
+        assert_eq!(pacing.take_due(2_000_000), [quick]);
+        assert_eq!(pacing.take_due(29_999_999), [unset]);
+        assert_eq!(pacing.take_due(30_000_000), [slow]);
+        // Below the floor, a ceiling counts as the floor.
+        pacing.set_ceiling(quick, Some(Duration::from_millis(10)));
+        pacing.settle(quick, RewriteResult::Idle, 0);
+        assert_eq!(pacing.interval(&quick), Some(REWRITE_INTERVAL_MIN));
     }
 
     #[test]

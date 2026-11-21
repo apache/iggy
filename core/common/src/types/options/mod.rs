@@ -79,6 +79,7 @@ pub use topic_type::TopicType;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
+use std::time::Duration;
 
 use bytes::Bytes;
 use iggy_binary_protocol::requests::system::{MAX_RESET_KEYS, WireResetKeys};
@@ -91,7 +92,7 @@ use crate::http::options::{OptionInputValue, OptionsUpdate, RESET_FIELD};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::utils::stream_key::{StreamEncryptionKey, WrapSet};
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 
 /// A single resolved option entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -365,6 +366,26 @@ pub mod topic_option_keys {
     /// `geo` or `geo_tiered`, as a `String`, create-only and only on a geo
     /// topic. See [`super::GeoMode`].
     pub const GEO_MODE: &str = "geo_mode";
+    /// The longest time a send to a geo topic waits for its upload to start:
+    /// `Uint64` micros or a humantime string, at most
+    /// [`super::FRESH_UPLOAD_INTERVAL_MAX`]. Overrides `[tiered_storage]
+    /// fresh_upload_interval`. This and the five durations below are only
+    /// on a geo topic, where an update can change them but not reset them.
+    pub const FRESH_UPLOAD_INTERVAL: &str = "fresh_upload_interval";
+    /// The shortest time between two uploads of the positions that a geo
+    /// topic's own offset stores wait for, at most
+    /// [`super::CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX`], zero for none.
+    pub const CONSUMER_OFFSET_UPLOAD_INTERVAL: &str = "consumer_offset_upload_interval";
+    /// How often a node uploads a geo topic's changed positions. Not zero.
+    pub const POSITIONS_PUBLISH_INTERVAL: &str = "positions_publish_interval";
+    /// How long a deleted geo topic's tombstone and objects stay. Not zero.
+    pub const TOMBSTONE_GRACE: &str = "tombstone_grace";
+    /// How long a geo topic's group polls wait for the peers' positions after
+    /// a node starts.
+    pub const POSITIONS_RESUME_TIMEOUT: &str = "positions_resume_timeout";
+    /// The longest wait between two long-term rewrites of a geo topic's
+    /// partition, at least [`super::LONG_TERM_REWRITE_MAX_INTERVAL_MIN`].
+    pub const LONG_TERM_REWRITE_MAX_INTERVAL: &str = "long_term_rewrite_max_interval";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -400,6 +421,22 @@ pub const DEFAULT_LOCAL_RETENTION_SIZE: u64 = u64::MAX;
 /// Ten minutes, in microseconds. Every segment costs uploads, a floor command
 /// and an eviction once tiered, so this caps one partition at 144 a day.
 pub const MIN_SEGMENT_MAX_AGE: u64 = 10 * 60 * 1_000_000;
+
+/// The longest `fresh_upload_interval`, of the server and of a geo topic. A
+/// producer waits out the interval before its messages are stored, so a
+/// longer one would only answer late.
+pub const FRESH_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(10);
+
+/// The longest `consumer_offset_upload_interval`, of the server and of a geo
+/// topic. A store of a busy log waits up to the interval before its answer, so
+/// a longer one only answers late.
+pub const CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(1);
+
+/// The shortest `long_term_rewrite_max_interval`, of the server and of a geo
+/// topic. It is the shortest wait between two rewrites of a partition, as its
+/// manifest is stored at most once a second and a rewrite more often publishes
+/// nothing sooner.
+pub const LONG_TERM_REWRITE_MAX_INTERVAL_MIN: Duration = Duration::from_secs(1);
 
 /// Largest partition group consensus supports.
 pub const MAX_REPLICATION_FACTOR: u32 = 32;
@@ -550,24 +587,28 @@ pub fn admit_tiered_storage(
 
 /// Refuse a create that gives a topic a setting its type cannot have.
 ///
-/// Only a geo topic has a mode. A geo topic moves its messages to the object
-/// store on its own write path, so it cannot also tier its local segments,
-/// and it keeps the partition count it was created with.
+/// Only a geo topic has a mode and the durations of [`GeoTopicDurations`]. A
+/// geo topic moves its messages to the object store on its own write path, so
+/// it cannot also tier its local segments, and it keeps the partition count it
+/// was created with.
 ///
 /// `explicit` holds the keys the request sets. The rules read the request
 /// alone, so the edge and the metadata primary give the same verdict.
 ///
 /// # Errors
 ///
-/// `InvalidOptionValue` naming `geo_mode` when `explicit` sets a mode and
-/// does not make the topic geo. For a geo topic, `InvalidOptionValue` naming
+/// `InvalidOptionValue` naming `geo_mode`, or the first duration it sets,
+/// when `explicit` sets one and does not make the topic geo. For a geo topic, `InvalidOptionValue` naming
 /// `tiered_storage` when `explicit` turns it on, and naming
 /// `partition_resize_policy` when `explicit` sets a policy other than
 /// `fixed`.
 pub fn validate_geo_topic(explicit: &ResourceOptions) -> Result<(), IggyError> {
     let parsed = TopicCreateOptions::from_resource_options(explicit);
     let refused = if !parsed.is_geo() {
-        parsed.geo_mode.map(|_| topic_option_keys::GEO_MODE)
+        parsed
+            .geo_mode
+            .map(|_| topic_option_keys::GEO_MODE)
+            .or_else(|| parsed.geo_durations.keys().next().map(<&str>::from))
     } else if parsed.tiered_storage == Some(true) {
         Some(topic_option_keys::TIERED_STORAGE)
     } else if parsed
@@ -885,6 +926,9 @@ pub struct TopicUpdateOptions {
     /// `None` keeps the topic's current local retention size. `ServerDefault`
     /// changes nothing, use `reset` to return to the default.
     pub local_retention_size: Option<MaxTopicSize>,
+    /// The durations to change on a geo topic. A `None` keeps the stored
+    /// value. None of them can be reset.
+    pub geo_durations: GeoTopicDurations,
     /// Keys to reset to their defaults: `message_expiry`, `max_topic_size`,
     /// `local_retention_age` or `local_retention_size`.
     pub reset: BTreeSet<OptionKey>,
@@ -921,6 +965,132 @@ pub struct UserUpdateOptions {
     pub raw: BTreeMap<String, String>,
 }
 
+/// The durations of a geo topic that override the server settings of the same
+/// name on each node. Each is `None` when the topic sets none, and the node
+/// then applies its own setting. They pace work that each node does for the
+/// topic, so they never reach other datacenters, and a shadow topic has none.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GeoTopicDurations {
+    /// The longest time a send waits for the upload of its fresh object to
+    /// start. One object carries the sends of every partition a shard leads,
+    /// so a send also goes with an earlier upload.
+    pub fresh_upload_interval: Option<IggyDuration>,
+    /// The shortest time between two uploads of the positions that the
+    /// offsets consumer groups store themselves wait for. Zero answers such a
+    /// store at its local commit.
+    pub consumer_offset_upload_interval: Option<IggyDuration>,
+    /// How often a node uploads the changed positions of the topic's groups.
+    pub positions_publish_interval: Option<IggyDuration>,
+    /// How long the tombstone and the objects of the deleted topic stay in
+    /// the object store.
+    pub tombstone_grace: Option<IggyDuration>,
+    /// How long, after a node starts, the group polls of the topic's
+    /// partitions wait for the positions of the geo peers.
+    pub positions_resume_timeout: Option<IggyDuration>,
+    /// The longest wait between two long-term rewrites of a partition.
+    pub long_term_rewrite_max_interval: Option<IggyDuration>,
+}
+
+impl GeoTopicDurations {
+    /// The option key of each duration, in catalog order.
+    pub const KEYS: [OptionKey; 6] = [
+        OptionKey::FreshUploadInterval,
+        OptionKey::ConsumerOffsetUploadInterval,
+        OptionKey::PositionsPublishInterval,
+        OptionKey::TombstoneGrace,
+        OptionKey::PositionsResumeTimeout,
+        OptionKey::LongTermRewriteMaxInterval,
+    ];
+
+    /// The duration that `key` names, `None` when it is unset or `key` is no
+    /// duration of a geo topic.
+    #[must_use]
+    pub const fn get(&self, key: OptionKey) -> Option<IggyDuration> {
+        match key {
+            OptionKey::FreshUploadInterval => self.fresh_upload_interval,
+            OptionKey::ConsumerOffsetUploadInterval => self.consumer_offset_upload_interval,
+            OptionKey::PositionsPublishInterval => self.positions_publish_interval,
+            OptionKey::TombstoneGrace => self.tombstone_grace,
+            OptionKey::PositionsResumeTimeout => self.positions_resume_timeout,
+            OptionKey::LongTermRewriteMaxInterval => self.long_term_rewrite_max_interval,
+            _ => None,
+        }
+    }
+
+    /// Set the duration that `key` names. Any other key changes nothing.
+    pub const fn set(&mut self, key: OptionKey, duration: IggyDuration) {
+        let slot = match key {
+            OptionKey::FreshUploadInterval => &mut self.fresh_upload_interval,
+            OptionKey::ConsumerOffsetUploadInterval => &mut self.consumer_offset_upload_interval,
+            OptionKey::PositionsPublishInterval => &mut self.positions_publish_interval,
+            OptionKey::TombstoneGrace => &mut self.tombstone_grace,
+            OptionKey::PositionsResumeTimeout => &mut self.positions_resume_timeout,
+            OptionKey::LongTermRewriteMaxInterval => &mut self.long_term_rewrite_max_interval,
+            _ => return,
+        };
+        *slot = Some(duration);
+    }
+
+    /// The keys of the durations that are set, in catalog order.
+    pub fn keys(&self) -> impl Iterator<Item = OptionKey> + '_ {
+        Self::KEYS
+            .into_iter()
+            .filter(|key| self.get(*key).is_some())
+    }
+
+    /// Each duration that `self` sets, the others from `defaults`.
+    #[must_use]
+    pub const fn or(self, defaults: Self) -> Self {
+        Self {
+            fresh_upload_interval: match self.fresh_upload_interval {
+                Some(duration) => Some(duration),
+                None => defaults.fresh_upload_interval,
+            },
+            consumer_offset_upload_interval: match self.consumer_offset_upload_interval {
+                Some(duration) => Some(duration),
+                None => defaults.consumer_offset_upload_interval,
+            },
+            positions_publish_interval: match self.positions_publish_interval {
+                Some(duration) => Some(duration),
+                None => defaults.positions_publish_interval,
+            },
+            tombstone_grace: match self.tombstone_grace {
+                Some(duration) => Some(duration),
+                None => defaults.tombstone_grace,
+            },
+            positions_resume_timeout: match self.positions_resume_timeout {
+                Some(duration) => Some(duration),
+                None => defaults.positions_resume_timeout,
+            },
+            long_term_rewrite_max_interval: match self.long_term_rewrite_max_interval {
+                Some(duration) => Some(duration),
+                None => defaults.long_term_rewrite_max_interval,
+            },
+        }
+    }
+
+    fn insert_into(&self, options: &mut ResourceOptions) -> Result<(), IggyError> {
+        for key in Self::KEYS {
+            if let Some(duration) = self.get(key) {
+                options.insert(
+                    HeaderKey::from(key),
+                    OptionValue::explicit(duration.encode()?),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+impl OptionKey {
+    /// Whether the key is one of the [`GeoTopicDurations`], the only options
+    /// an update can change on a geo topic.
+    #[must_use]
+    pub fn is_geo_duration(self) -> bool {
+        GeoTopicDurations::KEYS.contains(&self)
+    }
+}
+
 /// How a stream's messages are stored, read from its committed options.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEncryption {
@@ -950,6 +1120,8 @@ pub struct TopicResolvedOptions {
     pub topic_type: TopicType,
     /// `Some` exactly when `topic_type` is geo.
     pub geo_mode: Option<GeoMode>,
+    /// All `None` unless `topic_type` is geo.
+    pub geo_durations: GeoTopicDurations,
     /// The partition-facing knobs, with the shard-default semantics of
     /// [`TopicRuntimeOptions`].
     pub runtime: TopicRuntimeOptions,
@@ -1137,6 +1309,7 @@ impl TopicUpdateOptions {
                 OptionValue::explicit(local_retention_size.encode()?),
             );
         }
+        self.geo_durations.insert_into(&mut options)?;
         Ok(options)
     }
 }
@@ -1270,6 +1443,11 @@ impl From<&ResourceOptions> for TopicResolvedOptions {
             geo_mode: match topic_type {
                 TopicType::Geo => Some(parsed.geo_mode.unwrap_or_default()),
                 TopicType::Normal => None,
+            },
+            // Admission refuses them on a normal topic, as a mode.
+            geo_durations: match topic_type {
+                TopicType::Geo => parsed.geo_durations,
+                TopicType::Normal => GeoTopicDurations::default(),
             },
             runtime: TopicRuntimeOptions::from(&parsed),
         }
@@ -1523,6 +1701,9 @@ pub struct TopicCreateOptions {
     /// [`GeoMode::Geo`] on a geo topic, and a normal topic refuses any mode.
     /// The server refuses [`GeoMode::GeoTiered`] for now.
     pub geo_mode: Option<GeoMode>,
+    /// The durations of a geo topic that override the server settings of
+    /// each node. A normal topic refuses them.
+    pub geo_durations: GeoTopicDurations,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
     /// server catalog after this build shipped. Outbound only: a typed field
@@ -1666,6 +1847,15 @@ impl TopicCreateOptions {
             }
             OptionKey::TopicType => self.topic_type = Some(TopicType::decode(option, entry)?),
             OptionKey::GeoMode => self.geo_mode = Some(GeoMode::decode(option, entry)?),
+            OptionKey::FreshUploadInterval
+            | OptionKey::ConsumerOffsetUploadInterval
+            | OptionKey::PositionsPublishInterval
+            | OptionKey::TombstoneGrace
+            | OptionKey::PositionsResumeTimeout
+            | OptionKey::LongTermRewriteMaxInterval => {
+                self.geo_durations
+                    .set(option, IggyDuration::decode(option, entry)?);
+            }
             OptionKey::Name
             | OptionKey::Username
             | OptionKey::Status
@@ -1717,6 +1907,7 @@ impl TopicCreateOptions {
             local_retention_size: self.local_retention_size.or(defaults.local_retention_size),
             topic_type: self.topic_type.or(defaults.topic_type),
             geo_mode: self.geo_mode.or(defaults.geo_mode),
+            geo_durations: self.geo_durations.or(defaults.geo_durations),
             raw: BTreeMap::new(),
         }
     }
@@ -1868,6 +2059,7 @@ impl TopicCreateOptions {
                 OptionValue::explicit(geo_mode.encode()?),
             );
         }
+        self.geo_durations.insert_into(&mut options)?;
         Ok(options)
     }
 
@@ -2057,13 +2249,14 @@ mod tests {
             let key = HeaderKey::from(descriptor.key);
             // A server setting decides the replication factor's default, and
             // only a geo topic has a mode, so the catalog derives neither and
-            // admission stores the resolved value.
+            // admission stores the resolved value. A geo topic's durations
+            // stay unset, for each node to apply its own setting.
             let Some(default) = descriptor.default_value().expect("default encodes") else {
                 assert!(
                     matches!(
                         descriptor.key,
                         OptionKey::ReplicationFactor | OptionKey::GeoMode
-                    ),
+                    ) || descriptor.key.is_geo_duration(),
                     "{} has no default",
                     descriptor.key
                 );
@@ -2296,6 +2489,14 @@ mod tests {
             local_retention_size: Some(MaxTopicSize::from(1_000_000_000u64)),
             topic_type: Some(TopicType::Geo),
             geo_mode: Some(GeoMode::GeoTiered),
+            geo_durations: GeoTopicDurations {
+                fresh_upload_interval: Some(IggyDuration::from(0u64)),
+                consumer_offset_upload_interval: Some(IggyDuration::from(20_000u64)),
+                positions_publish_interval: Some(IggyDuration::from(2_000_000u64)),
+                tombstone_grace: Some(IggyDuration::from(3_600_000_000u64)),
+                positions_resume_timeout: Some(IggyDuration::from(0u64)),
+                long_term_rewrite_max_interval: Some(IggyDuration::from(30_000_000u64)),
+            },
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,
             partition_resize_policy: Some(PartitionResizePolicy::Fixed),

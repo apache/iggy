@@ -16,7 +16,7 @@
 // under the License.
 
 use iggy::prelude::{
-    IggyByteSize, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
+    IggyByteSize, IggyDuration, IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize,
     Partition as RustPartition, Topic as RustTopic, TopicDetails as RustTopicDetails,
 };
 
@@ -258,6 +258,105 @@ impl Topic {
         self.inner.resolved_options().geo_mode.map(GeoMode::from)
     }
 
+    /// Longest time a send to the geo topic waits for its upload to start, or
+    /// `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn fresh_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .fresh_upload_interval,
+        )
+    }
+
+    /// Shortest time between two uploads of the positions the geo topic's
+    /// stored offsets wait for, or `None` when the topic leaves it to each
+    /// node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn consumer_offset_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .consumer_offset_upload_interval,
+        )
+    }
+
+    /// How often a node uploads the geo topic's changed positions, or `None`
+    /// when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_publish_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_publish_interval,
+        )
+    }
+
+    /// How long the tombstone and the objects of the deleted geo topic stay,
+    /// or `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn tombstone_grace<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner.resolved_options().geo_durations.tombstone_grace,
+        )
+    }
+
+    /// How long the geo topic's group polls wait for the peers' positions
+    /// after a node starts, or `None` when the topic leaves it to each node's
+    /// server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_resume_timeout<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_resume_timeout,
+        )
+    }
+
+    /// Longest wait between two long-term rewrites of a partition of the geo
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn long_term_rewrite_max_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .long_term_rewrite_max_interval,
+        )
+    }
+
     /// Options the creating client set explicitly.
     ///
     /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
@@ -365,6 +464,105 @@ impl TopicDetails {
     #[getter]
     pub fn geo_mode(&self) -> Option<GeoMode> {
         self.inner.resolved_options().geo_mode.map(GeoMode::from)
+    }
+
+    /// Longest time a send to the geo topic waits for its upload to start, or
+    /// `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn fresh_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .fresh_upload_interval,
+        )
+    }
+
+    /// Shortest time between two uploads of the positions the geo topic's
+    /// stored offsets wait for, or `None` when the topic leaves it to each
+    /// node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn consumer_offset_upload_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .consumer_offset_upload_interval,
+        )
+    }
+
+    /// How often a node uploads the geo topic's changed positions, or `None`
+    /// when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_publish_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_publish_interval,
+        )
+    }
+
+    /// How long the tombstone and the objects of the deleted geo topic stay,
+    /// or `None` when the topic leaves it to each node's server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn tombstone_grace<'a>(&self, py: Python<'a>) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner.resolved_options().geo_durations.tombstone_grace,
+        )
+    }
+
+    /// How long the geo topic's group polls wait for the peers' positions
+    /// after a node starts, or `None` when the topic leaves it to each node's
+    /// server setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn positions_resume_timeout<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .positions_resume_timeout,
+        )
+    }
+
+    /// Longest wait between two long-term rewrites of a partition of the geo
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting.
+    #[gen_stub(override_return_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
+    #[getter]
+    pub fn long_term_rewrite_max_interval<'a>(
+        &self,
+        py: Python<'a>,
+    ) -> PyResult<Option<Bound<'a, PyDelta>>> {
+        geo_duration(
+            py,
+            self.inner
+                .resolved_options()
+                .geo_durations
+                .long_term_rewrite_max_interval,
+        )
     }
 
     /// Options the creating client set explicitly.
@@ -477,6 +675,16 @@ impl Partition {
     }
 }
 
+/// A duration of a geo topic as a `timedelta`, `None` when the topic sets none.
+fn geo_duration(
+    py: Python<'_>,
+    duration: Option<IggyDuration>,
+) -> PyResult<Option<Bound<'_, PyDelta>>> {
+    duration
+        .map(|duration| iggy_duration_to_py_delta(py, duration))
+        .transpose()
+}
+
 /// A `Vec<u8>` return would convert to `bytes`, so node ids are built as a list of `int`.
 fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyList>> {
     PyList::new(py, node_ids)
@@ -486,9 +694,11 @@ fn node_id_list<'a>(py: Python<'a>, node_ids: &[u8]) -> PyResult<Bound<'a, PyLis
 mod tests {
     use super::*;
     use iggy::prelude::{
-        GeoMode as RustGeoMode, HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue,
-        PartitionContext as RustPartitionContext, ResourceOptions, TopicType as RustTopicType,
+        GeoMode as RustGeoMode, GeoTopicDurations, HeaderKey, HeaderValue, IggyTimestamp,
+        OptionKey, OptionValue, PartitionContext as RustPartitionContext, ResourceOptions,
+        TopicType as RustTopicType,
     };
+    use std::time::Duration;
 
     #[test]
     fn given_geo_topic_options_when_reading_should_expose_topic_type_and_geo_mode() {
@@ -541,6 +751,65 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn given_geo_topic_durations_when_reading_should_return_set_ones_and_none_for_the_rest() {
+        Python::initialize();
+        let set: [(OptionKey, u64); 2] = [
+            (OptionKey::FreshUploadInterval, 0),
+            (OptionKey::TombstoneGrace, 3_600_000_000),
+        ];
+        let mut geo = topic_options(&[(OptionKey::TopicType, RustTopicType::Geo.as_ref())]);
+        for (key, micros) in set {
+            geo.insert(
+                HeaderKey::from(key),
+                OptionValue::explicit(HeaderValue::from(micros)),
+            );
+        }
+
+        for (options, expected) in [(geo, set.as_slice()), (ResourceOptions::new(), &[])] {
+            let topic = Topic::from(RustTopic {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 1,
+                options: options.clone(),
+            });
+            let details = TopicDetails::from(RustTopicDetails {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 0,
+                partitions: Vec::new(),
+                options,
+            });
+
+            Python::attach(|py| {
+                let readers = [
+                    Bound::new(py, topic).expect("topic wraps").into_any(),
+                    Bound::new(py, details).expect("details wrap").into_any(),
+                ];
+                for key in GeoTopicDurations::KEYS {
+                    let wanted = expected
+                        .iter()
+                        .find(|(set_key, _)| *set_key == key)
+                        .map(|(_, micros)| Duration::from_micros(*micros));
+                    let name: &str = key.into();
+                    for reader in &readers {
+                        let read = reader
+                            .getattr(name)
+                            .and_then(|value| value.extract::<Option<Duration>>())
+                            .expect("duration reads");
+                        assert_eq!(read, wanted, "{name}");
+                    }
+                }
+            });
+        }
     }
 
     #[test]

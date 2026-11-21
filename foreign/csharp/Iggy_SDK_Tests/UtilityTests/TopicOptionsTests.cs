@@ -39,10 +39,16 @@ public sealed class TopicOptionsTests
             LocalRetentionAge = TimeSpan.FromHours(6),
             LocalRetentionSize = 536870912,
             TopicType = TopicType.Geo,
-            GeoMode = GeoMode.GeoTiered
+            GeoMode = GeoMode.GeoTiered,
+            FreshUploadInterval = TimeSpan.FromMilliseconds(50),
+            ConsumerOffsetUploadInterval = TimeSpan.FromMilliseconds(20),
+            PositionsPublishInterval = TimeSpan.FromSeconds(2),
+            TombstoneGrace = TimeSpan.FromHours(1),
+            PositionsResumeTimeout = TimeSpan.FromSeconds(30),
+            LongTermRewriteMaxInterval = TimeSpan.FromSeconds(20)
         }.ToDictionary();
 
-        Assert.Equal(13, options.Count);
+        Assert.Equal(19, options.Count);
 
         Assert.Equal(HeaderKind.Uint64, options["segment_size"].Kind);
         Assert.Equal(134217728UL, options["segment_size"].ToUInt64());
@@ -79,6 +85,50 @@ public sealed class TopicOptionsTests
 
         Assert.Equal(HeaderKind.String, options["geo_mode"].Kind);
         Assert.Equal("geo_tiered", options["geo_mode"].ToString());
+
+        var durations = new Dictionary<string, ulong>
+        {
+            ["fresh_upload_interval"] = 50_000,
+            ["consumer_offset_upload_interval"] = 20_000,
+            ["positions_publish_interval"] = 2_000_000,
+            ["tombstone_grace"] = 3_600_000_000,
+            ["positions_resume_timeout"] = 30_000_000,
+            ["long_term_rewrite_max_interval"] = 20_000_000
+        };
+        foreach (var (key, micros) in durations)
+        {
+            Assert.Equal(HeaderKind.Uint64, options[key].Kind);
+            Assert.Equal(micros, options[key].ToUInt64());
+        }
+    }
+
+    [Fact]
+    public void ToDictionary_SendsAZeroGeoDurationAndLeavesAnUnsetOneOut()
+    {
+        var options = new TopicOptions
+        {
+            TopicType = TopicType.Geo,
+            FreshUploadInterval = TimeSpan.Zero,
+            PositionsResumeTimeout = TimeSpan.Zero,
+            MessageExpiry = TimeSpan.Zero
+        }.ToDictionary();
+
+        // A zero expiry keeps the server default, while a zero duration of a geo topic is a value.
+        Assert.Equal(
+            ["consumer_offset_durability", "durability", "fresh_upload_interval", "positions_resume_timeout", "topic_type"],
+            options.Keys.Order(StringComparer.Ordinal));
+        Assert.Equal(HeaderKind.Uint64, options["fresh_upload_interval"].Kind);
+        Assert.Equal(0UL, options["fresh_upload_interval"].ToUInt64());
+        Assert.Equal(0UL, options["positions_resume_timeout"].ToUInt64());
+    }
+
+    [Fact]
+    public void ToDictionary_RefusesANegativeGeoDuration()
+    {
+        var refused = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new TopicOptions { PositionsResumeTimeout = TimeSpan.FromMilliseconds(-1) }.ToDictionary());
+
+        Assert.Equal(nameof(TopicOptions.PositionsResumeTimeout), refused.ParamName);
     }
 
     [Theory]

@@ -543,6 +543,13 @@ await client.UpdateUserAsync(Identifier.String("alice"), new UserUpdate { Status
 
 Settings fixed at creation, such as compression, cannot be updated. `DescribeOptionsAsync(OptionsScope.Topic)` lists every key the server knows with its kind and whether it can be updated or reset. For a key newer than this SDK, set it through `Options` and reset it through `RawReset`, and the server decides whether the change is allowed.
 
+A geo topic also takes six durations: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`,
+`PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and
+`LongTermRewriteMaxInterval`. Each one overrides the server setting of the same name on every node.
+Zero is a value for them, so the SDK sends it. On a geo topic, an update can set them, and they are
+the only options that it can change there. An update cannot reset them. The server refuses them on a
+normal topic. When the topic does not set a duration, its property on `TopicResponse` is null.
+
 Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
 
 ## Publishing Messages

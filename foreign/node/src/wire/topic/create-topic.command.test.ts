@@ -151,6 +151,23 @@ describe('CreateTopic', () => {
       assert.equal('geo_mode' in unset, false);
     });
 
+    it('serialize the geo topic durations as uint64 options, sending 0n and omitting unset ones', () => {
+      const t = {
+        ...t1,
+        topicType: TopicType.Geo,
+        consumerOffsetUploadInterval: 0n,
+        tombstoneGrace: 3_600_000_000n
+      };
+      const options = deserializeOptions(CREATE_TOPIC.serialize(t), fixedSize + t.name.length);
+      assert.equal(options.consumer_offset_upload_interval, 0n);
+      assert.equal(options.tombstone_grace, 3_600_000_000n);
+      for (const key of [
+        'fresh_upload_interval', 'positions_publish_interval', 'positions_resume_timeout',
+        'long_term_rewrite_max_interval'
+      ])
+        assert.equal(key in options, false, key);
+    });
+
     it('throw on an unknown topicType or geoMode', () => {
       assert.throws(
         () => CREATE_TOPIC.serialize({ ...t1, topicType: 'tiered' as TopicType }),

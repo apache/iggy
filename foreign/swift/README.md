@@ -154,6 +154,9 @@ try await client.updateUser("alice", options: UserUpdateOptions(status: .inactiv
 
 Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. An update can turn `tiered_storage` on, never off. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
 
+A geo topic takes six durations of its own: `freshUploadInterval`, `consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`, `positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each travels as whole microseconds and overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent.
+An update can set them, and they are the only keys it may change on a geo topic, but it cannot reset them. A normal topic refuses them. `Topic` and `TopicDetails` read them back, nil when unset.
+
 Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
 
 Keys this SDK has no typed member for go in `raw`, values as strings the server parses, and reset names in `rawReset`. The server alone decides on a patch that carries either, since it may know keys this SDK does not:

@@ -1091,6 +1091,7 @@ mod tests {
             created_at: 1,
             published_at,
             state: TopicState::Live,
+            tombstone_grace: 0,
         }
     }
 

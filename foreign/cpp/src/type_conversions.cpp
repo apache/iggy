@@ -53,6 +53,30 @@ std::optional<GeoMode> GeoModeFromFfi(bool has_geo_mode, ffi::GeoMode geo_mode) 
     throw IggyException("Unknown geo mode");
 }
 
+std::optional<std::chrono::microseconds> GeoTopicDurationFromFfi(bool has_value, std::uint64_t micros) {
+    if (!has_value) {
+        return std::nullopt;
+    }
+    // The server takes any u64 for some of these durations. A value past the
+    // signed microseconds range, over 292,000 years, reads as the longest.
+    constexpr auto kLongest = static_cast<std::uint64_t>(std::chrono::microseconds::max().count());
+    return std::chrono::microseconds(
+        static_cast<std::chrono::microseconds::rep>(micros > kLongest ? kLongest : micros));
+}
+
+detail::GeoTopicDurations GeoTopicDurationsFromFfi(const ffi::GeoTopicDurations &durations) {
+    return detail::GeoTopicDurations{
+        GeoTopicDurationFromFfi(durations.has_fresh_upload_interval, durations.fresh_upload_interval_micros),
+        GeoTopicDurationFromFfi(durations.has_consumer_offset_upload_interval,
+                                durations.consumer_offset_upload_interval_micros),
+        GeoTopicDurationFromFfi(durations.has_positions_publish_interval, durations.positions_publish_interval_micros),
+        GeoTopicDurationFromFfi(durations.has_tombstone_grace, durations.tombstone_grace_micros),
+        GeoTopicDurationFromFfi(durations.has_positions_resume_timeout, durations.positions_resume_timeout_micros),
+        GeoTopicDurationFromFfi(durations.has_long_term_rewrite_max_interval,
+                                durations.long_term_rewrite_max_interval_micros),
+    };
+}
+
 std::optional<std::string> TextFromFfi(bool has_text, const rust::String &text) {
     if (!has_text) {
         return std::nullopt;
@@ -302,12 +326,12 @@ ResourceOptions ResourceOptions::FromFfi(rust::Vec<ffi::HeaderEntry> explicit_en
 }
 
 Topic Topic::FromFfi(ffi::Topic topic) {
-    return Topic(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
-                 topic.message_expiry,
-                 std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
-                 topic.max_topic_size, TopicTypeFromFfi(topic.topic_type),
-                 GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode), topic.messages_count, topic.partitions_count,
-                 ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+    return Topic(
+        topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
+        topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
+        topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
+        GeoTopicDurationsFromFfi(topic.geo_durations), topic.messages_count, topic.partitions_count,
+        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 PartitionContext PartitionContext::FromFfi(ffi::PartitionContext context) {
@@ -332,8 +356,8 @@ TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {
         topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
         topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
         topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
-        topic.messages_count, topic.partitions_count, std::move(partitions),
-        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+        GeoTopicDurationsFromFfi(topic.geo_durations), topic.messages_count, topic.partitions_count,
+        std::move(partitions), ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {

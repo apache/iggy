@@ -52,15 +52,8 @@ pub const MAX_PEERS: usize = 16;
 /// so a short origin leaves room for the name of the stream.
 pub const MAX_ORIGIN_LEN: usize = 32;
 
-/// The longest `consumer_offset_upload_interval`. A store of a busy log
-/// waits up to the interval before its answer, so a longer one only answers
-/// late.
-pub const CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(1);
-
-/// The shortest `long_term_rewrite_max_interval`. It is the shortest wait
-/// between two rewrites of a partition, as its manifest is stored at most
-/// once a second and a rewrite more often publishes nothing sooner.
-pub const LONG_TERM_REWRITE_MAX_INTERVAL_MIN: Duration = Duration::from_secs(1);
+/// The bounds of the settings that a geo topic can also set for itself.
+pub use iggy_common::{CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX, LONG_TERM_REWRITE_MAX_INTERVAL_MIN};
 
 #[serde_as]
 #[derive(Deserialize, Serialize, Clone, ConfigEnv)]

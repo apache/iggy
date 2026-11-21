@@ -22,7 +22,8 @@ use super::*;
 use crate::geo_topics::SWEEP_INTERVAL;
 use iggy_binary_protocol::requests::streams::UpdateStreamResolvedRequest;
 use iggy_common::{
-    CompressionAlgorithm, GeoMode, IggyByteSize, MaxTopicSize, TopicCreateOptions, TopicType,
+    CompressionAlgorithm, GeoMode, GeoTopicDurations, IggyByteSize, MaxTopicSize,
+    TopicCreateOptions, TopicType,
 };
 use iggy_object_store::{
     TopicCompression, TopicGeoMode, TopicKey, TopicObject, TopicRead, TopicState,
@@ -52,6 +53,23 @@ fn seed_geo_topic(
     name: &str,
     assignments: Vec<CreatedPartitionAssignment>,
 ) {
+    seed_geo_topic_with(
+        mux,
+        op,
+        (stream_id, name),
+        assignments,
+        GeoTopicDurations::default(),
+    );
+}
+
+/// [`seed_geo_topic`] of a topic that sets `durations` for itself.
+fn seed_geo_topic_with(
+    mux: &TestMux,
+    op: u64,
+    (stream_id, name): (u32, &str),
+    assignments: Vec<CreatedPartitionAssignment>,
+    durations: GeoTopicDurations,
+) {
     let options = TopicCreateOptions {
         topic_type: Some(TopicType::Geo),
         geo_mode: Some(GeoMode::Geo),
@@ -60,6 +78,7 @@ fn seed_geo_topic(
             MESSAGE_EXPIRY,
         ))),
         max_topic_size: Some(MaxTopicSize::Custom(IggyByteSize::from(MAX_TOPIC_SIZE))),
+        geo_durations: durations,
         ..TopicCreateOptions::default()
     };
     let req = CreateTopicWithAssignmentsRequest {
@@ -152,14 +171,22 @@ fn after(start: IggyTimestamp, wait: Duration) -> IggyTimestamp {
 /// A metadata primary with one geo topic of two partitions and one normal
 /// topic of one, in the stream `orders`.
 fn geo_primary(config: &ServerConfig) -> (Rc<TestShard>, Rc<MemoryTopicObjects>, TopicKey) {
+    geo_primary_with(config, GeoTopicDurations::default())
+}
+
+/// [`geo_primary`] whose geo topic sets `durations` for itself.
+fn geo_primary_with(
+    config: &ServerConfig,
+    durations: GeoTopicDurations,
+) -> (Rc<TestShard>, Rc<MemoryTopicObjects>, TopicKey) {
     let mux = TestMux::default();
     seed_stream(&mux, 1, "orders");
-    seed_geo_topic(
+    seed_geo_topic_with(
         &mux,
         2,
-        0,
-        "payments",
+        (0, "payments"),
         vec![assignment(0, 1), assignment(1, 2)],
+        durations,
     );
     seed_topic(&mux, 3, 0, "normal", vec![assignment(0, 3)]);
     let shard = build_metadata_primary_shard(config, mux);
@@ -204,6 +231,7 @@ async fn given_a_committed_geo_topic_when_the_metadata_primary_reconciles_should
             created_at,
             published_at: now.as_micros(),
             state: TopicState::Live,
+            tombstone_grace: 0,
         }
     );
     // The normal topic has no object.
@@ -286,6 +314,47 @@ async fn given_a_deleted_geo_topic_when_the_sweep_runs_should_keep_its_tombstone
     assert_eq!(read_topic(&objects, key), TopicRead::Missing);
     kept.sort();
     assert_eq!(store.keys(), kept);
+}
+
+/// The topic is no longer in metadata when its tombstone is written, so its
+/// own grace lives in its object.
+#[compio::test]
+async fn given_a_deleted_geo_topic_with_its_own_grace_when_the_sweep_runs_should_delete_it_once_that_grace_ends()
+ {
+    const OWN_GRACE: Duration = Duration::from_mins(10);
+    let tmp = TempDir::new().unwrap();
+    let config = geo_config(&tmp);
+    let (shard, objects, key) = geo_primary_with(
+        &config,
+        GeoTopicDurations {
+            tombstone_grace: Some(IggyDuration::new(OWN_GRACE)),
+            ..GeoTopicDurations::default()
+        },
+    );
+    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    reconcile_pass(&ctx).await;
+    let start = IggyTimestamp::now();
+    geo_topics_pass(&ctx, start).await;
+    let own_grace = u64::try_from(OWN_GRACE.as_micros()).unwrap();
+    assert_eq!(stored_object(&objects, key).tombstone_grace, own_grace);
+
+    seed_delete_topic(&shard.plane.metadata().mux_stm, 4, 0, 0);
+    reconcile_pass(&ctx).await;
+    let swept = after(start, SWEEP_INTERVAL);
+    geo_topics_pass(&ctx, swept).await;
+    let tombstone = stored_object(&objects, key);
+    assert!(!tombstone.is_live());
+    assert_eq!(tombstone.tombstone_grace, own_grace);
+
+    geo_topics_pass(
+        &ctx,
+        after(swept, OWN_GRACE.checked_sub(SWEEP_INTERVAL).unwrap()),
+    )
+    .await;
+    assert_eq!(stored_object(&objects, key), tombstone);
+    // Long before the node's grace of an hour.
+    geo_topics_pass(&ctx, after(swept, OWN_GRACE)).await;
+    assert_eq!(read_topic(&objects, key), TopicRead::Missing);
 }
 
 #[compio::test]

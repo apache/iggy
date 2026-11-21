@@ -5755,7 +5755,11 @@ where
                     return;
                 }
                 if self.places_send(request.header()) {
-                    self.offer_fresh_send(request, reply);
+                    let upload_interval = self
+                        .geo_durations(IggyNamespace::from_raw(request.header().group))
+                        .fresh_upload_interval
+                        .map(|interval| interval.get_duration());
+                    self.offer_fresh_send(request, reply, upload_interval);
                     return;
                 }
                 let hold = self.geo_commit_hold(&request);
@@ -5966,6 +5970,23 @@ where
                 .map_or_default(|topic| {
                     iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
                 })
+        })
+    }
+
+    /// The durations that the topic of `namespace` sets for itself. All are
+    /// `None` for a normal topic, a shadow topic and a topic that is gone, so
+    /// the shard applies its own settings there.
+    #[must_use]
+    pub fn geo_durations(&self, namespace: IggyNamespace) -> iggy_common::GeoTopicDurations
+    where
+        M: StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map_or_default(|topic| topic.resolved.geo_durations)
         })
     }
 

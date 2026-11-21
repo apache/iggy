@@ -355,6 +355,8 @@ where
             return;
         };
         let now = self.bus.monotonic_micros();
+        // Read at each pass, so a changed ceiling applies from the next one.
+        let ceiling = self.rewrite_ceiling(namespace);
         let (started, walk) = {
             // The rewrite reads the messages of the batches from the store.
             let partition = self
@@ -373,6 +375,7 @@ where
                 .unpublished_segment()
                 .map_or_else(|| Ok(partition.begin_segment_rewrite()), Err);
             let mut pacing = self.rewrite_pacing.borrow_mut();
+            pacing.set_ceiling(key, ceiling);
             match &started {
                 Ok(Some(RewriteStart::Register(_))) => {
                     pacing.set_lag(key, lag);
@@ -451,6 +454,17 @@ where
                 undelivered.borrow_mut().push(*finished);
             }
         });
+    }
+
+    /// The longest wait between two rewrites that the topic of `namespace`
+    /// sets for itself, `None` to follow the shard's.
+    fn rewrite_ceiling(&self, namespace: IggyNamespace) -> Option<Duration>
+    where
+        M: RestorableMetadataStm,
+    {
+        self.geo_durations(namespace)
+            .long_term_rewrite_max_interval
+            .map(|ceiling| ceiling.get_duration())
     }
 
     #[allow(clippy::future_not_send)]

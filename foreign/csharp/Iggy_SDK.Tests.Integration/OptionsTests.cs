@@ -59,7 +59,13 @@ public class OptionsTests
         "local_retention_age",
         "local_retention_size",
         "topic_type",
-        "geo_mode"
+        "geo_mode",
+        "fresh_upload_interval",
+        "consumer_offset_upload_interval",
+        "positions_publish_interval",
+        "tombstone_grace",
+        "positions_resume_timeout",
+        "long_term_rewrite_max_interval"
     ];
 
     private static readonly string[] NeverReturnedKeys = ["encryption_key", "encryption_key_wrapped", "critical_keys"];
@@ -199,7 +205,13 @@ public class OptionsTests
             LocalRetentionAge = TimeSpan.FromHours(1),
             LocalRetentionSize = 1_000_000_000,
             TopicType = TopicType.Normal,
-            GeoMode = GeoMode.Geo
+            GeoMode = GeoMode.Geo,
+            FreshUploadInterval = TimeSpan.FromMilliseconds(50),
+            ConsumerOffsetUploadInterval = TimeSpan.Zero,
+            PositionsPublishInterval = TimeSpan.FromSeconds(1),
+            TombstoneGrace = TimeSpan.FromHours(1),
+            PositionsResumeTimeout = TimeSpan.Zero,
+            LongTermRewriteMaxInterval = TimeSpan.FromSeconds(10)
         }.ToDictionary().Keys;
 
         typedKeys.ShouldAllBe(key => catalogKeys.Contains(key));
