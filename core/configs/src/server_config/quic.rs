@@ -19,10 +19,9 @@
 
 use super::COMPONENT;
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
 #[serde_as]
@@ -40,10 +39,10 @@ pub struct QuicConfig {
     #[config_env(leaf)]
     pub stream_receive_window: IggyByteSize,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub keep_alive_interval: IggyDuration,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub max_idle_timeout: IggyDuration,
     pub certificate: QuicCertificateConfig,
 }
