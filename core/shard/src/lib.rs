@@ -36,6 +36,7 @@ pub use fresh_sweeps::{
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
+pub mod peers;
 mod poll;
 mod primary_rebalance;
 pub mod rewrite_pacing;
@@ -2173,6 +2174,10 @@ where
     /// When the next rewrite pass over each placing partition here is due.
     rewrite_pacing: RefCell<rewrite_pacing::RewritePacing>,
 
+    /// Late-bound stores of the geo peers, empty on a node without peers.
+    /// See [`Self::set_peer_stores`].
+    peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2544,6 +2549,7 @@ where
             long_term_writer: RefCell::new(None),
             undelivered_segment_rewrites: Rc::default(),
             rewrite_pacing: RefCell::default(),
+            peer_stores: RefCell::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3532,6 +3538,7 @@ where
             long_term_writer: RefCell::new(None),
             undelivered_segment_rewrites: Rc::default(),
             rewrite_pacing: RefCell::default(),
+            peer_stores: RefCell::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),

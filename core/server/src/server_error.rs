@@ -481,6 +481,8 @@ pub enum ServerError {
         #[source]
         source: std::io::Error,
     },
+    #[error("geo peer {origin:?} can never be read: {reason}")]
+    GeoPeer { origin: String, reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

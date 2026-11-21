@@ -27,9 +27,11 @@
 //!
 //! [`FsStore`] keeps objects as files in a directory, and [`s3::S3Store`]
 //! keeps them in an S3 bucket. [`Backend`] is the one of them that a
-//! configuration names. [`MemoryStore`] and
+//! configuration names. [`ReadOnlyStore`] reads another cluster's store and
+//! refuses every write. [`MemoryStore`] and
 //! [`InlineTierExecutor`] stand in for a provider and for the tier service in
-//! tests, and [`contract`] holds the cases that providers pass.
+//! tests, [`RecordingStore`] shows which calls reach a provider, and
+//! [`contract`] holds the cases that providers pass.
 
 // Every future here runs on the shard that owns it and never crosses threads.
 #![allow(clippy::future_not_send)]
@@ -44,6 +46,8 @@ mod inline;
 mod layout;
 mod manifest;
 mod memory;
+mod read_only;
+mod recording;
 mod resolver;
 pub mod s3;
 mod segment_metadata;
@@ -59,6 +63,8 @@ pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
+pub use read_only::ReadOnlyStore;
+pub use recording::{RecordingStore, StoreCall, StoreCalls};
 pub use resolver::ShardResolver;
 pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataError};
 pub use store::{

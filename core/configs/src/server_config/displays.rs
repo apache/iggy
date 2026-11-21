@@ -40,7 +40,7 @@ impl Display for ServerConfig {
              encryption: {}, memory_pool: {:?}, sharding: {:?}, \
              quic: {}, tcp: {}, http: {}, telemetry: {}, \
              metadata: {}, message_bus: {}, partition: {}, external_auth: {}, \
-             tiered_storage: {} }}",
+             tiered_storage: {}, geo: {} }}",
             self.consumer_group,
             self.data_maintenance,
             self.heartbeat,
@@ -59,6 +59,7 @@ impl Display for ServerConfig {
             self.partition,
             self.external_auth,
             self.tiered_storage,
+            self.geo,
         )
     }
 }

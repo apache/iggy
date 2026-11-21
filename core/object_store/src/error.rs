@@ -79,6 +79,14 @@ pub enum ObjectStoreError {
     /// or a put mode that the provider does not know.
     #[error("the store does not support {0}")]
     Unsupported(String),
+    /// A put or a delete reached a store that only reads, such as the store
+    /// of another cluster, see [`crate::ReadOnlyStore`]. No provider got the
+    /// call.
+    #[error("the store is read-only, so it refused the {operation} of {key:?}")]
+    ReadOnly {
+        operation: &'static str,
+        key: String,
+    },
     /// The caller's [`crate::PutBody`] failed or broke its declared length.
     /// It holds the body's own error, unchanged.
     #[error("the put body failed: {0}")]
@@ -107,6 +115,7 @@ impl ObjectStoreError {
             | Self::InvalidKey { .. }
             | Self::InvalidRequest(_)
             | Self::Unsupported(_)
+            | Self::ReadOnly { .. }
             | Self::Body(_) => ErrorClass::Permanent,
         }
     }
@@ -181,6 +190,13 @@ mod tests {
             ),
             (
                 ObjectStoreError::Unsupported("IfAbsent".to_owned()),
+                ErrorClass::Permanent,
+            ),
+            (
+                ObjectStoreError::ReadOnly {
+                    operation: "PUT",
+                    key: key(),
+                },
                 ErrorClass::Permanent,
             ),
             (

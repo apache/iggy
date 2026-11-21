@@ -35,6 +35,7 @@ use metadata::AppliedFrontier;
 use partitions::FatalCommit;
 use server_common::executor::create_shard_executor;
 use shard::metrics::ShardMetrics;
+use shard::peers::SharedPeerStatus;
 use shard::{Receiver as ShardReceiver, Sender, ShardFrame, TaggedSender};
 use std::backtrace::Backtrace;
 use std::rc::Rc;
@@ -779,6 +780,7 @@ pub(in crate::boot) fn run_shard_thread(
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
     tiered_credentials: Option<SharedCredentials>,
+    geo_peer_statuses: Vec<SharedPeerStatus>,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -832,6 +834,7 @@ pub(in crate::boot) fn run_shard_thread(
             peer_exit,
             shutdown_deadline,
             tiered_credentials,
+            geo_peer_statuses,
             primary_handoff,
         ))
         .await
@@ -1002,6 +1005,7 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) stream_key_rewrapper: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
     pub(in crate::boot) store_identity: Option<Sender<()>>,
+    pub(in crate::boot) geo_peers: Option<Sender<()>>,
     pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
     pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
@@ -1017,6 +1021,7 @@ impl StopSignals {
             &self.stream_key_rewrapper,
             &self.segment_cleaner,
             &self.store_identity,
+            &self.geo_peers,
             &self.sysinfo_printer,
             &self.consumer_group_liveness,
         ]

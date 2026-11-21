@@ -1554,6 +1554,51 @@ handshake_grace = "10 s"
 #deletes = 2
 #housekeeping = 1
 
+# Geo topics: the name of this cluster among the datacenters, its origin, and
+# the object stores of the other clusters that it reads, its peers. Without
+# this section, the cluster has no origin and no peers.
+#[geo]
+# The name of this cluster. Shadow stream names and the objects that this
+# cluster publishes for its peers carry it. It holds 1 to 32 lowercase
+# letters, digits and '-', starts with a letter and does not end with '-'. A
+# cluster with peers needs it.
+#origin = "dc-a"
+# One table per peer, at most 16. A peer's store is the [tiered_storage] store
+# of the other cluster, with the same keys. The server only reads it: it never
+# puts, deletes or creates an object there, so read-only credentials are
+# enough. Each shard runs one tier service per peer, with the timeouts and job
+# caps of [tiered_storage].
+#
+# Shard 0 reads each peer's store identity object, "<prefix>/meta/identity",
+# at boot and every minute after that. While the node reads nothing from the
+# peer, or the peer's store does not answer, it reads the object every 5
+# seconds. The node remembers the first cluster that the object names, until
+# the node restarts. If the object names another cluster later, the node reads
+# nothing from the peer until it restarts. A peer that does not answer never
+# stops the boot. The gauges geo_peer_identity_verified and
+# geo_peer_unreachable show each peer by its origin.
+#[[geo.peers]]
+# The peer's own geo.origin.
+#origin = "dc-b"
+# "fs" (a directory) or "s3".
+#backend = "s3"
+# The peer's tiered_storage.prefix.
+#prefix = "iggy"
+# The fs backend: the directory that holds the peer's objects.
+#path = "/mnt/iggy-dc-b"
+# The s3 backend: the bucket, the region and, for a store other than AWS, its
+# URL without a path. url_style works as in [tiered_storage].
+#bucket = "iggy-segments-dc-b"
+#region = "us-east-1"
+#endpoint = "https://storage.example.com"
+#url_style = "auto"
+# Static s3 credentials, which an s3 peer needs. Set them in the environment,
+# for the first peer with IGGY_GEO_PEERS_0_ACCESS_KEY_ID and
+# IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather than in this file. The printed
+# configuration never shows them.
+#access_key_id = ""
+#secret_access_key = ""
+
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]
 # A literal IP or a DNS hostname, without a port. Named to match its roster

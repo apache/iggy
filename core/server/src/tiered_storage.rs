@@ -22,6 +22,7 @@
 //! Each shard gets its own store and service, because a provider holds
 //! files and connections of the shard that owns it.
 
+use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -49,6 +50,15 @@ use crate::store_identity::{self, IdentityChecker, TierHandlers};
 /// store. A store that does not answer is an outage that the node waits out,
 /// so neither waits for the whole request timeout.
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where an `s3` store is: the keys that `[tiered_storage]` and every
+/// `[[geo.peers]]` entry share.
+pub struct S3Location<'a> {
+    pub endpoint: &'a str,
+    pub region: &'a str,
+    pub bucket: &'a str,
+    pub url_style: S3UrlStyle,
+}
 
 /// Boot-time checks of the section, after `Validatable::validate`. A
 /// configuration that can never work refuses the boot here, before any
@@ -239,7 +249,7 @@ fn store(
                 .cloned()
                 .ok_or_else(|| refuse("the s3 backend has no credentials".to_owned()))?;
             Some(Backend::S3(
-                S3Store::new(s3_config(config, credentials))
+                S3Store::new(S3Location::from(config).config(credentials))
                     .map_err(|error| refuse(error.to_string()))?,
             ))
         }
@@ -249,38 +259,61 @@ fn store(
 /// Where the store keeps objects, for the log.
 fn store_location(config: &TieredStorageConfig) -> String {
     match config.backend {
-        TieredStorageBackend::S3 => format!("{}/{}", s3_endpoint(config), config.bucket),
+        TieredStorageBackend::S3 => S3Location::from(config).to_string(),
         TieredStorageBackend::Fs | TieredStorageBackend::None => config.path.clone(),
     }
 }
 
-/// The `s3` section in the form the provider takes. An empty endpoint is AWS
-/// in the configured region.
-fn s3_config(config: &TieredStorageConfig, credentials: SharedCredentials) -> S3Config {
-    let aws = config.endpoint.trim().is_empty();
-    S3Config {
-        endpoint: s3_endpoint(config),
-        region: config.region.clone(),
-        bucket: config.bucket.clone(),
-        url_style: match config.url_style {
-            S3UrlStyle::Auto if aws => UrlStyle::VirtualHosted,
-            S3UrlStyle::VirtualHosted => UrlStyle::VirtualHosted,
-            S3UrlStyle::Auto | S3UrlStyle::Path => UrlStyle::Path,
-        },
-        credentials,
+impl<'a> From<&'a TieredStorageConfig> for S3Location<'a> {
+    fn from(config: &'a TieredStorageConfig) -> Self {
+        Self {
+            endpoint: &config.endpoint,
+            region: &config.region,
+            bucket: &config.bucket,
+            url_style: config.url_style,
+        }
     }
 }
 
-/// The configured endpoint, or AWS in the configured region when it is empty.
-fn s3_endpoint(config: &TieredStorageConfig) -> String {
-    if config.endpoint.trim().is_empty() {
-        format!("https://s3.{}.amazonaws.com", config.region)
-    } else {
-        config.endpoint.clone()
+impl S3Location<'_> {
+    /// The location in the form the provider takes. An empty endpoint is AWS
+    /// in the region.
+    #[must_use]
+    pub fn config(&self, credentials: SharedCredentials) -> S3Config {
+        let aws = self.endpoint.trim().is_empty();
+        S3Config {
+            endpoint: self.endpoint(),
+            region: self.region.to_owned(),
+            bucket: self.bucket.to_owned(),
+            url_style: match self.url_style {
+                S3UrlStyle::Auto if aws => UrlStyle::VirtualHosted,
+                S3UrlStyle::VirtualHosted => UrlStyle::VirtualHosted,
+                S3UrlStyle::Auto | S3UrlStyle::Path => UrlStyle::Path,
+            },
+            credentials,
+        }
+    }
+
+    /// The endpoint, or AWS in the region when it is empty.
+    #[must_use]
+    pub fn endpoint(&self) -> String {
+        if self.endpoint.trim().is_empty() {
+            format!("https://s3.{}.amazonaws.com", self.region)
+        } else {
+            self.endpoint.to_owned()
+        }
     }
 }
 
-fn identity_timeout(config: &TieredStorageConfig) -> Duration {
+/// The endpoint and the bucket, for the log.
+impl Display for S3Location<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.endpoint(), self.bucket)
+    }
+}
+
+/// The longest that one read of a store identity object waits.
+pub fn identity_timeout(config: &TieredStorageConfig) -> Duration {
     config.request_timeout.get_duration().min(IDENTITY_TIMEOUT)
 }
 
@@ -545,15 +578,13 @@ mod tests {
 
     #[test]
     fn given_s3_sections_when_mapping_should_pick_the_endpoint_and_url_style() {
-        let aws = s3_config(&s3_section(""), keys());
-        let custom = s3_config(&s3_section("http://localhost:4566"), keys());
-        let forced = s3_config(
-            &TieredStorageConfig {
-                url_style: S3UrlStyle::Path,
-                ..s3_section("")
-            },
-            keys(),
-        );
+        let s3_config = |config: &TieredStorageConfig| S3Location::from(config).config(keys());
+        let aws = s3_config(&s3_section(""));
+        let custom = s3_config(&s3_section("http://localhost:4566"));
+        let forced = s3_config(&TieredStorageConfig {
+            url_style: S3UrlStyle::Path,
+            ..s3_section("")
+        });
 
         assert_eq!(aws.endpoint, "https://s3.eu-central-1.amazonaws.com");
         assert_eq!(aws.url_style, UrlStyle::VirtualHosted);
