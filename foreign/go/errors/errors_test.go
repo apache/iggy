@@ -164,6 +164,22 @@ func TestIggyError_ReplyTooLarge(t *testing.T) {
 	}
 }
 
+func TestIggyError_FreeSpaceReserveReached(t *testing.T) {
+	err := FreeSpaceReserveReached{}
+	if err.Code() != Code(4109) || FreeSpaceReserveReachedCode != Code(4109) {
+		t.Errorf("Code() = %v, FreeSpaceReserveReachedCode = %v, want 4109", err.Code(), FreeSpaceReserveReachedCode)
+	}
+	if err.Error() != "data disk is below its free-space reserve" {
+		t.Errorf("Error() = %q", err.Error())
+	}
+	if FreeSpaceReserveReachedCode.String() != "FreeSpaceReserveReached" {
+		t.Errorf("String() = %q", FreeSpaceReserveReachedCode.String())
+	}
+	if resolved := FromCode(Code(4109)); !errors.Is(resolved, ErrFreeSpaceReserveReached) {
+		t.Errorf("FromCode(4109) = %v, want ErrFreeSpaceReserveReached", resolved)
+	}
+}
+
 func TestFromCode_FallsBackToTheGenericError(t *testing.T) {
 	if resolved := FromCode(Code(0xFFFFFF)); !errors.Is(resolved, ErrError) {
 		t.Errorf("FromCode(unknown) = %v, want ErrError", resolved)

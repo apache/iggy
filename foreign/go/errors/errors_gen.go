@@ -2386,6 +2386,15 @@ func (e CannotModifyRootUser) Is(target error) bool {
 	return ok
 }
 
+type FreeSpaceReserveReached struct{}
+
+func (e FreeSpaceReserveReached) Error() string { return "data disk is below its free-space reserve" }
+func (e FreeSpaceReserveReached) Code() Code    { return 4109 }
+func (e FreeSpaceReserveReached) Is(target error) bool {
+	_, ok := target.(FreeSpaceReserveReached)
+	return ok
+}
+
 type ConsumerGroupIdNotFound struct {
 	GroupId uint32
 	TopicId uint32
@@ -3154,6 +3163,7 @@ var (
 	ErrStreamEncryptionUnavailable                = StreamEncryptionUnavailable{}
 	ErrUnsupportedCriticalOption                  = UnsupportedCriticalOption{}
 	ErrCannotModifyRootUser                       = CannotModifyRootUser{}
+	ErrFreeSpaceReserveReached                    = FreeSpaceReserveReached{}
 	ErrConsumerGroupIdNotFound                    = ConsumerGroupIdNotFound{}
 	ErrInvalidConsumerGroupId                     = InvalidConsumerGroupId{}
 	ErrConsumerGroupNameNotFound                  = ConsumerGroupNameNotFound{}
@@ -3423,6 +3433,7 @@ const (
 	StreamEncryptionUnavailableCode                Code = 4106
 	UnsupportedCriticalOptionCode                  Code = 4107
 	CannotModifyRootUserCode                       Code = 4108
+	FreeSpaceReserveReachedCode                    Code = 4109
 	ConsumerGroupIdNotFoundCode                    Code = 5000
 	InvalidConsumerGroupIdCode                     Code = 5002
 	ConsumerGroupNameNotFoundCode                  Code = 5003
@@ -3904,6 +3915,8 @@ func (c Code) String() string {
 		return "UnsupportedCriticalOption"
 	case CannotModifyRootUserCode:
 		return "CannotModifyRootUser"
+	case FreeSpaceReserveReachedCode:
+		return "FreeSpaceReserveReached"
 	case ConsumerGroupIdNotFoundCode:
 		return "ConsumerGroupIdNotFound"
 	case InvalidConsumerGroupIdCode:
@@ -4439,6 +4452,8 @@ func FromCode(code Code) IggyError {
 		return ErrUnsupportedCriticalOption
 	case CannotModifyRootUserCode:
 		return ErrCannotModifyRootUser
+	case FreeSpaceReserveReachedCode:
+		return ErrFreeSpaceReserveReached
 	case ConsumerGroupIdNotFoundCode:
 		return ErrConsumerGroupIdNotFound
 	case InvalidConsumerGroupIdCode:

@@ -73,6 +73,7 @@ internal static class VsrError
     internal const int OPTION_NOT_RESETTABLE = 4104;
     internal const int READ_ONLY_OPTION = 4105;
     internal const int CANNOT_MODIFY_ROOT_USER = 4108;
+    internal const int FREE_SPACE_RESERVE_REACHED = 4109;
     internal const int INCOMPATIBLE_PROTOCOL_VERSION = 14003;
     internal const int SESSION_MISMATCH = 14004;
     internal const int REQUEST_ID_EXHAUSTED = 14005;

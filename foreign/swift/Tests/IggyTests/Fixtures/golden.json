@@ -863,6 +863,7 @@
     "4106": "stream_encryption_unavailable",
     "4107": "unsupported_critical_option",
     "4108": "cannot_modify_root_user",
+    "4109": "free_space_reserve_reached",
     "5000": "consumer_group_id_not_found",
     "5002": "invalid_consumer_group_id",
     "5003": "consumer_group_name_not_found",
