@@ -581,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn given_two_proven_belows_of_one_batch_when_sealing_should_give_two_checksums() {
+    fn given_one_batch_with_two_proven_below_values_when_sealing_should_give_two_checksums() {
         let placed = placed();
         let mut other = placed;
         other.placement.proven_below += 1;
