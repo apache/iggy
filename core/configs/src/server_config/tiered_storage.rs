@@ -28,10 +28,10 @@
 
 use super::COMPONENT;
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{FRESH_UPLOAD_INTERVAL_MAX, IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::RangeInclusive;
 use std::time::Duration;
@@ -247,14 +247,14 @@ pub struct TieredStorageConfig {
     pub mock_s3: MockS3Config,
     /// The longest wait for the answer to one attempt at a store call other
     /// than a put. From 1 s to 1 h.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_request_timeout")]
     #[config_env(leaf)]
     pub request_timeout: IggyDuration,
     /// The longest a put waits for the store to take the next piece of its
     /// body, or to answer after the last piece. A put has no total deadline.
     /// From 1 s to 1 h.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_progress_timeout")]
     #[config_env(leaf)]
     pub progress_timeout: IggyDuration,
@@ -264,12 +264,12 @@ pub struct TieredStorageConfig {
     pub max_attempts: u32,
     /// The wait before the first retry, doubled for each retry after it.
     /// From 1 ms to 1 h.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_retry_delay")]
     #[config_env(leaf)]
     pub retry_delay: IggyDuration,
     /// The longest wait between two attempts. From 1 ms to 1 h.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_max_retry_delay")]
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
@@ -277,7 +277,7 @@ pub struct TieredStorageConfig {
     /// on one shard, unless an object fills first. A send that finds a free
     /// upload slot and the last upload started at least this long ago is
     /// uploaded at once. Zero uploads as soon as a slot is free. Up to 10 s.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_fresh_upload_interval")]
     #[config_env(leaf)]
     pub fresh_upload_interval: IggyDuration,
@@ -353,17 +353,17 @@ pub struct TierJobsConfig {
 #[serde(deny_unknown_fields)]
 pub struct MockS3Config {
     /// Each put, from the end of its body to its answer.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default)]
     #[config_env(leaf)]
     pub put_latency: IggyDuration,
     /// Each ranged read.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default)]
     #[config_env(leaf)]
     pub get_latency: IggyDuration,
     /// Each head, delete and listing.
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default)]
     #[config_env(leaf)]
     pub other_latency: IggyDuration,

@@ -15,14 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
 use crate::common::defaults::SERVER_CONFIG;
@@ -83,13 +82,13 @@ pub struct HttpJwtConfig {
     pub valid_issuers: Vec<String>,
     pub valid_audiences: Vec<String>,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub access_token_expiry: IggyExpiry,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub clock_skew: IggyDuration,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub not_before: IggyDuration,
     // skip_serializing keeps the secrets out of the runtime current_config.toml
     // (and the diagnostic snapshot that cats it). The live secrets are read from

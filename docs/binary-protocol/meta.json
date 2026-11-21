@@ -1,0 +1,4 @@
+{
+  "title": "Binary Protocol",
+  "pages": ["index", "framing", "connection-lifecycle", "commands", "encodings", "messages", "cluster"]
+}
