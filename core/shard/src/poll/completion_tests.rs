@@ -75,9 +75,9 @@ use crate::commit_batch::encode_commit_batch;
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    ConsumerAttachment, IggyShard, LifecycleFrame, NoopHost, PartitionConsensusConfig,
-    PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver, ReplicaTopology, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_channel,
+    ConsumerAttachment, ExternalGroupRead, IggyShard, LifecycleFrame, NoopHost,
+    PartitionConsensusConfig, PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver,
+    ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
@@ -569,7 +569,7 @@ async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: u32::try_from(BOUND_GROUP).unwrap(),
+                group: ExternalGroupRead::Group(u32::try_from(BOUND_GROUP).unwrap()),
                 metadata,
             },
         ] {
@@ -747,7 +747,7 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: 1,
+                group: ExternalGroupRead::Group(1),
                 metadata,
             },
         ] {
@@ -833,7 +833,7 @@ async fn given_a_pending_view_write_when_read_on_primary_should_refuse_until_it_
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: 1,
+                group: ExternalGroupRead::Group(1),
                 metadata,
             },
             PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
@@ -1259,7 +1259,7 @@ async fn given_deleted_history_when_metadata_still_lists_the_partition_should_re
                 (
                     "ExternalGroupOffsetOnPrimary",
                     PartitionRead::ExternalGroupOffsetOnPrimary {
-                        group_id: 1,
+                        group: ExternalGroupRead::Group(1),
                         metadata,
                     },
                 ),

@@ -100,9 +100,9 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 - The same key written in two datacenters has no defined order. If `dc-a` and `dc-b` both write
   key `42`, no reader can tell which write came last.
 - It is not a standby. No cluster is promoted, and no cluster ever writes into the log of another.
-- It shares only geo topics and the positions of their consumer groups. Users, permissions,
-  normal topics and the consumer groups themselves stay in the cluster that holds them. Create
-  them in each cluster.
+- It shares only geo topics and the positions of their consumers. Users, permissions, normal
+  topics and the consumer groups themselves stay in the cluster that holds them. Create them in
+  each cluster.
 
 ## What works in this version
 
@@ -119,9 +119,10 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 | A command that retires an origin that never returns                           | Yes             |
 | Recover the geo topics of a cluster that lost every disk, from its bucket     | Yes             |
 | Consumer positions that move between datacenters                              | Yes             |
+| Positions of plain consumers, and of Kafka groups through the Kafka gateway   | Yes             |
 | The `geo_tiered` mode, and a switch between modes                             | No              |
 | Geo topics in encrypted streams                                               | No              |
-| Geo topics through the Kafka gateway                                          | No              |
+| Create, produce to or read geo topics through the Kafka gateway               | No              |
 
 ## How a message moves
 
@@ -595,6 +596,34 @@ of what the shadow partition serves waits until it gets there; its position is n
   the cluster they connect to.
 - Grant read permissions on each shadow stream as on any other stream.
 
+### Plain consumers and Kafka groups
+
+A plain consumer, which reads without a group, carries its positions between datacenters too. So
+does a Kafka group that reads through the Kafka gateway. The rules of a group apply, with these
+differences:
+
+- A plain consumer is known by its id: the number its client sets, or the hash of its name. The
+  same consumer has the same id in every cluster.
+- The Kafka gateway keeps the offsets of the Kafka group `billing` as the external offsets of the
+  Iggy group `kafka.cg.billing` on the topic. They are known by that name. They are apart from the
+  offsets that the Iggy group stores as itself.
+- A store of either waits for the bucket, as a group's `StoreConsumerOffset` does. So the gateway
+  answers a Kafka `OffsetCommit` once the node's bucket holds the offset. An acknowledged commit
+  survives a datacenter that fails right after it.
+- The gateway creates the Iggy group at the Kafka group's first commit to a topic. In the other
+  datacenter, the gateway's first `OffsetFetch` comes before that commit, so it reads the
+  offsets by the group's name.
+- After a start, the polls of plain consumers and the gateway's offset reads on geo and shadow
+  topics wait for the peers' positions, as group polls do, with `TransientNotAccepted` (58). The
+  gateway answers such an `OffsetFetch` with `COORDINATOR_LOAD_IN_PROGRESS` (14), which Kafka
+  clients retry.
+- With the coordinator log of several gateways, Iggy answers `OffsetFetch` on the partitions of
+  geo and shadow topics, because only Iggy holds what another datacenter moved. The log adds its
+  commit metadata where it holds the same offset.
+- Neither has members in Iggy. So a position from another datacenter moves it at any time, also
+  while it reads here. Read a log with one plain consumer or one Kafka group in one datacenter at
+  a time. Two datacenters that read one log under one name at once undo each other's moves.
+
 ### Duplicates
 
 A send that was not acknowledged can still have committed. A producer that retries it in another
@@ -698,7 +727,9 @@ clusters already have the geo topic `orders/payments`.
 
    `dc-b` takes the positions of `dc-a` only for a group with no members in `dc-b`. A group whose
    consumers start sooner keeps the position `dc-b` took before them, and reads again what came
-   after it.
+   after it. Plain consumers and Kafka groups move the same way, by their ids and names. Start
+   them in `dc-b` only after they stopped in `dc-a`, see
+   [Plain consumers and Kafka groups](#plain-consumers-and-kafka-groups).
 4. Consumers in `dc-b` read the messages that `dc-a` published or proved before it failed from
    the shadow topic `__shadow_dc-a_orders/payments`. The messages that `dc-a` acknowledged and did
    not publish stay in the log of `dc-a` until it returns. A group whose position is past what the
@@ -1094,8 +1125,8 @@ object is deleted, and 1 hour before an unlisted long-term object is deleted.
 - **Shadow topics serve only published messages.** A message reaches the shadow topics of the
   peers after its origin's next rewrite and manifest and the peer's next listing, seconds after
   its commit, not at its commit.
-- **Only a group's offset stores wait for the bucket.** A poll that commits on read and a delete
-  of a group's offset are answered at their commit. A node whose store identity check of its own
+- **Only offset stores wait for the bucket.** A poll that commits on read and a delete of an
+  offset are answered at their commit. A node whose store identity check of its own
   bucket does not pass publishes no positions, and answers the stores at their commit. A store on
   a detached shadow topic is answered at its commit too: its origin deleted the topic, so no node
   publishes or takes its positions.
@@ -1108,7 +1139,10 @@ object is deleted, and 1 hour before an unlisted long-term object is deleted.
 - **No encrypted streams.** A geo topic in a stream with an encryption key is refused with
   `FeatureUnavailable` (5), because its sends reach the bucket before the stream's encryption
   runs.
-- **No Kafka gateway.** The Kafka gateway does not support geo topics or shadow streams.
+- **The Kafka gateway carries only offsets.** It carries the offsets of Kafka groups between
+  datacenters. It does not support geo topics or shadow streams for anything else.
+- **No member check for plain consumers and Kafka groups.** A position from another datacenter
+  moves them also while they read here. Read a log with one of them in one datacenter at a time.
 - **Frozen partition count and options.** A geo topic keeps its name, its options, including
   `message_expiry` and `max_topic_size`, and its partition count. Only its durations can change.
   In the `geo` mode it is always `persisted`.

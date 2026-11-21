@@ -15,19 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The offset stores of consumer groups on shadow partitions, whose replies
-//! wait for a round to store their positions.
+//! The offset stores of consumers on shadow partitions, whose replies wait
+//! for a round to store their positions, and the reads that wait for the
+//! peers' positions.
 
 use super::object_deletes::layout;
 use super::segment_uploads::namespace;
 use super::*;
+use crate::geo_commits::HeldReader;
 use crate::geo_positions::GeoPositionSettings;
 use consensus::build_reply_message_with;
-use iggy_common::GeoMode;
+use iggy_common::{GeoMode, IggyError};
 use iggy_object_store::{InlineTierExecutor, MemoryStore, ObjectPrefix};
 use metadata::stm::consumer_group::ConsumerGroup;
 use metadata::stm::shadow::{ShadowRetention, ShadowStream, ShadowTopic};
-use partitions::{ExecutorTopicObjects, TopicObjects};
+use partitions::{ExecutorTopicObjects, PollingConsumer, TopicObjects};
 
 const ORIGIN: &str = "dc-a";
 const GROUP: u32 = 5;
@@ -117,16 +119,26 @@ fn shadow_metadata(
 /// A `StoreConsumerOffset` that the group [`GROUP`] sends itself, with a
 /// quorum ack.
 fn group_store() -> Message<RoutedRequestHeader> {
+    store(
+        ConsumerKind::ConsumerGroup,
+        WireIdentifier::Numeric(GROUP),
+        AckLevel::Quorum,
+    )
+}
+
+/// A `StoreConsumerOffset` of the consumer `id` of `kind`, as it reaches
+/// the shard.
+fn store(kind: ConsumerKind, id: WireIdentifier, ack: AckLevel) -> Message<RoutedRequestHeader> {
     let body = StoreConsumerOffsetRequest {
         consumer: WireConsumer {
-            kind: ConsumerKind::ConsumerGroup.as_code(),
-            id: WireIdentifier::Numeric(GROUP),
+            kind: kind.as_code(),
+            id,
         },
         stream_id: WireIdentifier::Numeric(0),
         topic_id: WireIdentifier::Numeric(0),
         partition_id: Some(0),
         offset: 3,
-        ack: AckLevel::Quorum,
+        ack,
     }
     .to_bytes();
     let header_size = size_of::<RoutedRequestHeader>();
@@ -194,4 +206,114 @@ fn given_a_held_store_when_its_shadow_topic_detaches_should_answer_it_as_committ
             .status,
         0
     );
+}
+
+#[test]
+fn given_an_external_group_or_a_plain_consumer_when_it_stores_its_offset_should_hold_the_reply_too()
+{
+    let owner = shadow_owner();
+    let reporter = WireIdentifier::named("reporter").unwrap();
+
+    for (kind, id, held) in [
+        (
+            ConsumerKind::ExternalGroup,
+            WireIdentifier::Numeric(GROUP),
+            GROUP,
+        ),
+        (ConsumerKind::Consumer, WireIdentifier::Numeric(7), 7),
+        (
+            ConsumerKind::Consumer,
+            reporter,
+            iggy_common::calculate_32(b"reporter"),
+        ),
+    ] {
+        let hold = owner
+            .geo_commit_hold(&store(kind, id.clone(), AckLevel::Quorum))
+            .unwrap_or_else(|| panic!("a store of {kind:?} {id:?} waits for its position"));
+        assert_eq!(hold.reader(), HeldReader { kind, id: held });
+        assert!(
+            owner
+                .geo_commit_hold(&store(kind, id, AckLevel::NoAck))
+                .is_none(),
+            "only a quorum ack waits"
+        );
+    }
+}
+
+#[test]
+fn given_a_held_store_of_a_plain_consumer_when_no_group_has_its_id_should_keep_waiting_for_a_round()
+{
+    let owner = shadow_owner();
+    let hold = owner
+        .geo_commit_hold(&store(
+            ConsumerKind::Consumer,
+            WireIdentifier::Numeric(77),
+            AckLevel::Quorum,
+        ))
+        .unwrap();
+    let committed = build_reply_message_with(
+        &PrepareHeader {
+            operation: Operation::StoreConsumerOffset,
+            ..Default::default()
+        },
+        0,
+        |_| {},
+    );
+    let (reply, replies) = channel(1);
+    hold.keep(committed, reply);
+    let Ok(ShardFrame::Lifecycle(LifecycleFrame::GeoCommitHeld(commit))) = owner.inbox.try_recv()
+    else {
+        panic!("the shard's pump takes the held reply");
+    };
+    owner.on_geo_commit_held(*commit);
+
+    owner.expire_geo_commits();
+
+    assert!(
+        replies.try_recv().is_err(),
+        "a plain consumer is never gone, so its reply waits for its position"
+    );
+}
+
+#[test]
+fn given_a_shadow_partition_while_the_node_waits_for_its_peers_when_a_plain_consumer_or_the_gateway_reads_should_answer_58()
+ {
+    let owner = shadow_owner();
+    assert!(owner.geo_positions_resume_waiting(namespace()));
+
+    assert_eq!(
+        owner.geo_position_refusal(namespace(), PollingConsumer::Consumer(7, 0)),
+        Some(IggyError::TransientNotAccepted)
+    );
+    assert_eq!(
+        owner.geo_reader_refusal(namespace(), ConsumerKind::ExternalGroup, GROUP),
+        Some(IggyError::TransientNotAccepted)
+    );
+    assert_eq!(
+        owner.geo_missing_reader_refusal(namespace()),
+        Some(IggyError::TransientNotAccepted)
+    );
+}
+
+#[test]
+fn given_a_shadow_partition_once_the_wait_ended_when_a_plain_consumer_or_the_gateway_reads_should_answer()
+ {
+    let owner = shadow_owner();
+    owner.set_geo_positions(Some(GeoPositionSettings {
+        origin: "dc-b".to_owned(),
+        peers: vec![ORIGIN.to_owned()],
+        publish_interval: Duration::from_secs(1),
+        offset_upload_interval: Some(Duration::from_millis(50)),
+        resume_timeout: Duration::ZERO,
+    }));
+
+    assert_eq!(
+        owner.geo_position_refusal(namespace(), PollingConsumer::Consumer(7, 0)),
+        None
+    );
+    assert_eq!(
+        owner.geo_reader_refusal(namespace(), ConsumerKind::ExternalGroup, GROUP),
+        None
+    );
+    assert_eq!(owner.geo_missing_reader_refusal(namespace()), None);
 }

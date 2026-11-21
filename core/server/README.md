@@ -888,6 +888,17 @@ datacenters by its name on the topic. The group `billing` of the geo topic
 `__shadow_dc-a_orders/payments` of `dc-b` read the same log, and share one
 position on each of its partitions.
 
+Plain consumers and the external offsets of groups carry their positions in
+the same way. A plain consumer is known by its id, the number its client sets
+or the hash of its name. External offsets are known by their group's name, and
+are apart from the offsets that the group stores as itself. The Kafka gateway
+keeps the offsets of the Kafka group `billing` as the external offsets of the
+group `kafka.cg.billing`. It creates that group at its first commit to a topic.
+So a read of a missing group's external offsets answers by its name, from
+another datacenter's position. Neither has members, so the member check
+below does not hold them back: a log is read under one of their names in one
+datacenter at a time.
+
 A position is a reset counter and an offset. Of two positions the one with
 the higher reset wins, and within one reset the higher offset. A group that
 stores an offset below the one it had, or deletes its offset, moves its
@@ -908,9 +919,10 @@ changed. It keeps in it the partitions it stopped leading as it last stored
 them, and a new primary stores the partition at its first round. A node
 deletes its object of a log the cluster no longer holds.
 
-A `StoreConsumerOffset` that a consumer group sends itself, with a quorum
-ack, on a geo or shadow partition, commits as any other and is answered only
-once the node's object of the log holds the position it stored. Shard 0 then
+A `StoreConsumerOffset` that a consumer sends itself, with a quorum ack, on a
+geo or shadow partition, commits as any other and is answered only once the
+node's object of the log holds the position it stored. The consumer is a
+group, the external offsets of a group, or a plain consumer. Shard 0 then
 runs a round of that topic between the periodic ones: the primary folds the
 commit, and the node stores the object. A store that finds no round running
 and none started in the last `[geo] consumer_offset_upload_interval` (50 ms
@@ -938,7 +950,8 @@ partition serves is kept, and the group's polls wait there. A position for a
 group name that does not exist here is kept until a group of that name is
 created. That group's first polls wait until the position is bound to it.
 
-After a node starts, group polls of geo and shadow partitions wait, with
+After a node starts, the polls of groups and plain consumers on geo and shadow
+partitions, and the reads of external offsets there, wait, with
 `TransientNotAccepted` (58), until the partition took the positions of every
 peer once, or until `[geo] positions_resume_timeout` (10 seconds by default)
 passed. A datacenter that returns therefore resumes a group from where the
