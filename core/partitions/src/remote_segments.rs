@@ -24,7 +24,8 @@
 //! runs in a task of its own (see [`IndexFetch`]), apart from the polls that
 //! wait for it.
 //!
-//! No partition is handed a store yet, so nothing in production reads one.
+//! The shard hands its partitions one [`RemoteSegments`] over the tier
+//! service, see [`ExecutorObjects`].
 
 use std::cell::{Cell, RefCell};
 use std::ops::Range;
@@ -37,6 +38,7 @@ use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
 use iggy_object_store::{
     ErrorClass, KeyLayout, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey, SegmentObject,
+    TierExecutor, TierJobClass, TierJobRequest, TierScope,
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
@@ -77,6 +79,46 @@ impl<S: ObjectStore> RemoteObjects for S {
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
         ObjectStore::get_range(self, key, range).boxed_local()
+    }
+}
+
+/// Ranged reads through a tier executor, in its demand fetch class, so its
+/// caps bound how many ranges, and how many bytes of them, the polls of a
+/// shard hold in memory at once.
+pub struct ExecutorObjects<E> {
+    executor: E,
+    /// Never cancelled. A read belongs to a poll, and the poll's own deadline
+    /// ends it, whoever is the primary by then.
+    scope: TierScope,
+}
+
+impl<E> ExecutorObjects<E> {
+    #[must_use]
+    pub fn new(executor: E) -> Self {
+        Self {
+            executor,
+            scope: TierScope::new(),
+        }
+    }
+}
+
+impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        let request = TierJobRequest::new(TierJobClass::DemandFetch, self.scope.token())
+            .with_bytes(range.end.saturating_sub(range.start));
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            ObjectStore::get_range(&*store, &key, range).await
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
     }
 }
 
@@ -621,7 +663,7 @@ impl Drop for IndexFetch {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use iggy_object_store::ObjectPrefix;
+    use iggy_object_store::{InlineTierExecutor, MemoryStore, ObjectPrefix, PutBody, PutOptions};
     use std::cell::RefCell;
 
     const START_OFFSET: u64 = 100;
@@ -821,6 +863,31 @@ mod tests {
         assert!(!fetch.may_publish() && !fetch.segment_retired());
         drop(fetch);
         assert!(fence.begin(START_OFFSET).is_none());
+    }
+
+    #[compio::test]
+    async fn given_a_tier_executor_when_reading_a_range_should_read_it_from_the_executor_s_store() {
+        let executor = InlineTierExecutor::new(MemoryStore::new());
+        executor
+            .store()
+            .put(
+                "iggy/1/1/0/0/00000000000000000000.log",
+                PutBody::from_bytes(Bytes::from_static(b"0123456789")),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let objects = ExecutorObjects::new(executor);
+
+        let read = objects
+            .get_range("iggy/1/1/0/0/00000000000000000000.log", 2..6)
+            .await
+            .unwrap();
+        let missing = objects.get_range("iggy/1/1/0/0/missing.log", 0..1).await;
+
+        assert_eq!(read.bytes.as_ref(), b"2345");
+        assert_eq!(read.size, 10);
+        assert!(matches!(missing, Err(ObjectStoreError::NotFound { .. })));
     }
 
     /// A store that never answers.

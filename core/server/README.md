@@ -49,8 +49,12 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-METADATA-CHANGE-LOG-2` storage gate
+complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-1` storage gate
 requires fresh storage and rejects older data directories without modifying them.
+A partition of a tiered topic keeps a chain file, and its older segments live
+only in the object store. A build from before tiered storage would read such a
+partition as one that lost data, so `IGGY-METADATA-CHANGE-LOG-2` data directories
+must be wiped before the upgrade.
 Metadata snapshots now carry the metadata change log and topic creation ops, so
 `IGGY-RESOURCE-OPTIONS-1` data directories must be wiped before the upgrade.
 Cached replies now preserve a committed-result marker, which older receipts lack.
@@ -494,9 +498,26 @@ Topics created before replication factors keep every partition on every node.
 ### Tiered storage
 
 The `[tiered_storage]` section of [config.toml](config.toml) names an object
-store for the sealed segments of tiered topics. The server still refuses to turn
-`tiered_storage` on for a topic. No partition can read its segments back from
-the store yet.
+store for the sealed segments of tiered topics. A topic with `tiered_storage`
+on uploads each sealed segment there, removes the local copy once local
+retention allows it, and reads the segment back from the store when a poll
+asks for it.
+
+The cluster accepts `tiered_storage` on a topic only while every node has a
+backend and passes the store identity check described below. Until then the
+request fails with `FeatureUnavailable`.
+
+Each partition of a tiered topic also has a manifest object,
+`<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
+It lists the segments that the store holds, with their offsets, timestamps,
+sizes and checksums, so a reader that has only the bucket can read the
+partition. Such a reader takes only the segments that the manifest lists. Any
+other object under the partition's prefix can belong to an upload that never
+committed, or to a segment that retention removed. The partition's primary
+writes it on each run of the message cleaner, when a segment was uploaded or
+removed since the last one. The cluster never reads its own manifests back.
+The objects of a removed segment are deleted only once the manifest no longer
+lists it.
 
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
@@ -707,7 +728,7 @@ Replacing the binary does not migrate old data. Use the offline re-ingestion
 procedure above for an upgrade. A recovery from a backup must use a separately
 verified, compatible backup; copying a format marker is not a migration.
 
-Within compatible `IGGY-METADATA-CHANGE-LOG-2` storage, this release reads superblock
+Within compatible `IGGY-TIERED-SEGMENT-CHAIN-1` storage, this release reads superblock
 envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
 records remain readable. New records atomically retain an adopted view, its
 advertised head and exact prepare headers alongside the existing consensus state.
@@ -780,7 +801,7 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-METADATA-CHANGE-LOG-2` requires this initialization contract;
+Storage format `IGGY-TIERED-SEGMENT-CHAIN-1` requires this initialization contract;
 older data directories are refused before mutation.
 
 Retirement also writes `retirement.fence` in that external namespace directory

@@ -415,7 +415,10 @@ pub static CATALOG: [OptionDescriptor; 24] = [
         // moved to the object store.
         critical: true,
         description: || {
-            "Move sealed segments to the object store and keep only the local retention on              disk. An update can turn it on and never off, because the removed local              segments cannot come back. Not available yet: turning it on is refused"
+            "Move sealed segments to the object store and keep only the local retention on \
+             disk. An update can turn it on and never off, because the removed local \
+             segments cannot come back. Needs an object store on every node of the cluster: \
+             while one is not ready, turning it on is refused"
                 .to_owned()
         },
     },
