@@ -296,6 +296,7 @@ web-sys = { version = "0.3", features = [
     "Window",
     "Location",
     "HtmlSelectElement",
+    "HtmlDialogElement",
     "Clipboard",
     "Navigator",
     "ResizeObserver",

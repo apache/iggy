@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::embed_cache::DEFAULT_MAX_GIB;
 use crate::error::IggyBenchDashboardServerError;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use serde::Deserialize;
@@ -48,9 +49,19 @@ pub struct IggyBenchDashboardServerArgs {
     #[arg(long, default_value = "*")]
     pub cors_origins: String,
 
-    /// Directory for cached PNG files and artifact zips
+    /// Directory for cached PNG files, embed pages and artifact zips
     #[arg(long, default_value_os_t = default_cache_dir())]
     pub cache_dir: PathBuf,
+
+    /// Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the
+    /// files that readers used least recently
+    #[arg(
+        long,
+        value_name = "GIB",
+        default_value_t = DEFAULT_MAX_GIB,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub embed_cache_max_gib: u64,
 
     /// Dashboard configuration file: official suites, headline workloads, and thresholds
     #[arg(long, default_value = "dashboard.toml")]

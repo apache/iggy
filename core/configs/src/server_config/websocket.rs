@@ -27,10 +27,10 @@
 //! dependency and the compio-ws re-export are different major versions
 //! with incompatible config types.
 
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::IggyByteSize;
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::fmt::{Display, Formatter};
 
 #[serde_as]
@@ -43,14 +43,14 @@ pub struct WebSocketConfig {
     /// compio-ws default (currently 128 KiB).
     #[config_env(leaf)]
     #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde_as(as = "Option<DisplayFromStrOrNumber>")]
     pub read_buffer_size: Option<IggyByteSize>,
 
     /// Target buffer size for batched writes before compio-ws flushes.
     /// `None` keeps the compio-ws default (currently 128 KiB).
     #[config_env(leaf)]
     #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde_as(as = "Option<DisplayFromStrOrNumber>")]
     pub write_buffer_size: Option<IggyByteSize>,
 
     /// Hard ceiling on the write buffer; writes past it error instead
@@ -59,7 +59,7 @@ pub struct WebSocketConfig {
     /// (unlimited).
     #[config_env(leaf)]
     #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde_as(as = "Option<DisplayFromStrOrNumber>")]
     pub max_write_buffer_size: Option<IggyByteSize>,
 
     /// Hard upper bound on a single inbound WebSocket message
@@ -67,7 +67,7 @@ pub struct WebSocketConfig {
     /// (currently 64 MiB).
     #[config_env(leaf)]
     #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde_as(as = "Option<DisplayFromStrOrNumber>")]
     pub max_message_size: Option<IggyByteSize>,
 
     /// Hard upper bound on a single inbound WebSocket frame
@@ -75,7 +75,7 @@ pub struct WebSocketConfig {
     /// (currently 16 MiB).
     #[config_env(leaf)]
     #[serde(default)]
-    #[serde_as(as = "Option<DisplayFromStr>")]
+    #[serde_as(as = "Option<DisplayFromStrOrNumber>")]
     pub max_frame_size: Option<IggyByteSize>,
 
     /// Whether to accept unmasked frames from clients in violation of

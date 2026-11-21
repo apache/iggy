@@ -1,0 +1,95 @@
+---
+title: Troubleshooting
+description: "What the most common first-run failures look like, what causes them, and how to fix them."
+---
+
+This page covers the problems people most often hit the first time they run Apache Iggy. Each entry shows what you see, what causes it, and how to fix it.
+
+To collect diagnostic data for a bug report instead, see the `snapshot` command in [CLI commands](/docs/cli/commands).
+
+## Client hangs with no output
+
+**What you see:** the client starts and then prints nothing. It doesn't fail and it doesn't exit.
+
+**Cause:** nothing is listening on the address the client connects to, usually `127.0.0.1:8090`. The server isn't running, is bound to a different address, or hasn't finished starting. By default the SDKs retry the connection forever, and the retries are only logged if your application has logging set up, so all you see is silence.
+
+**Fix:** check the server has started before starting the client. It logs a `server client listeners started` line that includes the address, for example `tcp=127.0.0.1:8090`. You can also check the port directly:
+
+```bash
+nc -zv 127.0.0.1 8090
+```
+
+To make the client fail with an error instead of retrying forever, set `reconnection_retries=0` on the connection string, or call `.with_reconnection_max_retries(Some(0))` on the Rust client builder. Turning on logging in your application also shows each reconnect attempt.
+
+## Docker container can't be reached
+
+**What you see:** the server is running in Docker with `-p 8090:8090`, but clients on the host can't connect. On Docker Desktop the connection may be accepted and then reset straight away.
+
+**Cause:** the image doesn't override the server's addresses, so it binds `127.0.0.1` inside the container, where the published port can't reach it.
+
+**Fix:** set `IGGY_TCP_ADDRESS=0.0.0.0:8090`, and the equivalent for any other transport you expose, along with `IGGY_NODE_ADVERTISED_ADDRESS`. See the `docker run` and Compose examples in [Docker & Helm](/docs/server/docker).
+
+## Server exits with an io_uring error in a container
+
+**What you see:** the server exits at startup with one of these:
+
+```text
+Cannot create server bootstrap executor: Operation not permitted (os error 1): io_uring syscalls are blocked, typically by a container seccomp profile
+```
+
+```text
+Cannot create server bootstrap executor: Out of memory (os error 12): io_uring was denied locked memory for its rings
+```
+
+On a machine with more cores, the same problems can show up as `failed to create io_uring runtime for shard N` instead.
+
+**Cause:** Docker's default seccomp profile blocks the `io_uring` system calls the server needs, or the container's locked-memory limit is too small for the server's io_uring rings.
+
+**Fix:** run the container with `--security-opt seccomp=unconfined` and `--ulimit memlock=-1:-1`, or with a custom seccomp profile and a locked-memory limit big enough for the server. See [Why these capabilities?](/docs/server/docker#why-these-capabilities) and [Linux tuning](/docs/server/linux-tuning#runtime-access-and-process-limits).
+
+## Kernel too old
+
+**What you see:** the server exits with an `io_uring Invalid Argument (EINVAL)` report that includes a line like:
+
+```text
+Kernel 5.15 is too old (need >= 5.19)
+```
+
+**Cause:** on Linux the server needs kernel 5.19 or newer for the io_uring features it uses. WSL2 kernels can be missing io_uring features even on a newer version.
+
+**Fix:** upgrade the host kernel to 5.19 or newer. Under WSL2, run `wsl --update`. Containers use the host's kernel, so it's the host that needs upgrading. See [System requirements](/docs/server/introduction#system-requirements).
+
+## Missing root credentials
+
+A fresh standalone server refuses to start without root credentials. Set both `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` before first boot, or use `--with-default-root-credentials` for a disposable development instance. The server no longer generates a password.
+
+A cluster replica without credentials waits for the root account to arrive through replication. Provision the same initial credentials on all replicas so any promoted node can initialize it. Once root is stored, environment changes do not reset its password. Do not delete a data directory to change an existing password.
+
+## "Already exists" error when running the CLI again
+
+**What you see:** running `iggy stream create dev` a second time fails:
+
+```text
+Error: CommandError(Problem creating stream (name: dev and ID auto incremented)
+
+Caused by:
+    Stream with name:  already exists.)
+```
+
+The name is missing from the message because of a known bug where error details are lost between the server and the client ([#3735](https://github.com/apache/iggy/issues/3735)).
+
+**Cause:** the stream was created the first time. The CLI reports the server's error rather than skipping streams that already exist.
+
+**Fix:** nothing needs fixing. The stream exists and can be used as it is. Check with `iggy stream list` before creating it if you're running a setup script more than once.
+
+## Client cannot complete login
+
+Make sure that the client matches the server's protocol. Server 0.10.0 uses protocol 0.12.0 and rejects incompatible clients during login. A malformed old client can report a disconnect rather than a useful compatibility error.
+
+Use Rust SDK 0.12.0 or Python SDK 0.10.0 with this server. See [Server compatibility](/docs/sdk/introduction#server-compatibility) for the other languages. Also make sure that credentials match the stored account, not just the current bootstrap environment.
+
+## NUMA memory binding fails
+
+Apache Iggy 0.10.0 skips memory binding when the detected topology has one NUMA node. On a multi-node topology, container policy or host restrictions can still reject memory binding.
+
+Set `IGGY_SHARDING_CPU_ALLOCATION=all` when CPU pinning without NUMA memory binding fits the deployment. Inspect the host topology and allowed CPU set before changing production placement. See [Linux tuning](/docs/server/linux-tuning#cpu-placement-and-numa).
