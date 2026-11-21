@@ -244,7 +244,10 @@ policy. Rust and Python use their configured retry schedule rather than
 429/503 retry strategy.
 
 A 503 answer to a write means that nothing was admitted, so the write can be sent
-again. A 502 or 504 answer to a write means that its outcome is unknown, and the
+again. A 507 answer to a send, body `id` 4109 (`FreeSpaceReserveReached`), means
+the same: the data disk of the partition primary is below
+`[node] free_space_reserve`. It carries `Retry-After: 1`, and the Rust, C# and
+Java SDKs send it again as they do a 503. A 502 or 504 answer to a write means that its outcome is unknown, and the
 write can still commit. The body `id` 57 (`TransientNotCommitted`) or the body
 `code`, such as `produce_timeout`, names the cause. Read the state before writing
 again, because a resend is a new request that can apply twice. The Rust, C# and

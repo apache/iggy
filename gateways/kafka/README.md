@@ -716,6 +716,7 @@ One partition, one Iggy send. Each partition answers for itself.
 | 35 | Transactional or control batch | Fails. |
 | 6 | Request budget ran out. Or the send did not reach Iggy by the deadline, or Iggy refused it: no primary, partition busy or recreated, client shut down. Nothing written. | Retries. |
 | 7 | Deadline passed: after the send went out, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. Possibly written. | Retries. Can duplicate. |
+| 56 | The data disk of the partition primary stayed below `node.free_space_reserve` until the deadline. Nothing written. | Retries. |
 
 Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
 per slot. Past it: 10.
@@ -1075,6 +1076,10 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
   through `ensure_topic`'s `partition_count` argument once it exceeds the server's cap
 - A create past the node's partition cap (`PartitionsLimitReached`, 2022) → `POLICY_VIOLATION`
   (44). See `metadata.partitions_max` below
+- A send refused below the free-space reserve of the partition primary
+  (`FreeSpaceReserveReached`, 4109) → `KAFKA_STORAGE_ERROR` (56), which Kafka clients retry.
+  Nothing was written. The SDK already retried it until its deadline. See `node.free_space_reserve`
+  below
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 
 Fetch folds these into the codes a consumer handles: 7 → 6, 17 → 3, and any other code → -1.
@@ -1099,6 +1104,7 @@ an operator has to.
 | ------- | --------- | ------- |
 | Consumer offset keys per partition, per consumer kind | 4096, ceiling 262144 | `partition.consumer_offsets_max` |
 | Partitions of one node, all streams and topics | 0, no cap | `metadata.partitions_max` |
+| Free space each node keeps on its data disk | 1 GiB | `node.free_space_reserve` |
 | One user header name, and one header value | 255 bytes | fixed, `user_headers.rs` |
 | All user headers of one message | 100 KB | fixed, `MAX_USER_HEADERS_SIZE` |
 | Message payload | 64 MB | fixed, `MAX_PAYLOAD_SIZE` |

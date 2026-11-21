@@ -140,6 +140,12 @@ pub trait MessageClient {
     /// message durability also requires recoverable stable-storage copies on
     /// the quorum.
     ///
+    /// While the free space on the data disk of the partition primary is below
+    /// `[node] free_space_reserve`, the primary refuses the send with
+    /// `FreeSpaceReserveReached` (4109) and stores nothing. Binary clients send
+    /// it again to the same primary until the request deadline, and then return
+    /// that error. HTTP clients send it again up to their configured retries.
+    ///
     /// Binary clients refresh the partition context once after a definitive
     /// `HistoryUnavailable` (87) refusal. A refusal after an uncertain send
     /// keeps its original context and returns `OperationUncertain(op)`.

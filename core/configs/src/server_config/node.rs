@@ -36,7 +36,8 @@ pub struct NodeConfig {
     #[serde(default)]
     pub advertised_address: Option<String>,
     /// Free space the node keeps on its data disk. While less is free, the
-    /// node refuses new messages for the partitions it leads. `0` disables it.
+    /// node refuses new messages for the partitions it leads with
+    /// `FreeSpaceReserveReached` (4109). `0` disables it.
     #[serde(default = "default_free_space_reserve")]
     #[config_env(leaf)]
     pub free_space_reserve: IggyByteSize,

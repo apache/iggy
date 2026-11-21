@@ -465,6 +465,7 @@ This node's own client-facing identity. The address is read only while `cluster.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `advertised_address` | unset | The address clients dial, published in cluster metadata. A literal IP or a DNS hostname. Left unset, the server derives it from the bind address of the first enabled listener. That fails when the listener binds a wildcard, and the server refuses to start rather than publish an address no client can use. Declaring the unspecified address (`0.0.0.0`, `::`) is refused for the same reason. |
+| `free_space_reserve` | `"1 GiB"` | Free space the node keeps on the disk of its data directory. While less is free, the node refuses new messages for the partitions it leads with `FreeSpaceReserveReached` (4109), HTTP 507 over HTTP and `KAFKA_STORAGE_ERROR` (56) through the Kafka gateway, and stores nothing of them. Binary SDK clients send a refused batch again to the same node until the request deadline, then return 4109. HTTP clients send it again as they do after a 503, within their own retry configuration. Consumer offsets, retention and segment deletion keep working, so the node can free space. The free space is a sample of the disk taken once a second, minus what the node wrote and accepted since. `"0"` disables the reserve. Watch `data_disk_below_free_space_reserve` on each node. |
 
 ### `[cluster]`
 
