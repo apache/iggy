@@ -44,7 +44,7 @@ use prometheus_client::metrics::histogram::{Histogram, exponential_buckets};
 use prometheus_client::registry::Registry;
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
 use consensus::ReplicationStats;
@@ -52,6 +52,7 @@ use iggy_binary_protocol::{COMMAND_TABLE, Command, command_index};
 use iggy_common::ConsumerKind;
 use message_bus::{ReplicaLinkMetrics, ReplicaReadMetrics};
 use partitions::CheckpointTrigger;
+use server_common::sharding::IggyNamespace;
 
 /// Label for `frame_drops_total`.
 ///
@@ -114,6 +115,25 @@ impl From<Command> for FrameCommandLabel {
             command: CommandLabel(command),
         }
     }
+}
+
+/// What one partition that places its batches has yet to rewrite into
+/// long-term segments, as the shard that leads it found at its last tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongTermLag {
+    pub namespace: IggyNamespace,
+    /// Messages it committed that no long-term segment holds.
+    pub messages: u64,
+    /// Bytes of those messages, `None` until its replica counted them.
+    pub bytes: Option<u64>,
+}
+
+/// The lags a shard reported last, and the list of the report before it,
+/// which the next report fills so that a tick allocates none.
+#[derive(Debug, Default)]
+struct LongTermLags {
+    reported: Vec<LongTermLag>,
+    spare: Vec<LongTermLag>,
 }
 
 /// Variant labels used in `frame_drops_total`. Exposed as constants to
@@ -398,6 +418,10 @@ pub struct ShardMetrics {
     partitions_below_write_quorum: Gauge,
     partitions_owing_retirement: Gauge,
     partition_segment_upload_lag_seconds: Gauge,
+    partition_long_term_rewrite_lag_messages: Gauge,
+    partition_long_term_backlog_bytes: Gauge,
+    partition_long_term_lags: Arc<Mutex<LongTermLags>>,
+    partition_long_term_delayed_sends_total: Counter,
     retirement_debts_paid_total: Counter,
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
@@ -571,6 +595,10 @@ impl ShardMetrics {
             partitions_below_write_quorum: Gauge::default(),
             partitions_owing_retirement: Gauge::default(),
             partition_segment_upload_lag_seconds: Gauge::default(),
+            partition_long_term_rewrite_lag_messages: Gauge::default(),
+            partition_long_term_backlog_bytes: Gauge::default(),
+            partition_long_term_lags: Arc::default(),
+            partition_long_term_delayed_sends_total: Counter::default(),
             retirement_debts_paid_total: Counter::default(),
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
@@ -1425,6 +1453,77 @@ impl ShardMetrics {
         self.partition_segment_upload_lag_seconds.get()
     }
 
+    /// Republished by the pump's tick: the most messages one partition this
+    /// shard leads committed that no long-term segment holds yet, as the
+    /// partition's last rewrite pass found. Zero when none waits.
+    pub fn set_long_term_rewrite_lag(&self, messages: u64) {
+        self.partition_long_term_rewrite_lag_messages
+            .set(i64::try_from(messages).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_rewrite_lag_value(&self) -> i64 {
+        self.partition_long_term_rewrite_lag_messages.get()
+    }
+
+    /// Republished by the pump's tick: the most bytes of messages one
+    /// partition this shard leads committed that no long-term segment holds
+    /// yet, as far as its replica counted them.
+    pub fn set_long_term_backlog(&self, bytes: u64) {
+        self.partition_long_term_backlog_bytes
+            .set(i64::try_from(bytes).unwrap_or(i64::MAX));
+    }
+
+    /// An empty list for the pump's tick to fill and hand to
+    /// [`Self::set_long_term_lags`].
+    #[must_use]
+    pub fn long_term_lags_to_fill(&self) -> Vec<LongTermLag> {
+        let mut spare = std::mem::take(&mut self.lock_long_term_lags().spare);
+        spare.clear();
+        spare
+    }
+
+    /// Republished by the pump's tick: the lag of every partition this shard
+    /// leads that places its batches and has a rewrite wait. A scrape sees
+    /// the whole list of one tick or of the next, never a part.
+    pub fn set_long_term_lags(&self, lags: Vec<LongTermLag>) {
+        let mut held = self.lock_long_term_lags();
+        held.spare = std::mem::replace(&mut held.reported, lags);
+    }
+
+    /// What [`Self::set_long_term_lags`] took last.
+    ///
+    /// Not a registered series: a series per partition carries the names of
+    /// its stream and topic, which a shard does not hold.
+    #[must_use]
+    pub fn long_term_lags(&self) -> Vec<LongTermLag> {
+        self.lock_long_term_lags().reported.clone()
+    }
+
+    fn lock_long_term_lags(&self) -> MutexGuard<'_, LongTermLags> {
+        self.partition_long_term_lags
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A send to a partition past its long-term backlog limit waits before
+    /// the shard takes it.
+    pub(crate) fn record_long_term_delayed_send(&self) {
+        self.partition_long_term_delayed_sends_total.inc();
+    }
+
+    /// Test-only read: the largest backlog and the delayed sends.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn long_term_backlog_value(&self) -> (i64, u64) {
+        (
+            self.partition_long_term_backlog_bytes.get(),
+            self.partition_long_term_delayed_sends_total.get(),
+        )
+    }
+
     pub fn record_retirement_debt_paid(&self) {
         self.retirement_debts_paid_total.inc();
     }
@@ -1838,6 +1937,24 @@ impl ShardMetrics {
             "age of the oldest sealed segment that waits for its upload to the object store, \
              over the tiered partitions this shard leads",
             self.partition_segment_upload_lag_seconds.clone(),
+        );
+        registry.register(
+            "partition_long_term_rewrite_lag_messages",
+            "most messages one partition this shard leads committed that no long-term \
+             segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_rewrite_lag_messages.clone(),
+        );
+        registry.register(
+            "partition_long_term_backlog_bytes",
+            "most bytes of messages one partition this shard leads committed that no \
+             long-term segment holds yet, over the partitions that place their batches",
+            self.partition_long_term_backlog_bytes.clone(),
+        );
+        registry.register(
+            "partition_long_term_delayed_sends",
+            "sends this shard delayed because their partition's long-term backlog passed \
+             tiered_storage.long_term_backlog_limit",
+            self.partition_long_term_delayed_sends_total.clone(),
         );
         registry.register(
             "retirement_debts_paid",

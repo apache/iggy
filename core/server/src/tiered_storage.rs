@@ -34,8 +34,8 @@ use iggy_object_store::{
 };
 use message_bus::IggyMessageBus;
 use partitions::{
-    ExecutorDeleter, ExecutorFreshUploader, ExecutorManifestPublisher, ExecutorObjects,
-    ExecutorUploader, RemoteSegments,
+    ExecutorDeleter, ExecutorFreshUploader, ExecutorLongTermWriter, ExecutorManifestPublisher,
+    ExecutorObjects, ExecutorUploader, RemoteSegments,
 };
 use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
 use shard::{Sender, channel};
@@ -141,6 +141,7 @@ pub fn start(
         config.fresh_upload_interval.get_duration(),
         usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
     );
+    shard.set_long_term_backlog_limit(config.long_term_backlog_limit.as_bytes_u64());
     shard
         .plane
         .partitions()
@@ -160,7 +161,8 @@ pub fn start(
             service.clone(),
             layout.clone(),
         )),
-        Rc::new(ExecutorFreshUploader::new(service, layout.clone())),
+        Rc::new(ExecutorFreshUploader::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorLongTermWriter::new(service, layout.clone())),
     );
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.
@@ -367,6 +369,21 @@ mod tests {
         assert_eq!(
             usize::try_from(config.jobs.fresh_uploads).unwrap(),
             shard::FRESH_UPLOADS
+        );
+    }
+
+    #[test]
+    fn given_default_section_when_reading_the_long_term_backlog_limit_should_give_the_shard_default()
+     {
+        assert_eq!(
+            TieredStorageConfig::default()
+                .long_term_backlog_limit
+                .as_bytes_u64(),
+            shard::rewrite_pacing::LONG_TERM_BACKLOG_LIMIT
+        );
+        assert_eq!(
+            configs::tiered_storage::LONG_TERM_BACKLOG_LIMIT_MIN,
+            partitions::LONG_TERM_SEGMENT_BYTES as u64
         );
     }
 

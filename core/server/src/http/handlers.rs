@@ -116,6 +116,7 @@ use secrecy::zeroize::Zeroizing;
 use secrecy::{ExposeSecret, SecretString};
 use send_wrapper::SendWrapper;
 use serde::{Deserialize, Serialize};
+use shard::metrics::LongTermLag;
 use shard::{
     DeferredPollContext, DeferredPollRequest, PartitionRead, PartitionReadReply, PollQuotaIdentity,
 };
@@ -138,7 +139,7 @@ use crate::http::forward::{
     FirstAttempt, PartitionEffect, PartitionHop, PartitionRequest, require_local_primary,
     serve_partition,
 };
-use crate::http::metrics::{TopicUsageSample, gauge_value};
+use crate::http::metrics::{LongTermLagSample, TopicUsageSample, gauge_value};
 use crate::http::reads::{
     authorize_data_plane, authorize_read, await_metadata_floor, await_recovery_barrier,
     check_partition_freshness, check_partition_incarnation, gate_local_read, read_local,
@@ -709,7 +710,12 @@ pub(in crate::http) async fn get_metrics(
         .authorize(|permissioner| permissioner.get_stats(identity.user_id))
         .is_ok();
     let topic_gauges = exports_stats && state.server_config.http.metrics.topic_gauges;
-    let (counts, segments_count, messages_count, topic_usage) = state
+    let lags = if topic_gauges {
+        state.metrics.shard_long_term_lags()
+    } else {
+        Vec::new()
+    };
+    let (counts, segments_count, messages_count, topic_usage, long_term_lags) = state
         .shard
         .plane
         .metadata()
@@ -726,6 +732,7 @@ pub(in crate::http) async fn get_metrics(
                 } else {
                     Vec::new()
                 },
+                long_term_lag_samples(streams, &lags),
             )
         });
     let users_count = state
@@ -747,6 +754,7 @@ pub(in crate::http) async fn get_metrics(
     metrics.users.set(gauge_value(users_count));
     metrics.clients.set(gauge_value(clients_count));
     metrics.topic_usage.replace(topic_usage);
+    metrics.long_term_lags.replace(long_term_lags);
     Ok(metrics.formatted_output(exports_stats))
 }
 
@@ -769,6 +777,24 @@ fn topic_usage_samples(streams: &StreamsInner) -> Vec<TopicUsageSample> {
         }
     }
     samples
+}
+
+/// One sample per lag, named by its stream and topic. A partition whose
+/// topic the metadata does not hold is left out.
+fn long_term_lag_samples(streams: &StreamsInner, lags: &[LongTermLag]) -> Vec<LongTermLagSample> {
+    lags.iter()
+        .filter_map(|lag| {
+            let stream = streams.items.get(lag.namespace.stream_id())?;
+            let topic = stream.topics.get(lag.namespace.topic_id())?;
+            Some(LongTermLagSample {
+                stream: Arc::clone(&stream.name),
+                topic: Arc::clone(&topic.name),
+                partition: lag.namespace.partition_id(),
+                messages: lag.messages,
+                bytes: lag.bytes,
+            })
+        })
+        .collect()
 }
 
 /// `POST /snapshot`: collect a diagnostic archive and return it as a ZIP
@@ -2431,11 +2457,48 @@ mod tests {
         SendMessagesConfirmationResponse, SendMessagesResponse,
     };
     use iggy_common::{OptionInputMap, OptionInputValue, OptionKey, SendMessages};
+    use metadata::stm::stream::{Stream, Topic};
     use serde_json::Value;
+    use server_common::sharding::IggyNamespace;
 
     use crate::http::reply::classify_partition_reply;
     use crate::http::wire::build_request_message;
     use crate::reply_frame::build_deny_reply;
+
+    #[test]
+    fn given_lags_when_sampling_them_should_name_each_by_its_stream_and_topic_and_drop_the_unknown()
+    {
+        let mut streams = StreamsInner::default();
+        let mut stream = Stream::default();
+        stream.name = Arc::from("orders");
+        let topic_id = stream.topics.insert(Topic {
+            name: Arc::from("eu"),
+            ..Topic::default()
+        });
+        let stream_id = streams.items.insert(stream);
+        let lag = |stream_id, topic_id, partition_id, bytes| LongTermLag {
+            namespace: IggyNamespace::new(stream_id, topic_id, partition_id),
+            messages: 7,
+            bytes,
+        };
+
+        let samples = long_term_lag_samples(
+            &streams,
+            &[
+                lag(stream_id, topic_id, 2, Some(4096)),
+                lag(stream_id, topic_id + 1, 0, None),
+                lag(stream_id + 1, topic_id, 0, None),
+            ],
+        );
+
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        let sample = &samples[0];
+        assert_eq!((&*sample.stream, &*sample.topic), ("orders", "eu"));
+        assert_eq!(
+            (sample.partition, sample.messages, sample.bytes),
+            (2, 7, Some(4096))
+        );
+    }
 
     #[tokio::test]
     async fn given_a_committing_poll_when_sent_as_get_should_refuse_it_and_name_the_post_route() {

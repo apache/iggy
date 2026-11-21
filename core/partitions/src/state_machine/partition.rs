@@ -33,6 +33,7 @@ use super::{
     state_machine_pipeline_slots,
 };
 use crate::IggyPartition;
+use crate::long_term::LongTermLog;
 use crate::tiered_floor::TieredFloor;
 use crate::types::FatalCommit;
 
@@ -68,7 +69,8 @@ where
     /// Returns an error when called twice, or after the partition restored or
     /// applied an op.
     pub fn register_builtin_state_machines(&mut self) -> Result<(), RegistrationError> {
-        self.register_state_machine(Box::new(TieredFloor::default()))
+        self.register_state_machine(Box::new(TieredFloor::default()))?;
+        self.register_state_machine(Box::new(LongTermLog::default()))
     }
 
     #[must_use]
@@ -234,11 +236,14 @@ where
         let advance = (command.kind == crate::tiered_floor::ADVANCE_TIERED_FLOOR)
             .then(|| crate::tiered_floor::AdvanceTieredFloor::try_from(command.payload).ok())
             .flatten();
+        let long_term_floor = self.long_term_floor();
         match self.state_machines.apply(header.op, command) {
             Ok(Applied::Changed) => {
                 if let Some(advance) = advance {
                     self.note_tiered_advance(advance);
                 }
+                self.note_long_term_command(command.kind);
+                self.note_long_term_advance(long_term_floor);
                 true
             }
             Ok(Applied::Refused) => {
@@ -312,6 +317,8 @@ where
         snapshot: Option<&StateMachineSnapshot>,
         op: u64,
     ) -> Result<(), StateMachineError> {
+        // The long-term floor and the log under it may both change here.
+        self.long_term_backlog.forget();
         let Some(snapshot) = snapshot else {
             self.state_machines.reset();
             self.state_machines.advance_applied(op);

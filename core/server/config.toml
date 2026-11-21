@@ -192,7 +192,10 @@ endpoint = "/metrics"
 
 # Export the per-topic series (`topic_size_bytes`, `topic_messages` and
 # `topic_max_size_bytes`). Each scrape walks every topic to build them, which
-# costs time and memory on a node with many topics.
+# costs time and memory on a node with many topics. The same switch exports
+# the per-partition series of the geo topics this node leads
+# (`topic_partition_long_term_lag_messages` and
+# `topic_partition_long_term_lag_bytes`).
 # `true` exports them to users who may read the server stats.
 # `false` exports only the node totals.
 topic_gauges = true
@@ -1523,6 +1526,17 @@ handshake_grace = "10 s"
 # interval means fewer and larger objects, so fewer store requests, and a
 # longer wait for every producer. Up to 10 s.
 #fresh_upload_interval = "10 ms"
+# The bytes of messages one partition that stores them in fresh objects may
+# have committed that its primary has not yet rewritten into long-term
+# segments. Past it, the primary slows the sends to that partition and never
+# refuses them: each send waits before it is taken, 10 ms just past the limit
+# and longer the further past it is, up to 250 ms at twice the limit. A
+# producer that waits for each answer then sends less, and the rewrites catch
+# up. Sends to other partitions are not slowed. The next rewrite of a
+# partition past the limit does not wait out its usual interval, only the
+# shortest one, 250 ms after its last rewrite. "0" turns the delay off.
+# Otherwise at least 64 MiB, what one long-term segment holds.
+#long_term_backlog_limit = "1 GiB"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
 # alone. Only segment uploads and object deletes go through these caps so

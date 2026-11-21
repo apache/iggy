@@ -102,6 +102,17 @@ pub fn stage_owned_partitions(
             continue;
         };
 
+        // A partition that places its batches rewrites them into long-term
+        // segments and publishes what it stored. Each pass does nothing on a
+        // replica that is not its primary.
+        if shard.plane.partitions().places_batches(&namespace)
+            && let Some(created_revision) =
+                streams.with_committed_partition(namespace, |partition| partition.created_revision)
+        {
+            shard.request_rewrite_segments(namespace, created_revision);
+            shard.request_publish_manifest(namespace, created_revision, now);
+        }
+
         // `ServerDefault` resolves to "never expire" here, matching the legacy
         // cleaner: a topic created with the server default never expires
         // segments unless an explicit duration was stored.

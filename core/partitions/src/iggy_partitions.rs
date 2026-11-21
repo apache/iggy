@@ -978,11 +978,31 @@ where
     /// Give every partition here, and every one inserted later, the store
     /// its remote segments are read from.
     ///
-    /// A partition that is here already takes it at its next poll, on the
-    /// pump: the pump can hold a partition across a suspension, so no other
-    /// task writes to one.
+    /// A partition that is here already takes it the next time the pump
+    /// reaches for it through [`Self::get_mut_with_remote`]: the pump can
+    /// hold a partition across a suspension, so no other task writes to one.
     pub fn set_remote_segments(&self, remote: Rc<crate::RemoteSegments>) {
         *self.remote_segments.borrow_mut() = Some(remote);
+    }
+
+    /// [`Self::get_mut_by_ns`] for work that reads the partition's remote
+    /// data: a poll, or the rewrite of its placed batches. A partition that
+    /// was here before the shard got its store takes the store now.
+    ///
+    /// Pump only, as [`Self::get_mut_by_ns`].
+    #[allow(clippy::mut_from_ref)]
+    pub fn get_mut_with_remote(
+        &self,
+        namespace: &IggyNamespace,
+    ) -> Option<&mut IggyPartition<B, SB>> {
+        let remote = self.remote_segments.borrow().clone();
+        let partition = self.get_mut_by_ns(namespace)?;
+        if !partition.has_remote_segments()
+            && let Some(remote) = remote
+        {
+            partition.set_remote_segments(remote);
+        }
+        Some(partition)
     }
 
     /// The store the partitions here read their remote data from, `None` on
@@ -1570,13 +1590,7 @@ where
         // inside), so no sibling task can remove the partition under it.
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
-        let remote = self.remote_segments.borrow().clone();
-        let partition = self.get_mut_by_ns(namespace)?;
-        if !partition.has_remote_segments()
-            && let Some(remote) = remote
-        {
-            partition.set_remote_segments(remote);
-        }
+        let partition = self.get_mut_with_remote(namespace)?;
         Some(partition.build_poll_plan_within(consumer, args, validate_checksum, byte_budget))
     }
 
