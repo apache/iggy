@@ -821,7 +821,7 @@ impl BucketWatch {
     }
 
     /// The passes in which something read the bucket so far: runs of reads
-    /// with no gap longer than [`READ_PASS_GAP`] inside.
+    /// with no gap longer than `READ_PASS_GAP` inside.
     #[must_use]
     pub fn read_passes(&self) -> usize {
         let mut passes = 0;
@@ -894,7 +894,7 @@ impl From<Event> for BucketEvent {
 /// owns the bucket reads it too, for its own sweeps and rewrites, so a watch
 /// on the bucket cannot tell whose reads it saw. A watch on the mirror can.
 ///
-/// Every [`MIRROR_INTERVAL`] the thread copies each file that is new or was
+/// Every `MIRROR_INTERVAL` the thread copies each file that is new or was
 /// replaced, through a scratch file that it renames over the copy, and
 /// removes the copies of files that left the bucket. It opens nothing under
 /// the mirror but its scratch files, whose names start with a dot.
