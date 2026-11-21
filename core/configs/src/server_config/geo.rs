@@ -405,7 +405,13 @@ impl GeoPeerConfig {
 /// lowercase ASCII letters, digits and `-`, starting with a letter and not
 /// ending with `-`. It holds no `_`, so `__shadow_{origin}_{stream}` splits
 /// back at the first `_` after the marker.
-fn check_origin(origin: &str) -> Result<(), &'static str> {
+/// Why `origin` cannot name a cluster among the datacenters: a lowercase
+/// letter, then lowercase letters, digits and '-', at most
+/// [`MAX_ORIGIN_LEN`] bytes, not ending with '-'.
+///
+/// # Errors
+/// The reason, as a phrase that follows the name.
+pub fn check_origin(origin: &str) -> Result<(), &'static str> {
     // The reasons below spell out the limit.
     const _: () = assert!(MAX_ORIGIN_LEN == 32);
     if origin.is_empty() {

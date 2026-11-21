@@ -28,6 +28,8 @@
 //! their etags. The shard reads and commits the ones that changed, see
 //! `shard::ListedPeerManifest`.
 //!
+//! A peer whose origin retired is listed no more.
+//!
 //! A listing of a peer that fails is tried again after a wait that doubles,
 //! up to [`LIST_BACKOFF_MAX`]. The listings and reads go to the peer's own
 //! tier service in its housekeeping class, so neither a slow peer nor a busy
@@ -319,11 +321,16 @@ fn hand_out(
 
 /// The shadow partitions whose primary this node is, as their last reported
 /// view names it, grouped by peer stream. A detached shadow topic takes no
-/// new data, so it is left out.
+/// new data, and nothing of a retired origin is followed, so both are left
+/// out.
 fn wanted(inner: &StreamsInner, place: NodePlace) -> Vec<Wanted> {
     let mut wanted = Vec::new();
     for (stream_id, stream) in &inner.items {
-        let Some(source) = &stream.shadow else {
+        let Some(source) = stream
+            .shadow
+            .as_ref()
+            .filter(|source| !inner.retired_origins.contains_key(&source.origin))
+        else {
             continue;
         };
         let mut partitions = HashMap::new();

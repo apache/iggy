@@ -689,6 +689,18 @@ where
         change
     }
 
+    /// Serve no fresh batch again: the origin retired, so the tail would
+    /// grow no more, and each node found its own. Every replica then serves
+    /// what the committed manifests list, and nothing else.
+    pub fn drop_peer_fresh(&mut self) {
+        let Some(peer) = self.peer_log.as_deref_mut() else {
+            return;
+        };
+        if peer.fresh.clear() {
+            self.publish_poll_visibility();
+        }
+    }
+
     /// The store no longer holds the fresh object `object_id`.
     pub fn mark_peer_fresh_gone(&mut self, object_id: FreshObjectId) {
         if let Some(peer) = self.peer_log.as_deref_mut() {

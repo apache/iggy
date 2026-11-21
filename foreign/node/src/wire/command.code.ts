@@ -26,6 +26,7 @@ export const COMMAND_CODE = {
   BindSession: 15,
   UpdateResource: 16,
   GetMetadataChanges: 17,
+  RetireGeoOrigin: 18,
   GetMe: 20,
   GetClient: 21,
   GetClients: 22,

@@ -33,7 +33,8 @@
 //!
 //! The listings and reads go to the peer's own tier service in its
 //! housekeeping class, as the listings of its manifests do, with the same
-//! back-off for a peer whose listing failed.
+//! back-off for a peer whose listing failed. A peer whose origin retired is
+//! listed no more.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -127,12 +128,12 @@ impl PeerPositionLister {
             return;
         }
         state.next_pass_at = now.as_micros().saturating_add(interval);
-        let leads = shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|inner| leads_geo_partition(inner, &self.origin, place));
+        let (leads, retired) = shard.plane.metadata().mux_stm.streams().read(|inner| {
+            (
+                leads_geo_partition(inner, &self.origin, place),
+                inner.retired_origins.clone(),
+            )
+        });
         if !leads {
             return;
         }
@@ -141,10 +142,11 @@ impl PeerPositionLister {
         let mut reads = Vec::new();
         for peer in peers.iter() {
             let origin = peer.origin().to_owned();
-            if state
-                .backoff
-                .get(&origin)
-                .is_some_and(|(_, next_at)| now.as_micros() < *next_at)
+            if retired.contains_key(&origin)
+                || state
+                    .backoff
+                    .get(&origin)
+                    .is_some_and(|(_, next_at)| now.as_micros() < *next_at)
             {
                 continue;
             }

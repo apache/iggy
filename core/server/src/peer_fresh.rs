@@ -45,7 +45,8 @@
 //! cutover of each partition.
 //!
 //! All reads go to the peer's own tier service in a class of their own, so
-//! neither a busy peer nor this node's polls hold them back.
+//! neither a busy peer nor this node's polls hold them back. A peer whose
+//! origin retired is followed no more.
 
 #![allow(
     clippy::future_not_send,
@@ -197,12 +198,17 @@ impl PeerFreshFollower {
 
 /// The routes of each peer that a shadow partition here follows, for the
 /// peers whose shadow partitions this node leads one of, as their last
-/// reported view names it. A detached shadow topic takes no new data.
+/// reported view names it. A detached shadow topic takes no new data, and
+/// nothing of a retired origin is followed.
 fn followed(inner: &StreamsInner, place: NodePlace) -> BTreeMap<String, Routes> {
     let mut routes: BTreeMap<String, Routes> = BTreeMap::new();
     let mut leads: BTreeMap<String, bool> = BTreeMap::new();
     for (stream_id, stream) in &inner.items {
-        let Some(source) = &stream.shadow else {
+        let Some(source) = stream
+            .shadow
+            .as_ref()
+            .filter(|source| !inner.retired_origins.contains_key(&source.origin))
+        else {
             continue;
         };
         for (topic_id, topic) in &stream.topics {

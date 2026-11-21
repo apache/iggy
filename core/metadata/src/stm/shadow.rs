@@ -41,18 +41,26 @@
 //! disk, from its store, into the cluster rebuilt in its place: a restored
 //! stream and topic are this cluster's own, with the ids and the revision
 //! that the lost cluster gave them, so their objects keep their keys.
+//!
+//! An operator retires a peer that never returns with a
+//! [`RetireGeoOriginRequest`]. This cluster then follows nothing of the
+//! origin again, its shadow topics expire by their own retention, and a
+//! client may delete its shadow streams and topics. The retirement names the
+//! origin, so a datacenter that comes back needs another origin name.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use iggy_binary_protocol::codec::{
     WireDecode, WireEncode, read_bytes, read_u8, read_u32_le, read_u64_le, read_u128_le,
 };
 use iggy_binary_protocol::requests::streams::DeleteStreamRequest;
+use iggy_binary_protocol::requests::system::RetireGeoOriginRequest;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
 };
 use iggy_binary_protocol::{WireError, WireIdentifier, WireName};
 use iggy_common::IggyTimestamp;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::change_log::{AppliedChange, change_actor, stream_body};
@@ -101,6 +109,51 @@ pub struct ShadowTopic {
     /// When the peer wrote the topic's tombstone, in microseconds since the
     /// Unix epoch. `None` while the peer holds the topic.
     pub deleted_at: Option<u64>,
+    /// The retention of the topic in the peer, as its object said at
+    /// adoption. A geo topic keeps its options, so it does not change. It
+    /// applies once the peer's origin retired.
+    #[serde(default)]
+    pub retention: ShadowRetention,
+}
+
+/// The retention of a peer's geo topic, as the topic's object writes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShadowRetention {
+    /// How long a message lives, in microseconds, `u64::MAX` when messages
+    /// never expire.
+    pub message_expiry: u64,
+    /// The most bytes that the topic holds, `u64::MAX` without a limit.
+    pub max_topic_size: u64,
+}
+
+impl Default for ShadowRetention {
+    fn default() -> Self {
+        Self {
+            message_expiry: u64::MAX,
+            max_topic_size: u64::MAX,
+        }
+    }
+}
+
+impl ShadowRetention {
+    /// How long a message lives, in microseconds, `None` when messages never
+    /// expire.
+    #[must_use]
+    pub const fn expiry_micros(&self) -> Option<u64> {
+        match self.message_expiry {
+            0 | u64::MAX => None,
+            micros => Some(micros),
+        }
+    }
+
+    /// The most bytes that the topic holds, `None` without a limit.
+    #[must_use]
+    pub const fn max_bytes(&self) -> Option<u64> {
+        match self.max_topic_size {
+            0 | u64::MAX => None,
+            bytes => Some(bytes),
+        }
+    }
 }
 
 impl ShadowTopic {
@@ -147,6 +200,7 @@ pub enum ShadowTopicRequest {
     AdoptTopic {
         target: ShadowTopicTarget,
         create: Box<CreateTopicWithAssignmentsRequest>,
+        retention: ShadowRetention,
     },
     /// The peer deleted the topic at `deleted_at`.
     DetachTopic {
@@ -215,7 +269,7 @@ impl ShadowTopicRequest {
 //   rename stream: stream_id u32 | name
 //   remove stream: stream_id u32
 //   adopt topic:   stream_id u32 | topic_id u32 | created_revision u64
-//                  | create length u32 | create
+//                  | create length u32 | create | retention
 //   detach topic:  stream_id u32 | topic_id u32 | created_revision u64
 //                  | deleted_at u64
 //   remove topic:  stream_id u32 | topic_id u32 | created_revision u64
@@ -223,10 +277,13 @@ impl ShadowTopicRequest {
 //   restore topic: stream_id u32 | topic_id u32 | created_revision u64
 //                  | create length u32 | create
 //
+// A retention is message_expiry u64 | max_topic_size u64.
+//
 // A restore carries this cluster's origin, the retired cluster's
 // cluster_uid and the stream's id there.
 
 const TARGET_LEN: usize = 4 + 4 + 8;
+const RETENTION_LEN: usize = 8 + 8;
 
 impl WireEncode for ShadowTopicRequest {
     fn encoded_size(&self) -> usize {
@@ -238,9 +295,10 @@ impl WireEncode for ShadowTopicRequest {
             }
             Self::RenameStream { name, .. } => 4 + name.encoded_size(),
             Self::RemoveStream { .. } => 4,
-            Self::AdoptTopic { create, .. } | Self::RestoreTopic { create, .. } => {
-                TARGET_LEN + 4 + create.encoded_size()
+            Self::AdoptTopic { create, .. } => {
+                TARGET_LEN + 4 + create.encoded_size() + RETENTION_LEN
             }
+            Self::RestoreTopic { create, .. } => TARGET_LEN + 4 + create.encoded_size(),
             Self::DetachTopic { .. } => TARGET_LEN + 8,
             Self::RemoveTopic { .. } => TARGET_LEN,
         }
@@ -263,12 +321,15 @@ impl WireEncode for ShadowTopicRequest {
                 name.encode(buf);
             }
             Self::RemoveStream { stream_id, .. } => buf.put_u32_le(*stream_id),
-            Self::AdoptTopic { target, create } | Self::RestoreTopic { target, create } => {
-                encode_target(target, buf);
-                let length = u32::try_from(create.encoded_size()).expect("a create fits u32");
-                buf.put_u32_le(length);
-                create.encode(buf);
+            Self::AdoptTopic {
+                target,
+                create,
+                retention,
+            } => {
+                encode_create(target, create, buf);
+                encode_retention(retention, buf);
             }
+            Self::RestoreTopic { target, create } => encode_create(target, create, buf),
             Self::DetachTopic { target, deleted_at } => {
                 encode_target(target, buf);
                 buf.put_u64_le(*deleted_at);
@@ -282,6 +343,29 @@ fn encode_target(target: &ShadowTopicTarget, buf: &mut BytesMut) {
     buf.put_u32_le(target.stream_id);
     buf.put_u32_le(target.topic_id);
     buf.put_u64_le(target.created_revision);
+}
+
+fn encode_create(
+    target: &ShadowTopicTarget,
+    create: &CreateTopicWithAssignmentsRequest,
+    buf: &mut BytesMut,
+) {
+    encode_target(target, buf);
+    let length = u32::try_from(create.encoded_size()).expect("a create fits u32");
+    buf.put_u32_le(length);
+    create.encode(buf);
+}
+
+fn encode_retention(retention: &ShadowRetention, buf: &mut BytesMut) {
+    buf.put_u64_le(retention.message_expiry);
+    buf.put_u64_le(retention.max_topic_size);
+}
+
+fn decode_retention(buf: &[u8], position: usize) -> Result<ShadowRetention, WireError> {
+    Ok(ShadowRetention {
+        message_expiry: read_u64_le(buf, position)?,
+        max_topic_size: read_u64_le(buf, position + 8)?,
+    })
 }
 
 impl WireDecode for ShadowTopicRequest {
@@ -339,7 +423,13 @@ impl WireDecode for ShadowTopicRequest {
                             Box::new(CreateTopicWithAssignmentsRequest::decode_from(bytes)?);
                         position += 4 + length;
                         if kind == ADOPT_TOPIC {
-                            Self::AdoptTopic { target, create }
+                            let retention = decode_retention(buf, position)?;
+                            position += RETENTION_LEN;
+                            Self::AdoptTopic {
+                                target,
+                                create,
+                                retention,
+                            }
                         } else {
                             Self::RestoreTopic { target, create }
                         }
@@ -370,6 +460,43 @@ fn slice_from(buf: &[u8], offset: usize) -> Result<&[u8], WireError> {
     })
 }
 
+/// A geo peer that never returns, which this cluster no longer follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredOrigin {
+    /// The cluster lifetimes that the shadow streams of the origin came
+    /// from when it retired, in ascending order.
+    pub cluster_uids: Vec<u128>,
+    /// When the retirement committed, in microseconds since the Unix epoch.
+    pub retired_at: u64,
+}
+
+impl StateHandler for RetireGeoOriginRequest {
+    type State = StreamsInner;
+
+    /// Retire the origin once. Retiring it again changes nothing, so a
+    /// retried command keeps the first time.
+    fn apply(&self, state: &mut StreamsInner, timestamp: IggyTimestamp) -> ApplyReply {
+        let origin = self.origin.as_str();
+        if !state.retired_origins.contains_key(origin) {
+            let cluster_uids: BTreeSet<u128> = state
+                .items
+                .iter()
+                .filter_map(|(_, stream)| stream.shadow.as_ref())
+                .filter(|source| source.origin == origin)
+                .map(|source| source.cluster_uid)
+                .collect();
+            state.retired_origins.insert(
+                origin.to_owned(),
+                RetiredOrigin {
+                    cluster_uids: cluster_uids.into_iter().collect(),
+                    retired_at: timestamp.as_micros(),
+                },
+            );
+        }
+        ApplyReply::ok(Bytes::new())
+    }
+}
+
 impl StateHandler for ShadowTopicRequest {
     type State = StreamsInner;
 
@@ -385,7 +512,11 @@ impl StateHandler for ShadowTopicRequest {
             Self::RemoveStream { stream_id, source } => {
                 remove_stream(state, *stream_id, source, timestamp)
             }
-            Self::AdoptTopic { target, create } => adopt_topic(state, target, create, timestamp),
+            Self::AdoptTopic {
+                target,
+                create,
+                retention,
+            } => adopt_topic(state, target, create, *retention, timestamp),
             Self::DetachTopic { target, deleted_at } => detach_topic(state, target, *deleted_at),
             Self::RemoveTopic { target } => remove_topic(state, target, timestamp),
             Self::RestoreStream { source, name } => restore_stream(state, source, name, timestamp),
@@ -538,6 +669,7 @@ fn adopt_topic(
     state: &mut StreamsInner,
     target: &ShadowTopicTarget,
     create: &CreateTopicWithAssignmentsRequest,
+    retention: ShadowRetention,
     timestamp: IggyTimestamp,
 ) -> ApplyReply {
     if shadow_topic_ids(state, target).is_some() {
@@ -549,6 +681,7 @@ fn adopt_topic(
     let shadow = ShadowTopic {
         created_revision: target.created_revision,
         deleted_at: None,
+        retention,
     };
     create_topic(
         state,
@@ -781,8 +914,15 @@ mod tests {
                 derived_options: WireOptions::empty(),
                 partitions: assignments(partitions),
             }),
+            retention: RETENTION,
         }
     }
+
+    /// The retention of the peer's topic: a day, and a gigabyte.
+    const RETENTION: ShadowRetention = ShadowRetention {
+        message_expiry: 86_400_000_000,
+        max_topic_size: 1 << 30,
+    };
 
     /// A shadow stream holding the peer's topic `PEER_TOPIC` with two
     /// partitions, after a plain stream of this cluster at id 0.
@@ -1050,6 +1190,7 @@ mod tests {
             Some(ShadowTopic {
                 created_revision: PEER_REVISION,
                 deleted_at: None,
+                retention: RETENTION,
             })
         );
         let ids: Vec<usize> = topic
@@ -1076,7 +1217,12 @@ mod tests {
     #[test]
     fn given_another_incarnation_when_adopted_should_wait_for_the_old_one() {
         let (mut inner, stream_id) = shadowed();
-        let ShadowTopicRequest::AdoptTopic { mut target, create } = adoption(stream_id, 2) else {
+        let ShadowTopicRequest::AdoptTopic {
+            mut target,
+            create,
+            retention,
+        } = adoption(stream_id, 2)
+        else {
             unreachable!()
         };
         target.created_revision = PEER_REVISION + 1;
@@ -1084,7 +1230,11 @@ mod tests {
         let reply = apply(
             &mut inner,
             4,
-            &ShadowTopicRequest::AdoptTopic { target, create },
+            &ShadowTopicRequest::AdoptTopic {
+                target,
+                create,
+                retention,
+            },
         );
 
         assert_eq!(
@@ -1287,6 +1437,104 @@ mod tests {
             read_only()
         );
         assert!(inner.items.contains(stream_id as usize));
+    }
+
+    fn retirement(origin: &str) -> RetireGeoOriginRequest {
+        RetireGeoOriginRequest {
+            origin: name(origin),
+        }
+    }
+
+    #[test]
+    fn given_an_origin_when_retired_should_record_its_clusters_and_keep_the_first_time() {
+        let (mut inner, _) = shadowed();
+        let first = IggyTimestamp::from(1_000_u64);
+        assert_eq!(retirement(PEER).apply(&mut inner, first).code, 0);
+        assert_eq!(
+            retirement(PEER)
+                .apply(&mut inner, IggyTimestamp::from(2_000_u64))
+                .code,
+            0
+        );
+
+        assert_eq!(
+            inner.retired_origins.get(PEER),
+            Some(&RetiredOrigin {
+                cluster_uids: vec![PEER_CLUSTER],
+                retired_at: 1_000,
+            })
+        );
+    }
+
+    #[test]
+    fn given_an_origin_without_shadow_streams_when_retired_should_record_no_cluster() {
+        let mut inner = StreamsInner::new();
+        assert_eq!(apply(&mut inner, 1, &retirement("dc-c")).code, 0);
+
+        let retired = &inner.retired_origins["dc-c"];
+        assert_eq!(retired.cluster_uids, Vec::<u128>::new());
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_a_client_deletes_its_shadow_topic_should_accept_it() {
+        let (mut inner, stream_id) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement(PEER)).code, 0);
+        let delete = DeleteTopicRequest {
+            stream_id: wire_id(stream_id),
+            topic_id: wire_id(PEER_TOPIC),
+        };
+
+        assert_eq!(apply(&mut inner, 5, &delete).code, 0);
+        assert_eq!(inner.lifecycle_intents.len(), 1);
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_a_client_deletes_its_shadow_stream_should_accept_it() {
+        let (mut inner, stream_id) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement(PEER)).code, 0);
+        let delete = DeleteStreamRequest {
+            stream_id: wire_id(stream_id),
+        };
+
+        assert_eq!(apply(&mut inner, 5, &delete).code, 0);
+        assert_eq!(inner.lifecycle_intents.len(), 1);
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_a_client_writes_to_its_shadow_stream_should_refuse_it() {
+        let (mut inner, stream_id) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement(PEER)).code, 0);
+        let update = UpdateStreamResolvedRequest {
+            stream_id: wire_id(stream_id),
+            name: Some(name("renamed")),
+            explicit_options: WireOptions::empty(),
+            derived_options: WireOptions::empty(),
+        };
+
+        assert_eq!(apply(&mut inner, 5, &update).code, read_only());
+    }
+
+    #[test]
+    fn given_another_origin_retired_when_a_client_deletes_a_shadow_stream_should_refuse_it() {
+        let (mut inner, stream_id) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement("dc-c")).code, 0);
+        let delete = DeleteStreamRequest {
+            stream_id: wire_id(stream_id),
+        };
+
+        assert_eq!(apply(&mut inner, 5, &delete).code, read_only());
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_restored_from_a_snapshot_should_keep_it() {
+        let (mut inner, _) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement(PEER)).code, 0);
+        let retired = inner.retired_origins.clone();
+        let streams = Streams::from(inner);
+
+        let restored = Streams::from_snapshot(streams.to_snapshot()).unwrap();
+
+        assert_eq!(restored.retired_origins(), retired);
     }
 
     #[test]

@@ -44,13 +44,16 @@ use crate::stream_keys::{
 };
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, rewrite_request_body};
+use configs::geo::check_origin;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
 use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
-use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
+use iggy_binary_protocol::requests::system::{
+    ResourceTarget, RetireGeoOriginRequest, UpdateResourceRequest,
+};
 use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
@@ -454,6 +457,7 @@ where
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|patch| patch_bounds(shard, user_id, &patch))?,
         Operation::CreateStream => return bound_stream_create(request),
+        Operation::RetireGeoOrigin => bound_geo_retirement(&request)?,
         Operation::CreateUser => {
             let mut create_user = CreateUserRequest::decode_from(request_body(&request))
                 .map_err(|_| IggyError::InvalidCommand)?;
@@ -480,7 +484,8 @@ where
 /// Refuse a client write to a shadow stream before it takes a replicated
 /// log entry. Apply refuses the same, for a request that reached the primary
 /// before this node learned of the stream. A body that does not decode passes,
-/// for the stage that decodes it to refuse.
+/// for the stage that decodes it to refuse. A delete of a shadow stream or
+/// topic passes once the stream's origin retired.
 fn refuse_shadow_write(
     streams: &Streams,
     request: &Message<RoutedRequestHeader>,
@@ -496,12 +501,22 @@ fn refuse_shadow_write(
         Operation::DeletePartitions => DeletePartitionsRequest::decode_from(body)
             .ok()
             .map(|delete| delete.stream_id),
-        Operation::DeleteTopic => DeleteTopicRequest::decode_from(body)
-            .ok()
-            .map(|delete| delete.stream_id),
-        Operation::DeleteStream => DeleteStreamRequest::decode_from(body)
-            .ok()
-            .map(|delete| delete.stream_id),
+        Operation::DeleteTopic => {
+            return refuse_shadow_delete(
+                streams,
+                DeleteTopicRequest::decode_from(body)
+                    .ok()
+                    .map(|delete| delete.stream_id),
+            );
+        }
+        Operation::DeleteStream => {
+            return refuse_shadow_delete(
+                streams,
+                DeleteStreamRequest::decode_from(body)
+                    .ok()
+                    .map(|delete| delete.stream_id),
+            );
+        }
         Operation::DeleteSegments => DeleteSegmentsRequest::decode_from(body)
             .ok()
             .map(|delete| delete.stream_id),
@@ -517,6 +532,33 @@ fn refuse_shadow_write(
         _ => None,
     };
     if stream_id.is_some_and(|stream_id| streams.is_shadow_stream(&stream_id)) {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
+}
+
+/// Refuse the retirement of an origin whose name no cluster can take.
+fn bound_geo_retirement(request: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
+    let retire = RetireGeoOriginRequest::decode_from(request_body(request))
+        .map_err(|_| IggyError::InvalidCommand)?;
+    check_origin(retire.origin.as_str()).map_err(|reason| {
+        debug!(
+            origin = retire.origin.as_str(),
+            reason, "refusing to retire a geo origin whose name no cluster can take"
+        );
+        IggyError::InvalidFormat
+    })
+}
+
+/// Refuse a client delete of a shadow stream, or of a topic in one, whose
+/// origin has not retired.
+fn refuse_shadow_delete(
+    streams: &Streams,
+    stream_id: Option<WireIdentifier>,
+) -> Result<(), IggyError> {
+    if stream_id.is_some_and(|stream_id| {
+        streams.is_shadow_stream(&stream_id) && !streams.is_retired_shadow_stream(&stream_id)
+    }) {
         return Err(IggyError::ShadowStreamReadOnly);
     }
     Ok(())

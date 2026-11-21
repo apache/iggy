@@ -53,8 +53,9 @@ class ProtocolParityTest {
     // A unit, tuple or struct variant at the indent of the enum body, up to its explicit discriminant.
     private static final Pattern RUST_ERROR_VARIANT =
             Pattern.compile("(?ms)^ {4}([A-Z][A-Za-z0-9]*)(?:\\([^\\n]*\\)| \\{.*?^ {4}\\})? = ([0-9_]+),$");
-    // The SDK has no snapshot or segment API, so it never sends these.
-    private static final Set<String> UNSENT_COMMAND_CODES = Set.of("GET_SNAPSHOT_FILE_CODE", "DELETE_SEGMENTS_CODE");
+    // The SDK has no snapshot, segment or geo origin API, so it never sends these.
+    private static final Set<String> UNSENT_COMMAND_CODES =
+            Set.of("GET_SNAPSHOT_FILE_CODE", "DELETE_SEGMENTS_CODE", "RETIRE_GEO_ORIGIN_CODE");
     // The SDK names its command codes otherwise than Rust, and only a comparison by name finds two swapped codes.
     private static final Map<CommandCode, String> RUST_COMMAND_NAMES = Map.ofEntries(
             Map.entry(CommandCode.System.PING, "PING_CODE"),

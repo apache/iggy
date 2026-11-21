@@ -44,6 +44,12 @@ impl Permissioner {
         self.manage_servers(user_id)
     }
 
+    /// A retirement stops this cluster from following a datacenter for
+    /// good, so only a user who manages the servers may ask for it.
+    pub fn retire_geo_origin(&self, user_id: u32) -> Result<(), IggyError> {
+        self.manage_servers(user_id)
+    }
+
     fn get_server_info(&self, user_id: u32) -> Result<(), IggyError> {
         if let Some(global_permissions) = self.users_permissions.get(&user_id)
             && (global_permissions.manage_servers || global_permissions.read_servers)
@@ -142,6 +148,27 @@ mod tests {
         permissioner
             .get_metadata_changes(USER_ID)
             .expect("manage_servers grants the feed");
+    }
+
+    #[test]
+    fn given_only_manage_servers_when_retiring_a_geo_origin_should_be_allowed() {
+        let managing = permissioner_with(GlobalPermissions {
+            manage_servers: true,
+            ..GlobalPermissions::default()
+        });
+        let reading = permissioner_with(GlobalPermissions {
+            read_servers: true,
+            manage_streams: true,
+            ..GlobalPermissions::default()
+        });
+
+        managing
+            .retire_geo_origin(USER_ID)
+            .expect("manage_servers retires an origin");
+        assert!(matches!(
+            reading.retire_geo_origin(USER_ID),
+            Err(IggyError::Unauthorized)
+        ));
     }
 
     fn permissioner_with(global: GlobalPermissions) -> Permissioner {

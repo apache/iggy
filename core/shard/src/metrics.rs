@@ -538,6 +538,9 @@ pub struct ShardMetrics {
     /// Per geo peer, 1 while the peer's store did not answer the last read of
     /// its identity object.
     geo_peer_unreachable: Family<GeoPeerLabel, Gauge>,
+    /// Per geo peer, 1 once committed metadata retired its origin, so this
+    /// node follows nothing of it again.
+    geo_peer_retired: Family<GeoPeerLabel, Gauge>,
     /// Per geo peer, the shadow topics that serve what they hold because the
     /// peer's store did not answer the last listing of its topic objects. Set
     /// by the metadata primary.
@@ -778,6 +781,7 @@ impl ShardMetrics {
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
             geo_peer_unreachable: Family::default(),
+            geo_peer_retired: Family::default(),
             geo_shadow_topics_stale: Family::default(),
             geo_peer_manifest_requests_total: Family::default(),
             geo_peer_manifest_failures_total: Family::default(),
@@ -962,6 +966,15 @@ impl ShardMetrics {
             .set(i64::from(unreachable));
     }
 
+    /// Mark the geo peer `origin` retired, for every shard that shares the
+    /// gauge.
+    pub fn set_geo_peer_retired(&self, origin: &str) {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_peer_retired.get_or_create(&label).set(1);
+    }
+
     /// Export the object store and geo peer gauges of `node` from this shard
     /// as well. Only the boot probe and the identity checks of shard 0 set
     /// them.
@@ -970,6 +983,7 @@ impl ShardMetrics {
         self.object_store_unreachable = node.object_store_unreachable.clone();
         self.geo_peer_identity_verified = node.geo_peer_identity_verified.clone();
         self.geo_peer_unreachable = node.geo_peer_unreachable.clone();
+        self.geo_peer_retired = node.geo_peer_retired.clone();
         self.geo_shadow_topics_stale = node.geo_shadow_topics_stale.clone();
     }
 
@@ -1244,6 +1258,16 @@ impl ShardMetrics {
             self.geo_peer_identity_verified.get_or_create(&label).get() != 0,
             self.geo_peer_unreachable.get_or_create(&label).get() != 0,
         )
+    }
+
+    /// Whether the geo peer `origin` is marked retired.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn geo_peer_retired_value(&self, origin: &str) -> bool {
+        let label = GeoPeerLabel {
+            origin: origin.to_owned(),
+        };
+        self.geo_peer_retired.get_or_create(&label).get() != 0
     }
 
     #[cfg(any(test, feature = "simulator"))]
@@ -2930,6 +2954,11 @@ impl ShardMetrics {
             "geo_peer_unreachable",
             "1 while the store of the geo peer did not answer the last read of its identity object",
             self.geo_peer_unreachable.clone(),
+        );
+        registry.register(
+            "geo_peer_retired",
+            "1 once committed metadata retired the geo peer, so this node sends no listing and no check to its store",
+            self.geo_peer_retired.clone(),
         );
         registry.register(
             "geo_shadow_topics_stale",
