@@ -77,7 +77,7 @@ async fn given_a_short_data_disk_when_the_primary_gets_messages_should_refuse_th
     assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
     assert_eq!(
         refusal.await.unwrap().header().status,
-        IggyError::TransientNotAccepted.as_code()
+        IggyError::FreeSpaceReserveReached.as_code()
     );
     assert_eq!(reserve.refused_requests(), 1);
 
@@ -239,7 +239,7 @@ async fn given_a_send_waiting_in_one_wal_when_another_partition_gets_messages_sh
     assert_eq!(other.consensus.sequencer().current_sequence(), 0);
     assert_eq!(
         refusal.await.unwrap().header().status,
-        IggyError::TransientNotAccepted.as_code()
+        IggyError::FreeSpaceReserveReached.as_code()
     );
     assert_eq!(reserve.refused_requests(), 1);
     assert_eq!(
@@ -283,7 +283,7 @@ async fn given_a_queued_send_when_the_data_disk_falls_short_should_refuse_it_bef
     assert_eq!(partition.consensus.sequencer().current_sequence(), 0);
     assert_eq!(
         refusal.await.unwrap().header().status,
-        IggyError::TransientNotAccepted.as_code()
+        IggyError::FreeSpaceReserveReached.as_code()
     );
     assert_eq!(reserve.refused_requests(), 1);
 

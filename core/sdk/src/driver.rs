@@ -1144,7 +1144,9 @@ impl OperationDriver {
             }
             // The caller chose the replica, so its refusal is the answer.
             IggyError::NotPrimary if call.replica.is_some() => Err(Next::Fail(error)),
-            IggyError::DeferredPollCapacityExceeded => {
+            // The replica is the right one and can take the request later, so
+            // the route stays.
+            IggyError::DeferredPollCapacityExceeded | IggyError::FreeSpaceReserveReached => {
                 call.refusal = error;
                 call.settle_sent();
                 Err(Next::Pause)
@@ -2752,12 +2754,63 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn given_a_primary_below_its_free_space_reserve_when_space_returns_should_resend_the_same_frame_to_it()
+     {
+        let f = Fixture::new().await;
+        f.script_sends(repeat_n(
+            Answer::Refuse(IggyError::FreeSpaceReserveReached),
+            2,
+        ));
+
+        f.send_messages().await.unwrap();
+
+        let sends = f.sends();
+        assert_eq!(endpoints(&sends), vec![endpoint(PRIMARY); 3]);
+        for send in &sends {
+            assert_eq!(
+                bytemuck::bytes_of(&send.header),
+                bytemuck::bytes_of(&sends[0].header)
+            );
+            assert_eq!(send.body, PAYLOAD);
+        }
+        assert_eq!(f.cluster.count(GET_PARTITION_ROUTE_CODE), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_primary_below_its_free_space_reserve_when_the_deadline_passes_should_return_4109()
+     {
+        let f = Fixture::new().await;
+        f.script_sends(repeat_n(
+            Answer::Refuse(IggyError::FreeSpaceReserveReached),
+            ENDLESS,
+        ));
+        let started = Instant::now();
+
+        let result = f.send_messages().await;
+
+        assert_eq!(result.unwrap_err(), IggyError::FreeSpaceReserveReached);
+        assert!(started.elapsed() <= OPERATION_TIMEOUT);
+        let sends = f.sends();
+        assert!(sends.len() > 1, "the call retries before its deadline");
+        assert!(
+            endpoints(&sends)
+                .iter()
+                .all(|sent| *sent == endpoint(PRIMARY))
+        );
+        assert_eq!(f.cluster.count(GET_PARTITION_ROUTE_CODE), 1);
+        let op = sends[0].header.request;
+        assert!(ops(&sends).iter().all(|sent| *sent == op));
+        assert!(!f.driver.session.retains_operation(op));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn given_an_uncertain_57_when_later_attempts_fail_should_return_operation_uncertain() {
-        // 58 and 89 keep the call going until its deadline. Every other
+        // 58, 89 and 4109 keep the call going until its deadline. Every other
         // refusal ends it at once.
         let refusals = [
             IggyError::TransientNotAccepted,
             IggyError::NotPrimary,
+            IggyError::FreeSpaceReserveReached,
             IggyError::HistoryUnavailable,
             IggyError::ConsumerGroupPartitionNotOwned(1, 1),
             IggyError::InvalidCredentials,

@@ -556,6 +556,12 @@ pub enum IggyError {
     UnsupportedCriticalOption(String) = 4107,
     #[error("Cannot modify root user")]
     CannotModifyRootUser = 4108,
+    /// The data disk of the partition primary has less free space than
+    /// `[node] free_space_reserve`, so the primary refuses new messages.
+    /// Nothing was written, so a resend is safe. The refusal lasts until space
+    /// is freed or the reserve is lowered.
+    #[error("Data disk is below its free-space reserve")]
+    FreeSpaceReserveReached = 4109,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,
     #[error("Invalid consumer group ID")]
@@ -809,6 +815,15 @@ mod tests {
         assert_eq!(error.as_code(), 3024);
         assert_eq!(IggyError::from_code(3024), error);
         assert_eq!(IggyError::from_code_as_string(3024), error.as_string());
+    }
+
+    #[test]
+    fn free_space_reserve_reached_round_trips_by_code() {
+        let error = IggyError::FreeSpaceReserveReached;
+        assert_eq!(error.as_code(), 4109);
+        assert_eq!(IggyError::from_code(4109), error);
+        assert_eq!(error.as_string(), "free_space_reserve_reached");
+        assert_eq!(IggyError::from_code_as_string(4109), error.as_string());
     }
 
     #[test]

@@ -270,8 +270,10 @@ mod tests {
     use bytes::Bytes;
     use iggy_common::poll_messages::DEFAULT_PARTITION_ID;
     use iggy_common::{
-        AutoCommit, Checkpoint, CommitPolicy, MIN_DEFERRED_POLL_MAX_BYTES, PollOptions,
+        AutoCommit, Checkpoint, CommitPolicy, HttpClientConfig, MIN_DEFERRED_POLL_MAX_BYTES,
+        PollOptions,
     };
+    use std::iter;
     use std::time::{Duration, Instant};
     use tokio::time::timeout;
 
@@ -1040,6 +1042,50 @@ mod tests {
         assert_eq!(requests[2].context(), Some(CURRENT));
         first.unwrap();
         second.unwrap();
+    }
+
+    /// A 507 refuses a send before the server stores it, so the client sends it again.
+    #[tokio::test(start_paused = true)]
+    async fn given_a_send_refused_below_the_free_space_reserve_when_space_returns_should_resend_it()
+    {
+        let server = ScriptedServer::start(vec![
+            Reply::topic(&[(PARTITION_ID, CURRENT)]),
+            Reply::error(507, &IggyError::FreeSpaceReserveReached),
+            Reply::empty(201),
+        ])
+        .await;
+        let client = server.client();
+
+        let sent = send(&client, &Partitioning::partition_id(PARTITION_ID)).await;
+
+        let requests = server.requests();
+        assert_eq!(lines(&requests), [TOPIC_LINE, SEND_LINE, SEND_LINE]);
+        assert_eq!(requests[2].context(), Some(CURRENT));
+        sent.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn given_a_send_refused_below_the_free_space_reserve_when_retries_run_out_should_return_4109()
+     {
+        let retries = HttpClientConfig::default().retries as usize;
+        let mut replies = vec![Reply::topic(&[(PARTITION_ID, CURRENT)])];
+        replies.extend(
+            iter::repeat_with(|| Reply::error(507, &IggyError::FreeSpaceReserveReached))
+                .take(retries + 1),
+        );
+        let server = ScriptedServer::start(replies).await;
+        let client = server.client();
+
+        let refused = send(&client, &Partitioning::partition_id(PARTITION_ID)).await;
+
+        assert_eq!(refused.map(drop), Err(IggyError::FreeSpaceReserveReached));
+        let requests = server.requests();
+        assert_eq!(requests.len(), retries + 2);
+        assert!(
+            requests[1..]
+                .iter()
+                .all(|request| request.line == SEND_LINE)
+        );
     }
 
     #[tokio::test]

@@ -90,6 +90,9 @@ impl IntoResponse for CustomError {
                     // would make HTTP clients resend a read that no resend
                     // changes, so this is a 4xx that names the dependency.
                     IggyError::TieredReadFailed => StatusCode::FAILED_DEPENDENCY,
+                    // Nothing was stored, and the node takes the write again
+                    // once its data disk has room.
+                    IggyError::FreeSpaceReserveReached => StatusCode::INSUFFICIENT_STORAGE,
                     IggyError::TransientNotAccepted
                     | IggyError::DeferredPollCapacityExceeded
                     | IggyError::NotPrimary => StatusCode::SERVICE_UNAVAILABLE,
@@ -97,14 +100,15 @@ impl IntoResponse for CustomError {
                 };
                 let response =
                     (status_code, Json(ErrorResponse::from_error(&error))).into_response();
-                // Transient 503s are retryable, so the advisory Retry-After hint
-                // rides along, matching the other transient 503 bodies
-                // (`service_unavailable`, `server_busy`).
+                // Transient 503s and the 507 are retryable, so the advisory
+                // Retry-After hint rides along, matching the other transient 503
+                // bodies (`service_unavailable`, `server_busy`).
                 if matches!(
                     error,
                     IggyError::TransientNotAccepted
                         | IggyError::DeferredPollCapacityExceeded
                         | IggyError::NotPrimary
+                        | IggyError::FreeSpaceReserveReached
                 ) {
                     with_retry_after(response)
                 } else {
@@ -926,6 +930,18 @@ mod tests {
             IggyError::DeferredPollCapacityExceeded.as_code()
         );
         assert_eq!(error["code"], "deferred_poll_capacity_exceeded");
+    }
+
+    #[tokio::test]
+    async fn free_space_reserve_refusal_renders_507_with_its_code_and_retry_hint() {
+        let response =
+            PartitionWriteError::Rejected(IggyError::FreeSpaceReserveReached).into_response();
+        assert_eq!(response.status(), StatusCode::INSUFFICIENT_STORAGE);
+        assert!(response.headers().contains_key(RETRY_AFTER));
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error["id"], IggyError::FreeSpaceReserveReached.as_code());
+        assert_eq!(error["code"], "free_space_reserve_reached");
     }
 
     #[tokio::test]
