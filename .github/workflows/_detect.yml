@@ -65,6 +65,9 @@ on:
       examples_matrix:
         description: "Matrix for examples tests"
         value: ${{ jobs.detect.outputs.examples_matrix }}
+      docs:
+        description: "Whether the docs pages get a test build"
+        value: ${{ jobs.detect.outputs.docs }}
       other_matrix:
         description: "Matrix for other components"
         value: ${{ jobs.detect.outputs.other_matrix }}
@@ -92,6 +95,7 @@ jobs:
       swift_matrix: ${{ steps.mk.outputs.swift_matrix }}
       bdd_matrix: ${{ steps.mk.outputs.bdd_matrix }}
       examples_matrix: ${{ steps.mk.outputs.examples_matrix }}
+      docs: ${{ steps.mk.outputs.docs }}
       other_matrix: ${{ steps.mk.outputs.other_matrix }}
     steps:
       - uses: actions/checkout@v7.0.1
@@ -312,7 +316,7 @@ jobs:
               console.log(`Total files changed: ${files.length}`);
             }
 
-            const groups = { rust:[], python:[], php:[], node:[], go:[], java:[], csharp:[], cpp:[], swift:[], bdd:[], examples:[], other:[] };
+            const groups = { rust:[], python:[], php:[], node:[], go:[], java:[], csharp:[], cpp:[], swift:[], bdd:[], examples:[], docs:[], other:[] };
 
             // Process affected components and generate tasks
             console.log('');
@@ -349,6 +353,9 @@ jobs:
               else if (name.startsWith('examples-')) {
                 groups.examples.push(...entries);
               }
+              // Not in Other: _test.yml has write scopes, and the docs job runs
+              // npm packages from apache/iggy-website.
+              else if (name === 'docs') groups.docs.push(...entries);
               else if (name === 'shell-scripts') groups.other.push(...entries);
               else if (name === 'ci-workflows') groups.other.push(...entries);
               else groups.other.push(...entries);
@@ -424,6 +431,7 @@ jobs:
               { name: 'Swift SDK', tasks: groups.swift },
               { name: 'BDD Tests', tasks: groups.bdd },
               { name: 'Examples', tasks: groups.examples },
+              { name: 'Docs', tasks: groups.docs },
               { name: 'Other', tasks: groups.other }
             ];
 
@@ -475,4 +483,5 @@ jobs:
             setOutput('swift_matrix', JSON.stringify(matrix(groups.swift)));
             setOutput('bdd_matrix', JSON.stringify(matrix(groups.bdd)));
             setOutput('examples_matrix', JSON.stringify(matrix(groups.examples)));
+            setOutput('docs', String(groups.docs.length > 0));
             setOutput('other_matrix', JSON.stringify(matrix(groups.other)));

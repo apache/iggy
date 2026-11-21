@@ -427,6 +427,8 @@ mod tests {
     use super::super::tiered_storage::TieredStorageBackend;
     use super::*;
     use figment::Figment;
+    use figment::providers::Serialized;
+    use iggy_common::IggyByteSize;
 
     /// The embedded default TOML deserializes into a fully populated
     /// [`ServerConfig`] and passes validation. Exercises the
@@ -484,6 +486,59 @@ mod tests {
         unsafe { env::remove_var(NAME) };
         let cfg = cfg.expect("config with the env override deserializes");
         assert_eq!(cfg.metadata.change_log_activity_capacity, 4096);
+    }
+
+    /// The config file documents `retention = "0"` as turning deletion by age
+    /// off, so the same digits from the environment have to load the same way.
+    #[test]
+    #[serial_test::serial]
+    fn given_a_bare_zero_for_a_duration_env_var_when_loading_should_read_zero() {
+        let cfg = load_with_env_vars(&[("IGGY_LOGGING_RETENTION", "0")])
+            .expect("config with a bare 0 duration from the environment deserializes");
+
+        assert!(cfg.logging.retention.is_zero());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_a_bare_byte_count_for_a_size_env_var_when_loading_should_read_bytes() {
+        let cfg = load_with_env_vars(&[("IGGY_WEBSOCKET_READ_BUFFER_SIZE", "131072")])
+            .expect("config with a bare byte count from the environment deserializes");
+
+        assert_eq!(
+            cfg.websocket.read_buffer_size,
+            Some(IggyByteSize::from(131_072_u64))
+        );
+    }
+
+    /// The environment provider hands every all-digit value over as a number,
+    /// so a setting that parses the same digits from text has to take the
+    /// number too. Settings that take any text are plain strings and exempt.
+    #[test]
+    #[serial_test::serial]
+    fn given_digits_from_env_for_a_setting_parsing_them_as_text_when_loading_should_accept_them() {
+        const ANY_TEXT: &str = "any text";
+        let file = Figment::new().merge(Toml::string(include_str!("../../../server/config.toml")));
+        let leaves = ServerConfig::env_templates()
+            .iter()
+            .filter(|template| template.max_elements.is_empty());
+
+        let mut refused = Vec::new();
+        for template in leaves {
+            for digits in ["0", "1"] {
+                if load_with_env_vars(&[(template.env_name, digits)]).is_err()
+                    && loads_as_text(&file, template.config_path, digits)
+                    && !loads_as_text(&file, template.config_path, ANY_TEXT)
+                {
+                    refused.push(format!("{}={digits}", template.env_name));
+                }
+            }
+        }
+
+        assert!(
+            refused.is_empty(),
+            "these settings parse the digits as text but refuse them from the environment: {refused:?}"
+        );
     }
 
     /// The shipped file, like every file written before tiered storage, has
@@ -640,5 +695,38 @@ mod tests {
                 .all(|name| !SERVER_SCAN_ONLY_ENV_VARS.contains(name)),
             "advertised and scan-only env vars must stay disjoint"
         );
+    }
+
+    /// Loads the embedded config with `vars` set. Callers must be
+    /// `serial_test::serial`.
+    fn load_with_env_vars(vars: &[(&str, &str)]) -> Result<ServerConfig, Box<figment::Error>> {
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(name), "{name}");
+            // SAFETY: `serial_test::serial` on every caller keeps other tests
+            // off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract()
+            .map_err(Box::new);
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        cfg
+    }
+
+    /// Whether `file` deserializes with `text` written as a string at `path`,
+    /// the form the environment cannot produce for digits.
+    fn loads_as_text(file: &Figment, path: &str, text: &str) -> bool {
+        file.clone()
+            .merge(Serialized::default(path, text))
+            .extract::<ServerConfig>()
+            .is_ok()
     }
 }

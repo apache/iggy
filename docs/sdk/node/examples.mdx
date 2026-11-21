@@ -1,0 +1,52 @@
+---
+title: Examples
+description: "Build the local Node.js SDK and run its TypeScript examples."
+---
+
+Examples are available in the [examples/node](https://github.com/apache/iggy/tree/server-0.10.0/examples/node) directory, written in TypeScript. They use the SDK from the same checkout:
+
+- **getting-started** - basic producer and consumer
+- **basic** - producer and consumer with utilities
+- **message-envelope** - JSON message envelope pattern
+- **message-headers** - message-type dispatch using a JSON wrapper in the payload
+- **multi-tenant** - separate streams for tenants, using one client
+- **tcp-tls** - TLS-encrypted TCP connections
+- **stream-builder** - end-to-end walkthrough: create a stream and topic, produce, and consume
+- **sink-data-producer** - bulk data generation for sink connectors
+
+## Running the examples
+
+These examples target server **0.10.0**. See [Getting started](/docs/introduction/getting-started) for prerequisites:
+
+```bash
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+The default-root flag sets the `iggy`/`iggy` credentials used by the examples. `--fresh` deletes existing local server data. Explicit credential environment variables override the default-root flag. Bootstrap settings do not replace recovered credentials.
+
+From the repository root, build the local SDK before installing the examples. The stream-builder example creates a stream and topic, sends and consumes three messages, and deletes its resources:
+
+```bash
+npm --prefix foreign/node ci
+npm --prefix foreign/node run build
+npm --prefix examples/node ci
+cd examples/node
+DEBUG=iggy:examples npm run test:stream-builder
+```
+
+Each example has a script in `examples/node/package.json`. Set `DEBUG=iggy:examples*` to see its progress.
+
+The separate producer and consumer scripts do not consistently share resources: the envelope and headers consumers create new empty topics, and the tenant producer deletes its streams before exiting. The getting-started and basic producers spread batches over five partitions, while their consumers poll partition 0. Use the self-contained stream-builder command above for a complete send-and-consume walkthrough. The sink-data producer deletes its selected topic and stream when it finishes, including resources that already existed.
+
+The TCP/TLS pair needs a TLS-enabled source server. Run this command from the repository root, then the two `test:tcp-tls:*` scripts from `examples/node`, where they load `../../core/certs/iggy_ca_cert.pem`:
+
+```bash
+IGGY_TCP_TLS_ENABLED=true \
+IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+These are repository development certificates.
+
+For the quick-start code itself, see the [Node.js SDK intro](/docs/sdk/node/intro).
