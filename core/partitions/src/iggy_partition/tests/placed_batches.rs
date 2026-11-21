@@ -28,13 +28,13 @@ fn placed_record(index: u64) -> (Vec<u8>, Placement) {
     let whole = build_segment_record(IggyNamespace::new(1, 1, 0), 0);
     let mut header = BatchHeader::decode(&whole).unwrap();
     header.batch_checksum = 0;
-    let placement = Placement::of(7, index * 4096, &whole[COMMAND_HEADER_SIZE..]);
+    let placement = Placement::of(7, index * 4096, &whole[COMMAND_HEADER_SIZE..], 0);
     let mut record = vec![0; PLACED_BATCH_SIZE];
     PlacedBatch::new(header, placement).encode_into(&mut record);
     (record, placement)
 }
 
-fn placed_records(count: u64) -> (Vec<Vec<u8>>, Vec<Placement>) {
+pub(super) fn placed_records(count: u64) -> (Vec<Vec<u8>>, Vec<Placement>) {
     (0..count).map(placed_record).unzip()
 }
 
@@ -218,7 +218,7 @@ async fn given_a_segment_that_fits_two_placed_batches_when_a_third_commits_shoul
 
 /// A placing partition under `root`, where boot recovery finds its files,
 /// with segments that fit two placed batches and `count` batches committed.
-async fn placing_partition_on_disk(
+pub(super) async fn placing_partition_on_disk(
     root: &Path,
     count: u64,
 ) -> (PartitionsConfig, IggyPartition<IggyMessageBus>) {
@@ -242,7 +242,7 @@ async fn placing_partition_on_disk(
     (config, partition)
 }
 
-fn placed_segment_size() -> IggyByteSize {
+pub(super) fn placed_segment_size() -> IggyByteSize {
     IggyByteSize::from(2 * PLACED_BATCH_SIZE as u64)
 }
 
@@ -405,7 +405,31 @@ async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_shou
     let (config, partition) = Box::pin(placing_partition_on_disk(root.path(), 3)).await;
     drop(partition);
     let directory = config.get_partition_path(1, 1, 0);
-    let recovered = Box::pin(recover(&config)).await.unwrap();
+    let mut partition = Box::pin(rebooted_placing_partition(&config)).await;
+    assert_eq!(partition.log.active_segment().end_offset, 2);
+
+    // The test partition keeps no WAL, so its ops start over. The offsets
+    // are what the segments carry across the reboot.
+    let (records, _) = placed_records(2);
+    Box::pin(commit_records(&mut partition, 1, &records)).await;
+
+    assert_eq!(partition.offset.load(Ordering::Acquire), 4);
+    let stored: Vec<_> = segment_file_bytes(Path::new(&directory))
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .map(|placed| placed.header.base_offset)
+        .collect();
+    assert_eq!(stored, [0, 1, 2, 3, 4]);
+}
+
+/// The partition [`placing_partition_on_disk`] left under `config`, after a
+/// boot that recovers its segments and no WAL, so no commit of what they
+/// hold runs again.
+pub(super) async fn rebooted_placing_partition(
+    config: &PartitionsConfig,
+) -> IggyPartition<IggyMessageBus> {
+    let directory = config.get_partition_path(1, 1, 0);
+    let recovered = Box::pin(recover(config)).await.unwrap();
     let mut partition = test_partition_with_replicas(3);
     partition.set_places_batches(true);
     partition.set_partition_dir(directory.clone());
@@ -420,25 +444,12 @@ async fn given_a_rebooted_placing_partition_when_more_placed_batches_commit_shou
     );
     // The server restores the offsets from the recovered segments.
     let recovered_end = partition.log.active_segment().end_offset;
-    assert_eq!(recovered_end, 2);
     partition.offset.store(recovered_end, Ordering::Release);
     partition
         .dirty_offset
         .store(recovered_end, Ordering::Relaxed);
     partition.set_offset_space_used(true);
-
-    // The test partition keeps no WAL, so its ops start over. The offsets
-    // are what the segments carry across the reboot.
-    let (records, _) = placed_records(2);
-    Box::pin(commit_records(&mut partition, 1, &records)).await;
-
-    assert_eq!(partition.offset.load(Ordering::Acquire), 4);
-    let stored: Vec<_> = segment_file_bytes(Path::new(&directory))
-        .iter()
-        .flat_map(|bytes| placed_batches_in(bytes))
-        .map(|placed| placed.header.base_offset)
-        .collect();
-    assert_eq!(stored, [0, 1, 2, 3, 4]);
+    partition
 }
 
 /// A placing partition whose segments fit two placed batches.
@@ -547,12 +558,12 @@ async fn given_a_damaged_placed_batch_in_a_transferred_segment_when_spilling_sho
 
 /// A prepare a primary replicates for a one-message batch it placed in the
 /// object store, chained to `parent`.
-fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
+pub(super) fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<PrepareHeader> {
     let whole = checksummed_segment_prepare(op, parent, offset, b"payload");
     let header_size = size_of::<PrepareHeader>();
     let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).unwrap();
     let blob = &whole.as_slice()[header_size + COMMAND_HEADER_SIZE..];
-    let placed = PlacedBatch::new(batch, Placement::of(7, op * 4096, blob));
+    let placed = PlacedBatch::new(batch, Placement::of(7, op * 4096, blob, 0));
     let total = header_size + PLACED_BATCH_SIZE;
     let mut prepare = Message::<PrepareHeader>::new(total);
     placed.encode_into(&mut prepare.as_mut_slice()[header_size..]);
@@ -568,7 +579,9 @@ fn placed_segment_prepare(op: u64, parent: u128, offset: u64) -> Message<Prepare
 const PLACED_PER_SEGMENT: u64 = 2;
 
 /// A backup that places its batches, with a prepare WAL under `root`.
-async fn placing_backup_with_wal(root: &Path) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
+pub(super) async fn placing_backup_with_wal(
+    root: &Path,
+) -> (PartitionsConfig, IggyPartition<RecordingBus>) {
     let mut config = repair_config();
     config.path_layout.streams_root = root.to_string_lossy().into_owned();
     let directory = config.get_partition_path(1, 1, 0);
@@ -592,7 +605,7 @@ async fn placing_backup_with_wal(root: &Path) -> (PartitionsConfig, IggyPartitio
 
 /// Replicate and commit one placed batch per offset, each as op
 /// `offset + 1`. Returns the checksum the next prepare chains to.
-async fn replicate_placed(
+pub(super) async fn replicate_placed(
     partition: &mut IggyPartition<RecordingBus>,
     config: &PartitionsConfig,
     offsets: std::ops::RangeInclusive<u64>,
@@ -612,7 +625,7 @@ async fn replicate_placed(
     parent
 }
 
-fn stored_offsets(directory: &str) -> Vec<u64> {
+pub(super) fn stored_offsets(directory: &str) -> Vec<u64> {
     segment_file_bytes(Path::new(directory))
         .iter()
         .flat_map(|bytes| placed_batches_in(bytes))
@@ -750,11 +763,13 @@ fn placed_client_request(
             *next = header;
         },
     );
-    server_common::send_messages::place_request(&admitted, 7, request * 4096).unwrap()
+    let blob = server_common::send_messages::admitted_blob(&admitted).unwrap();
+    let placement = Placement::of(7, request * 4096, blob, 0);
+    server_common::send_messages::place_request(&admitted, placement).unwrap()
 }
 
 /// A primary alone in its group, so a request commits without a backup.
-async fn placing_primary() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+pub(super) async fn placing_primary() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
     let config = repair_config();
     let (directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 1)).await;
     partition.set_places_batches(true);
@@ -835,15 +850,16 @@ async fn given_a_placing_primary_when_the_placed_entry_gets_another_body_should_
     let mut damaged = placed_client_request(&partition, 1, 1);
     damaged.as_mut_slice()[size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE + 16] ^= 1;
     let elsewhere = IggyNamespace::new(1, 1, 5);
+    let elsewhere_send = checksumless_send_request(elsewhere, 1).transmute_header(
+        |mut header, next: &mut RoutedRequestHeader| {
+            header.group = partition.namespace().inner();
+            *next = header;
+        },
+    );
+    let elsewhere_blob = server_common::send_messages::admitted_blob(&elsewhere_send).unwrap();
     let other_partition = server_common::send_messages::place_request(
-        &checksumless_send_request(elsewhere, 1).transmute_header(
-            |mut header, next: &mut RoutedRequestHeader| {
-                header.group = partition.namespace().inner();
-                *next = header;
-            },
-        ),
-        7,
-        0,
+        &elsewhere_send,
+        Placement::of(7, 0, elsewhere_blob, 0),
     )
     .unwrap();
 
@@ -896,7 +912,7 @@ pub(super) fn whole_and_placed_in(
             let mut header = BatchHeader::decode(record).unwrap();
             header.batch_checksum = 0;
             let blob = &record[COMMAND_HEADER_SIZE..];
-            let placement = Placement::of(object_id, object.push(blob), blob);
+            let placement = Placement::of(object_id, object.push(blob), blob, 0);
             let mut placed = vec![0; PLACED_BATCH_SIZE];
             PlacedBatch::new(header, placement).encode_into(&mut placed);
             placed

@@ -21,9 +21,11 @@
 //! put, a ranged get, head, a batch delete and a paged list. [`KeyLayout`]
 //! builds the keys of a partition's objects from its recorded
 //! [`ObjectPrefix`], and [`SegmentMetadata`] is the user metadata of a
-//! segment's `.log` object. [`StoreIdentity`] is the object that claims a
-//! root for one cluster, and [`TopicObject`] is the object that describes a
-//! geo topic to the clusters that read the store. [`TierExecutor`] is how
+//! segment's `.log` object. [`SealedFreshObject`] writes a fresh object
+//! that describes itself, and [`FreshIndex`] reads its index back.
+//! [`StoreIdentity`] is the object that claims a root for one cluster, and
+//! [`TopicObject`] is the object that describes a geo topic to the clusters
+//! that read the store. [`TierExecutor`] is how
 //! uploads, cold reads and deletes hand work to the tier service of a shard.
 //!
 //! [`FsStore`] keeps objects as files in a directory, and [`s3::S3Store`]
@@ -41,6 +43,7 @@ mod backend;
 pub mod contract;
 mod error;
 mod fresh;
+mod fresh_index;
 mod fs;
 mod identity;
 mod inline;
@@ -49,6 +52,7 @@ mod manifest;
 mod memory;
 mod read_only;
 mod recording;
+mod recovery;
 mod resolver;
 pub mod s3;
 mod segment_metadata;
@@ -59,6 +63,13 @@ mod topic;
 pub use backend::Backend;
 pub use error::{ErrorClass, ObjectStoreError};
 pub use fresh::{FreshObject, FreshObjectId, is_fresh_object};
+pub use fresh_index::{
+    FRESH_BATCH_ROW_SIZE, FRESH_DIRECTORY_ROW_SIZE, FRESH_HEADER_SIZE, FRESH_INDEX_BYTES_MAX,
+    FRESH_INDEX_CHECKSUM_SIZE, FRESH_OBJECT_BATCHES_MAX, FRESH_OBJECT_DATA_BYTES_MAX,
+    FRESH_OBJECT_PROOFS_MAX, FRESH_PROOF_ROW_SIZE, FreshBatch, FreshBatchRow, FreshDirectoryRow,
+    FreshIndex, FreshObjectError, FreshObjectHeader, FreshPartition, FreshProducer, FreshProofRow,
+    SealedFreshObject,
+};
 pub use fs::FsStore;
 pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
@@ -67,6 +78,9 @@ pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
 pub use read_only::ReadOnlyStore;
 pub use recording::{RecordingStore, StoreCall, StoreCalls};
+pub use recovery::{
+    RECOVERY_PARTITIONS_MAX, RecoveredCutover, RecoveryRead, RecoveryRecord, RecoveryRecordError,
+};
 pub use resolver::ShardResolver;
 pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataError};
 pub use store::{

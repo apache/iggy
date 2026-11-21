@@ -3169,7 +3169,9 @@ where
     /// Snapshot committed durable offsets only. Eager auto-commit progress and
     /// follower-local cursor entries stay in the live maps until a replicated
     /// store commits them, so neither can be promoted by state transfer.
-    fn offsets_wire_snapshot(&self) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
+    pub(crate) fn offsets_wire_snapshot(
+        &self,
+    ) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
         self.validate_consumer_offset_transfer_counts()?;
         let consumer_map = self.consumer_offsets.borrow();
         let consumers = self.snapshot_offset_kind(ConsumerKind::Consumer, |id| {
@@ -3323,7 +3325,6 @@ where
         })
     }
 
-    #[cfg(test)]
     pub(crate) async fn spill_transfer_segment(
         &self,
         entry: &consensus::StateArtifact,
@@ -4247,7 +4248,7 @@ where
                     current: self
                         .retry_checkpoint_path(install.commit_op)
                         .map_err(|_| iggy_common::IggyError::CannotDeleteFile)?,
-                    keep_current: install.commit_op > 0,
+                    keep_current: true,
                 },
                 InstallFilePhase::ReclaimRetry,
             ),
@@ -5879,7 +5880,14 @@ where
     /// # Errors
     /// Returns an error for missing, corrupt, or incompatible retry protection.
     pub async fn restore_retry_checkpoint(&mut self, through_op: u64) -> std::io::Result<()> {
-        if through_op == 0 {
+        // Only an install at op 0 writes a checkpoint there, as a recovery
+        // from the object store does: no op carries what it installed.
+        let installed_at_zero = through_op == 0
+            && match self.retry_checkpoint_path(0) {
+                Ok(path) => compio::fs::metadata(&path).await.is_ok(),
+                Err(_) => false,
+            };
+        if through_op == 0 && !installed_at_zero {
             self.state_machines.reset();
             if self.partition_dir.is_some()
                 && let Err(error) = self.reclaim_retry_checkpoints(through_op).await
@@ -5968,8 +5976,7 @@ where
 
     // Call only after publication or validated recovery, under the partition owner.
     pub(crate) async fn reclaim_retry_checkpoints(&self, through_op: u64) -> std::io::Result<()> {
-        reclaim_retry_checkpoint_files(&self.retry_checkpoint_path(through_op)?, through_op > 0)
-            .await
+        reclaim_retry_checkpoint_files(&self.retry_checkpoint_path(through_op)?, true).await
     }
 }
 

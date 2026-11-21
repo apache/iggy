@@ -25,8 +25,8 @@
 //! A blob is the message frames of one batch. The object does not say where
 //! a blob starts or whose it is: the partition that commits the batch keeps
 //! its position and length, and reads exactly that range. The magic names
-//! the version, so an object that describes itself can follow without a
-//! reader taking one for the other.
+//! the version, so a reader never takes this object for the one that
+//! describes itself, which [`crate::SealedFreshObject`] writes.
 
 use bytes::{Bytes, BytesMut};
 
@@ -84,6 +84,34 @@ impl FreshObjectId {
         let bytes = self.0.to_le_bytes();
         u16::from_le_bytes([bytes[5], bytes[6]])
     }
+
+    /// When the life of the writer started, in microseconds since the Unix
+    /// epoch.
+    #[must_use]
+    pub const fn started_at(self) -> u64 {
+        let bytes = self.0.to_le_bytes();
+        u64::from_le_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ])
+    }
+
+    /// The object's number in the life of its writer.
+    #[must_use]
+    pub const fn sequence(self) -> u64 {
+        let bytes = self.0.to_le_bytes();
+        u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], 0, 0, 0])
+    }
+
+    /// The next object of the same writer life, `None` past the last one.
+    #[must_use]
+    pub const fn next(self) -> Option<Self> {
+        Self::new(
+            self.replica(),
+            self.shard(),
+            self.started_at(),
+            self.sequence() + 1,
+        )
+    }
 }
 
 /// Collects blobs into one fresh object.
@@ -140,10 +168,10 @@ impl FreshObject {
 }
 
 /// Whether `bytes`, the start of an object, are those of a fresh object this
-/// build reads ranges of.
+/// build reads ranges of: this format, or the one that describes itself.
 #[must_use]
 pub fn is_fresh_object(bytes: &[u8]) -> bool {
-    bytes.starts_with(MAGIC)
+    bytes.starts_with(MAGIC) || bytes.starts_with(crate::fresh_index::MAGIC)
 }
 
 #[cfg(test)]
@@ -159,6 +187,30 @@ mod tests {
         assert_eq!(FreshObjectId::from_raw(id.get()), id);
         let lowest = FreshObjectId::new(1, 2, 0, 0).unwrap();
         assert_eq!((lowest.replica(), lowest.shard()), (1, 2));
+    }
+
+    #[test]
+    fn given_an_id_when_reading_its_life_should_return_when_it_started_and_its_number_and_the_next()
+    {
+        let id = FreshObjectId::new(3, 4, 1_700_000_000_000_000, 41).unwrap();
+
+        assert_eq!(id.started_at(), 1_700_000_000_000_000);
+        assert_eq!(id.sequence(), 41);
+        assert_eq!(
+            id.next(),
+            FreshObjectId::new(3, 4, 1_700_000_000_000_000, 42)
+        );
+        let last = FreshObjectId::new(0xff, 0xffff, u64::MAX, FreshObjectId::SEQUENCE_MAX).unwrap();
+        assert_eq!(
+            (
+                last.started_at(),
+                last.sequence(),
+                last.replica(),
+                last.shard()
+            ),
+            (u64::MAX, FreshObjectId::SEQUENCE_MAX, 0xff, 0xffff)
+        );
+        assert_eq!(last.next(), None);
     }
 
     #[test]
@@ -183,8 +235,13 @@ mod tests {
 
     #[test]
     fn given_another_object_when_asking_should_not_take_it_for_a_fresh_object() {
-        assert!(!is_fresh_object(b"IGGYFRS2 and more"));
+        assert!(!is_fresh_object(b"IGGYFRS3 and more"));
         assert!(!is_fresh_object(b"IGGY"));
+    }
+
+    #[test]
+    fn given_an_object_that_describes_itself_when_asking_should_take_it_for_a_fresh_object() {
+        assert!(is_fresh_object(b"IGGYFRS2 and an index"));
     }
 
     #[test]

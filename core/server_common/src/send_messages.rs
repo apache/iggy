@@ -756,21 +756,12 @@ pub fn admitted_blob(request: &Message<RoutedRequestHeader>) -> Result<&[u8], Ig
         .ok_or(IggyError::InvalidCommand)
 }
 
-/// The request that commits where the blob of `request` sits in the object
-/// store: the header of `request`, and the placed batch of its batch at
-/// `position` of the object `object_id`.
-///
-/// `request` is an admitted `SendMessages` in its pipeline form. The result
-/// answers to the same client, session and request number, so its reply and
-/// its retries are those of the send.
+/// The batch header of an admitted `SendMessages` request in its pipeline
+/// form, once the request is found to hold one whole batch of messages.
 ///
 /// # Errors
 /// [`IggyError::InvalidCommand`] for a request that is not one whole batch.
-pub fn place_request(
-    request: &Message<RoutedRequestHeader>,
-    object_id: u128,
-    position: u64,
-) -> Result<Message<RoutedRequestHeader>, IggyError> {
+pub fn admitted_batch(request: &Message<RoutedRequestHeader>) -> Result<BatchHeader, IggyError> {
     let header_size = std::mem::size_of::<RoutedRequestHeader>();
     let body = request
         .as_slice()
@@ -778,15 +769,34 @@ pub fn place_request(
         .ok_or(IggyError::InvalidCommand)?;
     // Admission checked the messages. It leaves the batch checksum for the
     // stamp to fill, so that one says nothing here.
-    let batch = body
-        .get(..COMMAND_HEADER_SIZE)
+    body.get(..COMMAND_HEADER_SIZE)
         .and_then(|header| BatchHeader::decode(header).ok())
         .filter(|batch| body.len() == batch.total_size() && batch.message_count > 0)
-        .ok_or(IggyError::InvalidCommand)?;
-    let placed = PlacedBatch::new(
-        batch,
-        Placement::of(object_id, position, &body[COMMAND_HEADER_SIZE..]),
-    );
+        .ok_or(IggyError::InvalidCommand)
+}
+
+/// The request that commits where the blob of `request` sits in the object
+/// store: the header of `request`, and the placed batch of its batch at
+/// `placement`.
+///
+/// `request` is an admitted `SendMessages` in its pipeline form. The result
+/// answers to the same client, session and request number, so its reply and
+/// its retries are those of the send. The caller hashed the blob for
+/// `placement` already, so it is not hashed again.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a request that is not one whole batch,
+/// and for a placement of another length than its blob.
+pub fn place_request(
+    request: &Message<RoutedRequestHeader>,
+    placement: Placement,
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
+    let header_size = std::mem::size_of::<RoutedRequestHeader>();
+    let batch = admitted_batch(request)?;
+    if admitted_blob(request)?.len() as u64 != placement.length {
+        return Err(IggyError::InvalidCommand);
+    }
+    let placed = PlacedBatch::new(batch, placement);
     let total = header_size + PLACED_BATCH_SIZE;
     let mut message = Message::<RoutedRequestHeader>::new(total);
     placed.encode_into(&mut message.as_mut_slice()[header_size..]);
@@ -1515,7 +1525,7 @@ mod tests {
         let header_size = std::mem::size_of::<PrepareHeader>();
         let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).expect("batch header");
         let blob = &whole.as_slice()[PREPARE_SPLIT_POINT..header_size + batch.total_size()];
-        let placed = placement::PlacedBatch::new(batch, placement::Placement::of(7, 4096, blob));
+        let placed = placement::PlacedBatch::new(batch, placement::Placement::of(7, 4096, blob, 0));
         let mut bytes = Owned::<MESSAGE_ALIGN>::zeroed(header_size + PLACED_BATCH_SIZE);
         bytes.as_mut_slice()[..header_size].copy_from_slice(&whole.as_slice()[..header_size]);
         placed.encode_into(&mut bytes.as_mut_slice()[header_size..]);
@@ -1650,7 +1660,17 @@ mod tests {
         let batch = BatchHeader::decode(&admitted.as_slice()[header_size..]).expect("batch");
         let blob = admitted_blob(&admitted).expect("blob").to_vec();
 
-        let placed = place_request(&admitted, 9, 4096).expect("placed request");
+        let placed =
+            place_request(&admitted, Placement::of(9, 4096, &blob, 12)).expect("placed request");
+        let mut longer = Placement::of(9, 4096, &blob, 12);
+        longer.length += 1;
+        assert!(
+            matches!(
+                place_request(&admitted, longer),
+                Err(IggyError::InvalidCommand)
+            ),
+            "a placement of another length than the blob"
+        );
 
         assert_eq!(
             placed.header().size as usize,
@@ -1663,7 +1683,7 @@ mod tests {
         assert_eq!(decoded.header.message_count, batch.message_count);
         assert_eq!(decoded.header.batch_length, batch.batch_length);
         assert_eq!(decoded.header.partition_id, 3);
-        assert_eq!(decoded.placement, Placement::of(9, 4096, &blob));
+        assert_eq!(decoded.placement, Placement::of(9, 4096, &blob, 12));
         assert!(decoded.placement.matches(&blob));
     }
 }

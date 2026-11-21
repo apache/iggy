@@ -26,8 +26,8 @@ use crate::{FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX};
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_object_store::{
-    FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore, ObjectStoreError,
-    TierScopeToken, is_fresh_object,
+    FreshIndex, FreshObjectId, InlineTierExecutor, KeyLayout, MemoryStore, ObjectStore,
+    ObjectStoreError, TierScopeToken, is_fresh_object,
 };
 use partitions::{
     ExecutorFreshUploader, FRESH_DELETES_PER_BATCH, FRESH_OBJECTS_PER_SWEEP, FreshDeleteOutcome,
@@ -35,7 +35,7 @@ use partitions::{
     FreshUploadOutcome,
 };
 
-fn layout() -> KeyLayout {
+pub(super) fn layout() -> KeyLayout {
     KeyLayout::new("fresh-test").unwrap()
 }
 
@@ -43,19 +43,23 @@ type MemoryUploader = ExecutorFreshUploader<InlineTierExecutor<MemoryStore>>;
 
 /// An interval long enough that the sends a test submits together after an
 /// upload share one window.
-const LONG_INTERVAL: Duration = Duration::from_millis(500);
+pub(super) const LONG_INTERVAL: Duration = Duration::from_millis(500);
+
+/// A wait for proof rows longer than any test, so that only the windows a
+/// test sends carry them and the store holds no object of rows alone.
+pub(super) const NO_CONFIRMATION: Duration = Duration::from_secs(3600);
 
 /// Uploads into a memory store, unless told to refuse.
-struct TestUploader {
+pub(super) struct TestUploader {
     uploader: MemoryUploader,
-    refuses: Cell<bool>,
+    pub(super) refuses: Cell<bool>,
     /// The first attempts that fail, in the order they come.
-    fails_first: Cell<u32>,
+    pub(super) fails_first: Cell<u32>,
     attempts: Cell<u32>,
 }
 
 impl TestUploader {
-    fn new() -> Rc<Self> {
+    pub(super) fn new() -> Rc<Self> {
         Rc::new(Self {
             uploader: ExecutorFreshUploader::new(
                 InlineTierExecutor::new(MemoryStore::new()),
@@ -67,7 +71,7 @@ impl TestUploader {
         })
     }
 
-    fn store(&self) -> &MemoryStore {
+    pub(super) fn store(&self) -> &MemoryStore {
         self.uploader.executor().store()
     }
 }
@@ -94,7 +98,7 @@ impl FreshObjectUploader for TestUploader {
 /// A shard whose partition [`namespace`] is a single-replica primary on disk
 /// that places its batches.
 #[allow(clippy::future_not_send)]
-async fn placing_owner(directory: &Path) -> IoTestShard {
+pub(super) async fn placing_owner(directory: &Path) -> IoTestShard {
     Box::pin(placing_owner_of_topic(
         directory,
         TopicRuntimeOptions::default(),
@@ -103,7 +107,8 @@ async fn placing_owner(directory: &Path) -> IoTestShard {
 }
 
 /// [`placing_owner`] whose committed topic resolves to the options
-/// `committed`.
+/// `committed`. Proof rows wait for the windows of the test's sends, so
+/// that the store holds only the objects of those sends.
 #[allow(clippy::future_not_send)]
 async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions) -> IoTestShard {
     let bus = Rc::new(IggyMessageBus::new(0));
@@ -121,6 +126,7 @@ async fn placing_owner_of_topic(directory: &Path, committed: TopicRuntimeOptions
     });
     attach_segment_files(partition, directory, false).await;
     partition.register_builtin_state_machines().unwrap();
+    owner.set_fresh_confirm_after(NO_CONFIRMATION);
     owner
 }
 
@@ -172,7 +178,7 @@ fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
 
 /// Submit one send of a message of `payload_len` bytes, as a producer does.
 /// Returns where its answer arrives.
-fn submit_send(
+pub(super) fn submit_send(
     owner: &IoTestShard,
     request: u64,
     payload_len: usize,
@@ -181,7 +187,7 @@ fn submit_send(
 }
 
 /// [`submit_send`] to `partition`.
-fn submit_send_to(
+pub(super) fn submit_send_to(
     owner: &IoTestShard,
     partition: IggyNamespace,
     request: u64,
@@ -235,8 +241,15 @@ async fn submit_send_to_when_room(
     }
 }
 
+/// Objects with data this shard stored: every object it stored but those
+/// of proof rows alone.
+pub(super) fn data_objects_stored(owner: &IoTestShard) -> u64 {
+    let metrics = owner.metrics();
+    metrics.fresh_uploads_value().0 - metrics.fresh_confirmations_value()
+}
+
 /// Ops the partition `partition` committed.
-fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
+pub(super) fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
     owner
         .plane
         .partitions()
@@ -247,14 +260,14 @@ fn committed(owner: &IoTestShard, partition: IggyNamespace) -> u64 {
 }
 
 /// Ops the partition committed and wrote to its segment. Each send is one.
-fn committed_sends(owner: &IoTestShard) -> u64 {
+pub(super) fn committed_sends(owner: &IoTestShard) -> u64 {
     let partition = owner.plane.partitions().get_by_ns(&namespace()).unwrap();
     let written = partition.log.active_segment().size.as_bytes_u64() / PLACED_BATCH_SIZE as u64;
     partition.consensus().commit_min().min(written)
 }
 
 /// The placed batches the partition's segment holds.
-fn stored_placed_batches(directory: &Path) -> Vec<PlacedBatch> {
+pub(super) fn stored_placed_batches(directory: &Path) -> Vec<PlacedBatch> {
     std::fs::read(directory.join("00000000000000000000.log"))
         .unwrap()
         .chunks(PLACED_BATCH_SIZE)
@@ -522,17 +535,32 @@ async fn given_committed_sends_when_nothing_stages_a_pass_should_store_and_publi
         object: SegmentObject::Log,
     });
     assert_eq!(store.head(&log_key).await.unwrap().size, segments[0].size);
+    let mut fresh_with_data = 0;
+    for key in store.keys() {
+        if let Some(id) = layout().parse_fresh_key(&key) {
+            let size = store.head(&key).await.unwrap().size;
+            let bytes = store.get_range(&key, 0..size).await.unwrap().bytes;
+            let index = FreshIndex::decode(&bytes, FreshObjectId::from_raw(id)).unwrap();
+            fresh_with_data += usize::from(!index.is_confirmation());
+        }
+    }
+    assert_eq!(fresh_with_data, 2, "a fresh object per send");
     assert_eq!(
-        store.keys().len(),
-        4,
-        "a fresh object per send, the log and its index"
+        store.keys().len()
+            - store
+                .keys()
+                .iter()
+                .filter(|key| layout().parse_fresh_key(key).is_some())
+                .count(),
+        2,
+        "the log and its index"
     );
 }
 
 /// The whole store of one test: the fresh objects, the long-term segments,
 /// and the sweeps, all through one executor.
 #[allow(clippy::future_not_send)]
-async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
+pub(super) async fn swept_owner(directory: &Path) -> (IoTestShard, super::object_deletes::Shared) {
     with_swept_store(Box::pin(placing_owner(directory)).await)
 }
 
@@ -580,7 +608,7 @@ fn with_swept_store(owner: IoTestShard) -> (IoTestShard, super::object_deletes::
 }
 
 /// The ids of the fresh objects the store holds, ascending.
-fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
+pub(super) fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
     let mut objects: Vec<_> = store
         .keys()
         .iter()
@@ -593,7 +621,7 @@ fn fresh_objects(store: &MemoryStore) -> Vec<u128> {
 /// Run one sweep at `now` to the answer of every shard, and let the delete
 /// it started end.
 #[allow(clippy::future_not_send)]
-async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
+pub(super) async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
     let settled = owner.fresh_sweeps_settled();
     owner.request_sweep_fresh_objects(now);
     until(owner, |owner| owner.fresh_sweeps_settled() > settled).await;
@@ -603,14 +631,14 @@ async fn sweep(owner: &IoTestShard, now: IggyTimestamp) {
 }
 
 /// A time one grace period and a second after `now`.
-fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
+pub(super) fn past_grace(now: IggyTimestamp) -> IggyTimestamp {
     let grace = u64::try_from(partitions::FRESH_OBJECT_GRACE.as_micros()).unwrap();
     IggyTimestamp::from(now.as_micros() + grace + 1_000_000)
 }
 
 /// Rewrite the committed sends of the partition up to `floor`.
 #[allow(clippy::future_not_send)]
-async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
+pub(super) async fn rewrite_up_to(owner: &IoTestShard, floor: u64) {
     rewrite_partition_up_to(owner, namespace(), floor).await;
 }
 
@@ -1817,7 +1845,7 @@ async fn given_sends_to_two_placing_partitions_in_one_window_when_it_closes_shou
 
 /// Make the shard lead `count` partitions that place their batches: the
 /// fixture's own, and single-replica primaries in memory beside them.
-fn place_partitions(owner: &IoTestShard, count: usize) -> Vec<IggyNamespace> {
+pub(super) fn place_partitions(owner: &IoTestShard, count: usize) -> Vec<IggyNamespace> {
     let partitions = owner.plane.partitions();
     (0..count)
         .map(|partition_id| {
@@ -1910,7 +1938,7 @@ async fn given_sends_to_many_placing_partitions_when_they_arrive_within_an_inter
 
 /// Holds every attempt at an upload until the test settles it, so the test
 /// picks the order the uploads end in and which of them the store fails.
-struct GatedUploader {
+pub(super) struct GatedUploader {
     uploader: Rc<MemoryUploader>,
     /// Every attempt in the order it started: its object, and how to end it.
     started: RefCell<
@@ -1922,7 +1950,7 @@ struct GatedUploader {
 }
 
 impl GatedUploader {
-    fn new() -> Rc<Self> {
+    pub(super) fn new() -> Rc<Self> {
         Rc::new(Self {
             uploader: Rc::new(ExecutorFreshUploader::new(
                 InlineTierExecutor::new(MemoryStore::new()),
@@ -1932,7 +1960,7 @@ impl GatedUploader {
         })
     }
 
-    fn started(&self) -> usize {
+    pub(super) fn started(&self) -> usize {
         self.started.borrow().len()
     }
 
@@ -1943,7 +1971,7 @@ impl GatedUploader {
 
     /// End the attempt that started as number `attempt`: the store takes the
     /// object, or fails in a way a retry can get past.
-    fn settle(&self, attempt: usize, stores: bool) {
+    pub(super) fn settle(&self, attempt: usize, stores: bool) {
         let settle = self.started.borrow_mut()[attempt].1.take().unwrap();
         settle.send(stores).unwrap();
     }
@@ -2163,7 +2191,8 @@ async fn given_an_idle_shard_when_sends_arrive_should_upload_the_first_at_once_a
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
     owner.set_fresh_upload_pace(INTERVAL, 4);
-    let stored = |count: usize| uploader.store().keys().len() == count;
+    // Objects of proof rows alone go out beside the windows.
+    let stored = |count: u64| data_objects_stored(&owner) == count;
 
     pumped(&owner, async {
         assert_eq!(owner.fresh_uploads_deadline(), None);
@@ -2174,7 +2203,7 @@ async fn given_an_idle_shard_when_sends_arrive_should_upload_the_first_at_once_a
 
         let _second = submit_send(&owner, 2, 100);
         compio::time::sleep(INTERVAL / 4).await;
-        assert_eq!(uploader.store().keys().len(), 1);
+        assert_eq!(data_objects_stored(&owner), 1);
         let due_in = owner
             .fresh_uploads_deadline()
             .expect("the open window has a deadline of its own")
@@ -2733,6 +2762,7 @@ fn answer_as_second_shard(owner: &IoTestShard, sweep: u64, in_use: Option<&[u128
         sweep,
         shard: 1,
         in_use: in_use.map(|objects| objects.iter().copied().collect()),
+        floors: partitions::ProofFloors::default(),
     });
     owner.senders[0]
         .try_send(ShardFrame::lifecycle(LifecycleFrame::FreshObjectsReported(
@@ -2968,24 +2998,28 @@ impl FreshObjectSweeper for FlakySweeper {
     fn delete(
         &self,
         objects: Vec<u128>,
+        floors: Rc<partitions::ProofFloors>,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshDeleteOutcome> {
         self.deletes.set(self.deletes.get() + 1);
         if self.refuses.get() {
-            return Box::pin(std::future::ready(Ok(objects)));
+            return Box::pin(std::future::ready(Ok(partitions::FreshDeleted {
+                failed: objects,
+                kept: Vec::new(),
+            })));
         }
         let keeps = std::mem::take(&mut *self.keeps.borrow_mut());
         let (kept, sent): (Vec<u128>, Vec<u128>) =
             objects.into_iter().partition(|id| keeps.contains(id));
-        let delete = self.sweeper.delete(sent, scope);
+        let delete = self.sweeper.delete(sent, floors, scope);
         let held = self.held_delete.borrow_mut().take();
         Box::pin(async move {
             if let Some(held) = held {
                 let _ = held.await;
             }
-            let mut failed = delete.await?;
-            failed.extend(kept);
-            Ok(failed)
+            let mut deleted = delete.await?;
+            deleted.failed.extend(kept);
+            Ok(deleted)
         })
     }
 }

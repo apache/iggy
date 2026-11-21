@@ -36,9 +36,9 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    KeyLayout, ListRequest, MAX_TOPIC_OBJECT_LEN, ObjectStore, ObjectStoreError, TierExecutor,
-    TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken, TopicKey,
-    TopicObject, TopicRead,
+    KeyLayout, ListRequest, MAX_TOPIC_OBJECT_LEN, ObjectPrefix, ObjectStore, ObjectStoreError,
+    TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
+    TopicKey, TopicObject, TopicRead,
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -46,6 +46,7 @@ use tracing::{debug, warn};
 
 use crate::IggyPartition;
 use crate::object_delete::{delete_incarnation, delete_objects};
+use crate::origin_recovery::RecoveryPlan;
 
 /// How long the primary of a geo topic's partition waits after a read that
 /// did not find the object of a live topic before it reads again.
@@ -88,6 +89,15 @@ pub trait TopicObjects {
         partition_count: u32,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, TopicObjectOutcome<usize>>;
+
+    /// Read the plan that the recovery of `retired_cluster_uid` stored for
+    /// the partition incarnation `prefix`, `None` when it stored none.
+    fn read_recovery_plan(
+        &self,
+        retired_cluster_uid: u128,
+        prefix: ObjectPrefix,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, TopicObjectOutcome<Option<RecoveryPlan>>>;
 }
 
 /// The jobs on topic objects, through a tier executor.
@@ -170,6 +180,21 @@ impl<E: TierExecutor> TopicObjects for ExecutorTopicObjects<E> {
         self.executor
             .submit(request, move |store| async move {
                 delete_topic(&*store, &layout, &key, partition_count).await
+            })
+            .boxed_local()
+    }
+
+    fn read_recovery_plan(
+        &self,
+        retired_cluster_uid: u128,
+        prefix: ObjectPrefix,
+        scope: TierScopeToken,
+    ) -> LocalBoxFuture<'static, TopicObjectOutcome<Option<RecoveryPlan>>> {
+        let layout = self.layout.clone();
+        let request = TierJobRequest::new(TierJobClass::DemandFetch, scope);
+        self.executor
+            .submit(request, move |store| async move {
+                RecoveryPlan::read(&*store, &layout, retired_cluster_uid, &prefix).await
             })
             .boxed_local()
     }

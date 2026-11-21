@@ -123,6 +123,7 @@ async fn given_a_short_data_disk_when_a_send_is_retried_should_answer_the_outcom
                         base_offset: 0,
                         message_count: 1,
                         size_bytes: 0,
+                        placed: None,
                     }),
                 ),
             );

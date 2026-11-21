@@ -17,12 +17,18 @@
 
 //! A server with the `fs` object store and a geo topic on it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iggy::prelude::*;
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchProducer};
+use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch, Placement};
+use iggy_object_store::{
+    FreshIndex, FreshObjectId, FreshProofRow, FsStore, KeyLayout, ObjectStore,
+};
 use integration::harness::{TestHarness, TestServerConfig};
+use server_common::sharding::IggyNamespace;
 use tokio::time::{Instant, sleep};
 
 const STREAM: &str = "geo-stream";
@@ -34,6 +40,9 @@ const MESSAGE_BYTES: usize = 1024;
 /// store first, and the metadata primary then has to see it ready.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How long the bucket may take to prove the last committed batch: one
+/// object of proof rows alone after a wait and an upload.
+const PROVEN_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_back() {
@@ -79,6 +88,75 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
         files(store.path())
     );
     assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
+}
+
+/// A reader of the bucket alone, with no access to the cluster, finds every
+/// committed message once: the proof rows of the fresh objects bind each
+/// committed batch to its offset, and the batch rows of the object that
+/// holds it rebuild the placed batch the partition committed.
+#[tokio::test]
+async fn given_a_geo_topic_when_producing_should_prove_every_committed_message_in_the_bucket() {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_geo_topic(&client, &stream, TOPIC, None)
+        .await
+        .expect("create the geo topic");
+    let stream_id = client
+        .get_stream(&stream)
+        .await
+        .expect("get stream")
+        .expect("the stream exists")
+        .id;
+    let topic_id = client
+        .get_topic(&stream, &topic)
+        .await
+        .expect("get topic")
+        .expect("the topic exists")
+        .id;
+    let partition =
+        IggyNamespace::new(stream_id as usize, topic_id as usize, PARTITION_ID as usize);
+
+    send(&client, &stream, &topic, 0..MESSAGES).await;
+
+    let deadline = Instant::now() + PROVEN_DEADLINE;
+    let (objects, rows) = loop {
+        let objects = read_fresh_objects(store.path());
+        let rows = proof_rows(&objects, partition);
+        if rows.len() as u64 >= MESSAGES {
+            break (objects, rows);
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bucket proves {} of {MESSAGES} batches with {} objects",
+            rows.len(),
+            objects.len()
+        );
+        sleep(POLL_INTERVAL).await;
+    };
+    assert_eq!(
+        rows.keys().copied().collect::<Vec<_>>(),
+        (0..MESSAGES).collect::<Vec<_>>(),
+        "one batch per send, each proven"
+    );
+    for (offset, row) in &rows {
+        let blob = proven_blob(&objects, partition, row);
+        let found: Vec<u64> = (0..MESSAGES)
+            .filter(|index| contains(blob, &payload(*index)))
+            .collect();
+        assert_eq!(
+            found,
+            [*offset],
+            "the batch at {offset} holds its own message"
+        );
+    }
 }
 
 #[tokio::test]
@@ -348,4 +426,131 @@ fn files(root: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+/// A fresh object of the bucket, decoded under its key.
+struct FreshInBucket {
+    id: FreshObjectId,
+    index: FreshIndex,
+    bytes: Vec<u8>,
+}
+
+/// Every fresh object under the `fs` store at `root`, read through the
+/// provider on a compio runtime of its own thread, as the provider does not
+/// run on the harness's.
+fn read_fresh_objects(root: &Path) -> Vec<FreshInBucket> {
+    let layout = KeyLayout::new("iggy").expect("the default prefix");
+    let keys: Vec<(String, u128)> = files(root)
+        .into_iter()
+        .filter_map(|path| {
+            let key = path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+            let id = layout.parse_fresh_key(&key)?;
+            Some((key, id))
+        })
+        .collect();
+    let root = root.to_owned();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new()
+            .expect("a compio runtime")
+            .block_on(async {
+                let store = FsStore::new(&root);
+                let mut objects = Vec::new();
+                for (key, id) in keys {
+                    // An object still being written is not there yet.
+                    let Ok(meta) = store.head(&key).await else {
+                        continue;
+                    };
+                    let bytes = store
+                        .get_range(&key, 0..meta.size)
+                        .await
+                        .expect("a stored object reads back")
+                        .bytes
+                        .to_vec();
+                    let id = FreshObjectId::from_raw(id);
+                    let index = FreshIndex::decode(&bytes, id)
+                        .unwrap_or_else(|error| panic!("{key} does not decode: {error}"));
+                    objects.push(FreshInBucket { id, index, bytes });
+                }
+                objects
+            })
+    })
+    .join()
+    .expect("the read does not panic")
+}
+
+/// The proof rows of `partition` in `objects`, by the offset of their
+/// batch. Two different rows for one batch fail the test.
+fn proof_rows(objects: &[FreshInBucket], partition: IggyNamespace) -> BTreeMap<u64, FreshProofRow> {
+    let mut rows = BTreeMap::new();
+    for object in objects {
+        let Some(row) = object.index.partition(partition.inner()) else {
+            continue;
+        };
+        for proof in object.index.proofs_of(row) {
+            if let Some(earlier) = rows.insert(proof.base_offset, *proof) {
+                assert_eq!(
+                    earlier, *proof,
+                    "two rows for the batch at {}",
+                    proof.base_offset
+                );
+            }
+        }
+    }
+    rows
+}
+
+/// The messages of the batch `proof` names, once the rows of the object
+/// that holds them rebuild the placed batch the partition committed.
+fn proven_blob<'a>(
+    objects: &'a [FreshInBucket],
+    partition: IggyNamespace,
+    proof: &FreshProofRow,
+) -> &'a [u8] {
+    let source = objects
+        .iter()
+        .find(|object| object.id == proof.object_id)
+        .expect("the object that holds the batch is in the bucket");
+    let (row, batch) = source
+        .index
+        .batch_at(partition.inner(), proof.position)
+        .expect("a batch of the partition starts where the row says");
+    assert_eq!(batch.message_count, proof.message_count);
+    let header = BatchHeader {
+        partition_id: u64::from(PARTITION_ID),
+        base_offset: proof.base_offset,
+        base_timestamp: proof.base_timestamp,
+        origin_timestamp: batch.origin_timestamp,
+        batch_length: (BATCH_HEADER_SIZE as u64) + u64::from(batch.blob_length),
+        batch_checksum: 0,
+        message_count: batch.message_count,
+        producer: batch.producer.and_then(|producer| {
+            BatchProducer::new(producer.producer_id, producer.epoch, producer.base_sequence)
+        }),
+    };
+    let placement = Placement {
+        object_id: proof.object_id.get(),
+        position: proof.position,
+        length: u64::from(batch.blob_length),
+        blob_checksum: batch.blob_checksum,
+        proven_below: row.proven_below,
+    };
+    let mut placed = [0; PLACED_BATCH_SIZE];
+    PlacedBatch::new(header, placement).encode_into(&mut placed);
+    assert_eq!(
+        placement::checksum_of(&placed),
+        proof.placed_checksum,
+        "the rows rebuild the committed batch at {}",
+        proof.base_offset
+    );
+    let start = usize::try_from(proof.position).expect("a position fits");
+    let blob = &source.bytes[start..start + batch.blob_length as usize];
+    assert!(
+        placement.matches(blob),
+        "the blob is the one its placement names"
+    );
+    blob
+}
+
+fn contains(bytes: &[u8], needle: &[u8]) -> bool {
+    bytes.windows(needle.len()).any(|window| window == needle)
 }

@@ -318,6 +318,18 @@ where
         })
     }
 
+    /// Where a node that follows this peer's fresh objects reads them: the
+    /// peer's tier service, in the class of its own that a shadow
+    /// partition's lag waits for.
+    #[must_use]
+    pub fn follow_objects(&self) -> Rc<dyn RemoteObjects> {
+        Rc::new(PeerObjects {
+            origin: self.origin.clone(),
+            reads: ExecutorObjects::with_class(self.service.clone(), TierJobClass::FreshFollow),
+            status: self.status.clone(),
+        })
+    }
+
     fn objects(&self) -> PeerObjects<B> {
         PeerObjects {
             origin: self.origin.clone(),
@@ -383,6 +395,18 @@ where
             stores
                 .iter()
                 .map(|peer| (peer.origin().to_owned(), peer.manifest_objects()))
+                .collect(),
+        );
+        self.set_peer_fresh_objects(
+            stores
+                .iter()
+                .map(|peer| {
+                    (
+                        peer.origin().to_owned(),
+                        peer.follow_objects(),
+                        peer.layout().clone(),
+                    )
+                })
                 .collect(),
         );
         *self.peer_stores.borrow_mut() = Rc::new(stores);

@@ -46,6 +46,11 @@
 //! listing of a peer fails, or the node reads nothing from the peer, the
 //! shadow topics of the peer are stale: they serve what they hold, and the
 //! pass removes none of them but those whose grace ended.
+//!
+//! A node whose own store names another cluster creates no shadow stream:
+//! that cluster may be one that lost every disk, whose streams a recovery
+//! restores under their ids, and a shadow stream created first could take
+//! one of them.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -206,7 +211,10 @@ impl ShadowTopics {
         let Some(settings) = self.settings else {
             return;
         };
-        if !shard.plane.metadata().is_caught_up_primary() {
+        let metadata = shard.plane.metadata();
+        if !metadata.is_caught_up_primary()
+            || metadata.applied_frontier().store_claimed_by_another()
+        {
             self.stop(shard);
             return;
         }
@@ -917,6 +925,18 @@ fn describe(proposal: &ShadowTopicRequest) -> String {
                 target.topic_id, target.stream_id
             )
         }
+        ShadowTopicRequest::RestoreStream { source, name } => format!(
+            "restore stream {} as {}",
+            describe_source(source),
+            name.as_str()
+        ),
+        ShadowTopicRequest::RestoreTopic { target, create } => format!(
+            "restore topic {} ({}) of {} at revision {}",
+            target.topic_id,
+            create.request.name.as_str(),
+            describe_source(&target.source),
+            target.created_revision
+        ),
     }
 }
 

@@ -25,8 +25,8 @@ mod partition_io;
 pub use partition_io::{DEFAULT_PARTITION_IO_CAPACITY, PartitionIoLimits, PartitionIoLimitsError};
 mod fresh_writes;
 pub use fresh_writes::{
-    FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS,
-    FinishedFreshUpload,
+    FRESH_CONFIRM_AFTER, FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL,
+    FRESH_UPLOADS, FinishedFreshUpload,
 };
 mod fresh_sweeps;
 pub use fresh_sweeps::{
@@ -38,6 +38,7 @@ mod long_term_retention;
 mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
+mod peer_fresh_follows;
 mod peer_manifest_follows;
 pub mod peers;
 mod poll;
@@ -51,6 +52,7 @@ pub mod shards_table;
 mod test_support;
 pub mod tier_service;
 mod topic_object_checks;
+pub use peer_fresh_follows::PeerFreshFound;
 pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest};
 mod upload_pacing;
 
@@ -1340,6 +1342,10 @@ pub enum LifecycleFrame {
     /// The result of a read that a [`Self::PeerManifestsListed`] pass
     /// started, sent by the task that ran it.
     PeerManifestRead(Box<FinishedPeerManifestRead>),
+    /// What reads of a geo peer's fresh objects found for the shadow
+    /// partitions the shard owns: from shard 0, which follows the peer's
+    /// writers, or from a read that the shard started for a proof.
+    PeerFreshFound(Box<PeerFreshFound>),
     /// The result of a merge of long-term segments that the pump's tick
     /// started, sent by the task that ran it.
     SegmentMergeFinished(Box<FinishedSegmentMerge>),
@@ -2246,6 +2252,10 @@ where
     /// manifests.
     peer_manifest_follows: peer_manifest_follows::PeerManifestFollows,
 
+    /// What the shadow partitions here wait for of their peers' fresh
+    /// objects.
+    peer_fresh_follows: peer_fresh_follows::PeerFreshFollows,
+
     /// Late-bound stores of the geo peers, empty on a node without peers.
     /// See [`Self::set_peer_stores`].
     peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
@@ -2627,6 +2637,7 @@ where
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
+            peer_fresh_follows: peer_fresh_follows::PeerFreshFollows::default(),
             peer_stores: RefCell::default(),
             long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
@@ -3619,6 +3630,7 @@ where
             rewrite_pacing: RefCell::default(),
             topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
             peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
+            peer_fresh_follows: peer_fresh_follows::PeerFreshFollows::default(),
             peer_stores: RefCell::default(),
             long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
@@ -10141,6 +10153,7 @@ where
                 .sent_report(namespace)
                 .and_then(|(partition, sent)| {
                     self.pace_placing_primary(*namespace, partition);
+                    self.note_fresh_proofs(*namespace, partition);
                     self.stage_manifest_pass(*namespace, partition, manifest_now);
                     self.partition_quiet_until(*namespace, partition, sent.get())
                 });

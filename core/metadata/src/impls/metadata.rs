@@ -3795,7 +3795,8 @@ where
         if consensus.pipeline_is_full() {
             return Err(MetadataSubmitError::PipelineFull);
         }
-        if let ShadowTopicRequest::AdoptTopic { create, .. } = &mut request
+        if let ShadowTopicRequest::AdoptTopic { create, .. }
+        | ShadowTopicRequest::RestoreTopic { create, .. } = &mut request
             && let Err(error) = self.assign_shadow_partitions(create)
         {
             return Ok(error.as_code());

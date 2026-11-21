@@ -1,0 +1,535 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! Fresh objects that describe themselves: the index of each object, and
+//! the proof rows that bind the batches that committed to where they did.
+
+use super::fresh_writes::{
+    GatedUploader, LONG_INTERVAL, TestUploader, committed, committed_sends, fresh_objects, layout,
+    past_grace, place_partitions, placing_owner, rewrite_up_to, stored_placed_batches, submit_send,
+    submit_send_to, sweep, swept_owner,
+};
+use super::segment_uploads::{namespace, pumped, until};
+use super::*;
+use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch};
+use iggy_object_store::{FreshIndex, FreshObjectId, FreshProofRow, MemoryStore, ObjectStore};
+use partitions::ProvenBatch;
+
+const CLUSTER_UID: u128 = 0x00c1_05e5_0000_0000_0000_0000_0000_0042;
+
+/// A fresh object the store holds, as a reader of the store alone finds it.
+struct StoredObject {
+    id: FreshObjectId,
+    index: FreshIndex,
+    bytes: bytes::Bytes,
+}
+
+/// Every fresh object in `store`, in the order of their ids, each read
+/// whole and its index decoded under its key.
+#[allow(clippy::future_not_send)]
+async fn stored_objects(store: &MemoryStore) -> Vec<StoredObject> {
+    let mut keys = store.keys();
+    keys.sort();
+    let mut objects = Vec::new();
+    for key in keys {
+        let Some(id) = layout().parse_fresh_key(&key) else {
+            continue;
+        };
+        let id = FreshObjectId::from_raw(id);
+        let size = store.head(&key).await.unwrap().size;
+        let bytes = store.get_range(&key, 0..size).await.unwrap().bytes;
+        let index = FreshIndex::decode(&bytes, id)
+            .unwrap_or_else(|error| panic!("object {key} does not decode: {error}"));
+        objects.push(StoredObject { id, index, bytes });
+    }
+    objects
+}
+
+/// The distinct proof rows of `partition` across `objects`, by the offset
+/// of their batch, each with the objects that carry it.
+fn proof_rows(
+    objects: &[StoredObject],
+    partition: IggyNamespace,
+) -> BTreeMap<u64, Vec<(FreshProofRow, FreshObjectId)>> {
+    let mut rows: BTreeMap<u64, Vec<(FreshProofRow, FreshObjectId)>> = BTreeMap::new();
+    for object in objects {
+        let Some(row) = object.index.partition(partition.inner()) else {
+            continue;
+        };
+        for proof in object.index.proofs_of(row) {
+            rows.entry(proof.base_offset)
+                .or_default()
+                .push((*proof, object.id));
+        }
+    }
+    rows
+}
+
+/// The placed batch that `proof` rebuilds from the rows of the objects
+/// that hold it, as a reader of the store alone gets it.
+fn rebuilt(
+    objects: &[StoredObject],
+    partition: IggyNamespace,
+    proof: &FreshProofRow,
+) -> [u8; PLACED_BATCH_SIZE] {
+    let source = objects
+        .iter()
+        .find(|object| object.id == proof.object_id)
+        .expect("the object that holds the blob is stored");
+    let row = source
+        .index
+        .partition(partition.inner())
+        .expect("the source object holds the partition");
+    let rebuilt = PlacedBatch::try_from(ProvenBatch::find(proof, row, &source.index).unwrap())
+        .expect("the rows rebuild the committed placed batch");
+    let start = usize::try_from(rebuilt.placement.position).unwrap();
+    let end = start + usize::try_from(rebuilt.placement.length).unwrap();
+    assert!(
+        rebuilt.placement.matches(&source.bytes[start..end]),
+        "the placement names the blob of the batch"
+    );
+    let mut bytes = [0; PLACED_BATCH_SIZE];
+    rebuilt.encode_into(&mut bytes);
+    bytes
+}
+
+/// Wait until the store holds a proof row of each of the first `batches`
+/// batches of every one of `partitions`.
+#[allow(clippy::future_not_send)]
+async fn until_proven(
+    owner: &IoTestShard,
+    store: &MemoryStore,
+    partitions: &[IggyNamespace],
+    batches: u64,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let objects = Box::pin(stored_objects(store)).await;
+        if partitions
+            .iter()
+            .all(|partition| proof_rows(&objects, *partition).len() as u64 >= batches)
+        {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the batches were not all proven, with {} objects stored and {} uploads",
+            objects.len(),
+            owner.metrics().fresh_uploads_value().0
+        );
+        compio::time::sleep(TASK_POLL_INTERVAL).await;
+    }
+}
+
+/// A shard that leads `PARTITIONS` placing partitions takes one send per
+/// partition in each round, and the next round starts once the last one
+/// committed. Every object decodes as a reader finds it. The row of each
+/// committed batch rides an object of its own round or of the next one, and
+/// those of the last round an object of rows alone. There is one distinct
+/// row per batch, and a reader rebuilds from them exactly the placed batches
+/// the partition committed.
+#[compio::test]
+async fn given_sends_in_rounds_when_each_round_commits_should_prove_its_batches_in_the_objects_of_the_next()
+ {
+    const PARTITIONS: usize = 4;
+    const ROUNDS: u64 = 4;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let placing = place_partitions(&owner, PARTITIONS);
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+    owner.set_fresh_cluster_uid(CLUSTER_UID);
+    owner.set_fresh_upload_pace(Duration::from_millis(20), 2);
+
+    let objects_after_round = pumped(&owner, async {
+        let mut request = 0;
+        let mut objects_after_round = Vec::new();
+        for round in 1..=ROUNDS {
+            for partition in &placing {
+                request += 1;
+                owner.offer_fresh_send(sized_send_request(*partition, request, 100), channel(1).0);
+            }
+            until(&owner, |owner| {
+                placing
+                    .iter()
+                    .all(|partition| committed(owner, *partition) == round)
+            })
+            .await;
+            objects_after_round.push(uploader.store().keys().len());
+        }
+        until_proven(&owner, uploader.store(), &placing, ROUNDS).await;
+        objects_after_round
+    })
+    .await;
+
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    for object in &objects {
+        assert_eq!(object.index.header().object_id, object.id);
+        assert_eq!(object.index.header().cluster_uid, CLUSTER_UID);
+        assert_eq!(object.index.object_len(), object.bytes.len() as u64);
+    }
+    let round_of = |object: FreshObjectId| {
+        let position = objects
+            .iter()
+            .position(|stored| stored.id == object)
+            .unwrap();
+        1 + objects_after_round
+            .iter()
+            .position(|after| position < *after)
+            .unwrap_or(objects_after_round.len()) as u64
+    };
+    for partition in &placing {
+        let rows = proof_rows(&objects, *partition);
+        let offsets: Vec<u64> = rows.keys().copied().collect();
+        assert_eq!(
+            offsets,
+            (0..ROUNDS).collect::<Vec<_>>(),
+            "every batch of {partition:?} is proven"
+        );
+        for (offset, carried) in &rows {
+            assert!(
+                carried.iter().all(|(row, _)| *row == carried[0].0),
+                "one row for the batch at {offset}: {carried:?}"
+            );
+            let (row, carrier) = carried[0];
+            assert_ne!(carrier, row.object_id);
+            assert!(
+                round_of(carrier) <= round_of(row.object_id) + 1,
+                "the batch at {offset} is proven in its own round or the next"
+            );
+        }
+    }
+    let committed_batches = stored_placed_batches(directory.path());
+    for (offset, carried) in proof_rows(&objects, namespace()) {
+        let mut committed = [0; PLACED_BATCH_SIZE];
+        committed_batches[usize::try_from(offset).unwrap()].encode_into(&mut committed);
+        assert_eq!(
+            rebuilt(&objects, namespace(), &carried[0].0),
+            committed,
+            "the rows rebuild the batch at {offset} byte for byte"
+        );
+        assert_eq!(
+            carried[0].0.placed_checksum,
+            placement::checksum_of(&committed)
+        );
+    }
+    assert!(
+        objects.last().unwrap().index.is_confirmation(),
+        "the rows of the last round go out alone"
+    );
+    let claims: Vec<u64> = objects
+        .iter()
+        .filter_map(|object| object.index.partition(namespace().inner()))
+        .filter(|row| row.batch_count > 0)
+        .map(|row| row.claimed_first_offset)
+        .collect();
+    assert_eq!(
+        claims,
+        (0..ROUNDS).collect::<Vec<_>>(),
+        "with nothing refused, each claim is where its batch committed"
+    );
+}
+
+/// The store refuses for good the object that carries the row of the first
+/// batch. The next object carries it again, and claims where its own batch
+/// commits after the refused send.
+#[compio::test]
+async fn given_an_object_that_carried_proof_rows_when_the_store_refuses_it_for_good_should_carry_them_in_the_next_object()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        uploader.refuses.set(true);
+        let refused = submit_send(&owner, 2, 100);
+        until(&owner, |_| !refused.is_empty()).await;
+        uploader.refuses.set(false);
+        let _third = submit_send(&owner, 3, 100);
+        until(&owner, |owner| committed_sends(owner) == 2).await;
+    })
+    .await;
+
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    assert_eq!(objects.len(), 2, "the refused object is not in the store");
+    let rows = proof_rows(&objects, namespace());
+    assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [0]);
+    let (row, carrier) = rows[&0][0];
+    assert_eq!(row.object_id, objects[0].id);
+    assert_eq!(carrier, objects[1].id);
+    let committed_batches = stored_placed_batches(directory.path());
+    let mut committed = [0; PLACED_BATCH_SIZE];
+    committed_batches[0].encode_into(&mut committed);
+    assert_eq!(rebuilt(&objects, namespace(), &row), committed);
+    let second = objects[1].index.partition(namespace().inner()).unwrap();
+    assert_eq!(
+        second.claimed_first_offset, 1,
+        "the refused send no longer counts in the claim"
+    );
+    assert_eq!(
+        second.proven_below, 0,
+        "the row of the batch at 0 was in no stored object"
+    );
+}
+
+/// The rows of the partitions this shard leads ride the same object.
+#[compio::test]
+async fn given_two_partitions_when_both_commit_should_prove_both_in_one_object() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let other = place_partitions(&owner, 2)[1];
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+    owner.set_fresh_upload_pace(LONG_INTERVAL, 1);
+
+    pumped(&owner, async {
+        // Stored at once, so the two sends after it share the next window.
+        let _alone = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let _first = submit_send(&owner, 2, 100);
+        let _second = submit_send_to(&owner, other, 3, 100);
+        until(&owner, |owner| {
+            committed_sends(owner) == 2 && committed(owner, other) == 1
+        })
+        .await;
+        until_proven(&owner, uploader.store(), &[namespace()], 2).await;
+        until_proven(&owner, uploader.store(), &[other], 1).await;
+    })
+    .await;
+
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    let both = objects
+        .iter()
+        .find(|object| {
+            let proven = |partition: IggyNamespace| {
+                object
+                    .index
+                    .partition(partition.inner())
+                    .is_some_and(|row| row.proof_count > 0)
+            };
+            proven(namespace()) && proven(other)
+        })
+        .expect("one object proves the batches of both");
+    let other_row = both.index.partition(other.inner()).unwrap();
+    assert_eq!(
+        other_row.batch_count, 0,
+        "proof rows alone for the other partition"
+    );
+}
+
+/// An object that carries the row of a batch is still uploading when the
+/// next one is sealed. The next one claims no proof of that batch, and the
+/// one after the upload ends does.
+#[compio::test]
+async fn given_an_object_whose_proof_rows_still_upload_when_sealing_the_next_should_claim_them_unproven()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = GatedUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_upload_pace(Duration::ZERO, 3);
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |_| uploader.started() == 1).await;
+        uploader.settle(0, true);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        // Carries the row of the batch at 0, and holds its upload.
+        let _second = submit_send(&owner, 2, 100);
+        until(&owner, |_| uploader.started() == 2).await;
+        let _third = submit_send(&owner, 3, 100);
+        until(&owner, |_| uploader.started() == 3).await;
+        uploader.settle(1, true);
+        uploader.settle(2, true);
+        until(&owner, |owner| committed_sends(owner) == 3).await;
+        let _fourth = submit_send(&owner, 4, 100);
+        until(&owner, |_| uploader.started() == 4).await;
+        uploader.settle(3, true);
+        until(&owner, |owner| committed_sends(owner) == 4).await;
+    })
+    .await;
+
+    let claims: Vec<u64> = stored_placed_batches(directory.path())
+        .iter()
+        .map(|placed| placed.placement.proven_below)
+        .collect();
+    assert_eq!(claims, [0, 0, 0, 1]);
+}
+
+/// An idle shard stores the rows of the batch that committed last in an
+/// object of rows alone, once they waited for `FRESH_CONFIRM_AFTER`, and
+/// writes no other.
+#[compio::test]
+async fn given_an_idle_shard_when_a_batch_commits_should_store_one_object_of_its_proof_alone_after_the_wait()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+
+    let waited = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        let committed_at = std::time::Instant::now();
+        until(&owner, |_| uploader.store().keys().len() == 2).await;
+        let waited = committed_at.elapsed();
+        compio::time::sleep(2 * crate::FRESH_CONFIRM_AFTER).await;
+        waited
+    })
+    .await;
+
+    assert!(
+        waited + TASK_POLL_INTERVAL >= crate::FRESH_CONFIRM_AFTER,
+        "the rows waited for an object with data first: {waited:?}"
+    );
+    assert!(
+        waited < crate::FRESH_CONFIRM_AFTER + Duration::from_millis(500),
+        "the rows went out within the wait and one upload: {waited:?}"
+    );
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    assert_eq!(objects.len(), 2, "one object of rows alone, and no more");
+    let confirmation = &objects[1];
+    assert!(confirmation.index.is_confirmation());
+    assert_eq!(confirmation.index.batches(), []);
+    assert_eq!(
+        confirmation.index.object_len(),
+        confirmation.index.index_len(),
+        "it holds no data"
+    );
+    let rows = proof_rows(&objects, namespace());
+    assert_eq!(rows.keys().copied().collect::<Vec<_>>(), [0]);
+    assert_eq!(rows[&0][0].0.object_id, objects[0].id);
+    assert_eq!(owner.metrics().fresh_confirmations_value(), 1);
+    assert!(owner.metrics().fresh_proof_lag_value().abs() < f64::EPSILON);
+}
+
+/// Under steady load each window carries the rows of what committed before
+/// it, so no object of rows alone is stored until the load stops.
+#[compio::test]
+async fn given_steady_sends_when_windows_keep_closing_should_store_no_object_of_rows_alone_until_they_stop()
+ {
+    const SENDS: u64 = 30;
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+
+    let during_load = pumped(&owner, async {
+        for request in 1..=SENDS {
+            let _answer = submit_send(&owner, request, 100);
+            compio::time::sleep(crate::FRESH_CONFIRM_AFTER / 10).await;
+        }
+        until(&owner, |owner| committed_sends(owner) == SENDS).await;
+        let during_load = owner.metrics().fresh_confirmations_value();
+        until_proven(&owner, uploader.store(), &[namespace()], SENDS).await;
+        during_load
+    })
+    .await;
+
+    assert_eq!(during_load, 0, "no object of rows alone under load");
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    let confirmations: Vec<usize> = objects
+        .iter()
+        .enumerate()
+        .filter(|(_, object)| object.index.is_confirmation())
+        .map(|(position, _)| position)
+        .collect();
+    assert_eq!(
+        confirmations,
+        [objects.len() - 1],
+        "one object of rows alone, after the last send"
+    );
+}
+
+/// An object of rows alone that the store fails once is tried again under
+/// the same id, as an object with data is.
+#[compio::test]
+async fn given_an_object_of_rows_alone_when_the_store_fails_it_once_should_store_it_on_the_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    let uploader = TestUploader::new();
+    owner.set_fresh_uploader(Some(uploader.clone()));
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+
+    pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        // The upload of the data was the first attempt.
+        uploader.fails_first.set(2);
+        until_proven(&owner, uploader.store(), &[namespace()], 1).await;
+    })
+    .await;
+
+    let objects = Box::pin(stored_objects(uploader.store())).await;
+    assert_eq!(objects.len(), 2);
+    assert!(objects[1].index.is_confirmation());
+    let (retries, ..) = owner.metrics().fresh_load_value();
+    assert_eq!(retries, 1);
+    assert_eq!(owner.metrics().fresh_confirmations_value(), 1);
+}
+
+/// The object of rows alone proves a batch that no long-term segment holds
+/// yet, and no placed batch names it. The sweeps keep it past its grace,
+/// and delete it once the long-term floor passes the batch it proves.
+#[compio::test]
+async fn given_an_object_that_proves_a_batch_above_the_floor_when_sweeps_run_past_the_grace_should_keep_it_until_the_floor_passes()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let (owner, executor) = Box::pin(swept_owner(directory.path())).await;
+    owner.set_fresh_confirm_after(crate::FRESH_CONFIRM_AFTER);
+    let store = executor.0.store();
+    let now = IggyTimestamp::now();
+
+    let (data, confirmation) = pumped(&owner, async {
+        let _first = submit_send(&owner, 1, 100);
+        until(&owner, |owner| committed_sends(owner) == 1).await;
+        until(&owner, |_| fresh_objects(store).len() == 2).await;
+        let objects = fresh_objects(store);
+
+        sweep(&owner, now).await;
+        sweep(&owner, past_grace(now)).await;
+        assert_eq!(
+            fresh_objects(store),
+            objects,
+            "the data is named, and its proof is above the floor"
+        );
+        assert_eq!(owner.metrics().fresh_objects_proving_value(), 1);
+
+        rewrite_up_to(&owner, 0).await;
+        let unnamed_since = past_grace(now);
+        sweep(&owner, unnamed_since).await;
+        assert_eq!(
+            fresh_objects(store),
+            [objects[0]],
+            "the object of rows alone was due already, and the data waits out its grace"
+        );
+        sweep(&owner, past_grace(unnamed_since)).await;
+        (objects[0], objects[1])
+    })
+    .await;
+
+    assert_eq!(fresh_objects(store), Vec::<u128>::new());
+    assert_eq!(owner.metrics().fresh_objects_proving_value(), 0);
+    assert_ne!(data, confirmation);
+}

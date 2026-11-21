@@ -32,6 +32,11 @@ mod messages_writer;
 mod offset_recovery;
 pub mod offset_storage;
 mod partition_storage;
+mod peer_fresh;
+pub use peer_fresh::{
+    FRESH_INDEX_READ_MIN, FreshIndexRead, PEER_FRESH_ROWS_MAX, PEER_FRESH_SOURCES_MAX,
+    PeerFreshChange, PeerFreshLag, PeerFreshRows, PeerFreshTail, ProofTrust, read_fresh_index,
+};
 mod peer_log;
 pub mod peer_manifests;
 pub use peer_log::{
@@ -64,21 +69,31 @@ pub use object_delete::{
     delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
     sweep_long_term, sweep_segments, sweepable,
 };
+mod fresh_proofs;
+pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
 mod fresh_sweep;
 mod manifest_publish;
 pub use fresh_sweep::{
     ExecutorFreshSweeper, FRESH_DELETES_PER_BATCH, FRESH_OBJECT_GRACE, FRESH_OBJECTS_PER_SWEEP,
-    FreshDeleteOutcome, FreshListCursor, FreshListEnd, FreshListOutcome, FreshListRequest,
-    FreshListScope, FreshListedScope, FreshListing, FreshObjectSweeper, FreshObjectsInUse,
-    FreshScanFailed, FreshSettled, FreshSweep, list_fresh_objects,
+    FreshDeleteOutcome, FreshDeleted, FreshListCursor, FreshListEnd, FreshListOutcome,
+    FreshListRequest, FreshListScope, FreshListedScope, FreshListing, FreshObjectSweeper,
+    FreshObjectsInUse, FreshScanFailed, FreshSettled, FreshSweep, ProofFloors, list_fresh_objects,
 };
+mod origin_recovery;
 mod placed_read;
+mod proven_batch;
 pub use manifest_publish::{
     ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
     MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
 };
+pub use origin_recovery::{
+    DropReason, DroppedBatch, FRESH_INDEX_FIRST_READ, FreshScan, PartitionRecovery,
+    RECOVERY_PLAN_BATCHES_MAX, RecoveryInstallError, RecoveryPlan, RecoveryPlanError, SkipReason,
+    SkippedObject, plan_partition, scan_fresh_objects,
+};
+pub use proven_batch::{ProvenBatch, ProvenBatchError};
 mod topic_object;
 pub use segment_chain::object_prefix;
 pub use segment_upload::{

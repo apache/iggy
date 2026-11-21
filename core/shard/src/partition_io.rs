@@ -12398,6 +12398,7 @@ mod tests {
         assert_eq!(sent_groups, groups);
     }
 
+    mod fresh_proofs;
     mod fresh_writes;
     mod manifest_publishes;
     mod object_deletes;

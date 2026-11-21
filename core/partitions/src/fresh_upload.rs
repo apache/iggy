@@ -48,6 +48,14 @@ pub trait FreshObjectUploader {
 /// replaces one. A put that the store already took, which a retry after a
 /// lost answer finds, counts as stored. So the caller can upload the same
 /// bytes under the same id again after an upload that failed.
+///
+/// The object the retry finds counts as this one only when it has the same
+/// length and the same CRC32C as the bytes sent. Two writers under one id
+/// need two nodes of one replica id that started in the same microsecond,
+/// and a reader takes what the store holds for what the id names. The store
+/// reports the CRC32C it computed in its head. With a store that keeps none,
+/// the upload reads the object back and compares the bytes, a read that
+/// only a lost answer costs.
 pub struct ExecutorFreshUploader<E> {
     executor: E,
     layout: KeyLayout,
@@ -78,20 +86,21 @@ impl<E: TierExecutor> FreshObjectUploader for ExecutorFreshUploader<E> {
             TierJobRequest::new(TierJobClass::FreshUpload, scope).with_bytes(bytes.len() as u64);
         self.executor
             .submit(request, move |store| async move {
+                let crc32c = crc32c::crc32c(&bytes);
                 let options = PutOptions {
                     mode: PutMode::IfAbsent,
-                    crc32c: Some(crc32c::crc32c(&bytes)),
+                    crc32c: Some(crc32c),
                     ..PutOptions::default()
                 };
-                let size = bytes.len() as u64;
-                match store.put(&key, PutBody::from_bytes(bytes), &options).await {
-                    // The store holds an object under the id. Only this
-                    // upload writes it, so it is this one when it is as long.
+                match store
+                    .put(&key, PutBody::from_bytes(bytes.clone()), &options)
+                    .await
+                {
                     Err(ObjectStoreError::PreconditionFailed { .. }) => {
-                        match store.head(&key).await {
-                            Ok(meta) if meta.size == size => Ok(()),
-                            Ok(_) => Err(ObjectStoreError::PreconditionFailed { key }),
-                            Err(error) => Err(error),
+                        if holds_sent_bytes(&*store, &key, &bytes, crc32c).await? {
+                            Ok(())
+                        } else {
+                            Err(ObjectStoreError::PreconditionFailed { key })
                         }
                     }
                     put => put,
@@ -101,14 +110,34 @@ impl<E: TierExecutor> FreshObjectUploader for ExecutorFreshUploader<E> {
     }
 }
 
+/// Whether the object under `key` is `sent`, whose CRC32C is `crc32c`.
+async fn holds_sent_bytes<S: ObjectStore>(
+    store: &S,
+    key: &str,
+    sent: &Bytes,
+    crc32c: u32,
+) -> Result<bool, ObjectStoreError> {
+    let meta = store.head(key).await?;
+    let size = sent.len() as u64;
+    if meta.size != size {
+        return Ok(false);
+    }
+    if let Some(stored) = meta.crc32c {
+        return Ok(stored == crc32c);
+    }
+    Ok(store.get_range(key, 0..size).await?.bytes == *sent)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use iggy_object_store::{
-        FreshObject, InlineTierExecutor, MemoryStore, TierJobHandle, TierScope,
+        DeleteOutcome, FreshObject, InlineTierExecutor, ListPage, ListRequest, MemoryStore,
+        ObjectMeta, ObjectRange, RecordingStore, StoreCall, TierJobHandle, TierScope,
     };
     use std::cell::RefCell;
     use std::future::Future;
+    use std::ops::Range;
     use std::rc::Rc;
 
     fn layout() -> KeyLayout {
@@ -237,5 +266,122 @@ mod tests {
         let key = layout().fresh_key(id.get());
         let stored = store.get_range(&key, 0..first.len() as u64).await.unwrap();
         assert_eq!(stored.bytes, first);
+    }
+
+    /// The reads of objects that reached `calls`.
+    fn reads(calls: &[StoreCall]) -> Vec<StoreCall> {
+        calls
+            .iter()
+            .filter(|call| matches!(call, StoreCall::GetRange { .. }))
+            .cloned()
+            .collect()
+    }
+
+    #[compio::test]
+    async fn given_another_object_of_the_same_length_under_the_id_when_uploading_should_refuse_and_keep_it()
+     {
+        let store = RecordingStore::new(MemoryStore::new());
+        let calls = store.calls();
+        let uploader = ExecutorFreshUploader::new(InlineTierExecutor::new(store), layout());
+        let id = FreshObjectId::new(1, 2, 3, 4).unwrap();
+        let scope = TierScope::new();
+        let first = object(b"messages");
+        uploader
+            .upload(id, first.clone(), scope.token())
+            .await
+            .unwrap()
+            .unwrap();
+        let other = object(b"massages");
+        assert_eq!(other.len(), first.len());
+
+        let again = uploader.upload(id, other, scope.token()).await;
+
+        assert!(matches!(
+            again,
+            Ok(Err(ObjectStoreError::PreconditionFailed { .. }))
+        ));
+        let key = layout().fresh_key(id.get());
+        let stored = uploader
+            .executor()
+            .store()
+            .get_range(&key, 0..first.len() as u64)
+            .await
+            .unwrap();
+        assert_eq!(stored.bytes, first);
+        assert_eq!(reads(&calls.all()).len(), 1, "only the test reads");
+    }
+
+    /// A store that keeps no CRC32C of what it holds, as Azure Blob does.
+    struct KeepsNoChecksum(RecordingStore<MemoryStore>);
+
+    impl ObjectStore for KeepsNoChecksum {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            self.0.put(key, body, options).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            self.0.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            let meta = self.0.head(key).await?;
+            Ok(ObjectMeta {
+                crc32c: None,
+                ..meta
+            })
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.0.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.0.list(request).await
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_store_that_keeps_no_checksum_when_an_upload_finds_an_object_should_read_it_back_to_compare()
+     {
+        let store = RecordingStore::new(MemoryStore::new());
+        let calls = store.calls();
+        let uploader =
+            ExecutorFreshUploader::new(InlineTierExecutor::new(KeepsNoChecksum(store)), layout());
+        let id = FreshObjectId::new(1, 2, 3, 4).unwrap();
+        let scope = TierScope::new();
+        let first = object(b"messages");
+        uploader
+            .upload(id, first.clone(), scope.token())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let again = uploader.upload(id, first.clone(), scope.token()).await;
+        let other = uploader
+            .upload(id, object(b"massages"), scope.token())
+            .await;
+        let shorter = uploader.upload(id, object(b"message"), scope.token()).await;
+
+        assert!(matches!(again, Ok(Ok(()))), "{again:?}");
+        for refused in [other, shorter] {
+            assert!(matches!(
+                refused,
+                Ok(Err(ObjectStoreError::PreconditionFailed { .. }))
+            ));
+        }
+        let read_back = StoreCall::GetRange {
+            key: layout().fresh_key(id.get()),
+            range: 0..first.len() as u64,
+        };
+        assert_eq!(reads(&calls.all()), [read_back.clone(), read_back]);
     }
 }

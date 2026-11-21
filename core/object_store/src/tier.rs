@@ -58,16 +58,23 @@ pub enum TierJobClass {
     /// Verify passes, manifests and the orphan sweep, which run when the shard
     /// is idle.
     Housekeeping,
+    /// The reads of another cluster's fresh objects that the shadow
+    /// partitions of a node follow: the probes of the next object of each
+    /// writer, its index, and the listings that find writers. How far a
+    /// shadow partition is behind its origin waits for them, so they have
+    /// slots of their own and never wait for another class.
+    FreshFollow,
 }
 
 impl TierJobClass {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::DemandFetch,
         Self::Upload,
         Self::FreshUpload,
         Self::SpeculativeFetch,
         Self::Delete,
         Self::Housekeeping,
+        Self::FreshFollow,
     ];
 }
 

@@ -64,8 +64,8 @@ use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::TopicObjects;
 use tracing::{debug, info, warn};
 
-use crate::geo_peers::own_cluster_uid;
 use crate::shell::ServerShard;
+use crate::store_identity::own_cluster_uid;
 
 /// How often the metadata primary lists the topic objects of its store.
 pub const SWEEP_INTERVAL: Duration = Duration::from_mins(1);

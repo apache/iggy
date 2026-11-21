@@ -5106,7 +5106,7 @@ mod tests {
         let mut batch = BatchHeader::new(42, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, count);
         batch.base_offset = offset;
         batch.base_timestamp = 1_000 + op;
-        let placed = PlacedBatch::new(batch, Placement::of(u128::from(op), op * 4096, &blob));
+        let placed = PlacedBatch::new(batch, Placement::of(u128::from(op), op * 4096, &blob, 0));
         let template = sized_prepare(op, parent, size_of::<PrepareHeader>() + PLACED_BATCH_SIZE);
         let mut bytes = Owned::copy_from_slice(template.as_slice());
         placed.encode_into(&mut bytes.as_mut_slice()[size_of::<PrepareHeader>()..]);
