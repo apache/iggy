@@ -20,7 +20,7 @@
 //! Mirrors the runtime `core::message_bus::config::MessageBusConfig`,
 //! using configs-crate idioms:
 //!
-//! - `Duration` -> [`IggyDuration`] (DisplayFromStr-serde, `"5 s"` syntax)
+//! - `Duration` -> [`IggyDuration`] (`DisplayFromStrOrNumber`, `"5 s"` syntax)
 //! - `usize` / `u32` -> kept as the underlying integer type
 //!
 //! Transport-section concerns the bus does NOT own:
@@ -54,10 +54,10 @@
 use super::COMPONENT;
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyByteSize, IggyDuration, MAX_MESSAGE_SIZE_UPPER_BYTES, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 
 /// Hard upper bound on [`MessageBusConfig::max_batch`], in iovecs.
 ///
@@ -123,7 +123,7 @@ pub struct MessageBusConfig {
     /// How long a reply waits for room in a full client queue before the
     /// connection is closed.
     #[serde(default = "default_client_write_stall_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub client_write_stall_timeout: IggyDuration,
 
@@ -137,13 +137,13 @@ pub struct MessageBusConfig {
     /// `peer_id > self_id`. Also bounds each dial, so a peer that drops
     /// SYNs cannot stall the sweep.
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub reconnect_period: IggyDuration,
 
     /// Timeout for per-peer close drain (flush writer, tear down
     /// reader) before force-cancellation.
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub close_peer_timeout: IggyDuration,
 
     /// Wall-clock bound on a single `stream.shutdown()` (or
@@ -152,7 +152,7 @@ pub struct MessageBusConfig {
     /// (which bounds the registry-level drain over both reader and
     /// writer joins).
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub close_grace: IggyDuration,
 
     /// Wall-clock bound on a single connection's handshake phase: the
@@ -169,7 +169,7 @@ pub struct MessageBusConfig {
     /// redial, so a value below [`Self::reconnect_period`] lets them form
     /// only when all of them connect in one sweep.
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub handshake_grace: IggyDuration,
 
     /// Node-wide cap on open client sockets: TCP, TCP-TLS, WS, WSS, HTTP and

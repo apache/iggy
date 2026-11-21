@@ -19,16 +19,17 @@
 //! take OMB run ids only, so an iggy-bench run id gives 400 here.
 
 use super::{
-    AppState, EMBED_CACHE_DIR, EmbedPage, EmbedQuery, PngQuery, PngTheme, Result, get_client_addr,
-    png_cache_path, png_response, read_cached_png, render_png,
+    AppState, EmbedPage, EmbedQuery, PngQuery, Result, embed_response, get_client_addr,
+    page_file_name, png_file_name, render_png,
 };
 use crate::error::IggyBenchDashboardServerError;
-use crate::omb::embed::{OmbChartType, setup_line_hash};
+use crate::omb::embed::setup_line_hash;
 use crate::omb::{OmbCache, OmbFileError, OmbRun, OmbRunFiles, read_file};
 use crate::render::EmbedChart;
 use actix_web::error::BlockingError;
 use actix_web::http::header::{ContentDisposition, ContentType};
-use actix_web::{HttpRequest, HttpResponse, get, web};
+use actix_web::{HttpRequest, HttpResponse, get, mime, web};
+use bench_dashboard_shared::embed::OmbChartType;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
 use bench_dashboard_shared::omb::result::OmbResult;
@@ -45,9 +46,12 @@ use tracing::{info, warn};
 const TOML_CONTENT_TYPE: &str = "application/toml";
 /// The page title of the OMB embeds, which tells them apart from the iggy-bench embeds.
 const EMBED_PAGE_TITLE: &str = "Iggy OMB Benchmark Chart";
-/// Starts the names of the OMB PNG files, in the cache and in a download, so they never share a
-/// name with the files of an iggy-bench run.
-const PNG_FILE_PREFIX: &str = "omb";
+/// Starts the names of the OMB files, in the cache and in a download, so they never share a name
+/// with the files of an iggy-bench run.
+const FILE_PREFIX: &str = "omb";
+/// How long a browser or a proxy can keep an OMB embed page or PNG. The setup line comes from a
+/// sidecar that can change, and the max age bounds how long a reader sees an old line.
+const OMB_EMBED_MAX_AGE_SECS: u32 = 3600;
 
 /// The OMB part of the server state.
 pub struct OmbState {
@@ -134,6 +138,7 @@ pub async fn download_omb_setup(
 /// page, with the chart types of [`OmbChartType`].
 #[get("/embed/omb/{id}")]
 pub async fn embed_omb_chart(
+    app: web::Data<AppState>,
     data: web::Data<OmbState>,
     id: web::Path<String>,
     query: web::Query<EmbedQuery>,
@@ -153,28 +158,45 @@ pub async fn embed_omb_chart(
         .as_deref()
         .map(PageAction::from_str)
         .transpose()?;
-    let EmbedChart {
-        chart,
-        hardware_line,
-    } = load_embed_chart(data.run(id)?, chart_type, dark).await?;
-
-    // The quantile axis formats its labels with functions, which only `to_string` writes as
-    // JavaScript. serde_json would write them as strings. `to_string` also writes any text between
-    // charming's raw marks as JavaScript, so the chart's free text goes through `without_raw_mark`.
-    let option = chart.to_string();
-    Ok(EmbedPage {
-        option: &option,
-        hardware_line: &hardware_line,
+    // A cached page stays on the disk after its run is gone, so the lookup comes first.
+    let run = data.run(id)?;
+    let name = page_file_name(
+        cache_file_prefix(&run.summary),
+        chart_type,
         dark,
-        title: EMBED_PAGE_TITLE,
-        download_name: action
-            .map(|PageAction::Download| format!("{PNG_FILE_PREFIX}_{id}_{chart_type}.png")),
-    }
-    .response())
+        action.is_some(),
+    );
+
+    let build = async move {
+        let EmbedChart {
+            chart,
+            hardware_line,
+        } = load_embed_chart(run, chart_type, dark).await?;
+        // The quantile axis formats its labels with functions, which only `to_string` writes as
+        // JavaScript. serde_json would write them as strings. `to_string` also writes any text
+        // between charming's raw marks as JavaScript, so the chart's free text goes through
+        // `without_raw_mark`.
+        let option = chart.to_string();
+        let page = EmbedPage {
+            option: &option,
+            hardware_line: &hardware_line,
+            dark,
+            title: EMBED_PAGE_TITLE,
+            download_name: action
+                .map(|PageAction::Download| format!("{FILE_PREFIX}_{id}_{chart_type}.png")),
+        };
+        Ok::<_, IggyBenchDashboardServerError>(web::Bytes::from(page.html()))
+    };
+    let page = app.embed_cache.get_or_build(&name, build).await?;
+    Ok(embed_response(
+        mime::TEXT_HTML,
+        page,
+        OMB_EMBED_MAX_AGE_SECS,
+    ))
 }
 
 /// The chart of an OMB run as a PNG image. It takes the query of the iggy-bench PNG, with the chart
-/// types of [`OmbChartType`], and caches the default size the same way.
+/// types of [`OmbChartType`], and caches each size the same way.
 #[get("/embed/omb/{id}/chart.png")]
 pub async fn embed_omb_chart_png(
     app: web::Data<AppState>,
@@ -191,28 +213,18 @@ pub async fn embed_omb_chart_png(
 
     let id = run_id(&id)?;
     let chart_type: OmbChartType = query.chart_type.parse()?;
-    let theme: PngTheme = query.theme.parse()?;
-    query.check_size()?;
+    let variant = query.variant()?;
     // A cached PNG stays on the disk after its run is gone, so the lookup comes first.
     let run = data.run(id)?;
+    let name = png_file_name(cache_file_prefix(&run.summary), chart_type, variant);
 
-    let embed_dir = app.cache_dir.join(EMBED_CACHE_DIR);
-    let cached_path = query
-        .is_cached_size()
-        .then(|| png_cache_path(&embed_dir, png_cache_name(&run.summary), &query));
-    if let Some(png) = read_cached_png(cached_path.as_deref()).await {
-        info!("{client_addr}: Serving cached PNG for OMB run '{id}'");
-        return Ok(png_response(png));
-    }
-
-    let load = load_embed_chart(run, chart_type, theme.dark);
-    let png = render_png(&app, load, &query, theme, cached_path).await?;
-
-    info!(
-        "{client_addr}: Generated PNG for OMB run '{id}' ({}x{})",
-        query.width, query.height
-    );
-    Ok(png_response(png))
+    let render_pool = Arc::clone(&app.render_pool);
+    let build = async move {
+        let chart = load_embed_chart(run, chart_type, variant.theme.dark).await?;
+        render_png(&render_pool, chart, variant).await
+    };
+    let png = app.embed_cache.get_or_build(&name, build).await?;
+    Ok(embed_response(mime::IMAGE_PNG, png, OMB_EMBED_MAX_AGE_SECS))
 }
 
 impl OmbState {
@@ -283,14 +295,10 @@ impl FromStr for PageAction {
     }
 }
 
-/// Names the cached PNG files of a run. The sidecar can change under the same run id, so the hash
-/// of the setup line that it gives is in the name too.
-fn png_cache_name(summary: &OmbRunSummary) -> String {
-    format!(
-        "{PNG_FILE_PREFIX}_{}_{}",
-        summary.id,
-        setup_line_hash(summary)
-    )
+/// Starts the names of the cached files of a run. The sidecar can change under the same run id, so
+/// the hash of the setup line that it gives is in the name too.
+fn cache_file_prefix(summary: &OmbRunSummary) -> String {
+    format!("{FILE_PREFIX}_{}_{}", summary.id, setup_line_hash(summary))
 }
 
 /// Reads the result file again, as [`get_omb_run`] does, and draws the chart from it.
@@ -381,9 +389,11 @@ fn blocking_error(error: BlockingError) -> IggyBenchDashboardServerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embed_cache::EMBED_CACHE_DIR;
     use crate::handlers::tests::{
-        CACHED_PNG, HTML_CONTENT_TYPE, PNG_CONTENT_TYPE, app_state, app_state_with_cache_dir,
-        png_query,
+        CACHED_PNG, HTML_CONTENT_TYPE, PNG_CONTENT_TYPE, PRODUCER_AND_CONSUMER_DIR, app_state,
+        app_state_with_cache_dir, cached_path, fixture_file_prefix, header, png_name,
+        render_pool_without_renderer,
     };
     use crate::handlers::{embed_chart, embed_chart_png, unknown_api_path};
     use crate::omb::test_fixtures::{
@@ -391,13 +401,13 @@ mod tests {
         RC1_DEFAULT, RC1_PERSISTED,
     };
     use crate::render::PngRenderPool;
-    use actix_web::body::MessageBody;
     use actix_web::dev::ServiceResponse;
     use actix_web::http::StatusCode;
     use actix_web::http::header::{
         CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_SECURITY_POLICY, CONTENT_TYPE, X_FRAME_OPTIONS,
     };
     use actix_web::{App, test};
+    use bench_dashboard_shared::embed::PngSize;
     use bench_dashboard_shared::omb::setup::OMB_SETUP_FILE_NAME;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -477,7 +487,7 @@ mod tests {
     }
 
     fn cached_png_path(embed_dir: &Path, summary: &OmbRunSummary, query: &str) -> PathBuf {
-        png_cache_path(embed_dir, png_cache_name(summary), &png_query(query))
+        cached_path(embed_dir, &png_name(cache_file_prefix(summary), query))
     }
 
     /// The summary of `fixture` as the server loads it, with its sidecar.
@@ -516,13 +526,6 @@ mod tests {
 
     fn setup_uri(id: &str) -> String {
         format!("/api/omb/runs/{id}/setup.toml")
-    }
-
-    fn header<'a>(response: &'a ServiceResponse<impl MessageBody>, name: &str) -> Option<&'a str> {
-        response
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
     }
 
     fn attachment(file_name: &str) -> String {
@@ -1104,6 +1107,7 @@ mod tests {
             ("theme=blue", "Invalid theme"),
             ("width=0", "Invalid size"),
             ("height=4097", "Invalid size"),
+            ("width=800&height=600", "Invalid size"),
         ] {
             let response = test::call_service(
                 &app,
@@ -1121,44 +1125,76 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn given_cached_omb_png_when_requesting_png_should_serve_it_only_at_default_size() {
+    async fn given_cached_omb_png_of_each_size_when_requesting_png_should_serve_it_without_render()
+    {
         let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
         let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
         std::fs::create_dir(&embed_dir).expect("the embed directory is created");
         let summary = fixture_summary(&RC1_DEFAULT);
         let id = summary.id.to_string();
-        let default_size = "type=ladder";
-        let other_size = "type=ladder&width=800&height=600";
-        for query in [default_size, other_size] {
+        let queries = PngSize::ALL.map(|size| {
+            format!(
+                "type=ladder&width={}&height={}",
+                size.width(),
+                size.height()
+            )
+        });
+        for query in &queries {
             std::fs::write(cached_png_path(&embed_dir, &summary, query), CACHED_PNG)
                 .expect("the cached PNG is written");
         }
-        let app = embed_app!(cache_dir.path());
-
-        let response = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri(&png_uri(&id, default_size))
-                .to_request(),
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(AppState {
+                    render_pool: Arc::new(render_pool_without_renderer()),
+                    ..app_state_with_cache_dir(app_state(), cache_dir.path())
+                }))
+                .app_data(web::Data::new(omb_state(Some(Path::new(
+                    FIXTURE_OMB_RESULTS_DIR,
+                )))))
+                .service(embed_omb_chart_png),
         )
         .await;
-        assert!(response.status().is_success(), "{}", response.status());
-        assert_eq!(
-            header(&response, CONTENT_TYPE.as_str()),
-            Some(PNG_CONTENT_TYPE)
-        );
-        assert_eq!(test::read_body(response).await, CACHED_PNG);
 
-        let response = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri(&png_uri(&id, other_size))
-                .to_request(),
-        )
-        .await;
+        for query in &queries {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&png_uri(&id, query))
+                    .to_request(),
+            )
+            .await;
+            assert!(
+                response.status().is_success(),
+                "{query}: {}",
+                response.status()
+            );
+            assert_eq!(
+                header(&response, CONTENT_TYPE.as_str()),
+                Some(PNG_CONTENT_TYPE)
+            );
+            assert_eq!(test::read_body(response).await, CACHED_PNG, "{query}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_omb_embed_page_built_when_result_file_is_gone_should_serve_cached_page() {
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let run_dir = RC1_DEFAULT.copy_into(results_dir.path());
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let (state, _omb_cache) = reloadable_omb_state(results_dir.path());
+        let app = embed_app!(cache_dir.path(), state);
+        let uri = embed_uri(&fixture_id(&RC1_DEFAULT), "type=quantiles&theme=light");
+        let first =
+            test::call_and_read_body(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+        // Without a reload, the run stays listed and only the cache can answer.
+        std::fs::remove_dir_all(&run_dir).expect("the run directory is removed");
+
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+
         assert!(response.status().is_success(), "{}", response.status());
-        let png = test::read_body(response).await;
-        assert!(png.starts_with(PNG_SIGNATURE), "{:?}", &png[..8]);
+        assert_eq!(test::read_body(response).await, first);
     }
 
     #[actix_web::test]
@@ -1170,10 +1206,9 @@ mod tests {
         // The name that the run id alone gives, which an unknown run can have in the cache from
         // an older server.
         std::fs::write(
-            png_cache_path(
+            cached_path(
                 &embed_dir,
-                format!("{PNG_FILE_PREFIX}_{UNKNOWN_ID}"),
-                &png_query(query),
+                &png_name(format!("{FILE_PREFIX}_{UNKNOWN_ID}"), query),
             ),
             CACHED_PNG,
         )
@@ -1268,12 +1303,12 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn given_fixture_run_when_requesting_omb_png_should_render_it_and_cache_default_size() {
+    async fn given_fixture_run_when_requesting_omb_png_of_other_size_should_render_and_cache_it() {
         let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
         let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
         let app = embed_app!(cache_dir.path());
         let id = fixture_id(&RC1_PERSISTED);
-        let query = "type=quantiles&theme=light_nobg";
+        let query = "type=quantiles&theme=light_nobg&width=1200&height=630";
 
         let response = test::call_service(
             &app,
@@ -1296,7 +1331,7 @@ mod tests {
                 &fixture_summary(&RC1_PERSISTED),
                 query
             ))
-            .expect("the default size is cached"),
+            .expect("the size is cached"),
             png
         );
     }
@@ -1345,7 +1380,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn given_embed_page_or_png_when_requesting_should_allow_caching_for_an_hour() {
+    async fn given_embed_page_or_png_when_requesting_should_allow_caching_for_framework_max_age() {
         let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
         let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
         std::fs::create_dir(&embed_dir).expect("the embed directory is created");
@@ -1354,17 +1389,29 @@ mod tests {
         // Cached PNG files, so that no request starts a render.
         for cached_path in [
             cached_png_path(&embed_dir, &summary, "type=ladder"),
-            png_cache_path(&embed_dir, UUID, &png_query("type=latency")),
+            cached_path(
+                &embed_dir,
+                &png_name(
+                    fixture_file_prefix(PRODUCER_AND_CONSUMER_DIR, UUID),
+                    "type=latency",
+                ),
+            ),
         ] {
             std::fs::write(cached_path, CACHED_PNG).expect("the cached PNG is written");
         }
         let app = embed_app!(cache_dir.path());
 
-        for uri in [
-            embed_uri(&id, "type=ladder"),
-            png_uri(&id, "type=ladder"),
-            format!("/embed/{UUID}?type=latency"),
-            format!("/embed/{UUID}/chart.png?type=latency"),
+        for (uri, max_age) in [
+            (embed_uri(&id, "type=ladder"), "public, max-age=3600"),
+            (png_uri(&id, "type=ladder"), "public, max-age=3600"),
+            (
+                format!("/embed/{UUID}?type=latency"),
+                "public, max-age=3600",
+            ),
+            (
+                format!("/embed/{UUID}/chart.png?type=latency"),
+                "public, max-age=86400",
+            ),
         ] {
             let response =
                 test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
@@ -1376,7 +1423,7 @@ mod tests {
             );
             assert_eq!(
                 header(&response, CACHE_CONTROL.as_str()),
-                Some("public, max-age=3600"),
+                Some(max_age),
                 "{uri}"
             );
         }
