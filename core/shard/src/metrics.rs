@@ -430,6 +430,36 @@ pub struct ShardMetrics {
     /// How late each consensus tick of the message pump ran after its timer
     /// was due: the time the shard's thread spent on other work first.
     pump_tick_lateness: Histogram,
+    /// Fresh objects this shard stored, the ones the store refused, and the
+    /// bytes of the stored ones.
+    fresh_uploads_total: Counter,
+    fresh_upload_failures_total: Counter,
+    fresh_upload_bytes_total: Counter,
+    /// Attempts at storing a fresh object after one that failed.
+    fresh_upload_retries_total: Counter,
+    /// Sends to partitions that place their batches that this shard answered
+    /// as not accepted, before or after it stored their messages.
+    fresh_sends_denied_total: Counter,
+    /// Of those, the sends turned away because the waiting sends of their
+    /// partition held its share of the bytes, and because the waiting sends
+    /// of the shard held all the bytes they may.
+    fresh_sends_denied_partition_share_total: Counter,
+    fresh_sends_denied_shard_cap_total: Counter,
+    /// Fresh objects whose upload holds one of the shard's upload slots.
+    fresh_uploads_in_flight: Gauge,
+    /// Sends whose messages this shard holds or stored and whose request
+    /// has not reached its partition.
+    fresh_staged_sends: Gauge,
+    /// The three parts of a send to a partition that places its batches:
+    /// the wait of its upload window, the upload of its fresh object, and
+    /// the commit of where its messages sit.
+    fresh_window_wait: Histogram,
+    fresh_upload: Histogram,
+    fresh_commit: Histogram,
+    /// Bytes of each fresh object this shard stored. Objects far below
+    /// `FRESH_OBJECT_BYTES` under load mean that windows close with few
+    /// sends, so the store is asked for more objects than the load needs.
+    fresh_object_size: Histogram,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -571,6 +601,19 @@ impl ShardMetrics {
             fetches: FetchMetrics::new(),
             readiness_push_to_fire: latency_histogram(),
             pump_tick_lateness: latency_histogram(),
+            fresh_uploads_total: Counter::default(),
+            fresh_upload_failures_total: Counter::default(),
+            fresh_upload_bytes_total: Counter::default(),
+            fresh_upload_retries_total: Counter::default(),
+            fresh_sends_denied_total: Counter::default(),
+            fresh_sends_denied_partition_share_total: Counter::default(),
+            fresh_sends_denied_shard_cap_total: Counter::default(),
+            fresh_uploads_in_flight: Gauge::default(),
+            fresh_staged_sends: Gauge::default(),
+            fresh_window_wait: fresh_latency_histogram(),
+            fresh_upload: fresh_latency_histogram(),
+            fresh_commit: fresh_latency_histogram(),
+            fresh_object_size: fresh_object_size_histogram(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
         }
@@ -589,6 +632,98 @@ impl ShardMetrics {
 
     pub(crate) fn record_readiness_push_to_fire(&self, elapsed: Duration) {
         self.readiness_push_to_fire.observe(elapsed.as_secs_f64());
+    }
+
+    /// An upload window started its upload `wait` after its first send.
+    pub(crate) fn record_fresh_window_wait(&self, wait: Duration) {
+        self.fresh_window_wait.observe(wait.as_secs_f64());
+    }
+
+    /// The upload of a fresh object of `bytes` ended after `elapsed`, and
+    /// the store holds the object or not.
+    pub(crate) fn record_fresh_upload(&self, bytes: u64, elapsed: Duration, stored: bool) {
+        self.fresh_upload.observe(elapsed.as_secs_f64());
+        if stored {
+            self.fresh_uploads_total.inc();
+            self.fresh_upload_bytes_total.inc_by(bytes);
+            #[allow(clippy::cast_precision_loss)]
+            self.fresh_object_size.observe(bytes as f64);
+        } else {
+            self.fresh_upload_failures_total.inc();
+        }
+    }
+
+    /// An attempt at storing a fresh object failed, and another follows.
+    pub(crate) fn record_fresh_upload_retry(&self) {
+        self.fresh_upload_retries_total.inc();
+    }
+
+    /// A send to a partition that places its batches was answered as not
+    /// accepted.
+    pub(crate) fn record_fresh_send_denied(&self) {
+        self.fresh_sends_denied_total.inc();
+    }
+
+    /// A send was turned away because the waiting sends of its partition
+    /// hold the partition's share of the bytes.
+    pub(crate) fn record_fresh_send_over_partition_share(&self) {
+        self.fresh_sends_denied_partition_share_total.inc();
+    }
+
+    /// A send was turned away because the waiting sends of the shard hold
+    /// all the bytes they may.
+    pub(crate) fn record_fresh_send_over_shard_cap(&self) {
+        self.fresh_sends_denied_shard_cap_total.inc();
+    }
+
+    /// The shard has `in_flight` uploads of fresh objects and holds `staged`
+    /// sends for them.
+    pub(crate) fn set_fresh_load(&self, in_flight: usize, staged: usize) {
+        self.fresh_uploads_in_flight
+            .set(i64::try_from(in_flight).unwrap_or(i64::MAX));
+        self.fresh_staged_sends
+            .set(i64::try_from(staged).unwrap_or(i64::MAX));
+    }
+
+    /// The histogram of the time from a stored object to the answer of each
+    /// send in it, for the task that waits for the answer.
+    pub(crate) fn fresh_commit_latency(&self) -> Histogram {
+        self.fresh_commit.clone()
+    }
+
+    /// Test-only read, mirroring the siblings.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_uploads_value(&self) -> (u64, u64, u64) {
+        (
+            self.fresh_uploads_total.get(),
+            self.fresh_upload_failures_total.get(),
+            self.fresh_upload_bytes_total.get(),
+        )
+    }
+
+    /// Test-only read: upload retries, denied sends, uploads in flight and
+    /// staged sends.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_load_value(&self) -> (u64, u64, i64, i64) {
+        (
+            self.fresh_upload_retries_total.get(),
+            self.fresh_sends_denied_total.get(),
+            self.fresh_uploads_in_flight.get(),
+            self.fresh_staged_sends.get(),
+        )
+    }
+
+    /// Test-only read: sends turned away at their partition's share and at
+    /// the shard's cap.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn fresh_cap_denials_value(&self) -> (u64, u64) {
+        (
+            self.fresh_sends_denied_partition_share_total.get(),
+            self.fresh_sends_denied_shard_cap_total.get(),
+        )
     }
 
     pub(crate) fn record_pump_tick_lateness(&self, lateness: Duration) {
@@ -1835,6 +1970,75 @@ impl ShardMetrics {
             self.readiness_push_to_fire.clone(),
         );
         registry.register(
+            "fresh_uploads",
+            "fresh objects this shard stored for the partitions that place their batches",
+            self.fresh_uploads_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_failures",
+            "fresh objects the object store refused, whose sends were answered as not accepted",
+            self.fresh_upload_failures_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_bytes",
+            "bytes of the fresh objects this shard stored",
+            self.fresh_upload_bytes_total.clone(),
+        );
+        registry.register(
+            "fresh_upload_retries",
+            "attempts at storing a fresh object after an attempt that failed",
+            self.fresh_upload_retries_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied",
+            "sends to partitions that place their batches that this shard answered as not \
+             accepted",
+            self.fresh_sends_denied_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied_partition_share",
+            "sends turned away because the waiting sends of their partition held its share of \
+             the bytes that may wait",
+            self.fresh_sends_denied_partition_share_total.clone(),
+        );
+        registry.register(
+            "fresh_sends_denied_shard_cap",
+            "sends turned away because the waiting sends of the shard held all the bytes that \
+             may wait",
+            self.fresh_sends_denied_shard_cap_total.clone(),
+        );
+        registry.register(
+            "fresh_uploads_in_flight",
+            "fresh objects whose upload holds one of the shard's upload slots",
+            self.fresh_uploads_in_flight.clone(),
+        );
+        registry.register(
+            "fresh_staged_sends",
+            "sends whose messages this shard holds or stored and whose request has not \
+             reached its partition",
+            self.fresh_staged_sends.clone(),
+        );
+        registry.register(
+            "fresh_window_wait_seconds",
+            "how long an upload window stayed open after its first send",
+            self.fresh_window_wait.clone(),
+        );
+        registry.register(
+            "fresh_upload_seconds",
+            "how long the upload of a fresh object took",
+            self.fresh_upload.clone(),
+        );
+        registry.register(
+            "fresh_commit_seconds",
+            "how long a send waited for its answer after its fresh object was stored",
+            self.fresh_commit.clone(),
+        );
+        registry.register(
+            "fresh_object_size_bytes",
+            "bytes of each fresh object this shard stored",
+            self.fresh_object_size.clone(),
+        );
+        registry.register(
             "pump_tick_lateness_seconds",
             "how late each consensus tick of the message pump ran after its timer was due",
             self.pump_tick_lateness.clone(),
@@ -1963,6 +2167,25 @@ fn latency_histogram() -> Histogram {
         LATENCY_BUCKET_FACTOR,
         LATENCY_BUCKET_COUNT,
     ))
+}
+
+/// Buckets for the parts of a send that goes to the object store first, which
+/// take from 1 ms to a few hundred: every millisecond up to 5 ms, every 5 ms
+/// up to 100 ms, every 10 ms up to 200 ms, and from there half as much again
+/// per bucket up to about a minute.
+fn fresh_latency_histogram() -> Histogram {
+    let millis = (1..=5_u32)
+        .chain((10..=100).step_by(5))
+        .chain((110..=200).step_by(10))
+        .map(|millis| f64::from(millis) / 1_000.0);
+    Histogram::new(millis.chain(exponential_buckets(0.3, 1.5, 14)))
+}
+
+/// Buckets for the bytes of a stored fresh object: each twice the one before,
+/// from 1 KiB to 32 MiB. An object closes at 4 MiB, and is larger only when
+/// one send is.
+fn fresh_object_size_histogram() -> Histogram {
+    Histogram::new(exponential_buckets(1024.0, 2.0, 16))
 }
 
 /// The `command` of a request whose code the command table does not hold.
@@ -2351,6 +2574,28 @@ mod tests {
             "fetch_budget_waits_total 1",
             "fetch_quota_refusals_total 1",
             "fetch_fire_to_reply_seconds_count 2",
+        ] {
+            assert!(
+                scrape.lines().any(|line| line == series),
+                "{series} is not in the scrape:\n{scrape}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_fresh_uploads_when_they_settle_should_record_the_size_of_each_stored_object() {
+        let metrics = ShardMetrics::for_shard();
+        metrics.record_fresh_upload(1_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(3_000_000, Duration::from_millis(5), true);
+        metrics.record_fresh_upload(500, Duration::from_millis(5), false);
+        let scrape = metrics.scrape();
+        for series in [
+            "fresh_object_size_bytes_count 2",
+            "fresh_object_size_bytes_sum 3001000.0",
+            "fresh_object_size_bytes_bucket{le=\"1024.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"2097152.0\"} 1",
+            "fresh_object_size_bytes_bucket{le=\"4194304.0\"} 2",
+            "fresh_object_size_bytes_bucket{le=\"33554432.0\"} 2",
         ] {
             assert!(
                 scrape.lines().any(|line| line == series),

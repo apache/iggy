@@ -750,6 +750,147 @@ async fn given_uncommitted_placed_batches_when_a_view_change_discards_them_shoul
     assert_eq!(stored_offsets(&directory), [0, 1]);
 }
 
+/// The request the node's upload path hands a partition for a client's send
+/// of `count` messages, once their blob is stored.
+fn placed_client_request(
+    partition: &IggyPartition<IggyMessageBus>,
+    request: u64,
+    count: u32,
+) -> Message<RoutedRequestHeader> {
+    let admitted = checksumless_send_request(partition.namespace(), count).transmute_header(
+        |mut header, next: &mut RoutedRequestHeader| {
+            header.request = request;
+            header.metadata_watermark = partition.required_metadata_frontier;
+            *next = header;
+        },
+    );
+    server_common::send_messages::place_request(&admitted, 7, request * 4096).unwrap()
+}
+
+/// A primary alone in its group, so a request commits without a backup.
+async fn placing_primary() -> (tempfile::TempDir, IggyPartition<IggyMessageBus>) {
+    let config = repair_config();
+    let (directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 1)).await;
+    partition.set_places_batches(true);
+    (directory, partition)
+}
+
+#[compio::test]
+async fn given_a_placing_primary_when_the_upload_path_hands_it_placed_requests_should_commit_them()
+{
+    let (directory, mut partition) = Box::pin(placing_primary()).await;
+    let config = repair_config();
+
+    for (request, count) in [(1, 2), (2, 3)] {
+        let placed = placed_client_request(&partition, request, count);
+        Box::pin(partition.on_placed_request(placed, None)).await;
+        assert_eq!(
+            partition.consensus().sequencer().current_sequence(),
+            request,
+            "the placed request became a prepare"
+        );
+        partition.consensus().advance_commit_max(request);
+        Box::pin(settle_partition_io(&mut partition, &config)).await;
+    }
+
+    assert_eq!(partition.offset.load(Ordering::Acquire), 4);
+    let stored: Vec<_> = segment_file_bytes(directory.path())
+        .iter()
+        .flat_map(|bytes| placed_batches_in(bytes))
+        .map(|placed| {
+            (
+                placed.header.base_offset,
+                placed.header.message_count,
+                placed.placement.position,
+            )
+        })
+        .collect();
+    assert_eq!(stored, [(0, 2, 4096), (2, 3, 8192)]);
+}
+
+/// A send that still carries its messages was stored nowhere, and a
+/// placing partition has no place for the messages.
+#[compio::test]
+async fn given_a_placing_primary_when_a_send_arrives_with_its_messages_should_admit_nothing() {
+    let (_directory, mut partition) = Box::pin(placing_primary()).await;
+    let config = repair_config();
+    let whole = checksumless_send_request(partition.namespace(), 1).transmute_header(
+        |mut header, next: &mut RoutedRequestHeader| {
+            header.metadata_watermark = partition.required_metadata_frontier;
+            *next = header;
+        },
+    );
+
+    Box::pin(partition.on_request(whole, None)).await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+    assert_eq!(partition.dirty_offset.load(Ordering::Relaxed), 0);
+}
+
+#[compio::test]
+async fn given_a_primary_of_whole_batches_when_a_placed_request_arrives_should_admit_nothing() {
+    let config = repair_config();
+    let (_directory, mut partition) = Box::pin(disk_poll_partition_with_replicas(&config, 1)).await;
+    let placed = placed_client_request(&partition, 1, 1);
+
+    Box::pin(partition.on_placed_request(placed, None)).await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+}
+
+/// Only a placed batch for this partition goes in through the placed entry.
+#[compio::test]
+async fn given_a_placing_primary_when_the_placed_entry_gets_another_body_should_admit_nothing() {
+    let (_directory, mut partition) = Box::pin(placing_primary()).await;
+    let config = repair_config();
+    let whole = checksumless_send_request(partition.namespace(), 1);
+    let mut damaged = placed_client_request(&partition, 1, 1);
+    damaged.as_mut_slice()[size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE + 16] ^= 1;
+    let elsewhere = IggyNamespace::new(1, 1, 5);
+    let other_partition = server_common::send_messages::place_request(
+        &checksumless_send_request(elsewhere, 1).transmute_header(
+            |mut header, next: &mut RoutedRequestHeader| {
+                header.group = partition.namespace().inner();
+                *next = header;
+            },
+        ),
+        7,
+        0,
+    )
+    .unwrap();
+
+    for request in [whole, damaged, other_partition] {
+        Box::pin(partition.on_placed_request(request, None)).await;
+        Box::pin(settle_partition_io(&mut partition, &config)).await;
+    }
+
+    assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+}
+
+/// Primacy moved while the messages of a send were on their way to the
+/// store. The object is stored, and the replica that stored it no longer
+/// leads: it prepares nothing for the request, so nothing commits where
+/// those messages sit and the producer sends them again to the primary.
+#[compio::test]
+async fn given_a_replica_that_lost_primacy_when_a_placed_request_arrives_should_admit_nothing() {
+    let config = repair_config();
+    let (_directory, mut partition) = Box::pin(placing_partition()).await;
+    let placed = placed_client_request(&partition, 1, 2);
+    assert!(partition.takes_placed_sends() && partition.has_request_room());
+    let view = partition.consensus.view() + 1;
+    partition.consensus.set_view(view);
+    assert!(!partition.consensus.is_primary());
+    assert!(!partition.takes_placed_sends());
+
+    Box::pin(partition.on_placed_request(placed, None)).await;
+    Box::pin(settle_partition_io(&mut partition, &config)).await;
+
+    assert_eq!(partition.consensus().sequencer().current_sequence(), 0);
+    assert_eq!(partition.log.active_segment().current_position, 0);
+}
+
 /// A backup whose ring released the body of a committed placed batch still
 /// acknowledges the retransmit of that op. Only the placed batch's own
 /// checksum can tell it from another batch under the same header.

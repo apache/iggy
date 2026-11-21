@@ -499,6 +499,10 @@ where
         };
         let mut armed_deadline = None;
         let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
+        // The uploads of fresh objects run on deadlines of their own, far
+        // shorter than a tick: producers wait for the open window to close.
+        let mut armed_fresh_deadline = None;
+        let mut fresh_deadline = std::pin::pin!(deadline_timer(None));
         loop {
             self.service_deferred_polls().await;
             // Here and not at the end of the turn: an idle owner would hold
@@ -508,6 +512,11 @@ where
             if next_deadline != armed_deadline {
                 armed_deadline = next_deadline;
                 deferred_deadline.set(deadline_timer(next_deadline));
+            }
+            let next_fresh_deadline = self.fresh_uploads_deadline();
+            if next_fresh_deadline != armed_fresh_deadline {
+                armed_fresh_deadline = next_fresh_deadline;
+                fresh_deadline.set(deadline_timer(next_fresh_deadline));
             }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
@@ -534,6 +543,7 @@ where
                         fatal = Some(fault);
                         break;
                     }
+                    self.tick_fresh_writes().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -563,6 +573,11 @@ where
                 () = deferred_deadline.as_mut() => {
                     armed_deadline = None;
                     deferred_deadline.set(deadline_timer(None));
+                }
+                () = fresh_deadline.as_mut() => {
+                    armed_fresh_deadline = None;
+                    fresh_deadline.set(deadline_timer(None));
+                    self.drive_fresh_uploads();
                 }
                 frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
@@ -667,6 +682,9 @@ where
             // After every event, as partition I/O, so a busy inbox cannot
             // starve the serves that wait for a disk read.
             self.serve_landed_read().await;
+            // After every event too: a commit frees the room that the sends
+            // of a stored fresh object wait for, and it can come in any arm.
+            self.feed_fresh_sends_awaiting_room().await;
         }
 
         self.poll_completions.close();
@@ -788,6 +806,7 @@ where
                     }
                     self.tick_metadata().await;
                     let _ = self.tick_partitions(&mut namespace_scratch).await;
+                    self.tick_fresh_writes().await;
                     // After the tick: the first tick fires one interval after
                     // the stop began, so the tick at the deadline must still
                     // start its share of the reach.
@@ -1377,6 +1396,9 @@ where
             }
             LifecycleFrame::ManifestPublishFinished(finished) => {
                 self.on_manifest_publish_finished(&finished);
+            }
+            LifecycleFrame::FreshUploadFinished(finished) => {
+                self.on_fresh_upload_finished(*finished).await;
             }
             LifecycleFrame::TruncatePartition {
                 namespace,

@@ -37,6 +37,7 @@
 mod backend;
 pub mod contract;
 mod error;
+mod fresh;
 mod fs;
 mod identity;
 mod inline;
@@ -51,6 +52,7 @@ mod tier;
 
 pub use backend::Backend;
 pub use error::{ErrorClass, ObjectStoreError};
+pub use fresh::{FreshObject, FreshObjectId, is_fresh_object};
 pub use fs::FsStore;
 pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
