@@ -203,6 +203,10 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
+    /// Set when a command of the long-term log applies on the primary, and
+    /// taken by the shard, which publishes the manifest and starts the
+    /// rewrite that waited for the command.
+    pub(crate) long_term_changed: Cell<bool>,
     /// The highest committed truncation watermark a timed pass read from
     /// metadata for this partition. The watermark only rises, so the one
     /// metadata holds now is never below it.
@@ -215,6 +219,15 @@ where
     /// What this replica publishes of the partition's manifest while it is
     /// the primary.
     pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
+    /// The rewrite of this partition's placed batches into long-term
+    /// segments, while this replica is the primary.
+    pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
+    /// Number of the last long-term rewrite this partition started. It
+    /// outlives the view, so the late result of an earlier view's rewrite is
+    /// never taken for the one in flight.
+    pub(crate) long_term_rewrite_jobs: u64,
+    /// What this partition committed above its long-term floor.
+    pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
     /// Number of the last manifest publish this partition started. It
     /// outlives the view, so the late result of an earlier view's publish is
     /// never taken for the one in flight.
@@ -1149,10 +1162,14 @@ where
             segment_upload_attempts: 0,
             upload_cursor: None,
             upload_wanted: Cell::new(false),
+            long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
+            long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
+            long_term_rewrite_jobs: 0,
+            long_term_backlog: Box::default(),
             manifest_publish_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
@@ -3416,6 +3433,12 @@ where
         self.offset_space.append_live = true;
         self.offset_space.committed_seeded = true;
         self.publish_poll_visibility();
+    }
+
+    /// Whether a message of this partition ever committed, so its commit
+    /// offset names a message and is not an untouched zero.
+    pub(crate) const fn holds_committed_messages(&self) -> bool {
+        self.offset_space.committed_seeded
     }
 
     /// Whether this partition ever stamped an offset, i.e. whether its offset
@@ -6433,7 +6456,7 @@ where
                 commit_offset,
                 context,
                 tier: PollTier::Placed {
-                    placed: self.placed_read_plan(),
+                    placed: self.placed_read_plan(Some(query)),
                     query,
                 },
             };
@@ -6547,7 +6570,28 @@ where
     /// What a poll of this partition reads when it places its batches: its
     /// segments that hold a batch, and the placed batches still in its
     /// journal. Taken under the partition borrow, so the read runs without.
-    fn placed_read_plan(&self) -> crate::placed_read::PlacedReadPlan {
+    ///
+    /// `query` is the poll the plan is for, and picks the long-term segments
+    /// it carries. A read that starts above the long-term floor passes none.
+    pub(crate) fn placed_read_plan(
+        &self,
+        query: Option<MessageLookup>,
+    ) -> crate::placed_read::PlacedReadPlan {
+        let long_term = self.long_term_segments();
+        let first = match query {
+            Some(MessageLookup::Offset { offset, .. }) => {
+                long_term.partition_point(|segment| segment.end_offset < offset)
+            }
+            Some(MessageLookup::Timestamp { timestamp, .. }) => {
+                long_term.partition_point(|segment| segment.max_timestamp < timestamp)
+            }
+            None => long_term.len(),
+        };
+        let long_term = long_term[first..]
+            .iter()
+            .take(crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL)
+            .copied()
+            .collect();
         let segments = self
             .log
             .segments()
@@ -6568,6 +6612,8 @@ where
             resident: self.log.journal().inner.resident_message_entries(),
             remote: self.remote_segments.clone(),
             deadline: None,
+            prefix: crate::object_prefix(self.namespace(), self.created_revision()),
+            long_term,
         }
     }
 
@@ -7996,7 +8042,7 @@ where
         }
     }
 
-    fn partition_dir(&self) -> Option<String> {
+    pub(crate) fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
         }
@@ -12946,6 +12992,7 @@ where
         {
             self.offset.store(end_offset, Ordering::Release);
             self.committed_bytes = self.committed_bytes.saturating_add(batch_stats.size_bytes);
+            self.long_term_backlog.add(batch_stats.size_bytes);
             self.stats.set_current_offset(end_offset);
             // Advance the aggregate stats with the visible offset. Disk
             // persistence is threshold-gated in `commit_messages`, which

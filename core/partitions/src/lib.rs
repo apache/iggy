@@ -62,12 +62,19 @@ pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOu
 mod manifest_publish;
 mod placed_read;
 pub use manifest_publish::{
-    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, ManifestPublishOutcome, ManifestPublisher,
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, ManifestPublishOutcome, ManifestPublisher,
 };
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
     ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
     UploadError, UploadOutcome, upload_segment,
+};
+pub mod long_term;
+mod long_term_rewrite;
+pub use long_term_rewrite::{
+    BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError,
+    RewriteOutcome, SegmentRewrite,
 };
 mod segment_recovery;
 pub mod state_machine;

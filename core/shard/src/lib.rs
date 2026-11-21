@@ -28,10 +28,12 @@ pub use fresh_writes::{
     FRESH_OBJECT_BYTES, FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS,
     FinishedFreshUpload,
 };
+mod long_term_rewrites;
 mod manifest_publishes;
 mod object_deletes;
 mod poll;
 mod primary_rebalance;
+pub mod rewrite_pacing;
 mod router;
 mod segment_uploads;
 mod served_reads;
@@ -1270,6 +1272,30 @@ pub enum LifecycleFrame {
     /// The result of an attempt at the upload of a fresh object, sent by the
     /// task that ran it.
     FreshUploadFinished(Box<FinishedFreshUpload>),
+    /// Per-shard pass over a partition that places its batches: rewrite its
+    /// committed batches above the long-term floor into a segment, when this
+    /// replica is the primary and no rewrite is in flight, or send the
+    /// command of a stored segment again. Does nothing on a shard without a
+    /// writer.
+    RewriteSegments {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+    },
+    /// The result of a rewrite that a [`Self::RewriteSegments`] pass
+    /// started, sent by the task that ran it.
+    SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
+}
+
+/// What the task rewriting a segment hands back to the pump.
+pub struct FinishedSegmentRewrite {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the rewrite. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the rewrite.
+    pub id: u64,
+    pub outcome: partitions::RewriteOutcome,
 }
 
 /// What the task publishing a manifest hands back to the pump.
@@ -2104,6 +2130,18 @@ where
     /// batches.
     fresh_writes: fresh_writes::FreshWrites,
 
+    /// Late-bound writer of long-term segments. `None` on a shard without an
+    /// object store, where every rewrite pass is a no-op.
+    long_term_writer: RefCell<Option<Rc<dyn partitions::LongTermWriter>>>,
+
+    /// Results of rewrites whose frame the inbox refused. The partition
+    /// counts such a rewrite as in flight until it sees the result, so the
+    /// next rewrite pass takes them from here.
+    undelivered_segment_rewrites: Rc<RefCell<Vec<FinishedSegmentRewrite>>>,
+
+    /// When the next rewrite pass over each placing partition here is due.
+    rewrite_pacing: RefCell<rewrite_pacing::RewritePacing>,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2471,6 +2509,9 @@ where
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
+            rewrite_pacing: RefCell::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3384,6 +3425,7 @@ where
     /// # Panics
     /// Panics when the target cannot address the largest supported partition I/O job.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn without_inbox(
         identity: ShardIdentity,
         bus: B,
@@ -3454,6 +3496,9 @@ where
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
+            rewrite_pacing: RefCell::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -9968,10 +10013,13 @@ where
     /// changed while the tick awaited.
     fn settle_ticked_partitions(&self, visited: &[IggyNamespace]) {
         let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
         for namespace in visited {
             let quiet_until = partitions
                 .sent_report(namespace)
                 .and_then(|(partition, sent)| {
+                    self.pace_placing_primary(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
                     self.partition_quiet_until(*namespace, partition, sent.get())
                 });
             partitions.settle(namespace, quiet_until);

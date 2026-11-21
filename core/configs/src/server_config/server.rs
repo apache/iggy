@@ -569,6 +569,7 @@ mod tests {
             ("IGGY_TIERED_STORAGE_JOBS_UPLOAD_BYTES", "4 GiB"),
             ("IGGY_TIERED_STORAGE_JOBS_FRESH_UPLOADS", "8"),
             ("IGGY_TIERED_STORAGE_FRESH_UPLOAD_INTERVAL", "25 ms"),
+            ("IGGY_TIERED_STORAGE_LONG_TERM_BACKLOG_LIMIT", "512 MiB"),
         ];
         let known = ServerConfig::all_env_var_names();
         for (name, value) in vars {
@@ -597,6 +598,10 @@ mod tests {
         assert_eq!(tiered.jobs.uploads, 5);
         assert_eq!(tiered.jobs.fresh_uploads, 8);
         assert_eq!(tiered.fresh_upload_interval.get_duration().as_millis(), 25);
+        assert_eq!(
+            tiered.long_term_backlog_limit.as_bytes_u64(),
+            512 * 1024 * 1024
+        );
         assert_eq!(
             tiered.jobs.upload_bytes.as_bytes_u64(),
             4 * 1024 * 1024 * 1024
