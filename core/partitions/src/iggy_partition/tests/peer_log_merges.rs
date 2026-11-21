@@ -33,7 +33,7 @@ use super::peer_log::{
 };
 use super::placed_batches::{
     commit_long_term_request, object_bytes, placing_leader_of_three_with, publish_manifest,
-    store_with, whole_and_placed, writer,
+    store_segment_up_to, store_with, whole_and_placed,
 };
 use super::remote_poll::layout;
 use super::segment_chain::{PREFIX, tiered_partition};
@@ -41,8 +41,8 @@ use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::long_term::concatenated;
 use crate::{
-    LongTermWriter, MergePass, MergeSettled, PeerLogError, PeerManifestContradiction,
-    PeerManifestRefusal, RemoteObjects, RemoteSegments, SegmentLocation, upload_segment,
+    MergePass, MergeSettled, PeerLogError, PeerManifestContradiction, PeerManifestRefusal,
+    RemoteObjects, RemoteSegments, SegmentLocation, upload_segment,
 };
 use futures::channel::oneshot;
 use iggy_common::{
@@ -785,10 +785,7 @@ async fn rewrite_up_to(
     up_to: u64,
     request: u64,
 ) -> ManifestSegment {
-    let (id, mut rewrite, scope) = origin.begin_segment_rewrite().unwrap();
-    rewrite.up_to = up_to;
-    let outcome = writer(store).write(rewrite, scope).await;
-    let segment = origin.finish_segment_rewrite(id, outcome).unwrap();
+    let segment = Box::pin(store_segment_up_to(origin, store, up_to)).await;
     let command = origin.publish_segment_request(&segment, request).unwrap();
     Box::pin(commit_long_term_request(origin, command, false)).await;
     segment

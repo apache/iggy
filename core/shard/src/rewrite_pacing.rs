@@ -29,7 +29,9 @@
 //!
 //! A segment that ended at its byte cap left committed messages behind.
 //! The pass for them starts when the segment's command commits, since a
-//! rewrite continues where the long-term log ends.
+//! rewrite continues where the long-term log ends. A rewrite stores its
+//! segment only once the log holds its registration, so the pass that sent
+//! one is followed by the next when it commits too.
 //!
 //! Nothing ties the sends to a partition to its rewrites, so producers that
 //! outrun them grow its backlog: the bytes it committed that no long-term
@@ -40,6 +42,7 @@
 //! Every decision takes the time it is made at, so nothing here reads a
 //! clock.
 
+use partitions::{PlannedSegment, RewriteError};
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -117,6 +120,16 @@ pub struct BacklogCount {
     pub bytes: Option<u64>,
 }
 
+/// Where a plan of a partition's next segment found it ends, for the
+/// pump's next tick to hand to the partition.
+#[derive(Debug)]
+pub struct FinishedPlan {
+    pub key: RewriteKey,
+    /// The number the partition gave the plan.
+    pub id: u64,
+    pub outcome: Result<PlannedSegment, RewriteError>,
+}
+
 /// What a rewrite pass over a partition ended as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RewriteResult {
@@ -132,6 +145,9 @@ pub enum RewriteResult {
     Idle,
     /// The pass only sent a stored segment's command again.
     Resent,
+    /// The pass sent the registration of the segment the next rewrite
+    /// stores, which starts once it commits.
+    Registering,
     /// It failed.
     Unchanged,
 }
@@ -163,6 +179,8 @@ pub struct RewritePacing {
     backlog_limit: u64,
     /// Counts of backlogs that walks handed back since the last tick.
     backlog_counts: Rc<RefCell<Vec<BacklogCount>>>,
+    /// Ends of segments that plans found since the last tick.
+    plans: Rc<RefCell<Vec<FinishedPlan>>>,
     /// Whether the shard has yet to look over all its partitions for the
     /// ones to pace. A partition that sleeps is not looked at otherwise.
     sweep_wanted: bool,
@@ -174,6 +192,7 @@ impl Default for RewritePacing {
             partitions: HashMap::new(),
             backlog_limit: LONG_TERM_BACKLOG_LIMIT,
             backlog_counts: Rc::default(),
+            plans: Rc::default(),
             sweep_wanted: false,
         }
     }
@@ -289,6 +308,10 @@ impl RewritePacing {
                 pace.interval_micros
             }
             RewriteResult::Resent => micros(REWRITE_INTERVAL_MIN),
+            RewriteResult::Registering => {
+                pace.awaits_commit = true;
+                micros(REWRITE_INTERVAL_MIN)
+            }
             RewriteResult::Unchanged => {
                 pace.awaits_commit = false;
                 pace.interval_micros
@@ -346,6 +369,19 @@ impl RewritePacing {
     #[must_use]
     pub fn take_backlog_counts(&self) -> Vec<BacklogCount> {
         std::mem::take(&mut *self.backlog_counts.borrow_mut())
+    }
+
+    /// Where a plan of a partition's next segment leaves what it found,
+    /// from a task apart from the pump.
+    #[must_use]
+    pub fn plans(&self) -> Rc<RefCell<Vec<FinishedPlan>>> {
+        Rc::clone(&self.plans)
+    }
+
+    /// What the plans found since the last call.
+    #[must_use]
+    pub fn take_plans(&self) -> Vec<FinishedPlan> {
+        std::mem::take(&mut *self.plans.borrow_mut())
     }
 
     /// The partitions that have a wait here.
@@ -621,6 +657,23 @@ mod tests {
         assert!(!pacing.paces(&(IggyNamespace::new(1, 1, 1), 7)));
         pacing.committed(&(IggyNamespace::new(1, 1, 1), 7), 1_000);
         assert!(!pacing.paces(&(IggyNamespace::new(1, 1, 1), 7)));
+    }
+
+    /// A rewrite stores its segment once the registration commits, so the
+    /// commit makes the pass due, and a registration that got lost is sent
+    /// again after the minimum.
+    #[test]
+    fn given_a_registration_in_flight_when_it_commits_should_make_the_next_pass_due_at_once() {
+        let mut pacing = RewritePacing::default();
+        let min = micros(REWRITE_INTERVAL_MIN);
+        pacing.settle(key(), RewriteResult::Registering, 1_000);
+        assert_eq!(pacing.take_due(1_000 + min - 1), []);
+
+        pacing.committed(&key(), 2_000);
+
+        assert_eq!(pacing.take_due(2_000), [key()]);
+        pacing.settle(key(), RewriteResult::Registering, 3_000);
+        assert_eq!(pacing.take_due(3_000 + min), [key()]);
     }
 
     #[test]

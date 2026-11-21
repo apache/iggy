@@ -30,6 +30,11 @@
 //! segment was stored and before its command committed stores the same
 //! bytes under the same key, finds them there, and commits the command.
 //!
+//! The long-term log holds the registration of a merged segment before its
+//! object is stored, and the replace clears it. An object whose replace
+//! never commits, as when the next primary merged other segments, is
+//! deleted once its registration expires.
+//!
 //! A merge never trusts the store for what a segment holds: the bytes of
 //! every source must match the size and the hashes the log committed for
 //! it. A source that does not is left where it is and merged by nobody
@@ -52,6 +57,7 @@ use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
+use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, ObjectStoreError,
     SegmentObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope,
@@ -63,7 +69,10 @@ use tracing::{debug, error, warn};
 
 use crate::IggyPartition;
 use crate::iggy_index::IGGY_INDEX_SIZE;
-use crate::long_term::{LONG_TERM_SEGMENTS_MAX, REPLACE_SOURCES_MAX, concatenated};
+use crate::long_term::{
+    LONG_TERM_REGISTRATION_TTL, LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration,
+    REPLACE_SOURCES_MAX, concatenated,
+};
 use crate::long_term_delete::LongTermObject;
 use crate::long_term_rewrite::{
     INDEX_STRIDE_BYTES, LONG_TERM_SEGMENT_BYTES, SegmentIndex, write_file,
@@ -190,17 +199,17 @@ impl MergeRun {
     }
 
     /// The merge of `segments` within `limits` that makes the log shortest,
-    /// and of several that do, the one at the lowest offset. A merge that
-    /// would read a segment `skipped` names is left out.
+    /// and of several that do, the one at the lowest offset. A merge whose
+    /// sources `skipped` names is left out.
     #[must_use]
     pub fn best(
         segments: &[ManifestSegment],
         limits: MergeLimits,
-        skipped: impl Fn(&ManifestSegment) -> bool,
+        skipped: impl Fn(&[ManifestSegment]) -> bool,
     ) -> Option<Self> {
         Self::all(segments, limits)
             .into_iter()
-            .filter(|merge| !merge.sources(segments).iter().any(&skipped))
+            .filter(|merge| !skipped(merge.sources(segments)))
             // The first of equal ones is the one at the lowest offset.
             .reduce(|best, merge| {
                 if merge.reclaim() > best.reclaim() {
@@ -219,7 +228,7 @@ impl MergeRun {
     #[must_use]
     pub fn relieving(
         segments: &[ManifestSegment],
-        skipped: impl Fn(&ManifestSegment) -> bool,
+        skipped: impl Fn(&[ManifestSegment]) -> bool,
     ) -> Option<Self> {
         std::iter::successors(Some(MergeLimits::NORMAL), |limits| limits.doubled())
             .find_map(|limits| Self::best(segments, limits, &skipped))
@@ -227,6 +236,30 @@ impl MergeRun {
 
     fn sources<'a>(&self, segments: &'a [ManifestSegment]) -> &'a [ManifestSegment] {
         &segments[self.first..self.first + self.count]
+    }
+
+    /// The merge of the segments of `segments` from the one that starts at
+    /// `start_offset` to the one that ends at `end_offset`, when those are
+    /// two segments or more.
+    fn spanning(
+        segments: &[ManifestSegment],
+        (start_offset, end_offset): (u64, u64),
+    ) -> Option<Self> {
+        let first = segments
+            .binary_search_by_key(&start_offset, |segment| segment.start_offset)
+            .ok()?;
+        let last = segments
+            .binary_search_by_key(&end_offset, |segment| segment.end_offset)
+            .ok()?;
+        (last > first).then(|| Self {
+            first,
+            count: last - first + 1,
+            start_offset,
+            bytes: segments[first..=last]
+                .iter()
+                .map(|segment| segment.size)
+                .sum(),
+        })
     }
 }
 
@@ -551,6 +584,26 @@ pub enum MergePass {
     Drain,
 }
 
+/// What a pass over a partition starts of its next merge.
+pub enum MergeStart {
+    /// Commit this registration of what the merge stores. A pass after it
+    /// commits starts the merge.
+    Register(ObjectRegistration),
+    /// Run this merge under the scope of the token, and hand its result to
+    /// [`IggyPartition::finish_segment_merge`] with the number.
+    Merge(u64, SegmentMerge, TierScopeToken),
+}
+
+/// Where the registration of a merge stands in the long-term log.
+enum Registered {
+    /// The log holds it, from this view: the merge of `MergeRun` may store.
+    Ready(MergeRun),
+    /// Its command has not committed yet.
+    Pending(ObjectRegistration),
+    /// The log can no longer take it, or none was made.
+    Gone,
+}
+
 /// What became of the merged segment a partition stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeSettled {
@@ -596,6 +649,10 @@ pub struct LongTermMerges {
     /// grows by a segment at a time is not rewritten once for each. A log
     /// near its limit does not wait for the scan.
     resting: Option<u64>,
+    /// What this view registered for the merge it starts next, runs, or
+    /// waits on the command of. No merge stores an object before the long-term
+    /// log holds its registration.
+    registration: Option<ObjectRegistration>,
     /// Number of the last merge this partition started. Kept across views,
     /// so the result of a merge of an earlier view is never taken for
     /// another's.
@@ -603,9 +660,11 @@ pub struct LongTermMerges {
 }
 
 impl LongTermMerges {
-    fn skips(&self, segment: &ManifestSegment) -> bool {
-        self.quarantined.contains(&segment.start_offset)
-            || self.resting == Some(segment.start_offset)
+    fn skips(&self, sources: &[ManifestSegment]) -> bool {
+        sources.iter().any(|segment| {
+            self.quarantined.contains(&segment.start_offset)
+                || self.resting == Some(segment.start_offset)
+        })
     }
 
     /// Forget what this view learned and cancel the merge in flight.
@@ -636,8 +695,12 @@ where
         // The scan that asks merges what rests, and another view's
         // quarantine is not this one's.
         let quarantined = (lane.view == Some(self.consensus().view())).then_some(&lane.quarantined);
-        self.best_segment_merge(|segment| {
-            quarantined.is_some_and(|quarantined| quarantined.contains(&segment.start_offset))
+        self.best_segment_merge(|sources| {
+            quarantined.is_some_and(|quarantined| {
+                sources
+                    .iter()
+                    .any(|segment| quarantined.contains(&segment.start_offset))
+            })
         })
         .map(|merge| (merge.reclaim(), merge.start_offset))
     }
@@ -650,10 +713,15 @@ where
         self.merges_long_term_segments() && self.long_term_log_near_limit()
     }
 
-    /// Start the best merge of this partition's long-term segments, when
-    /// this replica is the primary of a partition that places its batches,
-    /// no merge is in flight, and none waits for its command. The caller
-    /// runs it under the returned scope and hands the result to
+    /// Take the next step of this partition's merges, when this replica is
+    /// the primary of a partition that places its batches, no merge is in
+    /// flight, and none waits for its command.
+    ///
+    /// A merge stores its segment only once the long-term log holds the
+    /// registration of it from this view: until then the step is the
+    /// registration, made at `now`, for the caller to commit. Once it is
+    /// held, the step is the merge, which the caller runs under the
+    /// returned scope and whose result it hands to
     /// [`Self::finish_segment_merge`] with the returned number.
     ///
     /// A merged segment whose command has not committed is settled by
@@ -664,7 +732,8 @@ where
     pub fn begin_segment_merge(
         &mut self,
         pass: MergePass,
-    ) -> Option<(u64, SegmentMerge, TierScopeToken)> {
+        now: IggyTimestamp,
+    ) -> Option<MergeStart> {
         if !self.merges_long_term_segments() {
             self.long_term_merges.clear();
             return None;
@@ -678,8 +747,16 @@ where
         if lane.running.is_some() || lane.stored.is_some() {
             return None;
         }
-        let lane = &self.long_term_merges;
-        let run = self.best_segment_merge(|segment| lane.skips(segment))?;
+        let run = match self.registered_merge() {
+            Registered::Ready(run) => run,
+            Registered::Pending(registration) => return Some(MergeStart::Register(registration)),
+            Registered::Gone => {
+                self.long_term_merges.registration = None;
+                let registration = self.next_merge_registration(now)?;
+                self.long_term_merges.registration = Some(registration);
+                return Some(MergeStart::Register(registration));
+            }
+        };
         let sources = run.sources(self.long_term_segments()).to_vec();
         let prefix = crate::object_prefix(self.namespace(), self.created_revision());
         let scope = TierScope::new();
@@ -702,7 +779,7 @@ where
                 TierJobClass::Housekeeping
             },
         };
-        Some((id, merge, token))
+        Some(MergeStart::Merge(id, merge, token))
     }
 
     /// Take the result of the merge numbered `id`, and return the segment
@@ -712,7 +789,7 @@ where
     ///
     /// A merge that found a source the store holds other bytes for is not
     /// started again while this replica stays the primary. Any other
-    /// failure is repeated by a later scan.
+    /// failure is repeated by a later scan, under the same registration.
     pub fn finish_segment_merge(
         &mut self,
         id: u64,
@@ -750,6 +827,7 @@ where
             }
             Ok(Err(MergeError::SourceDiverged { start_offset })) => {
                 lane.quarantined.insert(start_offset);
+                lane.registration = None;
                 error!(
                     namespace_raw,
                     start_offset,
@@ -780,22 +858,22 @@ where
         let Some((merged, sources)) = self.long_term_merges_of_this_view().stored else {
             return MergeSettled::Nothing;
         };
-        let listed = LongTermObject::classify(
-            self.long_term_segments(),
-            merged.start_offset,
-            merged.end_offset,
-        );
-        match listed {
-            LongTermObject::Unannounced => MergeSettled::Waiting(merged),
+        match self.long_term_object(merged.start_offset, merged.end_offset) {
+            LongTermObject::Registered | LongTermObject::Unannounced => {
+                MergeSettled::Waiting(merged)
+            }
             LongTermObject::Listed => {
                 let lane = &mut self.long_term_merges;
                 lane.stored = None;
+                lane.registration = None;
                 lane.resting =
                     (merged.size < LONG_TERM_MERGE_MIN_BYTES).then_some(merged.start_offset);
                 MergeSettled::Committed { replaced: sources }
             }
             LongTermObject::Dead => {
-                self.long_term_merges.stored = None;
+                let lane = &mut self.long_term_merges;
+                lane.stored = None;
+                lane.registration = None;
                 self.queue_dead_long_term_objects(&[(merged.start_offset, merged.end_offset)]);
                 MergeSettled::Retired
             }
@@ -809,6 +887,29 @@ where
         self.long_term_merges.running.is_some()
     }
 
+    /// The time before which the registrations of the long-term log expire
+    /// at `now`, when this replica is the primary that merges and the log
+    /// holds one it would expire. The registration of this view's own merge
+    /// never expires while the merge may still store or list its object,
+    /// and that of its rewrite names the next segment, which no expiry
+    /// takes.
+    #[must_use]
+    pub fn long_term_registrations_expiry(&self, now: IggyTimestamp) -> Option<u64> {
+        if !self.merges_long_term_segments() {
+            return None;
+        }
+        let log = self.long_term_log()?;
+        let lane = &self.long_term_merges;
+        let held = lane
+            .registration
+            .filter(|_| lane.view == Some(self.consensus().view()))
+            .and_then(|held| log.registration(held.start_offset, held.end_offset));
+        let ttl = u64::try_from(LONG_TERM_REGISTRATION_TTL.as_micros()).unwrap_or(u64::MAX);
+        let limit = now.as_micros().saturating_sub(ttl);
+        let before = held.map_or(limit, |held| limit.min(held.registered_at));
+        log.expires_any(before).then_some(before)
+    }
+
     /// Whether this replica is the one that merges the partition's
     /// long-term segments: the settled primary of a partition that places
     /// its batches.
@@ -820,11 +921,66 @@ where
         self.long_term_segments().len() >= LONG_TERM_SEGMENTS_PRESSURE
     }
 
-    /// The best merge of the partition's long-term segments that reads no
-    /// segment `skipped` names. A log near its limit takes larger segments
-    /// when it has no small ones to merge.
-    fn best_segment_merge(&self, skipped: impl Fn(&ManifestSegment) -> bool) -> Option<MergeRun> {
+    /// Where the registration of this view's next merge stands.
+    fn registered_merge(&self) -> Registered {
+        let (Some(registration), Some(log)) =
+            (self.long_term_merges.registration, self.long_term_log())
+        else {
+            return Registered::Gone;
+        };
+        let (start_offset, end_offset) = registration.key();
+        let held = match log.classify(start_offset, end_offset) {
+            // A registration from an earlier view is not this one's: the
+            // later time is what keeps its object from expiring.
+            LongTermObject::Registered => log
+                .registration(start_offset, end_offset)
+                .is_some_and(|held| held.registered_at >= registration.registered_at),
+            LongTermObject::Unannounced if !log.registrations_full() => false,
+            _ => return Registered::Gone,
+        };
+        if !held {
+            return Registered::Pending(registration);
+        }
+        MergeRun::spanning(log.segments(), registration.key())
+            .map_or(Registered::Gone, Registered::Ready)
+    }
+
+    /// The registration of the best merge that skips nothing this view
+    /// skips, at `now`. `None` when there is no merge, or the log takes no
+    /// registration of it.
+    fn next_merge_registration(&self, now: IggyTimestamp) -> Option<ObjectRegistration> {
+        let lane = &self.long_term_merges;
+        let run = self.best_segment_merge(|sources| lane.skips(sources))?;
+        let last = run.sources(self.long_term_segments()).last()?;
+        let registration = ObjectRegistration {
+            start_offset: run.start_offset,
+            end_offset: last.end_offset,
+            registered_at: now.as_micros(),
+        };
+        let log = self.long_term_log()?;
+        let (start_offset, end_offset) = registration.key();
+        (!log.registrations_full() || log.registration(start_offset, end_offset).is_some())
+            .then_some(registration)
+    }
+
+    /// The best merge of the partition's long-term segments whose sources
+    /// `skipped` does not name. A log near its limit takes larger segments
+    /// when it has no small ones to merge. A merge whose registration
+    /// expired is left out: the log refuses its replace.
+    fn best_segment_merge(&self, skipped: impl Fn(&[ManifestSegment]) -> bool) -> Option<MergeRun> {
         let segments = self.long_term_segments();
+        let expired = self.long_term_log().map_or(&[][..], LongTermLog::expired);
+        let skipped = |sources: &[ManifestSegment]| {
+            skipped(sources)
+                || sources
+                    .first()
+                    .zip(sources.last())
+                    .is_some_and(|(first, last)| {
+                        expired
+                            .binary_search(&(first.start_offset, last.end_offset))
+                            .is_ok()
+                    })
+        };
         if self.long_term_log_near_limit() {
             MergeRun::relieving(segments, skipped)
         } else {
@@ -958,8 +1114,8 @@ mod tests {
         let sizes = [MIB, MIB, 48 * MIB, MIB, MIB, MIB];
         let segments = log(&sizes);
 
-        let found = MergeRun::best(&segments, MergeLimits::NORMAL, |segment| {
-            segment.start_offset == 4
+        let found = MergeRun::best(&segments, MergeLimits::NORMAL, |sources| {
+            sources.iter().any(|segment| segment.start_offset == 4)
         });
 
         assert_eq!(found.map(|merge| (merge.first, merge.count)), Some((0, 2)));
@@ -1049,7 +1205,9 @@ mod tests {
         let sizes = [MIB, MIB, 40 * MIB, 40 * MIB];
         let segments = log(&sizes);
 
-        let found = MergeRun::relieving(&segments, |segment| segment.start_offset == 1);
+        let found = MergeRun::relieving(&segments, |sources| {
+            sources.iter().any(|segment| segment.start_offset == 1)
+        });
 
         assert_eq!(found, None);
         assert_eq!(relieving(&sizes), Some((0, 2)));

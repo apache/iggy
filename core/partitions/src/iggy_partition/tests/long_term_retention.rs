@@ -18,11 +18,11 @@
 use super::placed_batches::{
     FRESH_OBJECT, commit_long_term_request, commit_published_segment,
     leader_with_three_long_term_segments, lose_primacy, placing_leader_of_three_with,
-    placing_partition_of_small_segments, store_with, whole_and_placed, whole_and_placed_in, writer,
+    placing_partition_of_small_segments, store_segment_up_to, store_with, whole_and_placed,
+    whole_and_placed_in,
 };
 use super::remote_poll::{layout, polled_all};
 use super::*;
-use crate::LongTermWriter;
 use crate::long_term::{TRIM_SEGMENTS, TrimSegments};
 use crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL;
 use crate::state_machine::{Applied, MachineCommand};
@@ -371,10 +371,7 @@ async fn rewrite_up_to(
     ends: &[u64],
 ) {
     for (request, up_to) in (1..).zip(ends) {
-        let (id, mut rewrite, scope) = partition.begin_segment_rewrite().unwrap();
-        rewrite.up_to = *up_to;
-        let outcome = writer(store).write(rewrite, scope).await;
-        let segment = partition.finish_segment_rewrite(id, outcome).unwrap();
+        let segment = Box::pin(store_segment_up_to(partition, store, *up_to)).await;
         let command = partition
             .publish_segment_request(&segment, request)
             .unwrap();
