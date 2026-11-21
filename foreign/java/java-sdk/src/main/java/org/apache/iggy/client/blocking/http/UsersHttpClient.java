@@ -22,6 +22,8 @@ package org.apache.iggy.client.blocking.http;
 import org.apache.iggy.IggyVersion;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.TokenInfo;
@@ -59,6 +61,12 @@ class UsersHttpClient implements UsersClient {
         var request = httpClient.prepareGetRequest(USERS);
         List<HttpUser> users = httpClient.execute(request, new TypeReference<>() {});
         return users.stream().map(HttpUser::toUserInfo).toList();
+    }
+
+    @Override
+    public Page<UserInfo> getUsersPage(NamedPageQuery query) {
+        HttpPage<HttpUser> page = HttpPage.read(httpClient, USERS, query, new TypeReference<>() {});
+        return page.toPage(HttpUser::toUserInfo);
     }
 
     @Override

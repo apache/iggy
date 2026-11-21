@@ -20,7 +20,8 @@ use async_trait::async_trait;
 use iggy_common::UserClient;
 use iggy_common::locking::IggyRwLockFn;
 use iggy_common::{
-    Identifier, IdentityInfo, IggyError, Permissions, UserInfo, UserInfoDetails, UserStatus,
+    Identifier, IdentityInfo, IggyError, NamedPageQuery, Page, Permissions, UserInfo,
+    UserInfoDetails, UserStatus,
 };
 use iggy_common::{UserCreateOptions, UserUpdateOptions};
 
@@ -32,6 +33,10 @@ impl UserClient for IggyClient {
 
     async fn get_users(&self) -> Result<Vec<UserInfo>, IggyError> {
         super::with_client!(self, client => client.get_users().await)
+    }
+
+    async fn get_users_page(&self, query: &NamedPageQuery) -> Result<Page<UserInfo>, IggyError> {
+        super::with_client!(self, client => client.get_users_page(query).await)
     }
 
     async fn create_user(

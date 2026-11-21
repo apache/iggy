@@ -1,0 +1,144 @@
+---
+title: Linux tuning
+description: "Prepare Linux hosts for Iggy and measure the effects of memory, CPU, storage, and network tuning."
+---
+
+Host settings affect both production latency and benchmark results. Start with the distribution defaults, satisfy Iggy's runtime requirements, then change one setting at a time. The examples below are experiments for dedicated Linux hosts, not a configuration to apply unchanged to every VM.
+
+Use the [benchmarking guide](/docs/server/benchmarking) to compare throughput, p50, p99 and p99.9 latency, memory use, and errors under the same workload. Keep the server version, transport, topic durability, CPU allocation, and storage identical between runs.
+
+## Inspect the host first
+
+Run these read-only checks before changing the VM image or starting a benchmark:
+
+```bash
+uname -r
+lscpu
+free -h
+swapon --show
+ulimit -Sn
+ulimit -Hn
+ulimit -Sl
+ulimit -Hl
+sysctl vm.swappiness vm.dirty_background_bytes vm.dirty_bytes
+sysctl vm.dirty_background_ratio vm.dirty_ratio
+grep -E '^(HugePages_|Hugepagesize|Hugetlb|AnonHugePages)' /proc/meminfo
+ls /sys/kernel/mm/hugepages/
+```
+
+The shell's limits are not necessarily the service's limits. For a running process, inspect `/proc/PID/limits`, `/proc/PID/status`, and its cgroup limits. Replace `PID` with that process's ID. Record the VM type, vCPU topology, memory limit, disk type and provisioned throughput, filesystem, and network bandwidth with the result.
+
+## Runtime access and process limits
+
+Iggy uses `io_uring`. The kernel must implement the operations required by the server build, and the service or container must be allowed to use them. The server's startup diagnostics identify failed ring creation and unsupported operations. Where the kernel exposes them, inspect:
+
+```bash
+sysctl kernel.io_uring_disabled kernel.io_uring_group
+```
+
+`io_uring_disabled=0` permits ring creation. With `1`, an unprivileged service needs membership in the configured `io_uring_group`. With `2`, creation is disabled. Container syscall filters can independently deny access. Configure access for the service rather than assuming that a root shell proves the container can start. See the [kernel's io_uring controls](https://docs.kernel.org/admin-guide/sysctl/kernel.html#io-uring-disabled) and [Docker deployment guidance](/docs/server/docker).
+
+Size file-descriptor limits for connections, partitions, open segment files, and runtime overhead. `LimitNOFILE=65536` is an example starting budget, not an Iggy requirement. Increase it if measurements justify more. A systemd service can use the following drop-in:
+
+```ini
+[Service]
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+```
+
+Unlimited locked memory is an option for a dedicated service with a planned memory budget. A finite limit is also valid if it covers the runtime's locked-memory requirements. Neither setting creates RAM or overrides a container's memory ceiling.
+
+Recheck the actual process limits after restarting the service. PAM settings in `/etc/security/limits.conf` do not configure a system service. See [systemd resource limits](https://man7.org/linux/man-pages/man5/systemd.exec.5.html#PROCESS_PROPERTIES).
+
+## Swapping and writeback
+
+On a host with disk-backed swap and enough RAM for the workload, try `vm.swappiness=10` and compare it with the existing value. It reduces the preference for swapping relative to reclaiming file cache. It does not disable swapping, and even `0` permits swapping under sufficient pressure. zram and zswap can warrant different values. See [Linux swappiness](https://docs.kernel.org/admin-guide/sysctl/vm.html#swappiness).
+
+```bash
+# Optional experiment. Record the previous value first.
+sudo sysctl -w vm.swappiness=10
+```
+
+Leave memory for the kernel, page cache, other processes, and Iggy's buffers. Watch swap-in/out with `vmstat 1` and memory pressure in `/proc/pressure/memory`. Disabling swap does not fix an undersized memory budget.
+
+Dirty-page limits govern buffered writeback. Large percentage limits, such as `dirty_background_ratio=10` and `dirty_ratio=30`, can permit large bursts on high-memory VMs. If writeback coincides with latency spikes, compare explicit byte limits sized from disk throughput and the acceptable backlog.
+
+Byte and ratio forms are alternatives. Writing one disables its corresponding other form. These settings do not replace Iggy's persistence barriers. See [Linux writeback controls](https://docs.kernel.org/admin-guide/sysctl/vm.html#dirty-background-bytes).
+
+## Huge pages and mimalloc
+
+Huge pages can reduce translation overhead, but they consume memory differently from ordinary pages. Measure both throughput and tail latency. Iggy's default server build uses mimalloc. Check the startup allocator message, since builds that disable mimalloc do not use its environment options.
+
+There are three distinct controls:
+
+| Control | Meaning |
+| --- | --- |
+| Transparent huge pages (THP) | Kernel promotion of eligible mappings. Inspect the top-level and per-size THP policies. |
+| Linux HugeTLB pools | Explicitly reserved pages. `vm.nr_hugepages` counts pages of the default size reported by `Hugepagesize`. |
+| mimalloc environment options | Tell the allocator which page mechanisms to request. They are not kernel pool sizes. |
+
+### Explicit large pages
+
+First verify the default page size and leave sufficient ordinary memory. If `Hugepagesize` is `2048 kB`, 512 reserved pages consume 1 GiB:
+
+```bash
+# Only for a host whose default Hugepagesize is 2048 kB
+# and whose memory budget permits a 1 GiB reservation.
+sudo sysctl -w vm.nr_hugepages=512
+grep -E '^(HugePages_|Hugepagesize|Hugetlb)' /proc/meminfo
+```
+
+The requested count may not be allocated on a fragmented host. Boot-time reservation is more reliable. Reserved HugeTLB memory is unavailable for ordinary allocations or page cache, even while unused. Check NUMA placement and the actual pool, not just the requested count. See [HugeTLB administration](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html).
+
+Try the allocator option on a mimalloc-enabled server, with access to the pool configured for its service account:
+
+```bash
+MIMALLOC_ALLOW_LARGE_OS_PAGES=1 MIMALLOC_VERBOSE=1 ./target/release/iggy-server
+```
+
+Set allocator variables in the launching environment or the service's `Environment=` entries before process startup. The server can allocate before loading its `.env` file. Verbose allocator output is useful for checking the experiment, then turn it off for timed runs.
+
+**Do not copy a Linux page count into `MIMALLOC_RESERVE_HUGE_OS_PAGES`.** That mimalloc option counts **1 GiB pages**. A value of `2048` requests 2 TiB, whereas `vm.nr_hugepages=2048` represents 4 GiB only when the default HugeTLB page size is 2 MiB. A 2 MiB pool does not provide a matching 1 GiB reservation.
+
+A separate 1 GiB-page experiment requires platform support, a suitable pool, and a budget for each process. mimalloc advises normally choosing this reservation mode separately from `MIMALLOC_ALLOW_LARGE_OS_PAGES`. See [mimalloc environment options](https://github.com/microsoft/mimalloc#environment-options). HugeTLB allocation can require `CAP_IPC_LOCK` or membership in `vm.hugetlb_shm_group`, as described in [mmap permissions](https://man7.org/linux/man-pages/man2/mmap.2.html).
+
+### Transparent huge pages
+
+Inspect the current policy instead of universally enabling or disabling THP:
+
+```bash
+cat /sys/kernel/mm/transparent_hugepage/enabled
+cat /sys/kernel/mm/transparent_hugepage/defrag
+```
+
+Compare the existing policy with `madvise` if allocator page promotion or compaction is relevant. Direct reclaim and compaction can stall allocations. On recent kernels, per-size policies and explicit `MADV_COLLAPSE` requests also matter, so the top-level switch alone does not describe all behavior. See [transparent huge-page controls](https://docs.kernel.org/admin-guide/mm/transhuge.html).
+
+Verify actual usage in `/proc/PID/smaps`: `AnonHugePages` reports PMD-sized anonymous THP, while `Private_Hugetlb` and `Shared_Hugetlb` identify explicit huge-page mappings. A successful pool reservation alone does not prove Iggy used it.
+
+## CPU placement and NUMA
+
+Allocate dedicated CPUs where possible. On the current server, `[sharding] cpu_allocation` and `pin_cores` control shard placement, and the process's allowed CPU set constrains allocation. Check the embedded configuration for the exact version being deployed. Separate server CPUs from a colocated load generator and leave capacity for kernel and network work.
+
+Inspect NUMA topology with `lscpu` or `numactl --hardware`. Compare physical-core-only placement with SMT when relevant. Match memory placement and any per-node huge-page reservation to the CPUs running the shards. Avoid assuming that allocating a pool on one NUMA node helps shards running on another.
+
+For a reproducible dedicated-host experiment, compare the `performance` CPU governor with the current governor if the guest exposes CPU frequency control. Power and thermal limits can still constrain frequency. Many cloud guests cannot control the host's governor. Record the setting rather than assuming a command changed it. See [CPU performance scaling](https://docs.kernel.org/admin-guide/pm/cpufreq.html).
+
+Inspect CPU steal time, cgroup throttling, and per-core utilization before increasing shard counts. If one core handles most interrupts or receive processing, inspect RSS queue distribution and IRQ affinity. Do not disable irqbalance or assign every IRQ to a fixed core without measuring. See [Linux network scaling](https://docs.kernel.org/networking/scaling.html).
+
+## Network and storage
+
+Socket-buffer requirements depend on bandwidth and round-trip time. For example, 10 Gbit/s across 10 ms has a bandwidth-delay product of about 12.5 MB. If the connection is window-limited, inspect `net.core.rmem_max`, `net.core.wmem_max`, `net.ipv4.tcp_rmem`, and `net.ipv4.tcp_wmem`. Larger ceilings permit larger buffers, but do not force the application to use them or guarantee higher throughput.
+
+Raise `somaxconn`, `tcp_max_syn_backlog`, or `netdev_max_backlog` only when backlog pressure or drops show the need. QUIC uses UDP, so TCP tuning does not configure its flow-control windows or UDP receive buffers.
+
+Keep changes such as `tcp_tw_reuse`, shorter TCP timeouts, and wider ephemeral-port ranges tied to a demonstrated connection-churn problem. See [TCP controls](https://docs.kernel.org/networking/ip-sysctl.html) and [core networking controls](https://docs.kernel.org/admin-guide/sysctl/net.html).
+
+Use storage with measured sustained bandwidth and latency, and record cloud volume and instance limits. Keep free space for segments, WAL, and recovery. Compare warm-cache and cold-cache runs explicitly. Do not periodically drop caches or disable storage flushes to improve a benchmark number. Storage, retention, and the selected durability policy must match the workload being evaluated.
+
+## Apply, verify, and reproduce
+
+Trial a change with a runtime setting first. Keep the previous value for rollback. Persist accepted sysctl values in a dedicated `/etc/sysctl.d/` file and accepted service limits or allocator variables in that service's systemd drop-in. THP sysfs writes require a boot-time mechanism of their own. Recheck effective values after reboot and process restart.
+
+Collect `vmstat 1`, `iostat -xz 1`, `mpstat -P ALL 1`, pressure counters, and network drop/retransmission counters alongside benchmark results. The iostat and mpstat tools are provided by the sysstat package. Run long enough to include segment flushes, WAL checkpoints, and sustained device limits, rather than measuring only buffered admission.
+
+Iggy's topic `durability` and `consumer_offset_durability` independently default to `replicated`. `persisted` changes completion guarantees, and huge pages or sysctl settings do not replace it. Poll auto-commit remains asynchronous. Record both policies, replication-group size, payload and batch sizes, warmup, CPU allocation, and the exact host changes with each benchmark result.

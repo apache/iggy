@@ -219,6 +219,14 @@ impl PartitionIoQuiescence {
         self.active.get()
     }
 
+    /// No job, no local work, and no retirement or interruption under way.
+    pub(crate) const fn is_idle(&self) -> bool {
+        self.active.get().is_none()
+            && self.local_work.get() == 0
+            && !self.retiring.get()
+            && !self.interrupted.get()
+    }
+
     pub(crate) fn set(&self, active: Option<PartitionIoIdentity>) {
         self.active.set(active);
         if active.is_none() {

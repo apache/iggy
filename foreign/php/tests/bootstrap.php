@@ -228,26 +228,18 @@ function delete_user_by_name(IggyClient $client, string $username): void
     $client->sendBinaryRequest(34, chr(2) . chr(strlen($username)) . $username);
 }
 
-/**
- * Stream id to name, from the raw GetStreams answer (201): per stream its id, created_at,
- * topics_count, size, messages_count, name and the two length-prefixed option blocks.
- */
+/** Stream id to name, read page by page in id order. */
 function stream_list(IggyClient $client): array
 {
-    $payload = $client->sendBinaryRequest(201, '');
     $streams = [];
-    $position = 0;
-    while ($position < strlen($payload)) {
-        $id = unpack('V', $payload, $position)[1];
-        $position += 4 + 8 + 4 + 8 + 8;
-        $nameLength = ord($payload[$position]);
-        $streams[$id] = substr($payload, $position + 1, $nameLength);
-        $position += 1 + $nameLength;
-        for ($block = 0; $block < 2; $block++) {
-            $position += 4 + unpack('V', $payload, $position)[1];
+    $cursor = null;
+    do {
+        $page = $client->getStreamsPage(cursor: $cursor);
+        foreach ($page->items as $stream) {
+            $streams[$stream->id] = $stream->name;
         }
-    }
-    ksort($streams);
+        $cursor = $page->next;
+    } while ($cursor !== null);
 
     return $streams;
 }

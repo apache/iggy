@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use iggy_common::ConsumerGroupClient;
 use iggy_common::Identifier;
 use iggy_common::create_consumer_group::CreateConsumerGroup;
-use iggy_common::{ConsumerGroup, ConsumerGroupDetails};
+use iggy_common::{ConsumerGroup, ConsumerGroupDetails, NamedPageQuery, Page};
 
 #[async_trait]
 impl ConsumerGroupClient for HttpClient {
@@ -68,6 +68,25 @@ impl ConsumerGroupClient for HttpClient {
             .await
             .map_err(|_| IggyError::InvalidJsonResponse)?;
         Ok(consumer_groups)
+    }
+
+    async fn get_consumer_groups_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<ConsumerGroup>, IggyError> {
+        query.validate()?;
+        let response = self
+            .get_with_query(
+                &get_path(&stream_id.as_cow_str(), &topic_id.as_cow_str()),
+                &query.http_query_pairs(),
+            )
+            .await?;
+        response
+            .json()
+            .await
+            .map_err(|_| IggyError::InvalidJsonResponse)
     }
 
     async fn create_consumer_group(

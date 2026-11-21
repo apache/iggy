@@ -15,7 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
+use crate::commands::utils::list_rows::{ListRows, print_next};
 use anyhow::Context;
 use async_trait::async_trait;
 use comfy_table::Table;
@@ -45,11 +46,16 @@ impl Display for GetTopicsOutput {
 pub struct GetTopicsCmd {
     stream_id: Identifier,
     output: GetTopicsOutput,
+    rows: ListRows,
 }
 
 impl GetTopicsCmd {
-    pub fn new(stream_id: Identifier, output: GetTopicsOutput) -> Self {
-        Self { stream_id, output }
+    pub fn new(stream_id: Identifier, output: GetTopicsOutput, rows: ListRows) -> Self {
+        Self {
+            stream_id,
+            output,
+            rows,
+        }
     }
 }
 
@@ -67,10 +73,12 @@ impl CliCommand for GetTopicsCmd {
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
-        let topics = client
-            .get_topics(&self.stream_id)
+        let stream_id = &self.stream_id;
+        let (topics, next) = self
+            .rows
+            .read(|query| async move { client.get_topics_page(stream_id, &query).await })
             .await
-            .with_context(|| format!("Problem getting topics from stream {}", self.stream_id))?;
+            .with_context(|| format!("Problem getting topics from stream {stream_id}"))?;
 
         match self.output {
             GetTopicsOutput::Table => {
@@ -130,8 +138,9 @@ impl CliCommand for GetTopicsCmd {
                         );
                 });
             }
-            GetTopicsOutput::Json => print_json(&topics)?,
+            GetTopicsOutput::Json => return self.rows.print_json(topics, next),
         }
+        print_next(next);
 
         Ok(())
     }

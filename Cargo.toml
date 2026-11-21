@@ -163,11 +163,11 @@ humantime = "2.4.0"
 hwlocality = "1.0.0-alpha.13"
 hyper = "1.12.0"
 hyper-util = { version = "0.1.21", features = ["server-auto", "service"] }
-iggy = { path = "core/sdk", version = "0.12.0" }
-iggy-cli = { path = "core/cli", version = "0.15.0" }
+iggy = { path = "core/sdk", version = "0.12.1-edge.1" }
+iggy-cli = { path = "core/cli", version = "0.15.1-edge.1" }
 iggy-gateway-kafka = { path = "gateways/kafka" }
-iggy_binary_protocol = { path = "core/binary_protocol", version = "0.12.0" }
-iggy_common = { path = "core/common", version = "0.12.0" }
+iggy_binary_protocol = { path = "core/binary_protocol", version = "0.12.1-edge.1" }
+iggy_common = { path = "core/common", version = "0.12.1-edge.1" }
 iggy_kafka_wire = { path = "core/kafka_wire" }
 iggy_object_store = { path = "core/object_store" }
 indexmap = "2.14.2"
@@ -296,6 +296,7 @@ web-sys = { version = "0.3", features = [
     "Window",
     "Location",
     "HtmlSelectElement",
+    "HtmlDialogElement",
     "Clipboard",
     "Navigator",
     "ResizeObserver",

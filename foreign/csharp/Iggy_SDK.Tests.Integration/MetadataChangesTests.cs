@@ -113,6 +113,7 @@ public class MetadataChangesTests
     }
 
     [Test]
+    [NotInParallel]
     [MethodDataSource<IggyServerFixture>(nameof(IggyServerFixture.ProtocolData))]
     public async Task given_limit_of_one_when_following_should_page_one_record_at_a_time(Protocol protocol)
     {

@@ -140,10 +140,12 @@ quiesced and converged (leader-relative; entity oracle: held; evictions=0; ops_c
 coverage: replies_seen=51 replies_unknown=0 committed_rejections=0 samples_none=0 resends=0 denials=2 transients=0 evictions=0
 commands delivered: Request=52 Prepare=80 PrepareOk=78 Reply=52 Commit=56 RequestPrepares=3 RepairPrepare=4 RepairDone=3
 commands never delivered: Ping Pong PingClient PongClient StartViewChange DoViewChange StartView Eviction ...
+executor schedule: 0xad2d2e5c10f72b51
 workload-fuzz: OK (seed=1)
 ```
 
 The two banner lines are the run's identity: every network parameter is printed, not the interesting subset, because under `--faults swarm` those values are the run. Coverage prints twice, before the quiesce assert and after the drain, so a failed drain still reports what the run managed to do. The command coverage lines answer "did this path get exercised?" by counting at delivery, so a command listed as delivered was seen on the wire rather than inferred from the source.
+The `executor schedule` line is a rolling hash of every task poll and timer fire, so two runs that print the same line interleaved their tasks the same way.
 
 An invalid network configuration exits 2 before the simulator starts. Every other failure is a panic, and the hook prints `reproduce with --seed N` ahead of it.
 
@@ -156,6 +158,7 @@ An invalid network configuration exits 2 before the simulator starts. Every othe
 | Network overrides | `--packet-loss-prob`, `--replay-prob`, `--one-way-delay-min`, `--one-way-delay-mean`, `--link-capacity`, `--partition-mode`, `--partition-symmetry`, `--partition-prob`, `--unpartition-prob`, `--partition-stability`, `--unpartition-stability`, `--clog-prob`, `--clog-duration-mean` |
 | Checkpointing | `--journal-slots`, `--data-dir`, `--reuse-data-dir` |
 | Quiesce | `--no-quiesce`, `--heal-before-quiesce` |
+| Tick | `--visit-every-partition` |
 | Gates | `--min-commits` (1), `--min-ops-compared` (1), `--min-data-records-compared` (1), `--require-entity-oracle`, `--require-faults` |
 
 `--plane` picks the op mix: `partition` (writes and consumer offsets), `metadata` (replicated metadata mutations), `mixed` (stream creates over a write-heavy base), `uniform` (every action equally likely, the widest per-tick coverage), `consumer` (writes and offset polls as consumers and as the fixture group while clients join and leave it; requires `--shell`).
@@ -175,6 +178,8 @@ It reports `polls_compared`, `messages_compared_at_quiesce`, `messages_unverifia
 `--min-polls-compared` (1) sets the minimum number of served polls compared on arrival.
 
 `--heal-before-quiesce` restarts every crashed replica and stops the network drawing faults before the drain. It is off by default: a drain that fails with a replica still down is how a wedge shows up, and healing first resolves the wedge instead of reporting it.
+
+A shard tick visits only the partitions with due work, and the others sleep until their next timeout. `--visit-every-partition` makes every tick visit all of them. A sleeping partition has nothing to do, so a seed must print the same output with the flag and without it, the `executor schedule` line included. A difference means that a tick skipped a partition with work.
 
 ### Checkpoints
 

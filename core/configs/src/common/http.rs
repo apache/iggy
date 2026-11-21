@@ -15,15 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::IggyByteSize;
 use iggy_common::IggyDuration;
 use iggy_common::IggyError;
 use iggy_common::IggyExpiry;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
 use serde_with::serde_as;
+
+use crate::common::defaults::SERVER_CONFIG;
 
 /// Every `http.jwt.algorithm` the server can sign and verify with, and the
 /// `jsonwebtoken` algorithm each names.
@@ -81,13 +82,13 @@ pub struct HttpJwtConfig {
     pub valid_issuers: Vec<String>,
     pub valid_audiences: Vec<String>,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub access_token_expiry: IggyExpiry,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub clock_skew: IggyDuration,
     #[config_env(leaf)]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     pub not_before: IggyDuration,
     // skip_serializing keeps the secrets out of the runtime current_config.toml
     // (and the diagnostic snapshot that cats it). The live secrets are read from
@@ -107,6 +108,14 @@ pub struct HttpJwtConfig {
 pub struct HttpMetricsConfig {
     pub enabled: bool,
     pub endpoint: String,
+    /// Export the per-topic series. A scrape walks every topic to build them,
+    /// so a node with many topics can turn them off.
+    #[serde(default = "default_topic_gauges")]
+    pub topic_gauges: bool,
+}
+
+fn default_topic_gauges() -> bool {
+    SERVER_CONFIG.http.metrics.topic_gauges
 }
 
 #[derive(Debug)]
