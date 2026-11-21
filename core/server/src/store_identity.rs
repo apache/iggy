@@ -39,6 +39,12 @@
 //! when replica 0 reaches an empty store and the other nodes reach one that
 //! holds an earlier claim of this cluster.
 //!
+//! The first check of a process that reads back this cluster's id also puts
+//! the same bytes once more as a conditional create, which the store must
+//! refuse. A store that takes it ignores the condition that every object two
+//! writers can race on is created with, so the node fails the check, see
+//! [`StoreIdentity::check_conditional_create`].
+//!
 //! A store that stops answering after the check passed is an outage, and the
 //! node still passes: uploads retry. `object_store_unreachable` is 1 while
 //! the store does not answer the check.
@@ -105,6 +111,11 @@ pub struct IdentityChecker<S> {
     last: Option<Verdict>,
     /// The recovery the operator asked for, `None` when it named no cluster.
     recovery: Option<OriginRecovery>,
+    /// Whether a check of this process saw the store refuse a conditional
+    /// create over the identity object, see
+    /// [`StoreIdentity::check_conditional_create`]. A check sends one until
+    /// it does.
+    conditional_create_checked: bool,
 }
 
 /// What one check of the store identity found.
@@ -123,6 +134,10 @@ enum IdentityCheck {
     /// The call failed in a way that only an operator can fix, such as
     /// rejected credentials or an `fs` file without an object header.
     Refused(ObjectStoreError),
+    /// The object names this cluster, but the store took a conditional
+    /// create over it, so it ignores the condition that every object two
+    /// writers can race on is created with.
+    NoConditionalCreate(ObjectStoreError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +222,7 @@ impl<S: ObjectStore> IdentityChecker<S> {
             timeout,
             last: None,
             recovery,
+            conditional_create_checked: false,
         }
     }
 
@@ -306,7 +322,13 @@ impl<S: ObjectStore> IdentityChecker<S> {
 
     /// One attempt of [`IdentityCheck::run`] that waits at most the timeout.
     async fn check(&self, cluster_uid: u128, claim: bool) -> IdentityCheck {
-        let run = IdentityCheck::run(&self.store, &self.layout, cluster_uid, claim);
+        let run = IdentityCheck::run(
+            &self.store,
+            &self.layout,
+            cluster_uid,
+            claim,
+            !self.conditional_create_checked,
+        );
         compio::time::timeout(self.timeout, run)
             .await
             .unwrap_or_else(|_| {
@@ -334,8 +356,13 @@ impl<S: ObjectStore> IdentityChecker<S> {
             IdentityCheck::Foreign(_) => (Verdict::Foreign, Some(false), RECHECK_INTERVAL),
             // An outage leaves the check as it was.
             IdentityCheck::Unreachable(_) => (Verdict::Unreachable, None, RETRY_INTERVAL),
-            IdentityCheck::Refused(_) => (Verdict::Refused, Some(false), RECHECK_INTERVAL),
+            IdentityCheck::Refused(_) | IdentityCheck::NoConditionalCreate(_) => {
+                (Verdict::Refused, Some(false), RECHECK_INTERVAL)
+            }
         };
+        if verdict == Verdict::Verified {
+            self.conditional_create_checked = true;
+        }
         let was = self.last.replace(verdict);
         let was_verified = frontier.store_identity_verified();
         if let Some(verified) = verified {
@@ -400,6 +427,15 @@ impl<S: ObjectStore> IdentityChecker<S> {
                 "the identity check failed in a way that only an operator can fix, so this node \
                  runs no uploads or object deletes"
             ),
+            IdentityCheck::NoConditionalCreate(error) => error!(
+                root,
+                %error,
+                "the object store ignores conditional creates, which fresh objects, segment \
+                 uploads, the store identity and recovery records rely on, so this node runs no \
+                 uploads or object deletes. Point tiered_storage.backend and \
+                 tiered_storage.endpoint at a store that refuses a create over an existing \
+                 object: If-None-Match on s3, ifGenerationMatch=0 on gcs"
+            ),
         }
         delay
     }
@@ -407,12 +443,14 @@ impl<S: ObjectStore> IdentityChecker<S> {
 
 impl IdentityCheck {
     /// Claim the root for `cluster_uid` when `claim` allows it, then read the
-    /// identity back.
+    /// identity back. When it names this cluster and `check_create` asks for
+    /// it, also check that the store refuses a conditional create over it.
     async fn run<S: ObjectStore>(
         store: &S,
         layout: &KeyLayout,
         cluster_uid: u128,
         claim: bool,
+        check_create: bool,
     ) -> Self {
         let identity = StoreIdentity { cluster_uid };
         let claimed = if claim {
@@ -424,6 +462,15 @@ impl IdentityCheck {
             false
         };
         match StoreIdentity::read(store, layout).await {
+            Ok(IdentityRead::Found(found)) if found == identity && check_create => {
+                match identity.check_conditional_create(store, layout).await {
+                    Ok(()) => Self::Verified { claimed },
+                    Err(error @ ObjectStoreError::Unsupported(_)) => {
+                        Self::NoConditionalCreate(error)
+                    }
+                    Err(error) => Self::failed(error),
+                }
+            }
             Ok(IdentityRead::Found(found)) if found == identity => Self::Verified { claimed },
             Ok(IdentityRead::Found(found)) => Self::Foreign(Some(found.cluster_uid)),
             Ok(IdentityRead::Invalid) => Self::Foreign(None),
@@ -532,13 +579,14 @@ mod tests {
     use futures::executor::block_on;
     use iggy_object_store::{
         DeleteOutcome, FsStore, InlineTierExecutor, ListPage, ListRequest, MemoryStore, ObjectMeta,
-        ObjectRange, PutBody, PutOptions,
+        ObjectRange, PutBody, PutMode, PutOptions, RecordingStore, StoreCall,
     };
     use partitions::{
         ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
         ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorTopicObjects, ExecutorUploader,
     };
 
+    use super::test_stores::IgnoresCondition;
     use super::*;
     use crate::dispatch::test_support::{SpyBus, test_shard};
 
@@ -550,7 +598,13 @@ mod tests {
     }
 
     fn check(store: &impl ObjectStore, cluster_uid: u128, claim: bool) -> IdentityCheck {
-        block_on(IdentityCheck::run(store, &layout(), cluster_uid, claim))
+        block_on(IdentityCheck::run(
+            store,
+            &layout(),
+            cluster_uid,
+            claim,
+            true,
+        ))
     }
 
     fn found(store: &impl ObjectStore) -> IdentityRead {
@@ -855,6 +909,111 @@ mod tests {
         }
     }
 
+    #[test]
+    fn given_store_that_ignores_conditional_creates_when_checking_should_refuse_it() {
+        let store = IgnoresCondition(MemoryStore::new());
+
+        let claimed = check(&store, OURS, true);
+        let found = check(&store, OURS, false);
+
+        assert!(
+            matches!(
+                &claimed,
+                IdentityCheck::NoConditionalCreate(ObjectStoreError::Unsupported(_))
+            ),
+            "{claimed:?}"
+        );
+        assert!(
+            matches!(&found, IdentityCheck::NoConditionalCreate(_)),
+            "{found:?}"
+        );
+        assert_eq!(
+            block_on(StoreIdentity::read(&store, &layout())).unwrap(),
+            IdentityRead::Found(StoreIdentity { cluster_uid: OURS })
+        );
+    }
+
+    #[test]
+    fn given_no_conditional_create_when_recording_should_refuse_uploads_and_check_it_again() {
+        let mut checker = IdentityChecker::new(
+            MemoryStore::new(),
+            layout(),
+            true,
+            Duration::from_secs(5),
+            None,
+        );
+        let frontier = AppliedFrontier::new(AppliedFrontier::DEFAULT_READ_BUDGET);
+        let metrics = ShardMetrics::for_shard();
+        checker.record(
+            IdentityCheck::Verified { claimed: false },
+            OURS,
+            false,
+            &frontier,
+            &metrics,
+        );
+        let ignored = || {
+            IdentityCheck::NoConditionalCreate(ObjectStoreError::Unsupported(
+                "conditional creates".to_owned(),
+            ))
+        };
+        let mut fresh = IdentityChecker::new(
+            MemoryStore::new(),
+            layout(),
+            true,
+            Duration::from_secs(5),
+            None,
+        );
+
+        let delay = fresh.record(ignored(), OURS, false, &frontier, &metrics);
+
+        assert_eq!(delay, RECHECK_INTERVAL);
+        assert!(!frontier.store_identity_verified());
+        assert!(!frontier.store_claimed_by_another());
+        assert!(!fresh.conditional_create_checked);
+        assert!(checker.conditional_create_checked);
+    }
+
+    /// The check sends its conditional create until the store refuses one,
+    /// and never again after that.
+    #[compio::test]
+    async fn given_a_passed_check_when_checking_again_should_send_no_more_conditional_creates() {
+        let store = RecordingStore::new(MemoryStore::new());
+        let calls = store.calls();
+        let mut checker = IdentityChecker::new(store, layout(), true, Duration::from_secs(5), None);
+        let frontier = AppliedFrontier::new(AppliedFrontier::DEFAULT_READ_BUDGET);
+        let metrics = ShardMetrics::for_shard();
+        let puts = || {
+            calls
+                .mutations()
+                .into_iter()
+                .filter(|call| {
+                    matches!(
+                        call,
+                        StoreCall::Put {
+                            mode: PutMode::IfAbsent,
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+
+        let first = checker.check(OURS, true).await;
+        assert!(
+            matches!(first, IdentityCheck::Verified { claimed: true }),
+            "{first:?}"
+        );
+        assert_eq!(puts(), 2, "the claim and the check");
+        checker.record(first, OURS, false, &frontier, &metrics);
+        let second = checker.check(OURS, false).await;
+
+        assert!(
+            matches!(second, IdentityCheck::Verified { claimed: false }),
+            "{second:?}"
+        );
+        assert_eq!(puts(), 2);
+    }
+
     /// Two nodes that each keep an `fs` directory at the same path look alike
     /// in their configuration. Only replica 0 claims, so the other node finds
     /// no claim in its own directory.
@@ -867,15 +1026,15 @@ mod tests {
         let shared = FsStore::new(first.path());
 
         assert!(matches!(
-            IdentityCheck::run(&replica_0, &layout(), OURS, true).await,
+            IdentityCheck::run(&replica_0, &layout(), OURS, true, true).await,
             IdentityCheck::Verified { claimed: true }
         ));
         assert!(matches!(
-            IdentityCheck::run(&replica_1, &layout(), OURS, false).await,
+            IdentityCheck::run(&replica_1, &layout(), OURS, false, true).await,
             IdentityCheck::Missing
         ));
         assert!(matches!(
-            IdentityCheck::run(&shared, &layout(), OURS, false).await,
+            IdentityCheck::run(&shared, &layout(), OURS, false, true).await,
             IdentityCheck::Verified { claimed: false }
         ));
     }
@@ -1022,5 +1181,55 @@ mod tests {
             ))),
             (false, false, RECHECK_INTERVAL)
         );
+    }
+}
+
+/// Stores that break a rule of the contract, for the tests of the checks.
+#[cfg(test)]
+pub mod test_stores {
+    use std::ops::Range;
+
+    use iggy_object_store::{
+        DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, ObjectStore,
+        ObjectStoreError, PutBody, PutMode, PutOptions,
+    };
+
+    /// A store that takes every put as an overwrite, as a store does that
+    /// ignores `If-None-Match`.
+    pub struct IgnoresCondition(pub MemoryStore);
+
+    impl ObjectStore for IgnoresCondition {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            let overwrite = PutOptions {
+                mode: PutMode::Overwrite,
+                ..options.clone()
+            };
+            self.0.put(key, body, &overwrite).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            self.0.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            self.0.head(key).await
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.0.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.0.list(request).await
+        }
     }
 }

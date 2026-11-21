@@ -41,11 +41,13 @@ use iggy_binary_protocol::requests::messages::GetPartitionRouteRequest;
 use iggy_binary_protocol::requests::messages::send_messages::{RawMessage, SendMessagesEncoder};
 use iggy_binary_protocol::responses::messages::PartitionRouteResponse;
 use iggy_binary_protocol::{HEADER_SIZE, WireDecode, WireEncode, WireIdentifier, WirePartitioning};
+use iggy_object_store::gcs::GcsStore;
 use iggy_object_store::s3::S3Store;
 use iggy_object_store::{
     ErrorClass, FsStore, KeyLayout, ListRequest, LongTermKey, ObjectStore, PartitionManifest,
     SegmentObject,
 };
+use integration::harness::fake_gcs::FakeGcsBucket;
 use integration::harness::floci::FlociBucket;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
@@ -120,6 +122,7 @@ pub struct FsStoreOutage {
 pub enum Bucket {
     Fs(PathBuf),
     S3(FlociBucket),
+    Gcs(FakeGcsBucket),
 }
 
 /// A geo partition's manifest and the objects that stood beside it.
@@ -382,6 +385,12 @@ impl Bucket {
                         Self::S3(bucket) => {
                             read_objects(&S3Store::new(bucket.s3_config()).expect("the S3 store"))
                                 .await
+                        }
+                        Self::Gcs(bucket) => {
+                            read_objects(
+                                &GcsStore::new(bucket.gcs_config()).expect("the GCS store"),
+                            )
+                            .await
                         }
                     }
                 })

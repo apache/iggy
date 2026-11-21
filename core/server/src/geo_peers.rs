@@ -42,6 +42,7 @@ use configs::geo::{GeoConfig, GeoPeerConfig};
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
 use consensus::MetadataHandle;
 use futures::future::{Either, join_all, select};
+use iggy_object_store::gcs::{GcsAuth, GcsStore};
 use iggy_object_store::s3::{Credentials, S3Store};
 use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStore, ObjectStoreError,
@@ -57,7 +58,7 @@ use tracing::{debug, error, info, warn};
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
 use crate::store_identity::own_cluster_uid;
-use crate::tiered_storage::{S3Location, identity_timeout, service_config};
+use crate::tiered_storage::{S3Location, gcs_config, identity_timeout, service_config};
 
 /// How long shard 0 waits before it checks a peer again, once the node reads
 /// the peer or found a change that only an operator ends.
@@ -72,6 +73,13 @@ const CLUSTER_UID_WAIT: Duration = Duration::from_secs(1);
 /// look sends no request.
 const RETIREMENT_WAIT: Duration = Duration::from_secs(5);
 
+/// How the stores of each peer authorize their requests, in the order of
+/// the configuration: the access token of a `gcs` peer, `None` for a peer
+/// on another backend. Built once per node, so every shard's stores of a
+/// peer send the token of one refresher.
+#[derive(Clone, Default)]
+pub struct PeerAuth(Vec<Option<GcsAuth>>);
+
 /// Boot-time checks of the peers, after `Validatable::validate`. A peer
 /// whose configuration can never work refuses the boot here, before any
 /// shard starts. Nothing here reaches a peer's store, so a peer that does
@@ -79,13 +87,36 @@ const RETIREMENT_WAIT: Duration = Duration::from_secs(5);
 ///
 /// # Errors
 /// [`ServerError::GeoPeer`] for a prefix that is not a usable key prefix,
-/// or an `s3` endpoint that cannot address a bucket.
+/// or an `s3` or `gcs` endpoint that cannot address a bucket.
 pub fn preflight(config: &GeoConfig) -> Result<(), ServerError> {
     for peer in &config.peers {
         layout(peer)?;
-        store(peer)?;
+        store(peer, Some(&GcsAuth::Anonymous))?;
     }
     Ok(())
+}
+
+/// The access tokens of the `gcs` peers, each from a refresher of its own
+/// that starts here, after [`preflight`]. The boot never waits for a peer's
+/// token.
+///
+/// # Errors
+/// [`ServerError::GeoPeer`] for a key file that cannot sign.
+pub fn auth(config: &GeoConfig) -> Result<PeerAuth, ServerError> {
+    config
+        .peers
+        .iter()
+        .map(|peer| match peer.backend {
+            TieredStorageBackend::Gcs => {
+                crate::gcs_credentials::peer_auth(&peer.origin, &peer.gcs).map(Some)
+            }
+            TieredStorageBackend::None
+            | TieredStorageBackend::Fs
+            | TieredStorageBackend::S3
+            | TieredStorageBackend::MockS3 => Ok(None),
+        })
+        .collect::<Result<_, _>>()
+        .map(PeerAuth)
 }
 
 /// What the node knows about each peer, in the order of the configuration.
@@ -112,15 +143,16 @@ pub fn start(
     bus: &Rc<IggyMessageBus>,
     shard: &Rc<ServerShard>,
     statuses: &[SharedPeerStatus],
+    auth: &PeerAuth,
 ) -> Option<Sender<()>> {
     if config.peers.is_empty() {
         return None;
     }
-    shard.set_peer_stores(stores(config, tiered, bus, statuses));
+    shard.set_peer_stores(stores(config, tiered, bus, statuses, auth));
     if shard.id != 0 {
         return None;
     }
-    let checkers = checkers(config, tiered, statuses);
+    let checkers = checkers(config, tiered, statuses, auth);
     for checker in &checkers {
         shard
             .metrics()
@@ -145,6 +177,7 @@ fn stores<B>(
     tiered: &TieredStorageConfig,
     bus: &B,
     statuses: &[SharedPeerStatus],
+    auth: &PeerAuth,
 ) -> PeerStores<B>
 where
     B: MessageBus + Clone + 'static,
@@ -154,11 +187,12 @@ where
         .peers
         .iter()
         .zip(statuses)
-        .filter_map(|(peer, status)| {
+        .enumerate()
+        .filter_map(|(index, (peer, status))| {
             Some(PeerStore::new(
                 peer.origin.clone(),
                 layout(peer).ok()?,
-                store(peer).ok()?,
+                store(peer, auth.of(index)).ok()?,
                 bus.clone(),
                 &service,
                 status.clone(),
@@ -175,15 +209,17 @@ fn checkers(
     config: &GeoConfig,
     tiered: &TieredStorageConfig,
     statuses: &[SharedPeerStatus],
+    auth: &PeerAuth,
 ) -> Vec<PeerChecker<ReadOnlyStore>> {
     config
         .peers
         .iter()
         .zip(statuses)
-        .filter_map(|(peer, status)| {
+        .enumerate()
+        .filter_map(|(index, (peer, status))| {
             Some(PeerChecker::new(
                 peer.origin.clone(),
-                store(peer).ok()?,
+                store(peer, auth.of(index)).ok()?,
                 layout(peer).ok()?,
                 identity_timeout(tiered),
                 status.clone(),
@@ -483,8 +519,15 @@ fn uid(cluster_uid: u128) -> String {
     format!("{cluster_uid:032x}")
 }
 
-/// The store of `peer`, which only reads.
-fn store(peer: &GeoPeerConfig) -> Result<ReadOnlyStore, ServerError> {
+impl PeerAuth {
+    fn of(&self, index: usize) -> Option<&GcsAuth> {
+        self.0.get(index).and_then(Option::as_ref)
+    }
+}
+
+/// The store of `peer`, which only reads. A `gcs` peer's store sends the
+/// token of `gcs`.
+fn store(peer: &GeoPeerConfig, gcs: Option<&GcsAuth>) -> Result<ReadOnlyStore, ServerError> {
     let backend = match peer.backend {
         TieredStorageBackend::Fs => Backend::Fs(FsStore::foreign(&peer.path)),
         TieredStorageBackend::S3 => {
@@ -496,6 +539,14 @@ fn store(peer: &GeoPeerConfig) -> Result<ReadOnlyStore, ServerError> {
             let store = S3Store::new(S3Location::from(peer).config(credentials.into()))
                 .map_err(|error| refuse(peer, error.to_string()))?;
             Backend::S3(store)
+        }
+        TieredStorageBackend::Gcs => {
+            let auth = gcs
+                .cloned()
+                .ok_or_else(|| refuse(peer, "has no gcs credentials".to_owned()))?;
+            let store = GcsStore::new(gcs_config(&peer.gcs, auth))
+                .map_err(|error| refuse(peer, error.to_string()))?;
+            Backend::Gcs(store)
         }
         TieredStorageBackend::None => return Err(refuse(peer, "has no backend".to_owned())),
         TieredStorageBackend::MockS3 => {
@@ -798,7 +849,13 @@ mod tests {
         let shard = test_shard(&bus, 0, 1, 1);
         assert!(shard.peer_stores().is_empty());
 
-        shard.set_peer_stores(stores(&config, &tiered, &bus, &statuses));
+        shard.set_peer_stores(stores(
+            &config,
+            &tiered,
+            &bus,
+            &statuses,
+            &PeerAuth::default(),
+        ));
         let peers = shard.peer_stores();
         assert_eq!(peers.len(), 2);
         assert!(
@@ -806,7 +863,7 @@ mod tests {
             "no check ran yet"
         );
         let metrics = ShardMetrics::for_shard();
-        for mut checker in checkers(&config, &tiered, &statuses) {
+        for mut checker in checkers(&config, &tiered, &statuses, &PeerAuth::default()) {
             checker.step(OWN, &metrics).await;
         }
 
@@ -880,7 +937,7 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_hours(2))
             .unwrap();
-        let store = store(&fs_peer("dc-b", directory.path())).unwrap();
+        let store = store(&fs_peer("dc-b", directory.path()), None).unwrap();
 
         let page = store.list(&ListRequest::new("iggy/")).await.unwrap();
 
@@ -902,7 +959,12 @@ mod tests {
         let statuses = statuses(&config);
         let metrics = ShardMetrics::for_shard();
 
-        for mut checker in checkers(&config, &TieredStorageConfig::default(), &statuses) {
+        for mut checker in checkers(
+            &config,
+            &TieredStorageConfig::default(),
+            &statuses,
+            &PeerAuth::default(),
+        ) {
             checker.step(OWN, &metrics).await;
         }
 
@@ -918,12 +980,42 @@ mod tests {
     }
 
     #[test]
+    fn given_peers_when_building_their_auth_should_give_only_gcs_peers_a_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut gcs = GeoPeerConfig {
+            origin: "dc-c".to_owned(),
+            backend: TieredStorageBackend::Gcs,
+            ..GeoPeerConfig::default()
+        };
+        gcs.gcs.bucket = "iggy-dc-c".to_owned();
+        gcs.gcs.endpoint = "http://localhost:4443".to_owned();
+        gcs.gcs.auth = configs::tiered_storage::GcsAuth::None;
+        let config = geo(vec![fs_peer("dc-b", directory.path()), gcs.clone()]);
+
+        let auth = auth(&config).unwrap();
+
+        assert!(auth.of(0).is_none());
+        assert!(matches!(auth.of(1), Some(GcsAuth::Anonymous)));
+        assert!(store(&gcs, auth.of(1)).is_ok());
+        assert!(
+            matches!(store(&gcs, None), Err(ServerError::GeoPeer { ref origin, .. }) if origin == "dc-c"),
+            "a gcs peer without its token gets no store"
+        );
+        assert!(preflight(&config).is_ok());
+    }
+
+    #[test]
     fn given_a_retired_origin_when_retiring_its_checker_should_mark_the_status_and_gauge() {
         let directory = tempfile::tempdir().unwrap();
         let config = geo(vec![fs_peer("dc-b", directory.path())]);
         let statuses = statuses(&config);
         let metrics = ShardMetrics::for_shard();
-        let checkers = checkers(&config, &TieredStorageConfig::default(), &statuses);
+        let checkers = checkers(
+            &config,
+            &TieredStorageConfig::default(),
+            &statuses,
+            &PeerAuth::default(),
+        );
 
         checkers[0].retire(&metrics);
         checkers[0].retire(&metrics);

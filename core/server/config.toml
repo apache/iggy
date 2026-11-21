@@ -1466,7 +1466,8 @@ handshake_grace = "10 s"
 # that 'prefix' describes, and refuses them with FeatureUnavailable until then.
 #[tiered_storage]
 # "none", "fs" (a directory), "s3" (S3 and stores with its API, such as
-# Ceph RGW and R2) or "mock_s3". "mock_s3" keeps every object in the memory
+# Ceph RGW and R2), "gcs" (Google Cloud Storage, set up in
+# [tiered_storage.gcs]) or "mock_s3". "mock_s3" keeps every object in the memory
 # of the server, which loses them all when it stops, and answers each call
 # after the latency of [tiered_storage.mock_s3]. It is for benchmarks and
 # tests only, and no geo peer can read it.
@@ -1482,8 +1483,10 @@ handshake_grace = "10 s"
 # store and prefix: the check cannot tell two stores apart when replica 0
 # reaches an empty one and the other nodes reach one that holds an earlier
 # claim of this cluster. At boot the server reads the claim once, and only a
-# missing bucket or rejected credentials stop the boot. The server README
-# says how to keep and restore the claim.
+# missing bucket, rejected credentials or a store that ignores conditional
+# creates stop the boot: once the claim is there, the node puts it again
+# create-only, and the store must refuse that put. The server README says how
+# to keep and restore the claim.
 #prefix = "iggy"
 # The fs backend: the directory that holds the objects.
 #path = "/var/lib/iggy-tiered"
@@ -1558,6 +1561,27 @@ handshake_grace = "10 s"
 #speculative_fetch_bytes = "32 MiB"
 #deletes = 2
 #housekeeping = 1
+# The gcs backend: Google Cloud Storage, over its JSON API. A put is a
+# create-only upload where it must be (ifGenerationMatch=0), and GCS checks
+# the CRC32C of each body. GCS takes one write per second to one object name,
+# so on gcs set [geo] consumer_offset_upload_interval to "1 s" or more, or
+# "disabled".
+#[tiered_storage.gcs]
+#bucket = "iggy-segments"
+# The URL of the JSON API, without a path. Empty is Google Cloud Storage. An
+# emulator such as fake-gcs-server takes its own URL.
+#endpoint = ""
+# "auto" takes an access token from the first source that the node has, in
+# the order of Google's application default credentials: the service account
+# key file below, then the one that GOOGLE_APPLICATION_CREDENTIALS names, then
+# the metadata server of a Compute Engine instance or a GKE node, which also
+# serves GKE Workload Identity (GCE_METADATA_HOST moves it). The node fetches
+# a new token 5 minutes before the old one expires, and every shard uses it.
+# The service account needs the Storage Object User role on the bucket. "none"
+# sends no credentials, for an emulator.
+#auth = "auto"
+# The path of a service account JSON key file. Only the server may read it.
+#service_account_key = ""
 # The mock_s3 backend: what it adds to each store call. A put waits out its
 # latency after its body arrived and before it commits, and calls in flight
 # wait at the same time, as on a remote store. 'bytes_per_second' adds the
@@ -1650,7 +1674,7 @@ handshake_grace = "10 s"
 #[[geo.peers]]
 # The peer's own geo.origin.
 #origin = "dc-b"
-# "fs" (a directory) or "s3".
+# "fs" (a directory), "s3" or "gcs".
 #backend = "s3"
 # The peer's tiered_storage.prefix.
 #prefix = "iggy"
@@ -1668,6 +1692,14 @@ handshake_grace = "10 s"
 # configuration never shows them.
 #access_key_id = ""
 #secret_access_key = ""
+# The gcs backend: the peer's bucket and how this node gets a token that
+# reads it, with the keys of [tiered_storage.gcs]. The Storage Object Viewer
+# role is enough. A peer's token never holds up the boot.
+#[geo.peers.gcs]
+#bucket = "iggy-segments-dc-b"
+#endpoint = ""
+#auth = "auto"
+#service_account_key = ""
 
 # This node's own client-facing identity, used when 'cluster.enabled' is false.
 [node]

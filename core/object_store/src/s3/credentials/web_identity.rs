@@ -166,8 +166,8 @@ fn parse_answer(answer: &CredentialResponse) -> Result<FetchedCredentials, Crede
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::super::tests::RecordedTransport;
     use super::*;
+    use crate::credentials::testing::RecordedTransport;
 
     /// An answer of STS as AWS documents it, with example values.
     const ANSWER: &str = r#"<AssumeRoleWithWebIdentityResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">

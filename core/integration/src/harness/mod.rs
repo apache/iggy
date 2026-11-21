@@ -45,6 +45,7 @@ mod context;
 pub mod disk;
 mod error;
 pub mod ext_auth_server;
+pub mod fake_gcs;
 mod fixture;
 pub mod floci;
 pub mod geo_clusters;

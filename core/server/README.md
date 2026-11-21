@@ -525,6 +525,15 @@ in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
 an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the
 bucket goes in the URL path or in the host name.
 
+The `gcs` backend keeps the objects in a Google Cloud Storage bucket, which
+`[tiered_storage.gcs]` names. It talks to the JSON API of GCS, never to its
+S3 interoperability endpoint: GCS takes a create-only put as its own
+`ifGenerationMatch=0` precondition, and the server relies on create-only puts.
+An empty `endpoint` is Google Cloud Storage. An emulator, such as
+fake-gcs-server, takes its own URL and `auth = "none"`. GCS takes one write
+per second to one object name, so on `gcs` set `[geo]
+consumer_offset_upload_interval` to `1 s` or more, or to `disabled`.
+
 The `mock_s3` backend keeps the objects in the memory of the server, where
 every shard reads them, and answers each call after the latencies of
 `[tiered_storage.mock_s3]`. The server loses them all when it stops, so it is
@@ -551,11 +560,39 @@ for example because the role does not trust the token, the server does not
 start. If the source does not answer at boot, the server starts without
 credentials and keeps trying. No log line shows a key or a token.
 
+With `auth = "auto"`, the `gcs` backend sends an access token from the first
+source that the node has, in the order of Google's application default
+credentials:
+
+1. The service account JSON key file that `service_account_key` names. The
+   node signs a JWT with its key and exchanges it at the key's `token_uri`.
+2. The key file that `GOOGLE_APPLICATION_CREDENTIALS` names.
+3. The metadata server of the Compute Engine instance or the GKE node, which
+   on GKE with Workload Identity hands out the token of the pod's service
+   account. `GCE_METADATA_HOST` moves it.
+
+Only `service_account` key files work. A file that cannot be read or holds no
+RSA key stops the boot. The token reaches every shard and is refreshed as the
+`s3` credentials are. The service account needs the Storage Object User role
+on the bucket.
+
 At boot the server reads the store identity object `<prefix>/meta/identity`
-once. Only a missing bucket or rejected credentials stop the boot. If the store
-does not answer within `request_timeout`, or 5 seconds at most, the server
-starts with the `object_store_unreachable` gauge at 1. The store identity check
-judges any other answer.
+once. Only a missing bucket, rejected credentials or a store that ignores
+create-only puts stop the boot. If the store does not answer within
+`request_timeout`, or 5 seconds at most, the server starts with the
+`object_store_unreachable` gauge at 1. The store identity check judges any
+other answer.
+
+Fresh objects, segment uploads, the store identity object and recovery records
+are all written create-only, so of two writers that race on one key only one
+wins. A store that takes `If-None-Match` and overwrites anyway breaks that for
+all of them. So once the identity object holds this cluster's id, each node
+puts the same bytes once more, create-only, before its first upload, and the
+store must refuse that put. A store that takes it fails the check: the node
+runs no uploads or object deletes, and logs the settings to fix. At boot the
+probe sends the same put when the object is already there, and a store that
+takes it stops the boot. Either way the put writes the bytes that the object
+already holds.
 
 The store identity object claims the prefix for one cluster. While replica 0 is
 the caught-up metadata primary and no topic keeps data in the store, it writes
@@ -600,9 +637,10 @@ not work, because `fs` keeps a header before the body of each object file. A
 node that finds a wrong file still boots, but it runs no uploads or object
 deletes until the right file is back.
 
-With the `s3` backend, the object is the key `<prefix>/meta/identity` in the
-bucket. If it is lost or damaged, write the two lines back under that key with
-any S3 client. Each node logs the `cluster_uid` to write.
+With the `s3` and `gcs` backends, the object is the key `<prefix>/meta/identity`
+in the bucket. If it is lost or damaged, write the two lines back under that
+key with any client of the store, such as `gcloud storage cp`. Each node logs
+the `cluster_uid` to write.
 
 A node logs that the object names another cluster when:
 
@@ -615,7 +653,7 @@ A node logs that the object names another cluster when:
   `[geo] recover_cluster_uid`, as [Recover an origin that lost its
   disks](docs/GEO_TOPICS.md#recover-an-origin-that-lost-its-disks) describes.
 - The object holds bytes that no cluster wrote. Put the `fs` copy back, or
-  write the two lines again on `s3`.
+  write the two lines again on `s3` or `gcs`.
 
 Give every node the same store and the same prefix. The check cannot tell every
 pair of stores apart. For example, replica 0 reaches an empty store, and the
@@ -639,10 +677,13 @@ lowercase letters, digits and `-`. It starts with a letter and does not end
 with `-`. A cluster with peers needs an origin.
 
 Each `[[geo.peers]]` table gives the peer's `origin` and the keys of the peer's
-`[tiered_storage]` store: `backend`, `prefix`, `path` for `fs`, and `bucket`,
-`region`, `endpoint` and `url_style` for `s3`. An `s3` peer needs the static
-keys `access_key_id` and `secret_access_key`. The printed configuration never
-shows them. A cluster reads at most 16 peers.
+`[tiered_storage]` store: `backend`, `prefix`, `path` for `fs`, `bucket`,
+`region`, `endpoint` and `url_style` for `s3`, and a `[geo.peers.gcs]` table
+for `gcs`, with the keys of `[tiered_storage.gcs]`. An `s3` peer needs the
+static keys `access_key_id` and `secret_access_key`. The printed configuration
+never shows them. A `gcs` peer takes its token as the `gcs` backend does, from
+a refresher of its own, and the boot never waits for that token. A cluster
+reads at most 16 peers.
 
 The server never writes to a peer's store. Each shard reads a peer through a
 store that refuses every put, conditional create and delete before the request

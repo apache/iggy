@@ -161,7 +161,10 @@ about an hour later.
 - **One cluster per datacenter.** Each cluster has its own `[cluster]` configuration. Every node
   of one cluster gets the same `[tiered_storage]` and `[geo]` sections.
 - **One bucket per datacenter.** Use the `s3` backend for S3 or a store with its API, such as
-  MinIO, Ceph RGW or R2. The `fs` backend takes a directory, which suits tests on one host. The
+  MinIO, Ceph RGW or R2, and the `gcs` backend for Google Cloud Storage. Do not point the `s3`
+  backend at the S3 interoperability endpoint of GCS: GCS honors a create-only put only as its
+  own precondition, and a node refuses a store that ignores create-only puts. The `fs` backend
+  takes a directory, which suits tests on one host. The
   `mock_s3` backend keeps the objects in the memory of the server with the latency of
   `[tiered_storage.mock_s3]`, for benchmarks only: a restart loses every message of its geo topics,
   and no peer can read it. Create the bucket before the first start: a missing bucket stops the
@@ -173,7 +176,11 @@ about an hour later.
 - **Credentials.** Each cluster needs read and write access to its own bucket: get, put, list
   and delete. On S3 that is `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and
   `s3:ListBucket`. Each cluster needs only read access to the bucket of each peer: `s3:GetObject`
-  and `s3:ListBucket`. The server never writes to a peer's bucket.
+  and `s3:ListBucket`. On GCS, the role Storage Object User on the own bucket and Storage Object
+  Viewer on each peer's bucket. The server never writes to a peer's bucket.
+- **On GCS, one write per second per object.** GCS throttles a second write to one object name
+  within a second. Each node rewrites one positions object per log, so set
+  `[geo] consumer_offset_upload_interval` to `1 s` or more, or to `disabled`, on a `gcs` backend.
 - **No lifecycle rule that expires objects under the prefix.** The cluster deletes what it no
   longer needs. An object that a rule removes early is lost data.
 - **The segment cleaner stays on.** `[data_maintenance.messages] cleaner_enabled = true` is the
@@ -216,7 +223,9 @@ Each `[[geo.peers]]` table names one peer: its `origin`, which must equal that c
 16 peers. Two peers cannot name the same bucket and prefix. An `s3` peer takes only static keys:
 web identity and instance roles do not apply to peers. Set the keys in the environment, as
 `IGGY_GEO_PEERS_<n>_ACCESS_KEY_ID` and `IGGY_GEO_PEERS_<n>_SECRET_ACCESS_KEY`, where `<n>` is
-the peer's place in the list, from 0.
+the peer's place in the list, from 0. A `gcs` peer takes a `[geo.peers.gcs]` table with the keys
+of `[tiered_storage.gcs]`, and gets its token as the `gcs` backend does: from a service account
+key file or the metadata server.
 
 A peer that does not answer never stops the boot and never delays local traffic.
 
@@ -284,6 +293,38 @@ and `IGGY_GEO_PEERS_0_REGION=us-east-1`.
 For a store other than AWS, add its URL as `endpoint`, for example
 `endpoint = "https://minio.dc-b.example.com"`. For an `fs` peer, set `backend = "fs"` and `path`
 to the directory that holds the peer's objects.
+
+A datacenter on Google Cloud uses the `gcs` backend. If `dc-b` keeps its bucket on GCS, its nodes
+take:
+
+```toml
+[tiered_storage]
+backend = "gcs"
+prefix = "iggy"
+
+[tiered_storage.gcs]
+bucket = "iggy-dc-b"
+
+[geo]
+origin = "dc-b"
+consumer_offset_upload_interval = "1 s"
+```
+
+and the nodes of `dc-a` read it with:
+
+```toml
+[[geo.peers]]
+origin = "dc-b"
+backend = "gcs"
+prefix = "iggy"
+
+[geo.peers.gcs]
+bucket = "iggy-dc-b"
+service_account_key = "/etc/iggy/dc-b-reader.json"
+```
+
+On GCE or GKE the nodes need no key file: the metadata server hands out the token of the
+instance's service account, or of the pod's with Workload Identity.
 
 ### Check the setup
 
@@ -1005,7 +1046,8 @@ before an unlisted long-term object is deleted.
   takes `tombstone_grace`.
 - **A cluster with geo topics needs an origin.** Without `[geo] origin`, a geo topic takes no
   messages.
-- **Peers take static keys only.** An `s3` peer needs `access_key_id` and `secret_access_key`.
+- **`s3` peers take static keys only.** An `s3` peer needs `access_key_id` and
+  `secret_access_key`. A `gcs` peer takes a service account key file or the metadata server.
 - **Up to 16 peers.** A cluster reads at most 16 peers.
 - **Geo topics do not lock the store identity claim.** Once a topic is tiered, replica 0 never
   claims the prefix again. A geo topic does not have that effect: replica 0 keeps claiming again

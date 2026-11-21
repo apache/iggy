@@ -17,4 +17,5 @@
 
 //! Object store providers against real stores.
 
+mod gcs_contract;
 mod s3_contract;

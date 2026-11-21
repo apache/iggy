@@ -428,7 +428,7 @@ impl SystemPaths for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::super::geo::GeoPeerConfig;
-    use super::super::tiered_storage::{S3UrlStyle, TieredStorageBackend};
+    use super::super::tiered_storage::{GcsAuth, S3UrlStyle, TieredStorageBackend};
     use super::*;
     use figment::Figment;
     use figment::providers::Serialized;
@@ -653,6 +653,56 @@ mod tests {
         );
         cfg.validate()
             .expect("a mock_s3 section from the environment validates");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_gcs_env_vars_when_loading_should_set_the_section_and_a_peer() {
+        let vars = [
+            ("IGGY_TIERED_STORAGE_BACKEND", "gcs"),
+            ("IGGY_TIERED_STORAGE_GCS_BUCKET", "segments"),
+            ("IGGY_TIERED_STORAGE_GCS_ENDPOINT", "http://localhost:4443"),
+            ("IGGY_TIERED_STORAGE_GCS_AUTH", "none"),
+            (
+                "IGGY_TIERED_STORAGE_GCS_SERVICE_ACCOUNT_KEY",
+                "/etc/iggy/key.json",
+            ),
+            ("IGGY_GEO_ORIGIN", "dc-a"),
+            ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b"),
+            ("IGGY_GEO_PEERS_0_BACKEND", "gcs"),
+            ("IGGY_GEO_PEERS_0_GCS_BUCKET", "iggy-dc-b"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        let gcs = &cfg.tiered_storage.gcs;
+        assert_eq!(cfg.tiered_storage.backend, TieredStorageBackend::Gcs);
+        assert_eq!(gcs.bucket, "segments");
+        assert_eq!(gcs.endpoint, "http://localhost:4443");
+        assert_eq!(gcs.auth, GcsAuth::None);
+        assert_eq!(gcs.service_account_key, "/etc/iggy/key.json");
+        let [peer] = cfg.geo.peers.as_slice() else {
+            panic!("one peer: {}", cfg.geo);
+        };
+        assert_eq!(peer.backend, TieredStorageBackend::Gcs);
+        assert_eq!(peer.gcs.bucket, "iggy-dc-b");
+        assert_eq!(peer.gcs.auth, GcsAuth::Auto);
+        cfg.validate()
+            .expect("a gcs section from the environment validates");
     }
 
     /// Every file written before geo topics has no `[geo]` table.

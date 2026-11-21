@@ -20,6 +20,7 @@
 use crate::boot::handoff::{BootstrapBarrier, MetadataHandoff};
 use crate::boot::shard_main;
 use crate::boot::topology::RosterCells;
+use crate::geo_peers::PeerAuth;
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::shard_allocator::{ShardAllocator, ShardInfo};
 use crate::shell::ServerShard;
@@ -781,6 +782,7 @@ pub(in crate::boot) fn run_shard_thread(
     shutdown_deadline: Arc<ShutdownDeadline>,
     tiered_store: SharedStore,
     geo_peer_statuses: Vec<SharedPeerStatus>,
+    geo_peer_auth: PeerAuth,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -835,6 +837,7 @@ pub(in crate::boot) fn run_shard_thread(
             shutdown_deadline,
             tiered_store,
             geo_peer_statuses,
+            geo_peer_auth,
             primary_handoff,
         ))
         .await

@@ -23,10 +23,8 @@ mod sigv4;
 mod xml;
 
 use std::cell::{Cell, RefCell};
-use std::io;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use base64::Engine;
@@ -35,14 +33,13 @@ use chrono::{DateTime, TimeDelta, Utc};
 use futures::StreamExt;
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, DATE, ETAG, LAST_MODIFIED};
 use http::{HeaderMap, Method, StatusCode};
-use send_wrapper::SendWrapper;
 use url::Url;
 
 pub use credentials::SharedCredentials;
 pub use sigv4::Credentials;
 
 use crate::error::ObjectStoreError;
-use crate::resolver::ShardResolver;
+use crate::http::{streamed, transport};
 use crate::store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ObjectMeta, ObjectRange, ObjectStore,
     PutBody, PutMode, PutOptions, UserMetadata, validate_delete, validate_key, validate_metadata,
@@ -93,7 +90,7 @@ pub struct S3Config {
 /// - The client follows no redirect, because a redirect would resend a body
 ///   that is already sent, under a signature for another host.
 /// - Lookups of the store's host never block the shard, see
-///   [`ShardResolver`].
+///   [`crate::ShardResolver`].
 /// - When the store refuses a request for the skew of the clocks, the store
 ///   learns the offset from the answer's `Date` header and fails the call as
 ///   transient, so a retry signs with the corrected clock. A second refusal
@@ -167,7 +164,7 @@ impl S3Store {
             UrlStyle::VirtualHosted => (format!("{}.{authority}", config.bucket), String::new()),
         };
         Ok(Self {
-            client: http_client(scheme)?,
+            client: crate::http::client(scheme)?,
             origin: format!("{scheme}://{host}"),
             host,
             bucket_path,
@@ -351,7 +348,7 @@ impl ObjectStore for S3Store {
             }
             cyper::Body::empty()
         } else {
-            streamed(body, Rc::clone(&body_failure))
+            streamed(body.into_pieces(), Rc::clone(&body_failure))
         };
         let request = S3Request {
             method: Method::PUT,
@@ -559,21 +556,6 @@ impl Subject<'_> {
     }
 }
 
-/// The pieces of `body` as a request body. A failure of the body is left in
-/// `failure`, so the put returns the body's own error, not the one that the
-/// client makes of it.
-fn streamed(body: PutBody, failure: Rc<RefCell<Option<io::Error>>>) -> cyper::Body {
-    let pieces = body.into_pieces().map(move |piece| {
-        piece.map_err(|error| {
-            let kind = error.kind();
-            *failure.borrow_mut() = Some(error);
-            cyper::Error::System(io::Error::from(kind))
-        })
-    });
-    // The client polls the body on the shard thread that sends it.
-    cyper::Body::stream(SendWrapper::new(pieces))
-}
-
 /// The status, the `Date` header and the error body of a failed answer.
 async fn read_failure(
     response: cyper::Response,
@@ -724,39 +706,6 @@ fn header_crc32c(headers: &HeaderMap) -> Result<Option<u32>, ObjectStoreError> {
     let bytes = BASE64.decode(value.as_bytes()).map_err(|_| malformed())?;
     let bytes: [u8; 4] = bytes.try_into().map_err(|_| malformed())?;
     Ok(Some(u32::from_be_bytes(bytes)))
-}
-
-/// A client for a shard: host lookups off the shard thread, no redirects,
-/// and the system's certificate authorities only for `https`.
-fn http_client(scheme: &str) -> Result<cyper::Client, ObjectStoreError> {
-    let builder = cyper::Client::builder()
-        .custom_resolver(ShardResolver::default())
-        .redirect(cyper::redirect::Policy::none());
-    let builder = if scheme == "https" {
-        builder.use_rustls_default()
-    } else {
-        // Without a config, the client loads the system's certificate
-        // authorities when it is built, and fails on a host without them,
-        // although it never dials https.
-        builder.use_rustls(Arc::new(plain_http_tls_config()?))
-    };
-    builder.build().map_err(transport)
-}
-
-/// A TLS config that trusts no authority, for a client that dials only plain
-/// http.
-fn plain_http_tls_config() -> Result<rustls::ClientConfig, ObjectStoreError> {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    Ok(rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .map_err(|error| ObjectStoreError::Transport(error.to_string()))?
-        .with_root_certificates(rustls::RootCertStore::empty())
-        .with_no_client_auth())
-}
-
-#[allow(clippy::needless_pass_by_value)]
-fn transport(error: cyper::Error) -> ObjectStoreError {
-    ObjectStoreError::Transport(error.to_string())
 }
 
 #[cfg(test)]
