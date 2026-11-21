@@ -632,6 +632,11 @@ Stats IggyBlockingClient::GetStats() {
     return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
 }
 
+void IggyBlockingClient::RetireGeoOrigin(const std::string &origin) {
+    RethrowAsIggyException(
+        [this, &origin](ffi::ErrorInfo &error_info) { Handle()->retire_geo_origin(origin, error_info); });
+}
+
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {
     if (client_ == nullptr) {
         throw IggyException("Could not create Iggy client");

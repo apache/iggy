@@ -495,6 +495,36 @@ impl IggyClient {
         })
     }
 
+    /// Retire the geo origin of a datacenter that never returns.
+    ///
+    /// The cluster then follows nothing more of the origin: its shadow topics
+    /// serve what they hold until their retention removes it, and a client
+    /// may delete them. Retiring an origin that is retired already changes
+    /// nothing. A datacenter that comes back needs another origin name.
+    ///
+    /// Requires root or the global `manage_servers` permission.
+    ///
+    /// Args:
+    ///     origin: The origin name of the lost datacenter, such as `"dc-a"`.
+    ///
+    /// Returns:
+    ///     An awaitable that resolves to `None` once the cluster committed
+    ///     the retirement.
+    ///
+    /// Raises:
+    ///     IggyError: If the user lacks the permission, the server refuses
+    ///         the origin, or the request fails.
+    #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[None]", imports=("collections.abc")))]
+    fn retire_geo_origin<'a>(&self, py: Python<'a>, origin: String) -> PyResult<Bound<'a, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            inner
+                .retire_geo_origin(&origin)
+                .await
+                .map_err(to_runtime_error)
+        })
+    }
+
     /// Describe the option catalog for a resource scope.
     ///
     /// This is the discovery surface for the `options` argument on
@@ -3036,6 +3066,28 @@ mod tests {
                     .extract::<u32>()
                     .unwrap(),
                 REPLY_TOO_LARGE_CODE
+            );
+        });
+    }
+
+    // The Rust SDK returns 1021 without a retry, so the binding only has to keep its code.
+    #[test]
+    fn given_shadow_stream_refusal_when_mapping_should_keep_its_code_and_message() {
+        const SHADOW_STREAM_READ_ONLY_CODE: u32 = 1021;
+        Python::initialize();
+        Python::attach(|py| {
+            let raised = to_runtime_error(IggyError::ShadowStreamReadOnly);
+            assert!(raised.is_instance_of::<PyIggyError>(py));
+            assert!(!raised.is_instance_of::<OptionError>(py));
+            assert!(!raised.is_instance_of::<PendingOperationError>(py));
+            let value = raised.value(py);
+            assert_eq!(
+                value.getattr("code").unwrap().extract::<u32>().unwrap(),
+                SHADOW_STREAM_READ_ONLY_CODE
+            );
+            assert_eq!(
+                value.str().unwrap().to_str().unwrap(),
+                IggyError::ShadowStreamReadOnly.to_string()
             );
         });
     }

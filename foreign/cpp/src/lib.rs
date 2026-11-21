@@ -73,6 +73,10 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
+        topic_type: TopicType,
+        /// False on a normal topic, which has no geo mode.
+        has_geo_mode: bool,
+        geo_mode: GeoMode,
         messages_count: u64,
         partitions_count: u32,
         /// Options the creating client set explicitly. Carried as
@@ -119,6 +123,10 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
+        topic_type: TopicType,
+        /// See [`Topic::has_geo_mode`].
+        has_geo_mode: bool,
+        geo_mode: GeoMode,
         messages_count: u64,
         partitions_count: u32,
         partitions: Vec<Partition>,
@@ -148,6 +156,10 @@ mod ffi {
         /// One per server key that wraps the stream's key, empty for a
         /// plaintext stream.
         encryption_kek_fingerprints: Vec<String>,
+        /// True only on a shadow stream, the stream that serves the geo topics
+        /// of another datacenter.
+        has_shadow_origin: bool,
+        shadow_origin: String,
     }
 
     /// Who chose a stream's at-rest data key.
@@ -156,6 +168,20 @@ mod ffi {
         None = 0,
         Stream = 1,
         Server = 2,
+    }
+
+    /// What a topic is, fixed at creation.
+    #[repr(u8)]
+    enum TopicType {
+        Normal = 0,
+        Geo = 1,
+    }
+
+    /// How a geo topic writes its messages, fixed at creation.
+    #[repr(u8)]
+    enum GeoMode {
+        Geo = 0,
+        GeoTiered = 1,
     }
 
     #[repr(u8)]
@@ -451,6 +477,9 @@ mod ffi {
         has_encryption_key_fingerprint: bool,
         encryption_key_fingerprint: String,
         encryption_kek_fingerprints: Vec<String>,
+        /// See [`Stream::has_shadow_origin`].
+        has_shadow_origin: bool,
+        shadow_origin: String,
     }
 
     struct ConsumerGroupMember {
@@ -1527,6 +1556,10 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
+        /// Retires the geo origin of a datacenter that never returns. Needs
+        /// root or the global manage_servers permission.
+        fn retire_geo_origin(self: &Client, origin: &str, error_info: &mut ErrorInfo)
+        -> Result<()>;
         fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
         fn create_personal_access_token(
             self: &Client,

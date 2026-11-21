@@ -313,6 +313,8 @@ struct ResourceOptionsFixture: Decodable, Sendable {
         let encryptionKeySource: String
         let encryptionKeyFingerprint: String?
         let encryptionKekFingerprints: [String]
+        /// Present only on a shadow stream.
+        let shadowOrigin: String?
 
         enum CodingKeys: String, CodingKey {
             case id, name, options
@@ -323,6 +325,7 @@ struct ResourceOptionsFixture: Decodable, Sendable {
             case encryptionKeySource = "encryption_key_source"
             case encryptionKeyFingerprint = "encryption_key_fingerprint"
             case encryptionKekFingerprints = "encryption_kek_fingerprints"
+            case shadowOrigin = "shadow_origin"
         }
     }
 

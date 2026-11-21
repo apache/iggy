@@ -71,7 +71,8 @@ public sealed class StreamResponse
     public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
 
     /// <summary>
-    ///     Options the server filled or computes on reads, such as the encryption key source and fingerprints.
+    ///     Options the server filled or computes on reads, such as the encryption key source and fingerprints and
+    ///     the origin of a shadow stream.
     /// </summary>
     [JsonIgnore]
     public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }
@@ -100,6 +101,13 @@ public sealed class StreamResponse
         OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKekFingerprint) is { Length: > 0 } joined
             ? joined.Split(',')
             : [];
+
+    /// <summary>
+    ///     The geo origin whose topics this shadow stream serves, or null for any other stream. A shadow stream
+    ///     takes no writes.
+    /// </summary>
+    [JsonIgnore]
+    public string? ShadowOrigin => OptionValues.Text(Options, DerivedOptions, StreamOptionKey.ShadowOrigin);
 
     /// <summary>
     ///     REST renders both provenances into one object keyed by option name, so one JSON property

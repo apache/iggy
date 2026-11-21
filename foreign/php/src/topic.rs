@@ -85,6 +85,22 @@ impl TopicDetails {
     pub fn derived_options(&self) -> PhpResult<ZBox<ZendHashTable>> {
         options_array(&self.inner.options, false)
     }
+
+    /// What the topic is, `normal` or `geo`, fixed at creation.
+    #[php(getter, change_case = "snake_case")]
+    pub fn topic_type(&self) -> String {
+        self.inner.resolved_options().topic_type.to_string()
+    }
+
+    /// How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
+    /// for a normal topic.
+    #[php(getter, change_case = "snake_case")]
+    pub fn geo_mode(&self) -> Option<String> {
+        self.inner
+            .resolved_options()
+            .geo_mode
+            .map(|geo_mode| geo_mode.to_string())
+    }
 }
 
 /// One topic of a `TopicsPage`.
@@ -149,6 +165,22 @@ impl Topic {
     #[php(getter, change_case = "snake_case")]
     pub fn derived_options(&self) -> PhpResult<ZBox<ZendHashTable>> {
         options_array(&self.inner.options, false)
+    }
+
+    /// What the topic is, `normal` or `geo`, fixed at creation.
+    #[php(getter, change_case = "snake_case")]
+    pub fn topic_type(&self) -> String {
+        self.inner.resolved_options().topic_type.to_string()
+    }
+
+    /// How a geo topic writes its messages, `geo` or `geo_tiered`, fixed at creation. Null
+    /// for a normal topic.
+    #[php(getter, change_case = "snake_case")]
+    pub fn geo_mode(&self) -> Option<String> {
+        self.inner
+            .resolved_options()
+            .geo_mode
+            .map(|geo_mode| geo_mode.to_string())
     }
 }
 

@@ -48,6 +48,15 @@ type Client interface {
 	// Authentication is required.
 	GetClusterMetadata(ctx context.Context) (*ClusterMetadata, error)
 
+	// RetireGeoOrigin retires the geo peer origin, a datacenter that never
+	// returns. The cluster then follows nothing of it again: its shadow topics
+	// serve what they hold until their retention removes it, and a client may
+	// delete them. A datacenter that comes back needs another origin name. An
+	// origin that is empty or longer than 255 bytes returns
+	// ierror.ErrInvalidFormat without sending.
+	// Authentication is required, and root or the permission to manage the servers.
+	RetireGeoOrigin(ctx context.Context, origin string) error
+
 	// GetStream get the info about a specific stream by unique ID or name.
 	// Authentication is required, and the permission to read the streams.
 	GetStream(ctx context.Context, streamId Identifier) (*StreamDetails, error)

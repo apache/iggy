@@ -84,6 +84,7 @@ var optionCatalog = []optionRule{
 	{key: string(iggcon.TopicOptionLocalRetentionSize), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}, updatable: true, resettable: true},
 	{key: string(iggcon.TopicOptionTopicType), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
 	{key: string(iggcon.TopicOptionGeoMode), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeTopic}},
+	{key: string(iggcon.StreamOptionShadowOrigin), scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream}, readOnly: true},
 	{key: "critical_keys", scopes: []iggcon.OptionsScope{iggcon.OptionsScopeStream, iggcon.OptionsScopeTopic, iggcon.OptionsScopeUser}, readOnly: true},
 }
 

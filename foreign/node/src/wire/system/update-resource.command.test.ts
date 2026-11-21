@@ -118,7 +118,7 @@ type Fixture = {
       id: number, created_at: number, name: string, topics_count: number,
       size_bytes: number, messages_count: number, options: FixtureOptions,
       encryption_key_source: string, encryption_key_fingerprint: string | null,
-      encryption_kek_fingerprints: string[]
+      encryption_kek_fingerprints: string[], shadow_origin?: string
     }
   }[],
   topic_responses: {
@@ -415,7 +415,8 @@ describe('given shared vectors when encoding should match server contract', () =
       stream: {
         encryption_key_source: 'encryptionKeySource',
         encryption_key_fingerprint: 'encryptionKeyFingerprint',
-        encryption_kek_fingerprint: 'encryptionKekFingerprints'
+        encryption_kek_fingerprint: 'encryptionKekFingerprints',
+        shadow_origin: 'shadowOrigin'
       },
       topic: {},
       user: {}
@@ -503,10 +504,13 @@ describe('given shared vectors when encoding should match server contract', () =
         options: withProvenance(stream.options, stream.derivedOptions),
         encryption_key_source: stream.encryptionKeySource,
         encryption_key_fingerprint: stream.encryptionKeyFingerprint,
-        encryption_kek_fingerprints: stream.encryptionKekFingerprints
+        encryption_kek_fingerprints: stream.encryptionKekFingerprints,
+        ...(stream.shadowOrigin === null ? {} : { shadow_origin: stream.shadowOrigin })
       }, expected, name);
       assertNoSecrets(stream.options, stream.derivedOptions);
     }
+    const shadow = fixture.stream_responses.find(({ case: name }) => name === 'stream_shadow_of_a_geo_peer');
+    assert.equal(deserializeToStream(fromHex(shadow!.response_hex)).data.shadowOrigin, 'dc-a');
   });
 
   it('decodes topic responses with the settings read from the option blocks', () => {
@@ -530,6 +534,8 @@ describe('given shared vectors when encoding should match server contract', () =
       assert.equal(String(topic.tieredStorage), expected.options.tiered_storage.value, name);
       assert.equal(topic.localRetentionAge.toString(), expected.options.local_retention_age.value, name);
       assert.equal(topic.localRetentionSize.toString(), expected.options.local_retention_size.value, name);
+      assert.equal(topic.topicType, expected.options.topic_type.value, name);
+      assert.equal(topic.geoMode, expected.options.geo_mode?.value ?? null, name);
     }
   });
 

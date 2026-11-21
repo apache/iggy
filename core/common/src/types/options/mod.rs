@@ -66,8 +66,8 @@ pub use catalog::{
     OPTION_FLAG_SECRET, OPTION_FLAG_UPDATABLE, OptionAdmissionContext, OptionColumns,
     OptionDefault, OptionDescriptor, OptionMutability, OptionOperation, OptionStorage,
     OptionVisibility, StreamEncryptionSource, admit, canonical_value, check_critical_options,
-    critical_keys_marker, derived_defaults, descriptors_for, public_options, stream_key_from_entry,
-    stream_wrap_set,
+    critical_keys_marker, derived_defaults, descriptors_for, project_shadow_origin,
+    project_shadow_topic, public_options, stream_key_from_entry, stream_wrap_set,
 };
 pub use codec::OptionValueCodec;
 pub use durability::Durability;
@@ -1674,6 +1674,7 @@ impl TopicCreateOptions {
             | OptionKey::EncryptionKeySource
             | OptionKey::EncryptionKeyFingerprint
             | OptionKey::EncryptionKekFingerprint
+            | OptionKey::ShadowOrigin
             | OptionKey::CriticalKeys => {
                 return Err(IggyError::UnsupportedOptionKey(key_preview(key)));
             }

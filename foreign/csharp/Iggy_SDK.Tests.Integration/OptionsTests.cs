@@ -139,7 +139,7 @@ public class OptionsTests
 
         specs.Select(spec => spec.Key).ShouldBe([
             "name", "encryption_key", "encryption_key_source", "encryption_key_fingerprint",
-            "encryption_kek_fingerprint"
+            "encryption_kek_fingerprint", "shadow_origin"
         ]);
         var byKey = specs.ToDictionary(spec => spec.Key);
         byKey["name"].Updatable.ShouldBeTrue();
@@ -149,7 +149,11 @@ public class OptionsTests
         byKey["encryption_key"].Critical.ShouldBeTrue();
         byKey["encryption_key"].Updatable.ShouldBeFalse();
         byKey["encryption_key"].Resettable.ShouldBeFalse();
-        foreach (var key in new[] { "encryption_key_source", "encryption_key_fingerprint", "encryption_kek_fingerprint" })
+        foreach (var key in new[]
+                 {
+                     "encryption_key_source", "encryption_key_fingerprint", "encryption_kek_fingerprint",
+                     "shadow_origin"
+                 })
         {
             byKey[key].ReadOnly.ShouldBeTrue();
             byKey[key].Updatable.ShouldBeFalse();

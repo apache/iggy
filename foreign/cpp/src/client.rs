@@ -1564,6 +1564,21 @@ impl Client {
         })
     }
 
+    pub fn retire_geo_origin(
+        &self,
+        origin: &str,
+        error_info: &mut ffi::ErrorInfo,
+    ) -> Result<(), String> {
+        *error_info = ffi::ErrorInfo::default();
+        RUNTIME.block_on(async {
+            self.inner
+                .retire_geo_origin(origin)
+                .await
+                .inspect_err(|error| error_info.record(error))
+                .map_err(|error| format!("Could not retire geo origin '{origin}': {error}"))
+        })
+    }
+
     pub fn create_personal_access_token(
         &self,
         name: String,
@@ -2096,6 +2111,19 @@ mod tests {
             r#"{"id":1013,"reason":"invalid"}"#.to_owned(),
         ));
         assert_eq!(other.kind, "http_response_error");
+    }
+
+    // The Rust SDK returns 1021 without a retry, so the bridge only has to keep its code and kind.
+    #[test]
+    fn given_shadow_stream_refusal_when_recording_should_keep_its_code_and_kind() {
+        let mut info = ffi::ErrorInfo::default();
+
+        info.record(&IggyError::ShadowStreamReadOnly);
+
+        assert_eq!(info.code, 1021);
+        assert_eq!(info.kind, "shadow_stream_read_only");
+        assert!(!info.has_operation_id);
+        assert!(!info.has_blocked_partition_id);
     }
 
     #[test]

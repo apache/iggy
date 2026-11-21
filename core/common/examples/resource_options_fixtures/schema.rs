@@ -45,7 +45,7 @@ use iggy_common::{
     ServerKeyContext, StreamCreateOptions, StreamDetails, StreamEncryptionKey,
     StreamEncryptionSource, StreamKeyOrigin, StreamUpdateOptions, TopicCreateOptions, TopicDetails,
     TopicUpdateOptions, UserCreateOptions, UserInfoDetails, UserStatus, UserUpdateOptions, WrapSet,
-    admit, critical_keys_marker,
+    admit, critical_keys_marker, project_shadow_origin, public_options,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -401,6 +401,9 @@ pub struct StreamKeyState {
     pub kek_config_keys: Vec<String>,
     #[serde(with = "iggy_common::resource_options_json")]
     pub stored_extra: ResourceOptions,
+    /// The origin of a shadow stream, which the server reports read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -424,6 +427,8 @@ pub struct StreamProjection {
     pub encryption_key_source: Option<StreamEncryptionSource>,
     pub encryption_key_fingerprint: Option<String>,
     pub encryption_kek_fingerprints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -738,6 +743,15 @@ impl StreamKeyState {
         );
         Ok(stored)
     }
+
+    /// The options a read of the stream returns.
+    pub fn public_options(&self) -> Result<ResourceOptions, IggyError> {
+        let mut public = public_options(OptionsScope::Stream, &self.stored_options()?)?;
+        if let Some(origin) = &self.shadow_origin {
+            project_shadow_origin(&mut public, origin)?;
+        }
+        Ok(public)
+    }
 }
 
 impl TryFrom<u32> for ProtocolVersionValue {
@@ -856,6 +870,7 @@ impl From<&StreamDetails> for StreamProjection {
             encryption_key_source: details.encryption_key_source(),
             encryption_key_fingerprint: details.encryption_key_fingerprint(),
             encryption_kek_fingerprints: details.encryption_kek_fingerprints(),
+            shadow_origin: details.shadow_origin(),
         }
     }
 }

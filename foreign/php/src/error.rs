@@ -447,6 +447,20 @@ mod tests {
         ));
     }
 
+    // The Rust SDK returns 1021 without a retry, so the binding only has to keep its code and
+    // keep it out of the transient class that invites one.
+    #[test]
+    fn given_shadow_stream_refusal_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::ShadowStreamReadOnly;
+        assert_eq!(error.as_code(), 1021);
+        assert_eq!(error.as_string(), "shadow_stream_read_only");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+        assert!(PendingOperationException::from_error(&error).is_none());
+    }
+
     #[test]
     fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
         const PARTITION_ID: u32 = 7;

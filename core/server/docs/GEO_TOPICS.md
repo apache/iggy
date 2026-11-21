@@ -458,7 +458,8 @@ answers 58 while it holds 32 MiB of sends that wait for the bucket or for their 
 segment holds yet pass `long_term_backlog_limit`, its sends are slowed instead of refused: each
 waits 10 ms to 250 ms before the shard takes it.
 
-A send to a shadow topic returns `ShadowStreamReadOnly` (1021).
+A send to a shadow topic returns `ShadowStreamReadOnly` (1021). No SDK retries it, since a
+shadow topic never takes a send.
 
 ### Consumers
 
@@ -467,6 +468,13 @@ A consumer connects to the cluster of its own datacenter, and reads:
 - the geo topic, for the messages written in this datacenter, for example `orders/payments`;
 - the shadow topic of each peer, for the messages written there, for example
   `__shadow_dc-b_orders/payments` in `dc-a`.
+
+A client recognizes a shadow stream by the read-only key `shadow_origin`, which names the origin.
+A stream read reports it, alone or in a listing, and no other stream carries it. Every SDK has a
+typed getter for it, and for the `topic_type` and `geo_mode` of a topic. A shadow topic reads as a
+geo topic with the `geo_mode` of its origin, although this cluster stores it as a normal topic and
+runs none of a geo topic's write path for it. The CLI shows the origin in `iggy stream list`, and
+the type, the mode and the origin in `iggy topic get`.
 
 A shadow topic is read like any other topic, by stream name and topic name or id. It has the
 topic id and the partition ids of its origin's topic, and it is built to serve the origin's
@@ -1044,6 +1052,5 @@ before an unlisted long-term object is deleted.
   remove long-term segments. Only retention and a delete of the topic do.
 - **65,536 long-term segments per partition.** Merges keep the count down. A full log takes no new
   segment until merges or retention free room.
-- **No client tooling for the model yet.** No SDK reads a topic and its shadow topics together, and
-  stream listings do not mark shadow streams. A shadow stream is recognised by its `__shadow_`
-  name prefix.
+- **No consumer that reads a topic with its shadow topics.** A consumer reads the topic and each
+  shadow topic separately. Stream reads mark a shadow stream with `shadow_origin`.

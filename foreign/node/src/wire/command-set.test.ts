@@ -144,3 +144,17 @@ describe('CommandAPI.sendBinaryRequestToReplica', () => {
     assert.deepEqual(response, expectedResponse);
   });
 });
+
+describe('CommandAPI.cluster.retireGeoOrigin', () => {
+  it('sends the origin under code 18 and reads the empty reply as success', async () => {
+    const raw = mockRawClient();
+    raw.sendCommand = async (code, payload, options) => {
+      assert.equal(code, COMMAND_CODE.RetireGeoOrigin);
+      assert.deepEqual(payload, Buffer.from([4, ...Buffer.from('dc-a')]));
+      assert.equal(options, undefined);
+      return { status: 0, length: 0, data: Buffer.alloc(0) };
+    };
+
+    assert.equal(await new SimpleClient(raw).cluster.retireGeoOrigin({ origin: 'dc-a' }), true);
+  });
+});

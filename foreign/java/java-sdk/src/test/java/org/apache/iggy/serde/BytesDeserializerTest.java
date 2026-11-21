@@ -36,6 +36,8 @@ import org.apache.iggy.partition.Partition;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.stream.EncryptionKeySource;
 import org.apache.iggy.system.CacheMetricsKey;
+import org.apache.iggy.topic.GeoMode;
+import org.apache.iggy.topic.TopicType;
 import org.apache.iggy.user.UserStatus;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -93,6 +95,18 @@ class BytesDeserializerTest {
     }
 
     private static void writeTopicData(ByteBuf buffer, int partitionsCount) {
+        writeTopicData(
+                buffer,
+                partitionsCount,
+                Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)),
+                Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+    }
+
+    private static void writeTopicData(
+            ByteBuf buffer,
+            int partitionsCount,
+            Map<HeaderKey, HeaderValue> options,
+            Map<HeaderKey, HeaderValue> derivedOptions) {
         buffer.writeIntLE(10); // topic ID
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
         buffer.writeIntLE(partitionsCount);
@@ -100,9 +114,8 @@ class BytesDeserializerTest {
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
         buffer.writeBytes("test".getBytes());
-        writeOptionsBlock(
-                buffer, Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
-        writeOptionsBlock(buffer, Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+        writeOptionsBlock(buffer, options);
+        writeOptionsBlock(buffer, derivedOptions);
     }
 
     private static void writeTopicDataWithUnknownOptionKind(ByteBuf buffer) {
@@ -291,6 +304,38 @@ class BytesDeserializerTest {
             var topic = readTopic(buffer);
 
             assertThat(topic.options()).containsOnlyKeys("max_topic_size");
+        }
+
+        @Test
+        void shouldReadTheTypeAndModeOfAGeoTopic() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("geo")),
+                    Map.of(HeaderKey.fromString("geo_mode"), HeaderValue.fromString("geo_tiered")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topic.topicType()).contains(TopicType.GEO);
+            assertThat(topic.geoMode()).contains(GeoMode.GEO_TIERED);
+            assertThat(topicDetails.topicType()).contains(TopicType.GEO);
+            assertThat(topicDetails.geoMode()).contains(GeoMode.GEO_TIERED);
+        }
+
+        @Test
+        void shouldReadNoGeoModeOnANormalTopic() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer, 4, Map.of(), Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+
+            var topic = readTopic(buffer);
+
+            assertThat(topic.topicType()).contains(TopicType.NORMAL);
+            assertThat(topic.geoMode()).isEmpty();
         }
 
         @Test

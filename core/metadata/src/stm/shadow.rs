@@ -58,7 +58,7 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
 };
 use iggy_binary_protocol::{WireError, WireIdentifier, WireName};
-use iggy_common::IggyTimestamp;
+use iggy_common::{GeoMode, IggyTimestamp};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -114,6 +114,11 @@ pub struct ShadowTopic {
     /// applies once the peer's origin retired.
     #[serde(default)]
     pub retention: ShadowRetention,
+    /// How the peer writes the topic, as its object said at adoption. A
+    /// read of the shadow topic reports it, and the topic as a geo topic,
+    /// although it is stored as a normal one.
+    #[serde(default)]
+    pub geo_mode: GeoMode,
 }
 
 /// The retention of a peer's geo topic, as the topic's object writes it.
@@ -201,6 +206,7 @@ pub enum ShadowTopicRequest {
         target: ShadowTopicTarget,
         create: Box<CreateTopicWithAssignmentsRequest>,
         retention: ShadowRetention,
+        geo_mode: GeoMode,
     },
     /// The peer deleted the topic at `deleted_at`.
     DetachTopic {
@@ -269,7 +275,7 @@ impl ShadowTopicRequest {
 //   rename stream: stream_id u32 | name
 //   remove stream: stream_id u32
 //   adopt topic:   stream_id u32 | topic_id u32 | created_revision u64
-//                  | create length u32 | create | retention
+//                  | create length u32 | create | retention | geo_mode u8
 //   detach topic:  stream_id u32 | topic_id u32 | created_revision u64
 //                  | deleted_at u64
 //   remove topic:  stream_id u32 | topic_id u32 | created_revision u64
@@ -296,7 +302,7 @@ impl WireEncode for ShadowTopicRequest {
             Self::RenameStream { name, .. } => 4 + name.encoded_size(),
             Self::RemoveStream { .. } => 4,
             Self::AdoptTopic { create, .. } => {
-                TARGET_LEN + 4 + create.encoded_size() + RETENTION_LEN
+                TARGET_LEN + 4 + create.encoded_size() + RETENTION_LEN + 1
             }
             Self::RestoreTopic { create, .. } => TARGET_LEN + 4 + create.encoded_size(),
             Self::DetachTopic { .. } => TARGET_LEN + 8,
@@ -325,9 +331,11 @@ impl WireEncode for ShadowTopicRequest {
                 target,
                 create,
                 retention,
+                geo_mode,
             } => {
                 encode_create(target, create, buf);
                 encode_retention(retention, buf);
+                buf.put_u8(geo_mode_code(*geo_mode));
             }
             Self::RestoreTopic { target, create } => encode_create(target, create, buf),
             Self::DetachTopic { target, deleted_at } => {
@@ -359,6 +367,23 @@ fn encode_create(
 fn encode_retention(retention: &ShadowRetention, buf: &mut BytesMut) {
     buf.put_u64_le(retention.message_expiry);
     buf.put_u64_le(retention.max_topic_size);
+}
+
+const fn geo_mode_code(geo_mode: GeoMode) -> u8 {
+    match geo_mode {
+        GeoMode::Geo => 0,
+        GeoMode::GeoTiered => 1,
+    }
+}
+
+fn decode_geo_mode(buf: &[u8], position: usize) -> Result<GeoMode, WireError> {
+    match read_u8(buf, position)? {
+        0 => Ok(GeoMode::Geo),
+        1 => Ok(GeoMode::GeoTiered),
+        code => Err(WireError::Validation(
+            format!("unknown geo mode {code} of a shadow topic").into(),
+        )),
+    }
 }
 
 fn decode_retention(buf: &[u8], position: usize) -> Result<ShadowRetention, WireError> {
@@ -424,11 +449,13 @@ impl WireDecode for ShadowTopicRequest {
                         position += 4 + length;
                         if kind == ADOPT_TOPIC {
                             let retention = decode_retention(buf, position)?;
-                            position += RETENTION_LEN;
+                            let geo_mode = decode_geo_mode(buf, position + RETENTION_LEN)?;
+                            position += RETENTION_LEN + 1;
                             Self::AdoptTopic {
                                 target,
                                 create,
                                 retention,
+                                geo_mode,
                             }
                         } else {
                             Self::RestoreTopic { target, create }
@@ -516,7 +543,8 @@ impl StateHandler for ShadowTopicRequest {
                 target,
                 create,
                 retention,
-            } => adopt_topic(state, target, create, *retention, timestamp),
+                geo_mode,
+            } => adopt_topic(state, target, create, *retention, *geo_mode, timestamp),
             Self::DetachTopic { target, deleted_at } => detach_topic(state, target, *deleted_at),
             Self::RemoveTopic { target } => remove_topic(state, target, timestamp),
             Self::RestoreStream { source, name } => restore_stream(state, source, name, timestamp),
@@ -670,6 +698,7 @@ fn adopt_topic(
     target: &ShadowTopicTarget,
     create: &CreateTopicWithAssignmentsRequest,
     retention: ShadowRetention,
+    geo_mode: GeoMode,
     timestamp: IggyTimestamp,
 ) -> ApplyReply {
     if shadow_topic_ids(state, target).is_some() {
@@ -682,6 +711,7 @@ fn adopt_topic(
         created_revision: target.created_revision,
         deleted_at: None,
         retention,
+        geo_mode,
     };
     create_topic(
         state,
@@ -915,6 +945,7 @@ mod tests {
                 partitions: assignments(partitions),
             }),
             retention: RETENTION,
+            geo_mode: GeoMode::Geo,
         }
     }
 
@@ -1191,6 +1222,7 @@ mod tests {
                 created_revision: PEER_REVISION,
                 deleted_at: None,
                 retention: RETENTION,
+                geo_mode: GeoMode::Geo,
             })
         );
         let ids: Vec<usize> = topic
@@ -1221,6 +1253,7 @@ mod tests {
             mut target,
             create,
             retention,
+            geo_mode,
         } = adoption(stream_id, 2)
         else {
             unreachable!()
@@ -1234,6 +1267,7 @@ mod tests {
                 target,
                 create,
                 retention,
+                geo_mode,
             },
         );
 
