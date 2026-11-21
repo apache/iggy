@@ -31,7 +31,8 @@
 //!
 //! The partitions of a geo topic are left out: their objects wait for the
 //! tombstone of the topic, and the sweep of [`crate::geo_topics`] deletes
-//! them once its grace ends.
+//! them once its grace ends. So are the partitions of a shadow topic, whose
+//! objects are in the store of the peer that owns the topic.
 //!
 //! The queue is memory only and holds what this node saw commit while it was
 //! the metadata primary. A restart, a primary change, a change feed that
@@ -70,7 +71,7 @@ impl IncarnationDeletes {
         let mut left_out = 0_usize;
         for change in changes {
             if change.kind == PartitionChangeKind::Removed
-                && !change.geo_topic
+                && !change.skips_object_deletes
                 && !queue.queue(
                     object_prefix(change.namespace, change.created_revision),
                     now,

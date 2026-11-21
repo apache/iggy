@@ -110,6 +110,9 @@ pub fn sample(
         Outcome::OptionNotUpdatable => {
             unreachable!("the simulator creates no geo topic, the one that refuses an update")
         }
+        Outcome::ShadowStreamReadOnly => {
+            unreachable!("the simulator has no geo peers, so it holds no shadow stream")
+        }
     }
 }
 

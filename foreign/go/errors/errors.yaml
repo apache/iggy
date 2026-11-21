@@ -539,6 +539,10 @@
   code: 1020
   format: "too many streams"
   fields: []
+- name: ShadowStreamReadOnly
+  code: 1021
+  format: "the stream is a shadow of another cluster's stream and takes no writes"
+  fields: []
 - name: CannotCreateTopicsDirectory
   code: 2000
   format: "cannot create topics directory for stream with id: %d, path: %s"

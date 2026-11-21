@@ -1962,7 +1962,7 @@ mod tests {
                     namespace: IggyNamespace::new(0, 0, 0),
                     created_revision: state.items[0].topics[0].partitions[0].created_revision,
                     kind: PartitionChangeKind::ConsumerGroupDeleted,
-                    geo_topic: false,
+                    skips_object_deletes: false,
                 }
             )]
         );

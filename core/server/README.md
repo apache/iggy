@@ -701,7 +701,52 @@ hours by default), it deletes the segments and manifests of the topic, and then
 the tombstone. The tombstone records the time of its write. A restart or a new
 metadata primary therefore does not restart the grace.
 
-Clients cannot create geo topics yet, as the resource options below describe.
+### Shadow streams
+
+A cluster serves the geo topics of each peer that it reads as shadow streams.
+A shadow stream is named `__shadow_<origin>_<stream>`, after the peer's origin
+and stream name. It holds the geo topics of that peer stream, with the peer's
+topic ids and partition ids. The normal topics of the peer stream do not
+appear. The partitions of a shadow topic keep none of the peer's messages on
+this node's disk. They read the peer's log from the peer's store.
+
+Every 5 seconds, the caught-up metadata primary lists the topic objects of each
+peer. It reads each new object, and it reads a known object again every 30
+seconds. Then it proposes each change through the metadata consensus of this
+cluster, one operation at a time, so every node holds the same shadow streams:
+
+- A live object of a new peer stream creates its shadow stream.
+- A live object adds its topic to the shadow stream.
+- A renamed peer stream renames its shadow stream.
+- A tombstone detaches the shadow topic. The topic stays readable until
+  `tombstone_grace` passed since the peer wrote the tombstone. Then the primary
+  removes it.
+- An object that the peer's store no longer lists for 2 minutes removes its
+  shadow topic.
+- A shadow stream without topics and without live objects is removed.
+
+Clients read a shadow stream like any other stream. Consumer groups, consumer
+offsets and permissions work on it, and its positions stay in this cluster. A
+client cannot write to a shadow stream or change it. The server refuses these
+requests with `ShadowStreamReadOnly` (1021): a send, a topic create, update or
+delete, a partition add or delete, a segment delete, and a stream update or
+delete. A stream create or rename to a name that starts with `__shadow_`
+returns `InvalidStreamName` (1013).
+
+If a stream of this cluster already has the name of a shadow stream, the
+server logs it and adopts nothing for that peer stream. Rename the stream to
+let the peer's topics in. A peer stream whose shadow stream name is longer than
+255 bytes is also logged and skipped.
+
+A shadow topic is stale while the peer's store does not answer, or while the
+node reads nothing from the peer. A stale topic serves what it holds. The
+primary removes no stale topic, except one whose grace ended. The gauge
+`geo_shadow_topics_stale`, labelled with the peer's `origin`, counts the stale
+shadow topics on the metadata primary.
+
+If the identity object of a peer names another cluster than the one that the
+shadow streams came from, the server logs it. It leaves those shadow streams
+as they are.
 
 ## Resource options
 

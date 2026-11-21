@@ -758,6 +758,7 @@
     "1015": "cannot_read_streams",
     "1019": "invalid_topic_size",
     "1020": "too_many_streams",
+    "1021": "shadow_stream_read_only",
     "2000": "cannot_create_topics_directory",
     "2001": "cannot_create_topic_directory",
     "2002": "cannot_create_topic_info",

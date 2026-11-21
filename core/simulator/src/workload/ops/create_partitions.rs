@@ -89,7 +89,10 @@ pub fn sample(
         }
         // The sim client never sets a replication factor, so admission and
         // apply agree on the member count.
-        Outcome::PartitionResizeDisabled | Outcome::InvalidReplicationFactor => None,
+        Outcome::PartitionResizeDisabled
+        | Outcome::InvalidReplicationFactor
+        // The sim cluster has no geo peers, so it holds no shadow stream.
+        | Outcome::ShadowStreamReadOnly => None,
     }
 }
 

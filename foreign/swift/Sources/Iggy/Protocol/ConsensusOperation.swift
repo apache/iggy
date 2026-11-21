@@ -39,6 +39,8 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case updateUserResolved = 74
     /// A replicated rewrap of stream keys the server proposes itself.
     case rewrapStreamKeys = 75
+    /// A replicated shadow topic change the server proposes itself.
+    case shadowTopic = 76
 
     case createStream = 128
     // 129 was updateStream. The server keeps the code retired.

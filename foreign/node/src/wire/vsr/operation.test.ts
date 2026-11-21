@@ -88,7 +88,7 @@ describe('VSR operation classification', () => {
     assert.equal(isMetadata(Operation.UpdateResource), true);
     assert.equal(isResultFramed(Operation.UpdateResource), true);
     for (const resolved of [Operation.UpdateStreamResolved, Operation.UpdateTopicResolved,
-      Operation.UpdateUserResolved, Operation.RewrapStreamKeys]) {
+      Operation.UpdateUserResolved, Operation.RewrapStreamKeys, Operation.ShadowTopic]) {
       assert.equal(isInternal(resolved), true);
       assert.equal(isMetadata(resolved), true);
       assert.equal(isResultFramed(resolved), true);
@@ -108,6 +108,7 @@ describe('VSR operation classification', () => {
       [Operation.UpdateTopicResolved, Operation.UpdateResource],
       [Operation.UpdateUserResolved, Operation.UpdateResource],
       [Operation.RewrapStreamKeys, Operation.RewrapStreamKeys],
+      [Operation.ShadowTopic, Operation.ShadowTopic],
       [Operation.CreateStream, Operation.CreateStream]
     ])
       assert.equal(requestOperation(committed), request);
@@ -122,7 +123,7 @@ describe('VSR operation classification', () => {
     assert.equal(isInternal(Operation.RetireConsumerGroupOwners), true);
     assert.equal(isKnownOperation(Operation.StateMachineCommand), true);
     assert.equal(isInternal(Operation.StateMachineCommand), true);
-    for (const undeclared of [69, 76, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 171, 255])
+    for (const undeclared of [69, 77, 127, 129, 131, 133, 135, 142, 151, 159, 163, 164, 165, 171, 255])
       assert.equal(isKnownOperation(undeclared), false);
   });
 });

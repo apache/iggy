@@ -45,6 +45,7 @@ public final class VsrOperation {
     public static final int UPDATE_TOPIC_RESOLVED = 73;
     public static final int UPDATE_USER_RESOLVED = 74;
     public static final int REWRAP_STREAM_KEYS = 75;
+    public static final int SHADOW_TOPIC = 76;
 
     public static final int CREATE_STREAM = 128;
     // 129 was UpdateStream. Never reuse it.
@@ -116,7 +117,7 @@ public final class VsrOperation {
     static {
         KNOWN_OPERATIONS.set(RESERVED, LOGOUT + 1);
         KNOWN_OPERATIONS.set(CREATE_TOPIC_WITH_ASSIGNMENTS, TRUNCATE_PARTITION + 1);
-        KNOWN_OPERATIONS.set(UPDATE_STREAM_RESOLVED, REWRAP_STREAM_KEYS + 1);
+        KNOWN_OPERATIONS.set(UPDATE_STREAM_RESOLVED, SHADOW_TOPIC + 1);
         KNOWN_OPERATIONS.set(CREATE_STREAM);
         KNOWN_OPERATIONS.set(DELETE_STREAM);
         KNOWN_OPERATIONS.set(CREATE_TOPIC);

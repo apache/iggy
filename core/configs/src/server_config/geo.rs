@@ -66,7 +66,8 @@ pub struct GeoConfig {
     pub peers: Vec<GeoPeerConfig>,
     /// How long a deleted geo topic keeps its tombstone and its objects in
     /// this cluster's store, so that each peer sees the tombstone before the
-    /// objects go.
+    /// objects go. A cluster that reads peers also keeps a detached shadow
+    /// topic this long after the peer wrote its tombstone.
     #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_tombstone_grace")]
     #[config_env(leaf)]
