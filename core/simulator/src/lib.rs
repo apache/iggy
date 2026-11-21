@@ -89,6 +89,12 @@ pub struct SimReplica {
     /// Fixture metadata this replica observed before any WAL replay. Runtime
     /// allocations must be recovered from their logged commands instead.
     seeded_namespaces: RefCell<BTreeMap<IggyNamespace, (u32, Durability)>>,
+    /// Fixture partitions that place their batches. Production reads that from
+    /// the topic's options when it creates a partition and when boot recovers
+    /// one. Nothing in a topic's metadata says so here, so the replica keeps
+    /// it beside the seed and `materialise_partition` applies it each time it
+    /// builds the partition, a restart included.
+    placing_namespaces: RefCell<BTreeSet<IggyNamespace>>,
     /// Shards of this replica, indexed by shard id.
     pub shards: Vec<Rc<Replica>>,
     /// Shard 0's durable superblock. Held here, not in the shard, so its bytes
@@ -593,6 +599,7 @@ impl Simulator {
                 .collect();
             replicas.push(SimReplica {
                 seeded_namespaces: RefCell::new(BTreeMap::new()),
+                placing_namespaces: RefCell::new(BTreeSet::new()),
                 shards,
                 superblock,
                 metadata_journal,
@@ -708,6 +715,23 @@ impl Simulator {
                 );
             }
             materialise_partition(replica, namespace, self.consumer_offsets_max);
+        }
+    }
+
+    /// Make `namespace` a partition that places its batches on every replica,
+    /// now and each time a replica builds it again. Call it right after
+    /// [`Self::init_partition`], before the partition takes a prepare.
+    pub fn place_batches(&mut self, namespace: IggyNamespace) {
+        for replica in &self.replicas {
+            replica.placing_namespaces.borrow_mut().insert(namespace);
+            if let Some(partition) = replica
+                .partition_shard(namespace)
+                .plane
+                .partitions()
+                .get_mut_by_ns(&namespace)
+            {
+                partition.set_places_batches(true);
+            }
         }
     }
 
@@ -1618,6 +1642,7 @@ impl Simulator {
         }
         unsynced_partition_logs.retain(|namespace| partition_logs.contains_key(namespace));
         let seeded_namespaces = self.replicas[idx].seeded_namespaces.borrow().clone();
+        let placing_namespaces = self.replicas[idx].placing_namespaces.borrow().clone();
         let seed_namespaces: Vec<_> = seeded_namespaces
             .iter()
             .map(|(&namespace, &(view, durability))| (namespace, view, durability))
@@ -1721,6 +1746,7 @@ impl Simulator {
             .collect();
         self.replicas[idx] = SimReplica {
             seeded_namespaces: RefCell::new(seeded_namespaces),
+            placing_namespaces: RefCell::new(placing_namespaces),
             shards,
             superblock,
             metadata_journal,
@@ -2269,6 +2295,13 @@ fn materialise_partition(
                 .with_members(members)
                 .with_created_op(created_op),
         );
+        // Before the pump hands the partition its first frame: its log holds
+        // one kind of batch for good.
+        if replica.placing_namespaces.borrow().contains(&namespace)
+            && let Some(partition) = owner_shard.plane.partitions().get_mut_by_ns(&namespace)
+        {
+            partition.set_places_batches(true);
+        }
     }
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -2379,6 +2412,9 @@ mod slow_replica_tests;
 
 #[cfg(test)]
 mod stale_prepare_commit_tests;
+
+#[cfg(test)]
+mod placed_batches_tests;
 
 #[cfg(test)]
 mod replication_flow_tests;
