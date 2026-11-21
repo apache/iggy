@@ -57,7 +57,9 @@ public class OptionsTests
         "segment_max_age",
         "tiered_storage",
         "local_retention_age",
-        "local_retention_size"
+        "local_retention_size",
+        "topic_type",
+        "geo_mode"
     ];
 
     private static readonly string[] NeverReturnedKeys = ["encryption_key", "encryption_key_wrapped", "critical_keys"];
@@ -191,7 +193,9 @@ public class OptionsTests
             SegmentMaxAge = TimeSpan.FromHours(1),
             TieredStorage = false,
             LocalRetentionAge = TimeSpan.FromHours(1),
-            LocalRetentionSize = 1_000_000_000
+            LocalRetentionSize = 1_000_000_000,
+            TopicType = TopicType.Normal,
+            GeoMode = GeoMode.Geo
         }.ToDictionary().Keys;
 
         typedKeys.ShouldAllBe(key => catalogKeys.Contains(key));

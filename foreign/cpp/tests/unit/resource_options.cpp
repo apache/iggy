@@ -208,6 +208,10 @@ std::map<std::string, ScopeSurface> TypedSurface() {
                        .LocalRetentionSize()
                        .has_value();
                }},
+              {"topic_type",
+               [] { return TopicCreateOptions().SetTopicType(iggy::TopicType::Geo).TopicType().has_value(); }},
+              {"geo_mode",
+               [] { return TopicCreateOptions().SetGeoMode(iggy::GeoMode::GeoTiered).GeoMode().has_value(); }},
           },
           {
               {"name", [] { return TopicUpdateOptions().SetName("renamed").Name().has_value(); }},

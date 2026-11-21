@@ -23,6 +23,7 @@ import { dedupeOptions, serializeOptions, sortOptions, type OptionEntry } from '
 import { HeaderValue } from '../message/header.utils.js';
 import {
   isValidCompressionAlgorithm, CompressionAlgorithm, Durability, PartitionResizePolicy,
+  TopicType, GeoMode,
   compressionAlgorithmName,
   deserializeTopic,
   type Topic,
@@ -103,6 +104,21 @@ export type TopicOptions = {
    */
   localRetentionSize?: bigint,
   /**
+   * Whether the topic is normal or geo. The server default is normal. A geo
+   * topic needs an object store on every node of the cluster: while one is
+   * not ready, the server refuses `geo` with error 5, feature unavailable. A
+   * geo topic refuses tiered storage and an encrypted stream, and keeps its
+   * name, options and partition count.
+   */
+  topicType?: TopicType,
+  /**
+   * How a geo topic writes its messages. A geo topic created without one uses
+   * `geo`. The server refuses `geo_tiered` with error 5 for now. Only a geo
+   * topic takes a mode: the server refuses one on a normal topic with error
+   * 4042, invalid option value.
+   */
+  geoMode?: GeoMode,
+  /**
    * Option keys with no field of their own, for a key the server catalog gained
    * after this build shipped. A field above wins on collision, since the block
    * must not carry a key twice. Call `describeOptions` for the keys a server
@@ -151,6 +167,8 @@ export const CREATE_TOPIC = {
     tieredStorage,
     localRetentionAge = 0n,
     localRetentionSize = 0n,
+    topicType,
+    geoMode,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -243,6 +261,20 @@ export const CREATE_TOPIC = {
       options.push({
         key: 'local_retention_size', value: HeaderValue.Uint64(localRetentionSize)
       });
+    if (topicType !== undefined) {
+      if (!Object.values<string>(TopicType).includes(topicType))
+        throw new Error(`Invalid topic_type: ${topicType}`);
+      options.push({
+        key: 'topic_type', value: HeaderValue.String(topicType)
+      });
+    }
+    if (geoMode !== undefined) {
+      if (!Object.values<string>(GeoMode).includes(geoMode))
+        throw new Error(`Invalid geo_mode: ${geoMode}`);
+      options.push({
+        key: 'geo_mode', value: HeaderValue.String(geoMode)
+      });
+    }
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
     b.writeUInt8(bName.length, 4);

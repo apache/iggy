@@ -208,6 +208,11 @@ class ResourceOptionsTest {
         assertRefusal(
                 () -> TopicUpdate.builder().reset(TopicOptionKey.TIERED_STORAGE).build(),
                 IggyErrorCode.OPTION_NOT_UPDATABLE);
+        assertRefusal(
+                () -> TopicUpdate.builder().reset(TopicOptionKey.TOPIC_TYPE).build(),
+                IggyErrorCode.OPTION_NOT_UPDATABLE);
+        assertRefusal(
+                () -> TopicUpdate.builder().reset(TopicOptionKey.GEO_MODE).build(), IggyErrorCode.OPTION_NOT_UPDATABLE);
         assertRefusal(() -> StreamOptions.builder().encryptionKey(new byte[31]), IggyErrorCode.INVALID_ENCRYPTION_KEY);
         assertRefusal(() -> StreamOptions.builder().encryptionKeyBase64("AAAA"), IggyErrorCode.INVALID_ENCRYPTION_KEY);
         assertThat(StreamUpdate.builder().name(" ").build().entries().get(StreamOptionKey.NAME.value()))

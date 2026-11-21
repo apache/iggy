@@ -189,6 +189,7 @@ result_enum!(DeleteStreamResult { StreamNotFound = 1009 });
 
 // Topics.
 result_enum!(CreateTopicResult {
+    FeatureUnavailable = 5,
     StreamNotFound = 1009,
     NameAlreadyExists = 2013,
     InvalidReplicationFactor = 2018,
@@ -204,6 +205,7 @@ result_enum!(UpdateTopicResult {
     NameAlreadyExists = 2013,
     InvalidOptionValue = 4042,
     OptionsBlockTooLarge = 4043,
+    OptionNotUpdatable = 4103,
 });
 result_enum!(DeleteTopicResult {
     StreamNotFound = 1009,
@@ -740,6 +742,17 @@ mod tests {
         assert_eq!(
             u32::from(UpdateUserResult::InvalidOptionValue),
             invalid_option_value
+        );
+
+        // FeatureUnavailable (5) / OptionNotUpdatable (4103), the geo topic
+        // refusals that need committed state.
+        assert_eq!(
+            u32::from(CreateTopicResult::FeatureUnavailable),
+            IggyError::FeatureUnavailable.as_code()
+        );
+        assert_eq!(
+            u32::from(UpdateTopicResult::OptionNotUpdatable),
+            IggyError::OptionNotUpdatable(String::new()).as_code()
         );
 
         // UserAlreadyExists (46) - also stands in for username-already-exists.

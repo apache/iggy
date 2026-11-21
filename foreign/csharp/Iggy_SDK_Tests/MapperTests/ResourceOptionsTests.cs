@@ -514,7 +514,9 @@ public sealed class ResourceOptionsTests
                     SegmentMaxAge = TimeSpan.FromHours(1),
                     TieredStorage = false,
                     LocalRetentionAge = TimeSpan.FromHours(6),
-                    LocalRetentionSize = 536_870_912
+                    LocalRetentionSize = 536_870_912,
+                    TopicType = TopicType.Geo,
+                    GeoMode = GeoMode.GeoTiered
                 }.ToDictionary().Keys.ToHashSet());
                 Assert.Equal(updateKeys, new TopicUpdate
                 {

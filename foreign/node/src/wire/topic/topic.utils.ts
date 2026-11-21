@@ -320,3 +320,26 @@ export const PartitionResizePolicy = {
 } as const;
 
 export type PartitionResizePolicy = typeof PartitionResizePolicy[keyof typeof PartitionResizePolicy];
+
+/**
+ * What a topic is, fixed at create. A geo topic's messages also become
+ * readable in the other datacenters through the object store.
+ */
+export const TopicType = {
+  Normal: 'normal',
+  Geo: 'geo'
+} as const;
+
+export type TopicType = typeof TopicType[keyof typeof TopicType];
+
+/**
+ * How a geo topic writes its messages, fixed at create. `geo` uploads a batch
+ * to the object store before it commits, `geo_tiered` replicates it first and
+ * uploads sealed segments later.
+ */
+export const GeoMode = {
+  Geo: 'geo',
+  GeoTiered: 'geo_tiered'
+} as const;
+
+export type GeoMode = typeof GeoMode[keyof typeof GeoMode];

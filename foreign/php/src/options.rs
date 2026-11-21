@@ -118,6 +118,10 @@ pub enum TopicOptionKey {
     LocalRetentionAge,
     #[php(value = "local_retention_size")]
     LocalRetentionSize,
+    #[php(value = "topic_type")]
+    TopicType,
+    #[php(value = "geo_mode")]
+    GeoMode,
 }
 
 impl From<TopicOptionKey> for OptionKey {
@@ -139,6 +143,8 @@ impl From<TopicOptionKey> for OptionKey {
             TopicOptionKey::TieredStorage => Self::TieredStorage,
             TopicOptionKey::LocalRetentionAge => Self::LocalRetentionAge,
             TopicOptionKey::LocalRetentionSize => Self::LocalRetentionSize,
+            TopicOptionKey::TopicType => Self::TopicType,
+            TopicOptionKey::GeoMode => Self::GeoMode,
         }
     }
 }
@@ -163,6 +169,8 @@ impl StubLiteral for TopicOptionKey {
             Self::TieredStorage => "TieredStorage",
             Self::LocalRetentionAge => "LocalRetentionAge",
             Self::LocalRetentionSize => "LocalRetentionSize",
+            Self::TopicType => "TopicType",
+            Self::GeoMode => "GeoMode",
         };
         format!("\\Iggy\\TopicOptionKey::{case}")
     }

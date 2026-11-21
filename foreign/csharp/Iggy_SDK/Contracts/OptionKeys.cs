@@ -76,7 +76,9 @@ internal static class OptionKeys
         new("segment_max_age", HeaderKind.Uint64, OptionFlags.Critical),
         new("tiered_storage", HeaderKind.Bool, OptionFlags.Updatable | OptionFlags.Critical, true),
         new("local_retention_age", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable),
-        new("local_retention_size", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable)
+        new("local_retention_size", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable),
+        new("topic_type", HeaderKind.String, OptionFlags.Critical),
+        new("geo_mode", HeaderKind.String, OptionFlags.Critical)
     ];
 
     private static readonly OptionDescriptor[] UserKeys =
@@ -129,6 +131,8 @@ internal static class OptionKeys
             TopicOptionKey.TieredStorage => "tiered_storage",
             TopicOptionKey.LocalRetentionAge => "local_retention_age",
             TopicOptionKey.LocalRetentionSize => "local_retention_size",
+            TopicOptionKey.TopicType => "topic_type",
+            TopicOptionKey.GeoMode => "geo_mode",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown topic option key")
         });
     }

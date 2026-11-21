@@ -131,7 +131,7 @@ struct ModelVectorTests {
             maxTopicSize: .bytes(1_073_741_824), segmentSizeBytes: 1_048_576, durability: .persisted,
             consumerOffsetDurability: .replicated, messagesRequiredToSave: 7, sizeOfMessagesRequiredToSaveBytes: 4096,
             preallocateSegments: false, replicationFactor: 2, segmentMaxAge: .after(.seconds(3_600)), tieredStorage: false,
-            localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(536_870_912))
+            localRetentionAge: .after(.seconds(1_800)), localRetentionSize: .bytes(536_870_912), topicType: .geo, geoMode: .geoTiered)
         #expect(try create.encode() == golden.bytes("options.topic_create.full"))
         let update = TopicUpdateOptions(
             messageExpiry: .never, maxTopicSize: .unlimited, tieredStorage: true, localRetentionAge: .after(.seconds(1_800)),

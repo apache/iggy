@@ -70,5 +70,11 @@ public enum TopicOptionKey
     LocalRetentionAge,
 
     /// <summary><c>local_retention_size</c>, updatable and resettable to unlimited.</summary>
-    LocalRetentionSize
+    LocalRetentionSize,
+
+    /// <summary><c>topic_type</c>, create-only.</summary>
+    TopicType,
+
+    /// <summary><c>geo_mode</c>, create-only.</summary>
+    GeoMode
 }
