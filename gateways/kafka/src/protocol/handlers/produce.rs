@@ -557,7 +557,7 @@ fn request_timeout(timeout_ms: i32) -> Duration {
 /// unless the send still runs and keeps it.
 ///
 /// 7 means nothing was written, or the send may still land and a retry duplicate it. 6 means that
-/// it never went out.
+/// it never went out. 56 means that the primary had no room on its data disk and wrote nothing.
 async fn send_by(
     bridge: &IggyBridge,
     (turn, admission): Held,
@@ -572,12 +572,14 @@ async fn send_by(
         .await;
     let sent = match sent {
         Ok(base_offset) => Ok(base_offset),
-        // The SDK retries a send until the deadline, and then ends it with one of these two: not
-        // sent, or in doubt.
+        // The SDK retries a send until the deadline, and then ends it with one of these: not
+        // sent, refused for disk space, or in doubt.
         Err(
             error @ (BridgeError::Timeout
             | BridgeError::Iggy(
-                IggyError::TransientNotAccepted | IggyError::OperationUncertain(_),
+                IggyError::TransientNotAccepted
+                | IggyError::FreeSpaceReserveReached
+                | IggyError::OperationUncertain(_),
             )),
         ) => {
             // The client picks `timeout_ms`, so its expiry is no signal to the operator.
