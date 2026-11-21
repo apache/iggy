@@ -48,6 +48,31 @@ pub fn message_expiry(options: &ResourceOptions) -> String {
     duration(micros / MICROS_PER_SECOND)
 }
 
+/// Renders how long the server has been running, given microseconds.
+pub fn elapsed(micros: u64) -> String {
+    duration(micros / MICROS_PER_SECOND)
+}
+
+/// Re-renders a server byte size such as `"8615888 KiB"` in the largest
+/// binary unit that keeps it at or above 1, falling back to the server's text
+/// when it does not parse.
+pub fn byte_size(server_text: &str) -> String {
+    const UNITS: [&str; 6] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];
+    let Some(mut amount) = parse_byte_size(server_text) else {
+        return server_text.to_owned();
+    };
+    let mut unit = 0;
+    while amount >= 1024.0 && unit < UNITS.len() - 1 {
+        amount /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{amount} B")
+    } else {
+        format!("{amount:.2} {}", UNITS[unit])
+    }
+}
+
 /// Shows the payload as text when it is UTF-8 and as hex otherwise.
 pub fn payload(base64_payload: &str) -> String {
     match STANDARD.decode(base64_payload) {
@@ -120,6 +145,26 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+fn parse_byte_size(text: &str) -> Option<f64> {
+    let (amount, unit) = text.trim().split_once(' ')?;
+    let amount: f64 = amount.parse().ok()?;
+    let multiplier: f64 = match unit {
+        "B" => 1.0,
+        "KB" => 1e3,
+        "MB" => 1e6,
+        "GB" => 1e9,
+        "TB" => 1e12,
+        "PB" => 1e15,
+        "KiB" => 1024.0,
+        "MiB" => 1024.0_f64.powi(2),
+        "GiB" => 1024.0_f64.powi(3),
+        "TiB" => 1024.0_f64.powi(4),
+        "PiB" => 1024.0_f64.powi(5),
+        _ => return None,
+    };
+    Some(amount * multiplier)
+}
+
 fn format_micros(micros: u64, pattern: &str) -> String {
     i64::try_from(micros)
         .ok()
@@ -171,6 +216,27 @@ mod tests {
     fn given_expiry_in_micros_should_render_largest_units_first() {
         let micros = (86_400 + 3_600 + 5) * MICROS_PER_SECOND;
         assert_eq!(message_expiry(&expiry_options(micros)), "1d 1h 5s");
+    }
+
+    #[test]
+    fn given_exact_unit_sizes_should_render_largest_binary_unit() {
+        assert_eq!(byte_size("8615888 KiB"), "8.22 GiB");
+        assert_eq!(byte_size("16 GiB"), "16.00 GiB");
+        assert_eq!(byte_size("3.898 KB"), "3.81 KiB");
+        assert_eq!(byte_size("0 B"), "0 B");
+        assert_eq!(byte_size("512 B"), "512 B");
+    }
+
+    #[test]
+    fn given_unparsable_size_should_keep_server_text() {
+        assert_eq!(byte_size("lots"), "lots");
+        assert_eq!(byte_size("12 parsecs"), "12 parsecs");
+    }
+
+    #[test]
+    fn given_run_time_in_micros_should_render_duration() {
+        assert_eq!(elapsed(4_000_000), "4s");
+        assert_eq!(elapsed((3_600 + 120) * MICROS_PER_SECOND), "1h 2m");
     }
 
     #[test]

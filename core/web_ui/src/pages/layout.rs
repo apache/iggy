@@ -67,6 +67,7 @@ pub fn DashboardLayout() -> Element {
             aside { class: "sidebar",
                 img { class: "sidebar-logo", src: LOGO, alt: "Apache Iggy" }
                 nav {
+                    Link { class: "nav-link", active_class: "active", to: Route::Overview {}, "Overview" }
                     Link { class: "nav-link", active_class: "active", to: Route::Streams {}, "Streams" }
                 }
                 div { class: "sidebar-footer",
