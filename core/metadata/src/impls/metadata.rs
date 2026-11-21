@@ -82,8 +82,9 @@ use iggy_common::{
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
     TopicResolvedOptions, UserId, admit, admit_geo_topic, admit_tiered_storage,
-    critical_keys_marker, derived_defaults, stream_wrap_set, topic_option_keys, validate_geo_topic,
-    validate_local_retention, validate_segment_max_age, validate_topic_segment_size,
+    critical_keys_marker, derived_defaults, drop_options_fixed_by_type, stream_wrap_set,
+    topic_option_keys, validate_geo_topic, validate_local_retention, validate_segment_max_age,
+    validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -3831,7 +3832,8 @@ where
     }
 
     /// Fill in the derived options and the partition assignments of an
-    /// adopted shadow topic, as the admission of a topic create does. Its
+    /// adopted shadow topic or a restored geo topic, as the admission of a
+    /// topic create does, which drops the keys a geo topic's mode fixes. Its
     /// partitions count toward `[metadata] partitions_max` like any other.
     fn assign_shadow_partitions(
         &self,
@@ -3851,7 +3853,10 @@ where
                 committed.saturating_add(self.pending_partitions()?),
             )?;
         }
-        let explicit = resource_options_from_wire(&create.request.options, true)?;
+        let mut explicit = resource_options_from_wire(&create.request.options, true)?;
+        if drop_options_fixed_by_type(&mut explicit) {
+            create.request.options = resource_options_to_wire(&explicit, OptionsProvenance::All)?;
+        }
         let mut derived = derived_defaults(OptionsScope::Topic, &explicit)?;
         let replication_factor = resolve_replication_factor(
             None,
@@ -6294,7 +6299,7 @@ mod tests {
     };
     use iggy_common::MetadataChangeGroup;
     use iggy_common::{
-        GeoMode, HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage,
+        Durability, GeoMode, HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage,
         OptionValueCodec, PartitionResizePolicy, ServerKeyContext, StreamEncryptionKey,
         StreamKeyOrigin, TopicType, TopicUpdateOptions, UserStatus, UserUpdateOptions, WrapSet,
         check_critical_options, critical_keys_marker, descriptors_for, stream_wrap_set, variadic,
@@ -7743,6 +7748,50 @@ mod tests {
     }
 
     #[test]
+    fn given_a_restored_geo_topic_when_assigning_its_partitions_should_store_persisted_as_derived()
+    {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        let create = |options: &TopicCreateOptions| PersistedCreateTopicRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("payments").unwrap(),
+                options: options.to_wire().unwrap(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: Vec::new(),
+        };
+        let durability = HeaderKey::from(OptionKey::Durability);
+        let replicated = OptionValue::explicit(Durability::Replicated.encode().unwrap());
+
+        let mut restored = create(&TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            geo_mode: Some(GeoMode::Geo),
+            ..TopicCreateOptions::default()
+        });
+        metadata.assign_shadow_partitions(&mut restored).unwrap();
+        let explicit = resource_options_from_wire(&restored.request.options, true).unwrap();
+        let derived = resource_options_from_wire(&restored.derived_options, false).unwrap();
+        assert!(!explicit.contains_key(&durability));
+        assert_eq!(
+            derived.get(&durability),
+            Some(&OptionValue::derived(
+                Durability::Persisted.encode().unwrap()
+            ))
+        );
+
+        // A shadow adoption is stored as a normal topic and keeps its block.
+        let mut adopted = create(&TopicCreateOptions::default());
+        metadata.assign_shadow_partitions(&mut adopted).unwrap();
+        let explicit = resource_options_from_wire(&adopted.request.options, true).unwrap();
+        assert_eq!(explicit.get(&durability), Some(&replicated));
+    }
+
+    #[test]
     fn given_unrelated_metadata_inflight_when_over_cap_create_is_invalid_should_defer_it() {
         let mut metadata = placement_metadata();
         metadata.mux_stm = Rc::new(TestMux::new((
@@ -8486,6 +8535,49 @@ mod tests {
             PartitionResizePolicy::Fixed
         );
         assert!(resolved.runtime.places_batches);
+    }
+
+    #[test]
+    fn given_a_geo_topic_naming_a_durability_when_preparing_should_ignore_it_and_derive_persisted()
+    {
+        let durability = HeaderKey::from(OptionKey::Durability);
+        for named in [Durability::Replicated, Durability::Persisted] {
+            let plane = metadata_plane();
+            plane.observe_tiered_storage_readiness(true);
+            let persisted = prepare_topic_on(
+                &plane,
+                &iggy_common::TopicCreateOptions {
+                    topic_type: Some(TopicType::Geo),
+                    durability: named,
+                    ..Default::default()
+                },
+            )
+            .expect("a ready cluster admits a geo topic");
+            let explicit = resource_options_from_wire(&persisted.request.options, true)
+                .expect("explicit block decodes");
+            let derived = resource_options_from_wire(&persisted.derived_options, false)
+                .expect("derived block decodes");
+            assert!(!explicit.contains_key(&durability), "{named} is ignored");
+            assert_eq!(
+                derived.get(&durability),
+                Some(&OptionValue::derived(
+                    Durability::Persisted.encode().unwrap()
+                )),
+                "{named}"
+            );
+        }
+
+        let normal = prepare_topic_with(&iggy_common::TopicCreateOptions::default())
+            .expect("a normal topic is admitted");
+        let explicit = resource_options_from_wire(&normal.request.options, true)
+            .expect("explicit block decodes");
+        assert_eq!(
+            explicit.get(&durability),
+            Some(&OptionValue::explicit(
+                Durability::Replicated.encode().unwrap()
+            )),
+            "a normal topic keeps the durability it names"
+        );
     }
 
     #[test]

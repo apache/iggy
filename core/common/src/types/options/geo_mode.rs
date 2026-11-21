@@ -18,6 +18,8 @@
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumString};
 
+use super::Durability;
+
 /// How a geo topic writes its messages. Only a geo topic has a mode, and the
 /// only change between modes is `geo` to `geo_tiered` or back.
 #[derive(
@@ -46,6 +48,23 @@ pub enum GeoMode {
     GeoTiered,
 }
 
+impl GeoMode {
+    /// The durability a geo topic in this mode always has, whatever its
+    /// create names, or `None` when the mode leaves it to the topic.
+    ///
+    /// A `geo` send already waits for its upload, but the record that places
+    /// its batch is in the local journal, and a replicated acknowledgement
+    /// does not wait for that record to reach disk. A crash of every node at
+    /// once then loses the batch in every datacenter.
+    #[must_use]
+    pub const fn fixed_durability(self) -> Option<Durability> {
+        match self {
+            Self::Geo => Some(Durability::Persisted),
+            Self::GeoTiered => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +76,12 @@ mod tests {
             assert_eq!(text.parse::<GeoMode>(), Ok(mode));
             assert_eq!(text.to_uppercase().parse::<GeoMode>(), Ok(mode));
         }
+    }
+
+    #[test]
+    fn given_each_mode_when_asked_for_its_durability_should_fix_it_only_for_geo() {
+        assert_eq!(GeoMode::Geo.fixed_durability(), Some(Durability::Persisted));
+        assert_eq!(GeoMode::GeoTiered.fixed_durability(), None);
     }
 
     #[test]

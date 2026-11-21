@@ -3830,7 +3830,16 @@ pub(crate) fn create_topic(
     ) else {
         return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
     };
-    let resolved = explicit.resolved_over(&derived);
+    let mut resolved = explicit.resolved_over(&derived);
+    // The durability fields have no unset state, so a block without the key
+    // parses as replicated. The derived block holds what admission chose for
+    // the topic, which the overwrite below must keep.
+    if !explicit_map.contains_key(&HeaderKey::from(OptionKey::Durability)) {
+        resolved.durability = derived.durability;
+    }
+    if !explicit_map.contains_key(&HeaderKey::from(OptionKey::ConsumerOffsetDurability)) {
+        resolved.consumer_offset_durability = derived.consumer_offset_durability;
+    }
     let Ok(resolved_map) = resolved.to_option_map() else {
         return ApplyReply::err(CreateTopicResult::InvalidOptionValue);
     };
@@ -4950,8 +4959,8 @@ mod tests {
     };
     use iggy_binary_protocol::responses::topics::get_topic::GetTopicResponse;
     use iggy_common::{
-        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, GeoMode, HeaderKey, HeaderKind, IggyError,
-        OptionKey, OptionValue, OptionValueCodec, ServerKeyContext, StreamEncryptionKey,
+        CompressionAlgorithm, DEFAULT_SEGMENT_SIZE, Durability, GeoMode, HeaderKey, HeaderKind,
+        IggyError, OptionKey, OptionValue, OptionValueCodec, ServerKeyContext, StreamEncryptionKey,
         StreamKeyOrigin, WrappedStreamKey, derived_defaults, topic_option_keys,
     };
     use std::str::FromStr;
@@ -5828,14 +5837,31 @@ mod tests {
         explicit: &TopicCreateOptions,
         consensus_group_id: u64,
     ) -> ApplyReply {
-        let derived =
-            derived_defaults(OptionsScope::Topic, &explicit.to_option_map().unwrap()).unwrap();
+        apply_create_topic_block(
+            inner,
+            stream_id,
+            name,
+            &explicit.to_option_map().unwrap(),
+            consensus_group_id,
+        )
+    }
+
+    /// [`apply_create_topic`] with the explicit block as a client sent it,
+    /// which can leave out keys that `TopicCreateOptions` always sends.
+    fn apply_create_topic_block(
+        inner: &mut StreamsInner,
+        stream_id: u32,
+        name: &str,
+        explicit: &ResourceOptions,
+        consensus_group_id: u64,
+    ) -> ApplyReply {
+        let derived = derived_defaults(OptionsScope::Topic, explicit).unwrap();
         let request = CreateTopicWithAssignmentsRequest {
             request: WireCreateTopicRequest {
                 stream_id: WireIdentifier::numeric(stream_id),
                 partitions_count: 1,
                 name: WireName::new(name).unwrap(),
-                options: explicit.to_wire().unwrap(),
+                options: resource_options_to_wire(explicit, OptionsProvenance::All).unwrap(),
             },
             derived_options: resource_options_to_wire(&derived, OptionsProvenance::All).unwrap(),
             partitions: vec![CreatedPartitionAssignment {
@@ -5853,6 +5879,160 @@ mod tests {
             topic_type: Some(TopicType::Geo),
             ..TopicCreateOptions::default()
         }
+    }
+
+    /// The explicit block of `options` without the durability keys, as a
+    /// client that names neither sends it.
+    fn without_durability(options: &TopicCreateOptions) -> ResourceOptions {
+        let mut block = options.to_option_map().unwrap();
+        block.remove(&HeaderKey::from(OptionKey::Durability));
+        block.remove(&HeaderKey::from(OptionKey::ConsumerOffsetDurability));
+        block
+    }
+
+    /// The durability `topic_id` in stream 0 runs with, and its stored entry.
+    fn stored_durability(inner: &StreamsInner, topic_id: usize) -> (Durability, OptionValue) {
+        let topic = &inner.items[0].topics[topic_id];
+        let stored = topic
+            .options
+            .get(&HeaderKey::from(OptionKey::Durability))
+            .expect("a create stores the durability")
+            .clone();
+        (topic.resolved.runtime.durability, stored)
+    }
+
+    fn durability_entry(durability: Durability, explicit: bool) -> OptionValue {
+        let value = durability.encode().unwrap();
+        if explicit {
+            OptionValue::explicit(value)
+        } else {
+            OptionValue::derived(value)
+        }
+    }
+
+    #[test]
+    fn given_no_durability_when_applying_a_topic_create_should_store_the_derived_value() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        let geo = without_durability(&geo_topic());
+        let normal = without_durability(&TopicCreateOptions::default());
+
+        assert_eq!(
+            apply_create_topic_block(&mut inner, 0, "geo", &geo, 1).code,
+            0
+        );
+        assert_eq!(
+            apply_create_topic_block(&mut inner, 0, "normal", &normal, 2).code,
+            0
+        );
+
+        assert_eq!(
+            stored_durability(&inner, 0),
+            (
+                Durability::Persisted,
+                durability_entry(Durability::Persisted, false)
+            )
+        );
+        assert_eq!(
+            stored_durability(&inner, 1),
+            (
+                Durability::Replicated,
+                durability_entry(Durability::Replicated, false)
+            )
+        );
+        let offsets = HeaderKey::from(OptionKey::ConsumerOffsetDurability);
+        for topic in [0, 1] {
+            assert_eq!(
+                inner.items[0].topics[topic].options.get(&offsets),
+                Some(&durability_entry(Durability::Replicated, false)),
+                "only message durability depends on the topic type"
+            );
+        }
+    }
+
+    /// Apply stores what the primary committed and recomputes nothing, so a
+    /// geo topic created before its mode fixed the durability keeps the one
+    /// it was created with through a replay.
+    #[test]
+    fn given_a_committed_geo_create_naming_a_durability_when_replaying_should_store_it_as_committed()
+     {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        for (topic_id, consensus_group_id, durability) in [
+            (0, 1, Durability::Replicated),
+            (1, 2, Durability::Persisted),
+        ] {
+            let explicit = TopicCreateOptions {
+                durability,
+                ..geo_topic()
+            };
+            let name = format!("geo-{durability}");
+            assert_eq!(
+                apply_create_topic(&mut inner, 0, &name, &explicit, consensus_group_id).code,
+                0
+            );
+            assert_eq!(
+                stored_durability(&inner, topic_id),
+                (durability, durability_entry(durability, true))
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_geo_topic_without_durability_when_updating_it_should_keep_persisted() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "stream");
+        assert_eq!(
+            apply_create_topic_block(&mut inner, 0, "geo", &without_durability(&geo_topic()), 1)
+                .code,
+            0
+        );
+        let explicit = |key: OptionKey, value: HeaderValue| {
+            ResourceOptions::from([(HeaderKey::from(key), OptionValue::explicit(value))])
+        };
+        let apply = |inner: &mut StreamsInner, options: &ResourceOptions| {
+            let update = UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                name: None,
+                explicit_options: resource_options_to_wire(options, OptionsProvenance::All)
+                    .unwrap(),
+                derived_options: WireOptions::empty(),
+            };
+            StateHandler::apply(&update, inner, IggyTimestamp::now()).code
+        };
+        let not_updatable = IggyError::OptionNotUpdatable(String::new()).as_code();
+        let expiry = explicit(
+            OptionKey::MessageExpiry,
+            IggyExpiry::from(9_000_000u64).encode().unwrap(),
+        );
+        let replicated = explicit(
+            OptionKey::Durability,
+            Durability::Replicated.encode().unwrap(),
+        );
+        // A geo topic's durations are the only options an update can change.
+        let grace = explicit(
+            OptionKey::TombstoneGrace,
+            HeaderValue::from(3_600_000_000u64),
+        );
+
+        assert_eq!(apply(&mut inner, &expiry), not_updatable);
+        assert_eq!(apply(&mut inner, &replicated), not_updatable);
+        assert_eq!(apply(&mut inner, &grace), 0);
+        assert!(
+            inner.items[0].topics[0]
+                .resolved
+                .geo_durations
+                .tombstone_grace
+                .is_some()
+        );
+        assert_eq!(
+            stored_durability(&inner, 0),
+            (
+                Durability::Persisted,
+                durability_entry(Durability::Persisted, false)
+            )
+        );
     }
 
     #[test]
