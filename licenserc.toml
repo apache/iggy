@@ -58,6 +58,7 @@ excludes = [
     "**/CODEOWNERS",
     "**/gradlew",
     "**/*.md",
+    "**/*.mdx",
     "**/*.hbs",
     "**/*.gotmpl",
     "**/*.sln",

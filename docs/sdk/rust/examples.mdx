@@ -1,0 +1,94 @@
+---
+title: Examples
+description: "The Rust SDK examples in the core repository, and how to start a server to run them against."
+---
+
+In the core repository, you can find the following [examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src) using the Rust SDK.
+
+Build the SDK and server from the same checkout for unreleased changes. Start the server from the repository root in a separate terminal. The examples use `iggy`/`iggy`. For a new local instance with no `IGGY_ROOT_USERNAME` or `IGGY_ROOT_PASSWORD` overrides:
+
+```bash
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+Environment credentials take precedence over the flag, and bootstrap settings do not replace recovered credentials. `--fresh` deletes this replica's local data. Use disposable development data. A new standalone server without explicit credentials generates a root password. A new cluster requires explicit credentials.
+
+The examples are cargo example targets of the `iggy_examples` crate. Run them from the **repository root** with `cargo run --example <name>` so relative certificate paths resolve. Run each producer before its consumer. Some examples create fixed names and require fresh data when repeated. The getting-started consumer also expects stream and topic IDs `0`, so run that pair first on a fresh server. Partition IDs are **0-based**, but balanced producers and consumer groups can use multiple partitions.
+
+- **[Getting started](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/getting-started)** - the basic example which is discussed in the [getting started](/docs/introduction/getting-started) guide.
+
+  ```bash
+  cargo run --example getting-started-producer
+  cargo run --example getting-started-consumer
+  ```
+
+- **[Basic](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/basic)** - producer and consumer using the low-level `Client` trait with CLI args for transport selection (TCP/QUIC/HTTP/WebSocket).
+
+  ```bash
+  cargo run --example basic-producer
+  cargo run --example basic-consumer
+  ```
+
+- **[New SDK](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/new-sdk)** - an introduction to the high-level SDK as discussed in the [dedicated guide](/docs/sdk/rust/high-level-sdk).
+
+  ```bash
+  cargo run --example new-sdk-producer
+  cargo run --example new-sdk-consumer
+  ```
+
+- **[Stream builder](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/stream-builder)** - examples using the `IggyStream`, `IggyStreamProducer`, and `IggyStreamConsumer` builder APIs as discussed in the [stream builder guide](/docs/sdk/rust/stream-builder).
+
+  ```bash
+  cargo run --example stream-basic
+  cargo run --example stream-producer
+  cargo run --example stream-consumer
+  cargo run --example stream-producer-config
+  cargo run --example stream-consumer-config
+  ```
+
+- **[Message envelope](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-envelope)** - the example of how to send a message with a custom envelope e.g. to differentiate between different types of messages.
+
+  ```bash
+  cargo run --example message-envelope-producer
+  cargo run --example message-envelope-consumer
+  ```
+
+- **[Message headers](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-headers)** - the example of how to send a message with custom headers (typed headers, message type discrimination, client-side compression).
+
+  ```bash
+  cargo run --example message-headers-type-producer
+  cargo run --example message-headers-type-consumer
+  cargo run --example message-headers-compression-producer
+  cargo run --example message-headers-compression-consumer
+  cargo run --example typed-headers-producer
+  cargo run --example typed-headers-consumer
+  ```
+
+- **[Multi-tenant](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/multi-tenant)** - the larger example of how to structure your application to support multiple tenants (separated by the unique streams) with the different users, permissions, topics etc.
+
+  ```bash
+  cargo run --example multi-tenant-producer
+  cargo run --example multi-tenant-consumer
+  ```
+
+- **[TCP TLS](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/tcp-tls)** - TLS-encrypted TCP connections with custom CA certificates. Stop the plain server and start a TLS-enabled server from the repository root:
+
+  ```bash
+  IGGY_TCP_TLS_ENABLED=true \
+  IGGY_TCP_TLS_CERT_FILE=core/certs/iggy_cert.pem \
+  IGGY_TCP_TLS_KEY_FILE=core/certs/iggy_key.pem \
+  cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+  ```
+
+These certificates are for local testing. Then run:
+
+  ```bash
+  cargo run --example tcp-tls-producer
+  cargo run --example tcp-tls-consumer
+  ```
+
+- **[Sink data producer](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/sink-data-producer)** - generating random JSON records in bulk batches for sink connector testing.
+
+  ```bash
+  cargo run --example sink-data-producer
+  ```
