@@ -17,6 +17,7 @@
 
 use crate::args::kind::BenchmarkKindCommand;
 use crate::utils::ClientFactory;
+use crate::utils::readiness::wait_until_partitions_take_messages;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
@@ -99,6 +100,7 @@ pub trait Benchmarkable: Send {
         let client = self.client_factory().create_authenticated_client().await?;
         let reuse_streams = self.args().reuse_streams();
         let streams = client.get_streams().await?;
+        let mut streams_to_probe = Vec::new();
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");
             let stream_id: Identifier = stream_name.as_str().try_into()?;
@@ -160,6 +162,13 @@ pub trait Benchmarkable: Send {
                     },
                 )
                 .await?;
+            if topic_type.is_some() || tiered_storage.is_some() {
+                streams_to_probe.push(stream_id);
+            }
+        }
+        // After every topic is created, so their start-ups overlap.
+        for stream_id in &streams_to_probe {
+            wait_until_partitions_take_messages(&client, stream_id, partitions_count).await?;
         }
         Ok(())
     }

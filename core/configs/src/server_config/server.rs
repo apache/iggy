@@ -615,6 +615,46 @@ mod tests {
         assert!(!cfg.to_string().contains("wJalrXUtnFEMI"));
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn given_mock_s3_env_vars_when_loading_should_set_the_backend_and_its_latency() {
+        let vars = [
+            ("IGGY_TIERED_STORAGE_BACKEND", "mock_s3"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_PUT_LATENCY", "30 ms"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_GET_LATENCY", "15 ms"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_OTHER_LATENCY", "5 ms"),
+            ("IGGY_TIERED_STORAGE_MOCK_S3_BYTES_PER_SECOND", "100 MiB"),
+        ];
+        let known = ServerConfig::all_env_var_names();
+        for (name, value) in vars {
+            assert!(known.contains(&name), "{name}");
+            // SAFETY: `serial_test::serial` keeps other tests off the environment.
+            unsafe { env::set_var(name, value) };
+        }
+
+        let cfg: Result<ServerConfig, _> = Figment::new()
+            .merge(Toml::string(include_str!("../../../server/config.toml")))
+            .merge(ServerConfigEnvProvider::default())
+            .extract();
+
+        for (name, _) in vars {
+            // SAFETY: paired with the set above.
+            unsafe { env::remove_var(name) };
+        }
+        let cfg = cfg.expect("config with the env overrides deserializes");
+        let tiered = &cfg.tiered_storage;
+        assert_eq!(tiered.backend, TieredStorageBackend::MockS3);
+        assert_eq!(tiered.mock_s3.put_latency.get_duration().as_millis(), 30);
+        assert_eq!(tiered.mock_s3.get_latency.get_duration().as_millis(), 15);
+        assert_eq!(tiered.mock_s3.other_latency.get_duration().as_millis(), 5);
+        assert_eq!(
+            tiered.mock_s3.bytes_per_second.as_bytes_u64(),
+            100 * 1024 * 1024
+        );
+        cfg.validate()
+            .expect("a mock_s3 section from the environment validates");
+    }
+
     /// Every file written before geo topics has no `[geo]` table.
     #[test]
     fn given_a_config_file_without_geo_when_loading_should_have_no_origin_or_peers() {
