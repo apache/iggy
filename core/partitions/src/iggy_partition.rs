@@ -222,6 +222,9 @@ where
     /// The rewrite of this partition's placed batches into long-term
     /// segments, while this replica is the primary.
     pub(crate) long_term_rewrites: crate::long_term_rewrite::LongTermRewrites,
+    /// What this replica found of its geo topic's object while it is the
+    /// primary.
+    pub(crate) topic_object_check: crate::topic_object::TopicObjectCheck,
     /// Number of the last long-term rewrite this partition started. It
     /// outlives the view, so the late result of an earlier view's rewrite is
     /// never taken for the one in flight.
@@ -1168,6 +1171,7 @@ where
             object_delete_jobs: 0,
             manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
             long_term_rewrites: crate::long_term_rewrite::LongTermRewrites::default(),
+            topic_object_check: crate::topic_object::TopicObjectCheck::default(),
             long_term_rewrite_jobs: 0,
             long_term_backlog: Box::default(),
             manifest_publish_jobs: 0,
@@ -8860,6 +8864,23 @@ where
                     message.header(),
                     IggyError::TransientNotAccepted.as_code(),
                     "data disk is below its free-space reserve",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            // Other clusters adopt a geo topic from its object in the store,
+            // so a geo topic's partition takes no messages before its primary
+            // read the object back. Below the dedup lookup for the reason
+            // the reserve is.
+            if message.header().operation == Operation::SendMessages
+                && !self.takes_messages_of_its_topic()
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "the primary has not read the object of the geo topic yet",
                     reply.take(),
                 )
                 .await;

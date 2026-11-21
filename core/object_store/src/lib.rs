@@ -22,8 +22,9 @@
 //! builds the keys of a partition's objects from its recorded
 //! [`ObjectPrefix`], and [`SegmentMetadata`] is the user metadata of a
 //! segment's `.log` object. [`StoreIdentity`] is the object that claims a
-//! root for one cluster. [`TierExecutor`] is how uploads, cold reads and
-//! deletes hand work to the tier service of a shard.
+//! root for one cluster, and [`TopicObject`] is the object that describes a
+//! geo topic to the clusters that read the store. [`TierExecutor`] is how
+//! uploads, cold reads and deletes hand work to the tier service of a shard.
 //!
 //! [`FsStore`] keeps objects as files in a directory, and [`s3::S3Store`]
 //! keeps them in an S3 bucket. [`Backend`] is the one of them that a
@@ -53,6 +54,7 @@ pub mod s3;
 mod segment_metadata;
 mod store;
 mod tier;
+mod topic;
 
 pub use backend::Backend;
 pub use error::{ErrorClass, ObjectStoreError};
@@ -60,7 +62,7 @@ pub use fresh::{FreshObject, FreshObjectId, is_fresh_object};
 pub use fs::FsStore;
 pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
-pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject};
+pub use layout::{KeyLayout, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
 pub use memory::MemoryStore;
 pub use read_only::ReadOnlyStore;
@@ -76,4 +78,8 @@ pub use store::{
 pub use tier::{
     ScopeCancelled, TierExecutor, TierJobCancelled, TierJobClass, TierJobHandle, TierJobRequest,
     TierScope, TierScopeToken,
+};
+pub use topic::{
+    MAX_TOPIC_OBJECT_LEN, TopicCompression, TopicGeoMode, TopicObject, TopicObjectError, TopicRead,
+    TopicState,
 };

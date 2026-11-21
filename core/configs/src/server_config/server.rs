@@ -625,6 +625,7 @@ mod tests {
 
         assert!(cfg.geo.origin.is_empty());
         assert!(cfg.geo.peers.is_empty());
+        assert_eq!(cfg.geo.tombstone_grace.get_duration().as_secs(), 24 * 3600);
         cfg.validate().expect("a config without geo validates");
     }
 
@@ -633,6 +634,7 @@ mod tests {
     fn given_geo_env_vars_when_loading_should_set_the_origin_and_a_peer() {
         let vars = [
             ("IGGY_GEO_ORIGIN", "dc-a"),
+            ("IGGY_GEO_TOMBSTONE_GRACE", "2 h"),
             ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b"),
             ("IGGY_GEO_PEERS_0_BACKEND", "s3"),
             ("IGGY_GEO_PEERS_0_BUCKET", "iggy-dc-b"),
@@ -659,6 +661,7 @@ mod tests {
         }
         let cfg = cfg.expect("config with the env overrides deserializes");
         assert_eq!(cfg.geo.origin, "dc-a");
+        assert_eq!(cfg.geo.tombstone_grace.get_duration().as_secs(), 2 * 3600);
         let [peer] = cfg.geo.peers.as_slice() else {
             panic!("one peer: {}", cfg.geo);
         };

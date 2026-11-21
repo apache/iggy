@@ -1563,6 +1563,15 @@ handshake_grace = "10 s"
 # letters, digits and '-', starts with a letter and does not end with '-'. A
 # cluster with peers needs it.
 #origin = "dc-a"
+# How long a deleted geo topic keeps its tombstone and its objects in this
+# cluster's [tiered_storage] store. The cluster publishes one object for each
+# of its geo topics under "<prefix>/meta/topics/". When a geo topic is
+# deleted, the metadata primary turns its object into a tombstone, which tells
+# the peers that the topic is gone. After this grace, it deletes the topic's
+# segments and manifests, and then the tombstone. It checks once a minute, so
+# the objects can stay up to a minute longer. Make it longer than any outage
+# of a peer after which the peer must still see the tombstone.
+#tombstone_grace = "24 h"
 # One table per peer, at most 16. A peer's store is the [tiered_storage] store
 # of the other cluster, with the same keys. The server only reads it: it never
 # puts, deletes or creates an object there, so read-only credentials are
