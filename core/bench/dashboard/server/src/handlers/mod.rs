@@ -19,28 +19,27 @@ pub mod omb;
 
 use crate::artifacts;
 use crate::cache::{SeriesBuilder, SeriesKey};
+use crate::embed_cache::EmbedCache;
 use crate::github::StarCount;
-use crate::render::{ChartType, EmbedChart, PngRenderPool, without_raw_mark};
+use crate::render::{EmbedChart, PngRenderPool, without_raw_mark};
 use crate::{cache::BenchmarkCache, error::IggyBenchDashboardServerError};
 use actix_files::NamedFile;
-use actix_web::body::MessageBody;
 use actix_web::http::header::{
     CacheControl, CacheDirective, ContentDisposition, ContentType, DispositionParam,
     DispositionType,
 };
-use actix_web::{HttpRequest, HttpResponse, get, web};
+use actix_web::{HttpRequest, HttpResponse, get, mime, web};
 use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::embed::{ChartType, PngSize};
 use bench_dashboard_shared::github::GithubStars;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use charming::Chart;
 use serde::Deserialize;
 use std::fmt;
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
-use tempfile::NamedTempFile;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -49,9 +48,12 @@ type Result<T> = std::result::Result<T, IggyBenchDashboardServerError>;
 /// Same-origin copy of the ECharts build that `charming` bundles, placed in the frontend dist
 /// by `frontend/scripts/copy_echarts.sh`.
 const ECHARTS_SCRIPT_PATH: &str = "/vendor/echarts-5.5.1.min.js";
-const EMBED_CACHE_DIR: &str = "embed";
-/// How long a browser or a proxy can keep an embed page or PNG.
-const EMBED_MAX_AGE_SECS: u32 = 3600;
+/// How long a browser or a proxy can keep an iggy-bench PNG. A report seldom changes after upload,
+/// and the max age bounds how long a reader sees the old one.
+const IGGY_BENCH_PNG_MAX_AGE_SECS: u32 = 86_400;
+/// Shorter than the PNG max age, because the page loads `ECHARTS_SCRIPT_PATH`, and an upgrade that
+/// changes the ECharts version removes that file. A page kept for longer shows an empty frame.
+const IGGY_BENCH_PAGE_MAX_AGE_SECS: u32 = 3600;
 const ARTIFACTS_CACHE_DIR: &str = "artifacts";
 const UNKNOWN_API_PATH: &str = "Unknown API path";
 
@@ -59,6 +61,7 @@ pub struct AppState {
     pub cache: Arc<BenchmarkCache>,
     pub series_builder: Arc<SeriesBuilder>,
     pub render_pool: Arc<PngRenderPool>,
+    pub embed_cache: Arc<EmbedCache>,
     pub cache_dir: PathBuf,
     pub config: Arc<DashboardConfig>,
 }
@@ -331,18 +334,14 @@ fn default_theme() -> String {
     "dark".to_string()
 }
 
-const DEFAULT_PNG_WIDTH: u32 = 1600;
-const DEFAULT_PNG_HEIGHT: u32 = 1200;
-/// Bounds the pixel buffer of one render at 64 MiB.
-const MAX_PNG_SIDE: u32 = 4096;
 const IGGY_BENCH_PAGE_TITLE: &str = "Iggy Benchmark Chart";
 
 fn default_png_width() -> u32 {
-    DEFAULT_PNG_WIDTH
+    PngSize::DEFAULT.width()
 }
 
 fn default_png_height() -> u32 {
-    DEFAULT_PNG_HEIGHT
+    PngSize::DEFAULT.height()
 }
 
 fn default_legend() -> bool {
@@ -379,22 +378,23 @@ impl EmbedQuery {
 }
 
 impl PngQuery {
-    fn check_size(&self) -> Result<()> {
-        let sides = 1..=MAX_PNG_SIDE;
-        if sides.contains(&self.width) && sides.contains(&self.height) {
-            return Ok(());
-        }
-        Err(IggyBenchDashboardServerError::BadRequest(format!(
-            "Invalid size '{}x{}': width and height must be between 1 and {MAX_PNG_SIDE}",
-            self.width, self.height
-        )))
+    /// The checked theme, size and legend of the query.
+    fn variant(&self) -> Result<PngVariant> {
+        Ok(PngVariant {
+            theme: self.theme.parse()?,
+            size: PngSize::try_from((self.width, self.height))?,
+            legend: self.legend,
+        })
     }
+}
 
-    /// Only the default size goes to the disk cache, so the sizes that clients pick can't fill
-    /// the disk.
-    fn is_cached_size(&self) -> bool {
-        self.width == DEFAULT_PNG_WIDTH && self.height == DEFAULT_PNG_HEIGHT
-    }
+/// One PNG of a chart. The server draws only the sizes of [`PngSize::ALL`], so each chart has a
+/// fixed set of variants, and the cache holds a fixed number of PNG files per chart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PngVariant {
+    theme: PngTheme,
+    size: PngSize,
+    legend: bool,
 }
 
 /// The look of a PNG chart, named as in the `theme` query parameter.
@@ -405,36 +405,84 @@ struct PngTheme {
     transparent: bool,
 }
 
+impl PngTheme {
+    const ALL: [Self; 4] = [
+        Self {
+            dark: true,
+            transparent: false,
+        },
+        Self {
+            dark: false,
+            transparent: false,
+        },
+        Self {
+            dark: true,
+            transparent: true,
+        },
+        Self {
+            dark: false,
+            transparent: true,
+        },
+    ];
+
+    const fn name(self) -> &'static str {
+        match (self.dark, self.transparent) {
+            (true, false) => "dark",
+            (false, false) => "light",
+            (true, true) => "dark_nobg",
+            (false, true) => "light_nobg",
+        }
+    }
+}
+
 impl FromStr for PngTheme {
     type Err = IggyBenchDashboardServerError;
 
     fn from_str(theme: &str) -> Result<Self> {
-        let (dark, transparent) = match theme {
-            "dark" => (true, false),
-            "light" => (false, false),
-            "dark_nobg" => (true, true),
-            "light_nobg" => (false, true),
-            _ => {
-                return Err(IggyBenchDashboardServerError::BadRequest(format!(
+        Self::ALL
+            .into_iter()
+            .find(|png_theme| png_theme.name() == theme)
+            .ok_or_else(|| {
+                IggyBenchDashboardServerError::BadRequest(format!(
                     "Invalid theme: '{theme}'. Must be 'dark', 'light', 'dark_nobg', or 'light_nobg'"
-                )));
-            }
-        };
-        Ok(Self { dark, transparent })
+                ))
+            })
     }
 }
 
-/// `run` starts the file name, so the PNG files of two runs never share a name.
-fn png_cache_path(cache_dir: &Path, run: impl fmt::Display, query: &PngQuery) -> PathBuf {
-    let legend_suffix = if query.legend { "" } else { "_nolegend" };
-    let filename = format!(
-        "{run}_{chart_type}_{w}x{h}_{theme}{legend_suffix}.png",
-        chart_type = query.chart_type,
-        w = query.width,
-        h = query.height,
-        theme = query.theme,
-    );
-    cache_dir.join(filename)
+impl fmt::Display for PngTheme {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// The name of a cached PNG. `run` starts it, so the files of two runs never share a name. The
+/// chart type and the variant come from a checked query, so each run has a fixed set of names.
+fn png_file_name(
+    run: impl fmt::Display,
+    chart_type: impl fmt::Display,
+    variant: PngVariant,
+) -> String {
+    let PngVariant {
+        theme,
+        size,
+        legend,
+    } = variant;
+    let legend_suffix = if legend { "" } else { "_nolegend" };
+    format!("{run}_{chart_type}_{size}_{theme}{legend_suffix}.png")
+}
+
+/// The name of a cached embed page. A page has a dark and a light look only, so any other theme in
+/// the query gives the name of the dark page.
+fn page_file_name(
+    run: impl fmt::Display,
+    chart_type: impl fmt::Display,
+    dark: bool,
+    download: bool,
+) -> String {
+    let theme = if dark { "dark" } else { "light" };
+    let action = if download { "_download" } else { "" };
+    format!("{run}_{chart_type}_{theme}{action}.html")
 }
 
 #[get("/embed/{uuid}/chart.png")]
@@ -454,127 +502,96 @@ pub async fn embed_chart_png(
         IggyBenchDashboardServerError::InvalidUuid(format!("Invalid UUID format: '{uuid_str}'"))
     })?;
     let chart_type: ChartType = query.chart_type.parse()?;
-    let theme: PngTheme = query.theme.parse()?;
-    query.check_size()?;
+    let variant = query.variant()?;
+    // A cached PNG stays on the disk after its run is gone, so the lookup comes first.
+    let EmbedReport {
+        json_path,
+        file_prefix,
+    } = embed_report(&data, &uuid, &uuid_str)?;
 
-    let embed_dir = data.cache_dir.join(EMBED_CACHE_DIR);
-    let cached_path = query
-        .is_cached_size()
-        .then(|| png_cache_path(&embed_dir, uuid, &query));
-    if let Some(png) = read_cached_png(cached_path.as_deref()).await {
-        info!("{}: Serving cached PNG for '{}'", client_addr, uuid_str);
-        return Ok(png_response(png));
-    }
-
-    let (json_path, subtext) = embed_report(&data, &uuid, &uuid_str)?;
-    let load = data
-        .render_pool
-        .load_chart(json_path, chart_type, subtext, theme.dark);
-    let png = render_png(&data, load, &query, theme, cached_path).await?;
-
-    info!(
-        "{}: Generated PNG for '{}' ({}x{})",
-        client_addr, uuid_str, query.width, query.height
-    );
-    Ok(png_response(png))
-}
-
-/// The report file of a run, and the subtext of its embed charts from the loaded light report,
-/// whose throughput lines match the dashboard pages.
-fn embed_report(data: &AppState, uuid: &Uuid, uuid_str: &str) -> Result<(PathBuf, String)> {
-    let not_found =
-        || IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"));
-    let json_path = data
-        .cache
-        .get_benchmark_json_path(uuid)
-        .ok_or_else(not_found)?;
-    let report = data
-        .cache
-        .get_benchmark_report_light(uuid)
-        .ok_or_else(not_found)?;
-    Ok((json_path, report.subtext()))
-}
-
-/// The PNG at `cached_path`. `None` without a path, before a render stored the file, and for a
-/// file that can't be read, so the caller renders the chart again, as after a failed store.
-async fn read_cached_png(cached_path: Option<&Path>) -> Option<Vec<u8>> {
-    let cached_path = cached_path?.to_path_buf();
-    let target = cached_path.clone();
-    let read = web::block(move || std::fs::read(target))
-        .await
-        .unwrap_or_else(|e| Err(io::Error::other(e)));
-    match read {
-        Ok(png) => Some(png),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-        Err(e) => {
-            warn!("Failed to read cached PNG {}: {}", cached_path.display(), e);
-            None
-        }
-    }
-}
-
-fn png_response(png: impl MessageBody + 'static) -> HttpResponse {
-    HttpResponse::Ok()
-        .content_type("image/png")
-        .insert_header(embed_cache_control())
-        .body(png)
-}
-
-/// The chart of a run never changes, but the OMB setup line comes from a sidecar that can. The max
-/// age bounds how long a browser or a proxy shows an old line.
-fn embed_cache_control() -> CacheControl {
-    CacheControl(vec![
-        CacheDirective::Public,
-        CacheDirective::MaxAge(EMBED_MAX_AGE_SECS),
-    ])
-}
-
-/// Renders the chart of `load` at the size of `query`, and stores the PNG at `cached_path` if there
-/// is one. A failed store is only logged, so the next request renders again.
-///
-/// With a `cached_path`, the load, render and store wait for the cache turn, which starts with a
-/// second cache read. A request that missed the cache while another request rendered the same PNG
-/// gets that file, so the one render thread does not run the same render again.
-async fn render_png(
-    data: &AppState,
-    load: impl Future<Output = Result<EmbedChart>>,
-    query: &PngQuery,
-    theme: PngTheme,
-    cached_path: Option<PathBuf>,
-) -> Result<web::Bytes> {
-    let _turn = match cached_path {
-        Some(_) => Some(data.render_pool.cache_turn().await),
-        None => None,
+    let name = png_file_name(file_prefix, chart_type, variant);
+    let runs = Arc::clone(&data.cache);
+    let render_pool = Arc::clone(&data.render_pool);
+    let build = async move {
+        let subtext = embed_subtext(&runs, &uuid)?;
+        let chart = render_pool
+            .load_chart(json_path, chart_type, subtext, variant.theme.dark)
+            .await?;
+        render_png(&render_pool, chart, variant).await
     };
-    if let Some(png) = read_cached_png(cached_path.as_deref()).await {
-        info!("Serving the PNG that another request rendered while this one waited");
-        return Ok(web::Bytes::from(png));
-    }
+    let png = data.embed_cache.get_or_build(&name, build).await?;
+    Ok(embed_response(
+        mime::IMAGE_PNG,
+        png,
+        IGGY_BENCH_PNG_MAX_AGE_SECS,
+    ))
+}
 
-    let chart = png_chart(load.await?, query, theme)?;
-    let png_bytes = web::Bytes::from(
-        data.render_pool
-            .render_png(chart, query.width, query.height, theme.dark)
-            .await
-            .map_err(IggyBenchDashboardServerError::InternalError)?,
-    );
+/// What the embeds of a run take from the loaded runs before they read the cache.
+struct EmbedReport {
+    json_path: PathBuf,
+    /// Starts the names of the cached files of the run. The stamp of the report file is in it, so
+    /// a report that changes gets new files after the next load.
+    file_prefix: String,
+}
 
-    if let Some(cached_path) = cached_path {
-        let png = png_bytes.clone();
-        let target = cached_path.clone();
-        let stored = web::block(move || store_png(&target, &png))
-            .await
-            .unwrap_or_else(|e| Err(io::Error::other(e)));
-        if let Err(e) = stored {
-            warn!("Failed to cache PNG to {}: {}", cached_path.display(), e);
-        }
-    }
-    Ok(png_bytes)
+fn embed_report(data: &AppState, uuid: &Uuid, uuid_str: &str) -> Result<EmbedReport> {
+    let (json_path, stamp) = data.cache.get_report_file(uuid).ok_or_else(|| {
+        IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid_str}' not found"))
+    })?;
+    Ok(EmbedReport {
+        json_path,
+        file_prefix: format!("{uuid}_{stamp}"),
+    })
+}
+
+/// The subtext of the embed charts from the loaded light report, whose throughput lines match the
+/// dashboard pages. Only a build needs it, so a request that the cache answers copies no report.
+fn embed_subtext(runs: &BenchmarkCache, uuid: &Uuid) -> Result<String> {
+    let report = runs.get_benchmark_report_light(uuid).ok_or_else(|| {
+        IggyBenchDashboardServerError::NotFound(format!("Benchmark '{uuid}' not found"))
+    })?;
+    Ok(report.subtext())
+}
+
+fn embed_response(content_type: mime::Mime, body: web::Bytes, max_age_secs: u32) -> HttpResponse {
+    HttpResponse::Ok()
+        .content_type(content_type)
+        .insert_header(CacheControl(vec![
+            CacheDirective::Public,
+            CacheDirective::MaxAge(max_age_secs),
+        ]))
+        .body(body)
+}
+
+/// Renders `chart` as the PNG `variant`.
+async fn render_png(
+    render_pool: &PngRenderPool,
+    chart: EmbedChart,
+    variant: PngVariant,
+) -> Result<web::Bytes> {
+    let PngVariant {
+        theme,
+        size,
+        legend,
+    } = variant;
+    let chart = png_chart(chart, size.width(), size.height(), legend, theme)?;
+    let png = render_pool
+        .render_png(chart, size.width(), size.height(), theme.dark)
+        .await
+        .map_err(IggyBenchDashboardServerError::InternalError)?;
+    Ok(web::Bytes::from(png))
 }
 
 /// Strips the interactive parts of the chart, puts the hardware line above its subtext, and
 /// scales its text and legend to the image size.
-fn png_chart(chart: EmbedChart, query: &PngQuery, theme: PngTheme) -> Result<Chart> {
+fn png_chart(
+    chart: EmbedChart,
+    width: u32,
+    height: u32,
+    legend: bool,
+    theme: PngTheme,
+) -> Result<Chart> {
     let EmbedChart {
         chart,
         hardware_line,
@@ -607,7 +624,7 @@ fn png_chart(chart: EmbedChart, query: &PngQuery, theme: PngTheme) -> Result<Cha
             obj.insert("backgroundColor".to_string(), serde_json::json!("#ffffff"));
         }
         // Scale text relative to image dimensions (baseline: 1200x800)
-        let scale = (query.width as f64 / 1200.0).min(query.height as f64 / 800.0);
+        let scale = (width as f64 / 1200.0).min(height as f64 / 800.0);
         if let Some(t) = obj
             .get_mut("title")
             .and_then(|t| t.as_array_mut())
@@ -645,17 +662,17 @@ fn png_chart(chart: EmbedChart, query: &PngQuery, theme: PngTheme) -> Result<Cha
             g.insert("left".to_string(), serde_json::json!("12%"));
             g.insert("top".to_string(), serde_json::json!("20%"));
             g.insert("bottom".to_string(), serde_json::json!("10%"));
-            if !query.legend {
+            if !legend {
                 g.insert("right".to_string(), serde_json::json!("10%"));
             } else if series_count > 20 {
                 g.insert("right".to_string(), serde_json::json!("25%"));
             }
         }
-        if !query.legend {
+        if !legend {
             obj.remove("legend");
         } else if let Some(leg) = obj.get_mut("legend").and_then(first_legend) {
             {
-                let available_height = query.height as f64 * 0.75;
+                let available_height = height as f64 * 0.75;
                 let entry_height = available_height / series_count.max(1) as f64;
                 // In a small image the cap falls below the floor, and `clamp` panics on that.
                 let font_size = (entry_height * 0.55).min(10.0 * scale).max(6.0).round() as u32;
@@ -705,21 +722,6 @@ fn plain_titles(titles: &mut [serde_json::Value]) {
     }
 }
 
-/// Writes through a temp file renamed into place, so a parallel reader or a failed write never
-/// leaves a partial PNG at `cached_path` for later requests. The temp file is next to
-/// `cached_path`, because a rename can't move a file to another file system.
-fn store_png(cached_path: &Path, png: &[u8]) -> io::Result<()> {
-    let embed_dir = cached_path
-        .parent()
-        .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))?;
-    std::fs::create_dir_all(embed_dir)?;
-    let mut temp_file = NamedTempFile::new_in(embed_dir)?;
-    temp_file.write_all(png)?;
-    temp_file.as_file().sync_all()?;
-    temp_file.persist(cached_path)?;
-    Ok(())
-}
-
 #[get("/embed/{uuid}")]
 pub async fn embed_chart(
     data: web::Data<AppState>,
@@ -737,33 +739,45 @@ pub async fn embed_chart(
         IggyBenchDashboardServerError::InvalidUuid(format!("Invalid UUID format: '{uuid_str}'"))
     })?;
 
-    let is_dark = query.theme != "light";
+    let dark = query.theme != "light";
     let chart_type: ChartType = query.chart_type.parse()?;
+    let download = query.is_download();
+    let EmbedReport {
+        json_path,
+        file_prefix,
+    } = embed_report(&data, &uuid, &uuid_str)?;
 
-    let (json_path, subtext) = embed_report(&data, &uuid, &uuid_str)?;
-    let EmbedChart {
-        chart,
-        hardware_line,
-    } = data
-        .render_pool
-        .load_chart(json_path, chart_type, subtext, is_dark)
-        .await?;
-
-    let option = serde_json::to_string(&chart).map_err(|e| {
-        IggyBenchDashboardServerError::InternalError(format!(
-            "Failed to serialize chart to JSON: {e}"
-        ))
-    })?;
-    Ok(EmbedPage {
-        option: &option,
-        hardware_line: &hardware_line,
-        dark: is_dark,
-        title: IGGY_BENCH_PAGE_TITLE,
-        download_name: query
-            .is_download()
-            .then(|| format!("{uuid}_{chart_type}.png")),
-    }
-    .response())
+    let name = page_file_name(file_prefix, chart_type, dark, download);
+    let runs = Arc::clone(&data.cache);
+    let render_pool = Arc::clone(&data.render_pool);
+    let build = async move {
+        let subtext = embed_subtext(&runs, &uuid)?;
+        let EmbedChart {
+            chart,
+            hardware_line,
+        } = render_pool
+            .load_chart(json_path, chart_type, subtext, dark)
+            .await?;
+        let option = serde_json::to_string(&chart).map_err(|e| {
+            IggyBenchDashboardServerError::InternalError(format!(
+                "Failed to serialize chart to JSON: {e}"
+            ))
+        })?;
+        let page = EmbedPage {
+            option: &option,
+            hardware_line: &hardware_line,
+            dark,
+            title: IGGY_BENCH_PAGE_TITLE,
+            download_name: download.then(|| format!("{uuid}_{chart_type}.png")),
+        };
+        Ok::<_, IggyBenchDashboardServerError>(web::Bytes::from(page.html()))
+    };
+    let page = data.embed_cache.get_or_build(&name, build).await?;
+    Ok(embed_response(
+        mime::TEXT_HTML,
+        page,
+        IGGY_BENCH_PAGE_MAX_AGE_SECS,
+    ))
 }
 
 /// A page with one interactive chart, for an iframe, or with `action=download` a page that saves
@@ -780,13 +794,6 @@ struct EmbedPage<'a> {
 }
 
 impl EmbedPage<'_> {
-    fn response(&self) -> HttpResponse {
-        HttpResponse::Ok()
-            .content_type("text/html")
-            .insert_header(embed_cache_control())
-            .body(self.html())
-    }
-
     fn html(&self) -> String {
         let option = script_safe(self.option);
         let hardware_line = script_string(self.hardware_line);
@@ -940,24 +947,31 @@ mod tests {
     use super::*;
     use crate::cache::read_report;
     use crate::config;
+    use crate::embed_cache::tests::names_in;
+    use crate::embed_cache::{
+        BYTES_PER_GIB, DEFAULT_MAX_GIB, EMBED_CACHE_DIR, FileStamp, TEST_BUILD, stamped_name,
+    };
     use crate::render::RAW_MARK;
+    use actix_web::dev::ServiceResponse;
     use actix_web::http::StatusCode;
-    use actix_web::http::header::CONTENT_TYPE;
+    use actix_web::http::header::{CACHE_CONTROL, CONTENT_TYPE};
     use actix_web::{App, test};
     use bench_dashboard_shared::metrics::GroupMetrics;
     use bench_dashboard_shared::series::BenchmarkSeries;
     use bench_dashboard_shared::summary::BenchmarkSummary;
     use bench_report::group_metrics_kind::GroupMetricsKind;
     use charming::component::Title;
+    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const FIXTURE_RESULTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/results");
     const SHIPPED_CONFIG: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../dashboard.toml");
     /// An old cluster run left its bench.log in a sibling directory without a report.
     const RUN_DIR_WITHOUT_REPORT: &str = "rc1-cluster3-pinned-producer-20p-800MB-bench-log";
     /// 8 producers, 8 consumers, and the groups of producers, consumers, and both.
-    const PRODUCER_AND_CONSUMER_DIR: &str = "old-0.4.202-pinned-producer-and-consumer";
+    pub(super) const PRODUCER_AND_CONSUMER_DIR: &str = "old-0.4.202-pinned-producer-and-consumer";
     const PRODUCER_AND_CONSUMER_RUN: &str = "6b1e288a-9155-4da3-8d3f-ec4d929de3d3";
     const TWO_PRODUCERS_DIR: &str = "phase1a-pinned-producer-2p-20MB";
     const TWO_PRODUCERS_RUN: &str = "b5c560ad-1ad2-49f0-88dd-c29db75126aa";
@@ -988,6 +1002,7 @@ mod tests {
             ),
             cache,
             render_pool: Arc::new(PngRenderPool::new().expect("the render thread starts")),
+            embed_cache: Arc::new(EmbedCache::temporary()),
             cache_dir: std::env::temp_dir(),
             config: Arc::new(config),
         }
@@ -1103,10 +1118,7 @@ mod tests {
 
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
             assert_eq!(
-                response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok()),
+                header(&response, CONTENT_TYPE.as_str()),
                 Some(JSON_CONTENT_TYPE),
                 "{uri}"
             );
@@ -1445,11 +1457,46 @@ mod tests {
     pub(super) const PNG_CONTENT_TYPE: &str = "image/png";
     pub(super) const HTML_CONTENT_TYPE: &str = "text/html";
 
+    /// `state` with `cache_dir` and an embed cache in it, which takes the files that are there.
     pub(super) fn app_state_with_cache_dir(state: AppState, cache_dir: &Path) -> AppState {
+        let embed_cache = EmbedCache::open(
+            cache_dir.join(EMBED_CACHE_DIR),
+            DEFAULT_MAX_GIB * BYTES_PER_GIB,
+            TEST_BUILD,
+        )
+        .expect("the embed cache opens");
         AppState {
             cache_dir: cache_dir.to_path_buf(),
+            embed_cache: Arc::new(embed_cache),
             ..state
         }
+    }
+
+    /// The path in the embed directory of [`app_state_with_cache_dir`] of the cached file `name`.
+    pub(super) fn cached_path(embed_dir: &Path, name: &str) -> PathBuf {
+        embed_dir.join(stamped_name(TEST_BUILD, name))
+    }
+
+    /// Starts the names of the cached files of the fixture run `run` in `run_dir`.
+    pub(super) fn fixture_file_prefix(run_dir: &str, run: &str) -> String {
+        let report = Path::new(FIXTURE_RESULTS_DIR)
+            .join(run_dir)
+            .join(REPORT_FILE);
+        let stamp = FileStamp::of_file(&report).expect("the fixture report is readable");
+        format!("{run}_{stamp}")
+    }
+
+    /// A render pool whose render thread fails, for a test in which every PNG comes from the cache.
+    pub(super) fn render_pool_without_renderer() -> PngRenderPool {
+        PngRenderPool::with_renderer(|_, _, _, _| Err("no render expected".to_owned()))
+            .expect("the render threads start")
+    }
+
+    pub(super) fn header<'a, B>(response: &'a ServiceResponse<B>, name: &str) -> Option<&'a str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
     }
 
     fn embed_uri(uuid: &str, query: &str) -> String {
@@ -1466,11 +1513,11 @@ mod tests {
             .into_inner()
     }
 
-    fn content_type(response: &actix_web::dev::ServiceResponse) -> Option<&str> {
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
+    /// The name of the cached PNG of `run` for the valid PNG query `query`.
+    pub(super) fn png_name(run: impl fmt::Display, query: &str) -> String {
+        let query = png_query(query);
+        let variant = query.variant().expect("the PNG query is valid");
+        png_file_name(run, &query.chart_type, variant)
     }
 
     #[actix_web::test]
@@ -1494,7 +1541,10 @@ mod tests {
         .await;
 
         assert!(response.status().is_success(), "{}", response.status());
-        assert_eq!(content_type(&response), Some(HTML_CONTENT_TYPE));
+        assert_eq!(
+            header(&response, CONTENT_TYPE.as_str()),
+            Some(HTML_CONTENT_TYPE)
+        );
         let body = test::read_body(response).await;
         let page = std::str::from_utf8(&body).expect("the page is UTF-8");
         assert!(page.contains("var option = {"), "{page}");
@@ -1662,7 +1712,7 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn given_png_size_out_of_range_when_requesting_png_should_answer_bad_request_without_caching()
+    async fn given_size_outside_presets_when_requesting_png_should_answer_bad_request_without_caching()
      {
         let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
         let app = test::init_service(
@@ -1678,8 +1728,9 @@ mod tests {
         for query in [
             "width=0",
             "height=0",
-            "width=4097",
-            "height=4097",
+            "width=800&height=600",
+            "width=1920",
+            "width=4096&height=4096",
             "width=4294967295&height=4294967295",
         ] {
             let response = test::call_service(
@@ -1703,61 +1754,241 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn given_png_size_at_bounds_when_checking_should_accept_it() {
-        for query in [
-            "width=1&height=1",
-            "width=4096&height=4096",
-            "width=1&height=4096",
-        ] {
-            assert!(png_query(query).check_size().is_ok(), "{query}");
+    async fn given_each_png_variant_when_checking_its_query_should_accept_it_and_name_its_own_file()
+    {
+        let mut names = HashSet::new();
+        for theme in PngTheme::ALL {
+            for size in PngSize::ALL {
+                for legend in [true, false] {
+                    let variant = PngVariant {
+                        theme,
+                        size,
+                        legend,
+                    };
+                    let query = format!(
+                        "theme={theme}&width={}&height={}&legend={legend}",
+                        size.width(),
+                        size.height()
+                    );
+
+                    assert_eq!(png_query(&query).variant().ok(), Some(variant), "{query}");
+                    names.insert(png_file_name(
+                        PRODUCER_AND_CONSUMER_RUN,
+                        ChartType::Latency,
+                        variant,
+                    ));
+                }
+            }
+        }
+
+        assert_eq!(names.len(), PngTheme::ALL.len() * PngSize::ALL.len() * 2);
+        assert_eq!(
+            png_query("").variant().ok().map(|variant| variant.size),
+            Some(PngSize::DEFAULT)
+        );
+    }
+
+    #[actix_web::test]
+    async fn given_cached_png_of_each_size_when_requesting_png_should_serve_it_without_render() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
+        std::fs::create_dir(&embed_dir).expect("the embed directory is created");
+        let queries = PngSize::ALL.map(|size| {
+            format!(
+                "type=latency&width={}&height={}",
+                size.width(),
+                size.height()
+            )
+        });
+        let file_prefix = fixture_file_prefix(PRODUCER_AND_CONSUMER_DIR, PRODUCER_AND_CONSUMER_RUN);
+        // The same report under a run id that the server doesn't list.
+        let gone_run_prefix =
+            file_prefix.replace(PRODUCER_AND_CONSUMER_RUN, &Uuid::nil().to_string());
+        for query in &queries {
+            for prefix in [&file_prefix, &gone_run_prefix] {
+                std::fs::write(
+                    cached_path(&embed_dir, &png_name(prefix, query)),
+                    CACHED_PNG,
+                )
+                .expect("the cached PNG is written");
+            }
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(AppState {
+                    render_pool: Arc::new(render_pool_without_renderer()),
+                    ..app_state_with_cache_dir(app_state(), cache_dir.path())
+                }))
+                .service(embed_chart_png),
+        )
+        .await;
+
+        for query in &queries {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&png_uri(PRODUCER_AND_CONSUMER_RUN, query))
+                    .to_request(),
+            )
+            .await;
+            assert!(
+                response.status().is_success(),
+                "{query}: {}",
+                response.status()
+            );
+            assert_eq!(
+                header(&response, CONTENT_TYPE.as_str()),
+                Some(PNG_CONTENT_TYPE)
+            );
+            assert_eq!(test::read_body(response).await, CACHED_PNG, "{query}");
+
+            // The cache keeps the PNG of a run that is gone, and the lookup answers first.
+            let response = test::call_service(
+                &app,
+                test::TestRequest::get()
+                    .uri(&png_uri(&Uuid::nil().to_string(), query))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{query}");
         }
     }
 
     #[actix_web::test]
-    async fn given_cached_png_when_requesting_png_should_serve_it_only_at_default_size() {
+    async fn given_embed_page_built_when_report_breaks_should_serve_cached_page() {
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
         let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
-        let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
-        std::fs::create_dir(&embed_dir).expect("the embed directory is created");
-        // An unknown run, so a request that skips the cache answers 404 before any render.
-        let uuid = Uuid::nil();
-        let default_size = "type=latency";
-        let other_size = "type=latency&width=800&height=600";
-        for query in [default_size, other_size] {
-            std::fs::write(
-                png_cache_path(&embed_dir, uuid, &png_query(query)),
-                CACHED_PNG,
-            )
-            .expect("the cached PNG is written");
-        }
+        copy_fixture_run(PRODUCER_AND_CONSUMER_DIR, results_dir.path());
+        let state =
+            app_state_with_cache_dir(app_state_with_results(results_dir.path()), cache_dir.path());
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(embed_chart),
+        )
+        .await;
+        let uri = embed_uri(PRODUCER_AND_CONSUMER_RUN, "type=throughput&theme=light");
+        let first =
+            test::call_and_read_body(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+        std::fs::write(
+            results_dir
+                .path()
+                .join(PRODUCER_AND_CONSUMER_DIR)
+                .join(REPORT_FILE),
+            "{",
+        )
+        .expect("the report is overwritten");
+
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+
+        assert!(response.status().is_success(), "{}", response.status());
+        assert_eq!(test::read_body(response).await, first);
+    }
+
+    #[actix_web::test]
+    async fn given_report_rewritten_when_runs_reload_should_build_embed_page_and_png_again() {
+        const OLD_HARDWARE_LINE: &str =
+            "atlas @ AMD Ryzen 9 5950X 16-Core Processor (server server-0.4.202)";
+        const NEW_HARDWARE_LINE: &str =
+            "rewritten-host @ AMD Ryzen 9 5950X 16-Core Processor (server server-0.4.202)";
+        let results_dir = tempfile::tempdir().expect("a temporary directory is created");
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
+        copy_fixture_run(PRODUCER_AND_CONSUMER_DIR, results_dir.path());
+        let renders = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&renders);
+        let render_pool = PngRenderPool::with_renderer(move |_, _, _, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Ok(b"rendered png".to_vec())
+        })
+        .expect("the render threads start");
+        let state = AppState {
+            render_pool: Arc::new(render_pool),
+            ..app_state_with_cache_dir(app_state_with_results(results_dir.path()), cache_dir.path())
+        };
+        let runs = Arc::clone(&state.cache);
+        let app = test::init_service(
+            App::new()
+                .app_data(web::Data::new(state))
+                .service(embed_chart_png)
+                .service(embed_chart),
+        )
+        .await;
+        let page_uri = embed_uri(PRODUCER_AND_CONSUMER_RUN, "type=throughput&theme=light");
+        let png_uri = png_uri(PRODUCER_AND_CONSUMER_RUN, "type=throughput");
+        let get = |uri: &str| {
+            test::call_and_read_body(&app, test::TestRequest::get().uri(uri).to_request())
+        };
+        let first_page = get(&page_uri).await;
+        get(&png_uri).await;
+        let report_path = results_dir
+            .path()
+            .join(PRODUCER_AND_CONSUMER_DIR)
+            .join(REPORT_FILE);
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("the report is readable"))
+                .expect("the report is JSON");
+        report["hardware"]["identifier"] = serde_json::Value::from("rewritten-host");
+        std::fs::write(&report_path, report.to_string()).expect("the report is rewritten");
+        // Until the reload, the light report and the cached files stay as they were.
+        get(&png_uri).await;
+        assert_eq!(renders.load(Ordering::SeqCst), 1);
+
+        runs.load().expect("the results directory is readable");
+        let second_page = get(&page_uri).await;
+        get(&png_uri).await;
+
+        let first_page = std::str::from_utf8(&first_page).expect("the page is UTF-8");
+        let second_page = std::str::from_utf8(&second_page).expect("the page is UTF-8");
+        assert!(first_page.contains(OLD_HARDWARE_LINE), "{first_page}");
+        assert!(second_page.contains(NEW_HARDWARE_LINE), "{second_page}");
+        assert_eq!(renders.load(Ordering::SeqCst), 2);
+    }
+
+    #[actix_web::test]
+    async fn given_page_themes_when_requesting_embed_page_should_cache_one_page_per_look() {
+        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
         let app = test::init_service(
             App::new()
                 .app_data(web::Data::new(app_state_with_cache_dir(
                     app_state(),
                     cache_dir.path(),
                 )))
-                .service(embed_chart_png),
+                .service(embed_chart),
         )
         .await;
 
-        let response = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri(&png_uri(&uuid.to_string(), default_size))
-                .to_request(),
-        )
-        .await;
-        assert!(response.status().is_success(), "{}", response.status());
-        assert_eq!(content_type(&response), Some(PNG_CONTENT_TYPE));
-        assert_eq!(test::read_body(response).await, CACHED_PNG);
+        for query in [
+            "theme=dark",
+            "theme=dark_nobg",
+            "theme=anything&action=view",
+            "theme=light",
+            "theme=light&action=download",
+        ] {
+            let uri = embed_uri(PRODUCER_AND_CONSUMER_RUN, query);
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&uri).to_request()).await;
+            assert!(
+                response.status().is_success(),
+                "{uri}: {}",
+                response.status()
+            );
+            assert_eq!(
+                header(&response, CACHE_CONTROL.as_str()),
+                Some("public, max-age=3600"),
+                "{uri}"
+            );
+        }
 
-        let response = test::call_service(
-            &app,
-            test::TestRequest::get()
-                .uri(&png_uri(&uuid.to_string(), other_size))
-                .to_request(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let cached = names_in(&cache_dir.path().join(EMBED_CACHE_DIR));
+        let file_prefix = fixture_file_prefix(PRODUCER_AND_CONSUMER_DIR, PRODUCER_AND_CONSUMER_RUN);
+        assert_eq!(
+            cached,
+            ["dark", "light", "light_download"].map(|look| stamped_name(
+                TEST_BUILD,
+                &format!("{file_prefix}_latency_{look}.html")
+            ))
+        );
     }
 
     #[actix_web::test]
@@ -1830,28 +2061,6 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn given_partial_png_in_cache_when_storing_should_replace_it_without_leaving_temp_files()
-    {
-        let cache_dir = tempfile::tempdir().expect("a temporary directory is created");
-        let embed_dir = cache_dir.path().join(EMBED_CACHE_DIR);
-        std::fs::create_dir(&embed_dir).expect("the embed directory is created");
-        let cached_path = embed_dir.join("run.png");
-        std::fs::write(&cached_path, &CACHED_PNG[..CACHED_PNG.len() / 2])
-            .expect("the partial PNG is written");
-
-        store_png(&cached_path, CACHED_PNG).expect("the PNG is stored");
-
-        assert_eq!(
-            std::fs::read(&cached_path).expect("the cached PNG is readable"),
-            CACHED_PNG
-        );
-        let files = std::fs::read_dir(&embed_dir)
-            .expect("the embed directory is readable")
-            .count();
-        assert_eq!(files, 1);
-    }
-
-    #[actix_web::test]
     async fn given_raw_mark_in_title_or_hardware_line_when_preparing_png_should_keep_them_plain_text()
      {
         let embed = EmbedChart {
@@ -1863,8 +2072,10 @@ mod tests {
             hardware_line: format!("\"{RAW_MARK}b\"+alert(2){RAW_MARK}"),
         };
         let theme: PngTheme = "dark".parse().expect("dark is a PNG theme");
+        let size = PngSize::DEFAULT;
 
-        let chart = png_chart(embed, &png_query(""), theme).expect("the PNG chart is prepared");
+        let chart = png_chart(embed, size.width(), size.height(), true, theme)
+            .expect("the PNG chart is prepared");
 
         let option: serde_json::Value = serde_json::from_str(&chart.to_string())
             .expect("the renderer gets the chart as JSON without script");
@@ -1935,9 +2146,9 @@ mod tests {
         }
     }
 
-    fn png_legend_text_size(query: &str) -> f64 {
+    fn png_legend_text_size(width: u32, height: u32) -> f64 {
         let theme: PngTheme = "dark".parse().expect("dark is a PNG theme");
-        let chart = png_chart(two_producers_latency_chart(), &png_query(query), theme)
+        let chart = png_chart(two_producers_latency_chart(), width, height, true, theme)
             .expect("the PNG chart is prepared");
         let option = serde_json::to_value(&chart).expect("the chart serializes");
         option["legend"]["textStyle"]["fontSize"]
@@ -1948,14 +2159,14 @@ mod tests {
     /// 3 series, so the text size is the cap of 10 px times the scale of the image.
     #[actix_web::test]
     async fn given_single_legend_when_preparing_png_should_scale_its_text() {
-        assert_eq!(png_legend_text_size("width=800&height=600"), 7.0);
-        assert_eq!(png_legend_text_size(""), 13.0);
+        assert_eq!(png_legend_text_size(800, 600), 7.0);
+        assert_eq!(png_legend_text_size(1600, 1200), 13.0);
     }
 
     /// At 300 x 200 the cap of 2.5 px is below the floor of 6 px.
     #[actix_web::test]
     async fn given_small_png_size_when_preparing_png_should_keep_legend_text_at_floor() {
-        assert_eq!(png_legend_text_size("width=300&height=200"), 6.0);
+        assert_eq!(png_legend_text_size(300, 200), 6.0);
     }
 
     #[actix_web::test]
