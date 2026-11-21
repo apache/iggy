@@ -46,13 +46,13 @@ const WRITTEN_PARTITIONS: usize = 16;
 const REPLICAS: u8 = 3;
 /// `[partition] prepare_queue_depth` as shipped.
 const PREPARE_QUEUE_DEPTH: usize = 32;
-/// Measured at 9732 B: the 5.9 KB `IggyPartition` box, 66 B of slot and index
-/// entry in the shard, and 3.7 KB of heap. The 412 B of headroom catches the
-/// 3 KB view-change table held inline, or all 1.2 KB of the boxed session
+/// Measured at 10020 B: the 5.9 KB `IggyPartition` box, 66 B of slot and
+/// index entry in the shard, and 4.0 KB of heap. The 412 B of headroom catches
+/// the 3 KB view-change table held inline, or all 1.2 KB of the boxed session
 /// state. It does not catch one boxed field held inline, because the largest
 /// takes 360 B. Const asserts next to `IggyPartition` and `VsrConsensus` pin
 /// each of those fields to the size of one pointer.
-const IDLE_PARTITION_BYTES_MAX: usize = 9 * 1024 + 928;
+const IDLE_PARTITION_BYTES_MAX: usize = 10 * 1024 + 192;
 /// A partition in its own `Box` takes a whole mimalloc size class: 6,144 B is
 /// one, and one byte more falls into the 7,168 B class.
 const BOXED_PARTITION_BYTES_MAX: usize = 6 * 1024;

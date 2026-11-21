@@ -33,9 +33,9 @@ const TOPICS: &str = "topics";
 /// Decimal digits of `u64::MAX`: the most that an id takes, and the width of
 /// a zero-padded offset.
 const U64_DIGITS: usize = 20;
-/// The longest part of a key after the root: the `.index` key of a segment
-/// whose four ids and start offset are all `u64::MAX`.
-const LONGEST_SUFFIX_LEN: usize = 5 * (1 + U64_DIGITS) + 1 + SegmentObject::Index.extension().len();
+/// The longest part of a key after the root: the `.index` key of a long-term
+/// segment whose four ids and two offsets are all `u64::MAX`.
+const LONGEST_SUFFIX_LEN: usize = 6 * (1 + U64_DIGITS) + 1 + SegmentObject::Index.extension().len();
 /// The longest root that leaves room for every key under it.
 const MAX_ROOT_LEN: usize = MAX_KEY_LEN - LONGEST_SUFFIX_LEN;
 /// The most segments that a key adds after the root: `meta`, four ids and
@@ -114,12 +114,29 @@ impl TopicKey {
     }
 }
 
+/// The parts of the key of one object of a long-term segment: a segment of a
+/// partition that places its batches.
+///
+/// The key names where the segment ends as well as where it starts. Two
+/// segments from one offset that end at different offsets are then two
+/// objects, and a segment that takes the place of several never has the key
+/// of one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct LongTermKey {
+    pub prefix: ObjectPrefix,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub object: SegmentObject,
+}
+
 /// Builds and parses the keys of tiered storage under the bucket prefix from
 /// configuration, its root:
 ///
 /// ```text
 /// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.log
 /// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}.index
+/// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}-{end_offset:020}.log
+/// {root}/{stream_id}/{topic_id}/{partition_id}/{created_revision}/{start_offset:020}-{end_offset:020}.index
 /// {root}/meta/{stream_id}/{topic_id}/{partition_id}/{created_revision}/manifest.bin
 /// {root}/meta/identity
 /// {root}/meta/fresh/{replica:02x}/{object_id:032x}
@@ -127,8 +144,10 @@ impl TopicKey {
 /// ```
 ///
 /// The zero-padded offset matches the segment's file name on disk, so a
-/// listing returns the segments of an incarnation in offset order. Ids are
-/// decimal and never `meta`, so no segment key falls under `{root}/meta/`.
+/// listing returns the segments of an incarnation in offset order. The keys
+/// with two offsets are those of long-term segments, and neither parser
+/// accepts a key of the other kind. Ids are decimal and never `meta`, so no
+/// segment key falls under `{root}/meta/`.
 /// Under `{root}/meta/`, a manifest key goes on with an id, and `identity`,
 /// `fresh` and `topics` are not ids, so no two kinds share a key. The
 /// cluster's identity is not part of any key: the store identity object
@@ -141,9 +160,10 @@ impl TopicKey {
 /// Roots never nest in the keys of another root, so two clusters can share a
 /// bucket under roots such as `iggy` and `iggy/b`. A listing under a root
 /// still returns the keys of every longer root, so retire and the orphan
-/// sweep delete only the keys that [`Self::parse_segment_key`] accepts and
-/// the keys that [`Self::manifest_key`] builds, and the sweep of geo topic
-/// objects acts only on the keys that [`Self::parse_topic_key`] accepts.
+/// sweep delete only the keys that [`Self::parse_segment_key`] or
+/// [`Self::parse_long_term_key`] accepts and the keys that
+/// [`Self::manifest_key`] builds, and the sweep of geo topic objects acts
+/// only on the keys that [`Self::parse_topic_key`] accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyLayout {
     root: String,
@@ -155,18 +175,18 @@ impl KeyLayout {
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] when `root` is not a valid key, for
     /// example when it is empty or ends with `/`. The same error comes for a
-    /// root longer than 913 bytes or with more than 248 segments, because
+    /// root longer than 892 bytes or with more than 248 segments, because
     /// the longest key under it would then break [`MAX_KEY_LEN`] or
     /// [`MAX_KEY_SEGMENTS`]. It also comes for a root with a segment after
     /// its first that is all digits or `meta`. The keys under the shorter
     /// root continue with such a segment, so the two roots would share keys.
     pub fn new(root: impl Into<String>) -> Result<Self, ObjectStoreError> {
         // The docs and the reasons below spell out these limits.
-        const _: () = assert!(MAX_ROOT_LEN == 913 && MAX_ROOT_SEGMENTS == 248);
+        const _: () = assert!(MAX_ROOT_LEN == 892 && MAX_ROOT_SEGMENTS == 248);
         let root = root.into();
         validate_key(&root)?;
         let reason = if root.len() > MAX_ROOT_LEN {
-            "is longer than 913 bytes, the most that a root can take"
+            "is longer than 892 bytes, the most that a root can take"
         } else if root.split('/').count() > MAX_ROOT_SEGMENTS {
             "has more than 248 segments, the most that a root can take"
         } else if root.split('/').skip(1).any(continues_another_root) {
@@ -202,6 +222,18 @@ impl KeyLayout {
             "{}{:0width$}.{}",
             self.incarnation_prefix(&key.prefix),
             key.start_offset,
+            key.object.extension(),
+            width = U64_DIGITS
+        )
+    }
+
+    #[must_use]
+    pub fn long_term_key(&self, key: &LongTermKey) -> String {
+        format!(
+            "{}{:0width$}-{:0width$}.{}",
+            self.incarnation_prefix(&key.prefix),
+            key.start_offset,
+            key.end_offset,
             key.object.extension(),
             width = U64_DIGITS
         )
@@ -336,6 +368,39 @@ impl KeyLayout {
     /// [`Self::segment_key`] builds again byte for byte parses.
     #[must_use]
     pub fn parse_segment_key(&self, key: &str) -> Option<SegmentKey> {
+        let (prefix, stem, object) = self.parse_incarnation_object(key)?;
+        Some(SegmentKey {
+            prefix,
+            start_offset: parse_offset(stem)?,
+            object,
+        })
+    }
+
+    /// The long-term segment object that a listed key names, or `None` when
+    /// this layout did not build the key for one, as for the key of a
+    /// segment that names only its start. Parsing is strict, so only a key
+    /// that [`Self::long_term_key`] builds again byte for byte parses, and
+    /// only one whose segment does not end before it starts.
+    #[must_use]
+    pub fn parse_long_term_key(&self, key: &str) -> Option<LongTermKey> {
+        let (prefix, stem, object) = self.parse_incarnation_object(key)?;
+        let (start_offset, end_offset) = stem.split_once('-')?;
+        let start_offset = parse_offset(start_offset)?;
+        let end_offset = parse_offset(end_offset)?;
+        (end_offset >= start_offset).then_some(LongTermKey {
+            prefix,
+            start_offset,
+            end_offset,
+            object,
+        })
+    }
+
+    /// The incarnation, the name before the extension and the kind of an
+    /// object directly under an incarnation prefix of this root.
+    fn parse_incarnation_object<'key>(
+        &self,
+        key: &'key str,
+    ) -> Option<(ObjectPrefix, &'key str, SegmentObject)> {
         let mut parts = key
             .strip_prefix(self.root.as_str())?
             .strip_prefix('/')?
@@ -353,11 +418,7 @@ impl KeyLayout {
         let object = SegmentObject::ALL
             .into_iter()
             .find(|object| object.extension() == extension)?;
-        Some(SegmentKey {
-            prefix,
-            start_offset: parse_offset(stem)?,
-            object,
-        })
+        Some((prefix, stem, object))
     }
 }
 
@@ -378,7 +439,7 @@ fn parse_id(part: &str) -> Option<u64> {
     }
 }
 
-/// A start offset as [`KeyLayout`] writes it: exactly 20 decimal digits.
+/// An offset as [`KeyLayout`] writes it: exactly 20 decimal digits.
 fn parse_offset(stem: &str) -> Option<u64> {
     if stem.len() == U64_DIGITS && stem.bytes().all(|byte| byte.is_ascii_digit()) {
         stem.parse().ok()
@@ -618,6 +679,100 @@ mod tests {
     }
 
     #[test]
+    fn given_a_long_term_segment_when_building_keys_should_name_both_offsets() {
+        let log = LongTermKey {
+            prefix: PREFIX,
+            start_offset: 1_000,
+            end_offset: 1_999,
+            object: SegmentObject::Log,
+        };
+        let index = LongTermKey {
+            object: SegmentObject::Index,
+            ..log
+        };
+
+        assert_eq!(
+            layout().long_term_key(&log),
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999.log"
+        );
+        assert_eq!(
+            layout().long_term_key(&index),
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999.index"
+        );
+        assert!(
+            layout()
+                .long_term_key(&log)
+                .starts_with(&layout().incarnation_prefix(&PREFIX))
+        );
+    }
+
+    #[test]
+    fn given_built_long_term_keys_when_parsing_should_round_trip() {
+        for (start_offset, end_offset) in [(0, 0), (0, 1), (1_000, 1_999), (0, u64::MAX)] {
+            for object in SegmentObject::ALL {
+                let segment = LongTermKey {
+                    prefix: PREFIX,
+                    start_offset,
+                    end_offset,
+                    object,
+                };
+                let key = layout().long_term_key(&segment);
+
+                assert!(validate_key(&key).is_ok(), "{key}");
+                assert_eq!(layout().parse_long_term_key(&key), Some(segment), "{key}");
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_key_of_the_other_kind_when_parsing_should_return_none() {
+        let layout = layout();
+        for object in SegmentObject::ALL {
+            let segment = layout.segment_key(&SegmentKey {
+                prefix: PREFIX,
+                start_offset: 1_000,
+                object,
+            });
+            let long_term = layout.long_term_key(&LongTermKey {
+                prefix: PREFIX,
+                start_offset: 1_000,
+                end_offset: 1_999,
+                object,
+            });
+
+            assert_eq!(layout.parse_long_term_key(&segment), None, "{segment}");
+            assert_eq!(layout.parse_segment_key(&long_term), None, "{long_term}");
+        }
+    }
+
+    #[test]
+    fn given_keys_layout_did_not_build_when_parsing_as_long_term_should_return_none() {
+        let layout = layout();
+        for key in [
+            "tenant/iggy/meta/1/22/0/4096/manifest.bin",
+            "tenant/iggy2/1/22/0/4096/00000000000000001000-00000000000000001999.log",
+            "tenant/iggy/01/22/0/4096/00000000000000001000-00000000000000001999.log",
+            "tenant/iggy/1/22/0/4096/1000-1999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-1999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-000000000000000001999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-99999999999999999999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000_00000000000000001999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999-00000000000000002999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-.log",
+            "tenant/iggy/1/22/0/4096/-00000000000000001999.log",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999.timeindex",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999.log.tmp",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999",
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000001999.log/x",
+            "tenant/iggy/1/22/0/00000000000000001000-00000000000000001999.log",
+            // The segment would end before it starts.
+            "tenant/iggy/1/22/0/4096/00000000000000001000-00000000000000000999.log",
+        ] {
+            assert_eq!(layout.parse_long_term_key(key), None, "{key}");
+        }
+    }
+
+    #[test]
     fn given_offsets_when_building_keys_should_sort_in_offset_order() {
         let offsets = [0, 9, 10, 999, 1_000, u64::MAX];
         let keys: Vec<String> = offsets
@@ -656,9 +811,10 @@ mod tests {
     }
 
     fn widest_keys(layout: &KeyLayout) -> [String; 3] {
-        let index = layout.segment_key(&SegmentKey {
+        let index = layout.long_term_key(&LongTermKey {
             prefix: WIDEST,
             start_offset: u64::MAX,
+            end_offset: u64::MAX,
             object: SegmentObject::Index,
         });
         let topic = layout.topic_key(&TopicKey {
@@ -726,7 +882,7 @@ mod tests {
 
         assert!(matches!(
             KeyLayout::new(root),
-            Err(ObjectStoreError::InvalidKey { reason, .. }) if reason.contains("913 bytes")
+            Err(ObjectStoreError::InvalidKey { reason, .. }) if reason.contains("892 bytes")
         ));
     }
 

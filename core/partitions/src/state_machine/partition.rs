@@ -236,13 +236,16 @@ where
         let advance = (command.kind == crate::tiered_floor::ADVANCE_TIERED_FLOOR)
             .then(|| crate::tiered_floor::AdvanceTieredFloor::try_from(command.payload).ok())
             .flatten();
+        let long_term_before = self.long_term_progress();
+        let long_term_at_stake = self.long_term_segments_at_stake(command);
         let long_term_floor = self.long_term_floor();
         match self.state_machines.apply(header.op, command) {
             Ok(Applied::Changed) => {
                 if let Some(advance) = advance {
                     self.note_tiered_advance(advance);
                 }
-                self.note_long_term_command(command.kind);
+                self.note_long_term_command(long_term_before);
+                self.queue_dead_long_term_objects(&long_term_at_stake);
                 self.note_long_term_advance(long_term_floor);
                 true
             }

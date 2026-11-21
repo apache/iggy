@@ -942,7 +942,7 @@ fn stored_segments(store: &Shared) -> Vec<u64> {
         .store()
         .keys()
         .iter()
-        .filter_map(|key| layout().parse_segment_key(key))
+        .filter_map(|key| layout().parse_long_term_key(key))
         .filter(|key| key.object == SegmentObject::Log)
         .map(|key| key.start_offset)
         .collect();
@@ -990,7 +990,9 @@ fn given_a_primary_change_at_each_step_of_a_rewrite_when_the_next_primary_goes_o
         };
 
         // The segment is stored, and the primary stops before it sends the
-        // command. The next primary finds the segment and commits it.
+        // command. The next primary rewrites more than the stored segment
+        // holds: its key names another range, so the stored one is left for
+        // the delete once the floor passes its end.
         let stored_up_to = send_round(&mut sim);
         let leader = await_primary(&mut sim);
         held.set(true);
@@ -1011,10 +1013,11 @@ fn given_a_primary_change_at_each_step_of_a_rewrite_when_the_next_primary_goes_o
         let committed = send_round(&mut sim);
         request_rewrite(&sim, leader);
         settle_floors_at(&mut sim, committed);
+        assert!(stored_up_to < committed, "seed {seed:#x}");
         assert_eq!(
             long_term_log(&sim, leader),
-            [(0, stored_up_to), (stored_up_to + 1, committed)],
-            "the next primary took the stored segment as it is, seed {seed:#x}"
+            [(0, committed)],
+            "the next primary rewrote from the floor, seed {seed:#x}"
         );
 
         // The command reaches the backups, and the primary stops before it

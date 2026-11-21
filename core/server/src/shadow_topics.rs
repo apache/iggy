@@ -1252,6 +1252,22 @@ mod tests {
         ));
     }
 
+    /// The peer's topic places its batches, and a partition that does cannot
+    /// follow a peer's log. The shadow topic is a topic of this cluster that
+    /// is no geo topic, so its partitions take the log.
+    #[test]
+    fn given_the_shadow_of_a_topic_that_places_batches_when_deriving_its_runtime_options_should_place_none()
+     {
+        assert_eq!(object(key(), "orders", NOW).geo_mode, TopicGeoMode::Geo);
+        let (inner, stream_id) = adopted();
+        let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC_SLOT];
+
+        let runtime = iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options);
+
+        assert!(!runtime.places_batches);
+        assert!(!runtime.geo_topic);
+    }
+
     #[test]
     fn given_a_shadow_partition_when_naming_its_peer_log_should_use_the_peers_incarnation() {
         let (inner, stream_id) = adopted();

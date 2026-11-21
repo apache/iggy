@@ -34,8 +34,8 @@ pub mod offset_storage;
 mod partition_storage;
 mod peer_log;
 pub use peer_log::{
-    AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestRefusal,
-    remove_retired_indexes,
+    AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestContradiction,
+    PeerManifestRefusal,
 };
 mod persistence;
 mod poll_plan;
@@ -59,8 +59,9 @@ mod segment_upload;
 pub use object_delete::{
     DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, MAX_QUEUED_INCARNATIONS,
     ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
-    ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation, delete_objects,
-    delete_segments, list_segment_starts, sweep_segments, sweepable,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation,
+    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
+    sweep_long_term, sweep_segments, sweepable,
 };
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
@@ -84,6 +85,17 @@ pub use segment_upload::{
     UploadError, UploadOutcome, upload_segment,
 };
 pub mod long_term;
+mod long_term_delete;
+pub use long_term_delete::{
+    LONG_TERM_DELETE_DELAY, LONG_TERM_SWEEP_DEAD_MAX, LONG_TERM_SWEEP_INTERVAL, LongTermObject,
+    SegmentSpan, SweptLongTerm,
+};
+mod long_term_merge;
+pub use long_term_merge::{
+    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_MERGE_PRESSURE_BYTES,
+    LONG_TERM_MERGE_READ_BYTES, LONG_TERM_SEGMENTS_PRESSURE, LongTermMerger, MergeError,
+    MergeLimits, MergeOutcome, MergePass, MergeRun, MergeSettled, SegmentMerge,
+};
 mod long_term_rewrite;
 pub use long_term_rewrite::{
     BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteError,

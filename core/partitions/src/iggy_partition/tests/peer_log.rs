@@ -30,8 +30,8 @@ use crate::journal::MessageLookup;
 use crate::poll_plan::{PollPlan, PollReadResult, PollTier};
 use crate::segment_chain::PrefixAccess;
 use crate::{
-    PeerLogError, PeerManifestApplied, PeerManifestRefusal, RemoteObjects, RemoteSegments,
-    SegmentLocation, remove_retired_indexes, upload_segment,
+    PeerLogError, PeerManifestContradiction, PeerManifestRefusal, RemoteObjects, RemoteSegments,
+    SegmentLocation, upload_segment,
 };
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -49,7 +49,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 /// The root of the origin cluster's store.
-const ORIGIN_ROOT: &str = "dc-a";
+pub(super) const ORIGIN_ROOT: &str = "dc-a";
 
 /// The incarnation of the follower's own partition, unlike the origin's.
 const FOLLOWER_REVISION: u64 = 33;
@@ -59,7 +59,7 @@ const FOLLOWER_REVISION: u64 = 33;
 /// offset 4, which no manifest lists yet.
 const ORIGIN_FLOOR: u64 = 3;
 
-fn origin_layout() -> KeyLayout {
+pub(super) fn origin_layout() -> KeyLayout {
     KeyLayout::new(ORIGIN_ROOT).unwrap()
 }
 
@@ -74,7 +74,7 @@ fn object_key(start_offset: u64, object: SegmentObject) -> String {
 /// The origin after every sealed segment went through an upload into
 /// `store` and its floor advance committed, with the manifest it then
 /// stored beside them.
-async fn origin_in(
+pub(super) async fn origin_in(
     store: &FsStore,
 ) -> (
     tempfile::TempDir,
@@ -116,9 +116,18 @@ async fn stored_manifest(store: &impl ObjectStore) -> PartitionManifest {
 
 /// A partition of stream 5 that follows the origin's partition, reading
 /// `objects` under the origin's root.
-fn follower(
+pub(super) fn follower(
     objects: Rc<dyn RemoteObjects>,
 ) -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
+    let (directory, mut partition) = unattached();
+    partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
+    partition.set_remote_segments(Rc::new(RemoteSegments::new(objects, origin_layout())));
+    (directory, partition)
+}
+
+/// A partition of stream 5 with a directory and an incarnation of its own,
+/// which follows nothing yet.
+pub(super) fn unattached() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
     let directory = tempfile::tempdir().unwrap();
     let namespace = IggyNamespace::new(5, 2, 0);
     let consensus = VsrConsensus::new(
@@ -137,12 +146,10 @@ fn follower(
     ));
     partition.set_created_revision(FOLLOWER_REVISION);
     partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-    partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
-    partition.set_remote_segments(Rc::new(RemoteSegments::new(objects, origin_layout())));
     (directory, partition)
 }
 
-fn plan<B: MessageBus>(
+pub(super) fn plan<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     strategy: PollingStrategy,
     count: u32,
@@ -152,9 +159,9 @@ fn plan<B: MessageBus>(
 }
 
 /// The offsets of the messages an accepted read returns, and their bytes.
-type Polled = (Option<u64>, u32, Vec<u8>);
+pub(super) type Polled = (Option<u64>, u32, Vec<u8>);
 
-fn accepted<B: MessageBus>(
+pub(super) fn accepted<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     result: PollReadResult,
 ) -> Result<Polled, IggyError> {
@@ -168,7 +175,7 @@ fn accepted<B: MessageBus>(
     Ok((last, count, bytes))
 }
 
-async fn polled<B: MessageBus>(
+pub(super) async fn polled<B: MessageBus>(
     partition: &mut IggyPartition<B>,
     strategy: PollingStrategy,
     count: u32,
@@ -178,7 +185,7 @@ async fn polled<B: MessageBus>(
     accepted(partition, result).unwrap()
 }
 
-fn listed(start_offset: u64, end_offset: u64) -> ManifestSegment {
+pub(super) fn listed(start_offset: u64, end_offset: u64) -> ManifestSegment {
     ManifestSegment {
         start_offset,
         end_offset,
@@ -193,7 +200,7 @@ fn listed(start_offset: u64, end_offset: u64) -> ManifestSegment {
 
 /// A manifest of the origin's incarnation that lists `segments`, by first
 /// and last offset, above `trim_point`.
-fn manifest_of(trim_point: Option<u64>, segments: &[(u64, u64)]) -> PartitionManifest {
+pub(super) fn manifest_of(trim_point: Option<u64>, segments: &[(u64, u64)]) -> PartitionManifest {
     let segments: Vec<_> = segments
         .iter()
         .map(|(start, end)| listed(*start, *end))
@@ -206,6 +213,7 @@ fn manifest_of(trim_point: Option<u64>, segments: &[(u64, u64)]) -> PartitionMan
             .map(|segment| segment.end_offset)
             .or(trim_point),
         trim_point,
+        segments_keyed_by_both_offsets: false,
         segments,
     }
 }
@@ -230,7 +238,7 @@ fn first_segment_trimmed(manifest: &PartitionManifest) -> PartitionManifest {
 
 /// The segments of the log by first and last offset, where they are, and
 /// the offsets a poll sees.
-fn log_shape<B: MessageBus>(
+pub(super) fn log_shape<B: MessageBus>(
     partition: &IggyPartition<B>,
 ) -> (Vec<(u64, u64, SegmentLocation)>, u64, bool) {
     (
@@ -246,10 +254,10 @@ fn log_shape<B: MessageBus>(
 }
 
 /// A store whose first read waits for `release`.
-struct Gated {
-    store: FsStore,
-    gate: RefCell<Option<oneshot::Receiver<()>>>,
-    waiting: Cell<bool>,
+pub(super) struct Gated {
+    pub(super) store: FsStore,
+    pub(super) gate: RefCell<Option<oneshot::Receiver<()>>>,
+    pub(super) waiting: Cell<bool>,
 }
 
 impl RemoteObjects for Gated {
@@ -270,10 +278,10 @@ impl RemoteObjects for Gated {
     }
 }
 
-type InFlight = Pin<Box<dyn Future<Output = PollReadResult>>>;
+pub(super) type InFlight = Pin<Box<dyn Future<Output = PollReadResult>>>;
 
 /// Run `poll` until it waits on the gated store.
-async fn until_gated(gated: &Gated, poll: &mut InFlight) {
+pub(super) async fn until_gated(gated: &Gated, poll: &mut InFlight) {
     while !gated.waiting.get() {
         assert!(futures::poll!(poll.as_mut()).is_pending());
         compio::time::sleep(Duration::from_millis(1)).await;
@@ -377,7 +385,7 @@ async fn given_a_follower_when_it_polls_takes_manifests_and_runs_every_tiering_p
         manifest.clone(),
         first_segment_trimmed(&manifest),
     ] {
-        follower.apply_peer_manifest(&next).unwrap();
+        let _ = follower.apply_peer_manifest(&next).unwrap();
         for strategy in [
             PollingStrategy::offset(0),
             PollingStrategy::timestamp(IggyTimestamp::from(0)),
@@ -433,7 +441,7 @@ async fn given_a_poll_in_flight_when_a_newer_manifest_grows_the_log_should_compl
         waiting: Cell::new(false),
     });
     let (_directory, mut follower) = follower(gated.clone());
-    follower
+    let _ = follower
         .apply_peer_manifest(&first_segment_only(&manifest))
         .unwrap();
     let mut poll: InFlight =
@@ -469,7 +477,7 @@ async fn given_a_read_of_a_segment_a_trim_dropped_when_completing_should_refuse_
     let store = FsStore::new(bucket.path());
     let (_origin_directory, mut origin, manifest) = Box::pin(origin_in(&store)).await;
     let (directory, mut follower) = follower(Rc::new(FsStore::new(bucket.path())));
-    follower.apply_peer_manifest(&manifest).unwrap();
+    let _ = follower.apply_peer_manifest(&manifest).unwrap();
     let from_front = plan(&mut follower, PollingStrategy::offset(0), 10)
         .execute()
         .await;
@@ -499,7 +507,7 @@ async fn given_a_read_of_a_segment_a_trim_dropped_when_completing_should_refuse_
         Box::pin(polled(&mut follower, PollingStrategy::offset(0), 10)).await,
         new_front
     );
-    Box::pin(remove_retired_indexes(&trimmed)).await;
+    Box::pin(trimmed.remove_retired_indexes()).await;
     assert!(!directory.path().join(format!("{:020}.index", 0)).exists());
 }
 
@@ -516,12 +524,12 @@ async fn given_a_poll_in_flight_when_a_trim_drops_its_segment_and_the_origin_del
         waiting: Cell::new(false),
     });
     let (_directory, mut follower) = follower(gated.clone());
-    follower.apply_peer_manifest(&manifest).unwrap();
+    let _ = follower.apply_peer_manifest(&manifest).unwrap();
     let mut poll: InFlight =
         Box::pin(plan(&mut follower, PollingStrategy::offset(0), 10).execute());
     Box::pin(until_gated(&gated, &mut poll)).await;
 
-    follower
+    let _ = follower
         .apply_peer_manifest(&first_segment_trimmed(&manifest))
         .unwrap();
     let deleted = Box::pin(store.delete(&[
@@ -549,7 +557,7 @@ async fn given_a_poll_in_flight_when_a_trim_drops_its_segment_and_the_origin_del
 async fn given_manifests_that_break_the_log_when_applying_should_refuse_each_and_change_nothing() {
     let (_directory, mut follower) = follower(Rc::new(MemoryStore::new()));
     let applied = manifest_of(Some(9), &[(10, 19), (20, 29)]);
-    follower.apply_peer_manifest(&applied).unwrap();
+    let _ = follower.apply_peer_manifest(&applied).unwrap();
     let before = log_shape(&follower);
     let applied_state = follower.peer_log().unwrap().applied();
 
@@ -581,8 +589,10 @@ async fn given_manifests_that_break_the_log_when_applying_should_refuse_each_and
             PeerManifestRefusal::GoesBack {
                 floor: Some(19),
                 trim_point: Some(9),
+                segments: 1,
                 applied_floor: Some(29),
                 applied_trim_point: Some(9),
+                applied_segments: 2,
             },
         ),
         (
@@ -591,8 +601,10 @@ async fn given_manifests_that_break_the_log_when_applying_should_refuse_each_and
             PeerManifestRefusal::GoesBack {
                 floor: Some(29),
                 trim_point: None,
+                segments: 3,
                 applied_floor: Some(29),
                 applied_trim_point: Some(9),
+                applied_segments: 2,
             },
         ),
         (
@@ -621,12 +633,18 @@ async fn given_manifests_that_break_the_log_when_applying_should_refuse_each_and
         (
             "a kept segment that changed",
             changed_hash,
-            PeerManifestRefusal::Diverged { start_offset: 20 },
+            PeerManifestRefusal::Diverged {
+                start_offset: 20,
+                contradiction: PeerManifestContradiction::DoesNotAddUp,
+            },
         ),
         (
             "a kept segment cut in two",
             manifest_of(Some(14), &[(15, 19), (20, 29)]),
-            PeerManifestRefusal::Diverged { start_offset: 10 },
+            PeerManifestRefusal::Diverged {
+                start_offset: 10,
+                contradiction: PeerManifestContradiction::StartsOffBoundary,
+            },
         ),
     ];
     for (case, manifest, refusal) in cases {
@@ -757,7 +775,7 @@ async fn given_a_partition_with_a_log_of_its_own_when_following_a_peer_should_re
 async fn given_a_follower_when_a_client_sends_messages_should_refuse_them_and_journal_nothing() {
     let (mut partition, _) = recording_partition();
     partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
-    partition
+    let _ = partition
         .apply_peer_manifest(&manifest_of(None, &[(0, 3)]))
         .unwrap();
 
@@ -781,7 +799,7 @@ async fn given_a_follower_when_a_consumer_stores_its_offset_should_keep_it_as_a_
     partition.consumer_offset_dirs[ConsumerKind::Consumer.index()] =
         Some(directory.path().to_string_lossy().into_owned());
     partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
-    partition
+    let _ = partition
         .apply_peer_manifest(&manifest_of(None, &[(0, 1), (2, 3)]))
         .unwrap();
 
@@ -798,7 +816,7 @@ async fn given_a_follower_when_a_consumer_stores_its_offset_should_keep_it_as_a_
     // filled nor rolled.
     assert_eq!(log_shape(&partition), shape);
     assert!(partition.log.journal().inner.is_empty());
-    partition
+    let _ = partition
         .apply_peer_manifest(&manifest_of(Some(1), &[(2, 3), (4, 9)]))
         .unwrap();
 
@@ -826,13 +844,10 @@ async fn given_no_trim_when_applying_should_name_no_retired_index() {
         .apply_peer_manifest(&manifest_of(None, &[(0, 9)]))
         .unwrap();
     assert_eq!(
-        applied,
-        PeerManifestApplied {
-            appended: 1,
-            trimmed: 0,
-            retired_indexes: Vec::new(),
-        }
+        (applied.appended, applied.trimmed, applied.replaced),
+        (1, 0, 0)
     );
+    assert_eq!(applied.retired_indexes(), [] as [String; 0]);
 }
 
 #[compio::test]

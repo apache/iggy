@@ -26,24 +26,25 @@
 //! the partition.
 //!
 //! The segment ends where the rewrite stops: at the commit point, or once
-//! it holds [`LONG_TERM_SEGMENT_BYTES`]. Another primary can have stored a
-//! segment from the same offset that ends elsewhere, just before it lost
-//! primacy. The store refuses to replace it, and the rewrite then reports
-//! where that one ends, so the next attempt ends there too and writes the
-//! same bytes.
+//! it holds [`LONG_TERM_SEGMENT_BYTES`]. Its key names both its offsets, so
+//! a segment another primary stored from the same offset, just before it
+//! lost primacy, is another object when it ends elsewhere. The long-term log
+//! lists the one whose command commits. One that ends at the same offset
+//! holds the same bytes, and the rewrite takes it as its own.
 
 use std::future;
+use std::io;
 use std::rc::Rc;
 
 use bytes::Bytes;
+use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::placement::PlacedBatch;
 use iggy_object_store::{
-    KeyLayout, ManifestSegment, ObjectPrefix, ObjectStore, SegmentKey, SegmentMetadata,
-    SegmentObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope,
-    TierScopeToken,
+    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, SegmentObject,
+    TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -65,18 +66,15 @@ use crate::state_transfer::ChunkHasher;
 pub const LONG_TERM_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Bytes of a segment between two entries of its index.
-const INDEX_STRIDE_BYTES: u64 = 64 * 1024;
+pub const INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
 /// One rewrite, as the partition's owner captured it.
 pub struct SegmentRewrite {
     pub prefix: ObjectPrefix,
     /// The first offset of the segment: the long-term floor plus one.
     pub start_offset: u64,
-    /// The last offset the segment may hold. The commit point, or where a
-    /// segment another primary stored from `start_offset` ends.
+    /// The last offset the segment may hold: the commit point.
     pub up_to: u64,
-    /// Whether the segment must end exactly at `up_to`.
-    pub ends_at_up_to: bool,
     pub(crate) read: PlacedReadPlan,
 }
 
@@ -88,10 +86,6 @@ pub enum RewriteError {
     /// The batches read are not the run of offsets the segment needs.
     #[error("the batches read from offset {expected} continue at {found:?}")]
     Gap { expected: u64, found: Option<u64> },
-    /// The store holds a segment from the same offset that ends at
-    /// `end_offset`, which another primary stored.
-    #[error("the store holds a segment from the same offset that ends at {end_offset}")]
-    EndsElsewhere { end_offset: u64 },
     #[error(transparent)]
     Upload(UploadError),
 }
@@ -171,12 +165,6 @@ impl SegmentRewrite {
             .await
             .map_err(RewriteError::Read)?;
         let built = BuiltSegment::of(self.start_offset, &placed)?;
-        if self.ends_at_up_to && built.end_offset != self.up_to {
-            return Err(RewriteError::Gap {
-                expected: self.up_to.saturating_add(1),
-                found: Some(built.end_offset.saturating_add(1)),
-            });
-        }
         let mut log = SegmentBytes::<SegmentHasher>::sized(built.size)?;
         self.read
             .read_blobs(&placed, |piece| log.push(piece))
@@ -201,59 +189,35 @@ impl SegmentRewrite {
         };
         let log = Bytes::from(log.bytes);
         let index = Bytes::from(built.index);
-        let stored = store_segment(
+        let key = |object| {
+            layout.long_term_key(&LongTermKey {
+                prefix: self.prefix,
+                start_offset: record.start_offset,
+                end_offset: record.end_offset,
+                object,
+            })
+        };
+        store_segment(
             store,
-            layout,
-            self.prefix,
             &record,
+            key(SegmentObject::Log),
+            &key(SegmentObject::Index),
             future::ready(Ok(memory_body(&log))),
             future::ready(Ok(memory_body(&index))),
             crc32c::crc32c(&index),
         )
-        .await;
-        match stored {
-            Ok(()) => Ok(ManifestSegment {
-                start_offset: record.start_offset,
-                end_offset: record.end_offset,
-                start_timestamp: record.start_timestamp,
-                end_timestamp: record.end_timestamp,
-                max_timestamp: record.max_timestamp,
-                size: record.size,
-                crc32c: record.crc32c,
-                hash: record.hash,
-            }),
-            Err(UploadError::Diverged { key }) => {
-                Err(self.ends_elsewhere(store, layout, key).await)
-            }
-            Err(error) => Err(RewriteError::Upload(error)),
-        }
-    }
-
-    /// Why the store refused the segment: where the one it holds ends, when
-    /// its metadata says so, and the refusal itself otherwise.
-    async fn ends_elsewhere<S: ObjectStore>(
-        &self,
-        store: &S,
-        layout: &KeyLayout,
-        key: String,
-    ) -> RewriteError {
-        let log_key = layout.segment_key(&SegmentKey {
-            prefix: self.prefix,
-            start_offset: self.start_offset,
-            object: SegmentObject::Log,
-        });
-        let stored = store
-            .head(&log_key)
-            .await
-            .ok()
-            .and_then(|meta| SegmentMetadata::try_from(&meta.metadata).ok())
-            .filter(|stored| stored.start_offset == self.start_offset);
-        stored.map_or(
-            RewriteError::Upload(UploadError::Diverged { key }),
-            |stored| RewriteError::EndsElsewhere {
-                end_offset: stored.end_offset,
-            },
-        )
+        .await
+        .map_err(RewriteError::Upload)?;
+        Ok(ManifestSegment {
+            start_offset: record.start_offset,
+            end_offset: record.end_offset,
+            start_timestamp: record.start_timestamp,
+            end_timestamp: record.end_timestamp,
+            max_timestamp: record.max_timestamp,
+            size: record.size,
+            crc32c: record.crc32c,
+            hash: record.hash,
+        })
     }
 }
 
@@ -273,9 +237,7 @@ impl BuiltSegment {
     fn of(start_offset: u64, batches: &[PlacedBatch]) -> Result<Self, RewriteError> {
         let mut next_offset = start_offset;
         let mut built: Option<Self> = None;
-        let mut position = 0u64;
-        let mut indexed_at: Option<u64> = None;
-        let mut index = Vec::new();
+        let mut index = SegmentIndex::default();
         for batch in batches {
             let header = &batch.header;
             // The bytes of the segment are sized by the headers and filled
@@ -289,15 +251,14 @@ impl BuiltSegment {
                     found: Some(header.base_offset),
                 });
             }
-            if indexed_at.is_none_or(|indexed| position - indexed >= INDEX_STRIDE_BYTES) {
-                indexed_at = Some(position);
-                for field in [header.base_offset, header.base_timestamp, position] {
-                    index.extend_from_slice(&field.to_le_bytes());
-                }
-            }
+            index.push(
+                header.base_offset,
+                header.base_timestamp,
+                header.batch_length,
+            );
             let end_offset = header.base_offset + u64::from(header.message_count) - 1;
             let timestamp = header.base_timestamp;
-            position += header.batch_length;
+            let size = index.position();
             next_offset = end_offset + 1;
             built = Some(built.map_or(
                 Self {
@@ -305,18 +266,19 @@ impl BuiltSegment {
                     start_timestamp: timestamp,
                     end_timestamp: timestamp,
                     max_timestamp: timestamp,
-                    size: position,
+                    size,
                     index: Vec::new(),
                 },
                 |previous| Self {
                     end_offset,
                     end_timestamp: timestamp,
                     max_timestamp: previous.max_timestamp.max(timestamp),
-                    size: position,
+                    size,
                     ..previous
                 },
             ));
         }
+        let index = index.into_bytes();
         debug_assert_eq!(index.len() % IGGY_INDEX_SIZE, 0);
         built
             .map(|built| Self { index, ..built })
@@ -325,6 +287,52 @@ impl BuiltSegment {
                 found: None,
             })
     }
+}
+
+/// The index of a long-term segment, built from its batches in the order
+/// the segment holds them. It depends on nothing but the bytes of the
+/// segment, so every writer of the same segment builds the same index.
+#[derive(Default)]
+pub struct SegmentIndex {
+    /// The bytes of the segment before the next batch.
+    position: u64,
+    /// Where the batch of the last entry starts.
+    indexed_at: Option<u64>,
+    entries: Vec<u8>,
+}
+
+impl SegmentIndex {
+    /// Take the next batch of the segment. The first batch gets an entry,
+    /// and so does each batch that starts [`INDEX_STRIDE_BYTES`] or more
+    /// after the batch of the entry before.
+    pub fn push(&mut self, base_offset: u64, base_timestamp: u64, batch_length: u64) {
+        if self
+            .indexed_at
+            .is_none_or(|indexed| self.position - indexed >= INDEX_STRIDE_BYTES)
+        {
+            self.indexed_at = Some(self.position);
+            for field in [base_offset, base_timestamp, self.position] {
+                self.entries.extend_from_slice(&field.to_le_bytes());
+            }
+        }
+        self.position += batch_length;
+    }
+
+    /// The bytes of the batches taken so far.
+    pub const fn position(&self) -> u64 {
+        self.position
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.entries
+    }
+}
+
+pub async fn write_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
+    let mut file = compio::fs::File::create(path).await?;
+    let compio::BufResult(written, _) = file.write_all_at(bytes, 0).await;
+    written?;
+    file.sync_all().await
 }
 
 /// The bytes of a segment as its batches are put back together, and the
@@ -371,9 +379,6 @@ pub struct LongTermRewrites {
     /// A segment the store holds that the long-term log does not yet. Its
     /// command is sent again until the log ends with it.
     stored: Option<ManifestSegment>,
-    /// Where the segment from the floor on must end: where the one another
-    /// primary stored ends.
-    ends_at: Option<u64>,
     /// The commit point the last rewrite started at.
     committed_at_start: u64,
 }
@@ -495,14 +500,6 @@ where
         }
         let start_offset = floor.map_or(0, |floor| floor.saturating_add(1));
         let committed = committed.filter(|committed| *committed >= start_offset)?;
-        let (up_to, ends_at_up_to) = match rewrites.ends_at {
-            // The other primary rewrote batches this replica has yet to
-            // commit, which it will.
-            Some(end) if end > committed => return None,
-            Some(end) if end >= start_offset => (end, true),
-            // The log moved past that segment since.
-            Some(_) | None => (committed, false),
-        };
         let scope = TierScope::new();
         let token = scope.token();
         rewrites.committed_at_start = committed;
@@ -512,8 +509,7 @@ where
         let rewrite = SegmentRewrite {
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             start_offset,
-            up_to,
-            ends_at_up_to,
+            up_to: committed,
             read: self.placed_read_plan(None),
         };
         Some((id, rewrite, token))
@@ -549,7 +545,6 @@ where
         match outcome {
             Ok(Ok(segment)) => {
                 rewrites.stored = Some(segment);
-                rewrites.ends_at = None;
                 debug!(
                     namespace_raw,
                     start_offset = segment.start_offset,
@@ -558,10 +553,6 @@ where
                     "stored a long-term segment of the partition"
                 );
                 Some(segment)
-            }
-            Ok(Err(RewriteError::EndsElsewhere { end_offset })) => {
-                rewrites.ends_at = Some(end_offset);
-                None
             }
             Ok(Err(error)) => {
                 warn!(

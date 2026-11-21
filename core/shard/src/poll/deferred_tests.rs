@@ -3354,6 +3354,7 @@ fn origin_manifest(
             .map(|segment| segment.end_offset)
             .or(trim_point),
         trim_point,
+        segments_keyed_by_both_offsets: false,
         segments,
     }
 }
@@ -3362,6 +3363,15 @@ fn origin_manifest(
 /// cluster's log of two segments, read from a store that holds none of
 /// their objects.
 fn follow_a_peer(owner: &TestShard, directory: &std::path::Path) {
+    follow_a_peer_with(owner, directory, &origin_manifest(None, &[(0, 1), (2, 3)]));
+}
+
+/// [`follow_a_peer`] with `manifest` as the first one the partition applies.
+fn follow_a_peer_with(
+    owner: &TestShard,
+    directory: &std::path::Path,
+    manifest: &iggy_object_store::PartitionManifest,
+) {
     let partitions = owner.plane.partitions();
     drop(partitions.remove(&namespace()));
     let consensus = consensus::VsrConsensus::new(
@@ -3381,9 +3391,7 @@ fn follow_a_peer(owner: &TestShard, directory: &std::path::Path) {
     partition.set_created_revision(CREATED_REVISION);
     partition.set_partition_dir(directory.to_string_lossy().into_owned());
     partition.follow_peer_log("dc-a", ORIGIN_PREFIX).unwrap();
-    partition
-        .apply_peer_manifest(&origin_manifest(None, &[(0, 1), (2, 3)]))
-        .unwrap();
+    let _ = partition.apply_peer_manifest(manifest).unwrap();
     partitions.set_peer_remote_segments(vec![(
         "dc-a".to_owned(),
         Rc::new(partitions::RemoteSegments::new(
@@ -3427,13 +3435,51 @@ async fn given_a_parked_read_of_a_peer_log_when_a_trim_drops_its_segment_should_
     follow_a_peer(&owner, directory.path());
     let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
 
-    owner
+    let _ = owner
         .plane
         .partitions()
         .get_mut_by_ns(&namespace())
         .unwrap()
         .apply_peer_manifest(&origin_manifest(Some(1), &[(2, 3)]))
         .unwrap();
+    owner.on_deferred_poll_completed(1, failed).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+}
+
+/// [`origin_manifest`] of an origin that keys its segments by both offsets.
+fn keyed_origin_manifest(segments: &[(u64, u64)]) -> iggy_object_store::PartitionManifest {
+    iggy_object_store::PartitionManifest {
+        segments_keyed_by_both_offsets: true,
+        ..origin_manifest(None, segments)
+    }
+}
+
+#[compio::test]
+async fn given_a_parked_read_of_a_peer_log_when_a_merge_replaces_its_segments_should_ask_for_a_retry()
+ {
+    let owner = owner(&["seed"]).await;
+    let directory = tempfile::tempdir().unwrap();
+    follow_a_peer_with(
+        &owner,
+        directory.path(),
+        &keyed_origin_manifest(&[(0, 1), (2, 3)]),
+    );
+    let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
+
+    let applied = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .apply_peer_manifest(&keyed_origin_manifest(&[(0, 3)]))
+        .unwrap();
+    assert_eq!(applied.replaced, 2);
     owner.on_deferred_poll_completed(1, failed).await;
 
     assert!(matches!(
