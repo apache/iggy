@@ -23,11 +23,13 @@ use serde_with::serde_as;
 
 /// External authentication callout configuration.
 ///
-/// When enabled, login attempts for usernames not found in the local user
-/// store are forwarded to an external HTTP service. The service maps the
-/// caller to a pre-provisioned Iggy username or denies the login. Local
-/// users never hit the callout. The credential (password) is forwarded
-/// so the external service can verify the requester.
+/// When enabled, login attempts whose credential is not valid locally (an
+/// unknown username, or a personal access token that is unknown or expired) are
+/// forwarded to an external HTTP service for each kind listed in
+/// [`Self::credential_types`]. The service maps the caller to a
+/// pre-provisioned Iggy username or denies the login. Local credentials never
+/// hit the callout. The secret is forwarded so the external service can
+/// verify the requester.
 ///
 /// The callout can fire more than once for a single logical login because
 /// the SDK replays after transient failures. The external service must be
@@ -49,6 +51,29 @@ pub struct ExternalAuthConfig {
     /// to `shards * max_concurrent_callouts` requests in flight.
     #[serde(default = "default_max_concurrent_callouts")]
     pub max_concurrent_callouts: u32,
+    /// Credential kinds forwarded to the service. Personal access tokens are
+    /// opt-in so enabling the callout never sends tokens to a service that
+    /// predates them.
+    #[serde(default = "default_credential_types")]
+    #[config_env(leaf)]
+    pub credential_types: Vec<ExternalAuthCredentialType>,
+}
+
+/// A credential kind the callout can forward. The serialized name matches
+/// the `credentials.type` tag of the callout request.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalAuthCredentialType {
+    UsernamePassword,
+    PersonalAccessToken,
+}
+
+impl ExternalAuthConfig {
+    /// `true` when the callout is enabled and forwards `credential_type`.
+    #[must_use]
+    pub fn forwards(&self, credential_type: ExternalAuthCredentialType) -> bool {
+        self.enabled && self.credential_types.contains(&credential_type)
+    }
 }
 
 impl Default for ExternalAuthConfig {
@@ -58,6 +83,7 @@ impl Default for ExternalAuthConfig {
             url: String::new(),
             timeout: default_external_auth_timeout(),
             max_concurrent_callouts: default_max_concurrent_callouts(),
+            credential_types: default_credential_types(),
         }
     }
 }
@@ -94,6 +120,10 @@ impl Validatable<ConfigurationError> for ExternalAuthConfig {
             eprintln!("external_auth.max_concurrent_callouts must be greater than zero");
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.credential_types.is_empty() {
+            eprintln!("external_auth.credential_types must name at least one credential type");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         Ok(())
     }
 }
@@ -104,6 +134,10 @@ fn default_external_auth_timeout() -> IggyDuration {
 
 const fn default_max_concurrent_callouts() -> u32 {
     64
+}
+
+fn default_credential_types() -> Vec<ExternalAuthCredentialType> {
+    vec![ExternalAuthCredentialType::UsernamePassword]
 }
 
 #[cfg(test)]
@@ -199,5 +233,61 @@ mod tests {
             ..ExternalAuthConfig::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn given_enabled_config_with_empty_credential_types_when_validating_should_reject() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            url: "https://auth.example.com/verify".to_owned(),
+            credential_types: Vec::new(),
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_default_config_when_checking_forwarding_should_forward_only_passwords() {
+        let config = ExternalAuthConfig {
+            enabled: true,
+            ..ExternalAuthConfig::default()
+        };
+        assert!(config.forwards(ExternalAuthCredentialType::UsernamePassword));
+        assert!(!config.forwards(ExternalAuthCredentialType::PersonalAccessToken));
+    }
+
+    #[test]
+    fn given_disabled_config_when_checking_forwarding_should_forward_nothing() {
+        let config = ExternalAuthConfig {
+            credential_types: vec![
+                ExternalAuthCredentialType::UsernamePassword,
+                ExternalAuthCredentialType::PersonalAccessToken,
+            ],
+            ..ExternalAuthConfig::default()
+        };
+        assert!(!config.forwards(ExternalAuthCredentialType::UsernamePassword));
+        assert!(!config.forwards(ExternalAuthCredentialType::PersonalAccessToken));
+    }
+
+    #[test]
+    fn given_config_without_credential_types_when_parsing_should_default_to_passwords() {
+        let config: ExternalAuthConfig =
+            serde_json::from_str(r#"{"enabled": true, "url": "https://auth.example.com"}"#)
+                .unwrap();
+        assert_eq!(
+            config.credential_types,
+            vec![ExternalAuthCredentialType::UsernamePassword]
+        );
+    }
+
+    #[test]
+    fn given_config_with_personal_access_token_when_parsing_should_forward_tokens() {
+        let config: ExternalAuthConfig = serde_json::from_str(
+            r#"{"enabled": true, "url": "https://auth.example.com",
+                "credential_types": ["personal_access_token"]}"#,
+        )
+        .unwrap();
+        assert!(config.forwards(ExternalAuthCredentialType::PersonalAccessToken));
+        assert!(!config.forwards(ExternalAuthCredentialType::UsernamePassword));
     }
 }

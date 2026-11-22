@@ -313,12 +313,13 @@ See [Stream options](/docs/server/stream-options) for the rotation procedure. En
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `enabled` | `false` | Forward logins for unknown local usernames to an HTTP service. |
+| `enabled` | `false` | Forward logins with an unknown username, or an invalid token if configured, to an HTTP service. |
 | `url` | Empty | HTTP or HTTPS endpoint. Required when enabled and omitted from the effective configuration output. |
 | `timeout` | `"5 s"` | Positive callout timeout. |
 | `max_concurrent_callouts` | `64` | Positive per-shard limit. |
+| `credential_types` | `["username_password"]` | Credential types to forward: `username_password` and `personal_access_token`. Must not be empty when enabled. |
 
-The service maps a caller to an existing active, non-root account. Local usernames never use the callout. See [External authentication](/docs/server/external-authentication) for the JSON contract and failure behavior.
+The service maps a caller to an existing active, non-root account. Local usernames and valid local personal access tokens never use the callout. See [External authentication](/docs/server/external-authentication) for the JSON contract and failure behavior.
 
 ### `[memory_pool]`
 

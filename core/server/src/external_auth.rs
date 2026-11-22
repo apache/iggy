@@ -18,8 +18,10 @@
 //! External authentication callout.
 //!
 //! When enabled, the server POSTs credential and connection metadata to an
-//! external HTTP service during login. The service decides whether to map the
-//! caller to a pre-provisioned Iggy user (by username) or deny the login.
+//! external HTTP service during login: a username and password, or a personal
+//! access token, for each kind `credential_types` lists. The service decides
+//! whether to map the caller to a pre-provisioned Iggy user (by username) or
+//! deny the login.
 //!
 //! Per-thread in-flight callouts are capped at [`ExternalAuthConfig::max_concurrent_callouts`]
 //! via [`CalloutGuard`]. There is no per-client rate limit: operators should
@@ -33,6 +35,8 @@ use configs::external_auth::ExternalAuthConfig;
 use futures::StreamExt;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+
+use crate::dispatch::login_error::LoginRegisterError;
 
 const MAX_RESPONSE_BODY_BYTES: usize = 1_048_576;
 
@@ -120,7 +124,8 @@ pub struct ExternalAuthRequest<'a> {
 ///
 /// Internally tagged on `"type"` so each variant carries exactly the fields
 /// it needs. Future credential kinds (bearer tokens, client certificates)
-/// add a variant here without touching the request envelope.
+/// add a variant here without touching the request envelope. The tag matches
+/// the `ExternalAuthCredentialType` that gates the variant.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Credentials<'a> {
@@ -129,6 +134,22 @@ pub enum Credentials<'a> {
         #[serde(serialize_with = "serialize_secret")]
         password: &'a SecretString,
     },
+    PersonalAccessToken {
+        #[serde(serialize_with = "serialize_secret")]
+        token: &'a SecretString,
+    },
+}
+
+impl Credentials<'_> {
+    /// Terminal error for a login whose credential the callout rejects. It
+    /// matches the error of a local rejection of the same credential kind, so
+    /// turning on forwarding does not change what the client sees.
+    pub(crate) const fn rejection(&self) -> LoginRegisterError {
+        match self {
+            Self::UsernamePassword { .. } => LoginRegisterError::InvalidCredentials,
+            Self::PersonalAccessToken { .. } => LoginRegisterError::InvalidToken,
+        }
+    }
 }
 
 fn default_deny_reason() -> String {
@@ -250,21 +271,21 @@ pub fn preflight(config: &ExternalAuthConfig) -> Result<(), crate::server_error:
 }
 
 fn validate_credential_size(credentials: &Credentials<'_>) -> Result<(), ExternalAuthError> {
-    match credentials {
+    let secret = match credentials {
         Credentials::UsernamePassword { username, password } => {
-            if username.len() > MAX_CREDENTIAL_BYTES {
-                return Err(ExternalAuthError::BadRequest(format!(
-                    "username too large ({} bytes, limit {MAX_CREDENTIAL_BYTES})",
-                    username.len()
-                )));
-            }
-            let password_len = password.expose_secret().len();
-            if password_len > MAX_CREDENTIAL_BYTES {
-                return Err(ExternalAuthError::BadRequest(format!(
-                    "credential too large ({password_len} bytes, limit {MAX_CREDENTIAL_BYTES})",
-                )));
-            }
+            check_credential_len("username", username.len())?;
+            password
         }
+        Credentials::PersonalAccessToken { token } => token,
+    };
+    check_credential_len("credential", secret.expose_secret().len())
+}
+
+fn check_credential_len(label: &str, len: usize) -> Result<(), ExternalAuthError> {
+    if len > MAX_CREDENTIAL_BYTES {
+        return Err(ExternalAuthError::BadRequest(format!(
+            "{label} too large ({len} bytes, limit {MAX_CREDENTIAL_BYTES})"
+        )));
     }
     Ok(())
 }
@@ -382,8 +403,8 @@ pub fn validate_provisioned_account(
 }
 
 /// Why a pre-provisioned account was rejected. Logged for debugging but
-/// never exposed on the wire (the caller maps every variant to
-/// `InvalidCredentials`).
+/// never exposed on the wire (the caller maps every variant to the terminal
+/// rejection of the credential kind).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountRejection {
     NotFound,
@@ -404,8 +425,8 @@ impl std::fmt::Display for AccountRejection {
 }
 
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
-/// user. Logs the specific rejection reason; the wire error is always
-/// `InvalidCredentials`.
+/// user. Logs the specific rejection reason. The caller picks the wire error
+/// from the credential kind.
 pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
@@ -441,6 +462,7 @@ fn check_account_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::external_auth::ExternalAuthCredentialType;
 
     /// Deserialize JSON and validate, same as `callout_external_auth` does
     /// after receiving the HTTP body.
@@ -473,6 +495,63 @@ mod tests {
         assert_eq!(creds["username"], "alice");
         assert_eq!(creds["password"], "s3cret");
         assert_eq!(creds.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn request_personal_access_token_round_trip() {
+        let token = SecretString::from("pat-123".to_owned());
+        let req = ExternalAuthRequest {
+            transport: "tcp",
+            client_address: "10.0.0.1:5000",
+            connection_id: "0195f4d7-57d3-7c21-a711-08a147ad6c90",
+            credentials: Credentials::PersonalAccessToken { token: &token },
+        };
+        let val: serde_json::Value = serde_json::to_value(&req).unwrap();
+        let creds = &val["credentials"];
+        assert_eq!(creds["type"], "personal_access_token");
+        assert_eq!(creds["token"], "pat-123");
+        assert_eq!(creds.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn given_each_credential_when_serialized_should_tag_with_gating_type_name() {
+        let secret = SecretString::from("s3cret".to_owned());
+        let cases = [
+            (
+                Credentials::UsernamePassword {
+                    username: "alice",
+                    password: &secret,
+                },
+                ExternalAuthCredentialType::UsernamePassword,
+            ),
+            (
+                Credentials::PersonalAccessToken { token: &secret },
+                ExternalAuthCredentialType::PersonalAccessToken,
+            ),
+        ];
+        for (credentials, credential_type) in cases {
+            let val = serde_json::to_value(&credentials).unwrap();
+            assert_eq!(val["type"], credential_type.to_string());
+            assert_eq!(
+                serde_json::to_value(credential_type).unwrap(),
+                credential_type.to_string()
+            );
+        }
+    }
+
+    #[test]
+    fn given_oversized_token_when_validating_size_should_reject() {
+        let token = SecretString::from("x".repeat(MAX_CREDENTIAL_BYTES + 1));
+        let err = validate_credential_size(&Credentials::PersonalAccessToken { token: &token })
+            .unwrap_err();
+        assert!(matches!(err, ExternalAuthError::BadRequest(_)));
+    }
+
+    #[test]
+    fn given_debug_format_when_credentials_carry_token_should_redact() {
+        let token = SecretString::from("pat-secret".to_owned());
+        let rendered = format!("{:?}", Credentials::PersonalAccessToken { token: &token });
+        assert!(!rendered.contains("pat-secret"));
     }
 
     // ── response deserialization: allow ──────────────────────────────

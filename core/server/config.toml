@@ -1405,11 +1405,14 @@ handshake_grace = "10 s"
 # or with ulimit -Hn.
 #connections_max = 10000
 
-# External authentication callout. When enabled, login attempts for usernames
-# not found in the local user store are forwarded to an external HTTP service.
-# The service maps the caller to a pre-provisioned Iggy username or denies the
-# login. Local users authenticate through the built-in path and never hit the
-# callout.
+# External authentication callout. When enabled, login attempts whose
+# credential is not known locally are forwarded to an external HTTP service:
+# usernames not found in the local user store and, when 'credential_types'
+# lists them, personal access tokens that are unknown or expired. Unknown and
+# expired tokens are both forwarded, so callout latency does not tell them
+# apart. The service maps the caller to a pre-provisioned Iggy
+# username or denies the login. Local users and valid local tokens
+# authenticate through the built-in path and never hit the callout.
 #
 # ── Callout contract ────────────────────────────────────────────────────
 #
@@ -1425,6 +1428,13 @@ handshake_grace = "10 s"
 #       "password": "<cleartext>"
 #     }
 #   }
+#
+# A personal access token login sends this credentials object instead:
+#
+#     "credentials": {
+#       "type":  "personal_access_token",
+#       "token": "<cleartext>"
+#     }
 #
 # transport is one of: tcp, tcp_tls, ws, wss, quic, http.
 #
@@ -1443,7 +1453,7 @@ handshake_grace = "10 s"
 #     {"decision": "deny", "reason": "<optional reason>"}
 #
 # The mapped username must exist as an active, non-root user. The
-# credential (password) is forwarded so the external service can verify
+# credential (password or token) is forwarded so the external service can verify
 # the requester; use TLS ('url' starting with https://) to protect it.
 #
 # Callouts fire only on the normal-status primary. Backup nodes and
@@ -1457,8 +1467,14 @@ handshake_grace = "10 s"
 #timeout = "5 s"
 # Per-shard cap on concurrent callouts. Each shard thread gets its own
 # counter, so the external service can see up to shards * this value
-# requests in flight.
+# requests in flight. With "personal_access_token" forwarded, a flood of
+# random tokens can fill the cap and delay real external logins, so rate
+# limit token logins at the network or service boundary.
 #max_concurrent_callouts = 64
+# Credential types forwarded to the service: "username_password" and
+# "personal_access_token". Tokens are opt-in so an existing service never
+# receives a credential type it does not expect.
+#credential_types = ["username_password"]
 
 # Tiered storage: an object store for the sealed segments of tiered topics and
 # for the messages of geo topics. Without this section, the backend is "none":

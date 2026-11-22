@@ -22,7 +22,7 @@
 //! [`ServerConfig`] formatter and the [`MessageBusConfig`] section
 //! formatter.
 
-use super::external_auth::ExternalAuthConfig;
+use super::external_auth::{ExternalAuthConfig, ExternalAuthCredentialType};
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::partition::PartitionConfig;
@@ -189,8 +189,24 @@ impl Display for ExternalAuthConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "{{ enabled: {}, url: [redacted], timeout: {}, max_concurrent_callouts: {} }}",
-            self.enabled, self.timeout, self.max_concurrent_callouts,
+            "{{ enabled: {}, url: [redacted], timeout: {}, max_concurrent_callouts: {}, credential_types: [{}] }}",
+            self.enabled,
+            self.timeout,
+            self.max_concurrent_callouts,
+            self.credential_types
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
         )
+    }
+}
+
+impl Display for ExternalAuthCredentialType {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::UsernamePassword => "username_password",
+            Self::PersonalAccessToken => "personal_access_token",
+        })
     }
 }
