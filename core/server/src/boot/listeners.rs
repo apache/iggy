@@ -18,8 +18,8 @@
 //! Shard 0 listener start-up and the accept-fn factories.
 
 use crate::boot::credentials::{
-    RootCredentials, initialize_root_user, load_quic_server_credentials,
-    load_tcp_tls_server_credentials, load_wss_server_credentials,
+    RootCredentials, RootPasswordReset, initialize_root_user, load_quic_server_credentials,
+    load_tcp_tls_server_credentials, load_wss_server_credentials, reset_root_password,
 };
 use crate::boot::topology::{
     TcpTopology, client_listeners, derived_address_misses_listener, derived_bind_ip,
@@ -69,6 +69,7 @@ pub(in crate::boot) async fn start_tcp_runtime(
     connections: &Rc<ConnectionCap>,
     shard_metrics_all: &[ShardMetrics],
     root_credentials: Option<&RootCredentials>,
+    root_password_reset: Option<&RootPasswordReset>,
 ) -> Result<(), ServerError> {
     if topology.replica_count == 1 {
         initialize_root_user(
@@ -184,6 +185,10 @@ pub(in crate::boot) async fn start_tcp_runtime(
     .await?;
     if !shard.bus.token().is_triggered() {
         info!("Root user initialization complete.");
+    }
+
+    if let Some(reset) = root_password_reset {
+        reset_root_password(shard, reset, shard.bus.token(), compio::time::sleep).await?;
     }
 
     Ok(())

@@ -76,6 +76,7 @@ mimalloc = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 nix = { workspace = true }
 partitions = { workspace = true }
+passterm = { workspace = true }
 prometheus-client = { workspace = true }
 rand = { workspace = true }
 ring = { workspace = true }

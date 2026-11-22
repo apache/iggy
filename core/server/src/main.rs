@@ -25,7 +25,7 @@ use clap::Parser;
 use configs::{ConfigEnvMappings, print_env_var_names, server::ServerConfig};
 use server::boot::{
     apply_default_root_credentials, bootstrap, load_config, prepare_runtime_dirs,
-    raise_open_file_limit,
+    prompt_root_password_reset, raise_open_file_limit,
 };
 use server::server_error::ServerError;
 use server_common::fatal::{FatalReason, descriptors_exhausted, fatal_with_log_flush};
@@ -64,6 +64,12 @@ fn run() -> Result<(), ServerError> {
     if args.list_config_env_vars {
         print_config_env_vars().map_err(ServerError::ListConfigEnvVars)?;
         return Ok(());
+    }
+    if args.reset_root_password && args.fresh {
+        // `--fresh` runs before any prompt and deletes the data directory,
+        // root user included; resetting into that would destroy the very
+        // state the operator asked to recover.
+        return Err(ServerError::ResetRootPasswordFresh);
     }
     banner::print(server::VERSION);
     // `logging` owns the tracing appender worker guards; it must outlive the
@@ -122,7 +128,22 @@ fn run() -> Result<(), ServerError> {
     let config = bootstrap_result?;
     drop(bootstrap_runtime);
 
-    let shards = bootstrap(config, args.replica_id)?;
+    // Prompted after config and runtime-directory validation so a bad boot
+    // never blocks on operator input, and long before the shard threads
+    // spawn, while the process is still single-threaded. The values stay in
+    // memory: they are never exported to the environment or logged.
+    let root_password_reset = if args.reset_root_password {
+        warn!(
+            "--reset-root-password: the prompted password will be reset through metadata \
+             replication; remove the flag after the reset so a later restart cannot re-apply \
+             a stale password"
+        );
+        Some(prompt_root_password_reset()?)
+    } else {
+        None
+    };
+
+    let shards = bootstrap(config, args.replica_id, root_password_reset)?;
     if let Err(error) = shards.install_ctrlc_handler() {
         // Without a working SIGINT handler the server has no way to
         // observe an operator Ctrl-C and the shutdown flag would never
