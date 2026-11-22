@@ -20,6 +20,7 @@ use crate::actors::consumer::client::interface::{BenchmarkConsumerConfig, Consum
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
 use crate::benchmarks::common::create_consumer;
 use crate::utils::ClientFactory;
+use crate::utils::readiness::is_probe;
 use crate::utils::{batch_total_size_bytes, batch_user_size_bytes};
 use iggy::prelude::*;
 use std::sync::Arc;
@@ -89,7 +90,7 @@ impl ConsumerClient for LowLevelConsumerClient {
                 .await
         };
 
-        let polled = match polled {
+        let mut polled = match polled {
             Ok(polled) => polled,
             Err(IggyError::TopicIdNotFound(_, _) | IggyError::TransientNotAccepted) => {
                 return Ok(None);
@@ -98,6 +99,22 @@ impl ConsumerClient for LowLevelConsumerClient {
         };
 
         if polled.messages.is_empty() {
+            return Ok(None);
+        }
+        let probes = polled
+            .messages
+            .iter()
+            .take_while(|message| is_probe(message))
+            .count();
+        if probes > 0 {
+            // Reading again right after the probes keeps every later read
+            // on the boundaries of the producers' batches.
+            polled.messages.truncate(probes);
+            let after_probes = polled.continuation();
+            match self.reader.as_mut() {
+                Some(reader) => reader.seek(polled.partition_id, after_probes).await?,
+                None => self.polling_strategy = after_probes,
+            }
             return Ok(None);
         }
         let messages_count = polled.messages.len() as u64;

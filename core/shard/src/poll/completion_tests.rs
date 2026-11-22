@@ -78,16 +78,16 @@ use crate::commit_batch::encode_commit_batch;
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    ConsumerAttachment, IggyShard, LifecycleFrame, NoopHost, PartitionConsensusConfig,
-    PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver, ReplicaTopology, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_channel,
+    ConsumerAttachment, ExternalGroupRead, IggyShard, LifecycleFrame, NoopHost,
+    PartitionConsensusConfig, PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver,
+    ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
 
 #[compio::test]
 async fn given_a_primary_with_a_deferred_view_change_when_reading_should_refuse_old_history() {
-    let (mut fixture, _) = BoundPoll::activated().await;
+    let (mut fixture, _) = Box::pin(BoundPoll::activated()).await;
     let partition = fixture.partition.as_mut().unwrap();
     let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
         .transmute_header(|_, header: &mut StartViewChangeHeader| {
@@ -477,7 +477,7 @@ const BOUND_GROUP: u64 = 7;
 #[compio::test]
 async fn given_newer_installed_owner_when_stale_owner_polls_on_primary_should_refuse_without_progress()
  {
-    let (mut fixture, activated) = BoundPoll::activated().await;
+    let (mut fixture, activated) = Box::pin(BoundPoll::activated()).await;
     fixture
         .install(InstallConsumerGroupOwnerRequest {
             owner: ConsumerGroupOwner {
@@ -505,7 +505,7 @@ async fn given_newer_installed_owner_when_stale_owner_polls_on_primary_should_re
 #[compio::test]
 async fn given_unassigned_installed_owner_when_stale_owner_polls_on_primary_should_refuse_without_fatal_commit()
  {
-    let (mut fixture, activated) = BoundPoll::activated().await;
+    let (mut fixture, activated) = Box::pin(BoundPoll::activated()).await;
     fixture
         .install(InstallConsumerGroupOwnerRequest {
             owner: ConsumerGroupOwner {
@@ -528,7 +528,7 @@ async fn given_unassigned_installed_owner_when_stale_owner_polls_on_primary_shou
 /// replica can apply the install later. The owner retries until it does.
 #[compio::test]
 async fn given_unapplied_install_when_new_owner_polls_on_primary_should_retry_until_it_applies() {
-    let (mut fixture, _) = BoundPoll::activated().await;
+    let (mut fixture, _) = Box::pin(BoundPoll::activated()).await;
     let successor = fixture.reconnect_owner();
 
     let reply = fixture.poll().await;
@@ -551,7 +551,7 @@ async fn given_unapplied_install_when_new_owner_polls_on_primary_should_retry_un
 
 #[compio::test]
 async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generation() {
-    let (mut fixture, activated) = BoundPoll::activated().await;
+    let (mut fixture, activated) = Box::pin(BoundPoll::activated()).await;
 
     let reply = fixture.poll().await;
     fixture.commit().await;
@@ -562,7 +562,7 @@ async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generat
 #[compio::test]
 async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read_new_history() {
     const REPLACEMENT_REVISION: u64 = 2;
-    let (mut fixture, _) = BoundPoll::activated().await;
+    let (mut fixture, _) = Box::pin(BoundPoll::activated()).await;
     fixture.poll().await;
     fixture.commit().await;
     let (owner, ..) = fixture.served.as_ref().unwrap();
@@ -604,7 +604,7 @@ async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: u32::try_from(BOUND_GROUP).unwrap(),
+                group: ExternalGroupRead::Group(u32::try_from(BOUND_GROUP).unwrap()),
                 metadata,
             },
         ] {
@@ -782,7 +782,7 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: 1,
+                group: ExternalGroupRead::Group(1),
                 metadata,
             },
         ] {
@@ -871,7 +871,7 @@ async fn given_a_pending_view_write_when_read_on_primary_should_refuse_until_it_
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: 1,
+                group: ExternalGroupRead::Group(1),
                 metadata,
             },
             PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
@@ -1297,7 +1297,7 @@ async fn given_deleted_history_when_metadata_still_lists_the_partition_should_re
                 (
                     "ExternalGroupOffsetOnPrimary",
                     PartitionRead::ExternalGroupOffsetOnPrimary {
-                        group_id: 1,
+                        group: ExternalGroupRead::Group(1),
                         metadata,
                     },
                 ),

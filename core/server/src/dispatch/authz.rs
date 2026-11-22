@@ -125,6 +125,7 @@ where
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
                 | Operation::RewrapStreamKeys
+                | Operation::ShadowTopic
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
@@ -149,6 +150,7 @@ where
                 | Operation::CreatePersonalAccessToken
                 | Operation::DeletePersonalAccessToken
                 | Operation::JoinConsumerGroup
+                | Operation::RetireGeoOrigin
                 | Operation::LeaveConsumerGroup => Ok(()),
             });
     decision.err().map(|error| error.as_code())

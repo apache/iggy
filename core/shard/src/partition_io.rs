@@ -623,6 +623,7 @@ where
                 tracing::error!(namespace_raw = token.identity.namespace.inner(), %error, "partition I/O acceptance failed");
             }
             self.stage_wanted_upload(token.identity.namespace, partition);
+            self.stage_long_term_change(token.identity.namespace, partition);
             if matches!(
                 token.identity.continuation,
                 partitions::PartitionIoContinuation::Retention
@@ -667,6 +668,7 @@ where
         };
         let step = partition.resume_io(partitions.config()).await;
         self.stage_wanted_upload(namespace, partition);
+        self.stage_long_term_change(namespace, partition);
         if let Some(token) = self.partition_io.retained(namespace, incarnation)
             && !partition.retains_io_reservation(token.identity)
         {
@@ -11028,6 +11030,52 @@ mod tests {
         repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
         repair_rings: Option<Rc<partitions::RepairRingBudget>>,
     ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_of_topic(
+            bus,
+            store,
+            repair_memory,
+            repair_rings,
+            TopicRuntimeOptions::default(),
+        )
+    }
+
+    /// [`test_owner_with_repair_budgets`] whose committed topic resolves to
+    /// the options `runtime`.
+    fn test_owner_of_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+        repair_rings: Option<Rc<partitions::RepairRingBudget>>,
+        runtime: TopicRuntimeOptions,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_shaped(bus, store, (repair_memory, repair_rings), |topic| {
+            topic.resolved.runtime = runtime;
+        })
+    }
+
+    /// [`test_owner`] whose committed topic is a geo topic that sets
+    /// `durations` for itself.
+    fn test_owner_of_geo_topic<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        durations: iggy_common::GeoTopicDurations,
+    ) -> (IoTestShard<B>, TaggedSender) {
+        test_owner_shaped(bus, None, (None, None), |topic| {
+            topic.resolved.topic_type = iggy_common::TopicType::Geo;
+            topic.resolved.geo_mode = Some(iggy_common::GeoMode::Geo);
+            topic.resolved.geo_durations = durations;
+        })
+    }
+
+    /// The test owner, its committed topic shaped by `shape`.
+    fn test_owner_shaped<B: MessageBus + Clone + 'static>(
+        bus: &B,
+        store: Option<&Rc<HeldSuperblock>>,
+        (repair_memory, repair_rings): (
+            Option<Arc<partitions::RepairMemoryBudget>>,
+            Option<Rc<partitions::RepairRingBudget>>,
+        ),
+        shape: impl FnOnce(&mut Topic),
+    ) -> (IoTestShard<B>, TaggedSender) {
         let shard_id = ShardId::new(0);
         let config = PartitionsConfig {
             messages_required_to_save: 100,
@@ -11049,6 +11097,7 @@ mod tests {
         let mut inner = StreamsInner::default();
         let mut stream = Stream::default();
         let mut topic = Topic::default();
+        shape(&mut topic);
         for partition_id in 0..TEST_PARTITIONS {
             let namespace = IggyNamespace::new(0, 0, partition_id);
             let consensus = VsrConsensus::new(
@@ -12378,7 +12427,14 @@ mod tests {
         assert_eq!(sent_groups, groups);
     }
 
+    mod fresh_proofs;
+    mod fresh_writes;
+    mod geo_commits;
+    mod geo_positions_resume;
+    mod manifest_publishes;
     mod object_deletes;
+    mod peer_manifest_follows;
     mod segment_uploads;
     mod tier_service_uploads;
+    mod topic_object_checks;
 }

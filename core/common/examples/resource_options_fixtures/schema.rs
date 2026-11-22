@@ -36,16 +36,16 @@ use iggy_common::resource_options_json::encode_value;
 pub use iggy_common::wire_conversions::describe_options_response;
 use iggy_common::wire_conversions::identifier_to_wire;
 use iggy_common::{
-    CATALOG, CompressionAlgorithm, DEFAULT_PARTITIONS_COUNT, Durability, HeaderKey, HeaderKind,
-    HeaderValue, Identifier, IggyByteSize, IggyError, IggyExpiry, MaxTopicSize,
-    OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE, OPTION_FLAG_SECRET,
-    OPTION_FLAG_UPDATABLE, OptionAdmissionContext, OptionColumns, OptionDescriptor, OptionInputMap,
-    OptionKey, OptionMutability, OptionOperation, OptionStorage, OptionValue, OptionVisibility,
-    OptionsPatch, OptionsScope, OptionsUpdate, ResourceOptions, STREAM_KEY_LENGTH,
-    ServerKeyContext, StreamCreateOptions, StreamDetails, StreamEncryptionKey,
+    CATALOG, CompressionAlgorithm, DEFAULT_PARTITIONS_COUNT, Durability, GeoTopicDurations,
+    HeaderKey, HeaderKind, HeaderValue, Identifier, IggyByteSize, IggyDuration, IggyError,
+    IggyExpiry, MaxTopicSize, OPTION_FLAG_CRITICAL, OPTION_FLAG_READ_ONLY, OPTION_FLAG_RESETTABLE,
+    OPTION_FLAG_SECRET, OPTION_FLAG_UPDATABLE, OptionAdmissionContext, OptionColumns,
+    OptionDescriptor, OptionInputMap, OptionKey, OptionMutability, OptionOperation, OptionStorage,
+    OptionValue, OptionVisibility, OptionsPatch, OptionsScope, OptionsUpdate, ResourceOptions,
+    STREAM_KEY_LENGTH, ServerKeyContext, StreamCreateOptions, StreamDetails, StreamEncryptionKey,
     StreamEncryptionSource, StreamKeyOrigin, StreamUpdateOptions, TopicCreateOptions, TopicDetails,
     TopicUpdateOptions, UserCreateOptions, UserInfoDetails, UserStatus, UserUpdateOptions, WrapSet,
-    admit, critical_keys_marker,
+    admit, critical_keys_marker, project_shadow_origin, public_options,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -270,6 +270,26 @@ pub struct PatchInput {
     pub status: Option<UserStatus>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reset: Vec<OptionKey>,
+    #[serde(flatten)]
+    pub geo_durations: GeoDurationsInput,
+}
+
+/// The durations of a geo topic, each a decimal number of microseconds and
+/// absent when unset. Zero is a value, never dropped as a default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct GeoDurationsInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_upload_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_offset_upload_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_publish_interval: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tombstone_grace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub positions_resume_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_term_rewrite_max_interval: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -330,6 +350,10 @@ pub struct CreateTopicInput {
     pub segment_size: Option<String>,
     pub durability: Durability,
     pub consumer_offset_durability: Durability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic_type: Option<String>,
+    #[serde(flatten)]
+    pub geo_durations: GeoDurationsInput,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -401,6 +425,9 @@ pub struct StreamKeyState {
     pub kek_config_keys: Vec<String>,
     #[serde(with = "iggy_common::resource_options_json")]
     pub stored_extra: ResourceOptions,
+    /// The origin of a shadow stream, which the server reports read-only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -424,6 +451,8 @@ pub struct StreamProjection {
     pub encryption_key_source: Option<StreamEncryptionSource>,
     pub encryption_key_fingerprint: Option<String>,
     pub encryption_kek_fingerprints: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -447,6 +476,9 @@ pub struct TopicProjection {
     pub compression_algorithm: String,
     pub message_expiry: String,
     pub max_topic_size: String,
+    /// The durations of a geo topic, as its typed read reports them.
+    #[serde(flatten)]
+    pub geo_durations: GeoDurationsInput,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -585,6 +617,7 @@ impl PatchInput {
                 name: self.name.clone(),
                 message_expiry: decimal(self.message_expiry.as_deref())?.map(IggyExpiry::from),
                 max_topic_size: decimal(self.max_topic_size.as_deref())?.map(MaxTopicSize::from),
+                geo_durations: self.geo_durations.durations()?,
                 reset,
                 ..TopicUpdateOptions::default()
             }
@@ -674,6 +707,13 @@ impl CreateTopicInput {
             segment_size: decimal(self.segment_size.as_deref())?.map(IggyByteSize::from),
             durability: self.durability,
             consumer_offset_durability: self.consumer_offset_durability,
+            topic_type: self
+                .topic_type
+                .as_deref()
+                .map(str::parse)
+                .transpose()
+                .map_err(|_| IggyError::InvalidFormat)?,
+            geo_durations: self.geo_durations.durations()?,
             ..TopicCreateOptions::default()
         })
     }
@@ -737,6 +777,15 @@ impl StreamKeyState {
             OptionValue::explicit(critical_keys_marker(&[OptionKey::EncryptionKeyWrapped])?),
         );
         Ok(stored)
+    }
+
+    /// The options a read of the stream returns.
+    pub fn public_options(&self) -> Result<ResourceOptions, IggyError> {
+        let mut public = public_options(OptionsScope::Stream, &self.stored_options()?)?;
+        if let Some(origin) = &self.shadow_origin {
+            project_shadow_origin(&mut public, origin)?;
+        }
+        Ok(public)
     }
 }
 
@@ -856,6 +905,7 @@ impl From<&StreamDetails> for StreamProjection {
             encryption_key_source: details.encryption_key_source(),
             encryption_key_fingerprint: details.encryption_key_fingerprint(),
             encryption_kek_fingerprints: details.encryption_kek_fingerprints(),
+            shadow_origin: details.shadow_origin(),
         }
     }
 }
@@ -874,6 +924,40 @@ impl From<&TopicDetails> for TopicProjection {
             compression_algorithm: resolved.compression_algorithm.to_string(),
             message_expiry: u64::from(resolved.message_expiry).to_string(),
             max_topic_size: u64::from(resolved.max_topic_size).to_string(),
+            geo_durations: GeoDurationsInput::from(resolved.geo_durations),
+        }
+    }
+}
+
+impl GeoDurationsInput {
+    /// The typed durations of the SDK's options.
+    pub fn durations(&self) -> Result<GeoTopicDurations, IggyError> {
+        let duration = |text: &Option<String>| -> Result<Option<IggyDuration>, IggyError> {
+            Ok(decimal(text.as_deref())?.map(IggyDuration::from))
+        };
+        Ok(GeoTopicDurations {
+            fresh_upload_interval: duration(&self.fresh_upload_interval)?,
+            consumer_offset_upload_interval: duration(&self.consumer_offset_upload_interval)?,
+            positions_publish_interval: duration(&self.positions_publish_interval)?,
+            tombstone_grace: duration(&self.tombstone_grace)?,
+            positions_resume_timeout: duration(&self.positions_resume_timeout)?,
+            long_term_rewrite_max_interval: duration(&self.long_term_rewrite_max_interval)?,
+        })
+    }
+}
+
+impl From<GeoTopicDurations> for GeoDurationsInput {
+    fn from(durations: GeoTopicDurations) -> Self {
+        let text = |duration: Option<IggyDuration>| {
+            duration.map(|duration| duration.as_micros().to_string())
+        };
+        Self {
+            fresh_upload_interval: text(durations.fresh_upload_interval),
+            consumer_offset_upload_interval: text(durations.consumer_offset_upload_interval),
+            positions_publish_interval: text(durations.positions_publish_interval),
+            tombstone_grace: text(durations.tombstone_grace),
+            positions_resume_timeout: text(durations.positions_resume_timeout),
+            long_term_rewrite_max_interval: text(durations.long_term_rewrite_max_interval),
         }
     }
 }

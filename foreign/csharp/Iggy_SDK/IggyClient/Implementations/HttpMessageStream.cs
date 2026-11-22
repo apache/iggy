@@ -946,6 +946,26 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public async Task RetireGeoOriginAsync(string origin, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(origin);
+
+        // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
+        if (origin is "." or "..")
+        {
+            throw new ArgumentException("Geo origin must not be '.' or '..'.", nameof(origin));
+        }
+
+        using var content = new StringContent("{}", Encoding.UTF8, "application/json");
+        var response = await _httpClient.PostAsync($"/geo/origins/{Uri.EscapeDataString(origin)}/retire", content,
+            token);
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
+    }
+
+    /// <inheritdoc />
     public async Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query,
         CancellationToken token = default)
     {

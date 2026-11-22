@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod mux;
 pub mod partition_directory;
 pub mod result;
+pub mod shadow;
 pub mod snapshot;
 pub mod stream;
 pub mod user;

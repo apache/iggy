@@ -23,6 +23,10 @@
 //! With the coordinator log, only the coordinator of a group answers for it. The log answers each
 //! partition it holds an offset or a deletion for, with the commit metadata. Iggy answers the
 //! others, which hold offsets from before the log.
+//!
+//! Iggy answers every partition of a geo topic, which a shadow topic reads as: another datacenter
+//! can move a group's offsets there, and only Iggy holds what it moved. The log adds its commit
+//! metadata where it holds the offset that Iggy answers.
 
 use std::collections::{HashMap, HashSet};
 
@@ -38,7 +42,7 @@ use tokio::time::Instant;
 
 use crate::bridge::{BridgeError, IggyBridge, KafkaTopicMetadata, OffsetCalls, TopicTarget};
 use crate::coordinator::record::CommittedOffset;
-use crate::coordinator::replay::GroupOffsets;
+use crate::coordinator::replay::{GroupOffsets, TopicPartition};
 use crate::error::Result;
 use crate::group::is_valid_group_id;
 use crate::protocol::api::{
@@ -243,10 +247,12 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
         }
         None => None,
     };
+    let geo = geo_topics(bridge);
     // The log holds every offset of a group it deleted, so Iggy has nothing to add. Nor does it
-    // for a request whose every partition the log answers.
+    // for a request whose every partition the log answers, unless the request names a geo topic.
     if let Some(logged) = logged
         .as_ref()
+        .filter(|_| !names_geo(query.topics.as_deref(), &geo))
         .filter(|logged| logged.complete || answers_all(logged, query.topics.as_deref()))
     {
         return GroupAnswer {
@@ -261,17 +267,20 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
     // Each Iggy call stops at the deadline on its own, so none is cut off holding its slot.
     let read = match (&query.topics, &logged) {
         // Iggy reads only the partitions the log holds no entry for.
-        (Some(topics), Some(logged)) => {
-            read_topics(bridge, &query.group_id, &unlogged(topics, logged), calls)
-                .await
-                .map(|read| merged(topics, logged, read))
-        }
+        (Some(topics), Some(logged)) => read_topics(
+            bridge,
+            &query.group_id,
+            &unlogged(topics, logged, &geo),
+            calls,
+        )
+        .await
+        .map(|read| merged(topics, logged, &geo, read)),
         (Some(topics), None) => read_topics(bridge, &query.group_id, topics, calls).await,
         (None, _) => read_every_topic(bridge, &query.group_id, calls)
             .await
             .map(|mut read| {
                 if let Some(logged) = &logged {
-                    overlay(&mut read, logged);
+                    overlay(&mut read, logged, &geo);
                 }
                 read
             }),
@@ -285,9 +294,38 @@ async fn answer(state: &GatewayState, query: &GroupQuery, calls: &OffsetCalls) -
     }
 }
 
-/// `topics` without the partitions the log holds an entry for. Each topic stays, so the read
-/// answers in the same order.
-fn unlogged(topics: &[(TopicName, Vec<i32>)], logged: &GroupOffsets) -> Vec<(TopicName, Vec<i32>)> {
+/// The Kafka names of the geo topics, which a shadow topic reads as, from the change log.
+fn geo_topics(bridge: &IggyBridge) -> HashSet<String> {
+    bridge
+        .topic_shapes()
+        .borrow()
+        .iter()
+        .filter(|(_, shape)| shape.geo)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Whether a request of `topics` can read a geo topic. A request with no topic list reads every
+/// topic.
+fn names_geo(topics: Option<&[(TopicName, Vec<i32>)]>, geo: &HashSet<String>) -> bool {
+    topics.map_or(!geo.is_empty(), |topics| {
+        topics.iter().any(|(name, _)| geo.contains(name.0.as_str()))
+    })
+}
+
+/// Whether Iggy answers the partition `key` rather than the log: a partition of a geo topic, and
+/// one the log holds no entry for while it may not hold every offset of the group.
+fn reads_iggy(logged: &GroupOffsets, geo: &HashSet<String>, key: &TopicPartition) -> bool {
+    geo.contains(&key.0) || (!logged.complete && !logged.entries.contains_key(key))
+}
+
+/// `topics` with only the partitions that Iggy answers, see [`reads_iggy`]. Each topic stays, so
+/// the read answers in the same order.
+fn unlogged(
+    topics: &[(TopicName, Vec<i32>)],
+    logged: &GroupOffsets,
+    geo: &HashSet<String>,
+) -> Vec<(TopicName, Vec<i32>)> {
     topics
         .iter()
         .map(|(name, indexes)| {
@@ -297,7 +335,7 @@ fn unlogged(topics: &[(TopicName, Vec<i32>)], logged: &GroupOffsets) -> Vec<(Top
                 .copied()
                 .filter(|index| {
                     key.1 = *index;
-                    !logged.entries.contains_key(&key)
+                    reads_iggy(logged, geo, &key)
                 })
                 .collect();
             (name.clone(), indexes)
@@ -305,11 +343,12 @@ fn unlogged(topics: &[(TopicName, Vec<i32>)], logged: &GroupOffsets) -> Vec<(Top
         .collect()
 }
 
-/// The answer to `topics`, in request order: the log's for each partition it holds an entry
-/// for, else the next of `read`, which answers [`unlogged`] in that order.
+/// The answer to `topics`, in request order: the next of `read` for each partition that Iggy
+/// answers, which reads [`unlogged`] in that order, else the log's.
 fn merged(
     topics: &[(TopicName, Vec<i32>)],
     logged: &GroupOffsets,
+    geo: &HashSet<String>,
     read: Vec<TopicAnswer>,
 ) -> Vec<TopicAnswer> {
     topics
@@ -322,14 +361,15 @@ fn merged(
                 .iter()
                 .map(|&index| {
                     key.1 = index;
-                    logged.entries.get(&key).map_or_else(
-                        || {
-                            from_iggy.next().unwrap_or_else(|| {
-                                PartitionAnswer::new(index, UNKNOWN_OFFSET, ERROR_NONE)
-                            })
-                        },
-                        |committed| PartitionAnswer::logged(index, committed.as_ref()),
-                    )
+                    let committed = logged.entries.get(&key);
+                    if reads_iggy(logged, geo, &key) {
+                        let read = from_iggy.next().unwrap_or_else(|| {
+                            PartitionAnswer::new(index, UNKNOWN_OFFSET, ERROR_NONE)
+                        });
+                        with_logged_metadata(read, committed)
+                    } else {
+                        PartitionAnswer::logged(index, committed.and_then(Option::as_ref))
+                    }
                 })
                 .collect();
             TopicAnswer {
@@ -338,6 +378,20 @@ fn merged(
             }
         })
         .collect()
+}
+
+/// Iggy's answer `read`, with the log's metadata and leader epoch when the log holds the same
+/// offset.
+fn with_logged_metadata(
+    read: PartitionAnswer,
+    committed: Option<&Option<CommittedOffset>>,
+) -> PartitionAnswer {
+    match committed {
+        Some(Some(committed)) if read.error == ERROR_NONE && committed.offset == read.offset => {
+            PartitionAnswer::logged(read.index, Some(committed))
+        }
+        _ => read,
+    }
 }
 
 /// Whether the log holds an offset or a deletion for each partition of `topics`. A request with
@@ -395,17 +449,24 @@ fn from_log(logged: &GroupOffsets, topics: Option<&[(TopicName, Vec<i32>)]>) -> 
         .collect()
 }
 
-/// Puts the log's answer on each partition of Iggy's answer to a request with no topic list.
-/// The log's offsets that Iggy does not hold join the answer, and its deletions leave it.
-fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets) {
+/// Puts the log's answer on each partition of Iggy's answer to a request with no topic list,
+/// except on geo topics, see [`reads_iggy`]. The log's offsets that Iggy does not hold join the
+/// answer, and its deletions leave it.
+fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets, geo: &HashSet<String>) {
     for topic in topics.iter_mut() {
         let mut key = (topic.name.0.to_string(), 0);
-        for partition in &mut topic.partitions {
-            key.1 = partition.index;
-            if let Some(committed) = logged.entries.get(&key) {
-                *partition = PartitionAnswer::logged(partition.index, committed.as_ref());
-            }
-        }
+        topic.partitions = std::mem::take(&mut topic.partitions)
+            .into_iter()
+            .map(|partition| {
+                key.1 = partition.index;
+                let committed = logged.entries.get(&key);
+                if reads_iggy(logged, geo, &key) {
+                    with_logged_metadata(partition, committed)
+                } else {
+                    PartitionAnswer::logged(partition.index, committed.and_then(Option::as_ref))
+                }
+            })
+            .collect();
         topic
             .partitions
             .retain(|partition| partition.offset != UNKNOWN_OFFSET);
@@ -430,6 +491,9 @@ fn overlay(topics: &mut Vec<TopicAnswer>, logged: &GroupOffsets) {
         let Some(committed) = committed else {
             continue;
         };
+        if geo.contains(name) {
+            continue;
+        }
         let at = if let Some(&at) = positions.get(name.as_str()) {
             at
         } else {
@@ -807,7 +871,7 @@ mod tests {
             (topic("payments"), vec![0]),
         ];
 
-        let unread = unlogged(&topics, &logged);
+        let unread = unlogged(&topics, &logged, &HashSet::new());
         assert_eq!(unread[0].1, [0, 2]);
         assert_eq!(
             unread[1].1,
@@ -828,7 +892,7 @@ mod tests {
                 partitions: Vec::new(),
             },
         ];
-        let answer = merged(&topics, &logged, read);
+        let answer = merged(&topics, &logged, &HashSet::new(), read);
         let offsets: Vec<Vec<(i32, i64)>> = answer
             .iter()
             .map(|topic| {
@@ -847,6 +911,118 @@ mod tests {
             ]
         );
         assert_eq!(answer[0].partitions[1].leader_epoch, 3, "the log's commit");
+    }
+
+    fn logged_at(offset: i64) -> CommittedOffset {
+        CommittedOffset {
+            offset,
+            leader_epoch: 3,
+            metadata: Some("logged".to_string()),
+            commit_timestamp_ms: 0,
+            topic_incarnation: None,
+        }
+    }
+
+    /// `(index, offset, leader epoch)` of each partition of each topic.
+    fn answered(answer: &[TopicAnswer]) -> Vec<Vec<(i32, i64, i32)>> {
+        answer
+            .iter()
+            .map(|topic| {
+                topic
+                    .partitions
+                    .iter()
+                    .map(|partition| (partition.index, partition.offset, partition.leader_epoch))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn given_a_geo_topic_should_read_iggy_and_keep_the_logs_metadata_only_where_it_agrees() {
+        let logged = GroupOffsets {
+            complete: true,
+            entries: [
+                (("orders".to_string(), 0), Some(logged_at(10))),
+                (("orders".to_string(), 1), Some(logged_at(20))),
+                (("payments".to_string(), 0), Some(logged_at(7))),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let geo = HashSet::from(["orders".to_string()]);
+        let topics = vec![
+            (topic("orders"), vec![0, 1]),
+            (topic("payments"), vec![0, 1]),
+        ];
+        assert!(names_geo(Some(&topics), &geo));
+        assert!(!names_geo(Some(&topics[1..]), &geo));
+
+        let unread = unlogged(&topics, &logged, &geo);
+        assert_eq!(unread[0].1, [0, 1], "a geo topic reads Iggy");
+        assert_eq!(
+            unread[1].1,
+            Vec::<i32>::new(),
+            "the log holds every other offset of a deleted group"
+        );
+        let read = vec![
+            TopicAnswer {
+                name: topic("orders"),
+                partitions: vec![
+                    PartitionAnswer::new(0, 10, ERROR_NONE),
+                    PartitionAnswer::new(1, 25, ERROR_NONE),
+                ],
+            },
+            TopicAnswer {
+                name: topic("payments"),
+                partitions: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            answered(&merged(&topics, &logged, &geo, read)),
+            [
+                vec![(0, 10, 3), (1, 25, -1)],
+                vec![(0, 7, 3), (1, UNKNOWN_OFFSET, -1)]
+            ],
+            "another datacenter moved partition 1 of the geo topic"
+        );
+    }
+
+    #[test]
+    fn given_a_geo_topic_when_overlaying_a_read_of_every_topic_should_keep_iggys_offsets_there() {
+        let logged = GroupOffsets {
+            complete: false,
+            entries: [
+                (("orders".to_string(), 0), Some(logged_at(10))),
+                (("orders".to_string(), 1), Some(logged_at(20))),
+                (("orders".to_string(), 2), Some(logged_at(30))),
+                (("payments".to_string(), 0), Some(logged_at(7))),
+                (("payments".to_string(), 3), Some(logged_at(8))),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let geo = HashSet::from(["orders".to_string()]);
+        let mut read = vec![
+            TopicAnswer {
+                name: topic("orders"),
+                partitions: vec![
+                    PartitionAnswer::new(0, 10, ERROR_NONE),
+                    PartitionAnswer::new(1, 25, ERROR_NONE),
+                ],
+            },
+            TopicAnswer {
+                name: topic("payments"),
+                partitions: vec![PartitionAnswer::new(0, 99, ERROR_NONE)],
+            },
+        ];
+
+        overlay(&mut read, &logged, &geo);
+
+        assert_eq!(
+            answered(&read),
+            [vec![(0, 10, 3), (1, 25, -1)], vec![(0, 7, 3), (3, 8, 3)]]
+        );
     }
 
     #[tokio::test]

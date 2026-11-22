@@ -59,15 +59,16 @@ use crate::boot::threads::{
 use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
 use crate::dispatch::reads::read_frontier_budget;
 use crate::dispatch::session_ops::warm_dummy_password_hash;
+use crate::geo_peers::PeerAuth;
 use crate::server_error::ServerError;
 use crate::shell::{
     ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
 };
+use crate::tiered_storage::SharedStore;
 use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::Operation;
-use iggy_object_store::s3::SharedCredentials;
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
@@ -79,6 +80,7 @@ use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use shard::peers::SharedPeerStatus;
 use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
@@ -93,7 +95,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-3\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -303,9 +305,12 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
     crate::tiered_storage::preflight(&config.tiered_storage)?;
-    let tiered_credentials = crate::s3_credentials::credentials(&config.tiered_storage)?;
+    let tiered_store = SharedStore::new(&config.tiered_storage)?;
     let object_store_answered =
-        crate::tiered_storage::probe(&config.tiered_storage, tiered_credentials.as_ref())?;
+        crate::tiered_storage::probe(&config.tiered_storage, &tiered_store)?;
+    crate::geo_peers::preflight(&config.geo)?;
+    let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
+    let geo_peer_auth = crate::geo_peers::auth(&config.geo)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -465,7 +470,9 @@ pub fn bootstrap(
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
-        let tiered_credentials_for_shard = tiered_credentials.clone();
+        let tiered_store_for_shard = tiered_store.clone();
+        let geo_peer_statuses_for_shard = geo_peer_statuses.clone();
+        let geo_peer_auth_for_shard = geo_peer_auth.clone();
         let primary_handoff_for_shard = Arc::clone(&primary_handoff);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -489,7 +496,9 @@ pub fn bootstrap(
                     shard_metrics_for_shard,
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
-                    tiered_credentials_for_shard,
+                    tiered_store_for_shard,
+                    geo_peer_statuses_for_shard,
+                    geo_peer_auth_for_shard,
                     primary_handoff_for_shard,
                 )
             }) {
@@ -567,7 +576,9 @@ async fn shard_main(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
-    tiered_credentials: Option<SharedCredentials>,
+    tiered_store: SharedStore,
+    geo_peer_statuses: Vec<SharedPeerStatus>,
+    geo_peer_auth: PeerAuth,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -1032,13 +1043,26 @@ async fn shard_main(
         _ => None,
     };
 
+    shard.set_long_term_rewrite_max_interval(
+        config.geo.long_term_rewrite_max_interval.get_duration(),
+    );
     let store_identity_stop = crate::tiered_storage::start(
         &config.tiered_storage,
+        crate::origin_recovery::OriginRecovery::from_config(&config.geo),
         &bus,
         &shard,
         topology.self_replica_id,
-        tiered_credentials.as_ref(),
+        &tiered_store,
     );
+    let geo_peers_stop = crate::geo_peers::start(
+        &config.geo,
+        &config.tiered_storage,
+        &bus,
+        &shard,
+        &geo_peer_statuses,
+        &geo_peer_auth,
+    );
+    shard.set_geo_positions(crate::peer_positions::settings(&config.geo));
 
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
@@ -1063,6 +1087,7 @@ async fn shard_main(
         stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         store_identity: store_identity_stop,
+        geo_peers: geo_peers_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
     };
@@ -1375,6 +1400,23 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 mod tests {
     use super::*;
 
+    /// The two crates keep their own copy of the bounds, and they must not
+    /// drift apart.
+    #[test]
+    fn given_default_geo_section_when_reading_the_rewrite_ceiling_should_give_the_shard_bounds() {
+        assert_eq!(
+            ServerConfig::default()
+                .geo
+                .long_term_rewrite_max_interval
+                .get_duration(),
+            shard::rewrite_pacing::REWRITE_INTERVAL_MAX
+        );
+        assert_eq!(
+            configs::geo::LONG_TERM_REWRITE_MAX_INTERVAL_MIN,
+            shard::rewrite_pacing::REWRITE_INTERVAL_MIN
+        );
+    }
+
     #[compio::test]
     async fn given_missing_or_empty_storage_when_booting_should_initialize_without_wiping_on_restart()
      {
@@ -1439,6 +1481,8 @@ mod tests {
             b"IGGY-RESOURCE-OPTIONS-1\n",
             b"IGGY-METADATA-CHANGE-LOG-1\n",
             b"IGGY-METADATA-CHANGE-LOG-2\n",
+            b"IGGY-METADATA-CHANGE-LOG-3\n",
+            b"IGGY-TIERED-SEGMENT-CHAIN-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();

@@ -58,6 +58,7 @@ pub struct AppliedFrontier {
     partition_freshness: Option<PartitionFreshness>,
     tiered_storage_ready: AtomicBool,
     store_identity_verified: AtomicBool,
+    store_claimed_by_another: AtomicBool,
 }
 
 /// Volatile quorum evidence. Recovery restores metadata, never freshness.
@@ -117,13 +118,13 @@ impl AppliedFrontier {
             partition_freshness: None,
             tiered_storage_ready: AtomicBool::new(false),
             store_identity_verified: AtomicBool::new(false),
+            store_claimed_by_another: AtomicBool::new(false),
         }
     }
 
     /// Record whether the partitions of this node can read their remote
-    /// segments back. False until set. No boot path hands a partition those
-    /// reads yet (`IggyPartition::set_remote_segments`), so no boot path sets
-    /// this.
+    /// segments back. False until set, which the server does once it gave
+    /// them a store to read from.
     pub fn set_tiered_storage_ready(&self, ready: bool) {
         self.tiered_storage_ready.store(ready, Ordering::Release);
     }
@@ -153,6 +154,21 @@ impl AppliedFrontier {
     #[must_use]
     pub fn store_identity_verified(&self) -> bool {
         self.store_identity_verified.load(Ordering::Acquire)
+    }
+
+    /// Record whether the last check that read this node's store identity
+    /// object found it naming another cluster, or holding bytes no cluster
+    /// wrote. False until the server's identity check sets it.
+    pub fn set_store_claimed_by_another(&self, claimed: bool) {
+        self.store_claimed_by_another
+            .store(claimed, Ordering::Release);
+    }
+
+    /// Whether this node's store names another cluster, as
+    /// [`Self::set_store_claimed_by_another`] last recorded it.
+    #[must_use]
+    pub fn store_claimed_by_another(&self) -> bool {
+        self.store_claimed_by_another.load(Ordering::Acquire)
     }
 
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;

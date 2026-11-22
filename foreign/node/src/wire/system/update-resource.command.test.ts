@@ -34,7 +34,8 @@ import { deserializeToStream, type Stream } from '../stream/stream.utils.js';
 import { CREATE_TOPIC } from '../topic/create-topic.command.js';
 import { UPDATE_TOPIC } from '../topic/update-topic.command.js';
 import {
-  CompressionAlgorithm, compressionAlgorithmName, deserializeTopic, Durability, PartitionResizePolicy
+  CompressionAlgorithm, compressionAlgorithmName, deserializeTopic, Durability, GeoMode, PartitionResizePolicy,
+  TopicType, type Topic
 } from '../topic/topic.utils.js';
 import { CREATE_USER } from '../user/create-user.command.js';
 import { translateErrorCode } from '../error.code.js';
@@ -56,7 +57,13 @@ type FixtureOptions = Record<string, FixtureOption>;
 type FixtureKey = { raw_hex?: string, base64?: string };
 type Scope = 'topic' | 'stream' | 'user';
 type Target = { stream_id?: Id, topic_id?: Id, user_id?: Id };
-type UpdateInput = {
+/** The durations of a geo topic as decimal microseconds, absent when unset. */
+type GeoDurationsInput = {
+  fresh_upload_interval?: string, consumer_offset_upload_interval?: string,
+  positions_publish_interval?: string, tombstone_grace?: string,
+  positions_resume_timeout?: string, long_term_rewrite_max_interval?: string
+};
+type UpdateInput = GeoDurationsInput & {
   name?: string, username?: string, status?: string,
   message_expiry?: string, max_topic_size?: string, reset?: string[]
 };
@@ -101,10 +108,10 @@ type Fixture = {
   }[],
   create_topic: {
     case: string,
-    input: {
-      stream_id: Id, name: string, partitions_count: number, compression_algorithm: string,
-      message_expiry: string, max_topic_size: string, segment_size: string,
-      durability: Durability, consumer_offset_durability: Durability
+    input: GeoDurationsInput & {
+      stream_id: Id, name: string, partitions_count: number, compression_algorithm?: string,
+      message_expiry?: string, max_topic_size?: string, segment_size?: string,
+      durability: Durability, consumer_offset_durability: Durability, topic_type?: TopicType
     },
     body_hex: string
   }[],
@@ -117,12 +124,12 @@ type Fixture = {
       id: number, created_at: number, name: string, topics_count: number,
       size_bytes: number, messages_count: number, options: FixtureOptions,
       encryption_key_source: string, encryption_key_fingerprint: string | null,
-      encryption_kek_fingerprints: string[]
+      encryption_kek_fingerprints: string[], shadow_origin?: string
     }
   }[],
   topic_responses: {
     case: string, response_hex: string,
-    expected: {
+    expected: GeoDurationsInput & {
       id: number, created_at: number, name: string, partitions_count: number,
       size_bytes: number, messages_count: number, options: FixtureOptions,
       compression_algorithm: string, message_expiry: string, max_topic_size: string
@@ -150,6 +157,23 @@ const keyInput = (key: FixtureKey): Buffer | string =>
 const userStatus = (status: string) =>
   status === 'active' ? UserStatus.Active : UserStatus.Inactive;
 const optionalBigInt = (value?: string) => value === undefined ? undefined : BigInt(value);
+const geoDurations = (input: GeoDurationsInput) => ({
+  freshUploadInterval: optionalBigInt(input.fresh_upload_interval),
+  consumerOffsetUploadInterval: optionalBigInt(input.consumer_offset_upload_interval),
+  positionsPublishInterval: optionalBigInt(input.positions_publish_interval),
+  tombstoneGrace: optionalBigInt(input.tombstone_grace),
+  positionsResumeTimeout: optionalBigInt(input.positions_resume_timeout),
+  longTermRewriteMaxInterval: optionalBigInt(input.long_term_rewrite_max_interval)
+});
+/** The durations a topic read reports, in the projection's form: set ones only. */
+const geoDurationsProjection = (topic: Topic): GeoDurationsInput => Object.fromEntries(Object.entries({
+  fresh_upload_interval: topic.freshUploadInterval,
+  consumer_offset_upload_interval: topic.consumerOffsetUploadInterval,
+  positions_publish_interval: topic.positionsPublishInterval,
+  tombstone_grace: topic.tombstoneGrace,
+  positions_resume_timeout: topic.positionsResumeTimeout,
+  long_term_rewrite_max_interval: topic.longTermRewriteMaxInterval
+}).flatMap(([key, value]) => value === null ? [] : [[key, value.toString()]]));
 
 const kindName = (value: unknown): string => {
   if (typeof value === 'bigint') return 'uint64';
@@ -185,7 +209,8 @@ const encodeUpdate = (scope: Scope, target: Target, input: UpdateInput): Buffer 
       return UPDATE_TOPIC.serialize({
         streamId: target.stream_id!, topicId: target.topic_id!, name: input.name,
         messageExpiry: optionalBigInt(input.message_expiry),
-        maxTopicSize: optionalBigInt(input.max_topic_size), reset
+        maxTopicSize: optionalBigInt(input.max_topic_size), reset,
+        ...geoDurations(input)
       });
     case 'stream':
       return UPDATE_STREAM.serialize({ streamId: target.stream_id!, name: input.name, reset });
@@ -252,6 +277,8 @@ describe('given shared vectors when encoding should match server contract', () =
       ['topic', ['name'], 4104],
       ['topic', ['tiered_storage'], 4103],
       ['topic', ['tiered_storage', 'name'], 4103],
+      ['topic', ['tombstone_grace'], 4104],
+      ['topic', ['consumer_offset_upload_interval', 'message_expiry'], 4104],
       ['user', ['username'], 4104],
       ['topic', ['name', 'encryption_key'], 4041]
     ];
@@ -280,6 +307,16 @@ describe('given shared vectors when encoding should match server contract', () =
     assert.doesNotThrow(() => UPDATE_TOPIC.serialize({
       streamId: 1, topicId: 2, reset: ['local_retention_age', 'local_retention_size']
     }));
+  });
+
+  it('sets the durations of a geo topic, sending 0n as a value', () => {
+    const body = UPDATE_TOPIC.serialize({
+      streamId: 1, topicId: 2, positionsResumeTimeout: 0n, positionsPublishInterval: 2_000_000n
+    });
+    assert.deepEqual(deserializeOptions(body, 1 + 2 * serializeIdentifier(1).length + 1), {
+      positions_publish_interval: 2_000_000n,
+      positions_resume_timeout: 0n
+    });
   });
 
   it('lets a typed field win over a raw entry of the same key', () => {
@@ -368,7 +405,15 @@ describe('given shared vectors when encoding should match server contract', () =
         segment_max_age: () => topicBlock({ segmentMaxAge: 1n }),
         tiered_storage: () => topicBlock({ tieredStorage: false }),
         local_retention_age: () => topicBlock({ localRetentionAge: 1n }),
-        local_retention_size: () => topicBlock({ localRetentionSize: 1n })
+        local_retention_size: () => topicBlock({ localRetentionSize: 1n }),
+        topic_type: () => topicBlock({ topicType: TopicType.Geo }),
+        geo_mode: () => topicBlock({ geoMode: GeoMode.GeoTiered }),
+        fresh_upload_interval: () => topicBlock({ freshUploadInterval: 0n }),
+        consumer_offset_upload_interval: () => topicBlock({ consumerOffsetUploadInterval: 0n }),
+        positions_publish_interval: () => topicBlock({ positionsPublishInterval: 1n }),
+        tombstone_grace: () => topicBlock({ tombstoneGrace: 1n }),
+        positions_resume_timeout: () => topicBlock({ positionsResumeTimeout: 0n }),
+        long_term_rewrite_max_interval: () => topicBlock({ longTermRewriteMaxInterval: 1n })
       },
       user: {}
     };
@@ -391,7 +436,19 @@ describe('given shared vectors when encoding should match server contract', () =
         local_retention_age: () =>
           updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, localRetentionAge: 1n }), 2),
         local_retention_size: () =>
-          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, localRetentionSize: 1n }), 2)
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, localRetentionSize: 1n }), 2),
+        fresh_upload_interval: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, freshUploadInterval: 0n }), 2),
+        consumer_offset_upload_interval: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, consumerOffsetUploadInterval: 0n }), 2),
+        positions_publish_interval: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, positionsPublishInterval: 1n }), 2),
+        tombstone_grace: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, tombstoneGrace: 1n }), 2),
+        positions_resume_timeout: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, positionsResumeTimeout: 0n }), 2),
+        long_term_rewrite_max_interval: () =>
+          updateBlock(UPDATE_TOPIC.serialize({ streamId: 1, topicId: 1, longTermRewriteMaxInterval: 1n }), 2)
       },
       user: {
         username: () => updateBlock(UPDATE_USER.serialize({ userId: 1, username: 'alice2' }), 1),
@@ -412,7 +469,8 @@ describe('given shared vectors when encoding should match server contract', () =
       stream: {
         encryption_key_source: 'encryptionKeySource',
         encryption_key_fingerprint: 'encryptionKeyFingerprint',
-        encryption_kek_fingerprint: 'encryptionKekFingerprints'
+        encryption_kek_fingerprint: 'encryptionKekFingerprints',
+        shadow_origin: 'shadowOrigin'
       },
       topic: {},
       user: {}
@@ -468,11 +526,13 @@ describe('given shared vectors when encoding should match server contract', () =
         partitionCount: input.partitions_count,
         compressionAlgorithm: input.compression_algorithm === 'gzip'
           ? CompressionAlgorithm.Gzip : CompressionAlgorithm.None,
-        messageExpiry: BigInt(input.message_expiry),
-        maxTopicSize: BigInt(input.max_topic_size),
-        segmentSize: BigInt(input.segment_size),
+        messageExpiry: optionalBigInt(input.message_expiry),
+        maxTopicSize: optionalBigInt(input.max_topic_size),
+        segmentSize: optionalBigInt(input.segment_size),
         durability: input.durability,
-        consumerOffsetDurability: input.consumer_offset_durability
+        consumerOffsetDurability: input.consumer_offset_durability,
+        topicType: input.topic_type,
+        ...geoDurations(input)
       });
       assert.equal(encoded.toString('hex'), body_hex, name);
     }
@@ -500,10 +560,13 @@ describe('given shared vectors when encoding should match server contract', () =
         options: withProvenance(stream.options, stream.derivedOptions),
         encryption_key_source: stream.encryptionKeySource,
         encryption_key_fingerprint: stream.encryptionKeyFingerprint,
-        encryption_kek_fingerprints: stream.encryptionKekFingerprints
+        encryption_kek_fingerprints: stream.encryptionKekFingerprints,
+        ...(stream.shadowOrigin === null ? {} : { shadow_origin: stream.shadowOrigin })
       }, expected, name);
       assertNoSecrets(stream.options, stream.derivedOptions);
     }
+    const shadow = fixture.stream_responses.find(({ case: name }) => name === 'stream_shadow_of_a_geo_peer');
+    assert.equal(deserializeToStream(fromHex(shadow!.response_hex)).data.shadowOrigin, 'dc-a');
   });
 
   it('decodes topic responses with the settings read from the option blocks', () => {
@@ -521,12 +584,15 @@ describe('given shared vectors when encoding should match server contract', () =
         options: withProvenance(topic.options, topic.derivedOptions),
         compression_algorithm: compressionAlgorithmName(topic.compressionAlgorithm),
         message_expiry: topic.messageExpiry.toString(),
-        max_topic_size: topic.maxTopicSize.toString()
+        max_topic_size: topic.maxTopicSize.toString(),
+        ...geoDurationsProjection(topic)
       }, expected, name);
       assert.equal(topic.segmentMaxAge.toString(), expected.options.segment_max_age.value, name);
       assert.equal(String(topic.tieredStorage), expected.options.tiered_storage.value, name);
       assert.equal(topic.localRetentionAge.toString(), expected.options.local_retention_age.value, name);
       assert.equal(topic.localRetentionSize.toString(), expected.options.local_retention_size.value, name);
+      assert.equal(topic.topicType, expected.options.topic_type.value, name);
+      assert.equal(topic.geoMode, expected.options.geo_mode?.value ?? null, name);
     }
   });
 

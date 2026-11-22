@@ -21,6 +21,8 @@ use std::ops::Range;
 
 use crate::error::ObjectStoreError;
 use crate::fs::FsStore;
+use crate::gcs::GcsStore;
+use crate::mock_s3::MockS3Store;
 use crate::s3::S3Store;
 use crate::store::{
     DeleteOutcome, ListPage, ListRequest, ObjectMeta, ObjectRange, ObjectStore, PutBody, PutOptions,
@@ -34,6 +36,8 @@ use crate::store::{
 pub enum Backend {
     Fs(FsStore),
     S3(S3Store),
+    Gcs(GcsStore),
+    MockS3(MockS3Store),
 }
 
 impl ObjectStore for Backend {
@@ -46,6 +50,8 @@ impl ObjectStore for Backend {
         match self {
             Self::Fs(store) => store.put(key, body, options).await,
             Self::S3(store) => store.put(key, body, options).await,
+            Self::Gcs(store) => store.put(key, body, options).await,
+            Self::MockS3(store) => store.put(key, body, options).await,
         }
     }
 
@@ -57,6 +63,8 @@ impl ObjectStore for Backend {
         match self {
             Self::Fs(store) => store.get_range(key, range).await,
             Self::S3(store) => store.get_range(key, range).await,
+            Self::Gcs(store) => store.get_range(key, range).await,
+            Self::MockS3(store) => store.get_range(key, range).await,
         }
     }
 
@@ -64,6 +72,8 @@ impl ObjectStore for Backend {
         match self {
             Self::Fs(store) => store.head(key).await,
             Self::S3(store) => store.head(key).await,
+            Self::Gcs(store) => store.head(key).await,
+            Self::MockS3(store) => store.head(key).await,
         }
     }
 
@@ -71,6 +81,8 @@ impl ObjectStore for Backend {
         match self {
             Self::Fs(store) => store.delete(keys).await,
             Self::S3(store) => store.delete(keys).await,
+            Self::Gcs(store) => store.delete(keys).await,
+            Self::MockS3(store) => store.delete(keys).await,
         }
     }
 
@@ -78,6 +90,8 @@ impl ObjectStore for Backend {
         match self {
             Self::Fs(store) => store.list(request).await,
             Self::S3(store) => store.list(request).await,
+            Self::Gcs(store) => store.list(request).await,
+            Self::MockS3(store) => store.list(request).await,
         }
     }
 }

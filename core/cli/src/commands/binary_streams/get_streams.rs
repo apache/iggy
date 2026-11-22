@@ -89,6 +89,7 @@ impl CliCommand for GetStreamsCmd {
                     "Messages",
                     "Topics",
                     "Encryption",
+                    "Origin",
                 ]);
 
                 streams.iter().for_each(|stream| {
@@ -100,6 +101,7 @@ impl CliCommand for GetStreamsCmd {
                         format!("{}", stream.messages_count),
                         format!("{}", stream.topics_count),
                         encryption_source(stream.encryption_key_source()).to_owned(),
+                        stream.shadow_origin().unwrap_or_else(|| "-".to_owned()),
                     ]);
                 });
 
@@ -108,14 +110,15 @@ impl CliCommand for GetStreamsCmd {
             GetStreamsOutput::List => {
                 streams.iter().for_each(|stream| {
                     event!(target: PRINT_TARGET, Level::INFO,
-                        "{}|{}|{}|{}|{}|{}|{}",
+                        "{}|{}|{}|{}|{}|{}|{}|{}",
                         stream.id,
                         stream.created_at,
                         stream.name,
                         stream.size,
                         stream.messages_count,
                         stream.topics_count,
-                        encryption_source(stream.encryption_key_source())
+                        encryption_source(stream.encryption_key_source()),
+                        stream.shadow_origin().as_deref().unwrap_or("-")
                     );
                 });
             }

@@ -499,6 +499,10 @@ where
         };
         let mut armed_deadline = None;
         let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
+        // The uploads of fresh objects run on deadlines of their own, far
+        // shorter than a tick: producers wait for the open window to close.
+        let mut armed_fresh_deadline = None;
+        let mut fresh_deadline = std::pin::pin!(deadline_timer(None));
         loop {
             self.service_deferred_polls().await;
             // Here and not at the end of the turn: an idle owner would hold
@@ -508,6 +512,11 @@ where
             if next_deadline != armed_deadline {
                 armed_deadline = next_deadline;
                 deferred_deadline.set(deadline_timer(next_deadline));
+            }
+            let next_fresh_deadline = self.fresh_uploads_deadline();
+            if next_fresh_deadline != armed_fresh_deadline {
+                armed_fresh_deadline = next_fresh_deadline;
+                fresh_deadline.set(deadline_timer(next_fresh_deadline));
             }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
@@ -534,6 +543,11 @@ where
                         fatal = Some(fault);
                         break;
                     }
+                    self.tick_fresh_writes().await;
+                    self.tick_fresh_sweeps();
+                    self.tick_geo_positions();
+                    self.tick_long_term_rewrites().await;
+                    self.tick_long_term_merges().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -563,6 +577,11 @@ where
                 () = deferred_deadline.as_mut() => {
                     armed_deadline = None;
                     deferred_deadline.set(deadline_timer(None));
+                }
+                () = fresh_deadline.as_mut() => {
+                    armed_fresh_deadline = None;
+                    fresh_deadline.set(deadline_timer(None));
+                    self.drive_fresh_uploads();
                 }
                 frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
@@ -667,6 +686,9 @@ where
             // After every event, as partition I/O, so a busy inbox cannot
             // starve the serves that wait for a disk read.
             self.serve_landed_read().await;
+            // After every event too: a commit frees the room that the sends
+            // of a stored fresh object wait for, and it can come in any arm.
+            self.feed_fresh_sends_awaiting_room().await;
         }
 
         self.poll_completions.close();
@@ -788,6 +810,9 @@ where
                     }
                     self.tick_metadata().await;
                     let _ = self.tick_partitions(&mut namespace_scratch).await;
+                    self.tick_fresh_writes().await;
+                    self.tick_long_term_rewrites().await;
+                    self.tick_long_term_merges().await;
                     // After the tick: the first tick fires one interval after
                     // the stop began, so the tick at the deadline must still
                     // start its share of the reach.
@@ -1367,6 +1392,121 @@ where
             }
             LifecycleFrame::ObjectDeleteFinished(finished) => {
                 self.on_object_delete_finished(*finished);
+            }
+            LifecycleFrame::PublishManifest {
+                namespace,
+                created_revision,
+                now,
+            } => {
+                self.on_publish_manifest(namespace, created_revision, now);
+            }
+            LifecycleFrame::ManifestPublishFinished(finished) => {
+                self.on_manifest_publish_finished(&finished);
+            }
+            LifecycleFrame::FreshUploadFinished(finished) => {
+                self.on_fresh_upload_finished(*finished).await;
+            }
+            LifecycleFrame::RewriteSegments {
+                namespace,
+                created_revision,
+            } => {
+                self.on_rewrite_segments(namespace, created_revision).await;
+            }
+            LifecycleFrame::SegmentRewriteFinished(finished) => {
+                self.on_segment_rewrite_finished(*finished).await;
+            }
+            LifecycleFrame::SweepFreshObjects { now } => {
+                self.on_sweep_fresh_objects(now);
+            }
+            LifecycleFrame::FreshObjectsListed(finished) => {
+                self.on_fresh_objects_listed(*finished);
+            }
+            LifecycleFrame::ReportFreshObjects { sweep } => {
+                self.on_report_fresh_objects(sweep);
+            }
+            LifecycleFrame::FreshObjectsReported(report) => {
+                self.on_fresh_objects_reported(*report);
+            }
+            LifecycleFrame::FreshObjectsDeleted(finished) => {
+                self.on_fresh_objects_deleted(*finished);
+            }
+            LifecycleFrame::CheckTopicObjects { now } => {
+                self.on_check_topic_objects(now);
+            }
+            LifecycleFrame::TopicObjectCheckFinished(finished) => {
+                self.on_topic_object_check_finished(&finished);
+            }
+            LifecycleFrame::PeerManifestsListed {
+                origin,
+                now,
+                manifests,
+            } => {
+                self.on_peer_manifests_listed(&origin, now, manifests).await;
+            }
+            LifecycleFrame::PeerManifestRead(finished) => {
+                self.on_peer_manifest_read(*finished).await;
+            }
+            LifecycleFrame::RetainRetiredPeer {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_retired_peer(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
+            }
+            LifecycleFrame::ReportGeoPositions { round, scope } => {
+                self.on_report_geo_positions(round, scope).await;
+            }
+            LifecycleFrame::ReportGeoPositionsFolded { round, scope } => {
+                self.on_report_geo_positions_folded(round, scope.as_deref());
+            }
+            LifecycleFrame::GeoPositionsReported(report) => {
+                self.on_geo_positions_reported(*report);
+            }
+            LifecycleFrame::GeoPositionsStored(finished) => {
+                self.on_positions_stored(*finished);
+            }
+            LifecycleFrame::PeerPositionsListed(positions) => {
+                self.on_peer_positions_listed(*positions).await;
+            }
+            LifecycleFrame::NoteGeoPositions { namespace } => {
+                self.on_note_geo_positions(namespace).await;
+            }
+            LifecycleFrame::GeoCommitHeld(commit) => {
+                self.on_geo_commit_held(*commit);
+            }
+            LifecycleFrame::GeoCommitsWaiting { topics } => {
+                self.on_geo_commits_waiting(topics);
+            }
+            LifecycleFrame::GeoPositionsPublished { round, stored } => {
+                self.on_geo_positions_published(round, stored);
+            }
+            LifecycleFrame::SegmentMergeFinished(finished) => {
+                self.on_segment_merge_finished(*finished).await;
+            }
+            LifecycleFrame::RetainLongTerm {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_long_term(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
             }
             LifecycleFrame::TruncatePartition {
                 namespace,

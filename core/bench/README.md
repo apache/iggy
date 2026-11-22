@@ -34,6 +34,13 @@ These options apply when the benchmark creates topics. They do not change existi
 
 `--messages-required-to-save` controls a topic's segment-flush cadence independently of durability. `--max-topic-size` and `--message-expiry` are kind-specific topic options. Use the selected kind's `--help` to inspect supported flags. OS writeback settings do not replace these policies.
 
+`--topic-type geo` creates geo topics, and `--tiered-storage` creates topics with tiered storage. Both need a server with an object store (`[tiered_storage]` in its configuration), and the two cannot be combined. The report records which one a run used as the topic storage: `local`, `tiered` or `geo`.
+
+```bash
+iggy-bench --topic-type geo pinned-producer tcp
+iggy-bench --tiered-storage pinned-producer tcp
+```
+
 ## Host preparation
 
 Use a dedicated server and a separate load generator where possible. If they share a host, assign disjoint CPU sets and leave CPU capacity for kernel and network work. Match the deployment's CPU topology, storage, replication-group size, and durability policies.

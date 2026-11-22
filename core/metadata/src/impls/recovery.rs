@@ -2007,6 +2007,7 @@ mod tests {
             snapshot.snapshot_mut().users = Some(Users::default().to_snapshot());
             snapshot.snapshot_mut().streams = Some(StreamsSnapshot {
                 lifecycle_intents: std::collections::BTreeMap::default(),
+                retired_origins: std::collections::BTreeMap::default(),
                 items: Vec::new(),
                 revision: CURRENT_REVISION,
                 namespace_revision: CURRENT_REVISION,

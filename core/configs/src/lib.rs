@@ -31,6 +31,6 @@ pub use configs_impl::{
     print_env_var_names,
 };
 pub use server_config::{
-    cluster, external_auth, message_bus, metadata, partition, quic, server, sharding, tcp,
+    cluster, external_auth, geo, message_bus, metadata, partition, quic, server, sharding, tcp,
     tiered_storage, websocket,
 };

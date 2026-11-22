@@ -23,9 +23,28 @@ pub mod host;
 pub mod metrics;
 mod partition_io;
 pub use partition_io::{DEFAULT_PARTITION_IO_CAPACITY, PartitionIoLimits, PartitionIoLimitsError};
+mod fresh_writes;
+pub use fresh_writes::{
+    FRESH_CONFIRM_AFTER, FRESH_OBJECT_BYTES, FRESH_PARTITION_PENDING_BYTES_MAX,
+    FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS, FinishedFreshUpload,
+};
+mod fresh_sweeps;
+pub mod geo_commits;
+pub mod geo_positions;
+pub use fresh_sweeps::{
+    FRESH_SWEEP_INTERVAL, FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport,
+    FreshSweeps,
+};
+pub mod long_term_merges;
+mod long_term_retention;
+mod long_term_rewrites;
+mod manifest_publishes;
 mod object_deletes;
+mod peer_manifest_follows;
+pub mod peers;
 mod poll;
 mod primary_rebalance;
+pub mod rewrite_pacing;
 mod router;
 mod segment_uploads;
 mod served_reads;
@@ -33,6 +52,8 @@ pub mod shards_table;
 #[cfg(test)]
 mod test_support;
 pub mod tier_service;
+mod topic_object_checks;
+pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest};
 mod upload_pacing;
 
 pub use config::CoordinatorConfig;
@@ -517,7 +538,7 @@ pub enum PartitionRead {
     },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffsetOnPrimary {
-        group_id: u32,
+        group: ExternalGroupRead,
         metadata: metadata::stm::stream::PollMetadata,
     },
     /// Cooperative-rebalance classification: the group's last-polled and
@@ -535,6 +556,17 @@ pub enum PartitionRead {
     },
 }
 
+/// The group whose external offset an [`PartitionRead::ExternalGroupOffsetOnPrimary`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalGroupRead {
+    /// A group of this cluster, by its id.
+    Group(u32),
+    /// A group that this cluster does not have, by its name. On a geo or
+    /// shadow topic, a position that another datacenter published for its
+    /// external offsets answers it.
+    Missing(String),
+}
+
 impl PartitionRead {
     pub(crate) const fn requires_primary(&self) -> bool {
         matches!(
@@ -545,6 +577,18 @@ impl PartitionRead {
                 | Self::ExternalGroupOffsetOnPrimary { .. }
                 | Self::ResolveSegmentDeleteOffset { .. }
         )
+    }
+
+    /// The consumer whose messages the read polls, `None` for any other
+    /// read.
+    #[must_use]
+    pub(crate) const fn polling_consumer(&self) -> Option<PollingConsumer> {
+        match self {
+            Self::PollOnPrimary { consumer, .. }
+            | Self::UnboundPollOnPrimary { consumer, .. }
+            | Self::Poll { consumer, .. } => Some(*consumer),
+            _ => None,
+        }
     }
 
     /// Whether the read returns polled messages or a stored consumer offset.
@@ -1251,6 +1295,192 @@ pub enum LifecycleFrame {
     /// The result of a job that a [`Self::DeleteObjects`] pass started, sent
     /// by the task that ran it.
     ObjectDeleteFinished(Box<FinishedObjectDelete>),
+    /// Per-shard pass over a partition of a tiered topic: store its manifest,
+    /// when this replica is the primary, no publish is in flight, and the
+    /// manifest changed. The timer task stamps `now`. Does nothing on a shard
+    /// without a publisher.
+    PublishManifest {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+        now: IggyTimestamp,
+    },
+    /// The result of a publish that a [`Self::PublishManifest`] pass started,
+    /// sent by the task that ran it.
+    ManifestPublishFinished(Box<FinishedManifestPublish>),
+    /// The result of an attempt at the upload of a fresh object, sent by the
+    /// task that ran it.
+    FreshUploadFinished(Box<FinishedFreshUpload>),
+    /// Per-shard pass over a partition that places its batches: rewrite its
+    /// committed batches above the long-term floor into a segment, when this
+    /// replica is the primary and no rewrite is in flight, or send the
+    /// command of a stored segment again. Does nothing on a shard without a
+    /// writer.
+    RewriteSegments {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+    },
+    /// The result of a rewrite that a [`Self::RewriteSegments`] pass
+    /// started, sent by the task that ran it.
+    SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
+    /// Start a sweep of the fresh objects of this replica, on its first
+    /// shard: list them, when no sweep is in flight. The shard's tick starts
+    /// its sweeps without this frame, which is for a caller that wants one
+    /// at a `now` of its own. Does nothing on another shard or on one
+    /// without a sweeper.
+    SweepFreshObjects {
+        now: IggyTimestamp,
+    },
+    /// The listing that a [`Self::SweepFreshObjects`] pass started, sent by
+    /// the task that ran it.
+    FreshObjectsListed(Box<FinishedFreshListing>),
+    /// The first shard asks every shard which fresh objects its partitions
+    /// still name, for the sweep `sweep`.
+    ReportFreshObjects {
+        sweep: u64,
+    },
+    /// A shard's answer to [`Self::ReportFreshObjects`], sent to the first
+    /// shard by the task that read the partitions.
+    FreshObjectsReported(Box<FreshObjectsReport>),
+    /// The result of one delete job of a sweep, sent by the task that ran
+    /// it.
+    FreshObjectsDeleted(Box<FinishedFreshDelete>),
+    /// Per-shard pass over the partitions of geo topics: start the read of
+    /// the topic's object on each whose primary this replica is and that
+    /// does not take messages yet. The timer task stamps `now`. Does nothing
+    /// on a shard without topic objects.
+    CheckTopicObjects {
+        now: IggyTimestamp,
+    },
+    /// The result of a read that a [`Self::CheckTopicObjects`] pass started,
+    /// sent by the task that ran it.
+    TopicObjectCheckFinished(Box<FinishedTopicObjectCheck>),
+    /// Shard 0 hands the shard the manifests that a listing of the geo peer
+    /// `origin` found for the shadow partitions the shard owns. The shard
+    /// reads each one its partition has not committed, on the partitions
+    /// whose primary this replica is.
+    PeerManifestsListed {
+        origin: String,
+        now: IggyTimestamp,
+        manifests: Vec<ListedPeerManifest>,
+    },
+    /// The result of a read that a [`Self::PeerManifestsListed`] pass
+    /// started, sent by the task that ran it.
+    PeerManifestRead(Box<FinishedPeerManifestRead>),
+    /// Per-shard pass over a shadow partition whose origin retired: every
+    /// replica forgets what it knew of the partition's manifests, and the
+    /// primary commits what the retention of the topic in the peer removes
+    /// from the committed manifest.
+    RetainRetiredPeer {
+        namespace: IggyNamespace,
+        /// The incarnation the retention was read for.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
+    /// Shard 0 asks the shard for the consumer group positions of its geo
+    /// and shadow partitions, for the round `round`, of the topics in
+    /// `scope` by stream and topic id, or of every log. The primaries here
+    /// propose to fold what their groups committed first.
+    ReportGeoPositions {
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    },
+    /// The folds that a [`Self::ReportGeoPositions`] proposed ended: answer
+    /// the round with the partitions' positions now.
+    ReportGeoPositionsFolded {
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    },
+    /// A shard's answer to [`Self::ReportGeoPositions`], sent to shard 0.
+    GeoPositionsReported(Box<geo_positions::GeoPositionsReport>),
+    /// What the store took of a round's objects, sent to shard 0 by the task
+    /// that stored them.
+    GeoPositionsStored(Box<geo_positions::FinishedPositionsStore>),
+    /// Shard 0 hands the shard the positions that a geo peer publishes for
+    /// the partitions it owns. The primaries here commit those that win.
+    PeerPositionsListed(Box<geo_positions::PeerPositions>),
+    /// A group poll waits for the position of its name to be bound to it:
+    /// fold the groups of the partition of `namespace` now.
+    NoteGeoPositions {
+        namespace: IggyNamespace,
+    },
+    /// A consumer group's own offset store committed on a geo or shadow
+    /// partition here: hold its reply until the node's store holds its
+    /// position. Sent by the task that waited for the commit.
+    GeoCommitHeld(Box<geo_commits::HeldGeoCommit>),
+    /// A shard holds commits of `topics`, by stream and topic id: shard 0
+    /// starts a round of them when it may.
+    GeoCommitsWaiting {
+        topics: Vec<(usize, usize)>,
+    },
+    /// Shard 0 tells a shard whose report to `round` carried held commits
+    /// which logs' objects the store took in that round.
+    GeoPositionsPublished {
+        round: u64,
+        stored: Vec<iggy_object_store::GeoLog>,
+    },
+    /// The result of a merge of long-term segments that the pump's tick
+    /// started, sent by the task that ran it.
+    SegmentMergeFinished(Box<FinishedSegmentMerge>),
+    /// Per-shard pass over a partition that places its batches: every
+    /// replica removes its local segments at or below the trim point of the
+    /// long-term log, and the primary works out what the topic's retention
+    /// removes from that log and commits it as a trim. The timer task
+    /// resolves the same inputs as for `CleanPartition`.
+    RetainLongTerm {
+        namespace: IggyNamespace,
+        /// The incarnation the policy was read for.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
+}
+
+/// What the task merging long-term segments hands back to the pump.
+pub struct FinishedSegmentMerge {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the merge. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the merge.
+    pub id: u64,
+    pub outcome: partitions::MergeOutcome,
+}
+
+/// What the task rewriting a segment hands back to the pump.
+pub struct FinishedSegmentRewrite {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the rewrite. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the rewrite.
+    pub id: u64,
+    pub outcome: partitions::RewriteOutcome,
+}
+
+/// What the task reading a geo topic's object hands back to the pump.
+pub struct FinishedTopicObjectCheck {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the read.
+    pub created_revision: u64,
+    /// The partition's number for the read.
+    pub id: u64,
+    pub outcome: partitions::TopicObjectOutcome<iggy_object_store::TopicRead>,
+}
+
+/// What the task publishing a manifest hands back to the pump.
+pub struct FinishedManifestPublish {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the publish. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the publish.
+    pub id: u64,
+    pub outcome: partitions::ManifestPublishOutcome,
 }
 
 /// What the task running an object-delete job hands back to the pump.
@@ -2061,6 +2291,63 @@ where
     /// the next delete pass takes them from here.
     undelivered_object_deletes: Rc<RefCell<Vec<FinishedObjectDelete>>>,
 
+    /// Late-bound publisher of the manifests of tiered partitions. `None` on
+    /// a shard without an object store, where every manifest pass is a no-op.
+    manifest_publisher: RefCell<Option<Rc<dyn partitions::ManifestPublisher>>>,
+
+    /// Results of manifest publishes whose frame the inbox refused. The
+    /// partition counts such a publish as in flight until it sees the result,
+    /// so the next manifest pass takes them from here.
+    undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
+
+    /// The partitions whose changed manifest waits out
+    /// [`partitions::MANIFEST_STORE_INTERVAL`], by namespace and incarnation.
+    /// The pump's tick stages each one's pass once it passed, whether the
+    /// shard paces the partition or not, and whether it sleeps.
+    manifests_held: RefCell<BTreeSet<(IggyNamespace, u64)>>,
+
+    /// The upload-first produce path of the partitions here that place their
+    /// batches.
+    fresh_writes: fresh_writes::FreshWrites,
+
+    /// The sweep of the fresh objects of this replica, which its first shard
+    /// runs.
+    fresh_sweeps: fresh_sweeps::FreshSweeps,
+
+    /// Late-bound writer of long-term segments. `None` on a shard without an
+    /// object store, where every rewrite pass is a no-op.
+    long_term_writer: RefCell<Option<Rc<dyn partitions::LongTermWriter>>>,
+
+    /// Results of rewrites whose frame the inbox refused. The partition
+    /// counts such a rewrite as in flight until it sees the result, so the
+    /// next rewrite pass takes them from here.
+    undelivered_segment_rewrites: Rc<RefCell<Vec<FinishedSegmentRewrite>>>,
+
+    /// When the next rewrite pass over each placing partition here is due.
+    rewrite_pacing: RefCell<rewrite_pacing::RewritePacing>,
+
+    /// The reads of geo topic objects by the primaries of the partitions
+    /// here.
+    topic_object_checks: topic_object_checks::TopicObjectChecks,
+
+    /// What the primaries of shadow partitions here know of their peers'
+    /// manifests.
+    peer_manifest_follows: peer_manifest_follows::PeerManifestFollows,
+
+    /// What this shard does with the consumer group positions of its geo
+    /// and shadow partitions.
+    geo_positions: geo_positions::ShardGeoPositions,
+    /// The group offset stores whose replies wait for their positions.
+    geo_commits: geo_commits::ShardGeoCommits,
+
+    /// Late-bound stores of the geo peers, empty on a node without peers.
+    /// See [`Self::set_peer_stores`].
+    peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
+    /// The merges of small long-term segments of the placing partitions
+    /// here: the merger, the results the inbox refused, and when the shard
+    /// looks for the next merge.
+    long_term_merges: long_term_merges::ShardMerges,
+
     /// Request number of the last floor advance. An advance runs under the
     /// auto-commit client, which the partition does not deduplicate, so the
     /// number only tells two advances apart in a prepare.
@@ -2362,7 +2649,7 @@ where
     /// # Panics
     ///
     /// Panics if `poll_completion_capacity` is zero.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         identity: ShardIdentity,
         bus: B,
@@ -2425,6 +2712,20 @@ where
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
+            manifest_publisher: RefCell::new(None),
+            undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
+            fresh_writes: fresh_writes::FreshWrites::default(),
+            fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
+            rewrite_pacing: RefCell::default(),
+            topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
+            peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
+            geo_positions: geo_positions::ShardGeoPositions::default(),
+            geo_commits: geo_commits::ShardGeoCommits::default(),
+            peer_stores: RefCell::default(),
+            long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -3338,6 +3639,7 @@ where
     /// # Panics
     /// Panics when the target cannot address the largest supported partition I/O job.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn without_inbox(
         identity: ShardIdentity,
         bus: B,
@@ -3405,6 +3707,20 @@ where
             upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
             object_deleter: RefCell::new(None),
             undelivered_object_deletes: Rc::default(),
+            manifest_publisher: RefCell::new(None),
+            undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
+            fresh_writes: fresh_writes::FreshWrites::default(),
+            fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
+            rewrite_pacing: RefCell::default(),
+            topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
+            peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
+            geo_positions: geo_positions::ShardGeoPositions::default(),
+            geo_commits: geo_commits::ShardGeoCommits::default(),
+            peer_stores: RefCell::default(),
+            long_term_merges: long_term_merges::ShardMerges::default(),
             floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
             reconcile_needed: RefCell::new(BTreeSet::new()),
@@ -5453,6 +5769,15 @@ where
                     Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
                     return;
                 }
+                if self.places_send(request.header()) {
+                    let upload_interval = self
+                        .geo_durations(IggyNamespace::from_raw(request.header().group))
+                        .fresh_upload_interval
+                        .map(|interval| interval.get_duration());
+                    self.offer_fresh_send(request, reply, upload_interval);
+                    return;
+                }
+                let hold = self.geo_commit_hold(&request);
                 let (sender, receiver) = consensus::oneshot_channel();
                 self.plane
                     .partitions()
@@ -5466,8 +5791,12 @@ where
                 // Through the bus, not the runtime directly: the simulator
                 // supplies its own executor and virtual clock.
                 self.bus.spawn(async move {
-                    let committed = receiver.await.ok().map(Message::into_generic);
-                    let _ = reply.try_send(committed);
+                    match (receiver.await.ok(), hold) {
+                        (Some(committed), Some(hold)) => hold.keep(committed, reply),
+                        (committed, _) => {
+                            let _ = reply.try_send(committed.map(Message::into_generic));
+                        }
+                    }
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
@@ -5656,6 +5985,23 @@ where
                 .map_or_default(|topic| {
                     iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
                 })
+        })
+    }
+
+    /// The durations that the topic of `namespace` sets for itself. All are
+    /// `None` for a normal topic, a shadow topic and a topic that is gone, so
+    /// the shard applies its own settings there.
+    #[must_use]
+    pub fn geo_durations(&self, namespace: IggyNamespace) -> iggy_common::GeoTopicDurations
+    where
+        M: StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map_or_default(|topic| topic.resolved.geo_durations)
         })
     }
 
@@ -9916,10 +10262,14 @@ where
     /// changed while the tick awaited.
     fn settle_ticked_partitions(&self, visited: &[IggyNamespace]) {
         let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
         for namespace in visited {
             let quiet_until = partitions
                 .sent_report(namespace)
                 .and_then(|(partition, sent)| {
+                    self.pace_placing_primary(*namespace, partition);
+                    self.note_fresh_proofs(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
                     self.partition_quiet_until(*namespace, partition, sent.get())
                 });
             partitions.settle(namespace, quiet_until);

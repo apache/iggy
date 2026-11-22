@@ -74,6 +74,9 @@ impl CliCommand for GetStreamCmd {
         table.add_row(vec!["Stream ID", format!("{}", stream.id).as_str()]);
         table.add_row(vec!["Created", format!("{}", stream.created_at).as_str()]);
         table.add_row(vec!["Stream name", stream.name.as_str()]);
+        if let Some(origin) = stream.shadow_origin() {
+            table.add_row(vec!["Origin", origin.as_str()]);
+        }
         table.add_row(vec!["Stream size", format!("{}", stream.size).as_str()]);
         table.add_row(vec![
             "Stream message count",

@@ -1256,6 +1256,17 @@ where
         Ok(visibility)
     }
 
+    /// Whether the partition's peer log dropped or replaced a segment that
+    /// `result` walked, see [`partitions::IggyPartition::peer_log_moved_under_read`].
+    fn peer_log_moved_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.peer_log_moved_under_read(result)
+            })
+            .unwrap_or(false)
+    }
+
     fn offset_stored_since(
         &self,
         namespace: IggyNamespace,
@@ -1303,6 +1314,9 @@ where
         let admission = (|| {
             request.options.validate(request.args.count)?;
             let (history, _, view) = self.validate_deferred_context(namespace, &request)?;
+            if let Some(error) = self.geo_position_refusal(namespace, request.consumer) {
+                return Err(error);
+            }
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
@@ -1624,6 +1638,12 @@ where
                 return;
             }
         };
+        // Whatever the read found in the store, a trim or a merge in the
+        // peer log it covers makes the retry plan from the new log.
+        if self.peer_log_moved_under_read(waiter.namespace, &result) {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        }
         let result = match result.checked() {
             Ok(result) => result,
             Err(error) => {

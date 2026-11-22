@@ -71,6 +71,13 @@ func (s Stream) EncryptionKekFingerprints() []string {
 	return strings.Split(joined, ",")
 }
 
+// ShadowOrigin reports the geo origin whose topics this shadow stream serves,
+// false for any other stream. Writes to a shadow stream are refused with
+// ierror.ErrShadowStreamReadOnly.
+func (s Stream) ShadowOrigin() (string, bool) {
+	return s.textOption(StreamOptionShadowOrigin)
+}
+
 func (s Stream) textOption(key StreamOptionKey) (string, bool) {
 	for _, options := range []map[string]HeaderValue{s.DerivedOptions, s.Options} {
 		if value, ok := options[string(key)]; ok && value.Kind == String {

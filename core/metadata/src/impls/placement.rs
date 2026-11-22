@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::impls::metadata::{PartitionPlacementView, PartitionPrimaryTransfer};
+use crate::stm::shadow::ShadowTopicRequest;
 use crate::stm::stream::{
     Partition, PartitionChangeKind, Streams, StreamsInner, find_partition, primary_of,
 };
@@ -388,6 +389,18 @@ impl PlacementState {
                 CreatePartitionsWithAssignmentsRequest::decode_from(prepare.body())
                     .map_err(|_| IggyError::InvalidCommand)?
                     .partitions
+            }
+            // Only an adoption or a restore adds partitions. Every other
+            // shadow op takes an empty reservation, since the pipeline lists
+            // each of them.
+            Operation::ShadowTopic => {
+                match ShadowTopicRequest::decode_from(prepare.body())
+                    .map_err(|_| IggyError::InvalidCommand)?
+                {
+                    ShadowTopicRequest::AdoptTopic { create, .. }
+                    | ShadowTopicRequest::RestoreTopic { create, .. } => create.partitions,
+                    _ => Vec::new(),
+                }
             }
             _ => return Ok(None),
         };

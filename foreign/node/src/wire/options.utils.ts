@@ -50,7 +50,8 @@ export const StreamOptionKey = {
   EncryptionKey: 'encryption_key',
   EncryptionKeySource: 'encryption_key_source',
   EncryptionKeyFingerprint: 'encryption_key_fingerprint',
-  EncryptionKekFingerprint: 'encryption_kek_fingerprint'
+  EncryptionKekFingerprint: 'encryption_kek_fingerprint',
+  ShadowOrigin: 'shadow_origin'
 } as const;
 
 export type StreamOptionKey = typeof StreamOptionKey[keyof typeof StreamOptionKey];
@@ -72,7 +73,15 @@ export const TopicOptionKey = {
   SegmentMaxAge: 'segment_max_age',
   TieredStorage: 'tiered_storage',
   LocalRetentionAge: 'local_retention_age',
-  LocalRetentionSize: 'local_retention_size'
+  LocalRetentionSize: 'local_retention_size',
+  TopicType: 'topic_type',
+  GeoMode: 'geo_mode',
+  FreshUploadInterval: 'fresh_upload_interval',
+  ConsumerOffsetUploadInterval: 'consumer_offset_upload_interval',
+  PositionsPublishInterval: 'positions_publish_interval',
+  TombstoneGrace: 'tombstone_grace',
+  PositionsResumeTimeout: 'positions_resume_timeout',
+  LongTermRewriteMaxInterval: 'long_term_rewrite_max_interval'
 } as const;
 
 export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
@@ -127,6 +136,15 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['tiered_storage', { scopes: [Topic], flags: Updatable | Critical, internal: false, enableOnly: true }],
   ['local_retention_age', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
   ['local_retention_size', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
+  ['topic_type', { scopes: [Topic], flags: Critical, internal: false }],
+  ['geo_mode', { scopes: [Topic], flags: Critical, internal: false }],
+  ['fresh_upload_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['consumer_offset_upload_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['positions_publish_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['tombstone_grace', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['positions_resume_timeout', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['long_term_rewrite_max_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['shadow_origin', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
 ]);
 

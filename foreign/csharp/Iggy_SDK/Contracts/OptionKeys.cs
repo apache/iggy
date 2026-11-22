@@ -56,7 +56,8 @@ internal static class OptionKeys
         new("encryption_key", HeaderKind.Raw, OptionFlags.Secret | OptionFlags.Critical),
         new("encryption_key_source", HeaderKind.String, OptionFlags.ReadOnly),
         new("encryption_key_fingerprint", HeaderKind.String, OptionFlags.ReadOnly),
-        new("encryption_kek_fingerprint", HeaderKind.String, OptionFlags.ReadOnly)
+        new("encryption_kek_fingerprint", HeaderKind.String, OptionFlags.ReadOnly),
+        new("shadow_origin", HeaderKind.String, OptionFlags.ReadOnly)
     ];
 
     private static readonly OptionDescriptor[] TopicKeys =
@@ -76,7 +77,15 @@ internal static class OptionKeys
         new("segment_max_age", HeaderKind.Uint64, OptionFlags.Critical),
         new("tiered_storage", HeaderKind.Bool, OptionFlags.Updatable | OptionFlags.Critical, true),
         new("local_retention_age", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable),
-        new("local_retention_size", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable)
+        new("local_retention_size", HeaderKind.Uint64, OptionFlags.Updatable | OptionFlags.Resettable),
+        new("topic_type", HeaderKind.String, OptionFlags.Critical),
+        new("geo_mode", HeaderKind.String, OptionFlags.Critical),
+        new("fresh_upload_interval", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("consumer_offset_upload_interval", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("positions_publish_interval", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("tombstone_grace", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("positions_resume_timeout", HeaderKind.Uint64, OptionFlags.Updatable),
+        new("long_term_rewrite_max_interval", HeaderKind.Uint64, OptionFlags.Updatable)
     ];
 
     private static readonly OptionDescriptor[] UserKeys =
@@ -105,6 +114,7 @@ internal static class OptionKeys
             StreamOptionKey.EncryptionKeySource => "encryption_key_source",
             StreamOptionKey.EncryptionKeyFingerprint => "encryption_key_fingerprint",
             StreamOptionKey.EncryptionKekFingerprint => "encryption_kek_fingerprint",
+            StreamOptionKey.ShadowOrigin => "shadow_origin",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown stream option key")
         });
     }
@@ -129,6 +139,14 @@ internal static class OptionKeys
             TopicOptionKey.TieredStorage => "tiered_storage",
             TopicOptionKey.LocalRetentionAge => "local_retention_age",
             TopicOptionKey.LocalRetentionSize => "local_retention_size",
+            TopicOptionKey.TopicType => "topic_type",
+            TopicOptionKey.GeoMode => "geo_mode",
+            TopicOptionKey.FreshUploadInterval => "fresh_upload_interval",
+            TopicOptionKey.ConsumerOffsetUploadInterval => "consumer_offset_upload_interval",
+            TopicOptionKey.PositionsPublishInterval => "positions_publish_interval",
+            TopicOptionKey.TombstoneGrace => "tombstone_grace",
+            TopicOptionKey.PositionsResumeTimeout => "positions_resume_timeout",
+            TopicOptionKey.LongTermRewriteMaxInterval => "long_term_rewrite_max_interval",
             _ => throw new ArgumentOutOfRangeException(nameof(key), key, "Unknown topic option key")
         });
     }
@@ -151,6 +169,17 @@ internal static class OptionKeys
     {
         var length = Encoding.UTF8.GetByteCount(text);
         return length is 0 or > WireName.MAX_LENGTH ? HeaderValue.FromBool(false) : HeaderValue.FromString(text);
+    }
+
+    /// <summary>
+    ///     A duration of a geo topic in microseconds. Zero is a value for these keys, so a negative span, which would
+    ///     convert to zero, is refused instead of sent.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="duration" /> is negative.</exception>
+    internal static HeaderValue GeoDuration(TimeSpan duration, string property)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(duration, TimeSpan.Zero, property);
+        return HeaderValue.FromUInt64(DurationHelpers.ToDuration(duration));
     }
 
     /// <summary>Raw entries first, so a typed field the caller inserts afterwards wins on collision.</summary>

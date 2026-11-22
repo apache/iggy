@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 type GetClient struct {
@@ -133,6 +134,24 @@ func (g *GetMetadataChanges) AppendBinary(b []byte) ([]byte, error) {
 		binary.LittleEndian.PutUint16(b[tokenLengthAt:], uint16(len(b)-tokenLengthAt-2))
 	}
 	return b, nil
+}
+
+// RetireGeoOrigin tells the cluster that the geo peer Origin never returns.
+type RetireGeoOrigin struct {
+	Origin string
+}
+
+func (r *RetireGeoOrigin) Code() Code {
+	return RetireGeoOriginCode
+}
+
+// MarshalBinary encodes [origin_len:u8][origin], so an origin of 1 to 255
+// bytes.
+func (r *RetireGeoOrigin) MarshalBinary() ([]byte, error) {
+	if len(r.Origin) == 0 || len(r.Origin) > 255 {
+		return nil, ierror.ErrInvalidFormat
+	}
+	return append([]byte{byte(len(r.Origin))}, r.Origin...), nil
 }
 
 type GetStats struct{}

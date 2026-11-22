@@ -53,6 +53,7 @@ fn single_slots() -> TierServiceConfig {
     TierServiceConfig {
         demand_fetch: one,
         upload: one,
+        fresh_upload: one,
         speculative_fetch: one,
         delete: one,
         housekeeping: one,
@@ -361,6 +362,33 @@ async fn given_a_waiting_demand_fetch_when_an_upload_slot_frees_should_start_the
         open.send(()).unwrap();
     }
     assert!(fetch.await.is_ok() && waiting_fetch.await.is_ok() && next_upload.await.is_ok());
+}
+
+/// Producers wait for a fresh upload, and a segment upload can take minutes.
+#[compio::test]
+async fn given_uploads_at_their_cap_when_a_fresh_upload_comes_should_start_it_at_once() {
+    let service = service(&single_slots());
+    let scope = TierScope::new();
+    let started = Rc::new(RefCell::new(Vec::new()));
+    let job = |class, name| gated(&service, request(class, &scope), name, &started);
+    let (open_upload, upload) = job(TierJobClass::Upload, "upload");
+    let (open_waiting_upload, waiting_upload) = job(TierJobClass::Upload, "waiting upload");
+    let (open_fresh, fresh) = job(TierJobClass::FreshUpload, "fresh");
+    let (open_next_fresh, next_fresh) = job(TierJobClass::FreshUpload, "next fresh");
+    until(|| started.borrow().len() == 2).await;
+    settle().await;
+    assert_eq!(*started.borrow(), ["upload", "fresh"]);
+    assert_eq!(service.load(TierJobClass::FreshUpload).queued, 1);
+
+    open_fresh.send(()).unwrap();
+    assert_eq!(fresh.await, Ok("fresh"));
+
+    until(|| started.borrow().len() == 3).await;
+    assert_eq!(*started.borrow(), ["upload", "fresh", "next fresh"]);
+    for open in [open_upload, open_waiting_upload, open_next_fresh] {
+        open.send(()).unwrap();
+    }
+    assert!(upload.await.is_ok() && waiting_upload.await.is_ok() && next_fresh.await.is_ok());
 }
 
 #[compio::test]
