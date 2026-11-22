@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::harness::get_test_directory;
-use assert_cmd::prelude::CommandCargoExt;
+use crate::harness::{cargo_bin_path, get_test_directory};
 use iggy::prelude::*;
 use iggy_common::TransportProtocol;
 use std::{
     fs::{self, File},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     thread::{self, panicking},
     time::{Duration, Instant},
@@ -45,8 +45,7 @@ pub fn run_bench_and_wait_for_finish(
     bench: &str,
     amount_of_data_to_process: IggyByteSize,
 ) {
-    #[allow(deprecated)]
-    let mut command = Command::cargo_bin("iggy-bench").unwrap();
+    let mut command = Command::new(cargo_bin_path("iggy-bench").unwrap());
 
     let mut stderr_file_path = None;
     let mut stdout_file_path = None;
@@ -160,6 +159,17 @@ pub fn run_bench_and_wait_for_finish(
          alongside the server (a stale binary hangs instead of erroring)"
     );
     assert!(status.is_some_and(|status| status.success()));
+}
+
+/// The directories of the iggy-bench runs under `output_dir`, one per run, sorted by name.
+pub fn bench_run_dirs(output_dir: &Path) -> Vec<PathBuf> {
+    let mut run_dirs: Vec<PathBuf> = fs::read_dir(output_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_dir())
+        .collect();
+    run_dirs.sort();
+    run_dirs
 }
 
 pub fn get_random_path() -> String {

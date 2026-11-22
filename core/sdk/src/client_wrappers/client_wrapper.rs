@@ -21,16 +21,56 @@ use crate::http::http_transport::HttpTransport;
 use crate::quic::quic_client::QuicClient;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
+use async_dropper::AsyncDrop;
+use async_trait::async_trait;
+use iggy_binary_protocol::WireDecode;
+use iggy_binary_protocol::requests::messages::PollMessagesRequest;
+use iggy_binary_protocol::responses::messages::PollMessagesResponseHeader;
 use iggy_common::locking::IggyRwLockFn;
+use iggy_common::wire_conversions::{
+    consumer_to_wire, identifier_to_wire, polling_strategy_to_wire,
+};
 use iggy_common::{
     AssignmentVersion, BinaryClient, BinaryOperationLineage, BinarySendPartitioning,
     BinaryTransport, ClientState, Consumer, DeferredPollOptions, FetchedSection, Identifier,
-    IggyError, IggyMessage, MessageClient, PollingStrategy, SendMessagesResponse, SystemClient,
-    fetch_binary_messages, group_cache_key, send_binary_messages, sync_group_assignment,
+    IggyError, IggyMessage, MessageClient, PartitionContext, Partitioning, PollOptions,
+    PollingStrategy, SendMessagesResponse, SystemClient, fetch_binary_messages, group_cache_key,
+    select_send_partition, send_binary_messages, sync_group_assignment,
 };
 
+// The types that the client traits' signatures name, for the impls that `whichever` writes.
+use async_broadcast::Receiver;
+use iggy_common::{
+    BatchProducer, Checkpoint, Client, ClientInfo, ClientInfoDetails, ClusterClient,
+    ClusterMetadata, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupClient,
+    ConsumerGroupDetails, ConsumerOffsetClient, ConsumerOffsetInfo, DecodeError, DiagnosticEvent,
+    IdentityInfo, MetadataChanges, MetadataChangesQuery, NamedPageQuery, NonZeroIggyDuration,
+    OptionSpec, OptionsScope, Page, PageQuery, Partition, PartitionClient, Permissions,
+    PersonalAccessTokenClient, PersonalAccessTokenExpiry, PersonalAccessTokenInfo, PolledMessages,
+    RawPersonalAccessToken, SegmentClient, Snapshot, SnapshotCompression, Stats, Stream,
+    StreamClient, StreamCreateOptions, StreamDetails, StreamUpdateOptions, SystemSnapshotType,
+    Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
+};
+use std::time::Instant;
+
+// `whichever` writes `impl <Trait> for ClientWrapper` for each client trait: one `match` per
+// method that calls the transport's own impl. Each trait carries `#[whichever::dispatchable]`
+// in `iggy_common`, which hands its signatures to this crate.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
+#[whichever::dispatch(Client, from = false)]
+#[whichever::dispatch(ClusterClient)]
+#[whichever::dispatch(ConsumerGroupClient)]
+#[whichever::dispatch(ConsumerOffsetClient)]
+#[whichever::dispatch(MessageClient)]
+#[whichever::dispatch(PartitionClient)]
+#[whichever::dispatch(PersonalAccessTokenClient)]
+#[whichever::dispatch(SegmentClient)]
+#[whichever::dispatch(StreamClient)]
+#[whichever::dispatch(SystemClient)]
+#[whichever::dispatch(TopicClient)]
+#[whichever::dispatch(UserClient)]
 pub enum ClientWrapper {
     Iggy(IggyClient),
     Http(HttpClient),
@@ -47,6 +87,17 @@ impl ClientWrapper {
             Self::Tcp(client) => client.operation_lineage(),
             Self::Quic(client) => client.operation_lineage(),
             Self::WebSocket(client) => client.operation_lineage(),
+        }
+    }
+
+    /// The highest metadata op that a reply of the session showed. HTTP keeps no session.
+    pub(crate) async fn metadata_watermark(&self) -> u64 {
+        match self {
+            Self::Iggy(client) => Box::pin(client.client.read().await.metadata_watermark()).await,
+            Self::Http(_) => 0,
+            Self::Tcp(client) => client.driver.session().metadata_watermark(),
+            Self::Quic(client) => client.driver.session().metadata_watermark(),
+            Self::WebSocket(client) => client.driver.session().metadata_watermark(),
         }
     }
 
@@ -67,6 +118,9 @@ impl ClientWrapper {
                 ))
                 .await
             }
+            Self::Http(_) if partitioning.producer().is_some() => {
+                Err(IggyError::FeatureUnavailable)
+            }
             Self::Http(client) => {
                 client
                     .send_messages(stream, topic, partitioning.original(), messages)
@@ -80,6 +134,38 @@ impl ClientWrapper {
             }
             Self::WebSocket(client) => {
                 send_binary_messages(client, stream, topic, partitioning, messages).await
+            }
+        }
+    }
+
+    /// The partition that a send with `partitioning` goes to. See
+    /// [`select_send_partition`].
+    pub(crate) async fn select_send_partition(
+        &self,
+        stream: &Identifier,
+        topic: &Identifier,
+        partitioning: &Partitioning,
+        fresh: bool,
+    ) -> Result<u32, IggyError> {
+        match self {
+            Self::Iggy(client) => {
+                Box::pin(client.client.read().await.select_send_partition(
+                    stream,
+                    topic,
+                    partitioning,
+                    fresh,
+                ))
+                .await
+            }
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Tcp(client) => {
+                select_send_partition(client, stream, topic, partitioning, fresh).await
+            }
+            Self::Quic(client) => {
+                select_send_partition(client, stream, topic, partitioning, fresh).await
+            }
+            Self::WebSocket(client) => {
+                select_send_partition(client, stream, topic, partitioning, fresh).await
             }
         }
     }
@@ -191,6 +277,60 @@ impl ClientWrapper {
         }
     }
 
+    /// The context of the reply to a poll that commits nothing. The records of the reply stay
+    /// undecoded, so a message that does not decode cannot fail it. HTTP returns
+    /// `FeatureUnavailable`.
+    pub(crate) async fn poll_context(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        partition_id: u32,
+        consumer: &Consumer,
+        strategy: &PollingStrategy,
+        options: PollOptions,
+    ) -> Result<PartitionContext, IggyError> {
+        let request = PollMessagesRequest {
+            consumer: consumer_to_wire(consumer)?,
+            stream_id: identifier_to_wire(stream_id)?,
+            topic_id: identifier_to_wire(topic_id)?,
+            partition_id: Some(partition_id),
+            strategy: polling_strategy_to_wire(strategy),
+            count: options.count,
+            auto_commit: false,
+        };
+        macro_rules! poll {
+            ($client:expr) => {
+                $client
+                    .send_poll_with_response_and_options(
+                        &request,
+                        strategy.context(),
+                        Some(options.into()),
+                    )
+                    .await
+            };
+        }
+        let reply = match self {
+            Self::Tcp(client) => poll!(client),
+            Self::Quic(client) => poll!(client),
+            Self::WebSocket(client) => poll!(client),
+            Self::Http(_) => Err(IggyError::FeatureUnavailable),
+            Self::Iggy(client) => {
+                return Box::pin(client.client.read().await.poll_context(
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                    consumer,
+                    strategy,
+                    options,
+                ))
+                .await;
+            }
+        }?;
+        let (header, _) = PollMessagesResponseHeader::decode(&reply)
+            .map_err(|_| IggyError::InvalidNumberEncoding)?;
+        Ok(header.context)
+    }
+
     /// The partitions grouped by primary endpoint and split to fit one request
     /// each, so that a consumer can keep one [`fetch_messages`](Self::fetch_messages)
     /// in flight per group. Each group keeps the order of `partitions`, and the first
@@ -257,6 +397,13 @@ impl ClientWrapper {
                 .await
             }
         }
+    }
+}
+
+#[async_trait]
+impl AsyncDrop for ClientWrapper {
+    async fn async_drop(&mut self) {
+        let _ = UserClient::logout_user(self).await;
     }
 }
 

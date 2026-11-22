@@ -84,23 +84,12 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
     /// <summary>
     ///     Shared empty poll result for a group member that currently owns no partition, carrying
     ///     <see cref="PolledMessages.NoAssignedPartition" /> so a consumer can back off instead of re-polling at
-    ///     once. Same ownership rules as <see cref="EmptyPolledMessages" />.
+    ///     once. The instance owns no rented buffer - <see cref="EmptyMemoryOwner" /> disposes to nothing - so it is
+    ///     safe to hand out repeatedly even after a caller disposes it.
     /// </summary>
     private static readonly PolledMessagesRental NoAssignedPartitionPolledMessages = new(EmptyMemoryOwner.Instance)
     {
         PartitionId = PolledMessages.NoAssignedPartition,
-        CurrentOffset = 0,
-        Messages = []
-    };
-
-    /// <summary>
-    ///     Shared empty poll result. An idle consumer loop returns one on every iteration, and the instance owns
-    ///     no rented buffer - <see cref="EmptyMemoryOwner" /> disposes to nothing - so it is safe to hand out
-    ///     repeatedly even after a caller disposes it.
-    /// </summary>
-    private static readonly PolledMessagesRental EmptyPolledMessages = new(EmptyMemoryOwner.Instance)
-    {
-        PartitionId = 0,
         CurrentOffset = 0,
         Messages = []
     };
@@ -110,6 +99,18 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
 
     /// <inheritdoc />
     ulong ISessionGenerationProvider.SessionGeneration => _consensusSession.Generation;
+
+    /// <inheritdoc />
+    ulong IConsumerGroupAssignmentProvider.MetadataWatermark
+    {
+        get
+        {
+            lock (_pollRoutingGate)
+            {
+                return _metadataWatermark;
+            }
+        }
+    }
 
     private ulong BeginExplicitSignIn()
     {
@@ -491,10 +492,10 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
             {
                 // Both fence shapes - the typed error and the sentinel an empty poll carries - land on the same
                 // re-sync below. A caller context names the owner the poll was meant for, so the caller gets the
-                // fence instead of a poll of another partition.
-                if (pollingStrategy.Context is not null)
+                // fence instead of a poll of another partition. A fully zero context counts as none.
+                if (pollingStrategy.Context is { } context && context != default)
                 {
-                    _groupState.InvalidateAssignment(key);
+                    _groupState.ExpireAssignment(key);
                     await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
                     throw;
                 }
@@ -510,7 +511,7 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
                 rental.Dispose();
             }
 
-            _groupState.InvalidateAssignment(key);
+            _groupState.ExpireAssignment(key);
             await SyncGroupAssignmentAsync(streamId, topicId, consumer.ConsumerId, token, startedUnder: generation);
         }
 
@@ -527,12 +528,19 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
         var key = new GroupKey(streamId, topicId, groupId);
         if (resync)
         {
-            _groupState.InvalidateAssignment(key);
+            _groupState.ExpireAssignment(key);
         }
 
         if (!_groupState.HasAssignment(key))
         {
             await SyncGroupAssignmentAsync(streamId, topicId, groupId, token, startedUnder: generation);
+        }
+
+        // An empty list would read as a member that owns nothing, so the caller would never join again.
+        if (!_groupState.IsRegistered(key))
+        {
+            throw VsrError.Exception(VsrError.CONSUMER_GROUP_MEMBER_NOT_FOUND,
+                $"Client is not a member of consumer group {groupId} on topic {topicId}.");
         }
 
         return _groupState.AssignedPartitions(key);
@@ -567,7 +575,12 @@ public sealed partial class TcpMessageStream : ISessionGenerationProvider, ICons
 
             var assignment = SyncConsumerGroupAssignment.Decode(responseBuffer.Memory.Span);
             _groupState.RegisterGroup(key, streamId, topicId, groupId);
-            _groupState.SetAssignment(key, assignment.Generation, assignment.Partitions);
+            // A handover installs each owner in a later op than the join, and a reply lists only what its node has
+            // installed. So reads of a changed assignment wait for its commit. An unchanged one raises nothing.
+            if (_groupState.SetAssignment(key, assignment.Generation, assignment.Partitions))
+            {
+                (responseBuffer as SyncConsumerGroupReply)?.RaiseWatermark();
+            }
         }
     }
 

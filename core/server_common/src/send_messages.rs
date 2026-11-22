@@ -28,6 +28,7 @@ use crate::iobuf::Owned;
 use crate::sharding::IggyNamespace;
 use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::batch;
+use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch, Placement};
 use iggy_binary_protocol::requests::messages::SendMessagesHeader as SendMessagesMetadata;
 use iggy_binary_protocol::{PrepareHeader, RoutedRequestHeader, WireDecode, WireError};
 use iggy_common::{EncryptorKind, IggyError, random_id};
@@ -609,6 +610,78 @@ pub fn decode_prepare_slice_trusted(bytes: &[u8]) -> Result<BatchRef<'_>, IggyEr
     decode_prepare_slice_inner(bytes, false)
 }
 
+/// What a message prepare says about its batch, whether it carries the whole
+/// batch or a placed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrepareBatch {
+    /// The batch header. Its `batch_checksum` is zero for a placed batch.
+    pub header: BatchHeader,
+    /// Where the blob is, for a placed batch.
+    pub placement: Option<Placement>,
+    /// What tells this body from any other at its position in a segment: the
+    /// batch checksum of a whole batch, the placed batch's own checksum of a
+    /// placed one.
+    pub body_checksum: u64,
+    /// Bytes of the prepare that its segment holds: the whole batch, or the
+    /// placed one. Less than the batch's own length for a placed batch.
+    pub body_length: u64,
+}
+
+/// The batch of a message prepare, checked in full: the batch and message
+/// checksums of a whole batch, as [`decode_prepare_slice`] checks them, or
+/// the placed batch's own checksum.
+///
+/// # Errors
+/// As [`decode_prepare_slice`], and [`IggyError::InvalidCommand`] for a
+/// placed batch that fails its checks or does not fill the prepare exactly.
+pub fn decode_prepare_batch(bytes: &[u8]) -> Result<PrepareBatch, IggyError> {
+    decode_prepare_batch_inner(bytes, true)
+}
+
+/// [`decode_prepare_batch`] without the checksum passes over a whole batch,
+/// for bytes this node stamped or validated before, as
+/// [`decode_prepare_slice_trusted`]. A placed batch is small and is checked
+/// in full either way.
+///
+/// # Errors
+/// As [`decode_prepare_slice_trusted`], and [`IggyError::InvalidCommand`] for
+/// a placed batch that fails its checks or does not fill the prepare exactly.
+pub fn decode_prepare_batch_trusted(bytes: &[u8]) -> Result<PrepareBatch, IggyError> {
+    decode_prepare_batch_inner(bytes, false)
+}
+
+fn decode_prepare_batch_inner(
+    bytes: &[u8],
+    validate_checksum: bool,
+) -> Result<PrepareBatch, IggyError> {
+    let header_size = std::mem::size_of::<PrepareHeader>();
+    let Some(body) = bytes.get(header_size..) else {
+        return Err(IggyError::InvalidCommand);
+    };
+    if !placement::is_placed(body) {
+        let batch = decode_prepare_slice_inner(bytes, validate_checksum)?;
+        return Ok(PrepareBatch {
+            header: batch.header,
+            placement: None,
+            body_checksum: batch.header.batch_checksum,
+            body_length: batch.header.batch_length,
+        });
+    }
+    let prepare = bytemuck::checked::try_from_bytes::<PrepareHeader>(&bytes[..header_size])
+        .map_err(|_| IggyError::InvalidCommand)?;
+    if prepare.size as usize != header_size + PLACED_BATCH_SIZE || body.len() < PLACED_BATCH_SIZE {
+        return Err(IggyError::InvalidCommand);
+    }
+    let body = &body[..PLACED_BATCH_SIZE];
+    let placed = PlacedBatch::decode(body).map_err(|_| IggyError::InvalidCommand)?;
+    Ok(PrepareBatch {
+        header: placed.header,
+        placement: Some(placed.placement),
+        body_checksum: placement::checksum_of(body),
+        body_length: PLACED_BATCH_SIZE as u64,
+    })
+}
+
 fn decode_prepare_slice_inner(
     bytes: &[u8],
     validate_checksum: bool,
@@ -669,6 +742,85 @@ fn decode_prepare_slice_inner(
     Ok(batch)
 }
 
+/// The blob of an admitted `SendMessages` request in its pipeline form
+/// `[RoutedRequestHeader][256B batch header][blob]`, as
+/// [`convert_request_message`] returns it.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a request too short for a batch header.
+pub fn admitted_blob(request: &Message<RoutedRequestHeader>) -> Result<&[u8], IggyError> {
+    let start = std::mem::size_of::<RoutedRequestHeader>() + COMMAND_HEADER_SIZE;
+    request
+        .as_slice()
+        .get(start..request.header().size as usize)
+        .ok_or(IggyError::InvalidCommand)
+}
+
+/// The batch header of an admitted `SendMessages` request in its pipeline
+/// form, once the request is found to hold one whole batch of messages.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a request that is not one whole batch.
+pub fn admitted_batch(request: &Message<RoutedRequestHeader>) -> Result<BatchHeader, IggyError> {
+    let header_size = std::mem::size_of::<RoutedRequestHeader>();
+    let body = request
+        .as_slice()
+        .get(header_size..request.header().size as usize)
+        .ok_or(IggyError::InvalidCommand)?;
+    // Admission checked the messages. It leaves the batch checksum for the
+    // stamp to fill, so that one says nothing here.
+    body.get(..COMMAND_HEADER_SIZE)
+        .and_then(|header| BatchHeader::decode(header).ok())
+        .filter(|batch| body.len() == batch.total_size() && batch.message_count > 0)
+        .ok_or(IggyError::InvalidCommand)
+}
+
+/// The request that commits where the blob of `request` sits in the object
+/// store: the header of `request`, and the placed batch of its batch at
+/// `placement`.
+///
+/// `request` is an admitted `SendMessages` in its pipeline form. The result
+/// answers to the same client, session and request number, so its reply and
+/// its retries are those of the send. The caller hashed the blob for
+/// `placement` already, so it is not hashed again.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a request that is not one whole batch,
+/// and for a placement of another length than its blob.
+pub fn place_request(
+    request: &Message<RoutedRequestHeader>,
+    placement: Placement,
+) -> Result<Message<RoutedRequestHeader>, IggyError> {
+    let header_size = std::mem::size_of::<RoutedRequestHeader>();
+    let batch = admitted_batch(request)?;
+    if admitted_blob(request)?.len() as u64 != placement.length {
+        return Err(IggyError::InvalidCommand);
+    }
+    let placed = PlacedBatch::new(batch, placement);
+    let total = header_size + PLACED_BATCH_SIZE;
+    let mut message = Message::<RoutedRequestHeader>::new(total);
+    placed.encode_into(&mut message.as_mut_slice()[header_size..]);
+    let request_header = *request.header();
+    Ok(
+        message.transmute_header(|_, header: &mut RoutedRequestHeader| {
+            *header = request_header;
+            header.size = u32::try_from(total).expect("a placed request fits u32");
+        }),
+    )
+}
+
+/// Stamp the offset and the timestamp of a message prepare into its batch
+/// header, and renew the checksum that covers them.
+///
+/// A prepare that carries the whole batch gets a new batch checksum over its
+/// stamped header and its blob. One that carries a placed batch has no blob
+/// to hash, so its batch checksum stays zero and the placed batch's own
+/// checksum is renewed.
+///
+/// # Errors
+/// [`IggyError::InvalidCommand`] for a prepare too short for a batch header,
+/// or for a placed batch of another size than a placed batch has. Whatever
+/// the batch header's decoding refuses.
 pub fn stamp_prepare_for_persistence(
     mut message: Message<PrepareHeader>,
     base_offset: u64,
@@ -681,6 +833,20 @@ pub fn stamp_prepare_for_persistence(
     }
 
     let header_offset = std::mem::size_of::<PrepareHeader>();
+    if placement::is_placed(&bytes[header_offset..]) {
+        if total_size != header_offset + PLACED_BATCH_SIZE || bytes.len() < total_size {
+            return Err(IggyError::InvalidCommand);
+        }
+        let placed = &mut bytes[header_offset..total_size];
+        let mut command = placement::placed_header(placed).map_err(|error| batch_error(&error))?;
+        command.base_offset = base_offset;
+        command.base_timestamp = base_timestamp;
+        command.batch_checksum = 0;
+        command.encode_into(&mut placed[..COMMAND_HEADER_SIZE]);
+        placed[batch::BATCH_PRODUCER_OFFSET] |= placement::BATCH_PLACED;
+        placement::seal(placed);
+        return Ok((message, command, command.message_count));
+    }
     let mut command =
         BatchHeader::decode(&bytes[header_offset..header_offset + COMMAND_HEADER_SIZE])
             .map_err(|error| batch_error(&error))?;
@@ -1353,5 +1519,171 @@ mod tests {
                 junk.len(),
             );
         }
+    }
+    /// The prepare of `whole` with its batch placed in the object store.
+    fn placed_prepare(whole: &Owned<MESSAGE_ALIGN>) -> Message<PrepareHeader> {
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let batch = BatchHeader::decode(&whole.as_slice()[header_size..]).expect("batch header");
+        let blob = &whole.as_slice()[PREPARE_SPLIT_POINT..header_size + batch.total_size()];
+        let placed = placement::PlacedBatch::new(batch, placement::Placement::of(7, 4096, blob, 0));
+        let mut bytes = Owned::<MESSAGE_ALIGN>::zeroed(header_size + PLACED_BATCH_SIZE);
+        bytes.as_mut_slice()[..header_size].copy_from_slice(&whole.as_slice()[..header_size]);
+        placed.encode_into(&mut bytes.as_mut_slice()[header_size..]);
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut bytes.as_mut_slice()[..header_size],
+        );
+        header.size = u32::try_from(header_size + PLACED_BATCH_SIZE).expect("placed prepare size");
+        Message::try_from(bytes).expect("placed prepare")
+    }
+
+    #[test]
+    fn given_a_placed_batch_when_stamping_should_set_its_offsets_and_renew_its_own_checksum() {
+        let whole = prepare_with_messages(&sample_messages());
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let before =
+            placement::PlacedBatch::decode(&placed_prepare(&whole).as_slice()[header_size..])
+                .expect("placed batch before the stamp");
+
+        let (stamped, command, count) =
+            stamp_prepare_for_persistence(placed_prepare(&whole), 900, 1_700_000_000_000_000)
+                .expect("stamp a placed batch");
+
+        let after = placement::PlacedBatch::decode(&stamped.as_slice()[header_size..])
+            .expect("the stamped placed batch decodes");
+        assert_eq!(after.header, command);
+        assert_eq!(count, before.header.message_count);
+        assert_eq!(after.header.base_offset, 900);
+        assert_eq!(after.header.base_timestamp, 1_700_000_000_000_000);
+        assert_eq!(after.header.batch_checksum, 0);
+        assert_eq!(after.placement, before.placement);
+        assert_eq!(after.header.batch_length, before.header.batch_length);
+        // Nothing that expects the blob after the header takes it for a batch.
+        assert!(decode_prepare_slice(stamped.as_slice()).is_err());
+    }
+
+    #[test]
+    fn given_a_placed_batch_of_another_size_when_stamping_should_refuse_it() {
+        let whole = prepare_with_messages(&sample_messages());
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let placed = placed_prepare(&whole);
+        let mut bytes = Owned::<MESSAGE_ALIGN>::zeroed(placed.as_slice().len() + 8);
+        bytes.as_mut_slice()[..placed.as_slice().len()].copy_from_slice(placed.as_slice());
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+            &mut bytes.as_mut_slice()[..header_size],
+        );
+        header.size += 8;
+        let longer = Message::try_from(bytes).expect("a longer prepare");
+
+        assert!(matches!(
+            stamp_prepare_for_persistence(longer, 900, 1),
+            Err(IggyError::InvalidCommand)
+        ));
+    }
+    #[test]
+    fn given_a_whole_batch_when_decoding_the_prepare_batch_should_match_the_batch_decoder() {
+        let whole = prepare_with_messages(&sample_messages());
+        let (stamped, ..) = stamp_prepare_for_persistence(
+            Message::try_from(whole).expect("prepare"),
+            40,
+            1_700_000_000_000_000,
+        )
+        .expect("stamp");
+        let batch = decode_prepare_slice(stamped.as_slice()).expect("the batch decodes");
+
+        let decoded = decode_prepare_batch(stamped.as_slice()).expect("the prepare batch decodes");
+
+        assert_eq!(decoded.header, batch.header);
+        assert_eq!(decoded.placement, None);
+        assert_eq!(decoded.body_checksum, batch.header.batch_checksum);
+        assert_eq!(decoded.body_length, batch.header.batch_length);
+        assert_eq!(
+            decode_prepare_batch_trusted(stamped.as_slice()),
+            Ok(decoded)
+        );
+    }
+
+    #[test]
+    fn given_a_placed_batch_when_decoding_the_prepare_batch_should_give_its_header_and_placement() {
+        let whole = prepare_with_messages(&sample_messages());
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let (stamped, command, _) =
+            stamp_prepare_for_persistence(placed_prepare(&whole), 40, 1_700_000_000_000_000)
+                .expect("stamp");
+
+        let decoded = decode_prepare_batch(stamped.as_slice()).expect("the placed batch decodes");
+
+        assert_eq!(decoded.header, command);
+        assert!(decoded.placement.is_some());
+        assert_eq!(decoded.body_length, PLACED_BATCH_SIZE as u64);
+        assert!(decoded.body_length < decoded.header.batch_length);
+        assert_eq!(
+            decode_prepare_batch_trusted(stamped.as_slice()),
+            Ok(decoded)
+        );
+
+        // Another placement at the same offsets is another body.
+        let mut other = Owned::<MESSAGE_ALIGN>::copy_from_slice(stamped.as_slice());
+        let placement = &mut other.as_mut_slice()[header_size + COMMAND_HEADER_SIZE..];
+        placement[16] ^= 1;
+        placement::seal(&mut other.as_mut_slice()[header_size..]);
+        let other = decode_prepare_batch(other.as_slice()).expect("the other placed batch");
+        assert_eq!(other.header, decoded.header);
+        assert_ne!(other.body_checksum, decoded.body_checksum);
+    }
+
+    #[test]
+    fn given_a_damaged_placed_batch_when_decoding_the_prepare_batch_should_refuse_it_trusted_or_not()
+     {
+        let whole = prepare_with_messages(&sample_messages());
+        let header_size = std::mem::size_of::<PrepareHeader>();
+        let mut damaged =
+            Owned::<MESSAGE_ALIGN>::copy_from_slice(placed_prepare(&whole).as_slice());
+        damaged.as_mut_slice()[header_size + COMMAND_HEADER_SIZE + 16] ^= 1;
+
+        assert_eq!(
+            decode_prepare_batch(damaged.as_slice()),
+            Err(IggyError::InvalidCommand)
+        );
+        assert_eq!(
+            decode_prepare_batch_trusted(damaged.as_slice()),
+            Err(IggyError::InvalidCommand)
+        );
+    }
+    #[test]
+    fn given_an_admitted_send_when_placing_it_should_keep_its_identity_and_point_at_its_blob() {
+        let namespace = IggyNamespace::new(1, 1, 3);
+        let body = wire_send_messages_body(&sample_messages());
+        let admitted =
+            convert_request_message(namespace, wire_request_message(&body), ChecksumMode::Skip)
+                .expect("admission");
+        let header_size = std::mem::size_of::<RoutedRequestHeader>();
+        let batch = BatchHeader::decode(&admitted.as_slice()[header_size..]).expect("batch");
+        let blob = admitted_blob(&admitted).expect("blob").to_vec();
+
+        let placed =
+            place_request(&admitted, Placement::of(9, 4096, &blob, 12)).expect("placed request");
+        let mut longer = Placement::of(9, 4096, &blob, 12);
+        longer.length += 1;
+        assert!(
+            matches!(
+                place_request(&admitted, longer),
+                Err(IggyError::InvalidCommand)
+            ),
+            "a placement of another length than the blob"
+        );
+
+        assert_eq!(
+            placed.header().size as usize,
+            header_size + PLACED_BATCH_SIZE
+        );
+        assert_eq!(placed.header().client, admitted.header().client);
+        assert_eq!(placed.header().request, admitted.header().request);
+        assert_eq!(placed.header().operation, admitted.header().operation);
+        let decoded = PlacedBatch::decode(&placed.as_slice()[header_size..]).expect("placed batch");
+        assert_eq!(decoded.header.message_count, batch.message_count);
+        assert_eq!(decoded.header.batch_length, batch.batch_length);
+        assert_eq!(decoded.header.partition_id, 3);
+        assert_eq!(decoded.placement, Placement::of(9, 4096, &blob, 12));
+        assert!(decoded.placement.matches(&blob));
     }
 }

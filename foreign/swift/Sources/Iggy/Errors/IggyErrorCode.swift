@@ -97,6 +97,13 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case lifecycleBusy = 88
     case notPrimary = 89
     case deferredPollCapacityExceeded = 90
+    case producerIdsExhausted = 91
+    case producerSequenceOutOfOrder = 92
+    case producerEpochFenced = 93
+    case producerUnknown = 94
+    case producerPartitionRequired = 95
+    case tieredReadFailed = 96
+    case replyTooLarge = 97
     case clientNotFound = 100
     case invalidClientId = 101
     case connectionClosed = 206
@@ -131,6 +138,7 @@ public enum IggyErrorCode: UInt32, Sendable, Hashable, CaseIterable, Codable {
     case cannotReadStreams = 1015
     case invalidTopicSize = 1019
     case tooManyStreams = 1020
+    case shadowStreamReadOnly = 1021
     case cannotCreateTopicsDirectory = 2000
     case cannotCreateTopicDirectory = 2001
     case cannotCreateTopicInfo = 2002
@@ -365,6 +373,13 @@ extension IggyErrorCode {
         case .lifecycleBusy: "lifecycle_busy"
         case .notPrimary: "not_primary"
         case .deferredPollCapacityExceeded: "deferred_poll_capacity_exceeded"
+        case .producerIdsExhausted: "producer_ids_exhausted"
+        case .producerSequenceOutOfOrder: "producer_sequence_out_of_order"
+        case .producerEpochFenced: "producer_epoch_fenced"
+        case .producerUnknown: "producer_unknown"
+        case .producerPartitionRequired: "producer_partition_required"
+        case .tieredReadFailed: "tiered_read_failed"
+        case .replyTooLarge: "reply_too_large"
         case .clientNotFound: "client_not_found"
         case .invalidClientId: "invalid_client_id"
         case .connectionClosed: "connection_closed"
@@ -399,6 +414,7 @@ extension IggyErrorCode {
         case .cannotReadStreams: "cannot_read_streams"
         case .invalidTopicSize: "invalid_topic_size"
         case .tooManyStreams: "too_many_streams"
+        case .shadowStreamReadOnly: "shadow_stream_read_only"
         case .cannotCreateTopicsDirectory: "cannot_create_topics_directory"
         case .cannotCreateTopicDirectory: "cannot_create_topic_directory"
         case .cannotCreateTopicInfo: "cannot_create_topic_info"

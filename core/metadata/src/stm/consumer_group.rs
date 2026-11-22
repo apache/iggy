@@ -36,7 +36,7 @@ use crate::stm::result::{
     ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult, JoinConsumerGroupResult,
     LeaveConsumerGroupResult,
 };
-use crate::stm::stream::{Partition, StreamsInner};
+use crate::stm::stream::{Partition, PartitionChangeKind, StreamsInner};
 use bytes::Bytes;
 
 use bytes::{BufMut, BytesMut};
@@ -561,10 +561,11 @@ impl StateHandler for CreateConsumerGroupRequest {
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
         topic
             .consumer_groups
-            .insert(id, ConsumerGroup::new(id, name.clone()));
+            .insert(id, Box::new(ConsumerGroup::new(id, name.clone())));
         topic.consumer_group_index.insert(name, id);
         let partitions_count = topic.partitions.len() as u32;
         let consumer_groups_count = topic.consumer_groups.len() as u32;
+        state.catalog_counts.consumer_groups += 1;
         let changes = state
             .topic_key(stream_id, topic_id)
             .map(|topic| {
@@ -649,13 +650,19 @@ impl StateHandler for DeleteConsumerGroupRequest {
         };
         topic.consumer_group_index.remove(&group.name);
         let consumer_groups_count = u32::try_from(topic.consumer_groups.len()).ok();
+        state.catalog_counts.consumer_groups =
+            state.catalog_counts.consumer_groups.saturating_sub(1);
         // A finalized deletion applies at its completion op. A sibling group
         // created after the intent can hold a later op than the intent.
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
-        // Bump the partition-shaping revision so the reconciler's fast-skip
-        // doesn't pass over the delete: it reclaims the group's leftover
-        // offsets on the topic's surviving partitions.
+        // Each partition of the topic gets a change, so the reconciler
+        // reclaims the group's leftover offsets on it.
         state.revision = state.revision.wrapping_add(1);
+        state.record_topic_partition_changes(
+            stream_id,
+            topic_id,
+            PartitionChangeKind::ConsumerGroupDeleted,
+        );
         // The dropped group may have held pending revocations.
         state.recompute_consumer_group_metadata();
         let (requested_op, actor) = state.deletion_origin();
@@ -744,10 +751,9 @@ impl StateHandler for JoinConsumerGroupRequest {
                 .topic_key(stream_id, topic_id)
                 .zip(u32::try_from(group_id).ok())
                 .zip(u32::try_from(member_key).ok())
-                .map(|((topic, group_id), member_id)| {
+                .map_or_default(|((topic, group_id), member_id)| {
                     installed_partition_changes(topic, group_id, member_id, &before, &after)
                 })
-                .unwrap_or_default()
                 .into_iter()
                 .map(|body| {
                     AppliedChange::new(
@@ -958,7 +964,9 @@ impl StateHandler for RemoveConsumerGroupMembersRequest {
                     }
                 }
             }
-            // Only perturb the reconciler when a membership actually changed.
+            // Bump only when a membership actually changed. `revision` stamps
+            // the incarnation of every later partition, so every replica must
+            // bump at the same ops.
             if any_removed {
                 state.revision = state.revision.wrapping_add(1);
                 state.recompute_consumer_group_metadata();
@@ -1187,8 +1195,7 @@ impl StateHandler for RefreshConsumerGroupSessionRequest {
                     let after = group
                         .members
                         .get(member_id)
-                        .map(|member| member.partitions.clone())
-                        .unwrap_or_default();
+                        .map_or_default(|member| member.partitions.clone());
                     handovers.push((stream_id, topic_id, group_id, member_id, before, after));
                 }
             }
@@ -1306,7 +1313,7 @@ impl ConsumerGroupSnapshot {
 mod tests {
     use super::*;
     use crate::stm::snapshot::Snapshotable;
-    use crate::stm::stream::Streams;
+    use crate::stm::stream::{PartitionChange, Streams};
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::partitions::{
         CreatePartitionsRequest, CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
@@ -1318,6 +1325,7 @@ mod tests {
     };
     use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::IggyTimestamp;
+    use server_common::sharding::IggyNamespace;
 
     #[test]
     fn given_balanced_owners_when_fourth_member_joins_should_move_only_three_partitions() {
@@ -1921,6 +1929,45 @@ mod tests {
         assert_eq!(streams.consumer_group_session(OTHER), None);
     }
 
+    /// The final delete of a group records one change per partition of its
+    /// topic, so each owner reclaims the group's offsets without a walk.
+    #[test]
+    fn given_group_delete_when_it_finalizes_should_record_a_change_per_topic_partition() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        let before = state.revision;
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(0),
+        };
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, 0);
+
+        let changes: Vec<_> = state
+            .recent_partition_changes
+            .since(before)
+            .expect("the feed holds the delete")
+            .copied()
+            .collect();
+        assert_eq!(
+            changes,
+            [(
+                state.revision,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, 0),
+                    created_revision: state.items[0].topics[0].partitions[0].created_revision,
+                    kind: PartitionChangeKind::ConsumerGroupDeleted,
+                    skips_object_deletes: false,
+                }
+            )]
+        );
+    }
+
     #[test]
     fn deleting_a_parent_removes_its_session_refresh_index() {
         const CLIENT: u128 = 7;
@@ -2124,6 +2171,51 @@ mod tests {
     }
 
     #[test]
+    fn given_a_deleted_group_when_snapshotted_and_listed_should_hold_ascending_ids() {
+        let mut state = streams_with_topic();
+        for name in ["a", "b", "c", "d", "e"] {
+            assert_eq!(create_group(&mut state, name).code, 0);
+        }
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(2),
+        };
+        let deleted = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(deleted.code, 0);
+        assert_eq!(create_group(&mut state, "f").code, 0);
+        let expected = [0, 1, 3, 4, 5];
+
+        let snapshot = Streams::from(state).to_snapshot();
+        let snapshotted: Vec<u64> = snapshot.items[0].1.topics[0]
+            .1
+            .consumer_groups
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(snapshotted, expected);
+
+        let restored = Streams::from_snapshot(snapshot).unwrap();
+        let listed: Vec<u64> = restored.read(|inner| {
+            inner
+                .items
+                .get(0)
+                .unwrap()
+                .topics
+                .get(0)
+                .unwrap()
+                .consumer_groups_after(None, false)
+                .map(|group| group.id)
+                .collect()
+        });
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
     fn given_group_with_rows_and_no_members_when_partitions_grow_should_cover_every_partition() {
         const CLIENT: u128 = 7;
         let mut state = streams_with_topic();
@@ -2194,6 +2286,7 @@ mod tests {
                 initial_view: 0,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
@@ -2267,6 +2360,7 @@ mod tests {
                         initial_view: 0,
                         partition_id,
                         consensus_group_id: u64::from(partition_id) + 2,
+                        members: Vec::new(),
                     })
                     .collect(),
             },

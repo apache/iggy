@@ -67,7 +67,7 @@ connection. The cost rules it out.
 
 The Argon2 verify runs on the shard's compio runtime, which has no blocking pool. A burst of Kafka
 connections therefore stalls that shard's entire request loop, including produce and fetch traffic that has
-nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:211`) is cluster-wide.
+nothing to do with authentication. The 8192 ceiling (`[metadata] clients_table_max`, `core/consensus/src/impls.rs:249`) is cluster-wide.
 So connection churn on the Kafka side turns directly into session-table pressure on the Iggy side.
 
 ## Why not a shared service account
@@ -146,23 +146,28 @@ Per connection, with SASL enabled. Only ApiVersions and SaslHandshake are legal 
 | ------- | ------- | -------- |
 | `AwaitHandshake` | ApiVersions (18) | answer, stay |
 | | SaslHandshake (17) v1, supported mechanism | answer `error_code` 0, go to `AwaitToken` |
-| | SaslHandshake (17) v1, unknown mechanism | answer 33 with the mechanism list, then close |
-| | SaslHandshake (17) v0 | answer 35 with the mechanism list, then close |
+| | SaslHandshake (17) v0, supported mechanism | answer `error_code` 0, go to `AwaitRawToken` |
+| | SaslHandshake (17) v0 or v1, unknown mechanism | answer 33 with the mechanism list, then close |
 | | anything else | answer 34 shaped for that API, then close |
 | `AwaitToken` | SaslAuthenticate (36), credentials valid | answer 0, empty `auth_bytes`, go to `Authenticated` |
 | | SaslAuthenticate (36), credentials rejected | answer 58 with a generic message, then close |
 | | anything else | answer 34, then close |
+| `AwaitRawToken` | bare PLAIN token, credentials valid | send the empty server token in a length-prefixed frame (four zero bytes), go to `Authenticated` |
+| | bare token rejected, malformed or longer than 4096 bytes | close without an answer |
 | `Authenticated` | any supported API, including ApiVersions again | serve |
 | `AwaitHandshake` | ApiVersions past the allowance | answer 34, then close (two are allowed: the one a real broker allows, plus the KIP-511 downgrade retry) |
+| | SaslHandshake above v1 | close, no schema exists at that version |
 | `AwaitToken` | SaslAuthenticate above the advertised ceiling | close, no schema exists at that version |
 | any | Metadata or Produce while unauthenticated | close with no body (no error field, and acks=0 forbids one) |
 | | SaslHandshake or SaslAuthenticate | answer 34, keep the connection |
 
 Notes that decide the implementation.
 
-- **Handshake v1 only.** The handshake version selects the token framing (KIP-152). Refusing v0 means the
-  legacy bare-token mode is never entered, so the frame reader stays header-parsing-only. Only pre-1.0
-  Kafka clients are excluded.
+- **Handshake v0 and v1.** The handshake version selects the token framing (KIP-152). After v0, the next
+  frame is the bare token, with no request header. The connection loop reads it before it parses a header,
+  and caps it at 4096 bytes. A bare token has no answer that can carry an error, so every failure closes
+  the connection, as on a Kafka broker. kafka-python 2.0.2, Sarama up to 1.40.1 and aiokafka up to 0.12
+  send v0.
 - **`session_lifetime_ms` is 0.** No KIP-368 re-authentication, which keeps mid-connection identity change
   out of scope. That matters beyond convenience, see the re-authentication note below.
 - **ApiVersions is answered twice.** The Java client sends it once before the handshake and again after
@@ -286,6 +291,12 @@ The principal a certificate yields is the same `AuthenticatedPrincipal` a SASL l
 permissions read at admission, so everything written about the SASL identity above holds: it is a snapshot,
 it is not cached across connections, and nothing acts as it on the data plane yet
 ([#4518](https://github.com/apache/iggy/issues/4518)).
+
+The snapshot follows Iggy's metadata change log when the bridge's Iggy user can read it, which needs root
+or the global `manage_servers` permission. A connection then takes each permission change of its user
+within about a second, and closes once its user is deleted or deactivated.
+[`ACL_MAPPING.md`](ACL_MAPPING.md#staleness) has the detail. Without that permission, the snapshot holds
+until the connection closes.
 
 ## Re-authentication
 

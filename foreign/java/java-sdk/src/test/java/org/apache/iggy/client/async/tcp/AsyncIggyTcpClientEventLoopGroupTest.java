@@ -26,6 +26,7 @@ import io.netty.channel.IoEventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import org.apache.iggy.client.ConnectionInfo;
+import org.apache.iggy.client.blocking.tcp.IggyTcpClient;
 import org.junit.jupiter.api.Test;
 
 import java.io.EOFException;
@@ -63,7 +64,7 @@ class AsyncIggyTcpClientEventLoopGroupTest {
 
     private static final String OWNED_THREAD_PREFIX = "iggy-tcp-io-";
     private static final Duration HEARTBEAT_INTERVAL = Duration.ofMillis(25);
-    // Graceful shutdown waits a two-second quiet period before the loop thread exits.
+    // Bounds a close and the exit of its loop thread, whatever quiet period the run configures.
     private static final Duration SHUTDOWN_TIMEOUT = Duration.ofSeconds(15);
 
     private static final int HEADER_SIZE = 256;
@@ -96,6 +97,41 @@ class AsyncIggyTcpClientEventLoopGroupTest {
 
             client.close().get(SHUTDOWN_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
             awaitOwnedEventLoopThreadsSince(before, 0, SHUTDOWN_TIMEOUT);
+        }
+    }
+
+    // The test task sets the quiet period property to zero, so in these two tests only the builder value can hold
+    // the close.
+    @Test
+    void shouldHoldACloseForTheQuietPeriodSetOnTheBuilder() throws Exception {
+        Duration quietPeriod = Duration.ofMillis(500);
+        try (MockVsrServer server = MockVsrServer.start()) {
+            AsyncIggyTcpClient client =
+                    builder(server).shutdownQuietPeriod(quietPeriod).build();
+            client.connect().get(5, TimeUnit.SECONDS);
+
+            long closeStarted = System.nanoTime();
+            client.close().get(SHUTDOWN_TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+
+            assertThat(Duration.ofNanos(System.nanoTime() - closeStarted)).isGreaterThanOrEqualTo(quietPeriod);
+        }
+    }
+
+    @Test
+    void shouldHoldABlockingCloseForTheQuietPeriodSetOnTheBuilder() throws Exception {
+        Duration quietPeriod = Duration.ofMillis(500);
+        try (MockVsrServer server = MockVsrServer.start()) {
+            IggyTcpClient client = IggyTcpClient.builder()
+                    .host(loopback())
+                    .port(server.port())
+                    .shutdownQuietPeriod(quietPeriod)
+                    .build();
+            client.connect();
+
+            long closeStarted = System.nanoTime();
+            client.close();
+
+            assertThat(Duration.ofNanos(System.nanoTime() - closeStarted)).isGreaterThanOrEqualTo(quietPeriod);
         }
     }
 

@@ -16,31 +16,46 @@
 // under the License.
 
 use ahash::AHashMap;
+use compio::buf::{IntoInner, IoBuf};
+use compio::io::AsyncReadAtExt;
 use iggy_binary_protocol::{Operation, PrepareHeader};
+use journal::partition_journal::SegmentReference;
 use journal::{Journal, Storage};
 use server_common::{
-    iobuf::{Frozen, Owned},
-    send_messages::{self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_slice_trusted},
+    Message,
+    iobuf::{Frozen, IOV_MAX, Owned},
+    send_messages::{
+        self, BatchRef, COMMAND_HEADER_SIZE, decode_prepare_batch, decode_prepare_batch_trusted,
+        decode_prepare_slice_trusted,
+    },
+    sharding::IggyNamespace,
 };
 use std::io;
 use std::{
     cell::{Cell, RefCell, UnsafeCell},
-    collections::{BTreeMap, HashMap},
-    ops::RangeInclusive,
+    collections::{BTreeMap, VecDeque},
+    fmt::Debug,
+    ops::{RangeBounds, RangeInclusive},
+    rc::{Rc, Weak},
 };
 use tracing::warn;
 
+use crate::log::SegmentedLog;
+use crate::repair_memory::{
+    JournalBytes, RepairMemoryReservation, RepairRingBudget, RingCharge, RingTicket,
+};
+use crate::state_machine::{COMMANDS_RETAINED_BYTES_MAX, COMMANDS_RETAINED_MAX, StateMachineLog};
 use crate::{Fragment, PollFragments, PollQueryResult};
 
 const ZERO_LEN: usize = 0;
 const PREPARE_HEADER_SIZE: usize = std::mem::size_of::<PrepareHeader>();
 type JournalBuffer = Frozen<4096>;
 
-/// Decoded `SendMessages` header fields surfaced from a journal (re-)append so a
-/// caller can fold segment accounting without a second decode of the same bytes.
-/// Raw header values only: the journal stays agnostic of partition-layer
-/// accounting types (`JournalInfo` lives in the log layer). `None` is surfaced
-/// for non-`SendMessages` ops, which carry no segment bytes.
+/// Decoded `SendMessages` header fields: what a resident batch adds to the
+/// journal's offset and timestamp indexes and message totals, and what a flush
+/// folds into segment accounting. Raw header values only: the journal stays
+/// agnostic of partition-layer accounting types (`JournalInfo` lives in the
+/// log layer).
 #[derive(Clone, Copy)]
 pub struct RetainedBatchMeta {
     pub base_offset: u64,
@@ -49,12 +64,570 @@ pub struct RetainedBatchMeta {
     pub message_count: u32,
 }
 
+impl RetainedBatchMeta {
+    /// `None` for an op that is not `SendMessages` or that carries no
+    /// messages: such an entry has no offset to index and no segment bytes.
+    ///
+    /// Trusted (no batch-hash): every entry here was just stamped by
+    /// `stamp_prepare_for_persistence` (its checksum recomputed over this exact
+    /// blob) or was validated by such an append before, so re-hashing the
+    /// ~1 MiB blob only to read the header is waste.
+    fn of(header: &PrepareHeader, entry: &JournalBuffer) -> Option<Self> {
+        if header.operation != Operation::SendMessages {
+            return None;
+        }
+        let batch = decode_prepare_batch_trusted(entry.as_slice()).ok()?;
+        let message_count = batch.header.message_count;
+        (message_count != 0).then_some(Self {
+            base_offset: batch.header.base_offset,
+            base_timestamp: batch.header.base_timestamp,
+            total_size: batch.body_length,
+            message_count,
+        })
+    }
+}
+
 /// What one pass over the journal headers found for a repair window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepairedWindowShape {
     /// Every op in the window is resident. An EMPTY window is complete: nothing
     /// left can arrive and change the floor verdict.
     pub complete: bool,
+}
+
+/// Where a committed prepare's body sits in the log file of its segment. A
+/// segment stores the body without the prepare header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyPosition {
+    /// Start offset of the segment, which names its log file.
+    pub segment_start: u64,
+    pub position: u64,
+}
+
+impl From<SegmentReference> for BodyPosition {
+    fn from(reference: SegmentReference) -> Self {
+        Self {
+            segment_start: reference.start_offset,
+            position: reference.position,
+        }
+    }
+}
+
+/// A committed prepare the repair ring keeps without its body. The byte cap
+/// released the body, which still sits in its segment, so repair reads it
+/// back instead of answering `RangeEvicted`.
+///
+/// Built only from a whole `SendMessages` prepare, so `header.size` covers the
+/// prepare header and a batch.
+#[derive(Debug, Clone, Copy)]
+pub struct EvictedHeader {
+    header: PrepareHeader,
+    body: BodyPosition,
+    /// Checksum of the released batch. Bytes read back must carry it, so
+    /// another batch at the same position cannot pass for this op.
+    batch_checksum: u64,
+}
+
+/// What one released entry costs the evicted ring: 288 bytes, so
+/// [`EVICTED_HEADERS_MAX`] of them take 4.5 MiB per partition.
+pub const EVICTED_HEADER_BYTES: u64 = size_of::<EvictedHeader>() as u64;
+const _: () = assert!(EVICTED_HEADER_BYTES == 288);
+
+impl EvictedHeader {
+    #[must_use]
+    pub const fn header(&self) -> &PrepareHeader {
+        &self.header
+    }
+
+    /// Whether the body of `next` lies right after this one in the same
+    /// segment file.
+    const fn followed_by(&self, next: &Self) -> bool {
+        let body_len = (self.header.size as usize).saturating_sub(PREPARE_HEADER_SIZE);
+        self.body.segment_start == next.body.segment_start
+            && self.body.position + body_len as u64 == next.body.position
+    }
+
+    /// `prepare`, read back for this entry, if its body is the released one.
+    fn verified(&self, prepare: Owned<4096>) -> io::Result<JournalBuffer> {
+        let batch = decode_prepare_batch(prepare.as_slice()).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("the body read back fails its checks: {error}"),
+            )
+        })?;
+        if batch.body_checksum != self.batch_checksum {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "another batch sits at the evicted body position",
+            ));
+        }
+        Ok(prepare.into())
+    }
+
+    /// Whether `retransmit` is the prepare this entry keeps the header of.
+    /// Only the view may differ. No bytes are left in memory to compare the
+    /// body with, so it must pass its own checksums and carry the checksum
+    /// of the released batch.
+    #[must_use]
+    pub(crate) fn matches_retransmit(&self, retransmit: &Message<PrepareHeader>) -> bool {
+        let header = retransmit.header();
+        let frame = retransmit.as_slice();
+        PrepareHeader {
+            view: header.view,
+            ..self.header
+        } == *header
+            && frame.len() == header.size as usize
+            && decode_prepare_batch(frame)
+                .is_ok_and(|batch| batch.body_checksum == self.batch_checksum)
+    }
+
+    /// Start offset of the segment whose log file holds the body.
+    #[must_use]
+    pub const fn segment_start(&self) -> u64 {
+        self.body.segment_start
+    }
+
+    const fn same_prepare(&self, other: &Self) -> bool {
+        self.header.op == other.header.op && self.header.checksum == other.header.checksum
+    }
+}
+
+/// The released bodies that one serve reads back, with the log file of each
+/// segment that holds one. It owns what it reads, so a task that runs beside
+/// the pump can read the bodies while the log changes.
+#[derive(Debug)]
+pub struct ReleasedRead {
+    released: Vec<EvictedHeader>,
+    /// The log file of each segment by its start offset, `None` when the
+    /// segment left the log.
+    files: Vec<(u64, Option<String>)>,
+}
+
+impl ReleasedRead {
+    #[must_use]
+    pub fn new<J: Debug + Journal>(log: &SegmentedLog<J>, released: Vec<EvictedHeader>) -> Self {
+        let mut files: Vec<(u64, Option<String>)> = Vec::new();
+        for evicted in &released {
+            let segment = evicted.body.segment_start;
+            if files.iter().all(|(start, _)| *start != segment) {
+                files.push((segment, log.messages_path(segment)));
+            }
+        }
+        Self { released, files }
+    }
+
+    /// Reads the bodies back in op order. Bodies that lie back to back in one
+    /// file come back in one read.
+    ///
+    /// The read stops at the first body that it cannot serve: the segment
+    /// left the log, the read failed, or the bytes there are not the released
+    /// body, such as a torn or corrupt batch or another batch at the same
+    /// position. Such bytes are never returned.
+    pub async fn read(self) -> ReleasedBodies {
+        let mut bodies = ReleasedBodies {
+            read: VecDeque::with_capacity(self.released.len()),
+            failed: None,
+        };
+        if let Err(error) = self.read_runs(&mut bodies.read).await {
+            bodies.failed = self
+                .released
+                .get(bodies.read.len())
+                .map(|evicted| (*evicted, error));
+        }
+        bodies
+    }
+
+    async fn read_runs(
+        &self,
+        read: &mut VecDeque<(EvictedHeader, JournalBuffer)>,
+    ) -> io::Result<()> {
+        let mut file: Option<(u64, compio::fs::File)> = None;
+        let runs = self
+            .released
+            .chunk_by(EvictedHeader::followed_by)
+            .flat_map(|run| run.chunks(IOV_MAX));
+        for run in runs {
+            let Some(first) = run.first() else {
+                continue;
+            };
+            let segment = first.body.segment_start;
+            let file = match &mut file {
+                Some((start, file)) if *start == segment => file,
+                slot => {
+                    let path = self
+                        .files
+                        .iter()
+                        .find(|(start, _)| *start == segment)
+                        .and_then(|(_, path)| path.as_deref())
+                        .ok_or_else(|| {
+                            io::Error::new(io::ErrorKind::NotFound, "the segment left the log")
+                        })?;
+                    &slot
+                        .insert((segment, compio::fs::File::open(path).await?))
+                        .1
+                }
+            };
+            // A vectored file read in compio fills only the initialized bytes of
+            // each buffer, so the bodies start zeroed.
+            let buffers: Vec<_> = run
+                .iter()
+                .map(|evicted| {
+                    let size = evicted.header.size as usize;
+                    let mut prepare = Owned::<4096>::zeroed(size);
+                    prepare.as_mut_slice()[..PREPARE_HEADER_SIZE]
+                        .copy_from_slice(bytemuck::bytes_of(&evicted.header));
+                    prepare.slice(PREPARE_HEADER_SIZE..size)
+                })
+                .collect();
+            let compio::BufResult(result, buffers) = file
+                .read_vectored_exact_at(buffers, first.body.position)
+                .await;
+            for (evicted, body) in run.iter().zip(buffers) {
+                match evicted.verified(body.into_inner()) {
+                    Ok(prepare) => read.push_back((*evicted, prepare)),
+                    // Only the released body itself passes the checks, and a
+                    // failed read leaves zeros where it stopped, so after a failed
+                    // read the first body that fails is where the read stopped.
+                    Err(error) => return Err(result.err().unwrap_or(error)),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The bodies that a [`ReleasedRead`] brought back, in op order.
+#[derive(Debug)]
+pub struct ReleasedBodies {
+    read: VecDeque<(EvictedHeader, JournalBuffer)>,
+    /// The body that the read could not serve, and why. The read stopped
+    /// there.
+    failed: Option<(EvictedHeader, io::Error)>,
+}
+
+impl ReleasedBodies {
+    /// The body read back for `evicted`. Callers take ops in ascending order,
+    /// so the bodies of lower ops are dropped.
+    pub fn take(&mut self, evicted: &EvictedHeader) -> Option<JournalBuffer> {
+        while self
+            .read
+            .front()
+            .is_some_and(|(front, _)| front.header.op < evicted.header.op)
+        {
+            self.read.pop_front();
+        }
+        if !self
+            .read
+            .front()
+            .is_some_and(|(front, _)| front.same_prepare(evicted))
+        {
+            return None;
+        }
+        self.read.pop_front().map(|(_, body)| body)
+    }
+
+    /// Why the read could not serve `evicted`, if it stopped there.
+    pub fn take_failure(&mut self, evicted: &EvictedHeader) -> Option<io::Error> {
+        self.failed
+            .take_if(|(failed, _)| failed.same_prepare(evicted))
+            .map(|(_, error)| error)
+    }
+}
+
+/// A committed prepare the repair ring holds in memory, with the place of its
+/// body in a segment when the WAL wrote it there.
+struct RingEntry {
+    prepare: JournalBuffer,
+    body: Option<BodyPosition>,
+}
+
+/// A snapshot's repair suffix. Advancing or dropping the last lease releases
+/// its extra retention immediately. The ordinary ring keeps its own caps.
+pub struct RepairTailLease {
+    state: Rc<RepairTailState>,
+    retained: Weak<RefCell<RepairTail>>,
+}
+
+struct RepairTailState {
+    from_op: Cell<u64>,
+    valid: Cell<bool>,
+}
+
+impl RepairTailLease {
+    pub(crate) fn is_valid(&self) -> bool {
+        self.state.valid.get()
+    }
+
+    pub(crate) fn advance(&self, from_op: u64) {
+        self.state
+            .from_op
+            .set(self.state.from_op.get().max(from_op));
+        if let Some(retained) = self.retained.upgrade() {
+            retained.borrow_mut().release_below_leases();
+        }
+    }
+}
+
+impl Drop for RepairTailLease {
+    fn drop(&mut self) {
+        self.state.valid.set(false);
+        if let Some(retained) = self.retained.upgrade() {
+            retained.borrow_mut().release_below_leases();
+        }
+    }
+}
+
+#[derive(Default)]
+struct RepairTail {
+    leases: Vec<Weak<RepairTailState>>,
+    bodies: BTreeMap<u64, JournalBuffer>,
+    headers: BTreeMap<u64, EvictedHeader>,
+    memory: Option<RepairMemoryReservation>,
+    /// The ring's charge. The shard's shed stops at the lowest lease, so a
+    /// lease that moves or ends queues the ring for the shed again.
+    ring_charge: Option<Rc<RingCharge>>,
+}
+
+impl RepairTail {
+    /// [`Self::prune`] after a lease moved or ended.
+    fn release_below_leases(&mut self) {
+        self.prune();
+        if let Some(charge) = &self.ring_charge {
+            charge.queue_grown();
+        }
+    }
+
+    fn prune(&mut self) -> Option<u64> {
+        let mut from_op = None;
+        self.leases.retain(|lease| {
+            let Some(lease) = lease.upgrade().filter(|lease| lease.valid.get()) else {
+                return false;
+            };
+            let floor = lease.from_op.get();
+            from_op = Some(from_op.map_or(floor, |old: u64| old.min(floor)));
+            true
+        });
+        let Some(from_op) = from_op else {
+            self.bodies.clear();
+            self.headers.clear();
+            self.memory = None;
+            return None;
+        };
+        while let Some(entry) = self
+            .bodies
+            .first_entry()
+            .filter(|entry| *entry.key() < from_op)
+        {
+            let bytes = Self::body_memory_bytes(&entry.remove());
+            if let Some(memory) = &mut self.memory {
+                memory.release(bytes);
+            }
+        }
+        while let Some(entry) = self
+            .headers
+            .first_entry()
+            .filter(|entry| *entry.key() < from_op)
+        {
+            entry.remove();
+            if let Some(memory) = &mut self.memory {
+                memory.release(std::mem::size_of::<(u64, EvictedHeader)>());
+            }
+        }
+        Some(from_op)
+    }
+
+    fn invalidate(&mut self) {
+        for lease in &self.leases {
+            if let Some(lease) = lease.upgrade() {
+                lease.valid.set(false);
+            }
+        }
+        self.leases.clear();
+        self.bodies.clear();
+        self.headers.clear();
+        self.memory = None;
+        if let Some(charge) = &self.ring_charge {
+            charge.queue_grown();
+        }
+    }
+
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self
+            .memory
+            .as_mut()
+            .is_some_and(|memory| memory.try_add(bytes))
+        {
+            return true;
+        }
+        self.invalidate();
+        false
+    }
+
+    fn keep_header(&mut self, entry: &EvictedHeader, from_op: Option<u64>) {
+        let op = entry.header.op;
+        if from_op.is_none_or(|from_op| op < from_op) || self.headers.contains_key(&op) {
+            return;
+        }
+        if let Some(body) = self.bodies.remove(&op)
+            && let Some(memory) = &mut self.memory
+        {
+            memory.release(Self::body_memory_bytes(&body));
+        }
+        if self.reserve(std::mem::size_of::<(u64, EvictedHeader)>()) {
+            self.headers.insert(op, *entry);
+        }
+    }
+
+    fn keep_body(&mut self, op: u64, entry: RingEntry, from_op: Option<u64>) {
+        if from_op.is_none_or(|from_op| op < from_op)
+            || self.bodies.contains_key(&op)
+            || self.headers.contains_key(&op)
+        {
+            return;
+        }
+        if let Some(header) = entry.evicted_header() {
+            self.keep_header(&header, from_op);
+        } else if self.reserve(Self::body_memory_bytes(&entry.prepare)) {
+            self.bodies.insert(op, entry.prepare);
+        }
+    }
+
+    fn body_memory_bytes(body: &JournalBuffer) -> usize {
+        JournalBuffer::allocation_size(body.backing_capacity())
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<(u64, JournalBuffer)>()))
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl RingEntry {
+    /// Heap this entry pins while the ring holds its body: the padded backing
+    /// allocation, which a slice keeps whole, and the map entry. A lower
+    /// bound, because the map allocates more than its entries.
+    fn memory_bytes(&self) -> usize {
+        let capacity = self.prepare.backing_capacity();
+        // A live allocation always has a layout.
+        JournalBuffer::allocation_size(capacity).unwrap_or(capacity) + size_of::<(u64, Self)>()
+    }
+
+    /// What the ring keeps of this entry once its body leaves memory. `None`
+    /// when no segment holds the body.
+    fn evicted_header(&self) -> Option<EvictedHeader> {
+        let body = self.body?;
+        let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(
+            self.prepare.as_slice().get(..PREPARE_HEADER_SIZE)?,
+        )
+        .ok()?;
+        if header.operation != Operation::SendMessages {
+            return None;
+        }
+        let batch = decode_prepare_batch_trusted(self.prepare.as_slice()).ok()?;
+        Some(EvictedHeader {
+            header,
+            body,
+            batch_checksum: batch.body_checksum,
+        })
+    }
+}
+
+/// Running totals of the bodies the evicted ring holds in memory.
+#[derive(Clone, Copy, Default)]
+struct RingBytes {
+    /// Prepare lengths, the unit of the per-partition byte cap.
+    logical: u64,
+    /// Heap the prepares pin, the unit of the shard's ring budget.
+    allocated: usize,
+}
+
+impl RingBytes {
+    fn add(&mut self, entry: &RingEntry) {
+        self.logical += entry.prepare.len() as u64;
+        self.allocated += entry.memory_bytes();
+    }
+
+    fn remove(&mut self, entry: &RingEntry) {
+        self.logical -= entry.prepare.len() as u64;
+        self.allocated -= entry.memory_bytes();
+    }
+}
+
+/// What a ring charges to the shard's repair ring budget: the heap of its
+/// bodies in memory plus `header_slots` [`EvictedHeader`] slots. A lower
+/// bound of the heap the ring holds, as [`RingEntry::memory_bytes`] is.
+const fn charged_bytes(bytes: RingBytes, header_slots: usize) -> usize {
+    bytes.allocated + header_slots * size_of::<EvictedHeader>()
+}
+
+/// Returns the unused slots of a header deque that lost three quarters of
+/// its entries. A deque keeps its capacity when entries leave, so without
+/// this a ring that shed its headers still holds their heap. Keeps room to
+/// double, so a ring that takes and loses headers in turn does not
+/// reallocate on every change.
+fn shrink_headers(headers: &mut VecDeque<EvictedHeader>) {
+    if headers.len() <= headers.capacity() / 4 {
+        headers.shrink_to(headers.len() * 2);
+    }
+}
+
+/// Where the shard's shed stops in a ring: the lowest op that a snapshot
+/// lease or a pinned transfer plan still needs in memory.
+fn pinned_floor(lease_from: Option<u64>, plan_from: Option<u64>) -> Option<u64> {
+    lease_from.into_iter().chain(plan_from).min()
+}
+
+/// Drops the oldest entry of either tier of the evicted ring, so the ops it
+/// keeps stay one run.
+fn drop_oldest_evicted(
+    ring: &mut BTreeMap<u64, RingEntry>,
+    headers: &mut VecDeque<EvictedHeader>,
+    bytes: &mut RingBytes,
+    retained: &mut RepairTail,
+    from_op: Option<u64>,
+) {
+    let oldest_held = ring.first_key_value().map(|(op, _)| *op);
+    match headers.front() {
+        Some(evicted) if oldest_held.is_none_or(|held| evicted.header.op < held) => {
+            if let Some(entry) = headers.pop_front() {
+                retained.keep_header(&entry, from_op);
+            }
+        }
+        _ => {
+            if let Some((op, dropped)) = ring.pop_first() {
+                bytes.remove(&dropped);
+                retained.keep_body(op, dropped, from_op);
+            }
+        }
+    }
+}
+
+/// Whether the shard's shed can drop the oldest entry of the evicted ring:
+/// the ring holds more than its newest entry, and the oldest one is below
+/// `pinned_from`.
+fn is_droppable(
+    ring: &BTreeMap<u64, RingEntry>,
+    headers: &VecDeque<EvictedHeader>,
+    pinned_from: Option<u64>,
+) -> bool {
+    let oldest = ring
+        .first_key_value()
+        .map(|(op, _)| *op)
+        .into_iter()
+        .chain(headers.front().map(|evicted| evicted.header.op))
+        .min();
+    ring.len() + headers.len() > 1
+        && oldest.is_some_and(|op| pinned_from.is_none_or(|from| op < from))
+}
+
+/// What one visit of the shard's shed took from a ring.
+#[derive(Debug, Clone, Copy)]
+pub struct RingShed {
+    /// Entries whose body went back to its segment.
+    pub released: usize,
+    /// Entries the ring no longer holds. A release drops the oldest entries
+    /// too, once the ring holds [`EVICTED_HEADERS_MAX`] headers.
+    pub dropped: usize,
+    /// Whether the ring holds more for the same kind of visit. When it does,
+    /// the visit took the bytes it was asked for.
+    pub left: bool,
 }
 
 /// Lookup key for querying messages from the journal.
@@ -105,7 +678,7 @@ pub struct SelectedBatchSlice {
 ///
 /// # Warning — development storage only
 ///
-/// This storage backs the `Journal` trait with a plain `Vec<JournalBuffer>`
+/// This storage backs the `Journal` trait with a plain `VecDeque<JournalBuffer>`
 /// inside an `UnsafeCell`. Writes never hit disk, nothing is `fsync`ed, and
 /// every entry is lost on process exit.
 ///
@@ -126,11 +699,40 @@ pub struct SelectedBatchSlice {
 /// production cluster traffic.
 #[derive(Debug, Default)]
 pub struct PartitionJournalMemStorage {
-    entries: UnsafeCell<Vec<JournalBuffer>>,
-    /// Maps byte offset (as if disk-backed) to index in entries Vec
-    offset_to_index: UnsafeCell<HashMap<usize, usize>>,
-    /// Current write position (cumulative byte offset)
-    current_offset: UnsafeCell<usize>,
+    entries: UnsafeCell<VecDeque<JournalBuffer>>,
+    /// Offset of `entries[0]`. An offset counts the entries written since the
+    /// last drain, so popping the front leaves every other offset valid.
+    front_offset: Cell<usize>,
+    /// What the entries charge to the shard's journal budget, the sum of
+    /// [`resident_memory_bytes`].
+    charged: Cell<usize>,
+}
+
+/// Heap one resident entry takes besides its buffer: its slot in the storage
+/// deque, its header, and its keys in the op, offset, timestamp and
+/// first-header indexes.
+const RESIDENT_ENTRY_INDEX_BYTES: usize = size_of::<JournalBuffer>()
+    + size_of::<PrepareHeader>()
+    + size_of::<(u64, usize)>()
+    + size_of::<(u64, u64)>()
+    + size_of::<((u64, u64), u64)>()
+    + size_of::<(u64, usize)>();
+
+/// What a resident entry adds to the relief: its charge for a message
+/// batch, nothing for a control op, which no flush frees.
+fn message_charge(entry: &JournalBuffer) -> usize {
+    if operation_of(entry) == Some(Operation::SendMessages) {
+        resident_memory_bytes(entry)
+    } else {
+        0
+    }
+}
+
+/// What one resident entry charges to the shard's journal budget.
+fn resident_memory_bytes(entry: &JournalBuffer) -> usize {
+    let capacity = entry.backing_capacity();
+    // A live allocation always has a layout.
+    JournalBuffer::allocation_size(capacity).unwrap_or(capacity) + RESIDENT_ENTRY_INDEX_BYTES
 }
 
 impl Storage for PartitionJournalMemStorage {
@@ -141,15 +743,8 @@ impl Storage for PartitionJournalMemStorage {
     }
 
     async fn read_at(&self, offset: usize, _buffer: Self::Buffer) -> io::Result<Self::Buffer> {
-        let offset_to_index = unsafe { &*self.offset_to_index.get() };
-        let Some(&index) = offset_to_index.get(&offset) else {
-            return Ok(Owned::<4096>::zeroed(0).into());
-        };
-
-        let entries = unsafe { &*self.entries.get() };
-        Ok(entries
-            .get(index)
-            .cloned()
+        Ok(self
+            .read_at_sync(offset)
             .unwrap_or_else(|| Owned::<4096>::zeroed(0).into()))
     }
 }
@@ -167,29 +762,48 @@ where
     /// Keeping `op` in the key preserves duplicate timestamps while still
     /// letting us seek to the closest batch for timestamp-based polling.
     timestamp_to_op: UnsafeCell<BTreeMap<(u64, u64), u64>>,
-    headers: UnsafeCell<Vec<PrepareHeader>>,
+    headers: UnsafeCell<VecDeque<PrepareHeader>>,
+    /// Position of `headers[0]`, counted from the last clear, so the positions
+    /// in `first_header_by_op` stay valid when the front leaves.
+    front_position: Cell<usize>,
     /// Commit validation uses the first resident occurrence, including duplicates.
     first_header_by_op: RefCell<AHashMap<u64, usize>>,
+    /// Messages in the resident `SendMessages` batches.
+    resident_messages: Cell<u64>,
+    /// Segment bytes of the resident `SendMessages` batches.
+    resident_message_size: Cell<u64>,
     inner: UnsafeCell<JournalInner<S>>,
     /// Ring of recently evicted committed entries, keyed by op, retained so
     /// this replica can serve journal repair for rejoin windows after the
-    /// entries left the resident journal at flush. Bounded by
+    /// entries left the resident journal at flush. Bodies past the byte cap
+    /// move to `evicted_headers` when a segment holds them. Bounded by
     /// [`EVICTED_RING_CAPACITY`]; requests older than the ring answer
     /// `RangeEvicted` honestly.
-    evicted_ring: UnsafeCell<BTreeMap<u64, JournalBuffer>>,
-    /// Running byte total of the buffers held by `evicted_ring`.
-    evicted_ring_bytes: Cell<u64>,
+    evicted_ring: UnsafeCell<BTreeMap<u64, RingEntry>>,
+    /// Running byte totals of the prepares held by `evicted_ring`.
+    evicted_ring_bytes: Cell<RingBytes>,
+    /// The ring's entries whose bodies the byte cap released to their
+    /// segments, in op order. At most [`EVICTED_HEADERS_MAX`].
+    evicted_headers: UnsafeCell<VecDeque<EvictedHeader>>,
+    repair_tail: Rc<RefCell<RepairTail>>,
+    /// Highest op the byte cap released or passed over, so it looks at each
+    /// entry once. An entry that lands below it later keeps its body until
+    /// the oldest entries go.
+    released_through: Cell<u64>,
     /// Entry-count ceiling for `evicted_ring`. Defaults to
-    /// [`EVICTED_RING_CAPACITY`]; the server overrides it from config at
+    /// [`EVICTED_RING_CAPACITY`], and the server overrides it from config at
     /// partition build.
     evicted_ring_capacity: Cell<usize>,
     /// Byte ceiling for `evicted_ring`. Defaults to
-    /// [`EVICTED_RING_BYTES_MAX`]; the server overrides it from config at
+    /// [`EVICTED_RING_BYTES_MAX`], and the server overrides it from config at
     /// partition build.
     evicted_ring_bytes_max: Cell<u64>,
     /// Single-replica groups have nobody to repair; retaining evicted
     /// entries for them is pure memory waste.
     repair_retention: Cell<bool>,
+    /// This ring's share of the shard's repair ring budget, once the shard
+    /// holds the partition. `repair_tail` holds it too.
+    ring_charge: RefCell<Option<Rc<RingCharge>>>,
     /// Resident entries that are not `SendMessages` (consumer offset stores
     /// and deletes). They carry no segment bytes, so the message-count and
     /// byte flush thresholds never see them, yet the flush is the only
@@ -200,6 +814,13 @@ where
     /// Highest op an eviction removed. With the commit point it bounds where
     /// the next flush prefix may start.
     evicted_through: Cell<u64>,
+    /// Highest op the partition applied, as [`Self::mark_committed`] heard.
+    relief_through: Cell<u64>,
+    /// The resident charge of the `SendMessages` entries at or below
+    /// `relief_through` that the op index names. A flush through the commit
+    /// point frees it. A copy that a later append of its op replaced counts
+    /// no more, and only a rebuild drops such a copy.
+    relief: Cell<usize>,
     /// A resident op follows a higher one, so the next op to flush can sit
     /// behind the front. Flushes wait for `sort_by_op`.
     out_of_order: Cell<bool>,
@@ -207,42 +828,45 @@ where
     /// ticks resume the walk from here instead of rescanning the held prefix, and
     /// any removal resets it.
     held_run: Cell<(u64, u64)>,
+    /// The ops of the group's state-machine log. They share the op sequence
+    /// with the entries above but never become one: polls, flushes and the
+    /// repair ring see message batches and control ops only, while every
+    /// lookup by op answers from both.
+    commands: RefCell<StateMachineLog>,
 }
 
-/// How many evicted entries each partition retains for repair. Sized to
-/// cover a few seconds of traffic around a node restart; anything older is
-/// bulk-sync (phase 3) territory.
+/// How many evicted entries each partition retains for repair with their
+/// bodies in memory. The entries whose bodies went back to their segments
+/// have their own cap, `EVICTED_HEADERS_MAX`.
 pub const EVICTED_RING_CAPACITY: usize = 65536;
 
-/// Byte ceiling for the evicted ring. Every retained entry pins a full
-/// batch, so an entry cap alone can consume too much memory across many
-/// partitions. Whichever cap trips first evicts.
+/// Byte ceiling for the bodies the evicted ring holds in memory.
+///
+/// An entry that holds its body pins a full batch, so an entry cap alone can
+/// consume too much memory across many partitions. Past this cap the oldest
+/// bodies that a segment still holds leave memory, and the oldest entries go
+/// when none can leave. The headers of released bodies do not count here.
 pub const EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
+
+/// How many entries whose bodies went back to their segments each partition
+/// keeps for repair. Each one takes 288 bytes, so the cap holds 4.5 MiB per
+/// partition, under 8% of the body window that [`EVICTED_RING_BYTES_MAX`] sets.
+///
+/// The cap sets how far a backup can fall behind and still catch up by
+/// repair: 128 repair rounds at the default chunk of 128 ops. Past it, the
+/// backup gets `RangeEvicted` for the older ops and catches up by state
+/// transfer, which reuses the sealed segments that the backup holds.
+/// A power of two, so the deque that holds the headers, which makes room
+/// before each push, never allocates past it.
+pub const EVICTED_HEADERS_MAX: usize = 16384;
+const _: () = assert!(EVICTED_HEADERS_MAX.is_power_of_two());
 
 impl<S> Default for PartitionJournal<S>
 where
     S: Storage<Buffer = JournalBuffer> + Default,
 {
     fn default() -> Self {
-        Self {
-            op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
-            offset_to_op: UnsafeCell::new(BTreeMap::new()),
-            timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
-            headers: UnsafeCell::new(Vec::new()),
-            first_header_by_op: RefCell::new(AHashMap::new()),
-            inner: UnsafeCell::new(JournalInner {
-                storage: S::default(),
-            }),
-            evicted_ring: UnsafeCell::new(BTreeMap::new()),
-            evicted_ring_bytes: Cell::new(0),
-            evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
-            evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
-            repair_retention: Cell::new(true),
-            resident_control_ops: Cell::new(0),
-            evicted_through: Cell::new(0),
-            out_of_order: Cell::new(false),
-            held_run: Cell::new((0, 0)),
-        }
+        Self::with_storage(S::default())
     }
 }
 
@@ -264,30 +888,41 @@ where
 
 impl PartitionJournalMemStorage {
     /// Synchronous mirror of [`Storage::read_at`] for the poll path. Mem
-    /// storage never hits the reactor (it copies from an in-memory `Vec`), so
-    /// the read can run under a partition borrow without crossing an `.await`
-    /// - the property that keeps poll-read sound.
+    /// storage never hits the reactor (it copies from an in-memory `VecDeque`),
+    /// so the read can run under a partition borrow without crossing an
+    /// `.await` - the property that keeps poll-read sound.
     fn read_at_sync(&self, offset: usize) -> Option<JournalBuffer> {
-        let offset_to_index = unsafe { &*self.offset_to_index.get() };
-        let index = *offset_to_index.get(&offset)?;
         let entries = unsafe { &*self.entries.get() };
-        entries.get(index).cloned()
+        entries
+            .get(offset.checked_sub(self.front_offset.get())?)
+            .cloned()
     }
 
     fn entries(&self) -> Vec<JournalBuffer> {
         let entries = unsafe { &*self.entries.get() };
-        entries.clone()
+        entries.iter().cloned().collect()
     }
 
     fn drain(&self) -> Vec<JournalBuffer> {
         let entries = unsafe { &mut *self.entries.get() };
-        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
-        let current_offset = unsafe { &mut *self.current_offset.get() };
+        debug_assert_eq!(
+            entries.iter().map(resident_memory_bytes).sum::<usize>(),
+            self.charged.get(),
+            "the resident charge drifted from the resident entries"
+        );
+        self.front_offset.set(0);
+        self.charged.set(0);
+        std::mem::take(entries).into()
+    }
 
-        offset_to_index.clear();
-        *current_offset = 0;
-
-        std::mem::take(entries)
+    /// Removes the front entry and keeps the offsets of the others.
+    fn pop_front(&self) -> Option<JournalBuffer> {
+        let entries = unsafe { &mut *self.entries.get() };
+        let entry = entries.pop_front()?;
+        self.front_offset.set(self.front_offset.get() + 1);
+        self.charged
+            .set(self.charged.get() - resident_memory_bytes(&entry));
+        Some(entry)
     }
 
     fn is_empty(&self) -> bool {
@@ -296,21 +931,16 @@ impl PartitionJournalMemStorage {
     }
 
     fn current_offset(&self) -> usize {
-        let current_offset = unsafe { &*self.current_offset.get() };
-        *current_offset
+        let entries = unsafe { &*self.entries.get() };
+        self.front_offset.get() + entries.len()
     }
 
     fn write_at_sync(&self, buf: JournalBuffer) -> usize {
         let len = buf.len();
+        self.charged
+            .set(self.charged.get() + resident_memory_bytes(&buf));
         let entries = unsafe { &mut *self.entries.get() };
-        let offset_to_index = unsafe { &mut *self.offset_to_index.get() };
-        let current_offset = unsafe { &mut *self.current_offset.get() };
-
-        let index = entries.len();
-        offset_to_index.insert(*current_offset, index);
-        entries.push(buf);
-        *current_offset += len;
-
+        entries.push_back(buf);
         len
     }
 }
@@ -333,18 +963,49 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             let _ = inner.storage.drain();
         }
         self.clear_resident_indexes();
-        unsafe { &mut *self.evicted_ring.get() }.clear();
-        self.evicted_ring_bytes.set(0);
+        self.clear_evicted();
         self.evicted_through.set(0);
+        self.relief_through.set(0);
+        self.commands.borrow_mut().clear();
+        self.sync_ring_charge(false);
     }
 
     /// Disable repair retention (single-replica groups: nobody to repair).
     pub fn set_repair_retention(&self, enabled: bool) {
         self.repair_retention.set(enabled);
         if !enabled {
-            let ring = unsafe { &mut *self.evicted_ring.get() };
-            ring.clear();
-            self.evicted_ring_bytes.set(0);
+            self.clear_evicted();
+        }
+    }
+
+    fn clear_evicted(&self) {
+        self.repair_tail.borrow_mut().invalidate();
+        unsafe { &mut *self.evicted_ring.get() }.clear();
+        // `clear` keeps the capacity.
+        *unsafe { &mut *self.evicted_headers.get() } = VecDeque::new();
+        self.evicted_ring_bytes.set(RingBytes::default());
+        self.released_through.set(0);
+        self.sync_ring_charge(false);
+    }
+
+    pub(crate) fn retain_repair_from(
+        &self,
+        from_op: u64,
+        memory: RepairMemoryReservation,
+    ) -> RepairTailLease {
+        let state = Rc::new(RepairTailState {
+            from_op: Cell::new(from_op),
+            valid: Cell::new(true),
+        });
+        let mut retained = self.repair_tail.borrow_mut();
+        retained.prune();
+        if retained.memory.is_none() {
+            retained.memory = Some(memory);
+        }
+        retained.leases.push(Rc::downgrade(&state));
+        RepairTailLease {
+            state,
+            retained: Rc::downgrade(&self.repair_tail),
         }
     }
 
@@ -357,13 +1018,99 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         self.evicted_ring_bytes_max.set(bytes_max);
     }
 
-    /// Entries and payload bytes the repair ring retains, for the shard sweep.
+    /// Charges this ring to the shard's `budget` from now on, so the shard
+    /// can shed it. Replaces an earlier charge, which returns its bytes.
+    pub(crate) fn attach_ring_budget(
+        &self,
+        budget: Rc<RepairRingBudget>,
+        namespace: IggyNamespace,
+    ) {
+        let charge = Rc::new(RingCharge::new(budget, namespace));
+        self.repair_tail.borrow_mut().ring_charge = Some(Rc::clone(&charge));
+        *self.ring_charge.borrow_mut() = Some(charge);
+        self.sync_ring_charge(self.ring_entries() > 1);
+    }
+
+    /// Queues the ring for the shard's shed after a pin on its entries ended.
+    pub(crate) fn queue_ring_shed(&self) {
+        if let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.queue_grown();
+        }
+    }
+
+    /// Whether this ring still carries the charge that `ticket` names.
+    pub(crate) fn charged_by(&self, ticket: RingTicket) -> bool {
+        self.ring_charge
+            .borrow()
+            .as_ref()
+            .is_some_and(|charge| charge.ticket() == ticket)
+    }
+
+    /// Brings the charge in line with the ring after a change. `grew` queues
+    /// a ring that holds more than its newest entry for the shard.
+    fn sync_ring_charge(&self, grew: bool) {
+        if let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.update(self.journal_bytes(), self.ring_floor_bytes(), grew);
+        }
+    }
+
+    fn journal_bytes(&self) -> JournalBytes {
+        let inner = unsafe { &*self.inner.get() };
+        JournalBytes {
+            ring: self.ring_charged_bytes(),
+            resident: inner.storage.charged.get(),
+            commands: usize::try_from(self.commands.borrow().bytes()).unwrap_or(usize::MAX),
+            relief: self.relief.get(),
+        }
+    }
+
+    fn ring_charged_bytes(&self) -> usize {
+        let headers = unsafe { &*self.evicted_headers.get() };
+        charged_bytes(self.evicted_ring_bytes.get(), headers.capacity())
+    }
+
+    /// The part of the charge that no shed takes: the newest ring entry, and
+    /// the command at the commit point.
+    fn ring_floor_bytes(&self) -> usize {
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let newest = ring
+            .last_key_value()
+            .map_or(0, |(_, entry)| entry.memory_bytes());
+        let command = self.commands.borrow().bytes_at(self.relief_through.get());
+        newest.saturating_add(usize::try_from(command).unwrap_or(usize::MAX))
+    }
+
+    /// A change to the journal that skips [`Self::sync_ring_charge`] leaves
+    /// the budget charged for bytes no journal holds, and the shard then sheds
+    /// other journals for them on every tick.
+    fn debug_assert_ring_charge(&self) {
+        debug_assert!(
+            self.ring_charge.borrow().as_ref().is_none_or(|charge| {
+                charge.charged() == (self.journal_bytes(), self.ring_floor_bytes())
+            }),
+            "the journal changed without a charge sync"
+        );
+    }
+
+    /// Entries the repair ring retains and the bytes they pin, for the shard
+    /// sweep: the prepare of each entry held in memory, and an
+    /// [`EvictedHeader`] for each entry whose body went back to its segment.
     ///
     /// Excludes unused allocation capacity, alignment and index overhead.
     /// The newest entry is retained even when it exceeds the byte budget.
     pub fn evicted_ring_occupancy(&self) -> (usize, u64) {
         let ring = unsafe { &*self.evicted_ring.get() };
-        (ring.len(), self.evicted_ring_bytes.get())
+        let headers = unsafe { &*self.evicted_headers.get() };
+        let retained = self.repair_tail.borrow();
+        (
+            ring.len() + headers.len() + retained.bodies.len() + retained.headers.len(),
+            self.evicted_ring_bytes.get().logical
+                + headers.len() as u64 * EVICTED_HEADER_BYTES
+                + retained
+                    .memory
+                    .as_ref()
+                    .map_or(0, |memory| memory.bytes() as u64),
+        )
     }
 
     /// Committed entries already flushed out of the resident journal cannot be
@@ -385,12 +1132,134 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         self.resident_control_ops.get()
     }
 
+    /// Messages in the resident `SendMessages` batches, which the partition's
+    /// message-count flush threshold reads.
+    pub const fn resident_messages(&self) -> u64 {
+        self.resident_messages.get()
+    }
+
+    /// Segment bytes of the resident `SendMessages` batches, which the
+    /// partition's size flush threshold reads.
+    pub const fn resident_message_size(&self) -> u64 {
+        self.resident_message_size.get()
+    }
+
     /// Restore the materialized commit point for elections and body repair.
-    pub fn restore_checkpoint_prepare(&self, op: u64, prepare: JournalBuffer) {
+    /// `body` names the segment record of a message prepare that the WAL
+    /// wrote there. With it, the entry can release its body once it is no
+    /// longer the newest.
+    pub fn restore_checkpoint_prepare(
+        &self,
+        op: u64,
+        prepare: JournalBuffer,
+        body: Option<BodyPosition>,
+    ) {
+        self.mark_committed(op);
+        if is_command(&prepare) {
+            {
+                let mut commands = self.commands.borrow_mut();
+                commands.set_retained_from(op);
+                commands.insert(op, prepare);
+            }
+            self.sync_ring_charge(false);
+            return;
+        }
         let ring = unsafe { &mut *self.evicted_ring.get() };
-        debug_assert!(ring.is_empty());
-        self.evicted_ring_bytes.set(prepare.len() as u64);
-        ring.insert(op, prepare);
+        debug_assert!(ring.is_empty() && unsafe { &*self.evicted_headers.get() }.is_empty());
+        let entry = RingEntry { prepare, body };
+        let mut bytes = RingBytes::default();
+        bytes.add(&entry);
+        self.evicted_ring_bytes.set(bytes);
+        ring.insert(op, entry);
+        self.sync_ring_charge(false);
+    }
+
+    /// Release the oldest commands at or below `checkpoint_op` past the
+    /// retention caps. Released only once checkpointed, they lift the repair
+    /// floor no higher than ops both WALs already dropped.
+    ///
+    /// Returns whether the held commands are still past a cap, so the caller
+    /// asks for the checkpoint that lets more go.
+    pub fn release_checkpointed_commands(&self, checkpoint_op: u64) -> bool {
+        let mut commands = self.commands.borrow_mut();
+        let before = commands.len();
+        // Without repair retention nothing serves a released command, so every
+        // checkpointed one goes, as the evicted data entries do.
+        if !self.repair_retention.get() {
+            commands.release_checkpointed(checkpoint_op, 0, 0);
+        }
+        let over = commands.release_checkpointed(
+            checkpoint_op,
+            COMMANDS_RETAINED_MAX,
+            COMMANDS_RETAINED_BYTES_MAX,
+        );
+        if commands.len() != before {
+            self.held_run.set((0, 0));
+        }
+        drop(commands);
+        self.sync_ring_charge(false);
+        over
+    }
+
+    /// The partition applied every op through `op`. Its resident messages
+    /// from the last mark on join the relief, one index lookup for each, and
+    /// a command at `op` takes the floor from one at the last mark.
+    pub(crate) fn mark_committed(&self, op: u64) {
+        let from = self.relief_through.get();
+        if op <= from {
+            return;
+        }
+        self.relief_through.set(op);
+        let added = self.relief_in(from + 1..=op);
+        self.relief.set(self.relief.get() + added);
+        if added > 0 || self.commands_in(from..=op) > 0 {
+            self.sync_ring_charge(false);
+        }
+    }
+
+    /// Releases the oldest commands at or below `checkpoint_op` until the
+    /// held ones charge `excess` less, whatever the retention caps. Returns
+    /// how many went.
+    pub(crate) fn release_commands_for(&self, checkpoint_op: u64, excess: usize) -> usize {
+        let mut commands = self.commands.borrow_mut();
+        let before = commands.len();
+        let bytes_max = commands
+            .bytes()
+            .saturating_sub(u64::try_from(excess).unwrap_or(u64::MAX));
+        commands.release_checkpointed(checkpoint_op, usize::MAX, bytes_max);
+        let released = before - commands.len();
+        drop(commands);
+        if released > 0 {
+            self.held_run.set((0, 0));
+            self.sync_ring_charge(false);
+        }
+        released
+    }
+
+    /// This journal's share of the shard budget, once the shard holds it.
+    pub(crate) fn ring_charge(&self) -> Option<Rc<RingCharge>> {
+        self.ring_charge.borrow().clone()
+    }
+
+    /// What the resident messages in `ops` that the op index names charge.
+    fn relief_in(&self, ops: impl RangeBounds<u64>) -> usize {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let inner = unsafe { &*self.inner.get() };
+        op_to_storage_offset
+            .range(ops)
+            .filter_map(|(_, offset)| inner.storage.read_at_sync(*offset))
+            .map(|entry| message_charge(&entry))
+            .sum()
+    }
+
+    /// Recomputes the relief that the counter tracks. Every append, pop and
+    /// mark keeps the counter, so a path that skips it shows here.
+    fn debug_assert_relief(&self) {
+        debug_assert_eq!(
+            self.relief_in(..=self.relief_through.get()),
+            self.relief.get(),
+            "the relief drifted from the committed resident messages"
+        );
     }
 
     /// Entry bytes for `op`, from the resident journal or the evicted ring.
@@ -405,7 +1274,10 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        ring.get(&op).cloned()
+        ring.get(&op)
+            .map(|entry| entry.prepare.clone())
+            .or_else(|| self.repair_tail.borrow().bodies.get(&op).cloned())
+            .or_else(|| self.commands.borrow().get(op))
     }
 
     /// The lowest resident `SendMessages` op in `ops` with its entry bytes, in
@@ -460,8 +1332,12 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             return Some(header);
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        let entry = ring.get(&op)?;
-        let header_bytes = entry.as_slice().get(..PREPARE_HEADER_SIZE)?;
+        let retained = self.repair_tail.borrow();
+        let prepare = ring
+            .get(&op)
+            .map(|entry| &entry.prepare)
+            .or_else(|| retained.bodies.get(&op))?;
+        let header_bytes = prepare.as_slice().get(..PREPARE_HEADER_SIZE)?;
         bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .ok()
             .copied()
@@ -486,30 +1362,180 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             }
         }
         let ring = unsafe { &*self.evicted_ring.get() };
-        for (op, entry) in ring.range(ops) {
+        for (op, entry) in ring.range(ops.clone()) {
             if found.contains_key(op) {
                 continue;
             }
-            let Some(header_bytes) = entry.as_slice().get(..PREPARE_HEADER_SIZE) else {
+            let Some(header_bytes) = entry.prepare.as_slice().get(..PREPARE_HEADER_SIZE) else {
                 continue;
             };
             if let Ok(header) = bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes) {
                 found.insert(*op, *header);
             }
         }
+        for (op, entry) in self.repair_tail.borrow().bodies.range(ops.clone()) {
+            if found.contains_key(op) {
+                continue;
+            }
+            let Some(bytes) = entry.as_slice().get(..PREPARE_HEADER_SIZE) else {
+                continue;
+            };
+            if let Ok(header) = bytemuck::checked::try_from_bytes::<PrepareHeader>(bytes) {
+                found.insert(*op, *header);
+            }
+        }
+        for (op, header) in self.commands.borrow().headers(ops) {
+            found.entry(op).or_insert(header);
+        }
         found
     }
 
     /// Oldest op this journal can still serve for repair, including resident
-    /// backfills older than the retained repair range.
+    /// backfills older than the retained repair range and bodies read back
+    /// from segments.
     pub fn repair_retained_from(&self) -> Option<u64> {
+        self.with_command_floor(self.data_repair_retained_from())
+    }
+
+    fn data_repair_retained_from(&self) -> Option<u64> {
+        let headers = unsafe { &*self.evicted_headers.get() };
+        self.oldest_in_memory()
+            .into_iter()
+            .chain(headers.front().map(|evicted| evicted.header.op))
+            .chain(
+                self.repair_tail
+                    .borrow()
+                    .headers
+                    .first_key_value()
+                    .map(|(op, _)| *op),
+            )
+            .min()
+    }
+
+    /// Oldest op from which this journal holds every body up to its head in
+    /// memory, so repair serves that tail without a disk read.
+    pub fn memory_retained_from(&self) -> Option<u64> {
+        self.with_command_floor(self.data_memory_retained_from())
+    }
+
+    /// A floor the data entries set, raised to where the state-machine log
+    /// still holds every command, so a window from it has no released command
+    /// in it. Without data entries the oldest held command is the floor.
+    fn with_command_floor(&self, data_floor: Option<u64>) -> Option<u64> {
+        let commands = self.commands.borrow();
+        let retained_from = commands.retained_from();
+        data_floor.map_or_else(
+            || commands.ops(retained_from..).next(),
+            |floor| Some(floor.max(retained_from)),
+        )
+    }
+
+    fn data_memory_retained_from(&self) -> Option<u64> {
+        let headers = unsafe { &*self.evicted_headers.get() };
+        let oldest = self.oldest_in_memory()?;
+        let newest_released = headers
+            .back()
+            .map(|entry| entry.header.op)
+            .into_iter()
+            .chain(
+                self.repair_tail
+                    .borrow()
+                    .headers
+                    .last_key_value()
+                    .map(|(op, _)| *op),
+            )
+            .max();
+        Some(newest_released.map_or(oldest, |op| oldest.max(op.saturating_add(1))))
+    }
+
+    fn oldest_in_memory(&self) -> Option<u64> {
         let ring = unsafe { &*self.evicted_ring.get() };
         let resident = unsafe { &*self.op_to_storage_offset.get() };
         ring.first_key_value()
             .map(|(op, _)| *op)
             .into_iter()
             .chain(resident.first_key_value().map(|(op, _)| *op))
+            .chain(
+                self.repair_tail
+                    .borrow()
+                    .bodies
+                    .first_key_value()
+                    .map(|(op, _)| *op),
+            )
             .min()
+    }
+
+    /// The header the evicted ring keeps for `op` after the byte cap released
+    /// its body to a segment. [`Self::repair_entry`] and
+    /// [`Self::repair_header`] do not serve such an op: its body must be read
+    /// back with a [`ReleasedRead`].
+    #[must_use]
+    pub fn evicted_header(&self, op: u64) -> Option<EvictedHeader> {
+        let headers = unsafe { &*self.evicted_headers.get() };
+        headers
+            .binary_search_by_key(&op, |evicted| evicted.header.op)
+            .ok()
+            .and_then(|index| headers.get(index).copied())
+            .or_else(|| self.repair_tail.borrow().headers.get(&op).copied())
+    }
+
+    /// Forgets the released entries whose bodies lie in segments up to the
+    /// one at `start_offset`, once retention deletes it, so repair answers
+    /// `RangeEvicted` for them.
+    pub fn forget_segment(&self, start_offset: u64) {
+        if self
+            .repair_tail
+            .borrow()
+            .headers
+            .values()
+            .any(|entry| entry.body.segment_start <= start_offset)
+        {
+            self.repair_tail.borrow_mut().invalidate();
+        }
+        let headers = unsafe { &*self.evicted_headers.get() };
+        let through = headers
+            .iter()
+            .take_while(|evicted| evicted.body.segment_start <= start_offset)
+            .last()
+            .map(|evicted| evicted.header.op);
+        if let Some(through) = through {
+            self.forget_released_through(through);
+        }
+    }
+
+    /// Forgets every evicted entry at or below the released entry at `op`,
+    /// so repair answers `RangeEvicted` for them. A released entry is never
+    /// the newest one, so the commit point stays.
+    pub fn forget_released_through(&self, op: u64) {
+        let retained_affected = {
+            let retained = self.repair_tail.borrow();
+            retained
+                .headers
+                .first_key_value()
+                .is_some_and(|(first, _)| *first <= op)
+                || retained
+                    .bodies
+                    .first_key_value()
+                    .is_some_and(|(first, _)| *first <= op)
+        };
+        if retained_affected {
+            self.repair_tail.borrow_mut().invalidate();
+        }
+        let ring = unsafe { &mut *self.evicted_ring.get() };
+        let headers = unsafe { &mut *self.evicted_headers.get() };
+        let mut bytes = self.evicted_ring_bytes.get();
+        while let Some(entry) = ring.first_entry().filter(|entry| *entry.key() <= op) {
+            bytes.remove(&entry.remove());
+        }
+        while headers
+            .front()
+            .is_some_and(|evicted| evicted.header.op <= op)
+        {
+            headers.pop_front();
+        }
+        shrink_headers(headers);
+        self.evicted_ring_bytes.set(bytes);
+        self.sync_ring_charge(false);
     }
 
     /// Synchronous resident-range poll read. Never awaits (mem storage reads
@@ -574,6 +1600,7 @@ impl PartitionJournal<PartitionJournalMemStorage> {
             inner.storage.drain()
         };
         self.clear_resident_indexes();
+        self.sync_ring_charge(false);
         entries
     }
 
@@ -589,8 +1616,8 @@ impl PartitionJournal<PartitionJournalMemStorage> {
     }
 
     /// Inspect resident allocations without pinning extra payload references.
-    /// The closure cannot retain the borrowed entry vector across owner mutations.
-    pub(crate) fn with_entries<R>(&self, inspect: impl FnOnce(&[JournalBuffer]) -> R) -> R {
+    /// The closure cannot retain the borrowed entry deque across owner mutations.
+    pub(crate) fn with_entries<R>(&self, inspect: impl FnOnce(&VecDeque<JournalBuffer>) -> R) -> R {
         let inner = unsafe { &*self.inner.get() };
         let entries = unsafe { &*inner.storage.entries.get() };
         inspect(entries)
@@ -611,9 +1638,16 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         headers
             .iter()
             .take_while(|header| {
-                let connected = previous.map_or(header.op <= first_max, |op| {
-                    op.checked_add(1) == Some(header.op)
-                });
+                // Commands between two entries hold no segment bytes, so the
+                // prefix steps over them.
+                let connected = previous.map_or_else(
+                    || header.op <= first_max || self.commands_fill(first_max, header.op),
+                    |op| {
+                        op.checked_add(1).is_some_and(|next| {
+                            header.op >= next && self.commands_fill(next, header.op)
+                        })
+                    },
+                );
                 if header.op > through || !connected {
                     return false;
                 }
@@ -647,127 +1681,368 @@ impl PartitionJournal<PartitionJournalMemStorage> {
         ordered.sort_by_key(|(op, _)| *op);
         self.clear_resident_indexes();
         for (_, entry) in ordered {
-            self.append_with_meta_sync(entry);
+            self.append_sync(entry);
         }
         true
     }
 
-    /// Remove the persisted prefix and return the retained entries with their batch metadata.
-    pub fn evict_prefix(&self, count: usize) -> Vec<(JournalBuffer, Option<RetainedBatchMeta>)> {
-        let all_entries = {
-            let inner = unsafe { &*self.inner.get() };
-            inner.storage.drain()
+    /// Remove the persisted prefix: the `count` front entries.
+    pub fn evict_prefix(&self, count: usize) {
+        self.evict_prefix_located(count, |_| None);
+    }
+
+    /// [`Self::evict_prefix`] for a journal whose bodies also sit in segments.
+    /// `locate` names where the body of an evicted op lies, so the evicted
+    /// ring can release that body from memory and still serve the op.
+    ///
+    /// Costs O(`count`), however many entries stay resident: a lagging backup
+    /// holds hundreds of thousands and evicts after every flush. Two rare
+    /// shapes rebuild the retained tail instead, because a popped entry would
+    /// leave a stale index behind: a journal out of op order, and a prefix op
+    /// that has another copy in the retained tail.
+    pub fn evict_prefix_located(&self, count: usize, locate: impl Fn(u64) -> Option<BodyPosition>) {
+        let evicted = if self.out_of_order.get() || self.retains_copy_of_prefix(count) {
+            self.rebuild_without_prefix(count)
+        } else {
+            self.pop_prefix(count)
         };
-        // Ops are positional against `headers` until the clear below; capture
-        // the evicted prefix's ops first so the ring stays op-addressable.
-        let evicted_ops: Vec<u64> = {
-            let headers = unsafe { &*self.headers.get() };
-            headers.iter().take(count).map(|header| header.op).collect()
-        };
-        if let Some(&highest) = evicted_ops.iter().max() {
+        let landed = !evicted.is_empty();
+        if let Some(highest) = evicted.iter().map(|(op, _)| *op).max() {
             self.evicted_through
                 .set(self.evicted_through.get().max(highest));
         }
-        self.clear_resident_indexes();
-
-        let mut all_entries = all_entries.into_iter();
-        if self.repair_retention.get() {
-            let ring = unsafe { &mut *self.evicted_ring.get() };
-            let mut ring_bytes = self.evicted_ring_bytes.get();
-            for op in evicted_ops {
-                let Some(entry) = all_entries.next() else {
-                    break;
-                };
-                ring_bytes += entry.len() as u64;
-                if let Some(previous) = ring.insert(op, entry) {
-                    ring_bytes -= previous.len() as u64;
-                }
-                while ring.len() > self.evicted_ring_capacity.get()
-                    || (ring_bytes > self.evicted_ring_bytes_max.get() && ring.len() > 1)
-                {
-                    if let Some((_, dropped)) = ring.pop_first() {
-                        ring_bytes -= dropped.len() as u64;
-                    }
-                }
-            }
-            self.evicted_ring_bytes.set(ring_bytes);
-        } else {
-            // Consume without retaining: the iterator itself must still
-            // advance past the evicted prefix so the retained tail below is
-            // aligned.
-            for _ in &evicted_ops {
-                if all_entries.next().is_none() {
-                    break;
-                }
+        if !self.repair_retention.get() {
+            self.sync_ring_charge(false);
+            self.relief_landed(landed);
+            return;
+        }
+        let ring = unsafe { &mut *self.evicted_ring.get() };
+        let mut ring_bytes = self.evicted_ring_bytes.get();
+        for (op, prepare) in evicted {
+            let entry = RingEntry {
+                prepare,
+                body: locate(op),
+            };
+            ring_bytes.add(&entry);
+            if let Some(previous) = ring.insert(op, entry) {
+                ring_bytes.remove(&previous);
             }
         }
-        let retained: Vec<JournalBuffer> = all_entries.collect();
-        let mut result = Vec::with_capacity(retained.len());
-        for entry in retained {
-            let meta = self.append_with_meta_sync(entry.clone());
-            result.push((entry, meta));
-        }
-
-        result
+        self.evicted_ring_bytes.set(ring_bytes);
+        self.trim_evicted_ring();
+        self.sync_ring_charge(self.ring_entries() > 1);
+        self.relief_landed(landed);
     }
 
-    /// `append`, additionally returning the decoded `RetainedBatchMeta` for a
-    /// `SendMessages` entry so the eviction path folds its accounting without a
-    /// second decode of the same bytes.
+    /// An eviction is where a flush lands, so it ends what the shed waited
+    /// for.
+    fn relief_landed(&self, landed: bool) {
+        if landed && let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.relief_landed();
+        }
+    }
+
+    /// Whether an op in the `count` front entries has a copy behind them. The
+    /// op index names the last copy, so one lookup per op answers it.
+    fn retains_copy_of_prefix(&self, count: usize) -> bool {
+        let headers = unsafe { &*self.headers.get() };
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let inner = unsafe { &*self.inner.get() };
+        let retained_from = inner.storage.current_offset() - headers.len().saturating_sub(count);
+        headers.iter().take(count).any(|header| {
+            op_to_storage_offset
+                .get(&header.op)
+                .is_some_and(|&storage_offset| storage_offset >= retained_from)
+        })
+    }
+
+    /// Pops the `count` front entries and removes them from every index. The
+    /// caller makes sure that no evicted op has a retained copy, so each index
+    /// ends as a rebuild of the retained tail would leave it.
+    fn pop_prefix(&self, count: usize) -> Vec<(u64, JournalBuffer)> {
+        let headers = unsafe { &mut *self.headers.get() };
+        let inner = unsafe { &*self.inner.get() };
+        let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
+        let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
+        let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
+        let mut first_header_by_op = self.first_header_by_op.borrow_mut();
+        let mut evicted = Vec::with_capacity(count.min(headers.len()));
+        while evicted.len() < count {
+            // The length-lock pairs every header with one stored entry.
+            let (Some(header), Some(entry)) = (headers.pop_front(), inner.storage.pop_front())
+            else {
+                break;
+            };
+            self.front_position.set(self.front_position.get() + 1);
+            let op = header.op;
+            op_to_storage_offset.remove(&op);
+            if op <= self.relief_through.get() && header.operation == Operation::SendMessages {
+                self.relief
+                    .set(self.relief.get() - resident_memory_bytes(&entry));
+            }
+            first_header_by_op.remove(&op);
+            if header.operation != Operation::SendMessages {
+                self.resident_control_ops
+                    .set(self.resident_control_ops.get() - 1);
+            }
+            if let Some(meta) = RetainedBatchMeta::of(&header, &entry) {
+                // A later batch at the same offset keeps the key.
+                if offset_to_op.get(&meta.base_offset) == Some(&op) {
+                    offset_to_op.remove(&meta.base_offset);
+                }
+                timestamp_to_op.remove(&(meta.base_timestamp, op));
+                self.resident_messages
+                    .set(self.resident_messages.get() - u64::from(meta.message_count));
+                self.resident_message_size
+                    .set(self.resident_message_size.get() - meta.total_size);
+            }
+            evicted.push((op, entry));
+        }
+        // Every op above the highest evicted one is still resident, so the
+        // cached run keeps that part instead of a full walk on the next probe.
+        if let Some(highest) = evicted.iter().map(|(op, _)| *op).max() {
+            let (run_floor, run_through) = self.held_run.get();
+            let floor = run_floor.max(highest);
+            self.held_run.set(if floor < run_through {
+                (floor, run_through)
+            } else {
+                (0, 0)
+            });
+        }
+        evicted
+    }
+
+    /// Evicts the `count` front entries by draining the journal and appending
+    /// the retained tail again.
+    fn rebuild_without_prefix(&self, count: usize) -> Vec<(u64, JournalBuffer)> {
+        let entries = {
+            let inner = unsafe { &*self.inner.get() };
+            inner.storage.drain()
+        };
+        // Positional against `headers` until the clear below.
+        let ops: Vec<u64> = {
+            let headers = unsafe { &*self.headers.get() };
+            headers.iter().map(|header| header.op).collect()
+        };
+        self.clear_resident_indexes();
+        let mut entries = ops.into_iter().zip(entries);
+        let evicted = entries.by_ref().take(count).collect();
+        for (_, entry) in entries {
+            self.append_sync(entry);
+        }
+        evicted
+    }
+
+    /// Keeps the evicted ring within its caps. Past the byte cap the oldest
+    /// bodies that a segment holds leave memory first, and the oldest entries
+    /// go when none can leave. The byte cap never takes the newest entry, so
+    /// the commit point stays servable for a view change. A released body
+    /// keeps its header, and the oldest entries make room for it first once
+    /// [`EVICTED_HEADERS_MAX`] headers are kept.
+    fn trim_evicted_ring(&self) {
+        let mut retained = self.repair_tail.borrow_mut();
+        let lease_from = retained.prune();
+        let ring = unsafe { &mut *self.evicted_ring.get() };
+        let headers = unsafe { &mut *self.evicted_headers.get() };
+        let mut bytes = self.evicted_ring_bytes.get();
+        let bytes_max = self.evicted_ring_bytes_max.get();
+        while bytes.logical > bytes_max
+            && self.release_next_body(ring, headers, &mut bytes, &mut retained, lease_from, None)
+        {
+        }
+        while ring.len() > self.evicted_ring_capacity.get()
+            || (bytes.logical > bytes_max && ring.len() > 1)
+        {
+            drop_oldest_evicted(ring, headers, &mut bytes, &mut retained, lease_from);
+        }
+        shrink_headers(headers);
+        self.evicted_ring_bytes.set(bytes);
+    }
+
+    /// Releases the oldest bodies that a segment holds, for the shard's
+    /// repair ring budget, until this ring's charge falls by `excess`. Keeps
+    /// the newest entry.
     ///
+    /// Keeps every body from the lowest snapshot lease or from `plan_from`
+    /// on, whichever is lower. A transfer offer needs those bodies in memory
+    /// and plans again without them, so a shed that took them on every tick
+    /// would keep a written partition from ever sending its offer.
+    pub(crate) fn release_ring_bodies(&self, excess: usize, plan_from: Option<u64>) -> RingShed {
+        self.debug_assert_ring_charge();
+        self.debug_assert_relief();
+        let (released, dropped, left, pinned_from) = {
+            let mut retained = self.repair_tail.borrow_mut();
+            let lease_from = retained.prune();
+            let pinned_from = pinned_floor(lease_from, plan_from);
+            let ring = unsafe { &mut *self.evicted_ring.get() };
+            let headers = unsafe { &mut *self.evicted_headers.get() };
+            let mut bytes = self.evicted_ring_bytes.get();
+            let target = charged_bytes(bytes, headers.capacity()).saturating_sub(excess);
+            let entries = ring.len() + headers.len();
+            let mut released = 0;
+            let mut left = true;
+            while left && charged_bytes(bytes, headers.capacity()) > target {
+                left = self.release_next_body(
+                    ring,
+                    headers,
+                    &mut bytes,
+                    &mut retained,
+                    lease_from,
+                    pinned_from,
+                );
+                released += usize::from(left);
+            }
+            self.evicted_ring_bytes.set(bytes);
+            (
+                released,
+                // A release keeps its entry, so every entry that left was dropped.
+                entries - (ring.len() + headers.len()),
+                left && self.next_releasable(ring, pinned_from).is_some(),
+                pinned_from,
+            )
+        };
+        self.sync_ring_charge(false);
+        if !left && let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.bodies_released(self.has_droppable(pinned_from));
+        }
+        RingShed {
+            released,
+            dropped,
+            left,
+        }
+    }
+
+    /// Drops the oldest entries, for the shard's repair ring budget, until
+    /// this ring's charge falls by `excess`. Keeps the newest entry.
+    ///
+    /// Keeps every entry from the lowest snapshot lease or from `plan_from`
+    /// on, as [`Self::release_ring_bodies`] does. A dropped entry that a
+    /// lease covers only moves to the repair tail, which frees nothing.
+    pub(crate) fn drop_ring_entries(&self, excess: usize, plan_from: Option<u64>) -> RingShed {
+        self.debug_assert_ring_charge();
+        self.debug_assert_relief();
+        let (dropped, pinned_from) = {
+            let mut retained = self.repair_tail.borrow_mut();
+            let lease_from = retained.prune();
+            let pinned_from = pinned_floor(lease_from, plan_from);
+            let ring = unsafe { &mut *self.evicted_ring.get() };
+            let headers = unsafe { &mut *self.evicted_headers.get() };
+            let mut bytes = self.evicted_ring_bytes.get();
+            let target = charged_bytes(bytes, headers.capacity()).saturating_sub(excess);
+            let mut dropped = 0;
+            // The deque returns its unused slots below, so only the headers
+            // it holds count against the target.
+            while charged_bytes(bytes, headers.len()) > target
+                && is_droppable(ring, headers, pinned_from)
+            {
+                drop_oldest_evicted(ring, headers, &mut bytes, &mut retained, lease_from);
+                dropped += 1;
+            }
+            headers.shrink_to_fit();
+            self.evicted_ring_bytes.set(bytes);
+            (dropped, pinned_from)
+        };
+        self.sync_ring_charge(false);
+        let left = self.has_droppable(pinned_from);
+        if !left && let Some(charge) = self.ring_charge.borrow().as_ref() {
+            charge.entries_dropped();
+        }
+        RingShed {
+            released: 0,
+            dropped,
+            left,
+        }
+    }
+
+    /// Releases the body of the oldest entry above `released_through` that a
+    /// segment holds, and passes over the ones no segment holds. Never takes
+    /// the newest entry or an entry from `pinned_from` on. Returns whether it
+    /// released a body.
+    fn release_next_body(
+        &self,
+        ring: &mut BTreeMap<u64, RingEntry>,
+        headers: &mut VecDeque<EvictedHeader>,
+        bytes: &mut RingBytes,
+        retained: &mut RepairTail,
+        lease_from: Option<u64>,
+        pinned_from: Option<u64>,
+    ) -> bool {
+        loop {
+            let Some(op) = self.next_releasable(ring, pinned_from) else {
+                return false;
+            };
+            self.released_through.set(op);
+            let Some(evicted) = ring.get(&op).and_then(RingEntry::evicted_header) else {
+                continue;
+            };
+            if let Some(entry) = ring.remove(&op) {
+                bytes.remove(&entry);
+            }
+            while headers.len() >= EVICTED_HEADERS_MAX {
+                drop_oldest_evicted(ring, headers, bytes, retained, lease_from);
+            }
+            headers.push_back(evicted);
+            return true;
+        }
+    }
+
+    /// The oldest entry above `released_through` and below `pinned_from`
+    /// other than the newest one.
+    fn next_releasable(
+        &self,
+        ring: &BTreeMap<u64, RingEntry>,
+        pinned_from: Option<u64>,
+    ) -> Option<u64> {
+        let newest = ring.last_key_value().map(|(op, _)| *op);
+        ring.range(self.released_through.get().saturating_add(1)..)
+            .map(|(op, _)| *op)
+            .find(|op| Some(*op) != newest)
+            .filter(|op| pinned_from.is_none_or(|from| *op < from))
+    }
+
+    fn has_droppable(&self, pinned_from: Option<u64>) -> bool {
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let headers = unsafe { &*self.evicted_headers.get() };
+        is_droppable(ring, headers, pinned_from)
+    }
+
+    fn ring_entries(&self) -> usize {
+        let ring = unsafe { &*self.evicted_ring.get() };
+        let headers = unsafe { &*self.evicted_headers.get() };
+        ring.len() + headers.len()
+    }
+
     /// INVARIANT (length-lock): the header is pushed before `storage.write_at`,
     /// so `headers[i]` and the entry at storage index `i` stay positionally
     /// paired - materialization reads entries by that position. `MemStorage::write_at`
     /// is infallible, so the push never runs ahead of a failed write. A future
     /// fallible `Storage` MUST roll the header push back on a write error (or
     /// write before pushing the header) or the zip desyncs.
-    fn append_with_meta_sync(&self, entry: JournalBuffer) -> Option<RetainedBatchMeta> {
+    fn append_sync(&self, entry: JournalBuffer) {
         let header_bytes = &entry[..PREPARE_HEADER_SIZE];
         let header = *bytemuck::checked::try_from_bytes::<PrepareHeader>(header_bytes)
             .expect("partition journal append expects a valid prepare header");
+        if header.operation == Operation::StateMachineCommand {
+            self.commands.borrow_mut().insert(header.op, entry);
+            self.sync_ring_charge(false);
+            return;
+        }
         let op = header.op;
-        // One decode feeds both the offset/timestamp index and the surfaced
-        // accounting meta. Both are keyed on `base_timestamp`, the broker
-        // append time stamped into replies: the seek hint must live on the
-        // same clock as `select_batch_slice`'s filter or timestamp polls seek
-        // to the wrong resident entry.
-        // Trusted (no batch-hash): every entry reaching append was just stamped
-        // by `stamp_prepare_for_persistence` (its checksum recomputed over this
-        // exact blob) or re-appended from an already-validated resident entry,
-        // so re-hashing the ~1 MiB blob here only to read the header is waste.
-        let (index_offset_timestamp, meta) = if header.operation == Operation::SendMessages {
-            match decode_prepare_slice_trusted(entry.as_slice()) {
-                Ok(batch) if batch.message_count() != 0 => {
-                    let message_count = batch.message_count();
-                    let meta = RetainedBatchMeta {
-                        base_offset: batch.header.base_offset,
-                        base_timestamp: batch.header.base_timestamp,
-                        total_size: batch.header.total_size() as u64,
-                        message_count,
-                    };
-                    (
-                        Some((batch.header.base_offset, batch.header.base_timestamp)),
-                        Some(meta),
-                    )
-                }
-                _ => (None, None),
-            }
-        } else {
-            (None, None)
-        };
+        let meta = RetainedBatchMeta::of(&header, &entry);
 
         {
             let headers = unsafe { &mut *self.headers.get() };
-            if headers.last().is_some_and(|last| last.op > op) {
+            if headers.back().is_some_and(|last| last.op > op) {
                 self.out_of_order.set(true);
             }
             if !headers.is_empty() {
+                let position = self.front_position.get() + headers.len();
                 self.first_header_by_op
                     .borrow_mut()
                     .entry(op)
-                    .or_insert(headers.len());
+                    .or_insert(position);
             }
-            headers.push(header);
+            headers.push_back(header);
         };
 
         let storage_offset = {
@@ -779,27 +2054,51 @@ impl PartitionJournal<PartitionJournalMemStorage> {
 
         {
             let op_to_storage_offset = unsafe { &mut *self.op_to_storage_offset.get() };
-            op_to_storage_offset.insert(op, storage_offset);
+            let replaced = op_to_storage_offset.insert(op, storage_offset);
+            if op <= self.relief_through.get() {
+                let inner = unsafe { &*self.inner.get() };
+                let relief = |offset| {
+                    inner
+                        .storage
+                        .read_at_sync(offset)
+                        .map_or(0, |entry| message_charge(&entry))
+                };
+                self.relief
+                    .set(self.relief.get() - replaced.map_or(0, relief) + relief(storage_offset));
+            }
         }
         if header.operation != Operation::SendMessages {
             self.resident_control_ops
                 .set(self.resident_control_ops.get() + 1);
         }
 
-        if let Some((offset, timestamp)) = index_offset_timestamp {
+        if let Some(meta) = meta {
             let offset_to_op = unsafe { &mut *self.offset_to_op.get() };
-            offset_to_op.insert(offset, op);
+            offset_to_op.insert(meta.base_offset, op);
 
+            // Keyed on `base_timestamp`, the broker append time stamped into
+            // replies: the seek hint must live on the same clock as
+            // `select_batch_slice`'s filter or timestamp polls seek to the
+            // wrong resident entry.
             let timestamp_to_op = unsafe { &mut *self.timestamp_to_op.get() };
-            timestamp_to_op.insert((timestamp, op), op);
-        }
+            timestamp_to_op.insert((meta.base_timestamp, op), op);
 
-        meta
+            self.resident_messages
+                .set(self.resident_messages.get() + u64::from(meta.message_count));
+            self.resident_message_size
+                .set(self.resident_message_size.get() + meta.total_size);
+        }
+        self.sync_ring_charge(false);
     }
 
     pub fn is_empty(&self) -> bool {
         let inner = unsafe { &*self.inner.get() };
         inner.storage.is_empty()
+    }
+
+    /// No data entry and no command is held.
+    pub fn holds_no_ops(&self) -> bool {
+        self.is_empty() && self.commands.borrow().is_empty()
     }
 
     /// Owned, offset-ascending clones of the resident `SendMessages` entries a
@@ -847,42 +2146,91 @@ where
             op_to_storage_offset: UnsafeCell::new(BTreeMap::new()),
             offset_to_op: UnsafeCell::new(BTreeMap::new()),
             timestamp_to_op: UnsafeCell::new(BTreeMap::new()),
-            headers: UnsafeCell::new(Vec::new()),
+            headers: UnsafeCell::new(VecDeque::new()),
+            front_position: Cell::new(0),
             inner: UnsafeCell::new(JournalInner { storage }),
             first_header_by_op: RefCell::new(AHashMap::new()),
+            resident_messages: Cell::new(0),
+            resident_message_size: Cell::new(0),
             evicted_ring: UnsafeCell::new(BTreeMap::new()),
-            evicted_ring_bytes: Cell::new(0),
+            evicted_ring_bytes: Cell::new(RingBytes::default()),
+            evicted_headers: UnsafeCell::new(VecDeque::new()),
+            repair_tail: Rc::default(),
+            released_through: Cell::new(0),
             evicted_ring_capacity: Cell::new(EVICTED_RING_CAPACITY),
             evicted_ring_bytes_max: Cell::new(EVICTED_RING_BYTES_MAX),
             repair_retention: Cell::new(true),
+            ring_charge: RefCell::new(None),
             resident_control_ops: Cell::new(0),
             evicted_through: Cell::new(0),
+            relief_through: Cell::new(0),
+            relief: Cell::new(0),
             out_of_order: Cell::new(false),
             held_run: Cell::new((0, 0)),
+            commands: RefCell::new(StateMachineLog::default()),
         }
     }
 
     /// Forget every resident header and index. The caller drained the entries.
     fn clear_resident_indexes(&self) {
         unsafe { &mut *self.headers.get() }.clear();
+        self.front_position.set(0);
         self.first_header_by_op.borrow_mut().clear();
         unsafe { &mut *self.op_to_storage_offset.get() }.clear();
         unsafe { &mut *self.offset_to_op.get() }.clear();
         self.held_run.set((0, 0));
         unsafe { &mut *self.timestamp_to_op.get() }.clear();
         self.resident_control_ops.set(0);
+        self.resident_messages.set(0);
+        self.resident_message_size.set(0);
+        self.relief.set(0);
         self.out_of_order.set(false);
     }
 
     pub fn header_by_op(&self, op: u64) -> Option<PrepareHeader> {
+        self.data_header_by_op(op)
+            .or_else(|| self.commands.borrow().header(op))
+    }
+
+    fn data_header_by_op(&self, op: u64) -> Option<PrepareHeader> {
         let headers = unsafe { &*self.headers.get() };
-        if headers.first().is_some_and(|header| header.op == op) {
-            return headers.first().copied();
+        if headers.front().is_some_and(|header| header.op == op) {
+            return headers.front().copied();
         }
-        let index = *self.first_header_by_op.borrow().get(&op)?;
-        let header = headers.get(index);
+        let position = *self.first_header_by_op.borrow().get(&op)?;
+        let header = position
+            .checked_sub(self.front_position.get())
+            .and_then(|index| headers.get(index));
         debug_assert!(header.is_some_and(|header| header.op == op));
         header.copied()
+    }
+
+    /// Whether the state-machine log holds every op in `from..to`, so the data
+    /// entries on either side of that span are adjacent in the sequence.
+    fn commands_fill(&self, from: u64, to: u64) -> bool {
+        from >= to || {
+            let commands = self.commands.borrow();
+            commands.ops(from..to).count() as u64 == to - from
+        }
+    }
+
+    /// How many commands of the group's state-machine log this journal holds
+    /// in `ops`.
+    pub fn commands_in(&self, ops: impl RangeBounds<u64>) -> usize {
+        self.commands.borrow().ops(ops).count()
+    }
+
+    /// The ops of the commands this journal holds, ascending.
+    #[cfg(test)]
+    pub fn command_ops(&self) -> Vec<u64> {
+        self.commands.borrow().ops(..).collect()
+    }
+
+    /// Mark the commands below `op` as gone, as a replica restored from a
+    /// checkpoint at `op` holds none of them.
+    pub fn retain_commands_from(&self, op: u64) {
+        self.commands.borrow_mut().set_retained_from(op);
+        self.held_run.set((0, 0));
     }
 
     pub(crate) fn headers_for_commit(
@@ -920,7 +2268,18 @@ where
     /// consistent throughout every externally observable owner state.
     pub fn holds_op(&self, op: u64) -> bool {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        op_to_storage_offset.contains_key(&op)
+        op_to_storage_offset.contains_key(&op) || self.commands.borrow().contains(op)
+    }
+
+    /// Highest resident op below `op`.
+    pub fn held_below(&self, op: u64) -> Option<u64> {
+        let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
+        let data = op_to_storage_offset
+            .range(..op)
+            .next_back()
+            .map(|(held, _)| *held);
+        let command = self.commands.borrow().ops(..op).next_back();
+        data.max(command)
     }
 
     /// Highest op `h >= floor` such that every op in `floor + 1..=h` is resident.
@@ -942,14 +2301,22 @@ where
             floor
         };
         if through < top {
-            for op in op_to_storage_offset
+            let commands = self.commands.borrow();
+            let mut data = op_to_storage_offset
                 .range(through + 1..=top)
                 .map(|(op, _)| *op)
-            {
-                if op != through + 1 {
+                .peekable();
+            let mut command = commands.ops(through + 1..=top).peekable();
+            while through < top {
+                let next = through + 1;
+                // Both walks only move forward, so a copy of an op in both logs
+                // is stepped over in either.
+                let held_in_data = data.next_if_eq(&next).is_some();
+                let held_in_commands = command.next_if_eq(&next).is_some();
+                if !held_in_data && !held_in_commands {
                     break;
                 }
-                through = op;
+                through = next;
             }
         }
         if through > floor && (run_floor > floor || run_through < through) {
@@ -963,6 +2330,7 @@ where
     pub fn holds_op_in(&self, ops: RangeInclusive<u64>) -> bool {
         let headers = unsafe { &*self.headers.get() };
         headers.iter().any(|header| ops.contains(&header.op))
+            || self.commands.borrow().ops(ops).next().is_some()
     }
 
     /// Presence shape of the repair window `(floor, to_op]` in ONE pass over
@@ -974,13 +2342,18 @@ where
     /// The evicted ring is deliberately NOT consulted, matching the op-by-op
     /// form: consulting it would change the floor-refusal verdict.
     pub fn repaired_window_shape(&self, floor: u64, to_op: u64) -> RepairedWindowShape {
+        // A repair that reached its target asks about an empty window.
+        if floor >= to_op {
+            return RepairedWindowShape { complete: true };
+        }
         let headers = unsafe { &*self.headers.get() };
+        let commands = self.commands.borrow();
         let expected = to_op.saturating_sub(floor);
         // More in-window ops than resident headers can never be covered, and
         // `expected` is unbounded here (`to_op` rides the local `commit_max`),
         // so this is both the early answer and what keeps the bitset below from
         // being sized off an arbitrary number.
-        if expected > headers.len() as u64 {
+        if expected > (headers.len() + commands.len()) as u64 {
             return RepairedWindowShape { complete: false };
         }
         // Dense window, so a flat presence vector beats a `HashSet`: no hashing
@@ -992,12 +2365,14 @@ where
         let expected_len = expected as usize;
         let mut present = vec![false; expected_len];
         let mut covered = 0usize;
-        for header in headers
+        let in_window = headers
             .iter()
-            .filter(|header| header.op > floor && header.op <= to_op)
-        {
+            .map(|header| header.op)
+            .filter(|op| *op > floor && *op <= to_op)
+            .chain(commands.ops(floor.saturating_add(1)..=to_op));
+        for op in in_window {
             #[allow(clippy::cast_possible_truncation)]
-            let slot = (header.op - floor - 1) as usize;
+            let slot = (op - floor - 1) as usize;
             if !present[slot] {
                 present[slot] = true;
                 covered += 1;
@@ -1009,22 +2384,6 @@ where
         }
     }
 
-    /// Highest `commit` any resident header stamped, in ONE pass.
-    ///
-    /// A lower bound on the group's commit point, which is what a rebuilt replica
-    /// can recover from a log alone: a prepare records the primary's commit point
-    /// at send time, so the true point may be one higher.
-    ///
-    /// Scans resident headers without probing every op up to the log head.
-    pub fn max_commit_watermark(&self) -> u64 {
-        let headers = unsafe { &*self.headers.get() };
-        headers
-            .iter()
-            .map(|header| header.commit)
-            .max()
-            .unwrap_or(0)
-    }
-
     /// Headers for the contiguous op run `from_op ..= commit_max`, in op order,
     /// stopping at the first missing op and at `limit` headers. A replication
     /// gap must not be skipped: the caller advances `commit_min` strictly by
@@ -1033,6 +2392,10 @@ where
     /// `limit` bounds what one caller commits in a single pass. The run is
     /// re-derived from the caller's own `commit_min` every time, so a truncated
     /// answer is resumed, not lost.
+    ///
+    /// Costs one index lookup per returned header, however many headers are
+    /// resident: a lagging backup holds hundreds of thousands, and the commit
+    /// walk calls this on every tick.
     pub fn committed_headers_from(
         &self,
         from_op: u64,
@@ -1047,37 +2410,20 @@ where
         if from_op > commit_max {
             return Vec::new();
         }
-        let headers = unsafe { &*self.headers.get() };
-        // Sized off the RUN the caller asked for, capped by the headers that
-        // could possibly cover it. Sizing off `headers.len()` alone would make
-        // a one-op run allocate a slot per resident header, and `commit_max` is
-        // a cluster frontier this replica may be arbitrarily far below, so
-        // neither bound can be dropped. `saturating_add` because `commit_max`
-        // is `u64::MAX` on a saturated frontier, where `+ 1` would panic in
-        // debug and wrap to an empty span (a walk that never resumes) in
-        // release.
-        let span = (commit_max - from_op)
-            .saturating_add(1)
-            .min(limit as u64)
-            .min(headers.len() as u64);
-        // `span` is a `min` of two `usize`-derived values on a 64-bit target,
-        // so the narrowing is lossless; `slot` is then compared against it as
-        // a `u64` BEFORE any cast, so nothing depends on the cast to bound it.
-        #[allow(clippy::cast_possible_truncation)]
-        let span = span as usize;
-        let mut slots: Vec<Option<PrepareHeader>> = vec![None; span];
-        for header in headers {
-            if header.op < from_op || header.op - from_op >= span as u64 {
-                continue;
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            let slot = (header.op - from_op) as usize;
-            // Keep the first resident occurrence, matching `header_by_op`.
-            slots[slot].get_or_insert(*header);
-        }
+        // `saturating_add` because `commit_max` is `u64::MAX` on a saturated
+        // frontier, where `+ 1` would panic in debug and wrap to an empty span
+        // (a walk that never resumes) in release.
+        let span = (commit_max - from_op).saturating_add(1).min(limit as u64);
         // Stops at the first hole: a replication gap must not be skipped, or
-        // `advance_commit_min`'s sequential contract breaks.
-        slots.into_iter().map_while(|header| header).collect()
+        // `advance_commit_min`'s sequential contract breaks. `header_by_op`
+        // returns the first resident occurrence of an op.
+        (0..span)
+            .map_while(|index| {
+                from_op
+                    .checked_add(index)
+                    .and_then(|op| self.header_by_op(op))
+            })
+            .collect()
     }
 
     /// Oldest message offset still resident in the in-memory journal, if
@@ -1122,7 +2468,10 @@ where
     async fn bytes_by_op(&self, op: u64) -> Option<JournalBuffer> {
         let storage_offset = {
             let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-            *op_to_storage_offset.get(&op)?
+            let Some(storage_offset) = op_to_storage_offset.get(&op) else {
+                return self.commands.borrow().get(op);
+            };
+            *storage_offset
         };
 
         let bytes = {
@@ -1174,7 +2523,8 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     }
 
     async fn append(&self, entry: Self::Entry) -> io::Result<()> {
-        self.append_with_meta_sync(entry);
+        self.debug_assert_ring_charge();
+        self.append_sync(entry);
         Ok(())
     }
 
@@ -1186,7 +2536,10 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
     /// higher ops and stay there until `sort_by_op` runs.
     fn last_op(&self) -> Option<u64> {
         let op_to_storage_offset = unsafe { &*self.op_to_storage_offset.get() };
-        op_to_storage_offset.last_key_value().map(|(op, _)| *op)
+        op_to_storage_offset
+            .last_key_value()
+            .map(|(op, _)| *op)
+            .max(self.commands.borrow().last_op())
     }
 
     /// Removed entries must stay refillable and cannot enter the committed repair ring.
@@ -1202,24 +2555,37 @@ impl Journal for PartitionJournal<PartitionJournalMemStorage> {
             inner.storage.drain()
         };
         // Positional against `headers` until the clear below (see the length-lock
-        // invariant on `append_with_meta_sync`), so the ops are captured first.
+        // invariant on `append_sync`), so the ops are captured first.
         let entry_ops: Vec<u64> = {
             let headers = unsafe { &*self.headers.get() };
             headers.iter().map(|header| header.op).collect()
         };
         self.clear_resident_indexes();
 
-        let mut removed = 0usize;
+        let mut removed = self.commands.borrow_mut().remove(ops.clone());
         for (op, entry) in entry_ops.into_iter().zip(all_entries) {
             if ops.contains(&op) {
                 removed += 1;
                 continue;
             }
             // Replays bytes this journal already accepted once, so it cannot fail.
-            self.append_with_meta_sync(entry);
+            self.append_sync(entry);
         }
+        self.sync_ring_charge(false);
         Ok(removed)
     }
+}
+
+fn is_command(prepare: &JournalBuffer) -> bool {
+    operation_of(prepare) == Some(Operation::StateMachineCommand)
+}
+
+fn operation_of(prepare: &JournalBuffer) -> Option<Operation> {
+    prepare
+        .as_slice()
+        .get(..PREPARE_HEADER_SIZE)
+        .and_then(|bytes| bytemuck::checked::try_from_bytes::<PrepareHeader>(bytes).ok())
+        .map(|header| header.operation)
 }
 
 pub fn select_batch_slice(
@@ -1502,6 +2868,7 @@ pub fn select_resident(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RepairMemoryBudget;
     use bytes::Bytes;
     use iggy_binary_protocol::{Command, HEADER_SIZE};
     use journal::Journal;
@@ -1511,6 +2878,151 @@ mod tests {
         decode_batch_slice,
     };
     use server_common::sharding::IggyNamespace;
+    use std::sync::Arc;
+
+    #[compio::test]
+    async fn given_a_small_snapshot_tail_with_a_large_backing_buffer_when_retained_should_charge_and_release_the_allocation()
+     {
+        const BACKING_CAPACITY: usize = 64 * 1024;
+        let mut backing = Owned::<4096>::with_capacity(BACKING_CAPACITY);
+        backing.extend_from_slice(build_prepare(1, HEADER_SIZE).as_slice());
+        let prepare = Frozen::from(backing);
+        let charge = Frozen::<4096>::allocation_size(prepare.backing_capacity()).unwrap()
+            + size_of::<(u64, JournalBuffer)>();
+        let budget = Arc::new(RepairMemoryBudget::new(charge));
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(1, u64::MAX);
+        let lease = journal.retain_repair_from(1, budget.reservation());
+        journal.append(prepare).await.unwrap();
+        journal.evict_prefix(1);
+        journal
+            .append(build_prepare(2, HEADER_SIZE).into_frozen())
+            .await
+            .unwrap();
+        journal.evict_prefix(1);
+
+        assert!(lease.is_valid());
+        assert!(journal.repair_entry(1).is_some());
+        assert!(
+            !budget.reservation().try_add(1),
+            "the retained frame must charge its complete backing allocation"
+        );
+        lease.advance(2);
+        assert!(journal.repair_entry(1).is_none());
+        assert!(
+            budget.reservation().try_add(charge),
+            "advancing the lease must refund the complete allocation charge"
+        );
+    }
+
+    #[compio::test]
+    async fn given_snapshot_leases_when_the_ring_evicts_should_retain_until_every_receiver_advances()
+     {
+        const OPS: u64 = 8;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(1, u64::MAX);
+        let budget = Arc::new(RepairMemoryBudget::new(64 * 1024));
+        let first = journal.retain_repair_from(2, budget.reservation());
+        let second = journal.retain_repair_from(4, budget.reservation());
+        for op in 1..=OPS {
+            journal
+                .append(build_prepare(op, HEADER_SIZE).into_frozen())
+                .await
+                .unwrap();
+            journal.evict_prefix(1);
+        }
+        assert!(journal.repair_entry(1).is_none());
+        for op in 2..=OPS {
+            assert_eq!(
+                journal.repair_entry(op).unwrap().as_slice(),
+                build_prepare(op, HEADER_SIZE).as_slice()
+            );
+        }
+        assert_eq!(journal.repair_retained_from(), Some(2));
+        assert_eq!(journal.repair_headers_in(2..=OPS).len(), 7);
+        first.advance(6);
+        assert_eq!(journal.repair_retained_from(), Some(4));
+        drop(second);
+        assert_eq!(journal.repair_retained_from(), Some(6));
+        drop(first);
+        assert_eq!(journal.repair_retained_from(), Some(OPS));
+        assert!(
+            budget.reservation().try_add(64 * 1024),
+            "all extra retention must release its budget"
+        );
+    }
+
+    #[compio::test]
+    async fn given_disk_backed_snapshot_tail_when_headers_leave_the_ring_should_keep_locations_without_bodies()
+     {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(1, 1);
+        let budget = Arc::new(RepairMemoryBudget::new(64 * 1024));
+        let lease = journal.retain_repair_from(1, budget.reservation());
+        let ops = u64::try_from(EVICTED_HEADERS_MAX + 2).unwrap();
+        for op in 1..=ops {
+            journal
+                .append(build_message_prepare(op, op - 1, 1, 1))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(usize::try_from(ops).unwrap(), |op| {
+            Some(BodyPosition {
+                segment_start: 0,
+                position: op,
+            })
+        });
+        assert!(lease.is_valid());
+        assert!(journal.repair_entry(1).is_none());
+        assert_eq!(journal.evicted_header(1).unwrap().body.position, 1);
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        assert_eq!(journal.memory_retained_from(), Some(ops));
+        journal.forget_segment(0);
+        assert!(
+            !lease.is_valid(),
+            "GC must invalidate the promise before its disk bodies disappear"
+        );
+        assert!(journal.evicted_header(1).is_none());
+        assert!(budget.reservation().try_add(64 * 1024));
+    }
+
+    #[compio::test]
+    async fn given_snapshot_tail_and_unproven_walk_when_the_shared_cap_is_full_should_invalidate_without_blocking_writes()
+     {
+        let charge = build_prepare(1, HEADER_SIZE)
+            .retained_allocation_size()
+            .unwrap()
+            + size_of::<(u64, JournalBuffer)>();
+        let budget = Arc::new(RepairMemoryBudget::new(2 * charge));
+        let mut walk = budget.reservation();
+        assert!(walk.try_add(charge));
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(1, u64::MAX);
+        let lease = journal.retain_repair_from(1, budget.reservation());
+        for op in 1..=2 {
+            journal
+                .append(build_prepare(op, HEADER_SIZE).into_frozen())
+                .await
+                .unwrap();
+            journal.evict_prefix(1);
+        }
+        assert!(lease.is_valid());
+        journal
+            .append(build_prepare(3, HEADER_SIZE).into_frozen())
+            .await
+            .unwrap();
+        journal.evict_prefix(1);
+        assert!(!lease.is_valid());
+        assert_eq!(journal.repair_retained_from(), Some(3));
+        assert_eq!(journal.evicted_ring_occupancy(), (1, HEADER_SIZE as u64));
+        assert!(budget.reservation().try_add(charge));
+        drop(walk);
+        let replacement = journal.retain_repair_from(3, budget.reservation());
+        journal.clear_all();
+        assert!(!replacement.is_valid());
+        assert_eq!(journal.evicted_ring_occupancy(), (0, 0));
+        assert!(budget.reservation().try_add(2 * charge));
+    }
 
     fn build_prepare(op: u64, size: usize) -> Message<PrepareHeader> {
         Message::<PrepareHeader>::new(size).transmute_header(|_, h: &mut PrepareHeader| {
@@ -1730,6 +3242,585 @@ mod tests {
         assert!(journal.repair_entry(8).is_none());
     }
 
+    /// A body that no segment holds stays in memory while a newer body leaves
+    /// it, so the window that memory holds up to the head starts above the
+    /// newest released op.
+    #[compio::test]
+    async fn given_an_unlocated_body_below_a_released_one_when_asked_for_the_memory_window_should_start_above_the_release()
+     {
+        const PAYLOAD_LEN: usize = 64;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let body_len = build_message_prepare(1, 0, 1, PAYLOAD_LEN).len() as u64;
+        journal.set_ring_caps(EVICTED_RING_CAPACITY, 2 * body_len);
+        for op in 1..=3 {
+            journal
+                .append(build_message_prepare(op, op - 1, 1, PAYLOAD_LEN))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(3, |op| {
+            (op == 2).then_some(BodyPosition {
+                segment_start: 0,
+                position: 0,
+            })
+        });
+        assert!(journal.repair_entry(1).is_some());
+        assert!(journal.evicted_header(2).is_some());
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        assert_eq!(journal.memory_retained_from(), Some(3));
+    }
+
+    /// Released headers take no room from the bodies the byte cap keeps in
+    /// memory, and a newest body past the cap takes no header away.
+    #[compio::test]
+    async fn given_released_headers_when_bodies_pass_the_byte_cap_should_keep_both_windows() {
+        const OPS: u64 = 20;
+        const BODIES_KEPT: u64 = 3;
+        const PAYLOAD_LEN: usize = 64;
+        let located = |op| {
+            Some(BodyPosition {
+                segment_start: 0,
+                position: op,
+            })
+        };
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let body_len = build_message_prepare(1, 0, 1, PAYLOAD_LEN).len() as u64;
+        journal.set_ring_caps(EVICTED_RING_CAPACITY, BODIES_KEPT * body_len);
+        for op in 1..=OPS {
+            journal
+                .append(build_message_prepare(op, op - 1, 1, PAYLOAD_LEN))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(usize::try_from(OPS).unwrap(), located);
+        for op in 1..=OPS - BODIES_KEPT {
+            assert!(
+                journal.evicted_header(op).is_some(),
+                "op {op} lost its header"
+            );
+        }
+        for op in OPS - BODIES_KEPT + 1..=OPS {
+            assert!(journal.repair_entry(op).is_some(), "op {op} lost its body");
+        }
+
+        let large = build_message_prepare(OPS + 1, OPS, 1, PAYLOAD_LEN * 64);
+        assert!(large.len() as u64 > BODIES_KEPT * body_len);
+        journal.append(large).await.unwrap();
+        journal.evict_prefix_located(1, located);
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        for op in 1..=OPS {
+            assert!(
+                journal.evicted_header(op).is_some(),
+                "op {op} lost its header"
+            );
+        }
+        assert!(journal.repair_entry(OPS + 1).is_some());
+    }
+
+    /// Each release makes room in the header window first, so a full window
+    /// never grows its allocation past its cap.
+    #[compio::test]
+    async fn given_more_releases_than_the_header_cap_when_trimming_should_keep_the_deque_within_it()
+    {
+        const BATCH: u64 = 1024;
+        let headers_max = EVICTED_HEADERS_MAX;
+        let ops = u64::try_from(headers_max).unwrap() + 2;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(EVICTED_RING_CAPACITY, 1);
+        let template = build_message_prepare(1, 0, 1, 1);
+        for first in (1..=ops).step_by(usize::try_from(BATCH).unwrap()) {
+            let last = (first + BATCH - 1).min(ops);
+            for op in first..=last {
+                let mut prepare = Message::<PrepareHeader>::new(template.len());
+                prepare.as_mut_slice().copy_from_slice(template.as_slice());
+                let prepare = prepare.transmute_header(|header, stamped: &mut PrepareHeader| {
+                    *stamped = header;
+                    stamped.op = op;
+                });
+                journal.append(prepare.into_frozen()).await.unwrap();
+            }
+            journal.evict_prefix_located(usize::try_from(last - first + 1).unwrap(), |op| {
+                Some(BodyPosition {
+                    segment_start: 0,
+                    position: op,
+                })
+            });
+        }
+        let headers = unsafe { &*journal.evicted_headers.get() };
+        assert!(
+            headers.capacity() <= headers_max,
+            "the header deque grew to {} slots",
+            headers.capacity()
+        );
+        assert_eq!(headers.len(), headers_max);
+        assert_eq!(
+            journal.repair_retained_from(),
+            Some(ops - u64::try_from(headers_max).unwrap())
+        );
+    }
+
+    const RING_PAYLOAD_LEN: usize = 64;
+
+    /// A journal that charges its ring to a budget, holding `ops` evicted
+    /// one-message prepares, each in a segment of its own.
+    async fn charged_ring(
+        ops: u64,
+    ) -> (
+        PartitionJournal<PartitionJournalMemStorage>,
+        Rc<RepairRingBudget>,
+    ) {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+        for op in 1..=ops {
+            journal
+                .append(build_message_prepare(op, op - 1, 1, RING_PAYLOAD_LEN))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(usize::try_from(ops).unwrap(), |op| {
+            Some(BodyPosition {
+                segment_start: op,
+                position: 0,
+            })
+        });
+        (journal, budget)
+    }
+
+    /// What one body of [`charged_ring`] charges: its padded allocation and
+    /// its map entry, not its length.
+    fn ring_body_bytes() -> usize {
+        let prepare = build_message_prepare(1, 0, 1, RING_PAYLOAD_LEN);
+        let bytes = JournalBuffer::allocation_size(prepare.backing_capacity()).unwrap()
+            + size_of::<(u64, RingEntry)>();
+        assert!(bytes > prepare.len());
+        bytes
+    }
+
+    /// The budget counts the heap a ring holds. A body counts for its whole
+    /// allocation, and a released body for one header slot.
+    #[compio::test]
+    async fn given_a_ring_when_charged_should_count_allocations_and_header_slots() {
+        const OPS: u64 = 4;
+        let (journal, budget) = charged_ring(OPS).await;
+        let body = ring_body_bytes();
+        assert_eq!(budget.usage().charged_bytes, 4 * body);
+        assert_eq!(budget.usage().floor_bytes, body);
+
+        let shed = journal.release_ring_bodies(usize::MAX, None);
+        assert_eq!((shed.released, shed.dropped, shed.left), (3, 0, false));
+        let headers = unsafe { &*journal.evicted_headers.get() };
+        assert_eq!(
+            budget.usage().charged_bytes,
+            body + headers.capacity() * size_of::<EvictedHeader>()
+        );
+    }
+
+    /// A ring that drops its headers returns their slots, so the heap it
+    /// holds falls with its charge.
+    #[compio::test]
+    async fn given_released_headers_when_dropped_should_return_their_slots() {
+        const OPS: u64 = 64;
+        let (journal, budget) = charged_ring(OPS).await;
+        journal.release_ring_bodies(usize::MAX, None);
+
+        let shed = journal.drop_ring_entries(usize::MAX, None);
+
+        assert_eq!((shed.dropped, shed.left), (63, false));
+        let headers = unsafe { &*journal.evicted_headers.get() };
+        assert_eq!(headers.capacity(), 0);
+        assert_eq!(budget.usage().charged_bytes, ring_body_bytes());
+        assert!(journal.repair_entry(OPS).is_some());
+    }
+
+    /// The budget counts every holder of a journal: resident entries with
+    /// their index keys, held commands, and the ring. An entry moves its
+    /// charge from resident to ring when it leaves the journal.
+    #[compio::test]
+    async fn given_resident_entries_and_commands_when_charged_should_count_each_holder() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+        let message = build_message_prepare(1, 0, 1, RING_PAYLOAD_LEN);
+        let resident = JournalBuffer::allocation_size(message.backing_capacity()).unwrap()
+            + RESIDENT_ENTRY_INDEX_BYTES;
+        let command = build_command_prepare(2);
+        let command_bytes = JournalBuffer::allocation_size(command.backing_capacity()).unwrap()
+            + size_of::<(u64, JournalBuffer)>();
+        journal.append(message).await.unwrap();
+        journal.append(command).await.unwrap();
+        journal
+            .append(build_message_prepare(3, 1, 1, RING_PAYLOAD_LEN))
+            .await
+            .unwrap();
+        let charged = budget.usage();
+        assert_eq!(
+            (
+                charged.resident_bytes,
+                charged.command_bytes,
+                charged.charged_bytes
+            ),
+            (2 * resident, command_bytes, 0)
+        );
+
+        journal.evict_prefix_located(1, |op| {
+            Some(BodyPosition {
+                segment_start: op,
+                position: 0,
+            })
+        });
+        let charged = budget.usage();
+        assert_eq!(
+            (charged.resident_bytes, charged.charged_bytes),
+            (resident, ring_body_bytes())
+        );
+
+        journal.clear_all();
+        let charged = budget.usage();
+        assert_eq!(
+            (
+                charged.resident_bytes,
+                charged.command_bytes,
+                charged.charged_bytes
+            ),
+            (0, 0, 0)
+        );
+    }
+
+    /// What the budget holds for `journal` equals what the journal holds.
+    fn assert_charge_synced(
+        journal: &PartitionJournal<PartitionJournalMemStorage>,
+    ) -> JournalBytes {
+        let held = journal.journal_bytes();
+        let charged = journal
+            .ring_charge
+            .borrow()
+            .as_ref()
+            .map(|charge| charge.charged().0);
+        assert_eq!(charged, Some(held));
+        held
+    }
+
+    /// Every mutator brings the charge in line before it returns. A skipped
+    /// sync heals on the next append, so no step appends after its mutator:
+    /// an idle partition would keep the stale charge.
+    #[compio::test]
+    async fn given_each_journal_mutator_when_it_returns_should_leave_the_charge_synced() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+        let message = |op| build_message_prepare(op, op, 1, RING_PAYLOAD_LEN);
+
+        journal.restore_checkpoint_prepare(1, build_command_prepare(1), None);
+        assert!(assert_charge_synced(&journal).commands > 0);
+
+        journal.append(message(3)).await.unwrap();
+        journal.append(message(2)).await.unwrap();
+        assert!(journal.sort_by_op());
+        assert!(assert_charge_synced(&journal).resident > 0);
+
+        assert_eq!(journal.remove_range(1..=3).await.unwrap(), 3);
+        assert_eq!(assert_charge_synced(&journal), JournalBytes::default());
+
+        journal.append(message(4)).await.unwrap();
+        assert_eq!(journal.commit().len(), 1);
+        assert_eq!(assert_charge_synced(&journal).resident, 0);
+
+        journal.set_repair_retention(false);
+        journal.append(build_command_prepare(5)).await.unwrap();
+        journal.append(message(6)).await.unwrap();
+        journal.release_checkpointed_commands(5);
+        assert_eq!(assert_charge_synced(&journal).commands, 0);
+
+        journal.evict_prefix(1);
+        assert_eq!(assert_charge_synced(&journal).resident, 0);
+
+        journal.append(message(7)).await.unwrap();
+        journal.append(build_command_prepare(8)).await.unwrap();
+        journal.clear_all();
+        assert_eq!(assert_charge_synced(&journal), JournalBytes::default());
+    }
+
+    /// The relief counts the resident messages at or below the last mark that
+    /// the op index names. A mark adds the messages it passes, a later copy
+    /// of an op replaces the earlier one, a control op adds nothing, and an
+    /// eviction or a rebuild takes out what leaves.
+    #[compio::test]
+    async fn given_marks_appends_and_copies_when_counting_relief_should_match_the_committed_resident_messages()
+     {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let message = |op| build_message_prepare(op, op, 1, RING_PAYLOAD_LEN);
+        let one = resident_memory_bytes(&message(1));
+        for op in 1..=3 {
+            journal.append(message(op)).await.unwrap();
+        }
+        journal.append(build_control_prepare(4)).await.unwrap();
+        assert_eq!(journal.relief.get(), 0);
+
+        journal.mark_committed(2);
+        assert_eq!(journal.relief.get(), 2 * one);
+        journal.mark_committed(4);
+        assert_eq!(journal.relief.get(), 3 * one);
+
+        journal.append(message(2)).await.unwrap();
+        journal.append(message(5)).await.unwrap();
+        assert_eq!(journal.relief.get(), 3 * one);
+        assert!(journal.sort_by_op());
+        journal.debug_assert_relief();
+        assert_eq!(journal.relief.get(), 3 * one);
+
+        journal.evict_prefix(1);
+        assert_eq!(journal.relief.get(), 2 * one);
+        journal.clear_all();
+        assert_eq!((journal.relief.get(), journal.relief_through.get()), (0, 0));
+    }
+
+    /// A drop takes exactly the entries its target needs, because the deque
+    /// returns the slots of the headers that leave.
+    #[compio::test]
+    async fn given_a_drop_target_when_dropping_headers_should_take_no_more_than_it_needs() {
+        const OPS: u64 = 64;
+        const HEADERS_TO_DROP: usize = 3;
+        let (journal, budget) = charged_ring(OPS).await;
+        journal.release_ring_bodies(usize::MAX, None);
+        let headers = unsafe { &*journal.evicted_headers.get() };
+        let slack = headers.capacity() - headers.len();
+
+        let excess = (slack + HEADERS_TO_DROP) * size_of::<EvictedHeader>();
+        let before = budget.usage().charged_bytes;
+        let shed = journal.drop_ring_entries(excess, None);
+
+        assert_eq!((shed.dropped, shed.left), (HEADERS_TO_DROP, true));
+        assert_eq!(budget.usage().charged_bytes, before - excess);
+    }
+
+    /// A release into a full header window drops the oldest entry to make
+    /// room. The shed reports that entry as dropped, because repair no
+    /// longer serves it.
+    #[compio::test]
+    async fn given_a_full_header_window_when_releasing_for_the_budget_should_report_the_dropped_entries()
+     {
+        const PAST_THE_WINDOW: usize = 2;
+        // The newest entry keeps its body.
+        let ops = u64::try_from(EVICTED_HEADERS_MAX + PAST_THE_WINDOW + 1).unwrap();
+        let (journal, _budget) = charged_ring(ops).await;
+
+        let shed = journal.release_ring_bodies(usize::MAX, None);
+
+        assert_eq!(
+            (shed.released, shed.dropped, shed.left),
+            (
+                EVICTED_HEADERS_MAX + PAST_THE_WINDOW,
+                PAST_THE_WINDOW,
+                false
+            )
+        );
+        assert_eq!(
+            journal.repair_retained_from(),
+            Some(u64::try_from(PAST_THE_WINDOW).unwrap() + 1)
+        );
+    }
+
+    /// Without repair retention the ring is gone, and so is its charge.
+    #[compio::test]
+    async fn given_a_charged_ring_when_repair_retention_ends_should_return_its_charge() {
+        let (journal, budget) = charged_ring(4).await;
+        journal.release_ring_bodies(usize::MAX, None);
+
+        journal.set_repair_retention(false);
+
+        assert_eq!(budget.usage().charged_bytes, 0);
+        assert_eq!(budget.usage().floor_bytes, 0);
+    }
+
+    /// The commit point a restart restores is the newest entry of its ring.
+    #[compio::test]
+    async fn given_a_restored_checkpoint_prepare_when_charged_should_count_it_as_the_floor() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+
+        journal.restore_checkpoint_prepare(
+            1,
+            build_message_prepare(1, 0, 1, RING_PAYLOAD_LEN),
+            None,
+        );
+
+        let body = ring_body_bytes();
+        assert_eq!(budget.usage().charged_bytes, body);
+        assert_eq!(budget.usage().floor_bytes, body);
+    }
+
+    /// A view change and a transfer donor read the command at the commit
+    /// point from memory. It counts in the floor from its restore or its
+    /// commit until a later op commits, also one that brings no relief.
+    #[compio::test]
+    async fn given_a_command_at_the_commit_point_when_the_commit_point_moves_should_move_the_floor()
+    {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+
+        journal.restore_checkpoint_prepare(1, build_command_prepare(1), None);
+        let command = budget.usage().command_bytes;
+        assert_eq!(budget.usage().floor_bytes, command);
+
+        journal.append(build_control_prepare(2)).await.unwrap();
+        journal.mark_committed(2);
+        assert_eq!(budget.usage().floor_bytes, 0);
+
+        journal.append(build_command_prepare(3)).await.unwrap();
+        assert_eq!(budget.usage().floor_bytes, 0);
+        journal.mark_committed(3);
+        assert_eq!(budget.usage().floor_bytes, command);
+    }
+
+    /// A restart restores the commit point with the segment record of its
+    /// body. Once a newer op enters the ring, the shed can release that body.
+    /// Without the record, the body stays until the entry drops.
+    #[compio::test]
+    async fn given_a_restored_checkpoint_prepare_when_a_newer_op_arrives_should_release_its_body_only_with_its_record()
+     {
+        for (body, released) in [
+            (None, false),
+            (
+                Some(BodyPosition {
+                    segment_start: 0,
+                    position: 0,
+                }),
+                true,
+            ),
+        ] {
+            let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+            let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+            journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+            journal.restore_checkpoint_prepare(
+                1,
+                build_message_prepare(1, 0, 1, RING_PAYLOAD_LEN),
+                body,
+            );
+            journal.release_ring_bodies(usize::MAX, None);
+            assert_eq!(
+                budget.usage().charged_bytes,
+                ring_body_bytes(),
+                "the newest entry keeps its body"
+            );
+
+            journal
+                .append(build_message_prepare(2, 1, 1, RING_PAYLOAD_LEN))
+                .await
+                .unwrap();
+            journal.evict_prefix_located(1, |op| {
+                Some(BodyPosition {
+                    segment_start: op,
+                    position: 0,
+                })
+            });
+            journal.release_ring_bodies(usize::MAX, None);
+
+            let headers = unsafe { &*journal.evicted_headers.get() };
+            let charged = if released {
+                ring_body_bytes() + headers.capacity() * size_of::<EvictedHeader>()
+            } else {
+                2 * ring_body_bytes()
+            };
+            assert_eq!(budget.usage().charged_bytes, charged, "body {body:?}");
+        }
+    }
+
+    /// Retention deletes a segment, and the ring forgets the entries in it.
+    #[compio::test]
+    async fn given_released_entries_when_their_segment_goes_should_return_their_charge() {
+        const OPS: u64 = 64;
+        const DELETED_THROUGH: u64 = 60;
+        let (journal, budget) = charged_ring(OPS).await;
+        journal.release_ring_bodies(usize::MAX, None);
+        let before = budget.usage().charged_bytes;
+
+        journal.forget_segment(DELETED_THROUGH);
+
+        assert_eq!(journal.repair_retained_from(), Some(DELETED_THROUGH + 1));
+        let headers = unsafe { &*journal.evicted_headers.get() };
+        assert_eq!(
+            budget.usage().charged_bytes,
+            ring_body_bytes() + headers.capacity() * size_of::<EvictedHeader>()
+        );
+        assert!(
+            budget.usage().charged_bytes < before,
+            "the deque kept the slots of the forgotten headers"
+        );
+    }
+
+    /// A pinned transfer plan needs every body from the op after its commit
+    /// point in memory. The shed stops below that op, and reports nothing
+    /// left, so the shard does not visit the ring again for it.
+    #[compio::test]
+    async fn given_a_pinned_plan_tail_when_shedding_should_keep_the_entries_from_it() {
+        const OPS: u64 = 6;
+        const PLAN_FROM: u64 = 4;
+        let (journal, _budget) = charged_ring(OPS).await;
+
+        let released = journal.release_ring_bodies(usize::MAX, Some(PLAN_FROM));
+        assert_eq!((released.released, released.left), (3, false));
+        assert_eq!(journal.memory_retained_from(), Some(PLAN_FROM));
+
+        let dropped = journal.drop_ring_entries(usize::MAX, Some(PLAN_FROM));
+        assert_eq!((dropped.dropped, dropped.left), (3, false));
+        assert_eq!(journal.repair_retained_from(), Some(PLAN_FROM));
+        for op in PLAN_FROM..=OPS {
+            assert!(journal.repair_entry(op).is_some(), "op {op} lost its body");
+        }
+
+        let unpinned = journal.release_ring_bodies(usize::MAX, None);
+        assert_eq!((unpinned.released, unpinned.left), (2, false));
+    }
+
+    /// Retention that deletes a segment of a snapshot tail ends its lease.
+    /// The bodies the lease pinned are then free to shed, so the ring goes
+    /// back in the shed's queue.
+    #[compio::test]
+    async fn given_a_pinned_ring_when_retention_ends_its_lease_should_queue_it_for_the_shed() {
+        const OPS: u64 = 4;
+        const RING_CAPACITY: u64 = 2;
+        const TAIL_THROUGH: u64 = OPS - RING_CAPACITY;
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        journal.set_ring_caps(usize::try_from(RING_CAPACITY).unwrap(), u64::MAX);
+        let budget = Rc::new(RepairRingBudget::new(usize::MAX));
+        journal.attach_ring_budget(Rc::clone(&budget), IggyNamespace::new(1, 1, 0));
+        let memory = Arc::new(RepairMemoryBudget::new(usize::MAX));
+        let lease = journal.retain_repair_from(1, memory.reservation());
+        for op in 1..=OPS {
+            journal
+                .append(build_message_prepare(op, op - 1, 1, RING_PAYLOAD_LEN))
+                .await
+                .unwrap();
+        }
+        journal.evict_prefix_located(usize::try_from(OPS).unwrap(), |op| {
+            Some(BodyPosition {
+                segment_start: op,
+                position: 0,
+            })
+        });
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        let ticket = budget.oldest_grown();
+        assert!(ticket.is_some());
+        let pinned = journal.release_ring_bodies(usize::MAX, None);
+        assert_eq!((pinned.released, pinned.left), (0, false));
+        budget.pop_grown();
+        assert_eq!(budget.oldest_grown(), None);
+
+        journal.forget_segment(TAIL_THROUGH);
+
+        assert!(!lease.is_valid());
+        assert_eq!(
+            budget.oldest_grown(),
+            ticket,
+            "the ring lost its lease but stays out of the shed's queue"
+        );
+        let unpinned = journal.release_ring_bodies(usize::MAX, None);
+        assert_eq!((unpinned.released, unpinned.left), (1, false));
+    }
+
     #[compio::test]
     async fn repair_headers_in_serves_the_commit_point_from_the_evicted_ring() {
         // Blank AT the commit point is the one slot a merge can neither adopt nor
@@ -1839,9 +3930,9 @@ mod tests {
             "read must not evict op 1"
         );
 
-        let retained = journal.evict_prefix(committed.len());
+        journal.evict_prefix(committed.len());
         assert_eq!(
-            retained.len(),
+            journal.resident_entries().len(),
             2,
             "ops 3 and 4 stay resident after eviction"
         );
@@ -1852,7 +3943,7 @@ mod tests {
         let header3 = journal.header_by_op(3).expect("op 3 must be retained");
         let header4 = journal.header_by_op(4).expect("op 4 must be retained");
 
-        // Retained entries are still byte-readable after the storage rebuild.
+        // Retained entries are still byte-readable after the eviction.
         for header in [header3, header4] {
             let entry = journal
                 .entry(&header)
@@ -1867,8 +3958,7 @@ mod tests {
 
         // Advancing the frontier flushes the rest with no gap.
         let committed = journal.committed_prefix(4);
-        let rest = journal.evict_prefix(committed.len());
-        assert!(rest.is_empty(), "ops 3 and 4 flush on the next evict");
+        journal.evict_prefix(committed.len());
         assert!(journal.is_empty(), "journal is empty once all ops flushed");
     }
 
@@ -1899,8 +3989,12 @@ mod tests {
             .collect();
         assert_eq!(ops, vec![1, 2], "prefix stops before the op 3 gap");
 
-        let retained = journal.evict_prefix(committed.len());
-        assert_eq!(retained.len(), 1, "op 4 stays retained past the gap");
+        journal.evict_prefix(committed.len());
+        assert_eq!(
+            journal.resident_entries().len(),
+            1,
+            "op 4 stays retained past the gap"
+        );
         assert!(journal.header_by_op(4).is_some(), "op 4 still resident");
     }
 
@@ -1998,6 +4092,27 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_reordered_duplicates_when_walking_should_follow_op_order_and_first_copy() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for (op, checksum) in [(3, 30), (1, 10), (4, 40), (2, 20), (1, 11), (2, 21)] {
+            let entry = build_prepare(op, HEADER_SIZE).transmute_header(
+                |mut old, header: &mut PrepareHeader| {
+                    old.checksum = checksum;
+                    *header = old;
+                },
+            );
+            journal.append(entry.into_frozen()).await.unwrap();
+        }
+
+        let run: Vec<_> = journal
+            .committed_headers_from(1, u64::MAX, usize::MAX)
+            .iter()
+            .map(|header| (header.op, header.checksum))
+            .collect();
+        assert_eq!(run, vec![(1, 10), (2, 20), (3, 30), (4, 40)]);
+    }
+
     /// Three-message batch with the broker append time (`base_timestamp`)
     /// deliberately AFTER every producer stamp (`origin_timestamp` + deltas),
     /// the layout every real batch has (the broker stamps later than the
@@ -2086,6 +4201,145 @@ mod tests {
             .into_frozen()
     }
 
+    fn build_command_prepare(op: u64) -> Frozen<4096> {
+        build_prepare(op, HEADER_SIZE + 16)
+            .transmute_header(|header: PrepareHeader, command: &mut PrepareHeader| {
+                *command = header;
+                command.operation = Operation::StateMachineCommand;
+                command.commit = op - 1;
+            })
+            .into_frozen()
+    }
+
+    /// Ops 1 and 4 carry messages, 2 and 5 are commands, 3 is a consumer
+    /// offset op.
+    async fn interleaved_journal() -> PartitionJournal<PartitionJournalMemStorage> {
+        journal_with(&[
+            build_message_prepare(1, 0, 1, 8),
+            build_command_prepare(2),
+            build_control_prepare(3),
+            build_message_prepare(4, 1, 1, 8),
+            build_command_prepare(5),
+        ])
+        .await
+    }
+
+    #[compio::test]
+    async fn given_commands_between_entries_when_looking_up_by_op_should_answer_from_both_logs() {
+        let journal = interleaved_journal().await;
+
+        assert_eq!(journal.held_through(0), 5);
+        assert_eq!(journal.last_op(), Some(5));
+        assert_eq!(journal.held_below(5), Some(4));
+        assert_eq!(journal.held_below(4), Some(3));
+        for op in 1..=5 {
+            assert!(journal.holds_op(op), "op {op}");
+            assert_eq!(journal.header_by_op(op).map(|header| header.op), Some(op));
+            assert!(journal.repair_entry(op).is_some(), "op {op}");
+        }
+        assert_eq!(
+            journal
+                .repair_headers_in(1..=5)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert!(journal.repaired_window_shape(0, 5).complete);
+        assert_eq!(
+            journal
+                .committed_headers_from(1, 5, usize::MAX)
+                .iter()
+                .map(|header| header.op)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // Polls, flushes and the control-op bound see the data log only.
+        assert_eq!(entry_ops(&journal.resident_entries()), vec![1, 3, 4]);
+        assert_eq!(journal.resident_control_ops(), 1);
+        assert_eq!(journal.resident_messages(), 2);
+        assert_eq!(journal.command_ops(), vec![2, 5]);
+    }
+
+    #[compio::test]
+    async fn given_commands_between_entries_when_flushing_should_step_over_them() {
+        let journal = interleaved_journal().await;
+        // Ops 1 to 4 are contiguous once the command at 2 fills its gap.
+        assert_eq!(journal.committed_prefix_len(0, 4), 3);
+        assert_eq!(journal.committed_prefix_len(0, 1), 1);
+        // A command at the front starts the prefix right above the flushed ops.
+        let leading =
+            journal_with(&[build_command_prepare(1), build_message_prepare(2, 0, 1, 8)]).await;
+        assert_eq!(leading.committed_prefix_len(0, 2), 1);
+        // A missing op is a hole either way.
+        let holed = journal_with(&[
+            build_message_prepare(1, 0, 1, 8),
+            build_message_prepare(4, 1, 1, 8),
+            build_command_prepare(2),
+        ])
+        .await;
+        assert_eq!(holed.held_through(0), 2);
+    }
+
+    #[compio::test]
+    async fn given_commands_when_removing_a_suffix_should_drop_both_logs_and_refill() {
+        let journal = interleaved_journal().await;
+        assert_eq!(journal.remove_range(4..=u64::MAX).await.unwrap(), 2);
+        assert_eq!(journal.last_op(), Some(3));
+        assert_eq!(journal.held_through(0), 3);
+        journal.append(build_command_prepare(4)).await.unwrap();
+        assert_eq!(journal.held_through(0), 4);
+        assert_eq!(journal.commands_in(4..=4), 1);
+        journal.clear_all();
+        assert!(journal.holds_no_ops());
+    }
+
+    #[compio::test]
+    async fn given_committed_commands_when_releasing_should_raise_the_repair_floor() {
+        let journal = journal_with(&[build_command_prepare(1), build_command_prepare(2)]).await;
+        assert_eq!(journal.repair_retained_from(), Some(1));
+        journal.retain_commands_from(2);
+        assert_eq!(journal.repair_retained_from(), Some(2));
+        journal.restore_checkpoint_prepare(3, build_command_prepare(3), None);
+        assert_eq!(journal.commands_in(3..=3), 1);
+        assert_eq!(journal.repair_retained_from(), Some(3));
+    }
+
+    /// Nothing serves a released command without repair retention, so every
+    /// checkpointed command goes and only the ones above the checkpoint stay.
+    #[compio::test]
+    async fn given_no_repair_retention_when_releasing_should_drop_every_checkpointed_command() {
+        let commands: Vec<_> = (1..=4).map(build_command_prepare).collect();
+        let retained = journal_with(&commands).await;
+        assert!(!retained.release_checkpointed_commands(3));
+        assert_eq!(
+            retained.commands_in(..),
+            4,
+            "within the caps, repair keeps them"
+        );
+
+        let unretained = journal_with(&commands).await;
+        unretained.set_repair_retention(false);
+        assert!(!unretained.release_checkpointed_commands(3));
+        assert_eq!(unretained.commands_in(..), 1);
+        assert_eq!(unretained.commands_in(4..=4), 1);
+        assert_eq!(unretained.repair_retained_from(), Some(4));
+    }
+
+    /// A completed suffix repair asks about the window above its target,
+    /// which is empty, while commands are still held.
+    #[compio::test]
+    #[allow(clippy::reversed_empty_ranges)]
+    async fn given_held_commands_when_the_repair_window_is_empty_should_report_it_complete() {
+        let journal =
+            journal_with(&[build_message_prepare(1, 0, 1, 8), build_command_prepare(2)]).await;
+        assert!(journal.repaired_window_shape(2, 2).complete);
+        assert!(journal.repaired_window_shape(5, 2).complete);
+        assert!(journal.repaired_window_shape(0, 2).complete);
+        assert!(!journal.repaired_window_shape(0, 3).complete);
+        assert!(!journal.holds_op_in(3..=2));
+    }
+
     fn entry_ops(entries: &[Frozen<4096>]) -> Vec<u64> {
         entries
             .iter()
@@ -2116,7 +4370,7 @@ mod tests {
         );
         assert_eq!(journal.resident_control_ops(), 3);
 
-        // Eviction rebuilds the poll view from the retained tail.
+        // Eviction drops the evicted batches from the poll view.
         journal.evict_prefix(2);
         assert_eq!(entry_ops(&journal.resident_message_entries()), vec![3, 5]);
         assert_eq!(journal.resident_control_ops(), 2);
@@ -2152,6 +4406,196 @@ mod tests {
             .expect("append");
         journal.clear_all();
         assert_eq!(journal.resident_control_ops(), 0);
+    }
+
+    /// What readers see of the resident journal. The storage offsets of an
+    /// eviction and of a rebuild differ, so entries are read back through them
+    /// instead of compared. Probing `held_through` also seeds its cached run.
+    #[derive(Debug, PartialEq)]
+    struct ResidentView {
+        entry_ops: Vec<u64>,
+        headers: Vec<Option<PrepareHeader>>,
+        reads: Vec<(u64, Option<u64>)>,
+        offsets: BTreeMap<u64, u64>,
+        timestamps: BTreeMap<(u64, u64), u64>,
+        held_through: Vec<u64>,
+        control_ops: usize,
+        totals: (u64, u64),
+        out_of_order: bool,
+    }
+
+    fn resident_view(
+        journal: &PartitionJournal<PartitionJournalMemStorage>,
+        top_op: u64,
+    ) -> ResidentView {
+        let inner = unsafe { &*journal.inner.get() };
+        let entries = journal.resident_entries();
+        let folded = entries.iter().fold((0, 0), |(messages, size), entry| {
+            let header =
+                bytemuck::checked::try_from_bytes::<PrepareHeader>(&entry[..PREPARE_HEADER_SIZE])
+                    .expect("entry holds a valid prepare header");
+            RetainedBatchMeta::of(header, entry).map_or((messages, size), |meta| {
+                (
+                    messages + u64::from(meta.message_count),
+                    size + meta.total_size,
+                )
+            })
+        });
+        let totals = (journal.resident_messages(), journal.resident_message_size());
+        assert_eq!(totals, folded, "the totals must count the resident batches");
+        ResidentView {
+            entry_ops: entry_ops(&entries),
+            headers: (0..=top_op).map(|op| journal.header_by_op(op)).collect(),
+            reads: unsafe { &*journal.op_to_storage_offset.get() }
+                .iter()
+                .map(|(&op, &storage_offset)| {
+                    let entry = inner.storage.read_at_sync(storage_offset);
+                    (op, entry.map(|entry| entry_ops(&[entry])[0]))
+                })
+                .collect(),
+            offsets: unsafe { &*journal.offset_to_op.get() }.clone(),
+            timestamps: unsafe { &*journal.timestamp_to_op.get() }.clone(),
+            held_through: (0..=top_op)
+                .map(|floor| journal.held_through(floor))
+                .collect(),
+            control_ops: journal.resident_control_ops(),
+            totals,
+            out_of_order: journal.out_of_order.get(),
+        }
+    }
+
+    async fn journal_with(
+        entries: &[Frozen<4096>],
+    ) -> PartitionJournal<PartitionJournalMemStorage> {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for entry in entries {
+            journal.append(entry.clone()).await.expect("append");
+        }
+        journal
+    }
+
+    #[compio::test]
+    async fn given_journal_shapes_when_evicting_a_prefix_should_leave_what_a_rebuild_leaves() {
+        // `(op, base offset)` per entry, `None` for an offset op. The shapes:
+        // batches between offset ops, two batches at one base offset, and a
+        // duplicated op that a prefix either takes whole or splits.
+        let shapes: [&[(u64, Option<u64>)]; 3] = [
+            &[
+                (1, Some(0)),
+                (2, None),
+                (3, Some(3)),
+                (4, None),
+                (5, Some(6)),
+                (6, Some(9)),
+                (7, None),
+            ],
+            &[(1, Some(0)), (2, Some(3)), (3, Some(3)), (4, Some(6))],
+            &[(1, Some(0)), (2, None), (2, None), (3, Some(3)), (4, None)],
+        ];
+        for shape in shapes {
+            let entries: Vec<_> = shape
+                .iter()
+                .zip(0u128..)
+                .map(|(&(op, base_offset), checksum)| {
+                    base_offset.map_or_else(
+                        || {
+                            build_prepare(op, HEADER_SIZE + 16)
+                                .transmute_header(|mut old, header: &mut PrepareHeader| {
+                                    old.checksum = checksum;
+                                    *header = old;
+                                })
+                                .into_frozen()
+                        },
+                        |base_offset| build_message_prepare(op, base_offset, 3, 8),
+                    )
+                })
+                .collect();
+            let next_op = shape.iter().map(|(op, _)| op).max().unwrap() + 1;
+            let next = build_message_prepare(next_op, 100, 3, 8);
+            for count in 0..=entries.len() + 1 {
+                let popped = journal_with(&entries).await;
+                let rebuilt = journal_with(&entries).await;
+                resident_view(&popped, next_op);
+                resident_view(&rebuilt, next_op);
+
+                popped.evict_prefix(count);
+                rebuilt.rebuild_without_prefix(count);
+                assert_eq!(
+                    resident_view(&popped, next_op),
+                    resident_view(&rebuilt, next_op),
+                    "shape {shape:?}, evicting {count}"
+                );
+
+                // Positions taken after the eviction must stay right too.
+                for journal in [&popped, &rebuilt] {
+                    journal.append(next.clone()).await.expect("append");
+                }
+                popped.evict_prefix(1);
+                rebuilt.rebuild_without_prefix(1);
+                assert_eq!(
+                    resident_view(&popped, next_op),
+                    resident_view(&rebuilt, next_op),
+                    "shape {shape:?}, evicting {count} and then 1"
+                );
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_backfill_inside_the_prefix_when_evicting_should_flush_the_tail_in_order() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for op in [1u64, 2, 5, 3, 4] {
+            journal
+                .append(build_control_prepare(op))
+                .await
+                .expect("append");
+        }
+        assert_eq!(journal.committed_prefix_len(0, u64::MAX), 0);
+
+        journal.evict_prefix(3);
+
+        assert_eq!(entry_ops(&journal.resident_entries()), vec![3, 4]);
+        assert_eq!(
+            journal.committed_prefix_len(0, u64::MAX),
+            2,
+            "the out-of-order pair left with the prefix"
+        );
+    }
+
+    #[compio::test]
+    async fn given_every_rebuild_when_counting_resident_messages_should_count_the_batches() {
+        let journal = PartitionJournal::<PartitionJournalMemStorage>::default();
+        for (op, base_offset) in [(1u64, 0u64), (3, 6), (4, 9), (2, 3)] {
+            journal
+                .append(build_message_prepare(op, base_offset, 3, 8))
+                .await
+                .expect("append");
+        }
+        let batch_size = journal.resident_message_size() / 4;
+        assert_eq!(journal.resident_messages(), 12);
+
+        assert!(journal.sort_by_op());
+        assert_eq!(journal.resident_messages(), 12, "sorting keeps every batch");
+
+        journal.evict_prefix(1);
+        assert_eq!(journal.resident_messages(), 9);
+        assert_eq!(journal.resident_message_size(), 3 * batch_size);
+
+        journal.truncate_from(4).await.expect("truncate");
+        assert_eq!(journal.resident_messages(), 6, "ops 2 and 3 stay");
+
+        journal.commit();
+        assert_eq!(journal.resident_messages(), 0);
+
+        journal
+            .append(build_message_prepare(5, 12, 3, 8))
+            .await
+            .expect("append");
+        journal.clear_all();
+        assert_eq!(
+            (journal.resident_messages(), journal.resident_message_size()),
+            (0, 0)
+        );
     }
 
     fn offset_lookup(offset: u64, count: u32) -> MessageLookup {

@@ -18,7 +18,9 @@
 use crate::WireError;
 use crate::codec::{WireDecode, WireEncode, read_u32_le};
 use crate::primitives::options::{WireOptions, decode_options_prefixed};
-use crate::primitives::partition_assignment::CreatedPartitionAssignment;
+use crate::primitives::partition_assignment::{
+    CreatedPartitionAssignment, decode_members, encode_members, members_encoded_size,
+};
 use crate::requests::topics::CreateTopicRequest;
 use bytes::{BufMut, BytesMut};
 
@@ -51,6 +53,7 @@ impl WireEncode for CreateTopicWithAssignmentsRequest {
                 .iter()
                 .map(WireEncode::encoded_size)
                 .sum::<usize>()
+            + members_encoded_size(&self.partitions)
     }
 
     fn encode(&self, buf: &mut BytesMut) {
@@ -71,6 +74,7 @@ impl WireEncode for CreateTopicWithAssignmentsRequest {
         for partition in &self.partitions {
             partition.encode(buf);
         }
+        encode_members(&self.partitions, buf);
     }
 }
 
@@ -135,6 +139,7 @@ impl WireDecode for CreateTopicWithAssignmentsRequest {
             offset += consumed;
             partitions.push(partition);
         }
+        offset += decode_members(buf, offset, &mut partitions)?;
 
         Ok((
             Self {
@@ -180,11 +185,13 @@ mod tests {
                     initial_view: 7,
                     partition_id: 0,
                     consensus_group_id: 1,
+                    members: Vec::new(),
                 },
                 CreatedPartitionAssignment {
                     initial_view: 8,
                     partition_id: 1,
                     consensus_group_id: 2,
+                    members: Vec::new(),
                 },
             ],
         };
@@ -209,6 +216,7 @@ mod tests {
                 initial_view: 7,
                 partition_id: 0,
                 consensus_group_id: 1,
+                members: Vec::new(),
             }],
         };
         let bytes = request.to_bytes();
@@ -247,6 +255,49 @@ mod tests {
             CreateTopicWithAssignmentsRequest::decode_from(&huge_count),
             Err(WireError::UnexpectedEof { .. })
         ));
+    }
+
+    #[test]
+    fn given_member_lists_when_encoding_should_roundtrip_and_stay_optional() {
+        let assignment = |partition_id, members: &[u8]| CreatedPartitionAssignment {
+            initial_view: 1,
+            partition_id,
+            consensus_group_id: u64::from(partition_id) + 1,
+            members: members.to_vec(),
+        };
+        let mut request = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(1),
+                partitions_count: 2,
+                name: WireName::new("events").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: vec![assignment(0, &[4, 1, 3]), assignment(1, &[1, 3, 0])],
+        };
+        let bytes = request.to_bytes();
+        assert_eq!(bytes.len(), request.encoded_size());
+        assert_eq!(&bytes[bytes.len() - 7..], &[3, 4, 1, 3, 1, 3, 0]);
+        assert_eq!(
+            CreateTopicWithAssignmentsRequest::decode_from(&bytes).unwrap(),
+            request
+        );
+        for truncated in bytes.len() - 6..bytes.len() {
+            assert!(matches!(
+                CreateTopicWithAssignmentsRequest::decode_from(&bytes[..truncated]),
+                Err(WireError::UnexpectedEof { .. })
+            ));
+        }
+
+        for partition in &mut request.partitions {
+            partition.members.clear();
+        }
+        let legacy = request.to_bytes();
+        assert_eq!(legacy.len(), bytes.len() - 7);
+        assert_eq!(
+            CreateTopicWithAssignmentsRequest::decode_from(&legacy).unwrap(),
+            request
+        );
     }
 
     #[test]

@@ -128,9 +128,10 @@ pub async fn read_message<S: AsyncReadExt>(
     let body_size = total_size - HEADER_SIZE;
 
     // Stage 2: grow the same `Owned` in place and fill the tail via a
-    // slice read. Total allocations for a body frame: ONE
-    // (`Owned::with_capacity(HEADER_SIZE)` plus one in-place realloc of
-    // the backing AVec). The body lands in this `Owned` in one pass. A
+    // slice read. Total allocations for a body frame: ONE. The header
+    // buffer takes a whole `MESSAGE_ALIGN` unit, so a frame up to that
+    // size grows inside it and a bigger frame reallocs the backing AVec
+    // once. The body lands in this `Owned` in one pass. A
     // buffered read half skips the buffer only on an empty buffer and a
     // caller slice of at least one buffer, so a body of one to two buffers
     // crosses the buffer whole.
@@ -228,6 +229,43 @@ mod tests {
 
         let res = read_message(&mut b, MAX_MESSAGE_SIZE).await;
         assert!(matches!(res, Err(IggyError::InvalidCommand)));
+    }
+
+    /// Two small frames from one write come out whole on an unbuffered
+    /// stream. Each lands in a buffer whose block is a whole alignment
+    /// unit, bigger than the frame, and the read still stops at the size
+    /// from the header.
+    #[compio::test]
+    #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
+    async fn read_splits_back_to_back_frames_smaller_than_their_block() {
+        const FRAME_LENS: [usize; 2] = [624, 1000];
+        let frames: Vec<_> = FRAME_LENS
+            .into_iter()
+            .zip(1u8..)
+            .map(|(frame_len, fill)| {
+                let mut msg = Message::<GenericHeader>::new(frame_len).transmute_header(
+                    |_, h: &mut GenericHeader| {
+                        h.command = Command::Ping;
+                        h.size = frame_len as u32;
+                    },
+                );
+                msg.as_mut_slice()[HEADER_SIZE..].fill(fill);
+                msg.into_frozen()
+            })
+            .collect();
+        let expected: Vec<Vec<u8>> = frames.iter().map(|frame| frame.to_vec()).collect();
+
+        let (mut a, mut b) = local_pair().await;
+        a.write_vectored_all(frames).await.0.unwrap();
+
+        for frame in &expected {
+            let read = read_message(&mut b, MAX_MESSAGE_SIZE)
+                .await
+                .unwrap()
+                .into_frozen();
+            assert_eq!(read.as_slice(), frame.as_slice());
+            assert_eq!(read.backing_capacity(), MESSAGE_ALIGN);
+        }
     }
 
     /// The one place the batching factor is asserted: here the traffic

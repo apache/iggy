@@ -148,8 +148,10 @@ struct CommandCodeTests {
     }
 
     @Test func serverOrderedOperationsAreInternal() {
-        let partitionFences: [ConsensusOperation] = [.retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners]
-        for operation in partitionFences {
+        let serverOrderedPartitionOperations: [ConsensusOperation] = [
+            .retireSession, .installConsumerGroupOwner, .transitionPartitionHistory, .retireConsumerGroupOwners, .stateMachineCommand,
+        ]
+        for operation in serverOrderedPartitionOperations {
             #expect(operation.isInternal)
             #expect(operation.isPartition)
             #expect(!operation.isMetadata)
@@ -157,7 +159,7 @@ struct CommandCodeTests {
         }
         for operation in [
             ConsensusOperation.finalizeSession, .completeLifecycle, .truncatePartition, .updateStreamResolved, .updateTopicResolved,
-            .updateUserResolved, .rewrapStreamKeys,
+            .updateUserResolved, .rewrapStreamKeys, .shadowTopic,
         ] {
             #expect(operation.isInternal)
             #expect(operation.isMetadata)
@@ -165,6 +167,8 @@ struct CommandCodeTests {
         }
         #expect(ConsensusOperation.forCode(CommandCode.updateResource.rawValue) == .updateResource)
         #expect(ConsensusOperation.updateResource.isMetadata && ConsensusOperation.updateResource.isResultFramed)
+        #expect(ConsensusOperation.forCode(CommandCode.retireGeoOrigin.rawValue) == .retireGeoOrigin)
+        #expect(ConsensusOperation.retireGeoOrigin.isMetadata && ConsensusOperation.retireGeoOrigin.isResultFramed)
         for operation in [ConsensusOperation.sendMessages, .storeConsumerOffset, .createStream, .register, .updateResource] {
             #expect(!operation.isInternal)
         }

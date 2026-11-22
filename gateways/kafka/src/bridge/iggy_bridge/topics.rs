@@ -21,8 +21,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iggy::prelude::{
-    Identifier, IggyClient, IggyError, IggyExpiry, PartitionClient, StreamClient,
-    StreamCreateOptions, Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions,
+    Identifier, IggyClient, IggyError, PartitionClient, StreamClient, StreamCreateOptions, Topic,
+    TopicClient, TopicDetails,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::{Instant, timeout_at};
@@ -31,7 +31,9 @@ use tracing::{debug, info, warn};
 use super::{IggyBridge, REQUEST_TIMEOUT, metadata_write_on, with_request_timeout};
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::validate_kafka_topic_name;
-use crate::protocol::handlers::topic_config::message_expiry_is_explicit;
+use crate::bridge::topic_settings::{
+    KafkaTopicSettings, TopicConfigSnapshot, TopicConfigUpdate, replication_factor_of,
+};
 
 /// Partitions of a topic whose creator leaves the count to the broker: Kafka's own
 /// `num.partitions` default.
@@ -58,7 +60,10 @@ const AUTO_CREATE_LIMIT: std::time::Duration = REQUEST_TIMEOUT.saturating_mul(4)
 /// `TOPIC_ALREADY_EXISTS`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TopicCreationOutcome {
-    Created,
+    /// Created, with the replication factor Iggy stored, the server default included.
+    Created {
+        replication_factor: Option<u32>,
+    },
     AlreadyExists,
 }
 
@@ -73,6 +78,8 @@ pub enum TopicCreationOutcome {
 pub struct KafkaTopicMetadata {
     pub kafka_topic: String,
     pub partitions_count: u32,
+    /// The replication factor Iggy stored, or `None` for a topic created before Iggy stored one.
+    pub replication_factor: Option<u32>,
 }
 
 /// [`IggyBridge::list_kafka_topics`], with the override topics that it leaves out because the
@@ -184,16 +191,8 @@ impl IggyBridge {
             return Ok(());
         }
 
-        // message_expiry left at TopicCreateOptions::default() (None -> ServerDefault) means
-        // never-expire (segment_cleaner.rs treats ServerDefault the same as NeverExpire), not
-        // Kafka's own 7-day default - deliberate for now (imposing a retention policy is a product
-        // decision this bridge shouldn't make unasked), but a real surprise for anyone repointing
-        // a Kafka app that assumes bounded retention. Flagged in the README; revisit once there's
-        // a way to configure it (env var, topic-mapping field) rather than hardcoding a number.
-        let options = TopicCreateOptions {
-            partitions_count: Some(partition_count),
-            ..TopicCreateOptions::default()
-        };
+        let options = KafkaTopicSettings::default()
+            .create_options(partition_count, &self.config.topic_defaults);
         match self
             .metadata_write(|| self.client.create_topic(stream_id, topic_name, &options))
             .await
@@ -352,7 +351,8 @@ impl IggyBridge {
         with_request_timeout(client.get_topic(&stream_id, &topic_id)).await
     }
 
-    /// Sets `message_expiry` on the Iggy topic backing `kafka_topic`.
+    /// Writes `update` to the Iggy topic backing `kafka_topic`: the expiry, the size cap, or both,
+    /// each set or reset to the Iggy default. An empty update writes nothing.
     ///
     /// Does not create the topic and does not rename it.
     ///
@@ -362,19 +362,19 @@ impl IggyBridge {
     /// topic-naming rules. Returns [`BridgeError::Timeout`] if a call takes longer than
     /// `REQUEST_TIMEOUT`. Returns [`BridgeError::Iggy`] for connectivity, auth, or a
     /// missing topic.
-    pub async fn update_kafka_topic_message_expiry(
+    pub async fn update_kafka_topic_config(
         &self,
         kafka_topic: &str,
-        message_expiry: IggyExpiry,
+        update: &TopicConfigUpdate,
     ) -> Result<(), BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
+        if update.is_empty() {
+            return Ok(());
+        }
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
         let topic_id = Identifier::named(topic_name).map_err(BridgeError::Iggy)?;
-        let options = TopicUpdateOptions {
-            message_expiry: Some(message_expiry),
-            ..TopicUpdateOptions::default()
-        };
+        let options = update.options();
         self.metadata_write(|| self.client.update_topic(&stream_id, &topic_id, &options))
             .await
     }
@@ -423,14 +423,17 @@ impl IggyBridge {
             .map(|(_, stream_name, _)| stream_name.clone())
             .collect();
 
-        let mut topics_by_stream: HashMap<String, HashMap<String, u32>> =
+        let mut topics_by_stream: HashMap<String, HashMap<String, (u32, Option<u32>)>> =
             HashMap::with_capacity(distinct_streams.len());
         for stream_name in distinct_streams {
             let stream_id = Identifier::named(&stream_name).map_err(BridgeError::Iggy)?;
             let topics = with_request_timeout(self.client.get_topics(&stream_id)).await?;
             let by_name = topics
                 .into_iter()
-                .map(|topic| (topic.name, topic.partitions_count))
+                .map(|topic| {
+                    let replication_factor = replication_factor_of(&topic.options);
+                    (topic.name, (topic.partitions_count, replication_factor))
+                })
                 .collect();
             topics_by_stream.insert(stream_name, by_name);
         }
@@ -441,10 +444,13 @@ impl IggyBridge {
                 let metadata = topics_by_stream
                     .get(&stream_name)
                     .and_then(|topics| topics.get(&topic_name))
-                    .map(|&partitions_count| KafkaTopicMetadata {
-                        kafka_topic: kafka_topic.as_str().to_string(),
-                        partitions_count,
-                    });
+                    .map(
+                        |&(partitions_count, replication_factor)| KafkaTopicMetadata {
+                            kafka_topic: kafka_topic.as_str().to_string(),
+                            partitions_count,
+                            replication_factor,
+                        },
+                    );
                 (kafka_topic, metadata)
             })
             .collect())
@@ -472,7 +478,23 @@ impl IggyBridge {
         kafka_topic: &str,
         partition_count: u32,
     ) -> Result<TopicCreationOutcome, BridgeError> {
-        self.create_kafka_topic_on(&self.client, kafka_topic, partition_count)
+        self.create_kafka_topic_with(kafka_topic, partition_count, &KafkaTopicSettings::default())
+            .await
+    }
+
+    /// [`Self::create_kafka_topic`] with the settings a `CreateTopics` request names. Each one it
+    /// leaves out takes the gateway default.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::create_kafka_topic`].
+    pub async fn create_kafka_topic_with(
+        &self,
+        kafka_topic: &str,
+        partition_count: u32,
+        settings: &KafkaTopicSettings,
+    ) -> Result<TopicCreationOutcome, BridgeError> {
+        self.create_kafka_topic_on(&self.client, kafka_topic, partition_count, settings)
             .await
     }
 
@@ -492,7 +514,8 @@ impl IggyBridge {
         partition_count: u32,
     ) -> Result<TopicCreationOutcome, BridgeError> {
         let create = |connected: Arc<IggyClient>| async move {
-            self.create_kafka_topic_on(&connected, kafka_topic, partition_count)
+            let settings = KafkaTopicSettings::default();
+            self.create_kafka_topic_on(&connected, kafka_topic, partition_count, &settings)
                 .await
         };
         self.auto_create_client
@@ -514,6 +537,7 @@ impl IggyBridge {
         client: &IggyClient,
         kafka_topic: &str,
         partition_count: u32,
+        settings: &KafkaTopicSettings,
     ) -> Result<TopicCreationOutcome, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
         if partition_count == 0 {
@@ -524,10 +548,7 @@ impl IggyBridge {
         let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
         let stream_id = Identifier::named(stream_name).map_err(BridgeError::Iggy)?;
 
-        let options = TopicCreateOptions {
-            partitions_count: Some(partition_count),
-            ..TopicCreateOptions::default()
-        };
+        let options = settings.create_options(partition_count, &self.config.topic_defaults);
         let create_topic = || {
             metadata_write_on(client, || {
                 client.create_topic(&stream_id, topic_name, &options)
@@ -556,7 +577,9 @@ impl IggyBridge {
                         requested: partition_count,
                     });
                 }
-                Ok(TopicCreationOutcome::Created)
+                Ok(TopicCreationOutcome::Created {
+                    replication_factor: replication_factor_of(&created.options),
+                })
             }
             Err(BridgeError::Iggy(IggyError::TopicNameAlreadyExists(_, _))) => {
                 Ok(TopicCreationOutcome::AlreadyExists)
@@ -619,6 +642,7 @@ impl IggyBridge {
                 Ok(Some(details)) => results.push(KafkaTopicMetadata {
                     kafka_topic: kafka_topic.to_string(),
                     partitions_count: details.partitions_count,
+                    replication_factor: replication_factor_of(&details.options),
                 }),
                 Ok(None) => {}
                 // One override naming a topic this caller (the bridge user) can't read must not
@@ -663,9 +687,11 @@ impl IggyBridge {
                 );
                 continue;
             }
+            let replication_factor = replication_factor_of(&topic.options);
             results.push(KafkaTopicMetadata {
                 kafka_topic: topic.name,
                 partitions_count: topic.partitions_count,
+                replication_factor,
             });
         }
 
@@ -728,18 +754,6 @@ fn stream_ensured<T>(
         }
         Err(err) => Err(err),
     }
-}
-
-/// `message_expiry` and whether it was set explicitly, from one `get_topics` row.
-///
-/// Enough for `DescribeConfigs`. The partition list on `TopicDetails` is not loaded. Only
-/// [`message_expiry_is_explicit`] of the full `ResourceOptions` map a row carries is ever read
-/// downstream, so this stores that one bit instead of cloning the whole map into the cache for
-/// every topic in the stream, including every topic no describe ever names.
-#[derive(Debug, Clone, Copy)]
-pub struct TopicConfigSnapshot {
-    pub message_expiry: IggyExpiry,
-    pub message_expiry_explicit: bool,
 }
 
 /// One stream's `get_topics` result, shared by every Kafka name that resolves there.
@@ -824,18 +838,13 @@ async fn load_stream(
     }
     match timeout_at(deadline, bridge.topics_in_stream(stream)).await {
         Ok(Ok(topics)) => {
+            // The snapshot keeps the few settings a config request reads, not the whole options
+            // map of every topic in the stream, most of which no request names.
             let ready = topics
                 .into_iter()
                 .map(|topic| {
-                    let message_expiry_explicit = message_expiry_is_explicit(&topic.options);
-                    let message_expiry = topic.resolved_options().message_expiry;
-                    (
-                        topic.name,
-                        TopicConfigSnapshot {
-                            message_expiry,
-                            message_expiry_explicit,
-                        },
-                    )
+                    let snapshot = TopicConfigSnapshot::new(&topic.options, topic.partitions_count);
+                    (topic.name, snapshot)
                 })
                 .collect();
             StreamLoad::Ready(ready)

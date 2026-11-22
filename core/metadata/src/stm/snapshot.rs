@@ -67,13 +67,37 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 14: `TopicSnapshot` gained `created_op`, the identity of a topic
 /// incarnation, and the snapshot carries the metadata change log.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 14;
+///
+/// Version 15: `PartitionSnapshot` gained `members` and `retirement_debt_op`,
+/// and each pending lifecycle target `retired_members`, as trailing, defaulted
+/// fields.
+///
+/// Version 16: `PartitionSnapshot` gained `created_op`, the metadata op of a
+/// partition incarnation, as a trailing, defaulted field.
+///
+/// Version 17: `StreamSnapshot` and `TopicSnapshot` gained `shadow`, the peer
+/// stream or topic incarnation that a shadow stream or topic serves, as
+/// trailing, defaulted fields.
+///
+/// Version 18: `TopicSnapshot` gained `recovered_from`, the cluster that lost
+/// every disk whose geo topic a recovery restored, as a trailing, defaulted
+/// field.
+///
+/// Version 19: `StreamsSnapshot` gained `retired_origins`, the geo peers that
+/// never return, and the shadow record of a topic its peer's `retention`,
+/// both as trailing, defaulted fields.
+///
+/// Version 20: the shadow record of a topic gained the peer's `geo_mode`, as a
+/// trailing, defaulted field.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 20;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Session protection is mandatory and its nested layout changed. Older
-/// snapshots cannot prove the current retry contract and are refused.
-pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = SNAPSHOT_FORMAT_VERSION;
+/// Session protection is mandatory and its nested layout changed in version
+/// 14, so older snapshots cannot prove the current retry contract and are
+/// refused. Version 14 reads with every partition on every node and no
+/// retirement debt.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -371,6 +395,7 @@ impl MetadataSnapshot {
     pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
+            streams.validate_partition_members()?;
         }
         self.change_log.validate(self.sequence_number)
     }
@@ -620,6 +645,7 @@ macro_rules! impl_fill_restore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stm::consumer_group::ConsumerGroupSnapshot;
     use crate::stm::stream::{
         PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
     };
@@ -652,7 +678,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 14;
+        const PINNED_VERSION: u32 = 20;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -668,15 +694,16 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn nested_snapshot_shapes_are_pinned_too() {
         // The top-level count above is blind to everything under it, which is how
         // `TopicSnapshot` once swapped a removed field for an added one and kept
         // the same element count: a version 2 file then decoded field-by-field
         // one position out of place instead of failing. The types the STM
         // actually grows need their own pins.
-        const TOPIC_FIELD_COUNT: u32 = 10;
-        const STREAM_FIELD_COUNT: u32 = 7;
-        const STREAMS_FIELD_COUNT: u32 = 4;
+        const TOPIC_FIELD_COUNT: u32 = 12;
+        const STREAM_FIELD_COUNT: u32 = 8;
+        const STREAMS_FIELD_COUNT: u32 = 5;
         const USER_FIELD_COUNT: u32 = 7;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
@@ -684,7 +711,9 @@ mod tests {
         const CLIENT_TABLE_FIELD_COUNT: u32 = 2;
         // Version 5 appended `created_view` the same way. Version 10 dropped
         // `purge_generation` from the middle, which no default can cover.
-        const PARTITION_FIELD_COUNT: u32 = 6;
+        // `members`, `retirement_debt_op` and `created_op` are appended with
+        // defaults.
+        const PARTITION_FIELD_COUNT: u32 = 9;
 
         let client_table = consensus::ClientTableSnapshot {
             slots: Vec::new(),
@@ -713,6 +742,8 @@ mod tests {
             options: ResourceOptions::new(),
             consumer_group_catalog_op: 0,
             created_op: 0,
+            shadow: None,
+            recovered_from: None,
         };
         let encoded = rmp_serde::to_vec(&topic).unwrap();
         assert_eq!(
@@ -728,6 +759,9 @@ mod tests {
             created_revision: 0,
             deleted_up_to_offset: 0,
             created_view: 0,
+            members: Vec::new(),
+            retirement_debt_op: 0,
+            created_op: 0,
         };
         let encoded = rmp_serde::to_vec(&partition).unwrap();
         assert_eq!(
@@ -748,6 +782,7 @@ mod tests {
             topics: Vec::new(),
             options: ResourceOptions::new(),
             created_op: 0,
+            shadow: None,
         };
         let encoded = rmp_serde::to_vec(&stream).unwrap();
         assert_eq!(
@@ -761,6 +796,7 @@ mod tests {
             revision: 1,
             namespace_revision: 1,
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
         };
         let encoded = rmp_serde::to_vec(&streams).unwrap();
         assert_eq!(
@@ -851,7 +887,7 @@ mod tests {
 
     #[test]
     fn decode_refuses_snapshots_without_durable_session_protection() {
-        for version in 0..SNAPSHOT_FORMAT_VERSION {
+        for version in 0..MIN_READABLE_SNAPSHOT_FORMAT_VERSION {
             let mut snapshot = MetadataSnapshot::new(9);
             snapshot.version = version;
             let bytes = snapshot.encode().unwrap();
@@ -871,6 +907,100 @@ mod tests {
             Err(SnapshotError::UnsupportedFormatVersion { found, expected })
                 if found == INDEPENDENT_OWNER_GENERATION_FORMAT && expected == SNAPSHOT_FORMAT_VERSION
         ));
+    }
+
+    #[test]
+    fn given_format_fourteen_partition_when_decoding_should_default_the_appended_fields() {
+        #[derive(Serialize)]
+        struct FormatFourteenPartition {
+            id: usize,
+            consensus_group_id: u64,
+            created_at: IggyTimestamp,
+            created_revision: u64,
+            deleted_up_to_offset: u64,
+            created_view: u32,
+        }
+        let mut snapshot = MetadataSnapshot::new(9);
+        snapshot.version = MIN_READABLE_SNAPSHOT_FORMAT_VERSION;
+        assert!(MetadataSnapshot::decode(&snapshot.encode().unwrap()).is_ok());
+
+        let encoded = rmp_serde::to_vec(&FormatFourteenPartition {
+            id: 2,
+            consensus_group_id: 3,
+            created_at: IggyTimestamp::from(4),
+            created_revision: 5,
+            deleted_up_to_offset: 6,
+            created_view: 7,
+        })
+        .unwrap();
+        let decoded: PartitionSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!((decoded.id, decoded.created_view), (2, 7));
+        assert!(decoded.members.is_empty(), "stored on every node");
+        assert_eq!(decoded.retirement_debt_op, 0);
+        assert_eq!(decoded.created_op, 0);
+    }
+
+    #[test]
+    fn given_format_fifteen_stream_and_topic_when_decoding_should_read_them_as_this_clusters_own() {
+        #[derive(Serialize)]
+        struct FormatFifteenTopic {
+            id: usize,
+            name: String,
+            created_at: IggyTimestamp,
+            stats: StatsSnapshot,
+            partitions: Vec<PartitionSnapshot>,
+            consumer_groups: Vec<(u64, ConsumerGroupSnapshot)>,
+            next_consumer_group_id: u64,
+            options: ResourceOptions,
+            consumer_group_catalog_op: u64,
+            created_op: u64,
+        }
+        #[derive(Serialize)]
+        struct FormatFifteenStream {
+            id: usize,
+            name: String,
+            created_at: IggyTimestamp,
+            stats: StatsSnapshot,
+            topics: Vec<(usize, FormatFifteenTopic)>,
+            options: ResourceOptions,
+            created_op: u64,
+        }
+        let stats = || StatsSnapshot {
+            size_bytes: 0,
+            messages_count: 0,
+            segments_count: 0,
+        };
+        let encoded = rmp_serde::to_vec(&FormatFifteenStream {
+            id: 1,
+            name: "orders".to_owned(),
+            created_at: IggyTimestamp::from(2),
+            stats: stats(),
+            topics: vec![(
+                0,
+                FormatFifteenTopic {
+                    id: 0,
+                    name: "payments".to_owned(),
+                    created_at: IggyTimestamp::from(3),
+                    stats: stats(),
+                    partitions: Vec::new(),
+                    consumer_groups: Vec::new(),
+                    next_consumer_group_id: 0,
+                    options: ResourceOptions::new(),
+                    consumer_group_catalog_op: 4,
+                    created_op: 5,
+                },
+            )],
+            options: ResourceOptions::new(),
+            created_op: 6,
+        })
+        .unwrap();
+
+        let decoded: StreamSnapshot = rmp_serde::from_slice(&encoded).unwrap();
+
+        assert_eq!(decoded.created_op, 6);
+        assert_eq!(decoded.shadow, None);
+        assert_eq!(decoded.topics[0].1.created_op, 5);
+        assert_eq!(decoded.topics[0].1.shadow, None);
     }
 
     #[test]
@@ -899,6 +1029,7 @@ mod tests {
         let mut snapshot = MetadataSnapshot::new(50);
         snapshot.streams = Some(StreamsSnapshot {
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![(3, stream)],
@@ -975,6 +1106,7 @@ mod tests {
         let mut snapshot = MetadataSnapshot::new(100);
         snapshot.streams = Some(StreamsSnapshot {
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![(
@@ -1006,6 +1138,9 @@ mod tests {
                                 created_revision: 0,
                                 deleted_up_to_offset: 0,
                                 created_view: 0,
+                                members: vec![2, 0, 1],
+                                retirement_debt_op: 9,
+                                created_op: 11,
                             }],
                             consumer_groups: Vec::new(),
                             // Nonzero and distinct from every id above so the
@@ -1015,10 +1150,16 @@ mod tests {
                             options: ResourceOptions::default(),
                             consumer_group_catalog_op: 7,
                             created_op: 8,
+                            shadow: None,
+                            // A restored geo topic's marker survives the
+                            // roundtrip, as every replica that builds its
+                            // partitions later reads it.
+                            recovered_from: Some(0x0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a),
                         },
                     )],
                     options: ResourceOptions::default(),
                     created_op: 9,
+                    shadow: None,
                 },
             )],
         });
@@ -1043,11 +1184,17 @@ mod tests {
         let (_, topic) = &stream.topics[0];
         assert_eq!(topic.partitions.len(), 1);
         assert_eq!(topic.partitions[0].consensus_group_id, 33);
+        assert_eq!(topic.partitions[0].retirement_debt_op, 9);
+        assert_eq!(topic.partitions[0].created_op, 11);
         // Never-reuse counter: `#[serde(default)]` would silently restore 0 if
         // the field were dropped from the wire format, so pin its survival.
         assert_eq!(topic.next_consumer_group_id, 5);
         assert_eq!(topic.consumer_group_catalog_op, 7);
         assert_eq!(topic.created_op, 8);
+        assert_eq!(
+            topic.recovered_from,
+            Some(0x0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a_0a0a)
+        );
     }
 
     fn user_snapshot_fixture(id: u32, username: &str, password_hash: &str) -> UserSnapshot {
@@ -1072,6 +1219,7 @@ mod tests {
             topics: vec![],
             options: ResourceOptions::default(),
             created_op: 0,
+            shadow: None,
         }
     }
 
@@ -1098,6 +1246,7 @@ mod tests {
 
         let streams_snap = StreamsSnapshot {
             lifecycle_intents: std::collections::BTreeMap::default(),
+            retired_origins: std::collections::BTreeMap::default(),
             revision: 0,
             namespace_revision: 0,
             items: vec![

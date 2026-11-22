@@ -270,7 +270,7 @@ impl StateChecker {
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace)
+                    .peek_by_ns(&namespace)
                     .expect("a journaled partition is hosted");
                 let prepare = partition
                     .log
@@ -432,11 +432,17 @@ fn check_partition_owner(
     if header.operation == Operation::InstallConsumerGroupOwner {
         let install = InstallConsumerGroupOwnerRequest::decode_from(body)
             .expect("a committed owner installation decodes");
-        if !owners
+        let retired = owners
             .retirement
             .as_ref()
-            .is_some_and(|catalog| catalog.retires(install.group_id))
-        {
+            .is_some_and(|catalog| catalog.retires(install.group_id));
+        // The partition keeps the higher generation, so a superseded install
+        // that commits after its successor changes no owner.
+        let superseded = owners
+            .installed
+            .get(&install.group_id)
+            .is_some_and(|installed| install.owner.generation <= installed.generation);
+        if !retired && !superseded {
             owners.installed.insert(install.group_id, install.owner);
         }
         return;
@@ -686,7 +692,7 @@ pub fn assert_applied_data_agrees(
                 .partition_shard(namespace)
                 .plane
                 .partitions()
-                .get_by_ns(&namespace)
+                .peek_by_ns(&namespace)
             else {
                 continue;
             };
@@ -908,6 +914,50 @@ mod tests {
         );
     }
 
+    /// The partition keeps the higher generation when a superseded owner install
+    /// commits after its successor (`apply_consumer_group_owner` returns early),
+    /// so the successor still owns the group and its offset is fenced correctly.
+    #[test]
+    fn given_a_superseded_install_committed_after_its_successor_when_the_successor_commits_should_pass_the_oracle()
+     {
+        let superseded = ConsumerGroupOwner {
+            client_id: 0,
+            session: 0,
+            generation: 85,
+        };
+        let successor = ConsumerGroupOwner {
+            client_id: 2,
+            session: 2,
+            generation: 88,
+        };
+        let mut owners = PartitionOwners::default();
+        for (op, owner) in [(19, successor), (24, superseded)] {
+            let install = InstallConsumerGroupOwnerRequest {
+                incarnation: 1,
+                group_id: 0,
+                owner,
+                metadata_op: owner.generation,
+            };
+            check_partition_owner(
+                &mut owners,
+                &PrepareHeader {
+                    operation: Operation::InstallConsumerGroupOwner,
+                    op,
+                    ..Default::default()
+                },
+                &install.to_bytes(),
+                SEED,
+            );
+        }
+        check_offset(
+            &mut owners,
+            successor.client_id,
+            successor.session,
+            successor.generation,
+            Operation::StoreConsumerOffset,
+        );
+    }
+
     fn installed_owner() -> PartitionOwners {
         PartitionOwners {
             installed: BTreeMap::from([(
@@ -1111,8 +1161,8 @@ mod tests {
             }
         }
 
-        for replica_idx in 0..3usize {
-            let shard = sim.replicas[replica_idx].partition_shard(namespace);
+        for replica in &sim.replicas {
+            let shard = replica.partition_shard(namespace);
             let partitions = shard.plane.partitions();
             let config = partitions.config();
             let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
@@ -1284,6 +1334,7 @@ mod tests {
         journal.restore_checkpoint_prepare(
             op,
             server_common::iobuf::Owned::copy_from_slice(&entry).into(),
+            None,
         );
     }
 

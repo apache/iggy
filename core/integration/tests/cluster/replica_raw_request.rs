@@ -17,9 +17,11 @@
 
 use bytes::Bytes;
 use iggy::prelude::*;
-use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::codes::{CREATE_STREAM_CODE, GET_STATS_CODE, GET_STREAMS_CODE};
+use iggy_binary_protocol::primitives::page::WirePageQuery;
+use iggy_binary_protocol::requests::streams::GetStreamsRequest;
 use iggy_binary_protocol::responses::system::get_stats::StatsResponse;
+use iggy_binary_protocol::{WireDecode, WireEncode};
 use integration::iggy_harness;
 use std::collections::BTreeSet;
 
@@ -83,9 +85,13 @@ async fn given_a_stream_created_by_the_client_when_listing_on_each_replica_shoul
         .map(|node| node.replica_id)
         .collect();
 
+    let first_page = GetStreamsRequest {
+        page: WirePageQuery::default(),
+    }
+    .to_bytes();
     for replica in replicas {
         let reply = client
-            .send_binary_request_to_replica(GET_STREAMS_CODE, Bytes::new(), replica)
+            .send_binary_request_to_replica(GET_STREAMS_CODE, first_page.clone(), replica)
             .await
             .unwrap_or_else(|error| panic!("streams of replica {replica}: {error}"));
         assert!(
@@ -118,5 +124,12 @@ async fn given_an_unknown_replica_or_a_replicated_command_when_sent_should_refus
             .send_binary_request_to_replica(CREATE_STREAM_CODE, Bytes::new(), 1)
             .await,
         Err(IggyError::InvalidCommand)
+    );
+    assert_eq!(
+        client
+            .send_binary_request_to_replica(GET_STREAMS_CODE, Bytes::new(), 1)
+            .await,
+        Err(IggyError::InvalidCommand),
+        "a list read without its page block"
     );
 }

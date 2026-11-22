@@ -133,11 +133,15 @@ internal sealed class BinaryFactory
         return payload;
     }
 
-    /// <summary>One partition record of a topic details reply: 40 bytes of counters, then the 24-byte context.</summary>
+    /// <summary>
+    ///     One partition record of a topic details reply: 40 bytes of counters, the 24-byte context, then the
+    ///     members and the in-sync members, each a u8 count followed by that many u8 node ids.
+    /// </summary>
     internal static byte[] CreatePartitionPayload(uint id, ulong createdAt, uint segmentsCount, ulong currentOffset,
-        ulong sizeBytes, ulong messagesCount, PartitionContext context)
+        ulong sizeBytes, ulong messagesCount, PartitionContext context, byte[] members, byte[] inSyncMembers)
     {
-        var payload = new byte[40 + PartitionContext.ENCODED_SIZE];
+        var countersSize = 40 + PartitionContext.ENCODED_SIZE;
+        var payload = new byte[countersSize + 1 + members.Length + 1 + inSyncMembers.Length];
         BinaryPrimitives.WriteUInt32LittleEndian(payload, id);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(4), createdAt);
         BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(12), segmentsCount);
@@ -147,6 +151,11 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(40), context.Incarnation);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(48), context.OwnerGeneration);
         BinaryPrimitives.WriteUInt64LittleEndian(payload.AsSpan(56), context.MetadataOp);
+        payload[countersSize] = (byte)members.Length;
+        members.CopyTo(payload.AsSpan(countersSize + 1));
+        var inSyncPosition = countersSize + 1 + members.Length;
+        payload[inSyncPosition] = (byte)inSyncMembers.Length;
+        inSyncMembers.CopyTo(payload.AsSpan(inSyncPosition + 1));
         return payload;
     }
 
@@ -167,6 +176,23 @@ internal sealed class BinaryFactory
         BinaryPrimitives.WriteUInt32LittleEndian(entry.AsSpan(position + 1), (uint)value.Length);
         value.CopyTo(entry.AsSpan(position + 5));
         return entry;
+    }
+
+    /// <summary>A list reply: <c>[next_len:u8][next][count:u32][item]*</c>, with a count of the given items.</summary>
+    internal static byte[] CreatePagePayload(byte[] next, params byte[][] items)
+    {
+        var payload = new byte[1 + next.Length + 4 + items.Sum(item => item.Length)];
+        payload[0] = (byte)next.Length;
+        next.CopyTo(payload.AsSpan(1));
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1 + next.Length), (uint)items.Length);
+        var position = 1 + next.Length + 4;
+        foreach (var item in items)
+        {
+            item.CopyTo(payload.AsSpan(position));
+            position += item.Length;
+        }
+
+        return payload;
     }
 
     internal static byte[] CreateGroupPayload(uint id, uint membersCount, uint partitionsCount, string name,

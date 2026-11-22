@@ -30,7 +30,10 @@
 //! before any replication wait.
 
 use crate::shards_table::ShardsTable;
-use crate::{ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender};
+use crate::{
+    COLD_POLL_BUDGET, ConsumerOffsetRead, ExternalGroupRead, IggyShard, PartitionRead,
+    PartitionReadReply, Sender,
+};
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
@@ -179,7 +182,7 @@ where
             return;
         }
         let partitions = self.plane.partitions();
-        if matches!(read, PartitionRead::SessionRetired { .. }) {
+        if matches!(read, PartitionRead::SessionsRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
                 partitions
                     .with_partition(&namespace, |partition| {
@@ -193,7 +196,9 @@ where
                 return;
             }
         }
-        let rejection = self.partition_read_rejection(namespace, &read);
+        let rejection = self
+            .partition_read_rejection(namespace, &read)
+            .or_else(|| self.geo_read_refusal(namespace, &read));
         if let Some(error) = rejection {
             let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
@@ -232,16 +237,32 @@ where
             read => (read, None),
         };
         let result = match read {
-            PartitionRead::SessionRetired {
-                identity,
+            PartitionRead::SessionsRetired {
+                ended,
+                retired_through,
                 created_revision,
             } => partitions
                 .with_partition(&namespace, |partition| {
-                    PartitionReadReply::SessionRetired(
-                        partition.created_revision() == created_revision
-                            && partition.session_retired(identity),
-                    )
+                    (partition.created_revision() == created_revision).then(|| {
+                        PartitionReadReply::SessionsRetired(
+                            partition.sessions_retired(&ended, retired_through),
+                        )
+                    })
                 })
+                .flatten()
+                .unwrap_or(PartitionReadReply::NotFound),
+            PartitionRead::RetirementDebt {
+                created_revision,
+                debt_op,
+            } => partitions
+                .with_partition(&namespace, |partition| {
+                    (partition.created_revision() == created_revision).then(|| {
+                        PartitionReadReply::RetirementDebt(
+                            partition.observe_retirement_debt(debt_op),
+                        )
+                    })
+                })
+                .flatten()
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::DeferredPoll(_) => unreachable!("deferred admission handled above"),
             // Answered above, entry by entry.
@@ -259,7 +280,7 @@ where
                     {
                         PartitionReadReply::Primary {
                             view,
-                            primary: consensus.primary_index(view),
+                            primary: consensus.primary_node(view),
                         }
                     } else {
                         PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
@@ -284,6 +305,15 @@ where
                             completion::reject(&reply, self.metrics.frame_drop_metrics(), reason);
                             return;
                         }
+                        let Ok(cold) = self.poll_completions.admit(plan.reads_remote()) else {
+                            completion::reject(
+                                &reply,
+                                self.metrics.frame_drop_metrics(),
+                                crate::metrics::frame_drop_reason::FULL,
+                            );
+                            return;
+                        };
+                        let plan = plan.with_deadline(std::time::Instant::now() + COLD_POLL_BUDGET);
                         let Some(completion) = self
                             .poll_completions
                             .try_reserve(namespace, reply, attachment)
@@ -298,7 +328,7 @@ where
                             tier = "disk",
                             "partition poll dispatch"
                         );
-                        self.bus.spawn(read_poll(namespace, plan, completion));
+                        self.bus.spawn(read_poll(namespace, plan, completion, cold));
                         return;
                     }
                     Some(plan) => {
@@ -340,14 +370,20 @@ where
                     current_offset: 0,
                 }
             }
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
-                .external_group_offset_read(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
-                    PartitionReadReply::ConsumerOffset {
-                        stored,
-                        current_offset,
-                    }
-                }),
+            PartitionRead::ExternalGroupOffsetOnPrimary { group, .. } => match group {
+                ExternalGroupRead::Group(group_id) => {
+                    partitions.external_group_offset_read(&namespace, group_id)
+                }
+                ExternalGroupRead::Missing(name) => {
+                    partitions.external_position_read(&namespace, name)
+                }
+            }
+            .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                PartitionReadReply::ConsumerOffset {
+                    stored,
+                    current_offset,
+                }
+            }),
             PartitionRead::GroupOffsetState { group_id } => partitions
                 .group_offset_state(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {
@@ -388,9 +424,13 @@ where
                     if consensus.is_normal_backup() {
                         return Some(IggyError::NotPrimary);
                     }
+                    // The quorum check of a primary waits for its view write, so
+                    // until the write lands nothing bounds how long a primary cut
+                    // off from a newer view serves.
                     if !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
+                        || consensus.needs_superblock_persist()
                     {
                         return Some(IggyError::TransientNotAccepted);
                     }
@@ -669,9 +709,11 @@ async fn read_poll(
     namespace: IggyNamespace,
     plan: PollPlan,
     completion: completion::PollCompletionSender,
+    cold: Option<completion::ColdPollPermit>,
 ) {
     let poll_started = std::time::Instant::now();
     let result = plan.execute().await;
+    drop(cold);
     let elapsed = poll_started.elapsed();
     if elapsed > std::time::Duration::from_secs(1) {
         tracing::warn!(

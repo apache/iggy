@@ -30,14 +30,41 @@ use std::sync::atomic::{AtomicUsize, Ordering, fence};
 /// writes), `EMSGSIZE` from `sendmsg(2)` (socket writes).
 pub const IOV_MAX: usize = 1024;
 
-#[derive(Debug, Clone)]
+/// Uniquely owned bytes aligned to `ALIGN`.
+///
+/// Every allocation that `Owned` makes spans whole alignment units, and
+/// `From<AVec>` adopts a vector as it is. An allocator serves a
+/// smaller aligned request from a bigger block: mimalloc takes
+/// `size + ALIGN - 1` bytes, so a 600 B frame at 4 KiB holds a 5,120 B block.
+/// Whole units get a naturally aligned block. By the size classes of
+/// mimalloc v3 (`mi_bin`), that block is the buffer part of
+/// [`Frozen::allocation_size`] up to 32 KiB, and above that it adds less
+/// than a quarter.
+///
+/// `capacity` is what [`IoBufMut::buf_capacity`] reports: the requested size,
+/// not the block. A compio read fills exactly that many bytes, so a framed
+/// read never takes the next frame into the rest of the block.
+///
+/// Invariant: `inner.len() <= capacity <= inner.capacity()`.
+#[derive(Debug)]
 pub struct Owned<const ALIGN: usize = 4096> {
     inner: AVec<u8, ConstAlign<ALIGN>>,
+    capacity: usize,
 }
 
 impl<const ALIGN: usize> From<AVec<u8, ConstAlign<ALIGN>>> for Owned<ALIGN> {
     fn from(vec: AVec<u8, ConstAlign<ALIGN>>) -> Self {
-        Self { inner: vec }
+        Self {
+            capacity: vec.capacity(),
+            inner: vec,
+        }
+    }
+}
+
+// Not derived: `AVec::clone` allocates `len` bytes, below a copied `capacity`.
+impl<const ALIGN: usize> Clone for Owned<ALIGN> {
+    fn clone(&self) -> Self {
+        Self::copy_from_slice(self.as_slice())
     }
 }
 
@@ -93,9 +120,9 @@ impl<const ALIGN: usize> Prefix<ALIGN> {
 
 impl<const ALIGN: usize> Owned<ALIGN> {
     pub fn zeroed(len: usize) -> Self {
-        let mut inner: AVec<u8, ConstAlign<ALIGN>> = AVec::new(ALIGN);
-        inner.resize(len, 0);
-        Self { inner }
+        let mut owned = Self::with_capacity(len);
+        owned.inner.resize(len, 0);
+        owned
     }
 
     /// Allocate a buffer with `capacity` reserved bytes and `len == 0`.
@@ -104,18 +131,25 @@ impl<const ALIGN: usize> Owned<ALIGN> {
     /// advances the length via [`SetLen::set_len`].
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            inner: AVec::with_capacity(ALIGN, capacity),
+            inner: AVec::with_capacity(ALIGN, whole_units::<ALIGN>(capacity)),
+            capacity,
         }
     }
 
     pub fn copy_from_slice(data: &[u8]) -> Self {
-        let mut inner: AVec<u8, ConstAlign<ALIGN>> = AVec::new(ALIGN);
-        inner.extend_from_slice(data);
-        Self { inner }
+        let mut owned = Self::with_capacity(data.len());
+        owned.inner.extend_from_slice(data);
+        owned
     }
 
     pub fn as_slice(&self) -> &[u8] {
         &self.inner
+    }
+
+    /// Capacity of the allocation retained when this buffer is frozen.
+    #[must_use]
+    pub fn backing_capacity(&self) -> usize {
+        self.inner.capacity()
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
@@ -123,7 +157,9 @@ impl<const ALIGN: usize> Owned<ALIGN> {
     }
 
     pub fn extend_from_slice(&mut self, bytes: &[u8]) {
+        self.grow_allocation(bytes.len(), Growth::Amortized);
         self.inner.extend_from_slice(bytes);
+        self.capacity = self.capacity.max(self.inner.len());
     }
 
     pub fn truncate(&mut self, len: usize) {
@@ -160,14 +196,47 @@ impl<const ALIGN: usize> Owned<ALIGN> {
 
         (prefix, tail)
     }
+
+    /// Raise `capacity` to `len + additional` unless it already covers it.
+    fn reserve_capacity(&mut self, additional: usize, growth: Growth) {
+        if self.capacity - self.inner.len() >= additional {
+            return;
+        }
+        self.grow_allocation(additional, growth);
+        self.capacity = self.inner.len() + additional;
+    }
+
+    /// Make room for `additional` more bytes in an allocation of whole units.
+    fn grow_allocation(&mut self, additional: usize, growth: Growth) {
+        let len = self.inner.len();
+        // A saturated size makes `AVec` panic on the overflow, as it does
+        // for any request above `isize::MAX`.
+        let required = len.saturating_add(additional);
+        if required <= self.inner.capacity() {
+            return;
+        }
+        let target = match growth {
+            Growth::Exact => required,
+            Growth::Amortized => required.max(2 * self.inner.capacity()),
+        };
+        self.inner.reserve_exact(whole_units::<ALIGN>(target) - len);
+    }
+}
+
+/// How an `Owned` grows past its allocation, as `AVec::reserve_exact` and
+/// `AVec::reserve` do.
+enum Growth {
+    Exact,
+    Amortized,
 }
 
 // SAFETY contract for the compio IO buf impls below:
 // * `as_init` returns the initialized prefix (len bytes).
-// * `as_uninit` returns the full allocation up to capacity; compio writes
-//   bytes into it during reads and THEN calls `SetLen::set_len` to advance
-//   the initialized region, which is exactly what `AVec::set_len` expects.
-// * `buf_capacity` is the AVec capacity, not the initialized length.
+// * `as_uninit` returns the first `capacity` bytes of the allocation, which
+//   the invariant of `Owned` keeps inside it; compio writes bytes into it
+//   during reads and THEN calls `SetLen::set_len` to advance the
+//   initialized region, which is exactly what `AVec::set_len` expects.
+// * `buf_capacity` is the requested `capacity`, not the allocation.
 impl<const ALIGN: usize> IoBuf for Owned<ALIGN> {
     fn as_init(&self) -> &[u8] {
         self.inner.as_slice()
@@ -176,36 +245,28 @@ impl<const ALIGN: usize> IoBuf for Owned<ALIGN> {
 
 impl<const ALIGN: usize> IoBufMut for Owned<ALIGN> {
     fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
-        let cap = self.inner.capacity();
         let ptr = self.inner.as_mut_ptr().cast::<MaybeUninit<u8>>();
-        unsafe { slice::from_raw_parts_mut(ptr, cap) }
+        unsafe { slice::from_raw_parts_mut(ptr, self.capacity) }
     }
 
     fn buf_capacity(&mut self) -> usize {
-        self.inner.capacity()
+        self.capacity
     }
 
     fn reserve(&mut self, len: usize) -> Result<(), ReserveError> {
-        // `reserve(additional)` contract: capacity >= current_len + additional
-        // after the call. `AVec::reserve` matches this contract exactly.
-        if self.inner.capacity() - self.inner.len() >= len {
-            return Ok(());
-        }
-        self.inner.reserve(len);
+        self.reserve_capacity(len, Growth::Amortized);
         Ok(())
     }
 
     fn reserve_exact(&mut self, len: usize) -> Result<(), ReserveExactError> {
-        if self.inner.capacity() - self.inner.len() >= len {
-            return Ok(());
-        }
-        self.inner.reserve_exact(len);
+        self.reserve_capacity(len, Growth::Exact);
         Ok(())
     }
 }
 
 impl<const ALIGN: usize> SetLen for Owned<ALIGN> {
     unsafe fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= self.capacity, "set_len past the reported capacity");
         unsafe { self.inner.set_len(len) };
     }
 }
@@ -482,21 +543,7 @@ impl<const ALIGN: usize> Extent<ALIGN> {
     }
 
     pub(crate) fn copy_from_slice(src: &[u8]) -> Self {
-        let mut v: AVec<u8, ConstAlign<ALIGN>> = AVec::new(ALIGN);
-        v.extend_from_slice(src);
-
-        let (ptr, _, len, capacity) = v.into_raw_parts();
-        let guard = AVecRawGuard::<ALIGN>::new(ptr, len, capacity);
-        let data = unsafe { NonNull::new_unchecked(ptr) };
-
-        let ctrlb = ControlBlock::new(data, len, capacity);
-        guard.defuse();
-
-        Extent {
-            ptr: data,
-            len,
-            ctrlb,
-        }
+        extent_from_aligned_vec(Owned::<ALIGN>::copy_from_slice(src).inner)
     }
 }
 
@@ -514,6 +561,12 @@ impl<const ALIGN: usize> Clone for Extent<ALIGN> {
             ctrlb: self.ctrlb,
         }
     }
+}
+
+/// `bytes` rounded up to whole alignment units. Past `usize::MAX` it
+/// saturates, and `AVec` then panics on the size.
+fn whole_units<const ALIGN: usize>(bytes: usize) -> usize {
+    bytes.checked_next_multiple_of(ALIGN).unwrap_or(usize::MAX)
 }
 
 fn freeze_extent<const ALIGN: usize>(extent: Extent<ALIGN>) -> Frozen<ALIGN> {
@@ -643,7 +696,7 @@ unsafe fn try_merge_extents<const ALIGN: usize>(
 
         let ctrlb = reclaim_unique_control_block(tail_ctrlb);
         let inner = AVec::from_raw_parts(ctrlb.base.as_ptr(), ALIGN, ctrlb.len, ctrlb.capacity);
-        Ok(Owned { inner })
+        Ok(Owned::from(inner))
     }
 }
 
@@ -707,6 +760,51 @@ mod tests {
         o.extend_from_slice(b"def");
         assert_eq!(o.as_slice(), b"abcdef");
         assert_eq!(o.buf_capacity(), capacity);
+    }
+
+    #[test]
+    fn owned_allocates_whole_alignment_units() {
+        let odd = [7u8; A + 1];
+        let mut extended = Owned::<A>::with_capacity(1);
+        extended.extend_from_slice(&odd);
+        let mut reserved = Owned::<A>::with_capacity(1);
+        IoBufMut::reserve(&mut reserved, odd.len()).unwrap();
+        let allocations = [
+            Owned::<A>::with_capacity(odd.len()).backing_capacity(),
+            Owned::<A>::zeroed(odd.len()).backing_capacity(),
+            owned(&odd).backing_capacity(),
+            owned(&odd).clone().backing_capacity(),
+            extended.backing_capacity(),
+            reserved.backing_capacity(),
+            Prefix::<A>::copy_from_slice(&odd)
+                .freeze()
+                .backing_capacity(),
+        ];
+        assert_eq!(allocations, [2 * A; 7]);
+        assert_eq!(Owned::<A>::zeroed(0).backing_capacity(), 0);
+    }
+
+    #[test]
+    fn owned_reports_the_requested_capacity_and_grows_it_inside_the_block() {
+        const HEADER: usize = 16;
+        const BODY: usize = 24;
+        let mut o = Owned::<A>::with_capacity(HEADER);
+        assert_eq!(o.as_uninit().len(), HEADER);
+        o.extend_from_slice(&[1; HEADER]);
+        let block = o.as_slice().as_ptr();
+
+        IoBufMut::reserve_exact(&mut o, BODY).unwrap();
+        assert_eq!(o.buf_capacity(), HEADER + BODY);
+        assert_eq!(o.as_uninit().len(), HEADER + BODY);
+        assert_eq!(
+            o.as_slice().as_ptr(),
+            block,
+            "a body that fits must keep the block"
+        );
+
+        IoBufMut::reserve_exact(&mut o, A).unwrap();
+        assert_eq!(o.buf_capacity(), HEADER + A);
+        assert_eq!(o.backing_capacity(), 2 * A);
     }
 
     //  Owned::split_at: shared control block / disjoint views

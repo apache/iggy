@@ -24,7 +24,7 @@ use std::task::{Poll, Waker};
 use std::time::{Duration, Instant};
 
 use compio::fs::File;
-use consensus::VsrState;
+use consensus::{StateArtifactHasher, VsrState};
 use futures::{StreamExt, TryStreamExt};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::MAX_MESSAGE_SIZE_UPPER_BYTES;
@@ -72,11 +72,15 @@ pub struct MaterializationIoJob {
     pub(crate) bodies_written: Option<u64>,
     pub(crate) written: u64,
     pub(crate) completes: bool,
+    pub(crate) checksum: Option<Box<StateArtifactHasher>>,
+    pub(crate) digest: Option<Box<crate::segment_chain::SegmentDigest>>,
 }
 
 pub struct MaterializationIoResult {
     pub(crate) target: MaterializationTarget,
     pub(crate) outcome: Result<(u64, u64), IggyError>,
+    pub(crate) checksum: Option<Box<StateArtifactHasher>>,
+    pub(crate) digest: Option<Box<crate::segment_chain::SegmentDigest>>,
 }
 
 pub enum PartitionIoJob<SB = PingPongSuperblock> {
@@ -91,7 +95,11 @@ pub enum PartitionIoJob<SB = PingPongSuperblock> {
         namespace: IggyNamespace,
         paths: [Option<String>; 3],
         strict: bool,
+        /// The trim point that must be durable before anything is unlinked.
+        trim: Option<Box<crate::segment_chain::ChainAppend>>,
     },
+    EvictSegment(Box<crate::segment_chain::EvictionJob>),
+    Tiering(Box<crate::segment_chain::TieringJob>),
     EmptySegment(SegmentIoJob),
     OffsetCleanup {
         directory: String,
@@ -133,6 +141,8 @@ pub enum PartitionIoResult {
         outcome: Result<(), IggyError>,
     },
     SegmentRemoved(Result<(), IggyError>),
+    SegmentEvicted(crate::segment_chain::EvictionResult),
+    Tiering(crate::segment_chain::TieringResult),
     EmptySegment(Result<InstalledSegment, IggyError>),
     OffsetCleanup(OffsetCleanupIoResult),
     RetryCheckpoint(std::io::Result<()>),
@@ -156,6 +166,8 @@ pub enum PartitionIoContinuation {
     Superblock,
     Checkpoint,
     Retention,
+    Eviction,
+    Tiering,
     Quarantine,
 }
 
@@ -180,6 +192,7 @@ pub struct CapturedPartitionIo<SB> {
 #[derive(Default)]
 pub struct PartitionIoQuiescence {
     active: Cell<Option<PartitionIoIdentity>>,
+    local_work: Cell<usize>,
     retiring: Cell<bool>,
     deleting: Cell<bool>,
     interrupted: Cell<bool>,
@@ -206,12 +219,33 @@ impl PartitionIoQuiescence {
         self.active.get()
     }
 
+    /// No job, no local work, and no retirement or interruption under way.
+    pub(crate) const fn is_idle(&self) -> bool {
+        self.active.get().is_none()
+            && self.local_work.get() == 0
+            && !self.retiring.get()
+            && !self.interrupted.get()
+    }
+
     pub(crate) fn set(&self, active: Option<PartitionIoIdentity>) {
         self.active.set(active);
-        if active.is_none()
-            && let Some(waiter) = self.waiter.borrow_mut().take()
-        {
-            waiter.wake();
+        if active.is_none() {
+            self.wake_waiter();
+        }
+    }
+
+    pub(crate) fn begin_local_work(&self) -> bool {
+        if self.is_retiring() || self.is_interrupted() {
+            return false;
+        }
+        self.local_work.set(self.local_work.get() + 1);
+        true
+    }
+
+    pub(crate) fn settle_local_work(&self) {
+        self.local_work.set(self.local_work.get() - 1);
+        if self.local_work.get() == 0 {
+            self.wake_waiter();
         }
     }
 
@@ -248,13 +282,20 @@ impl PartitionIoQuiescence {
                     "partition writer was interrupted",
                 )));
             }
-            if self.active.get().is_none() {
+            if self.active.get().is_none() && self.local_work.get() == 0 {
                 return Poll::Ready(Ok(()));
             }
             *self.waiter.borrow_mut() = Some(context.waker().clone());
             Poll::Pending
         })
         .await
+    }
+
+    fn wake_waiter(&self) {
+        let waiter = self.waiter.borrow_mut().take();
+        if let Some(waiter) = waiter {
+            waiter.wake();
+        }
     }
 }
 
@@ -372,6 +413,8 @@ pub struct RotationTarget {
     pub(crate) messages_position: Option<u64>,
     pub(crate) index_writer: Option<Rc<IggyIndexWriter>>,
     pub(crate) index_position: Option<u64>,
+    /// The sealed segment's chain record that the rotation job appends.
+    pub(crate) chain_record: Option<crate::segment_chain::ChainRecord>,
 }
 
 pub struct MaterializationTarget {
@@ -395,6 +438,7 @@ pub struct SegmentIoJob {
     pub(crate) preallocate: bool,
     pub(crate) segment_bodies: bool,
     pub(crate) old_index: Option<Rc<IggyIndexWriter>>,
+    pub(crate) chain_append: Option<crate::segment_chain::ChainAppend>,
 }
 
 pub struct InstalledSegment {
@@ -416,6 +460,9 @@ pub enum TransferFileJob {
         directory: String,
         keep: Vec<std::path::PathBuf>,
         bodies: bool,
+        /// The transferred chain's bytes, which replace the chain; `None`
+        /// removes it.
+        chain: Option<Vec<u8>>,
     },
     Rename {
         from: std::path::PathBuf,
@@ -541,8 +588,29 @@ impl MaterializationIoJob {
             bodies_written,
             written,
             completes,
+            mut checksum,
+            mut digest,
             ..
         } = self;
+        for batch in &mut batches {
+            if batch.len() < size_of::<PrepareHeader>() {
+                return MaterializationIoResult {
+                    target,
+                    outcome: Err(IggyError::CannotWriteToFile),
+                    checksum: None,
+                    digest: None,
+                };
+            }
+            *batch = batch.slice(size_of::<PrepareHeader>()..);
+        }
+        if let Some(hasher) = checksum.as_mut() {
+            crate::state_transfer::hash_yielding(hasher, batches.iter().map(Frozen::as_slice))
+                .await;
+        }
+        if let Some(digest) = digest.as_mut() {
+            crate::state_transfer::hash_yielding(digest, batches.iter().map(Frozen::as_slice))
+                .await;
+        }
         let outcome = if let Some(saved) = bodies_written {
             target
                 .index_writer
@@ -556,11 +624,10 @@ impl MaterializationIoJob {
                 return MaterializationIoResult {
                     target,
                     outcome: Err(IggyError::CannotWriteToFile),
+                    checksum: None,
+                    digest: None,
                 };
             };
-            for batch in &mut batches {
-                *batch = batch.slice(size_of::<PrepareHeader>()..);
-            }
             // Both halves must settle, including when either one fails.
             let (messages, indexes) = futures::future::join(
                 writer.save_frozen_batches_at(&batches, position, completes),
@@ -593,7 +660,12 @@ impl MaterializationIoJob {
                 Ok((0, 0))
             }
         });
-        MaterializationIoResult { target, outcome }
+        MaterializationIoResult {
+            target,
+            outcome,
+            checksum,
+            digest,
+        }
     }
 }
 
@@ -636,6 +708,8 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
             | Self::OffsetDirectories(_)
             | Self::SegmentDirectory(_)
             | Self::RemoveSegment { .. }
+            | Self::EvictSegment(_)
+            | Self::Tiering(_)
             | Self::EmptySegment(_)
             | Self::OffsetCleanup { .. }
             | Self::RetryCheckpoint { .. }
@@ -668,7 +742,15 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                 namespace,
                 paths,
                 strict,
+                trim,
             } => {
+                // Boxed so the rarely taken append does not grow every job's future.
+                if let Some(trim) = &trim
+                    && let Err(error) = Box::pin(trim.execute()).await
+                {
+                    warn!(namespace_raw = namespace.inner(), path = trim.path, %error, "cannot append the trim point before retention unlinks a segment");
+                    return PartitionIoResult::SegmentRemoved(Err(IggyError::CannotWriteToFile));
+                }
                 let mut outcome = Ok(());
                 for path in paths.into_iter().flatten() {
                     match compio::fs::remove_file(&path).await {
@@ -684,6 +766,10 @@ impl<SB: SuperblockStore> PartitionIoJob<SB> {
                 }
                 PartitionIoResult::SegmentRemoved(outcome)
             }
+            Self::EvictSegment(job) => {
+                PartitionIoResult::SegmentEvicted(Box::pin(job.execute()).await)
+            }
+            Self::Tiering(job) => PartitionIoResult::Tiering(Box::pin(job.execute()).await),
             Self::EmptySegment(job) => PartitionIoResult::EmptySegment(job.execute().await),
             Self::OffsetCleanup {
                 directory,
@@ -803,6 +889,13 @@ pub fn file_phase_charge<'path, SB: SuperblockStore>(
         .checked_add(buffers)?
         .checked_add(DIRECTORY_ITERATION_SCRATCH_MAX)?
         .checked_add(execution_allocation_charge::<SB>()?)
+}
+
+async fn remove_if_present(path: &str) -> std::io::Result<()> {
+    match compio::fs::remove_file(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        outcome => outcome,
+    }
 }
 
 fn execution_allocation_charge<SB: SuperblockStore>() -> Option<usize> {
@@ -942,12 +1035,23 @@ impl TransferFileJob {
                 directory,
                 keep,
                 bodies,
+                chain,
             } => {
                 crate::state_transfer::sweep_staging_except(&directory, keep.into_iter().collect())
                     .await;
                 let outcome = async {
                     if bodies {
                         crate::state_transfer::remove_public_segment_files(&directory).await?;
+                    }
+                    // The chain describes the segments the install replaces.
+                    match chain {
+                        Some(bytes) => {
+                            crate::segment_chain::replace_chain(&directory, bytes).await?;
+                        }
+                        None => {
+                            remove_if_present(&crate::segment_chain::chain_path(&directory))
+                                .await?;
+                        }
                     }
                     crate::state_transfer::fsync_dir(&directory).await
                 }
@@ -1195,6 +1299,7 @@ impl TransferFileJob {
                                 ".index",
                                 crate::state_transfer::STAGING_SUFFIX,
                                 crate::segment_anchor::ANCHOR_SUFFIX,
+                                crate::segment_chain::CHAIN_FILE,
                             ]
                             .iter()
                             .any(|suffix| path.ends_with(suffix))
@@ -1225,6 +1330,12 @@ impl TransferFileJob {
 impl SegmentIoJob {
     #[allow(clippy::future_not_send)]
     pub(crate) async fn execute(self) -> Result<InstalledSegment, IggyError> {
+        if let Some(append) = &self.chain_append {
+            append.execute().await.map_err(|error| {
+                warn!(path = append.path, %error, "cannot append the sealed segment's chain record");
+                IggyError::CannotWriteToFile
+            })?;
+        }
         if let Some(writer) = &self.old_index {
             writer.fsync().await?;
         }
@@ -1607,6 +1718,8 @@ mod tests {
         std::os::unix::fs::symlink(&preserved, &replacement_symlink).unwrap();
         let stale_segment = directory.path().join("stale.log");
         std::fs::write(&stale_segment, b"stale").unwrap();
+        let chain = directory.path().join(crate::segment_chain::CHAIN_FILE);
+        std::fs::write(&chain, b"chain").unwrap();
         let emptied_marker = directory.path().join("emptied");
         std::fs::write(
             &emptied_marker,
@@ -1643,6 +1756,7 @@ mod tests {
                 preallocate: false,
                 segment_bodies: false,
                 old_index: None,
+                chain_append: None,
             },
         }
         .execute()
@@ -1665,6 +1779,10 @@ mod tests {
         assert!(replacement_symlink.is_symlink());
         assert_eq!(std::fs::read(&preserved).unwrap(), b"preserved");
         assert!(!stale_segment.exists());
+        assert!(
+            !chain.exists(),
+            "the chain goes with the history it describes"
+        );
         assert!(!emptied_marker.exists());
         assert!(!segment_symlink.exists());
         assert!(messages_path.is_file());

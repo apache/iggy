@@ -16,7 +16,7 @@
 // under the License.
 
 use super::client_builder::{ClientBuilder, ServerConnection};
-use super::common::SIGTERM_TIMEOUT;
+use super::common::{SIGTERM_TIMEOUT, cargo_bin_command};
 use super::connectors_runtime::ConnectorsRuntimeHandle;
 use super::mcp::McpHandle;
 use crate::harness::config::{ConnectorsRuntimeConfig, McpConfig, TestServerConfig};
@@ -24,7 +24,6 @@ use crate::harness::context::TestContext;
 use crate::harness::error::TestBinaryError;
 use crate::harness::port_reserver::PortReserver;
 use crate::harness::traits::{IggyServerDependent, Restartable, TestBinary};
-use assert_cmd::prelude::CommandCargoExt;
 use iggy::prelude::{DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME};
 use iggy_common::{IggyDuration, TransportProtocol};
 use rand::RngExt as _;
@@ -158,14 +157,14 @@ impl ServerHandle {
             .join(format!("server_{}_local_data", self.server_id))
     }
 
-    /// The `cluster.commit_broadcast_interval` the server runs with, read from
+    /// The `cluster.commit_busy_heartbeat_interval` the server runs with, read from
     /// the config it dumped at boot.
     ///
     /// # Errors
     ///
     /// [`TestBinaryError::InvalidState`] when the dump cannot be read or holds
     /// no valid interval.
-    pub fn commit_broadcast_interval(&self) -> Result<Duration, TestBinaryError> {
+    pub fn commit_busy_heartbeat_interval(&self) -> Result<Duration, TestBinaryError> {
         let path = self.data_path().join(CONFIG_DUMP_PATH);
         let invalid = |reason: String| TestBinaryError::InvalidState {
             message: format!("{}: {reason}", path.display()),
@@ -174,12 +173,16 @@ impl ServerHandle {
         let config: Value = toml::from_str(&dump).map_err(|error| invalid(error.to_string()))?;
         let interval = config
             .get("cluster")
-            .and_then(|cluster| cluster.get("commit_broadcast_interval"))
+            .and_then(|cluster| cluster.get("commit_busy_heartbeat_interval"))
             .and_then(Value::as_str)
-            .ok_or_else(|| invalid("no cluster.commit_broadcast_interval".to_string()))?;
+            .ok_or_else(|| invalid("no cluster.commit_busy_heartbeat_interval".to_string()))?;
         IggyDuration::from_str(interval)
             .map(|interval| interval.get_duration())
-            .map_err(|error| invalid(format!("commit_broadcast_interval {interval:?}: {error}")))
+            .map_err(|error| {
+                invalid(format!(
+                    "commit_busy_heartbeat_interval {interval:?}: {error}"
+                ))
+            })
     }
 
     fn stdout_log_path(&self) -> PathBuf {
@@ -220,6 +223,11 @@ impl ServerHandle {
 
     pub fn remove_env(&mut self, key: impl Into<String>) {
         self.config.removed_envs.push(key.into());
+    }
+
+    /// The value that the server config gives the environment variable `key`.
+    pub fn env(&self, key: &str) -> Option<&str> {
+        self.config.extra_envs.get(key).map(String::as_str)
     }
 
     pub fn collect_logs(&self) -> (String, String) {
@@ -1058,25 +1066,16 @@ impl TestBinary for ServerHandle {
             let _ = fs::remove_file(&config_path);
         }
 
-        #[allow(deprecated)]
         let launched_binary = self.launched_binary();
         let mut command = if let Some(ref path) = self.config.executable_path {
             let path_ref = Path::new(path);
             if path_ref.components().count() == 1 && !path_ref.exists() {
-                Command::cargo_bin(path).map_err(|e| TestBinaryError::ProcessSpawn {
-                    binary: launched_binary.clone(),
-                    source: std::io::Error::other(e.to_string()),
-                })?
+                cargo_bin_command(path)?
             } else {
                 Command::new(path)
             }
         } else {
-            Command::cargo_bin(Self::default_server_binary()).map_err(|e| {
-                TestBinaryError::ProcessSpawn {
-                    binary: launched_binary.clone(),
-                    source: std::io::Error::other(e.to_string()),
-                }
-            })?
+            cargo_bin_command(Self::default_server_binary())?
         };
 
         command.env("IGGY_PATH", data_path.display().to_string());

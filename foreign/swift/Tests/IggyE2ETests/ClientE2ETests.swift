@@ -67,6 +67,26 @@ struct SessionE2ETests {
         }
     }
 
+    @Test func aConnectionStringSignsInWithAPasswordOrAToken() async throws {
+        let address = try #require(E2EEnvironment.address)
+        var options = "reconnection_interval=200ms&reestablish_after=0"
+        if let tls = E2EEnvironment.tlsOptions, let domain = tls.domain, let caFile = tls.caFile {
+            options += "&tls=true&tls_domain=\(domain)&tls_ca_file=\(caFile)"
+        }
+        let client = try IggyClient(connectionString: "iggy://\(E2EEnvironment.rootUsername):\(E2EEnvironment.rootPassword)@\(address)?\(options)")
+        try await client.connect()
+        #expect(await client.state == .authenticated)
+        let name = E2EEnvironment.uniqueName("swift-cs")
+        let token = try await client.createPersonalAccessToken(name: name)
+        await client.shutdown()
+
+        let tokenClient = try IggyClient(connectionString: "iggy+tcp://\(token.token)@\(address)?\(options)")
+        try await tokenClient.connect()
+        #expect(await tokenClient.state == .authenticated)
+        try await tokenClient.deletePersonalAccessToken(name: name)
+        await tokenClient.shutdown()
+    }
+
     @Test func invalidCredentialsAreRejected() async throws {
         try await E2EEnvironment.withSession(login: false) { session in
             let client = session.client

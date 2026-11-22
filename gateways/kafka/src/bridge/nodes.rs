@@ -22,6 +22,9 @@
 //! each read or offset client that a timeout dropped. Beside a stopped node, the configured
 //! address is down, so a new client also tries the nodes of the last roster that the bridge read.
 //! That roster comes from the cluster itself, so a new client never reaches another cluster.
+//!
+//! With the roster, the bridge reads the size of the cluster and the replication factor that Iggy
+//! gives a topic by default. Kafka requests that create topics report both.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
@@ -41,6 +44,11 @@ pub struct KnownNodes(Arc<Mutex<Known>>);
 struct Known {
     /// The TCP address of each node, in roster order.
     roster: Vec<String>,
+    /// How many nodes the last roster listed, the ones without an address among them. 0 until
+    /// the bridge reads one.
+    node_count: usize,
+    /// The replication factor Iggy gives a topic that names none, from its last answer.
+    default_replication_factor: Option<u32>,
     /// Until when each address that a dial could not reach stays at the back.
     unreachable: HashMap<String, Instant>,
 }
@@ -54,7 +62,27 @@ impl KnownNodes {
             .iter()
             .filter_map(|node| tcp_address(&node.ip, node.endpoints.tcp))
             .collect();
-        self.known().roster = roster;
+        let mut known = self.known();
+        known.roster = roster;
+        known.node_count = metadata.nodes.len();
+    }
+
+    /// How many nodes the last roster listed, or `None` before the bridge reads one.
+    #[must_use]
+    pub fn node_count(&self) -> Option<usize> {
+        Some(self.known().node_count).filter(|count| *count > 0)
+    }
+
+    /// Records the replication factor Iggy gives a topic that names none.
+    pub fn learn_default_replication_factor(&self, factor: u32) {
+        self.known().default_replication_factor = Some(factor);
+    }
+
+    /// The replication factor Iggy gives a topic that names none, or `None` before the bridge
+    /// reads it.
+    #[must_use]
+    pub fn default_replication_factor(&self) -> Option<u32> {
+        self.known().default_replication_factor
     }
 
     /// The addresses a new client tries in turn: `configured` first, then each node of the
@@ -192,6 +220,12 @@ mod tests {
             known.dial_order("iggy:8090"),
             ["iggy:8090", "[fd00::4]:8090"]
         );
+        assert_eq!(known.node_count(), Some(4), "every node counts");
+    }
+
+    #[test]
+    fn given_no_roster_yet_should_know_no_node_count() {
+        assert_eq!(KnownNodes::default().node_count(), None);
     }
 
     #[test]

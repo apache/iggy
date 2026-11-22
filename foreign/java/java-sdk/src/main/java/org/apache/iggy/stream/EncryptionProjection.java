@@ -48,7 +48,7 @@ public final class EncryptionProjection {
                 .orElse(List.of());
     }
 
-    private static Optional<String> text(
+    static Optional<String> text(
             Map<String, HeaderValue> options, Map<String, HeaderValue> derived, StreamOptionKey key) {
         HeaderValue value = derived.get(key.value());
         if (value == null) {

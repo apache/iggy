@@ -108,12 +108,15 @@ PolledMessages::PolledMessages(ffi::PolledMessages batch)
 }
 
 ReadException::ReadException(const std::string &message, ffi::ReadErrorInfo &error)
-    : IggyException(message, error.error) {
+    : IggyException(message, error.error), lasting_refusal_(error.lasting_refusal) {
     if (error.has_partition_id) {
         partition_id_ = error.partition_id;
     }
     if (!error.skip.empty()) {
         skip_ = std::shared_ptr<const ::iggy::Continuation>(new ::iggy::Continuation(error.skip[0]->copy()));
+    }
+    if (error.has_lost) {
+        lost_.emplace(error.lost_first, error.lost_last);
     }
 }
 

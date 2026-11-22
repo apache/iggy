@@ -31,7 +31,7 @@ import {
 } from '../offset/offset.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
 import { ResponseError, responseError } from '../error.utils.js';
-import { EMPTY_PARTITION_CONTEXT, type PartitionContext } from '../vsr/header.js';
+import { EMPTY_PARTITION_CONTEXT, sameContext, type PartitionContext } from '../vsr/header.js';
 import {
   SYNC_GROUP,
   type ConsumerGroupAssignment,
@@ -126,7 +126,9 @@ export type PollMessages = {
    * deleted and recreated since. Without one the client takes the context its
    * cached route reports: after another client deletes and recreates the
    * partition, one poll can fail with 87 (5009 for a group consumer). The
-   * failed route is dropped and the next call routes again.
+   * failed route is dropped and the next call routes again. A context that is
+   * all zero counts as none. A context of incarnation 0 takes the incarnation
+   * of the route once and keeps its owner generation and metadata op.
    */
   context?: PartitionContext,
   /**
@@ -357,8 +359,10 @@ const pollConsumerGroup = async (
         throw error;
       state.cursors.delete(key);
       // A caller context names one owner, so a retry under it would be
-      // refused again. The caller decides, as in the Rust SDK.
-      if (request.context && error.errorCode === GROUP_PARTITION_NOT_OWNED)
+      // refused again. The caller decides, as in the Rust SDK. A context that
+      // is all zero names none, as the client sends it.
+      if (request.context && !sameContext(request.context, EMPTY_PARTITION_CONTEXT) &&
+          error.errorCode === GROUP_PARTITION_NOT_OWNED)
         throw error;
       continue;
     }

@@ -24,7 +24,8 @@ use crate::primitives::options::{
 use crate::responses::streams::StreamResponse;
 use bytes::{BufMut, BytesMut};
 
-/// Topic header within a `GetStream` response.
+/// Topic header on the wire. Used in the `GetStream`, `GetTopic` and
+/// `CreateTopic` responses and in a `GetTopics` page.
 ///
 /// Wire format (33 + `name_len` + options bytes):
 /// ```text
@@ -39,7 +40,7 @@ use bytes::{BufMut, BytesMut};
 /// re-sends only `options`; the effective configuration is the union.
 /// Message expiry, compression and the size cap live in those blocks only.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TopicHeader {
+pub struct TopicResponse {
     pub id: u32,
     pub created_at: u64,
     pub partitions_count: u32,
@@ -50,11 +51,11 @@ pub struct TopicHeader {
     pub derived_options: WireOptions,
 }
 
-impl TopicHeader {
+impl TopicResponse {
     pub(crate) const FIXED_SIZE: usize = 4 + 8 + 4 + 8 + 8 + 1; // 33
 }
 
-impl WireEncode for TopicHeader {
+impl WireEncode for TopicResponse {
     fn encoded_size(&self) -> usize {
         Self::FIXED_SIZE
             + self.name.len()
@@ -74,7 +75,7 @@ impl WireEncode for TopicHeader {
     }
 }
 
-impl WireDecode for TopicHeader {
+impl WireDecode for TopicResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
         let id = read_u32_le(buf, 0)?;
         let created_at = read_u64_le(buf, 4)?;
@@ -108,7 +109,7 @@ impl WireDecode for TopicHeader {
 ///
 /// Wire format:
 /// ```text
-/// [StreamResponse][TopicHeader]*
+/// [StreamResponse][TopicResponse]*
 /// ```
 ///
 /// The number of topics is determined by `stream.topics_count` or by
@@ -116,7 +117,7 @@ impl WireDecode for TopicHeader {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetStreamResponse {
     pub stream: StreamResponse,
-    pub topics: Vec<TopicHeader>,
+    pub topics: Vec<TopicResponse>,
 }
 
 impl WireEncode for GetStreamResponse {
@@ -140,7 +141,7 @@ impl WireEncode for GetStreamResponse {
 /// Smallest a topic header can encode as: the fixed ids, timestamps, sizes,
 /// counts and name length, plus the shortest name `WireName` accepts (one byte,
 /// since it rejects an empty one) and two empty length-prefixed option blocks.
-const MIN_TOPIC_HEADER_SIZE: usize = TopicHeader::FIXED_SIZE + 1 + 4 + 4;
+const MIN_TOPIC_RESPONSE_SIZE: usize = TopicResponse::FIXED_SIZE + 1 + 4 + 4;
 
 impl WireDecode for GetStreamResponse {
     fn decode(buf: &[u8]) -> Result<(Self, usize), WireError> {
@@ -150,10 +151,10 @@ impl WireDecode for GetStreamResponse {
         let mut topics = Vec::with_capacity(crate::codec::bounded_capacity(
             stream.topics_count as usize,
             buf.len().saturating_sub(pos),
-            MIN_TOPIC_HEADER_SIZE,
+            MIN_TOPIC_RESPONSE_SIZE,
         ));
         for _ in 0..stream.topics_count {
-            let (topic, consumed) = TopicHeader::decode(&buf[pos..])?;
+            let (topic, consumed) = TopicResponse::decode(&buf[pos..])?;
             pos += consumed;
             topics.push(topic);
         }
@@ -178,8 +179,8 @@ mod tests {
         }
     }
 
-    fn sample_topic(id: u32, name: &str) -> TopicHeader {
-        TopicHeader {
+    fn sample_topic(id: u32, name: &str) -> TopicResponse {
+        TopicResponse {
             id,
             created_at: 1_710_000_000_000,
             partitions_count: 3,
@@ -219,28 +220,28 @@ mod tests {
     }
 
     #[test]
-    fn topic_header_roundtrip() {
+    fn topic_response_roundtrip() {
         let topic = sample_topic(5, "events");
         let bytes = topic.to_bytes();
-        assert_eq!(bytes.len(), TopicHeader::FIXED_SIZE + 6 + 4 + 4);
-        let (decoded, consumed) = TopicHeader::decode(&bytes).unwrap();
+        assert_eq!(bytes.len(), TopicResponse::FIXED_SIZE + 6 + 4 + 4);
+        let (decoded, consumed) = TopicResponse::decode(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(decoded, topic);
     }
 
     #[test]
-    fn min_topic_header_size_matches_the_shortest_encoding() {
+    fn min_topic_response_size_matches_the_shortest_encoding() {
         let bytes = sample_topic(1, "t").to_bytes();
-        assert_eq!(bytes.len(), MIN_TOPIC_HEADER_SIZE);
+        assert_eq!(bytes.len(), MIN_TOPIC_RESPONSE_SIZE);
     }
 
     #[test]
-    fn topic_header_truncated_returns_error() {
+    fn topic_response_truncated_returns_error() {
         let topic = sample_topic(1, "t");
         let bytes = topic.to_bytes();
         for i in 0..bytes.len() {
             assert!(
-                TopicHeader::decode(&bytes[..i]).is_err(),
+                TopicResponse::decode(&bytes[..i]).is_err(),
                 "expected error for truncation at byte {i}"
             );
         }

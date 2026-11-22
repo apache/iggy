@@ -31,6 +31,11 @@ const TOPIC: &str = "metrics-topic";
 const METRICS_USER: &str = "metrics-reader";
 const METRICS_PASSWORD: &str = "metrics-reader-pass";
 const TOPIC_SERIES: [&str; 3] = ["topic_size_bytes", "topic_messages", "topic_max_size_bytes"];
+/// The host volume's series, gated by the same rule as the per-topic ones.
+/// `volume_used_bytes` waits for the first disk sample, so only the counter is
+/// certain to be in a privileged scrape.
+const DISK_SERIES: [&str; 2] = ["volume_used_bytes", "disk_allocated_bytes"];
+const DISK_COUNTER: &str = "disk_allocated_bytes_total ";
 
 /// The value of the unlabelled `name` gauge.
 fn gauge(exposition: &str, name: &str) -> Option<u64> {
@@ -178,7 +183,7 @@ async fn given_scraped_topic_when_deleted_should_drop_its_series_on_next_scrape(
 }
 
 #[iggy_harness(cluster_nodes = 1)]
-async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_series(
+async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_and_disk_series(
     harness: &TestHarness,
 ) {
     let client = harness.tcp_root_client().await.expect("tcp root client");
@@ -215,6 +220,12 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             "root must see the {name} series:\n{privileged_before}"
         );
     }
+    assert!(
+        privileged_before
+            .lines()
+            .any(|line| line.starts_with(DISK_COUNTER)),
+        "root must see the disk series:\n{privileged_before}"
+    );
 
     let restricted = scrape_as(&user).await;
     assert_eq!(
@@ -235,6 +246,12 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             "a user without server read must not see any {name} series:\n{restricted}"
         );
     }
+    for name in DISK_SERIES {
+        assert!(
+            !restricted.lines().any(|line| line.contains(name)),
+            "a user without server read must not see the {name} series:\n{restricted}"
+        );
+    }
 
     let privileged_after = scrape_as(&root).await;
     for name in TOPIC_SERIES {
@@ -243,6 +260,70 @@ async fn given_user_without_server_read_when_scraping_metrics_should_omit_topic_
             "a denied scrape must not empty the next privileged one ({name}):\n{privileged_after}"
         );
     }
+    assert!(
+        privileged_after
+            .lines()
+            .any(|line| line.starts_with(DISK_COUNTER)),
+        "a denied scrape must not hide the disk series from the next privileged one:\n{privileged_after}"
+    );
+}
+
+/// With the per-topic series off, a scrape walks no topic, and the totals
+/// still come from the counters the server keeps.
+#[iggy_harness(cluster_nodes = 1, server(http.metrics.topic_gauges = false))]
+async fn given_topic_gauges_off_when_scraping_metrics_should_keep_only_the_totals(
+    harness: &TestHarness,
+) {
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    create_topic(&client, MaxTopicSize::from(2 * 1024 * 1024 * 1024u64)).await;
+    let stream_id = Identifier::from_str_value(STREAM).expect("stream identifier");
+    let topic_id = Identifier::from_str_value(TOPIC).expect("topic identifier");
+    let mut messages: Vec<IggyMessage> = (0..10)
+        .map(|index| {
+            IggyMessage::builder()
+                .payload(format!("message-{index}").into())
+                .build()
+                .expect("build message")
+        })
+        .collect();
+    client
+        .send_messages(
+            &stream_id,
+            &topic_id,
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("send messages");
+
+    let exposition = scrape(harness).await;
+
+    for (name, expected) in [
+        ("streams", 1),
+        ("topics", 1),
+        ("partitions", 1),
+        ("messages", 10),
+    ] {
+        assert_eq!(
+            gauge(&exposition, name),
+            Some(expected),
+            "the {name} total must stay on:\n{exposition}"
+        );
+    }
+    for name in TOPIC_SERIES {
+        assert!(
+            !exposition
+                .lines()
+                .any(|line| line.starts_with(&format!("{name}{{"))),
+            "the switch must drop every {name} series:\n{exposition}"
+        );
+    }
+    assert!(
+        exposition
+            .lines()
+            .any(|line| line.starts_with(DISK_COUNTER)),
+        "the switch must leave the disk series alone:\n{exposition}"
+    );
 }
 
 async fn create_topic(client: &IggyClient, max_topic_size: MaxTopicSize) {

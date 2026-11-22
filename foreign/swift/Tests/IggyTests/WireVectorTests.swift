@@ -61,7 +61,7 @@ struct RequestVectorTests {
             try Requests.createStream(name: "test-stream", options: try OptionsBlock.encode(sampleOptions)) == golden.bytes("request.create_stream.options"))
         #expect(try encode(5) == golden.bytes("request.delete_stream"))
         #expect(try encode("my-stream") == golden.bytes("request.get_stream"))
-        #expect(golden.bytes("request.get_streams").isEmpty)
+        #expect(try Requests.listPage(query: PageQuery()) == golden.bytes("request.get_streams"))
         let key = Data((0..<UInt8(EncryptionKey.length)).map { $0 })
         #expect(
             try Requests.createStream(name: "test-stream", options: StreamCreateOptions(encryptionKey: key).encode())
@@ -76,7 +76,9 @@ struct RequestVectorTests {
                 == golden.bytes("request.create_topic"))
         #expect(try Requests.streamAndTopic(1, 5) == golden.bytes("request.delete_topic"))
         #expect(try Requests.streamAndTopic("my-stream", "my-topic") == golden.bytes("request.get_topic"))
-        #expect(try encode(42) == golden.bytes("request.get_topics"))
+        let topicsQuery = NamedPageQuery(
+            page: PageQuery(order: .created, descending: true, limit: 20, cursor: PageCursor.created(at: 1_710_000_000_000_000, id: 7)), name: "ord")
+        #expect(try Requests.listPage(42, query: topicsQuery) == golden.bytes("request.get_topics"))
         let update = TopicUpdateOptions(name: "updated-topic", messageExpiry: .after(.seconds(604_800)), reset: [.maxTopicSize])
         #expect(try Requests.updateResource(.topic(stream: 1, topic: 2), update.toPatch()) == golden.bytes("request.update_resource.topic"))
         // Reset names travel in byte order, whatever order they were named in.
@@ -90,13 +92,15 @@ struct RequestVectorTests {
         #expect(try Requests.partitions(streamID: 1, topicID: 2, partitionsCount: 5) == golden.bytes("request.create_partitions"))
         #expect(try Requests.partitions(streamID: "stream", topicID: "topic", partitionsCount: 2) == golden.bytes("request.delete_partitions"))
         #expect(try Requests.deleteSegments(streamID: 1, topicID: 2, partitionID: 3, segmentsCount: 10) == golden.bytes("request.delete_segments"))
+        let partitionsQuery = PageQuery(descending: true, limit: PageQuery.maxLimit, cursor: PageCursor.id(2))
+        #expect(try Requests.listPage("stream", "topic", query: partitionsQuery) == golden.bytes("request.get_partitions"))
     }
 
     @Test func consumerGroups() throws {
         #expect(try Requests.createConsumerGroup(streamID: 1, topicID: 2, name: "grp") == golden.bytes("request.create_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: 1, topicID: 2, groupID: 3) == golden.bytes("request.delete_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: "stream-1", topicID: "topic-1", groupID: "group-1") == golden.bytes("request.get_consumer_group"))
-        #expect(try Requests.streamAndTopic(1, 2) == golden.bytes("request.get_consumer_groups"))
+        #expect(try Requests.listPage(1, 2, query: PageQuery()) == golden.bytes("request.get_consumer_groups"))
         #expect(try Requests.consumerGroup(streamID: 1, topicID: 2, groupID: 3) == golden.bytes("request.join_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: 1, topicID: 2, groupID: "g") == golden.bytes("request.leave_consumer_group"))
         #expect(try Requests.consumerGroup(streamID: "stream-1", topicID: "topic-1", groupID: "group-1") == golden.bytes("request.sync_consumer_group"))
@@ -160,7 +164,8 @@ struct RequestVectorTests {
                 == golden.bytes("request.create_user.no_permissions"))
         #expect(try encode("old-user") == golden.bytes("request.delete_user"))
         #expect(try encode(42) == golden.bytes("request.get_user"))
-        #expect(golden.bytes("request.get_users").isEmpty)
+        // The first page of the walk that the whole-list methods do.
+        #expect(try Requests.listPage(query: PageQuery(limit: PageQuery.maxLimit)) == golden.bytes("request.get_users"))
         #expect(
             try Requests.updateResource(.user(1), UserUpdateOptions(username: "new-name", status: .inactive).toPatch())
                 == golden.bytes("request.update_resource.user"))

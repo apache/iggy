@@ -10,13 +10,13 @@
 
 Official Swift client SDK for [Apache Iggy](https://iggy.apache.org) message streaming.
 
-The SDK is built up in stages. The client is a TCP connection with optional TLS that
-speaks the consensus protocol, signs in, keeps the session alive with a heartbeat,
-reconnects, and follows the cluster leader. It manages streams, topics, partitions,
-segments, users, personal access tokens, and consumer groups, sends and polls messages,
-stores consumer offsets, produces with a batching producer, and consumes with a
-consumer that tracks and commits its position. Examples and BDD scenarios follow in
-later changes.
+The client is a TCP connection with optional TLS that speaks the consensus protocol,
+signs in, keeps the session alive with a heartbeat, reconnects, and follows the cluster
+leader. It manages streams, topics, partitions, segments, users, personal access tokens,
+and consumer groups, sends and polls messages, stores consumer offsets, produces with a
+batching producer, and consumes with a consumer that tracks and commits its position.
+A runnable producer and consumer live in [`examples/swift`](../../examples/swift), and the
+scenarios every SDK shares run against this one from [`bdd/swift`](../../bdd/swift).
 
 Swift supports the consensus wire protocol and checks commitment proof during
 automatic retries. It does not yet expose retained-operation resolve/abandon APIs,
@@ -36,28 +36,32 @@ The SDK depends on [SwiftNIO](https://github.com/apple/swift-nio),
 
 ## Installation
 
-Swift Package Manager fetches a package from the root of a git repository, so the SDK
-cannot be depended on straight from this monorepo's subdirectory. Add it through the
-package mirror, which carries every release as a `v<version>` tag:
+Swift Package Manager resolves a package from the root of a git repository, so the Iggy repository root carries a `Package.swift` that publishes this SDK. Depend on the Iggy repository itself.
+
+There is no stable Swift release yet. Until there is, pin a development snapshot exactly, replacing `0.1.10-edge.1` with the newest `vX.Y.Z-edge.N` tag:
 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/apache/iggy-swift.git", from: "0.1.1")
+    .package(url: "https://github.com/apache/iggy.git", exact: "0.1.10-edge.1")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy-swift")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
-From a checkout of this repository, or a vendored copy, depend on it by path:
+Stable Swift releases use `vX.Y.Z` tags after PMC approval. An `X.Y.Z-edge.N` tag is a development snapshot of unreleased changes, not an Apache release, and a version range never selects one. Once a stable release exists, depend on it with `.upToNextMinor(from: "X.Y.Z")`: while the SDK is 0.x, `from:` would also take the next minor release. A requirement must start at the first stable `v0.1.x` tag, because the repository's `0.0.4` to `0.0.52` tags predate the Swift SDK and have no root manifest.
+
+The first resolve mirror-clones the whole Iggy repository, about 145 MiB with every pull request ref, and checks out its 67 MiB tree for a 0.8 MiB SDK. SwiftPM keeps the clone in its cache, so later resolves fetch only new commits.
+
+From a checkout of this repository, depend on its root by path. SwiftPM names a path dependency after its directory, so the package is `iggy` for a checkout in `../iggy`:
 
 ```swift
 dependencies: [
-    .package(name: "apache-iggy", path: "../iggy/foreign/swift")
+    .package(path: "../iggy")
 ],
 targets: [
-    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "apache-iggy")])
+    .target(name: "MyApp", dependencies: [.product(name: "Iggy", package: "iggy")])
 ]
 ```
 
@@ -98,6 +102,40 @@ let client = IggyClient(configuration: configuration)
 The server certificate is verified against the system roots, or against `caFile` when
 set, and against the host of the address unless `TLSOptions.domain` names another one.
 
+### Connection strings
+
+A client can also take the connection string every Iggy SDK reads. The credentials
+become the auto-login, either `username:password` or a personal access token alone:
+
+```swift
+let client = try IggyClient(connectionString: "iggy://iggy:iggy@localhost:8090?tls=true&tls_ca_file=/etc/iggy/ca.pem")
+let configuration = try ClientConfiguration(connectionString: "iggy+tcp://\(token)@[::1]:8090?reconnection_retries=5")
+```
+
+The options are `tls`, `tls_domain`, `tls_ca_file`, `reconnection_retries` (a count or
+`unlimited`), `reconnection_interval`, `reestablish_after`, `heartbeat_interval`, `nodelay`,
+`max_pending_operations`, and `max_pending_operation_bytes`. Durations take the spellings
+of the Rust SDK, such as `500ms`, `5s`, or `1h 30m`. An unknown option or a malformed
+value fails with `invalidConnectionString`, and a bad retry count with
+`invalidNumberValue`, so a string is valid in every SDK or in none. Only the `iggy://`
+and `iggy+tcp://` schemes are accepted.
+
+Some options read differently than in Rust:
+
+- `tls` and `nodelay` take `true` or `false`, and any other value fails, where Rust
+  reads it as false.
+- Without `nodelay` the client keeps Nagle off, its own default.
+- `reconnection_interval` is the full pause between rounds over the endpoints. Rust
+  takes it as the base of a jittered backoff capped at 10 seconds.
+- `reestablish_after` is how long after the last successful connection the client
+  waits before redialing that endpoint. Rust takes it as the uptime that resets the
+  backoff.
+- A request that needs the connection waits for the redial, up to the request timeout
+  (30 seconds by default), and fails when the wait, or the `reconnection_interval`
+  pause, outlasts it. An explicit `connect()` waits it out.
+- The pending operation limits are checked and then ignored, since this client keeps
+  no operations to replay.
+
 ### Resource options
 
 Streams, topics, and users carry options. A create call takes a typed options value, and an update names only the keys it changes, plus the keys to return to their defaults. Every other key keeps its stored value:
@@ -114,7 +152,10 @@ try await client.updateTopic(
 try await client.updateUser("alice", options: UserUpdateOptions(status: .inactive))
 ```
 
-Only `message_expiry` and `max_topic_size` can be reset. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
+Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. An update can turn `tiered_storage` on, never off. Compression and the other topic settings are fixed at create, and no stream or user key is resettable yet. A typed update that breaks these rules fails before anything is sent, with the error the server would return.
+
+A geo topic takes six durations of its own: `freshUploadInterval`, `consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`, `positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each travels as whole microseconds and overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent.
+An update can set them, and they are the only keys it may change on a geo topic, but it cannot reset them. A normal topic refuses them. `Topic` and `TopicDetails` read them back, nil when unset.
 
 Everything else, such as a taken name or a missing resource, is refused by the server. `describeOptions(scope:)` lists every key of a scope with flags saying what an update may do with it. Renaming the signed-in user, through `username` or a raw `username` entry, moves the credentials later reconnects use.
 
@@ -127,6 +168,32 @@ try await client.updateTopic(streamID: "payments-v2", topicID: "orders", options
 `StreamCreateOptions.encryptionKey` gives the stream its own data key. It must be 32 random bytes, never derived from a password. It travels inside the create request over whatever transport the client uses, so protecting it in transit with TLS is the caller's choice.
 
 The server stores it wrapped and never returns it: reads report `encryptionKeySource`, `encryptionKeyFingerprint`, and `encryptionKekFingerprints`, and `EncryptionKey.fingerprint(_:)` computes the fingerprint of a key to compare. Without a key, a server with encryption enabled generates one for the stream.
+
+### List pages
+
+`getStreams()`, `getTopics(streamID:)`, `getConsumerGroups(streamID:topicID:)` and `getUsers()` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. An entity that someone creates or deletes during the read can appear or not appear. The read keeps the sign-in it started with, and one request timeout covers every page. If the server answers with the cursor it was sent, the read fails with `invalidCommand`.
+
+`getStreamsPage(_:)`, `getTopicsPage(streamID:query:)`, `getPartitionsPage(streamID:topicID:query:)`, `getConsumerGroupsPage(streamID:topicID:query:)` and `getUsersPage(_:)` return one page. To read the next page, send the same query with the `next` of the page as its `cursor`. A page can be empty and still have a `next`:
+
+```swift
+func printStreams(_ client: IggyClient) async throws {
+    var query = NamedPageQuery()
+    while true {
+        let page = try await client.getStreamsPage(query)
+        for stream in page.items {
+            print(stream.id, stream.name)
+        }
+        guard let next = page.next else {
+            return
+        }
+        query.page.cursor = next
+    }
+}
+```
+
+A `PageQuery` holds `order`, `descending`, `limit` and `cursor`. `order` selects `.id` or `.created`, and `descending` reverses it. The stream, topic, consumer group and user page methods take a `NamedPageQuery`, which holds a `PageQuery` in `page` and an optional `name`. `name` keeps the entries whose name holds the text, case-sensitive. The partitions page method takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with `invalidCommand`, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A `PageCursor` prints as the `pg1_` text form that the HTTP API and the CLI use, and `PageCursor(text:)` reads it back. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with `invalidCommand`.
 
 ### Metadata changes
 
@@ -287,30 +354,72 @@ for try await batch in reader {
 
 The reader groups its partitions by their primary and reads each group with one request, which the server holds until a message arrives or the wait runs out. A moved primary, a rebalance and a lost connection are repaired inside, so a caller never groups partitions or handles `notPrimary`.
 
+The reader looks up the primaries beside its reads, also while batches wait for `next()`. After a good lookup, a failed one keeps the last groups. The reads go on with them, and the reader looks up again after `retryInterval`. Unless its refusal is transient, a failed lookup is thrown once as a `ReadError` without a partition. A partition refused as not primary waits for the next good lookup.
+
+A group member syncs its assignment beside its reads in the same way. After a good sync, a sync that fails or gets no reply keeps the last assignment, and the reads go on under it.
+
 The partitions that a read served go last in the next read of their group, so a backlog does not starve the other partitions. The partitions whose last read ended before their head are spread over the free requests of the reader, each share in a fetch of its own with the full `count` and `maxBytes`, while the quiet partitions of a group share one fetch that may wait.
 
 `next()` returns a batch of one partition, never empty, in offset order within one generation of the partition: from its first read, from each `seek(partitionID:to:)`, and from each new assignment. The default wait of a reader is five seconds. With a zero `maxWait`, a partition that a read found empty waits `retryInterval` before it is read again.
 
 - `.manual`: `commit(_:)` stores a checkpoint that the reader delivered.
-- `.onRead`: the server stores each read, and the reader reads only when `next()` waits with nothing queued, so no batch is stored before it was asked for. It then fills its free requests: the quiet partitions of a group share one fetch that may wait, and the backlogged ones take a committing fetch each beside it, with the full `count` and `maxBytes`. A partition that leaves the assignment still hands over the reads that the server stored for it.
+- `.onRead`: the server stores each read, and the reader reads only when `next()` waits with nothing queued, so it stores nothing while the application does not ask. It then fills its free requests: the quiet partitions of a group share one fetch that may wait, and the backlogged ones take a committing fetch each beside it, with the full `count` and `maxBytes`.
+  A partition that leaves the assignment still hands over the reads that the server stored for it. `close()` does not move the offset of a partition that left. So the group loses its batches that `next()` did not return before `close()`.
+  A crash, or a reader that stops without `close()`, loses the batches that the server stored before the application took them: up to the replies of 32 requests. `.manual` and `.auto` store offsets after delivery instead.
 
-  `close()` moves the offset of each partition back to the last batch delivered. It cancels the committing reads in flight first, and each waits for its one reply, so a parked read ends the close in about a round trip.
+  The `start` of the configuration applies only to a partition without a stored offset. A partition with one resumes after it. A seek moves the stored offset. The reader reads a timestamp or `.last` position first without a commit. Then it reads on from the first message of that read, so `.last` delivers the last `count` messages.
+
+  `close()` moves the offset of each partition back to the last batch delivered. A partition that delivered nothing moves before the first message it read. At offset zero, if a stored offset exists, the close deletes it. It cancels the committing reads in flight first, and each waits for its one reply, so a parked read ends the close in about a round trip.
 
   A read that lost its reply, or a section whose error leaves the outcome unknown, may have stored messages that never arrived. The reader abandons that read and reads its partitions again after `retryInterval`: the next reply then starts past those messages, and the reader reads that gap again without a commit and delivers it first.
 
-  A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, the reader reports `fetchProgressUncertain` with the lost range.
+  A forward jump without such a lost read is a store of the application or of another session, and the reader delivers from there. When the partition moved to another member before the gap was read, `next()` first throws `fetchProgressUncertain`, whose `lost` holds the first and the last offset of the range. Then it returns the batch after the gap. If the history no longer holds the gap or its start, for example after retention, the reader does the same with the missing range.
 
-  A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. A refused store fails the seek and moves nothing. A seek to offset zero or to another strategy stores nothing. A partition that a lost read of another caller on the same client blocks reports `partitionLaneBlocked` once and reads again after that operation was abandoned.
+  When `historyUnavailable` stops the partition during the gap read, the reader first reports the rest of the gap the same way. Then `next()` returns the batch after the gap, and only then it throws the error that stopped the partition.
+
+  A seek to an offset above zero stores the offset before it first, once the committing read of the partition in flight ended, so a restart resumes at the sought offset. If a stored offset exists, a seek to offset zero or to `.first` deletes it instead. A seek to a timestamp first reads the message at the timestamp without a commit, then works as a seek to its offset. Without such a message it stores nothing. A read never moves the stored offset back.
+
+  No committing read of the partition starts while the seek runs. A refused read, store, lookup or delete fails the seek and moves nothing. A store or delete refused as not owned goes once more, as described for `consumerGroupPartitionNotOwned` below. A store or delete with an unknown outcome also fails the seek. If that write moved the stored offset forward, the next read reads the skipped messages again. After such a delete, the partition reads on after the deleted offset.
+  Unless a later message was delivered, `close()` stores that offset again. A partition whose start found no stored offset, and that delivered nothing, gets no stored offset again at the close. A store with an unknown outcome can move the stored offset back. Until a new batch arrives, `close()` then stores the offset from before that store. For a group member, an unknown outcome that ends after a new session, or after the partition left the assignment, changes nothing.
+
+  A seek cancelled before its first store or delete moves nothing. A seek cancelled after that throws `CancellationError` at once. The seek still finishes, and it moves on success. The reader then logs a failure as a warning. A later seek and `close()` wait for it.
+  A seek after the start of the close fails with `invalidCommand`. A seek to another strategy stores nothing. The seeks of a partition move it in the order of their calls. Each seek waits for the writes of the seeks before it. A seek that stores nothing waits too.
+
+  A partition that a lost read of another caller on the same client blocks reports `partitionLaneBlocked` once and reads again after that operation was abandoned.
 
 - `.auto(AutoCommit(interval:every:after:))`: the reader counts a batch when `next()` returns it (`.delivery`), when the next one is asked for or the reader closes (`.processing`), or when the application calls `mark(_:)` (`.marked`), and stores the latest counted position of each partition at the interval, on the event of `every` (`.message`, `.messages(n)` counted per partition, `.batch`), before a rebalance takes a partition away, and in `close()`.
 
   `AutoCommit.default` stores every 10,000 messages or 5 seconds after `.processing`. A store only moves forward, and a position of an older generation is dropped.
 
-A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. The reader reads its partitions again after `retryInterval`. A message that does not decode, and `historyUnavailable` for a position read in a history that is gone, stop the partition until a seek.
+A failed read is thrown as a `ReadError` with the partition, the `IggyError` and, for a message that does not decode, its offset, its record and `skip`, the continuation after it. For a lost range it has `lost`.
+The reader reads its partitions again after `retryInterval`. A message that does not decode, `historyUnavailable` for a position read in a history that is gone, and `tieredReadFailed` for tiered data that the object store refuses for good, stop the partition until a seek. A lost range itself does not stop the partition and needs no seek.
+A read refused with `tieredReadFailed` is never sent again.
+
+`consumerGroupPartitionNotOwned` on a read of a group member is not a leave. A new session and a move of the partition away and back look the same. The partition keeps its position and what `close()` needs of it. The reader syncs its assignment and reads the partition again after `retryInterval`.
+Each further refusal in a row doubles that wait, up to 32 times `retryInterval` at the sixth. The sixth refusal in a row also makes `next()` throw one `ReadError` for the partition, the partition reads on, and the count starts again.
+
+When the reader joins again after a new session or a lost membership, the count starts again and the partition reads at once. If the application joins the member (`autoJoinConsumerGroup` is `false`), a new session starts the count again in the same way. Only a leave that a sync shows drops the state of the partition.
+
+After a new session, the server installs the owner again under a new generation. Until a read of the new session names that owner, the reads and offset writes of the partition name owner generation 0. If such a write carries a metadata op at or after the install, the server binds it to the installed owner. When the client sends such a write, it raises the metadata op of the write to the newest op that it saw. A read keeps its op.
+
+A store or delete refused as not owned is not a leave either. Another member can own a partition that left, or can have read it while it was away. So if the reader no longer reads the partition, or the write belongs to an assignment of the partition that ended, the write fails with the refusal.
+Otherwise the reader syncs its assignment, reads the partition once without a commit, and sends the write once more under the owner of that read. Only the context of that read counts, so a message that does not decode does not fail it. If that read fails other than by a transient refusal, or reads another history of the partition, the write fails with the refusal.
+
+While a transient refusal or `notPrimary` answers that read, the reader reads again after `retryInterval`. A cancel of the caller of the write ends that retry, and so does the start of `close()`. Then the write fails with the refusal, and the answer of a read in flight at that end sends no write. So `close()` waits for a `commit(_:)` no longer than one request in flight.
+The same rule holds for a seek write and an `.auto` store in the background. If no caller waits for such a failure, the reader logs it.
+
+The writes of `close()` itself retry that read too. The close belongs to the caller that started it. If that caller is cancelled, the reader stops each such retry at once. No such read starts after the cancel, and the write fails with its refusal. A read in flight at the cancel ends within the request timeout of the reader options, and its answer sends no write.
+The close deadline ends that retry in the same way, 10 seconds after the start of the close.
+The close still sends once each of its offset writes and lookups that it did not send yet, and then the leave. So a close that starts in a cancelled task also sends its writes and the leave.
+
+Each offset write and lookup ends within 30 seconds, a fixed limit that includes each resend after a transient refusal. The close sends them one after another. So during an outage it can take about 30 seconds for each partition with a pending store. The leave first waits for a join in flight, which sends up to three requests. So the leave can take up to four times the client `requestTimeout`. The close ends after the last request.
+
+A later caller of `close()` waits for the same close and gets its result. A cancel of a later caller cancels nothing. `IggyConsumer` cancels the close at `offsetDrainTimeout`.
 
 ### Consumer groups
 
 `joinConsumerGroup`, `leaveConsumerGroup`, `createConsumerGroup` and `getConsumerGroup` manage groups directly, but reading a group goes through a `PartitionReader` or an `IggyConsumer` that names `.group(id)`, which joins on its own. Membership belongs to the session. A reconnect resumes the session and keeps it.
+If the outcome of the join of a new reader, or of the group create before it, is unknown, building the reader fails with `transientNotCommitted`. The client keeps nothing of that request, so the next build starts over. A join that landed keeps the member in the group until the session ends.
 
 When the server no longer holds the session, the client signs in under a new one and the reader joins again. In a cluster, reads and offset writes go to the partition's primary over a second connection bound to the same session, and the heartbeat syncs every joined group.
 
@@ -377,9 +486,14 @@ for try await received in consumer {
 
 A handler that throws leaves its message uncounted and ends `consumeMessages(_:)` with its error, so the message is read again by the next run. Under the other policies a handler that throws is logged and reading goes on.
 
-`pollingStrategy` says where a partition without a position starts. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading until the client cannot come back on its own. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
+`pollingStrategy` says where a partition without a position starts. With `.onRead` it applies only to a partition without a stored offset, and a partition with one resumes after it. A failed read is thrown as a `ReadError` and leaves the consumer usable: a caller of `next()` can call it again, and `consumeMessages(_:)` logs it and keeps reading.
 
-`shutdown()` counts the last message under `.processing` and closes the reader within `offsetDrainTimeout`: it stores the counted positions under `.auto`, moves the offset of each partition back to the last message handed over under `.onRead`, and leaves the group.
+`consumeMessages(_:)` ends with the error once the client cannot come back on its own, and for a message that does not decode, `historyUnavailable` or `tieredReadFailed`, which stop the partition until a seek. A lost range (`ReadError.lost`, error 14010) ends `consumeMessages(_:)` with that error. A new call reads on.
+
+It also ends with `partitionLaneBlocked` under `.onRead`: a lost committing read of another caller blocks the partition until `abandonOperation(_:)` takes that operation, after which the reader reads it again by itself. Without `allowReplay` a message at or below the last one handed over from the same partition history is skipped, unless `seek(partitionID:to:)` moved the partition back.
+
+`shutdown()` counts the last message under `.processing` and closes the reader. The close stores the counted positions under `.auto`. Under `.onRead`, it moves the offset of each partition back to the last message handed over. Then it leaves the group. At `offsetDrainTimeout`, `shutdown()` cancels the close and waits for its end, as described for `PartitionReader`.
+After that, `shutdown()` can wait up to 30 seconds for each offset write and lookup in flight or not sent yet. It can also wait up to the request timeout of `pollOptions` for each read in flight. The leave first waits for a join in flight, which sends up to three requests. So the leave can take up to four times the client `requestTimeout`.
 
 Unlike the Rust consumer this one has no encryptor, and it does not resolve a group create or join whose reply was lost, since the Swift client has no operation lanes. For the same reason a store of a partition waits for a read in flight that reads or moves the stored offset of that partition, and no such read starts while the store waits.
 
@@ -435,7 +549,7 @@ can duplicate the earlier write. See the server's
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 ## Testing
@@ -477,9 +591,16 @@ The hash, error-code, model, request, reply, and consensus header tests compare 
 cargo run --manifest-path Tools/golden-vectors/Cargo.toml -- Tests/IggyTests/Fixtures/golden.json
 ```
 
-The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`.
+The resource options tests compare against `Tests/IggyTests/Fixtures/resource_options.json`, the fixture every SDK shares, generated by `core/common/examples/resource_options_fixtures.rs`. Never edit the copy. The metadata changes tests do the same with `Tests/IggyTests/Fixtures/metadata_changes.json`, generated by `core/common/examples/metadata_changes_fixtures.rs`. The list page tests do the same with `Tests/IggyTests/Fixtures/list_pages.json`, generated by `core/common/examples/list_pages_fixtures.rs`.
 
 The metadata changes scenario that churns the change log past its capacity runs only when `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY` is set for both the server and the test run, for example to 64.
+
+The shared scenarios in `bdd/scenarios` run through `bdd/swift/tests`, a package with a
+small Gherkin runner. CI runs it in Docker with `scripts/run-bdd-tests.sh swift`. Against a
+local server started as above with `IGGY_METADATA_CHANGE_LOG_RESOURCE_CAPACITY=64`, run one
+feature with `IGGY_TCP_ADDRESS=127.0.0.1:8090 IGGY_ROOT_USERNAME=iggy IGGY_ROOT_PASSWORD=iggy
+BDD_FEATURE=stream_options swift run iggy-bdd` from `bdd/swift/tests`. The examples run with
+`scripts/run-examples-from-readme.sh --language swift`.
 
 ## Contributing
 
@@ -491,3 +612,24 @@ swift format format --in-place --recursive Sources Tests Package.swift
 swift format lint --strict --recursive Sources Tests Package.swift
 swift build -Xswiftc -warnings-as-errors
 ```
+
+The same configuration covers the examples, the BDD runner and the root manifest, from the repository root:
+
+```bash
+for package in examples/swift/getting-started bdd/swift/tests; do
+  swift format lint --strict --recursive --configuration foreign/swift/.swift-format "$package/Sources" "$package/Package.swift"
+done
+swift format lint --strict --configuration foreign/swift/.swift-format Package.swift
+```
+
+### Releasing
+
+`IggyVersion.sdkVersion` in `Sources/Iggy/Iggy.swift` is the SDK version. Change it only with `scripts/bump-version.sh sdk-swift` from the repository root, which also regenerates the golden vectors that embed it: `--edge` for the next development snapshot, `--patch --edge` for the first snapshot after a stable release, `--strip-edge` for the version that goes to a release vote.
+
+After a merge to master, CI tags an untagged `X.Y.Z-edge.N` version as `vX.Y.Z-edge.N`.
+
+For a stable release, the PMC vote must cover the Swift version and source archive, including the root manifest. The release manager verifies the vote result and publishes the signed source release through Apache's release process. The workflow does not verify the vote automatically. Merging a plain `X.Y.Z` version to master does not publish a stable Swift tag.
+
+After that, run the Publish workflow on the voted commit with `publish_other=swift` and `create_edge_docker_tag=false`. Run with `dry_run=true` first, then `dry_run=false` and `skip_tag_creation=false` to publish the tag.
+
+The root `Package.swift` declares only the library. Its tools version, platforms, dependencies and `Iggy` target must match this package's manifest, and CI fails when they differ.

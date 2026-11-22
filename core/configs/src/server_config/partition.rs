@@ -41,10 +41,12 @@
 use super::COMPONENT;
 use crate::ConfigurationError;
 use crate::common::validators::SEGMENT_MAX_SIZE_BYTES;
-use configs::ConfigEnv;
-use iggy_common::{IggyByteSize, Validatable};
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
+use iggy_common::{IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
+use serde_with::serde_as;
 use std::num::NonZeroU32;
+use std::time::Duration;
 
 /// Mirrors `consensus::PIPELINE_PREPARE_QUEUE_MAX`.
 pub const DEFAULT_PARTITION_PREPARE_QUEUE_DEPTH: usize = 32;
@@ -118,9 +120,9 @@ fn default_offset_reservation_lease() -> NonZeroU32 {
 pub const DEFAULT_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Upper bound on `evicted_ring_capacity`. The ring exists per multi-replica
-/// partition and each retained entry pins a full committed batch, so
-/// worst-case pinned memory scales with the partition count; a typo guard,
-/// not a sizing endorsement.
+/// partition, and each retained entry pins a full committed batch until the
+/// byte cap releases it to its segment, so worst-case pinned memory scales
+/// with the partition count. A typo guard, not a sizing endorsement.
 pub const MAX_EVICTED_RING_CAPACITY: usize = 65536;
 
 /// Mirrors `partitions::EVICTED_RING_BYTES_MAX`.
@@ -129,6 +131,34 @@ pub const DEFAULT_EVICTED_RING_BYTES_MAX: u64 = 64 * 1024 * 1024;
 /// Upper bound on `evicted_ring_bytes_max`, per partition. Whichever ring cap
 /// trips first evicts; this byte ceiling is the second typo guard.
 pub const MAX_EVICTED_RING_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Shipped default for [`PartitionConfig::journal_memory_node_bytes_max`].
+pub const DEFAULT_JOURNAL_MEMORY_NODE_BYTES_MAX: u64 = 8 * 1024 * 1024 * 1024;
+
+fn default_journal_memory_node_bytes_max() -> IggyByteSize {
+    IggyByteSize::from(DEFAULT_JOURNAL_MEMORY_NODE_BYTES_MAX)
+}
+
+/// Shipped default for [`PartitionConfig::checkpoint_idle_delay`].
+pub const DEFAULT_CHECKPOINT_IDLE_DELAY: Duration = Duration::from_secs(30);
+
+/// Shipped default for [`PartitionConfig::checkpoint_max_delay`].
+pub const DEFAULT_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(5 * 60);
+
+fn default_checkpoint_idle_delay() -> IggyDuration {
+    IggyDuration::new(DEFAULT_CHECKPOINT_IDLE_DELAY)
+}
+
+fn default_checkpoint_max_delay() -> IggyDuration {
+    IggyDuration::new(DEFAULT_CHECKPOINT_MAX_DELAY)
+}
+
+/// Shipped default for [`PartitionConfig::wal_reload_node_bytes_max`].
+pub const DEFAULT_WAL_RELOAD_NODE_BYTES_MAX: u64 = 4 * 1024 * 1024 * 1024;
+
+fn default_wal_reload_node_bytes_max() -> IggyByteSize {
+    IggyByteSize::from(DEFAULT_WAL_RELOAD_NODE_BYTES_MAX)
+}
 
 /// Shipped default for [`PartitionConfig::dedup_clients_max`]; pinned against
 /// the runtime constant by a bootstrap assert.
@@ -164,6 +194,11 @@ fn default_wal_bytes_max() -> IggyByteSize {
     IggyByteSize::from(DEFAULT_PARTITION_WAL_BYTES_MAX)
 }
 
+fn default_repair_memory_bytes_max() -> IggyByteSize {
+    const DEFAULT_REPAIR_MEMORY_BYTES_MAX: u64 = 1024 * 1024 * 1024;
+    IggyByteSize::from(DEFAULT_REPAIR_MEMORY_BYTES_MAX)
+}
+
 /// Ceiling on the group-commit delay. A longer wait costs more than the
 /// barrier it is meant to amortize.
 pub const MAX_PARTITION_WAL_GROUP_COMMIT_DELAY_MICROS: u64 = 10_000;
@@ -173,13 +208,24 @@ fn default_wal_group_commit_delay_micros() -> u64 {
 }
 
 /// Capacity tunables for the per-partition consensus plane.
+#[serde_as]
 #[derive(Debug, Deserialize, Serialize, Clone, ConfigEnv)]
 pub struct PartitionConfig {
     /// Active WAL and pending prepare budget per persisted partition.
     /// Temporary generation rewrites may require additional disk space.
+    ///
+    /// It also bounds the memory of a backup that repairs an unproven log from
+    /// the head down: that repair holds up to this many bytes of batches per
+    /// partition, subject to the shared `repair_memory_bytes_max` cap.
     #[serde(default = "default_wal_bytes_max")]
     #[config_env(leaf)]
     pub wal_bytes_max: IggyByteSize,
+    /// Node-wide allocation cap for unproven repair walks and snapshot repair tails.
+    /// Exhausted walks fall back to state transfer; exhausted tails require a fresh snapshot.
+    /// Normal prepare queues and state-transfer buffers have separate limits.
+    #[serde(default = "default_repair_memory_bytes_max")]
+    #[config_env(leaf)]
+    pub repair_memory_bytes_max: IggyByteSize,
     /// Bounded wait, in microseconds, for more prepares before a persisted
     /// partition's WAL writer starts its durability barrier. Zero disables it.
     ///
@@ -248,15 +294,57 @@ pub struct PartitionConfig {
     /// restarting peer can be served from the ring before falling back to
     /// bulk sync, at the cost of pinned memory per partition. Must be > 0 and
     /// <= [`MAX_EVICTED_RING_CAPACITY`]. Single-replica partitions retain
-    /// nothing regardless.
+    /// nothing regardless. The entries whose batches went back to their
+    /// segments have their own cap of 16384.
     pub evicted_ring_capacity: usize,
 
     /// Byte ceiling for the evicted ring per partition; whichever ring cap
     /// (this or [`Self::evicted_ring_capacity`]) trips first evicts. Bounds
     /// the ring memory a burst of large batches can pin. Must be > 0 and <=
-    /// [`MAX_EVICTED_RING_BYTES`].
+    /// [`MAX_EVICTED_RING_BYTES`]. The headers of the batches that went back to
+    /// their segments do not count here.
     #[config_env(leaf)]
     pub evicted_ring_bytes_max: IggyByteSize,
+
+    /// Node-wide budget for the journal memory of all partitions: the
+    /// resident ops that wait for their flush, the evicted rings, and the
+    /// held state machine commands, each at its allocated size. Split evenly
+    /// across the shards, because a shard can shed only its own partitions
+    /// ([`Self::journal_memory_shard_bytes_max`]). Past its share a shard
+    /// releases ring batches to their segments, asks flushes through the
+    /// commit point, and for what no flush covers drops the oldest ring
+    /// entries and releases checkpointed commands. Every ring keeps its
+    /// newest entry. Must be > 0, and must leave each shard at least 1 byte.
+    #[serde(default = "default_journal_memory_node_bytes_max")]
+    #[config_env(leaf)]
+    pub journal_memory_node_bytes_max: IggyByteSize,
+
+    /// A partition with an op above its WAL checkpoint comes due for a
+    /// checkpoint this long after its last op, or at
+    /// [`Self::checkpoint_max_delay`] after its first op since its last
+    /// checkpoint, whichever comes first. A boot then loads the ops above the
+    /// checkpoint only. Must be > 0 and at most the max delay.
+    #[serde(default = "default_checkpoint_idle_delay")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[config_env(leaf)]
+    pub checkpoint_idle_delay: IggyDuration,
+
+    /// The longest a partition that never goes quiet waits for a checkpoint
+    /// after its first op since its last one. Must be > 0.
+    #[serde(default = "default_checkpoint_max_delay")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[config_env(leaf)]
+    pub checkpoint_max_delay: IggyDuration,
+
+    /// Node-wide cap on the partition WAL bytes above the checkpoints, which
+    /// a boot loads into memory again. Split evenly across the shards
+    /// ([`Self::wal_reload_shard_bytes_max`]). Past its share a shard queues
+    /// checkpoints for the partitions whose first op since their checkpoint
+    /// is oldest, until the queued bytes cover the excess. Must be > 0, and
+    /// must leave each shard at least 1 byte.
+    #[serde(default = "default_wal_reload_node_bytes_max")]
+    #[config_env(leaf)]
+    pub wal_reload_node_bytes_max: IggyByteSize,
 
     /// Byte budget for segment payloads a SERVING shard keeps resident to
     /// answer state-transfer chunk requests, per shard (so the process-wide
@@ -282,6 +370,11 @@ pub struct PartitionConfig {
 
 impl Validatable<ConfigurationError> for PartitionConfig {
     fn validate(&self) -> Result<(), ConfigurationError> {
+        let repair_bytes = self.repair_memory_bytes_max.as_bytes_u64();
+        if repair_bytes == 0 || usize::try_from(repair_bytes).is_err() {
+            eprintln!("{COMPONENT} partition.repair_memory_bytes_max must fit in usize and be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         let wal_bytes = self.wal_bytes_max.as_bytes_u64();
         if !(MIN_PARTITION_WAL_BYTES_MAX..=MAX_PARTITION_WAL_BYTES_MAX).contains(&wal_bytes)
             || !wal_bytes.is_multiple_of(4096)
@@ -382,7 +475,45 @@ impl Validatable<ConfigurationError> for PartitionConfig {
             );
             return Err(ConfigurationError::InvalidConfigurationValue);
         }
+        if self.journal_memory_node_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT} partition.journal_memory_node_bytes_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.checkpoint_max_delay.is_zero() {
+            eprintln!("{COMPONENT} partition.checkpoint_max_delay must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.checkpoint_idle_delay.is_zero()
+            || self.checkpoint_idle_delay.get_duration() > self.checkpoint_max_delay.get_duration()
+        {
+            eprintln!(
+                "{COMPONENT} partition.checkpoint_idle_delay ({}) must be > 0 and at most \
+                 partition.checkpoint_max_delay ({})",
+                self.checkpoint_idle_delay, self.checkpoint_max_delay
+            );
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
+        if self.wal_reload_node_bytes_max.as_bytes_u64() == 0 {
+            eprintln!("{COMPONENT} partition.wal_reload_node_bytes_max must be > 0");
+            return Err(ConfigurationError::InvalidConfigurationValue);
+        }
         Ok(())
+    }
+}
+
+impl PartitionConfig {
+    /// The part of [`Self::journal_memory_node_bytes_max`] that each of
+    /// `shards` shards sheds its rings against.
+    #[must_use]
+    pub fn journal_memory_shard_bytes_max(&self, shards: u16) -> u64 {
+        self.journal_memory_node_bytes_max.as_bytes_u64() / u64::from(shards).max(1)
+    }
+
+    /// The part of [`Self::wal_reload_node_bytes_max`] that each of `shards`
+    /// shards queues checkpoints against.
+    #[must_use]
+    pub fn wal_reload_shard_bytes_max(&self, shards: u16) -> u64 {
+        self.wal_reload_node_bytes_max.as_bytes_u64() / u64::from(shards).max(1)
     }
 }
 
@@ -423,6 +554,33 @@ mod tests {
         assert_eq!(
             config.wal_bytes_max.as_bytes_u64(),
             DEFAULT_PARTITION_WAL_BYTES_MAX
+        );
+    }
+
+    #[test]
+    fn given_a_repair_memory_limit_when_loading_config_should_preserve_overrides_and_reject_zero() {
+        const CUSTOM_BYTES: u64 = 8 * 1024 * 1024;
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.repair_memory_bytes_max,
+            PartitionConfig::default().repair_memory_bytes_max,
+            "older configuration files use the shipped node-wide limit"
+        );
+        let mut config = PartitionConfig {
+            repair_memory_bytes_max: IggyByteSize::from(CUSTOM_BYTES),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        let restored: PartitionConfig =
+            serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            restored.repair_memory_bytes_max.as_bytes_u64(),
+            CUSTOM_BYTES
+        );
+        config.repair_memory_bytes_max = IggyByteSize::from(0_u64);
+        assert!(
+            config.validate().is_err(),
+            "a zero repair budget must fail validation"
         );
     }
 
@@ -613,6 +771,140 @@ mod tests {
             ..PartitionConfig::default()
         };
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_checkpoint_delays_when_loading_config_should_default_when_omitted_and_reject_bad_pairs()
+     {
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.checkpoint_idle_delay.get_duration(),
+            DEFAULT_CHECKPOINT_IDLE_DELAY,
+            "older configuration files use the shipped idle delay"
+        );
+        assert_eq!(
+            omitted.checkpoint_max_delay.get_duration(),
+            DEFAULT_CHECKPOINT_MAX_DELAY,
+            "older configuration files use the shipped max delay"
+        );
+        let names = crate::server_config::server::ServerConfig::all_env_var_names();
+        for name in [
+            "IGGY_PARTITION_CHECKPOINT_IDLE_DELAY",
+            "IGGY_PARTITION_CHECKPOINT_MAX_DELAY",
+        ] {
+            assert!(names.contains(&name), "missing {name}");
+        }
+        let shipped = PartitionConfig::default();
+        assert_eq!(
+            (
+                shipped.checkpoint_idle_delay.get_duration(),
+                shipped.checkpoint_max_delay.get_duration()
+            ),
+            (DEFAULT_CHECKPOINT_IDLE_DELAY, DEFAULT_CHECKPOINT_MAX_DELAY),
+            "config.toml and the serde defaults ship the same delays"
+        );
+
+        let parsed: PartitionConfig = serde_json::from_str(&partial_table(None).replace(
+            r#""prepare_queue_depth": 32,"#,
+            r#""prepare_queue_depth": 32, "checkpoint_idle_delay": "2 s", "checkpoint_max_delay": "1 min","#,
+        ))
+        .unwrap();
+        assert_eq!(
+            parsed.checkpoint_idle_delay.get_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            parsed.checkpoint_max_delay.get_duration(),
+            Duration::from_secs(60)
+        );
+        assert!(parsed.validate().is_ok());
+
+        let delays = |idle: &str, max: &str| PartitionConfig {
+            checkpoint_idle_delay: idle.parse().unwrap(),
+            checkpoint_max_delay: max.parse().unwrap(),
+            ..PartitionConfig::default()
+        };
+        assert!(delays("5 min", "5 min").validate().is_ok(), "equal delays");
+        assert!(delays("0", "5 min").validate().is_err(), "zero idle delay");
+        assert!(
+            delays("disabled", "5 min").validate().is_err(),
+            "disabled idle delay"
+        );
+        assert!(delays("30 s", "0").validate().is_err(), "zero max delay");
+        assert!(
+            delays("6 min", "5 min").validate().is_err(),
+            "idle above max"
+        );
+    }
+
+    #[test]
+    fn given_a_node_ring_budget_when_loading_config_should_default_when_omitted_and_reject_zero() {
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.journal_memory_node_bytes_max.as_bytes_u64(),
+            DEFAULT_JOURNAL_MEMORY_NODE_BYTES_MAX,
+            "older configuration files use the shipped node-wide budget"
+        );
+        assert_eq!(
+            PartitionConfig::default()
+                .journal_memory_node_bytes_max
+                .as_bytes_u64(),
+            DEFAULT_JOURNAL_MEMORY_NODE_BYTES_MAX,
+            "config.toml and the serde default ship the same budget"
+        );
+        let config = PartitionConfig {
+            journal_memory_node_bytes_max: IggyByteSize::from(0_u64),
+            ..PartitionConfig::default()
+        };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn given_a_node_reload_budget_when_loading_config_should_default_split_and_reject_zero() {
+        const NODE_BYTES: u64 = 1024;
+        let omitted: PartitionConfig = serde_json::from_str(&partial_table(None)).unwrap();
+        assert_eq!(
+            omitted.wal_reload_node_bytes_max.as_bytes_u64(),
+            DEFAULT_WAL_RELOAD_NODE_BYTES_MAX,
+            "older configuration files use the shipped reload budget"
+        );
+        assert_eq!(
+            PartitionConfig::default()
+                .wal_reload_node_bytes_max
+                .as_bytes_u64(),
+            DEFAULT_WAL_RELOAD_NODE_BYTES_MAX,
+            "config.toml and the serde default ship the same budget"
+        );
+        assert!(
+            crate::server_config::server::ServerConfig::all_env_var_names()
+                .contains(&"IGGY_PARTITION_WAL_RELOAD_NODE_BYTES_MAX")
+        );
+        let config = |bytes: u64| PartitionConfig {
+            wal_reload_node_bytes_max: IggyByteSize::from(bytes),
+            ..PartitionConfig::default()
+        };
+        assert!(config(0).validate().is_err());
+        assert_eq!(
+            config(NODE_BYTES).wal_reload_shard_bytes_max(4),
+            NODE_BYTES / 4
+        );
+        assert_eq!(config(NODE_BYTES).wal_reload_shard_bytes_max(2048), 0);
+    }
+
+    #[test]
+    fn given_a_node_ring_budget_when_split_should_give_each_shard_an_equal_share() {
+        const NODE_BYTES: u64 = 1024;
+        let config = PartitionConfig {
+            journal_memory_node_bytes_max: IggyByteSize::from(NODE_BYTES),
+            ..PartitionConfig::default()
+        };
+        assert_eq!(config.journal_memory_shard_bytes_max(1), NODE_BYTES);
+        assert_eq!(config.journal_memory_shard_bytes_max(4), NODE_BYTES / 4);
+        assert_eq!(
+            config.journal_memory_shard_bytes_max(2048),
+            0,
+            "more shards than bytes leaves a share of nothing"
+        );
     }
 
     #[test]

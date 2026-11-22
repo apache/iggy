@@ -16,6 +16,7 @@
 // under the License.
 
 use bytes::{Bytes, BytesMut};
+use iggy_binary_protocol::batch::BatchProducer;
 use iggy_binary_protocol::codes::{
     CANCEL_DEFERRED_REQUEST_CODE, FETCH_MESSAGES_CODE, GET_STREAM_CODE, POLL_MESSAGES_CODE,
     POLL_MESSAGES_DEFERRED_CODE,
@@ -449,6 +450,21 @@ impl SimClient {
         name: &str,
         partitions_count: u32,
     ) -> Message<RoutedRequestHeader> {
+        self.create_topic_with_factor(stream, name, partitions_count, None)
+    }
+
+    /// [`Self::create_topic`] with an explicit replication factor; `None`
+    /// leaves it to the server default.
+    ///
+    /// # Panics
+    /// As [`Self::create_topic`].
+    pub fn create_topic_with_factor(
+        &self,
+        stream: &str,
+        name: &str,
+        partitions_count: u32,
+        replication_factor: Option<u32>,
+    ) -> Message<RoutedRequestHeader> {
         let wire = CreateTopicRequest {
             stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
             partitions_count,
@@ -456,6 +472,7 @@ impl SimClient {
             options: iggy_common::TopicCreateOptions {
                 durability: iggy_common::Durability::Persisted,
                 consumer_offset_durability: iggy_common::Durability::Persisted,
+                replication_factor,
                 ..Default::default()
             }
             .to_wire()
@@ -768,6 +785,28 @@ impl SimClient {
         group: IggyNamespace,
         messages: &[Bytes],
     ) -> Message<RoutedRequestHeader> {
+        self.send_batch(group, None, messages)
+    }
+
+    /// [`Self::send_messages`] as one batch of an idempotent producer.
+    ///
+    /// # Panics
+    /// Panics if a group id exceeds `u32` or the request buffer is invalid.
+    pub fn send_producer_messages(
+        &self,
+        group: IggyNamespace,
+        producer: BatchProducer,
+        messages: &[Bytes],
+    ) -> Message<RoutedRequestHeader> {
+        self.send_batch(group, Some(producer), messages)
+    }
+
+    fn send_batch(
+        &self,
+        group: IggyNamespace,
+        producer: Option<BatchProducer>,
+        messages: &[Bytes],
+    ) -> Message<RoutedRequestHeader> {
         let to_u32 = |v: usize| u32::try_from(v).expect("group id fits u32");
         let stream_id = WireIdentifier::Numeric(to_u32(group.stream_id()));
         let topic_id = WireIdentifier::Numeric(to_u32(group.topic_id()));
@@ -790,8 +829,15 @@ impl SimClient {
 
         let size = SendMessagesEncoder::encoded_size(&stream_id, &topic_id, &partitioning, &raw);
         let mut buf = BytesMut::with_capacity(size);
-        SendMessagesEncoder::encode(&mut buf, &stream_id, &topic_id, &partitioning, &raw)
-            .expect("simulator send batch encodes");
+        SendMessagesEncoder::encode_with_producer(
+            &mut buf,
+            &stream_id,
+            &topic_id,
+            &partitioning,
+            producer,
+            &raw,
+        )
+        .expect("simulator send batch encodes");
 
         self.build_request_with_namespace(Operation::SendMessages, &buf, group)
     }

@@ -30,6 +30,7 @@ use crate::credentials::IggyCredentials;
 use crate::error::{CmdToolError, IggyCmdError};
 use crate::logging::Logging;
 use args::context::ContextAction;
+use args::geo::GeoAction;
 use args::message::MessageAction;
 use args::metadata::MetadataAction;
 use args::partition::PartitionAction;
@@ -41,7 +42,7 @@ use iggy::client_provider::{self, ClientProviderConfig};
 use iggy::clients::client::IggyClient;
 use iggy::prelude::{
     Aes256GcmEncryptor, ClientError, EncryptorKind, MetadataChangesQuery,
-    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions,
+    PersonalAccessTokenExpiry, StreamUpdateOptions, TopicUpdateOptions, TransportProtocol,
 };
 use iggy_cli::commands::binary_context::common::{ContextManager, validate_transport};
 use iggy_cli::commands::binary_context::create_context::CreateContextCmd;
@@ -66,9 +67,11 @@ use iggy_cli::commands::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
     binary_context::get_contexts::GetContextsCmd,
+    binary_geo::retire_origin::RetireGeoOriginCmd,
     binary_message::{poll_messages::PollMessagesCmd, send_messages::SendMessagesCmd},
     binary_partitions::{
         create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
+        get_partitions::GetPartitionsCmd,
     },
     binary_personal_access_tokens::{
         create_personal_access_token::CreatePersonalAccessTokenCmd,
@@ -95,6 +98,7 @@ use iggy_cli::commands::{
     },
 };
 use std::error::Error;
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{Level, event};
 
@@ -127,8 +131,14 @@ fn get_command(
                 args.stream_id.clone(),
                 StreamUpdateOptions::from(&args),
             )),
-            StreamAction::Get(args) => Box::new(GetStreamCmd::new(args.stream_id.clone())),
-            StreamAction::List(args) => Box::new(GetStreamsCmd::new(args.list_mode.into())),
+            StreamAction::Get(args) => Box::new(GetStreamCmd::new(
+                args.stream_id.clone(),
+                args.output.into(),
+            )),
+            StreamAction::List(args) => Box::new(GetStreamsCmd::new(
+                args.list_output.output().into(),
+                args.page.into(),
+            )),
         },
         Command::Topic(command) => match command {
             TopicAction::Create(args) => Box::new(CreateTopicCmd::new(
@@ -154,10 +164,12 @@ fn get_command(
             TopicAction::Get(args) => Box::new(GetTopicCmd::new(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
+                args.output.into(),
             )),
             TopicAction::List(args) => Box::new(GetTopicsCmd::new(
                 args.stream_id.clone(),
-                args.list_mode.into(),
+                args.list_output.output().into(),
+                args.page.into(),
             )),
         },
         Command::Partition(command) => match command {
@@ -170,6 +182,12 @@ fn get_command(
                 args.stream_id.clone(),
                 args.topic_id.clone(),
                 args.partitions_count,
+            )),
+            PartitionAction::List(args) => Box::new(GetPartitionsCmd::new(
+                args.stream_id,
+                args.topic_id,
+                args.list_mode.into(),
+                args.page.into(),
             )),
         },
         Command::Segment(command) => match command {
@@ -231,7 +249,10 @@ fn get_command(
                 Box::new(DeleteUserCmd::new(delete_args.user_id.clone()))
             }
             UserAction::Get(get_args) => Box::new(GetUserCmd::new(get_args.user_id.clone())),
-            UserAction::List(list_args) => Box::new(GetUsersCmd::new(list_args.list_mode.into())),
+            UserAction::List(list_args) => Box::new(GetUsersCmd::new(
+                list_args.list_mode.into(),
+                list_args.page.into(),
+            )),
             UserAction::Name(name_args) => Box::new(UpdateUserCmd::new(
                 name_args.user_id.clone(),
                 UpdateUserType::Name(name_args.username.clone()),
@@ -265,6 +286,9 @@ fn get_command(
                 Box::new(GetClusterMetadataCmd::new(args.list_mode.into()))
             }
         },
+        Command::Geo(command) => match command {
+            GeoAction::Retire(args) => Box::new(RetireGeoOriginCmd::new(args.origin.clone())),
+        },
         Command::ConsumerGroup(command) => match command {
             ConsumerGroupAction::Create(create_args) => Box::new(CreateConsumerGroupCmd::new(
                 create_args.stream_id.clone(),
@@ -285,6 +309,7 @@ fn get_command(
                 list_args.stream_id.clone(),
                 list_args.topic_id.clone(),
                 list_args.list_mode.into(),
+                list_args.page.into(),
             )),
         },
         Command::Message(command) => match command {
@@ -310,6 +335,8 @@ fn get_command(
                 poll_args.consumer.clone(),
                 poll_args.show_headers,
                 poll_args.output_file.clone(),
+                poll_args.consumer_group.clone(),
+                poll_args.follow,
             )),
         },
         Command::ConsumerOffset(command) => match command {
@@ -408,6 +435,14 @@ async fn run() -> Result<(), IggyCmdError> {
     let cli_options = merged_args.cli;
 
     validate_transport(&iggy_args.transport)?;
+    if let Command::Message(MessageAction::Poll(poll_args)) = &command {
+        poll_args.validate()?;
+        if poll_args.consumer_group.is_some()
+            && TransportProtocol::from_str(&iggy_args.transport) == Ok(TransportProtocol::Http)
+        {
+            return Err(anyhow::anyhow!("--consumer-group is not supported over HTTP").into());
+        }
+    }
     let server_address = iggy_args
         .get_server_address()
         .ok_or_else(|| ClientError::InvalidTransport(iggy_args.transport.clone()))?;
@@ -457,9 +492,12 @@ async fn run() -> Result<(), IggyCmdError> {
     } else {
         println!("Executing {}", command.explain());
     }
-    command.execute_cmd(&client).await?;
+    command.execute_with_iggy_client(&client).await?;
 
-    credentials.logout_user().await?;
+    tokio::select! {
+        logout = credentials.logout_user() => logout?,
+        _ = tokio::signal::ctrl_c() => std::process::exit(130),
+    }
 
     Ok(())
 }

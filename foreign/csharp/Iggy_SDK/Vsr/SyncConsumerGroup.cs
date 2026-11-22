@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+using System.Buffers;
 using System.Buffers.Binary;
 
 namespace Apache.Iggy.Vsr;
@@ -58,4 +59,17 @@ internal readonly record struct SyncConsumerGroupAssignment(ulong Generation, IR
         return VsrError.Exception(VsrError.INVALID_COMMAND,
             "Consumer group assignment reply is too short for the partition count it declares.");
     }
+}
+
+/// <summary>
+///     A <c>SyncConsumerGroup</c> reply. Only its reader knows whether the assignment changed, so the reader raises
+///     the metadata watermark to the commit of the reply, through the guard of the link that carried it.
+/// </summary>
+internal sealed class SyncConsumerGroupReply(IMemoryOwner<byte> reply, Action raiseWatermark) : IMemoryOwner<byte>
+{
+    public Memory<byte> Memory => reply.Memory;
+
+    internal void RaiseWatermark() => raiseWatermark();
+
+    public void Dispose() => reply.Dispose();
 }

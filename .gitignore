@@ -27,6 +27,10 @@ foreign/java/**/out
 foreign/node/**/dist
 foreign/swift/.build
 foreign/swift/.swiftpm
+# The root manifest publishes the Swift SDK. Consumers resolve their own pins.
+/.build
+/.swiftpm
+/Package.resolved
 examples/swift/.build
 examples/swift/**/.build
 examples/swift/**/.swiftpm
@@ -53,8 +57,7 @@ foreign/node/.npm
 __pycache__/
 go.work
 core/bench/dashboard/frontend/dist
-core/integration/tests/connectors/postgres/cdc_restart_connectors/*
-!core/integration/tests/connectors/postgres/cdc_restart_connectors/config.toml
+core/web_ui/dist
 LICENSE-binary
 **/LICENSE-binary
 gateways/kafka/tools/kafka-tool/kafka_messages/

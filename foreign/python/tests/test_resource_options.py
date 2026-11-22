@@ -30,6 +30,7 @@ import re
 import secrets
 from datetime import timedelta
 from pathlib import Path
+from typing import TypedDict, cast, get_type_hints
 
 import pytest
 
@@ -60,6 +61,7 @@ from apache_iggy import (
     Topic,
     TopicDetails,
     TopicOptions,
+    TopicType,
     UserInfo,
     UserInfoDetails,
     UserOptions,
@@ -109,6 +111,21 @@ FINGERPRINT_LENGTH = 16
 U64_MAX = 2**64 - 1
 MICROS_PER_HOUR = 3_600_000_000
 GIB = 1024**3
+
+
+class GeoDurations(TypedDict, total=False):
+    """The durations of a geo topic, as `TopicOptions` and `update_topic` take them."""
+
+    fresh_upload_interval: timedelta
+    consumer_offset_upload_interval: timedelta
+    positions_publish_interval: timedelta
+    tombstone_grace: timedelta
+    positions_resume_timeout: timedelta
+    long_term_rewrite_max_interval: timedelta
+
+
+# In catalog order, the order the hints are declared in.
+GEO_DURATION_KEYS = tuple(get_type_hints(GeoDurations))
 
 
 @pytest.mark.usefixtures("iggy_client")
@@ -258,7 +275,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_should_preserve_all_ten_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_sixteen_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -281,6 +298,18 @@ class TestTopicOptions:
                 messages_required_to_save=7,
                 size_of_messages_required_to_save=4096,
                 preallocate_segments=True,
+                replication_factor=1,
+                # A finite age is refused together with preallocate_segments.
+                segment_max_age=IggyExpiry.NeverExpire(),
+                # Turning tiered storage on is refused until the server tiers topics.
+                tiered_storage=False,
+                local_retention_age=IggyExpiry.ExpireDuration(
+                    duration=timedelta(minutes=30)
+                ),
+                local_retention_size=MaxTopicSize.Custom(bytes=GIB // 2),
+                # A geo topic is refused while the server has no object
+                # store, and a normal topic refuses any geo_mode.
+                topic_type=TopicType.Normal,
             ),
         )
 
@@ -298,11 +327,50 @@ class TestTopicOptions:
             "messages_required_to_save": 7,
             "size_of_messages_required_to_save": 4096,
             "preallocate_segments": True,
+            "replication_factor": 1,
+            "segment_max_age": U64_MAX,
+            "tiered_storage": False,
+            "local_retention_age": MICROS_PER_HOUR // 2,
+            "local_retention_size": GIB // 2,
+            "topic_type": "normal",
         }
         assert topic.derived_options.to_scalar_dict() == {}
         assert topic.compression_algorithm == "gzip"
         assert isinstance(topic.max_topic_size, MaxTopicSize.Custom)
         assert topic.max_topic_size.bytes == GIB
+        assert topic.topic_type == TopicType.Normal
+        assert topic.geo_mode is None
+        assert all(getattr(topic, key) is None for key in GEO_DURATION_KEYS)
+
+    @pytest.mark.asyncio
+    async def test_given_geo_durations_on_normal_topic_when_creating_or_updating_should_refuse_each(  # noqa: E501
+        self, transport_client: IggyClient, unique_name
+    ):
+        """Only a geo topic takes the durations, so a normal topic reads none."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        durations = geo_durations(
+            fixture_case("create_topic", "geo_topic_with_durations")["input"]
+        )
+        await transport_client.create_stream(stream_name)
+
+        with pytest.raises(OptionError) as refusal:
+            await transport_client.create_topic(
+                stream_name, topic_name, TopicOptions(**durations)
+            )
+        assert refusal.value.kind == "invalid_option_value"
+        assert await transport_client.get_topic(stream_name, topic_name) is None
+
+        await transport_client.create_topic(stream_name, topic_name)
+        for key, duration in durations.items():
+            with pytest.raises(OptionError) as refusal:
+                await transport_client.update_topic(
+                    stream_name, topic_name, **cast(GeoDurations, {key: duration})
+                )
+            assert refusal.value.kind == "invalid_option_value", key
+        topic = await transport_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert all(getattr(topic, key) is None for key in GEO_DURATION_KEYS)
 
     @pytest.mark.asyncio
     async def test_given_topic_reset_when_updating_should_preserve_unmentioned_values(  # noqa: E501
@@ -582,7 +650,7 @@ class TestSharedVectors:
             for scope in row["scopes"]:
                 if row["storage"] == "map" and row["mutability"] != "read_only":
                     assert key in create_fields[scope], f"{scope} create {key}"
-                if row["mutability"] == "updatable":
+                if row["mutability"] in ("updatable", "enable_only"):
                     assert key in update_fields[scope], f"{scope} update {key}"
                 if row["flags"] & resettable:
                     assert hasattr(OptionKey, member_name(key)), f"reset {key}"
@@ -592,6 +660,38 @@ class TestSharedVectors:
                         assert hasattr(reader, key) or hasattr(reader, f"{key}s"), (
                             f"{reader.__name__} {key}"
                         )
+
+    @pytest.mark.unit
+    def test_given_geo_duration_vectors_when_building_typed_options_should_keep_zero_and_refuse_before_io(  # noqa: E501
+        self,
+    ):
+        """Zero is a value, a negative or too long duration and a reset are refused."""
+        created = geo_durations(
+            fixture_case("create_topic", "geo_topic_with_durations")["input"]
+        )
+        updated = geo_durations(
+            fixture_case("update_resource", "topic_set_geo_durations")["input"]
+        )
+        assert list(created) == list(updated) == list(GEO_DURATION_KEYS)
+        assert timedelta(0) in created.values()
+        TopicOptions(topic_type=TopicType.Geo, **created)
+
+        client = IggyClient("127.0.0.1:1")
+        for key in GEO_DURATION_KEYS:
+            for refused in (
+                timedelta(microseconds=-1),
+                timedelta(microseconds=U64_MAX + 1),
+            ):
+                durations = cast(GeoDurations, {key: refused})
+                with pytest.raises(ValueError):
+                    TopicOptions(**durations)
+                with pytest.raises(ValueError):
+                    client.update_topic(1, 2, **durations)
+            with pytest.raises(
+                OptionError, match=ERROR_MESSAGES["option_not_resettable"]
+            ) as refusal:
+                client.update_topic(1, 2, reset=[option_key(key)])
+            assert_option_error(refusal.value, "option_not_resettable")
 
     @pytest.mark.unit
     def test_given_invalid_key_when_encoding_should_reject_before_network_io(
@@ -717,6 +817,18 @@ def option_key(key: str) -> OptionKey:
     return getattr(OptionKey, member_name(key))
 
 
+def geo_durations(values: dict) -> GeoDurations:
+    """Return the durations of a geo topic a fixture input sets, in catalog order."""
+    return cast(
+        GeoDurations,
+        {
+            key: timedelta(microseconds=int(values[key]))
+            for key in GEO_DURATION_KEYS
+            if key in values
+        },
+    )
+
+
 def typed_update(client: IggyClient, vector: dict):
     """Issue the typed update a fixture vector describes."""
     target = vector["target"]
@@ -738,6 +850,7 @@ def typed_update(client: IggyClient, vector: dict):
             if max_size is None
             else MaxTopicSize.Custom(bytes=int(max_size)),
             reset=reset,
+            **geo_durations(values),
         )
     if vector["scope"] == "stream":
         return client.update_stream(

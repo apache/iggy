@@ -18,6 +18,7 @@
 package binaryserialization
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -81,22 +82,6 @@ func DeserializeStream(payload []byte) (*iggcon.StreamDetails, error) {
 		Stream: stream,
 		Topics: topics,
 	}, nil
-}
-
-func DeserializeStreams(payload []byte) ([]iggcon.Stream, error) {
-	streams := make([]iggcon.Stream, 0)
-	position := 0
-
-	for position < len(payload) {
-		stream, readBytes, err := DeserializeToStream(payload, position)
-		if err != nil {
-			return nil, fmt.Errorf("failed to deserialize stream at offset %d: %w", position, err)
-		}
-		streams = append(streams, stream)
-		position += readBytes
-	}
-
-	return streams, nil
 }
 
 const streamFixedSize = 4 + 8 + 4 + 8 + 8 + 1 // 33 bytes: id + created_at + topics_count + size_bytes + messages_count + name_len
@@ -466,39 +451,17 @@ func readLengthPrefixed(payload []byte, position int, field string) ([]byte, int
 	return payload[position : position+length], 4 + length, nil
 }
 
-func DeserializeTopics(payload []byte) ([]iggcon.Topic, error) {
-	if len(payload) < 4 {
-		return nil, fmt.Errorf(
-			"not enough data to read topics count: need 4 bytes, got %d", len(payload))
-	}
-	topicsCount := binary.LittleEndian.Uint32(payload[0:4])
-	position := 4
-
-	// The declared count is server-controlled; the allocation hint is capped
-	// by what the body could possibly hold.
-	topics := make([]iggcon.Topic, 0, boundedCapacity(topicsCount, len(payload)-position, topicMinimumSize))
-	for i := uint32(0); i < topicsCount; i++ {
-		topic, readBytes, err := DeserializeToTopic(payload, position)
-		if err != nil {
-			return nil, err
-		}
-		topics = append(topics, topic)
-		position += readBytes
-	}
-
-	return topics, nil
-}
-
 func DeserializeTopic(payload []byte) (*iggcon.TopicDetails, error) {
 	topic, position, err := DeserializeToTopic(payload, 0)
 	if err != nil {
 		return &iggcon.TopicDetails{}, err
 	}
 
-	partitions := make([]iggcon.PartitionContract, 0)
-	length := len(payload)
-
-	for position < length {
+	// The header's count delimits the entries, so a body short of it is
+	// refused rather than read as fewer partitions.
+	partitions := make([]iggcon.PartitionContract, 0,
+		boundedCapacity(topic.PartitionsCount, len(payload)-position, partitionMinimumSize))
+	for i := uint32(0); i < topic.PartitionsCount; i++ {
 		partition, readBytes, err := DeserializePartition(payload, position)
 		if err != nil {
 			return nil, err
@@ -578,15 +541,44 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 
 	topic.MessageExpiry = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionMessageExpiry, uint64(iggcon.IggyExpiryNeverExpire)))
 	topic.MaxTopicSize = topicUint64Option(topic, iggcon.TopicOptionMaxTopicSize, math.MaxUint64)
+	topic.SegmentMaxAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionSegmentMaxAge, uint64(iggcon.IggyExpiryNeverExpire)))
+	topic.LocalRetentionAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionLocalRetentionAge, defaultLocalRetentionAge))
+	topic.LocalRetentionSize = topicUint64Option(topic, iggcon.TopicOptionLocalRetentionSize, math.MaxUint64)
+	if value, ok := topicOption(topic, iggcon.TopicOptionTieredStorage); ok && value.Kind == iggcon.Bool && len(value.Value) == 1 {
+		topic.TieredStorage = value.Value[0] != 0
+	}
 	topic.CompressionAlgorithm = uint8(iggcon.CompressionAlgorithmNone)
 	if value, ok := topicOption(topic, iggcon.TopicOptionCompressionAlgorithm); ok && value.Kind == iggcon.String {
 		if algorithm, known := compressionAlgorithms[string(value.Value)]; known {
 			topic.CompressionAlgorithm = uint8(algorithm)
 		}
 	}
+	topic.TopicType = iggcon.TopicTypeNormal
+	if topicStringOption(topic, iggcon.TopicOptionTopicType) == string(iggcon.TopicTypeGeo) {
+		topic.TopicType = iggcon.TopicTypeGeo
+	}
+	// The server refuses a mode and the durations on a normal topic, so stored
+	// ones are ignored rather than trusted.
+	if topic.TopicType == iggcon.TopicTypeGeo {
+		mode := iggcon.GeoModeGeo
+		if topicStringOption(topic, iggcon.TopicOptionGeoMode) == string(iggcon.GeoModeGeoTiered) {
+			mode = iggcon.GeoModeGeoTiered
+		}
+		topic.GeoMode = &mode
+		topic.FreshUploadInterval = topicDurationOption(topic, iggcon.TopicOptionFreshUploadInterval)
+		topic.ConsumerOffsetUploadInterval = topicDurationOption(topic, iggcon.TopicOptionConsumerOffsetUploadInterval)
+		topic.PositionsPublishInterval = topicDurationOption(topic, iggcon.TopicOptionPositionsPublishInterval)
+		topic.TombstoneGrace = topicDurationOption(topic, iggcon.TopicOptionTombstoneGrace)
+		topic.PositionsResumeTimeout = topicDurationOption(topic, iggcon.TopicOptionPositionsResumeTimeout)
+		topic.LongTermRewriteMaxInterval = topicDurationOption(topic, iggcon.TopicOptionLongTermRewriteMaxInterval)
+	}
 
 	return topic, readBytes, nil
 }
+
+// defaultLocalRetentionAge is the catalog default of local_retention_age, one
+// day in microseconds.
+const defaultLocalRetentionAge uint64 = 86_400_000_000
 
 // compressionAlgorithms maps the catalog spelling of compression_algorithm to
 // its code.
@@ -605,6 +597,16 @@ func topicOption(topic iggcon.Topic, key iggcon.TopicOptionKey) (iggcon.HeaderVa
 	return value, ok
 }
 
+// topicStringOption reads a String option, empty when the server reported
+// none.
+func topicStringOption(topic iggcon.Topic, key iggcon.TopicOptionKey) string {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.String {
+		return ""
+	}
+	return string(value.Value)
+}
+
 // topicUint64Option reads a Uint64 option, or the catalog default when the
 // server reported none.
 func topicUint64Option(topic iggcon.Topic, key iggcon.TopicOptionKey, fallback uint64) uint64 {
@@ -615,13 +617,31 @@ func topicUint64Option(topic iggcon.Topic, key iggcon.TopicOptionKey, fallback u
 	return binary.LittleEndian.Uint64(value.Value)
 }
 
+// topicDurationOption reads a Uint64 duration that has no default, nil when
+// the server reported none.
+func topicDurationOption(topic iggcon.Topic, key iggcon.TopicOptionKey) *iggcon.Duration {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.Uint64 || len(value.Value) != 8 {
+		return nil
+	}
+	duration := iggcon.Duration(binary.LittleEndian.Uint64(value.Value))
+	return &duration
+}
+
+// partitionCountersSize covers id + created_at + segments_count +
+// current_offset + size_bytes + messages_count + context.
+const partitionCountersSize = 4 + 8 + 4 + 8 + 8 + 8 + iggcon.PartitionContextSize // 64 bytes
+
+// partitionMinimumSize is a partition whose members and in-sync node lists
+// are both empty: the counters and one u8 count per list.
+const partitionMinimumSize = partitionCountersSize + 1 + 1 // 66 bytes
+
 func DeserializePartition(payload []byte, position int) (iggcon.PartitionContract, int, error) {
-	const partitionSize = 40 + iggcon.PartitionContextSize
-	if position < 0 || position > len(payload) || len(payload)-position < partitionSize {
+	if position < 0 || position > len(payload) || len(payload)-position < partitionMinimumSize {
 		return iggcon.PartitionContract{}, 0, fmt.Errorf("truncated partition response")
 	}
 	var partitionContext iggcon.PartitionContext
-	if err := partitionContext.UnmarshalBinary(payload[position+40 : position+partitionSize]); err != nil {
+	if err := partitionContext.UnmarshalBinary(payload[position+40 : position+partitionCountersSize]); err != nil {
 		return iggcon.PartitionContract{}, 0, err
 	}
 	id := binary.LittleEndian.Uint32(payload[position : position+4])
@@ -630,7 +650,14 @@ func DeserializePartition(payload []byte, position int) (iggcon.PartitionContrac
 	currentOffset := binary.LittleEndian.Uint64(payload[position+16 : position+24])
 	sizeBytes := binary.LittleEndian.Uint64(payload[position+24 : position+32])
 	messagesCount := binary.LittleEndian.Uint64(payload[position+32 : position+40])
-	readBytes := partitionSize
+	members, membersEnd, err := deserializeNodeIds(payload, position+partitionCountersSize, "partition members")
+	if err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
+	inSyncMembers, end, err := deserializeNodeIds(payload, membersEnd, "partition in-sync members")
+	if err != nil {
+		return iggcon.PartitionContract{}, 0, err
+	}
 
 	partition := iggcon.PartitionContract{
 		Context:       partitionContext,
@@ -640,47 +667,59 @@ func DeserializePartition(payload []byte, position int) (iggcon.PartitionContrac
 		CurrentOffset: currentOffset,
 		SizeBytes:     sizeBytes,
 		MessagesCount: messagesCount,
+		Members:       members,
+		InSyncMembers: inSyncMembers,
 	}
 
-	return partition, readBytes, nil
+	return partition, end - position, nil
 }
 
-func DeserializeConsumerGroups(payload []byte) []iggcon.ConsumerGroup {
-	var consumerGroups []iggcon.ConsumerGroup
-	length := len(payload)
-	position := 0
+// deserializeNodeIds reads a u8 count followed by that many u8 node ids and
+// returns the position past the list.
+func deserializeNodeIds(payload []byte, position int, field string) ([]uint8, int, error) {
+	if position >= len(payload) {
+		return nil, 0, fmt.Errorf("truncated %s count at offset %d", field, position)
+	}
+	count := int(payload[position])
+	start := position + 1
+	if len(payload)-start < count {
+		return nil, 0, fmt.Errorf("truncated %s at offset %d: need %d bytes, got %d",
+			field, start, count, len(payload)-start)
+	}
+	return bytes.Clone(payload[start : start+count]), start + count, nil
+}
 
-	for position < length {
-		// use slices
-		consumerGroup, readBytes := DeserializeToConsumerGroup(payload, position)
-		consumerGroups = append(consumerGroups, *consumerGroup)
-		position += readBytes
+// consumerGroupFixedSize covers the fields before the name:
+// id + partitions_count + members_count + name_len.
+const consumerGroupFixedSize = 4 + 4 + 4 + 1
+
+func DeserializeToConsumerGroup(payload []byte, position int) (iggcon.ConsumerGroup, int, error) {
+	remaining := len(payload) - position
+	if remaining < consumerGroupFixedSize {
+		return iggcon.ConsumerGroup{}, 0, fmt.Errorf(
+			"not enough data to read consumer group header: need %d bytes, got %d",
+			consumerGroupFixedSize, remaining)
+	}
+	readBytes := consumerGroupFixedSize + int(payload[position+12])
+	if remaining < readBytes {
+		return iggcon.ConsumerGroup{}, 0, fmt.Errorf(
+			"not enough data to read consumer group name: need %d bytes, got %d",
+			readBytes, remaining)
 	}
 
-	return consumerGroups
+	return iggcon.ConsumerGroup{
+		Id:              binary.LittleEndian.Uint32(payload[position : position+4]),
+		PartitionsCount: binary.LittleEndian.Uint32(payload[position+4 : position+8]),
+		MembersCount:    binary.LittleEndian.Uint32(payload[position+8 : position+12]),
+		Name:            string(payload[position+consumerGroupFixedSize : position+readBytes]),
+	}, readBytes, nil
 }
 
-func DeserializeToConsumerGroup(payload []byte, position int) (*iggcon.ConsumerGroup, int) {
-	id := binary.LittleEndian.Uint32(payload[position : position+4])
-	partitionsCount := binary.LittleEndian.Uint32(payload[position+4 : position+8])
-	membersCount := binary.LittleEndian.Uint32(payload[position+8 : position+12])
-	nameLength := int(payload[position+12])
-	name := string(payload[position+13 : position+13+nameLength])
-
-	readBytes := 12 + 1 + nameLength
-
-	consumerGroup := iggcon.ConsumerGroup{
-		Id:              id,
-		MembersCount:    membersCount,
-		PartitionsCount: partitionsCount,
-		Name:            name,
+func DeserializeConsumerGroup(payload []byte) (*iggcon.ConsumerGroupDetails, error) {
+	consumerGroup, pos, err := DeserializeToConsumerGroup(payload, 0)
+	if err != nil {
+		return nil, err
 	}
-
-	return &consumerGroup, readBytes
-}
-
-func DeserializeConsumerGroup(payload []byte) *iggcon.ConsumerGroupDetails {
-	consumerGroup, pos := DeserializeToConsumerGroup(payload, 0)
 	members := make([]iggcon.ConsumerGroupMember, 0)
 	for pos < len(payload) {
 		m, readBytes := DeserializeToConsumerGroupMember(payload, pos)
@@ -691,9 +730,9 @@ func DeserializeConsumerGroup(payload []byte) *iggcon.ConsumerGroupDetails {
 		return members[i].ID < members[j].ID
 	})
 	return &iggcon.ConsumerGroupDetails{
-		ConsumerGroup: *consumerGroup,
+		ConsumerGroup: consumerGroup,
 		Members:       members,
-	}
+	}, nil
 }
 
 func DeserializeToConsumerGroupMember(payload []byte, position int) (iggcon.ConsumerGroupMember, int) {
@@ -710,27 +749,6 @@ func DeserializeToConsumerGroupMember(payload []byte, position int) (iggcon.Cons
 		PartitionsCount: partitionsCount,
 		Partitions:      partitions,
 	}, readBytes
-}
-
-func DeserializeUsers(payload []byte) ([]iggcon.UserInfo, error) {
-	if len(payload) == 0 {
-		return nil, errors.New("empty payload")
-	}
-
-	var result []iggcon.UserInfo
-	length := len(payload)
-	position := 0
-
-	for position < length {
-		response, readBytes, err := deserializeToUser(payload, position)
-		if err != nil {
-			return nil, err
-		}
-		result = append(result, *response)
-		position += readBytes
-	}
-
-	return result, nil
 }
 
 func DeserializeUser(payload []byte) (*iggcon.UserInfoDetails, error) {

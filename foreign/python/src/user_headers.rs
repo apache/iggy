@@ -20,7 +20,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use iggy::prelude::{
-    HeaderField, HeaderKey as RustHeaderKey, HeaderKind, HeaderValue as RustHeaderValue,
+    HeaderField, HeaderFieldMarker, HeaderKey as RustHeaderKey, HeaderKind,
+    HeaderValue as RustHeaderValue,
 };
 use pyo3::PyClass;
 use pyo3::exceptions::PyValueError;
@@ -698,7 +699,9 @@ fn py_header_to_plain<'py, T: ToPlain + PyClass>(
 /// values). Returns `Ok(None)` when the object is not a supported plain type so
 /// the caller can raise a message naming keys vs values; genuine range/length
 /// errors are returned as `Err`.
-fn plain_to_rust_header_field<T>(obj: &Bound<'_, PyAny>) -> PyResult<Option<HeaderField<T>>> {
+fn plain_to_rust_header_field<T: HeaderFieldMarker>(
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<Option<HeaderField<T>>> {
     if obj.is_instance_of::<PyBool>() {
         return Ok(Some(obj.extract::<bool>()?.into()));
     }

@@ -17,6 +17,7 @@
 
 use crate::args::kind::BenchmarkKindCommand;
 use crate::utils::ClientFactory;
+use crate::utils::readiness::wait_until_partitions_take_messages;
 use crate::{args::common::IggyBenchArgs, utils::client_factory::create_client_factory};
 use async_trait::async_trait;
 use bench_report::benchmark_kind::BenchmarkKind;
@@ -99,6 +100,7 @@ pub trait Benchmarkable: Send {
         let client = self.client_factory().create_authenticated_client().await?;
         let reuse_streams = self.args().reuse_streams();
         let streams = client.get_streams().await?;
+        let mut streams_to_probe = Vec::new();
         for i in 1..=number_of_streams {
             let stream_name = format!("bench-stream-{i}");
             let stream_id: Identifier = stream_name.as_str().try_into()?;
@@ -120,23 +122,25 @@ pub trait Benchmarkable: Send {
                 .create_stream(&stream_name, &StreamCreateOptions::default())
                 .await?;
             let topic_name = "topic-1".to_string();
-            let max_topic_size = self
-                .args()
-                .max_topic_size()
-                .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom);
+            let max_topic_size = self.args().new_topic_max_size();
             let message_expiry = self.args().message_expiry();
             let durability = self.args().durability();
             let messages_required_to_save =
                 self.args().messages_required_to_save().map(NonZeroU32::get);
 
+            let topic_type = self.args().topic_type();
+            let tiered_storage = self.args().tiered_storage();
+
             info!(
-                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, durability: {}, messages required to save: {:?}",
+                "Creating the test topic '{}' for stream '{}' with max topic size: {:?}, message expiry: {}, durability: {}, messages required to save: {:?}, topic type: {:?}, tiered storage: {:?}",
                 topic_name,
                 stream_name,
                 max_topic_size,
                 message_expiry,
                 durability,
-                messages_required_to_save
+                messages_required_to_save,
+                topic_type,
+                tiered_storage
             );
 
             client
@@ -152,10 +156,19 @@ pub trait Benchmarkable: Send {
                         durability,
                         consumer_offset_durability: self.args().consumer_offset_durability(),
                         messages_required_to_save,
+                        topic_type,
+                        tiered_storage,
                         ..TopicCreateOptions::default()
                     },
                 )
                 .await?;
+            if topic_type.is_some() || tiered_storage.is_some() {
+                streams_to_probe.push(stream_id);
+            }
+        }
+        // After every topic is created, so their start-ups overlap.
+        for stream_id in &streams_to_probe {
+            wait_until_partitions_take_messages(&client, stream_id, partitions_count).await?;
         }
         Ok(())
     }
@@ -193,8 +206,7 @@ pub trait Benchmarkable: Send {
         let rate_limit = self
             .args()
             .rate_limit()
-            .map(|rl| format!(" global rate limit: {rl}/s"))
-            .unwrap_or_default();
+            .map_or_default(|rl| format!(" global rate limit: {rl}/s"));
 
         format!("{message_size}{messages_per_batch}{data}{rate_limit}")
     }

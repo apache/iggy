@@ -24,6 +24,7 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the system module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait SystemClient {
     /// Get the stats of the system such as PID, memory usage, streams count etc.
     ///

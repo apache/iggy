@@ -296,8 +296,8 @@ impl<'a> Iterator for FetchMessagesSectionIterator<'a> {
 mod tests {
     use super::*;
     use crate::batch::{
-        BATCH_HEADER_SIZE, BATCH_RESERVED_OFFSET, BatchHeader, calculate_batch_checksum,
-        decode_batch_slice,
+        BATCH_HEADER_SIZE, BATCH_PRODUCER_OFFSET, BATCH_RESERVED_OFFSET, BatchHeader,
+        calculate_batch_checksum, decode_batch_slice,
     };
     use crate::requests::messages::{
         FetchMessagesRequest, FetchMessagesTarget, MIN_DEFERRED_POLL_MAX_BYTES,
@@ -613,6 +613,7 @@ mod tests {
             .collect::<Vec<_>>()
             .concat();
         let empty_context = "00".repeat(PartitionContext::ENCODED_SIZE);
+        let no_producer = "00".repeat(BATCH_RESERVED_OFFSET - BATCH_PRODUCER_OFFSET);
         let reserved = "00".repeat(BATCH_HEADER_SIZE - BATCH_RESERVED_OFFSET);
         let expected = [
             "02000000",
@@ -639,6 +640,7 @@ mod tests {
             "3501000000000000",
             "bd2d787d3cdb745c",
             "01000000",
+            &no_producer,
             &reserved,
             "8e5ca59edbbdbfb9",
             "01000000000000000000000000000000",

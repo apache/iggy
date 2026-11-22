@@ -140,11 +140,6 @@ run_suite(){
     esac
   fi
 
-  if [ "$svc" = "swift-bdd" ] && [ "$FEATURE" != "deferred_polling" ] && [ "$FEATURE" != "all" ]; then
-    unsupported "$FEATURE" "$svc" || return 1
-    return 0
-  fi
-
   if [ "$FEATURE" = "resource_options_patch" ] && [ "$svc" = "php-bdd" ]; then
     unsupported "$FEATURE" "$svc" || return 1
     return 0

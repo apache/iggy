@@ -122,15 +122,17 @@ services:
       - iggy-kafka-gateway
     ports:
       - 127.0.0.1:9093:9093
+      # /metrics, /ready and /live (IGGY_KAFKA_HTTP_ADDR, baked into the image).
+      - 127.0.0.1:9096:9096
     # `depends_on: service_healthy` only gates the initial `up`, never a later restart - without
     # its own healthcheck this container crash-loops invisibly (no state `docker compose ps` can
-    # show) if restarted while iggy-server happens to be down. The listener binds only after the
-    # bridge connects (src/main.rs), so "port answers" already implies "bridge is up".
+    # show) if restarted while iggy-server happens to be down. `--check-ready` asks the gateway's
+    # own /ready, which answers 503 while the bridge cannot reach iggy-server.
     healthcheck:
-      test: ["CMD", "nc", "-z", "127.0.0.1", "9093"]
+      test: ["CMD", "/iggy-gateway-kafka", "--check-ready"]
       interval: 10s
-      timeout: 3s
-      start_period: 15s
+      timeout: 5s
+      start_period: 60s
       retries: 5
 
 volumes:

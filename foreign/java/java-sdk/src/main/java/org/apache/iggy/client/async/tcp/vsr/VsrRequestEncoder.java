@@ -135,8 +135,11 @@ public final class VsrRequestEncoder {
             frame.setLongLE(VsrHeaders.REQUEST_ID_OFFSET, requestId);
             frame.setByte(VsrHeaders.REQUEST_OPERATION_OFFSET, operation);
             frame.setLongLE(VsrHeaders.REQUEST_SESSION_OFFSET, sessionId);
-            // A fetch carries its fences per target and does not inherit the session's metadata watermark.
-            if (commandCode != CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+            // Each fetch target carries its own fence. The header names only the metadata the session saw, so a
+            // replica that has not applied it answers 58 instead of judging the targets against older group state.
+            if (commandCode == CommandCode.Messages.FETCH_MESSAGES.getValue()) {
+                frame.setLongLE(VsrHeaders.REQUEST_METADATA_OP_OFFSET, session.metadataWatermark());
+            } else {
                 frame.setLongLE(
                         VsrHeaders.REQUEST_INCARNATION_OFFSET,
                         context.incarnation().longValue());

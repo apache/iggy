@@ -52,6 +52,8 @@ impl CommitErrorScope {
                     | IggyError::ConsumerGroupPartitionNotOwned(..)
                     // A read that needs a new offset key above the limit returns no messages.
                     | IggyError::TooManyConsumerOffsets
+                    // A read that the object store refused returns no messages either.
+                    | IggyError::TieredReadFailed
             ),
             // None of these leaves an offset stored in the history that the request named.
             Self::Section => matches!(
@@ -63,6 +65,7 @@ impl CommitErrorScope {
                     | IggyError::ConsumerGroupPartitionNotOwned(..)
                     | IggyError::PartitionNotFound(..)
                     | IggyError::TooManyConsumerOffsets
+                    | IggyError::TieredReadFailed
             ),
         }
     }
@@ -77,6 +80,9 @@ mod tests {
         assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::TransientNotAccepted));
     }
 
+    /// The server checks the grant again after the owner's read stored the offset, so a
+    /// permission lost during a committing read can come back as `Unauthorized` over a batch
+    /// that is already committed.
     #[test]
     fn given_lost_session_when_classifying_then_should_leave_outcome_unknown_in_both_scopes() {
         for error in [
@@ -90,6 +96,14 @@ mod tests {
             assert!(!CommitErrorScope::Request.proves_nothing_stored(&error));
             assert!(!CommitErrorScope::Section.proves_nothing_stored(&error));
         }
+    }
+
+    /// A read that the object store refused returns no messages, so no offset follows it. A
+    /// reader that took it as an unknown outcome would retry a failure that no retry changes.
+    #[test]
+    fn given_tiered_read_failed_when_classifying_then_should_prove_nothing_stored_in_both_scopes() {
+        assert!(CommitErrorScope::Request.proves_nothing_stored(&IggyError::TieredReadFailed));
+        assert!(CommitErrorScope::Section.proves_nothing_stored(&IggyError::TieredReadFailed));
     }
 
     #[test]

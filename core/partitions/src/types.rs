@@ -16,10 +16,20 @@
 // under the License.
 
 use iggy_binary_protocol::Operation;
-use iggy_common::{IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext};
+use iggy_common::{
+    ConsumerGroupId, ConsumerOffset, IggyByteSize, PollingKind, PollingStrategy, ServerKeyContext,
+};
 use server_common::iobuf::Frozen;
 use smallvec::SmallVec;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// Offset cursors of one partition, keyed by consumer id. Only the owner shard
+/// reads them, and a `BTreeMap` keeps the iteration order the same in every run.
+pub type ConsumerOffsets = BTreeMap<usize, ConsumerOffset>;
+
+/// Offset cursors of one partition, keyed by consumer group.
+pub type ConsumerGroupOffsets = BTreeMap<ConsumerGroupId, ConsumerOffset>;
 
 /// A local commit that failed for an op the cluster had already committed.
 ///
@@ -356,8 +366,10 @@ pub enum RepairConclusion {
     /// The walk reached the requested frontier; the session was dropped.
     Done,
     /// The floor's continuity check failed: ops below it are neither locally
-    /// durable nor repaired. The session was dropped here -- state transfer
-    /// supersedes repair -- and the caller arms the transfer.
+    /// durable nor repaired. The repair walk of an unproven view log that
+    /// outgrew its byte budget also ends here, with `floor` at `commit_min`.
+    /// The session was dropped here -- state transfer supersedes repair -- and
+    /// the caller arms the transfer.
     FloorRefused { floor: u64, to_op: u64 },
 }
 

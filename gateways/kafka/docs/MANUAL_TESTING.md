@@ -24,8 +24,8 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 # From iggy workspace root (or iggy-gateway-kafka subdir)
 cargo build -p iggy-gateway-kafka
 
-# Terminal 1 — start listener (default 127.0.0.1:9093)
-RUST_LOG=info cargo run -p iggy-gateway-kafka
+# Terminal 1 — start listener (default 127.0.0.1:9093) in stub mode, without Iggy
+IGGY_KAFKA_BRIDGE_ENABLED=false RUST_LOG=info cargo run -p iggy-gateway-kafka
 ```
 
 Expected log:
@@ -79,7 +79,7 @@ No host installs needed, both clients run from containers with `--network host`:
 IGGY_PATH=/tmp/iggy-sasl-data ./target/debug/iggy-server --fresh --with-default-root-credentials
 
 # Terminal 2 - gateway with SASL on
-IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_BRIDGE_ENABLED=false IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
   IGGY_KAFKA_BIND_ADDR=127.0.0.1:9095 RUST_LOG=debug cargo run -p iggy-gateway-kafka
 ```
 
@@ -98,6 +98,8 @@ docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 \
 | S4 | No credentials | `docker run --rm --network host edenhill/kcat:1.7.1 -b 127.0.0.1:9095 -L` | No metadata served; client suggests SASL may be required | Pass |
 | S5 | Java client | see below | Authenticates, and lists `SaslHandshake(17): 0 to 1 [usable: 1]` and `SaslAuthenticate(36): 0 to 2 [usable: 2]` | Pass |
 | S6 | Feature off | restart without `IGGY_KAFKA_SASL_ENABLED`, rerun S1 | Client reports no broker SASL support; plaintext `-L` still served | Pass |
+| S7 | kafka-python 2.0.2 | see below | Produces 10 records and reads them back in a group. With the password `WRONG`, it ends with `NoBrokersAvailable` | Pass |
+| S8 | Sarama 1.40.1 | see below | Produces 10 records and reads them back. With the password `WRONG`, it ends with `client has run out of available brokers to talk to: EOF` | Pass |
 
 S5 is the case that matters most, because the Java client negotiates `SaslAuthenticate` **v2**, the
 compact framing no other case here exercises, and it sends `ApiVersions` both before and after
@@ -110,9 +112,36 @@ sasl.mechanism=PLAIN
 sasl.jaas.config=org.apache.kafka.common.security.plain.PlainLoginModule required username="iggy" password="iggy";
 EOF
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-broker-api-versions.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties
 ```
+
+S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
+(KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
+cases produce, so in terminal 2 drop `IGGY_KAFKA_BRIDGE_ENABLED=false` and add
+`IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway. kafka-python 2.0.2 needs Python 3.11 or older:
+
+```bash
+uv venv --python 3.11 /tmp/kafka-python-2.0.2
+uv pip install --python /tmp/kafka-python-2.0.2/bin/python kafka-python==2.0.2
+/tmp/kafka-python-2.0.2/bin/python - <<'EOF'
+from kafka import KafkaConsumer, KafkaProducer
+common = dict(bootstrap_servers="127.0.0.1:9095", security_protocol="SASL_PLAINTEXT",
+              sasl_mechanism="PLAIN", sasl_plain_username="iggy", sasl_plain_password="iggy")
+producer = KafkaProducer(**common)
+for i in range(10):
+    producer.send("v0-kafka-python", f"kafka-python {i}".encode()).get(timeout=10)
+producer.close()
+consumer = KafkaConsumer("v0-kafka-python", group_id="v0", auto_offset_reset="earliest",
+                         consumer_timeout_ms=15000, **common)
+print(len(list(consumer)), "records read")
+EOF
+```
+
+For S8, a Go program on `github.com/IBM/sarama v1.40.1` does the same. It sets
+`config.Net.SASL.Version = sarama.SASLHandshakeV0`, sends 10 records with a `SyncProducer`, and
+reads them back with `ConsumePartition` from `OffsetOldest`. With `RUST_LOG=debug`, the gateway logs
+`SASL mechanism negotiated` with `api_version=0` for each connection of both clients.
 
 ### Category T — ACL view
 
@@ -141,7 +170,7 @@ Then list each principal's ACLs with the real admin client, swapping the usernam
 
 ```bash
 docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:ro \
-  apache/kafka:3.9.0 /opt/kafka/bin/kafka-acls.sh \
+  apache/kafka:4.4.0 /opt/kafka/bin/kafka-acls.sh \
   --bootstrap-server 127.0.0.1:9095 --command-config /tmp/client.properties --list
 ```
 
@@ -217,7 +246,7 @@ IGGY_KAFKA_LISTENERS=PLAINTEXT://127.0.0.1:9093,SSL://127.0.0.1:9094,SASL_SSL://
 ```
 
 `KC` below is `docker run --rm --network host -v /tmp/certs:/certs:ro edenhill/kcat:1.7.1`, and
-`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:3.9.0`.
+`KAFKA` is `docker run --rm --network host -v /tmp/certs:/certs:ro -v /tmp/client.properties:/tmp/client.properties:ro apache/kafka:4.4.0`.
 
 | ID | Test | Command | Pass criteria | Last run |
 | ---- | ------ | --------- | --------------- | ---------- |
@@ -355,8 +384,8 @@ The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:909
 broker's usual port). Every command below passes `--host 127.0.0.1:9093` explicitly - omitting it
 connection-refuses before any assertion runs.
 
-Every case below describes a gateway started **without** a bridge (`IGGY_KAFKA_BRIDGE_ENABLED`
-unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
+Every case below describes a gateway started **without** a bridge
+(`IGGY_KAFKA_BRIDGE_ENABLED=false`). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
 `tests/produce_real_bridge_tests.rs` covers the bridge path.
 
 | ID | Test | Steps | Expected result | Pass criteria |
@@ -376,9 +405,13 @@ unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists
 
 For each API key, test **min−1**, **min**, **max**, **max+1** using `kafka-message-gen send --host 127.0.0.1:9093` with `--version N`.
 
+`kafka-protocol` 0.18 encodes ApiVersions only up to v4, so `kafka-message-gen` writes the v5
+request itself. To check v5 with a real client, run `kafka-broker-api-versions.sh` from
+`apache/kafka:4.4.0`. It prints `ApiVersions(18): 0 to 5 [usable: 5]`.
+
 | API key | Name | Min | Max | Test versions |
 | --------- | ------ | ----- | ----- | --------------- |
-| 18 | ApiVersions | 0 | 3 | −1, 0, 3, 4 |
+| 18 | ApiVersions | 0 | 5 | −1, 0, 5, 6 |
 | 3 | Metadata | 0 | 9 | −1, 0, 9, 10 |
 | 0 | Produce | 3 | 9 | 2, 3, 9, 10 |
 | 1 | Fetch | 4 | 12 | 3, 4, 12, 13 |
@@ -532,6 +565,10 @@ suite except `tests/phase1_e2e_tests.rs` does.
 | I4 | Read-back via Kafka Fetch | `kcat -b 127.0.0.1:9093 -C -t orders -o beginning -e` | The produced record's payload is printed - validates the actual Kafka Fetch path, not just Iggy's own side |
 | I5 | Volume persistence across a restart | `docker compose restart iggy-server`, wait for its health check to go healthy again, re-run I4's poll command | The same record is still readable after the container restarts against the same named volume |
 | I6 | Teardown | `docker compose down -v` | Both containers stop; volume removed |
+| I7 | Health check and readiness | After I1, run `docker compose ps`, then `curl -i 127.0.0.1:9096/ready` | The gateway shows `(healthy)`. `/ready` answers `200` and `ready` |
+| I8 | Metrics | After I4, run `curl -s 127.0.0.1:9096/metrics \| grep -E 'requests_total\|response_errors_total'` | `iggy_kafka_gateway_requests_total` has a line for `Produce` and for `Fetch`. A Fetch of a missing topic adds a `response_errors_total` line with `code="3"` |
+| I9 | Iggy lost | `docker compose stop iggy-server`, then run `curl -i 127.0.0.1:9096/ready` for about 10 s | `/ready` answers `503` with `Iggy is unreachable` within about 5 s. `curl 127.0.0.1:9096/live` still answers `200`. `docker compose start iggy-server` makes `/ready` answer `200` again |
+| I10 | Non-root image | `docker compose exec iggy-gateway-kafka id` | `uid=10001(iggy) gid=10001(iggy)` |
 
 I5 is a graceful restart (`docker compose restart` sends SIGTERM, which flushes on the way down) -
 it checks that the named volume actually persists data across a container restart, not that a
@@ -667,7 +704,7 @@ kcat version (if used): ___________
 [ ] F1–F6  TCP / connection behavior
 [ ] G1–G19  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3)
 [ ] H1–H6  Adversarial input
-[ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
+[ ] I1–I10 Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 [ ] J1–J4  AKHQ ListOffsets by timestamp
 
 Automated regression:

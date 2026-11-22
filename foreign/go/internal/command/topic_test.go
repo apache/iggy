@@ -229,6 +229,7 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 			iggcon.MessagesRequiredToSaveOption(7),
 			iggcon.SizeOfMessagesRequiredToSaveOption(4096),
 			iggcon.PreallocateSegmentsOption(false),
+			iggcon.ReplicationFactorOption(3),
 		}},
 	}
 
@@ -261,6 +262,7 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		{"messages_required_to_save", iggcon.Uint32, []byte{7, 0, 0, 0}},
 		{"size_of_messages_required_to_save", iggcon.Uint64, []byte{0, 16, 0, 0, 0, 0, 0, 0}},
 		{"preallocate_segments", iggcon.Bool, []byte{0}},
+		{"replication_factor", iggcon.Uint32, []byte{3, 0, 0, 0}},
 	}
 	if len(byKey) != len(want) {
 		t.Fatalf("options block carries %d keys, want %d: %v", len(byKey), len(want), byKey)
@@ -276,6 +278,365 @@ func TestCreateTopic_TypedOptionConstructorsReachTheBlock(t *testing.T) {
 		}
 		if !bytes.Equal(got.Value, expected.value) {
 			t.Errorf("key %q value = %v, want %v", expected.key, got.Value, expected.value)
+		}
+	}
+}
+
+func TestCreateTopic_ReplicationFactorFieldRidesTheBlockAsUint32(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	replicationFactor := uint32(2)
+	command := CreateTopic{
+		StreamId: streamId,
+		Name:     "topic",
+		Options:  iggcon.TopicOptions{ReplicationFactor: &replicationFactor},
+	}
+
+	serialized, err := command.MarshalBinary()
+	if err != nil {
+		t.Fatalf("failed to serialize CreateTopic: %v", err)
+	}
+
+	const streamIdSize = 2 + 4
+	optionsOffset := streamIdSize + 4 + 1 + len(command.Name)
+	options, err := iggcon.DeserializeHeaders(serialized[optionsOffset:])
+	if err != nil {
+		t.Fatalf("options block is not valid TLV: %v", err)
+	}
+	var found bool
+	for _, entry := range options {
+		if string(entry.Key.Value) != "replication_factor" {
+			continue
+		}
+		found = true
+		if entry.Value.Kind != iggcon.Uint32 {
+			t.Errorf("replication_factor kind = %d, want Uint32", entry.Value.Kind)
+		}
+		if !bytes.Equal(entry.Value.Value, []byte{2, 0, 0, 0}) {
+			t.Errorf("replication_factor value = %v, want [2 0 0 0]", entry.Value.Value)
+		}
+	}
+	if !found {
+		t.Errorf("replication_factor is missing from the options block: %v", options)
+	}
+}
+
+func TestCreateTopic_SegmentMaxAgeFieldRidesTheBlockAsUint64(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	segmentOptions := func(age iggcon.Duration) []iggcon.HeaderEntry {
+		t.Helper()
+		command := CreateTopic{
+			StreamId: streamId,
+			Name:     "topic",
+			Options:  iggcon.TopicOptions{SegmentMaxAge: &age},
+		}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		options, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		var entries []iggcon.HeaderEntry
+		for _, entry := range options {
+			if string(entry.Key.Value) == string(iggcon.TopicOptionSegmentMaxAge) {
+				entries = append(entries, entry)
+			}
+		}
+		return entries
+	}
+
+	entries := segmentOptions(iggcon.Duration(3_600_000_000))
+	if len(entries) != 1 {
+		t.Fatalf("segment_max_age entries = %v, want exactly one", entries)
+	}
+	if entries[0].Value.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(entries[0].Value.Value) != 3_600_000_000 {
+		t.Errorf("segment_max_age = %+v, want Uint64 3600000000", entries[0].Value)
+	}
+	if entries := segmentOptions(iggcon.IggyExpiryServerDefault); len(entries) != 0 {
+		t.Errorf("the server-default sentinel must leave segment_max_age derived, got %v", entries)
+	}
+}
+
+func TestCreateTopic_TieringFieldsRideTheBlock(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	tieringOptions := func(options iggcon.TopicOptions) map[string]iggcon.HeaderValue {
+		t.Helper()
+		command := CreateTopic{StreamId: streamId, Name: "topic", Options: options}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		entries, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		byKey := make(map[string]iggcon.HeaderValue, len(entries))
+		for _, entry := range entries {
+			byKey[string(entry.Key.Value)] = entry.Value
+		}
+		return byKey
+	}
+
+	tieredStorage := false
+	localRetentionAge := iggcon.Duration(21_600_000_000)
+	localRetentionSize := uint64(10 << 30)
+	options := tieringOptions(iggcon.TopicOptions{
+		TieredStorage:      &tieredStorage,
+		LocalRetentionAge:  &localRetentionAge,
+		LocalRetentionSize: &localRetentionSize,
+	})
+	if value := options[string(iggcon.TopicOptionTieredStorage)]; value.Kind != iggcon.Bool || !bytes.Equal(value.Value, []byte{0}) {
+		t.Errorf("tiered_storage = %+v, want Bool false", value)
+	}
+	if value := options[string(iggcon.TopicOptionLocalRetentionAge)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 21_600_000_000 {
+		t.Errorf("local_retention_age = %+v, want Uint64 21600000000", value)
+	}
+	if value := options[string(iggcon.TopicOptionLocalRetentionSize)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 10<<30 {
+		t.Errorf("local_retention_size = %+v, want Uint64 %d", value, 10<<30)
+	}
+
+	serverDefaultAge := iggcon.IggyExpiryServerDefault
+	serverDefaultSize := uint64(0)
+	options = tieringOptions(iggcon.TopicOptions{
+		LocalRetentionAge:  &serverDefaultAge,
+		LocalRetentionSize: &serverDefaultSize,
+	})
+	for _, key := range []iggcon.TopicOptionKey{
+		iggcon.TopicOptionTieredStorage,
+		iggcon.TopicOptionLocalRetentionAge,
+		iggcon.TopicOptionLocalRetentionSize,
+	} {
+		if value, sent := options[string(key)]; sent {
+			t.Errorf("the server-default sentinel must leave %s derived, got %+v", key, value)
+		}
+	}
+}
+
+func TestUpdateTopic_TieringFieldsRideTheBlock(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(2))
+	const prefixSize = 1 + (2 + 4) + (2 + 4) + 1
+	tieredStorage := true
+	localRetentionAge := iggcon.Duration(21_600_000_000)
+	localRetentionSize := uint64(10 << 30)
+	request := UpdateTopic{
+		StreamId:           streamId,
+		TopicId:            topicId,
+		TieredStorage:      &tieredStorage,
+		LocalRetentionAge:  &localRetentionAge,
+		LocalRetentionSize: &localRetentionSize,
+	}
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("failed to serialize UpdateTopic: %v", err)
+	}
+	entries, err := iggcon.DeserializeHeaders(serialized[prefixSize:])
+	if err != nil {
+		t.Fatalf("options block is not valid TLV: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("entries = %v, want the three tiering keys", entries)
+	}
+	byKey := make(map[string]iggcon.HeaderValue, len(entries))
+	for _, entry := range entries {
+		byKey[string(entry.Key.Value)] = entry.Value
+	}
+	if value := byKey[string(iggcon.TopicOptionTieredStorage)]; value.Kind != iggcon.Bool || !bytes.Equal(value.Value, []byte{1}) {
+		t.Errorf("tiered_storage = %+v, want Bool true", value)
+	}
+	if value := byKey[string(iggcon.TopicOptionLocalRetentionAge)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 21_600_000_000 {
+		t.Errorf("local_retention_age = %+v, want Uint64 21600000000", value)
+	}
+	if value := byKey[string(iggcon.TopicOptionLocalRetentionSize)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 10<<30 {
+		t.Errorf("local_retention_size = %+v, want Uint64 %d", value, 10<<30)
+	}
+
+	reset := UpdateTopic{
+		StreamId: streamId,
+		TopicId:  topicId,
+		Reset:    []iggcon.TopicOptionKey{iggcon.TopicOptionLocalRetentionAge, iggcon.TopicOptionLocalRetentionSize},
+	}
+	if _, err := reset.MarshalBinary(); err != nil {
+		t.Errorf("resetting the local retention keys must be accepted, got %v", err)
+	}
+}
+
+func TestUpdateTopic_TieredStorageCannotBeTurnedOffOrReset(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(2))
+	tieredStorage := false
+	requests := map[string]UpdateTopic{
+		"off":   {StreamId: streamId, TopicId: topicId, TieredStorage: &tieredStorage},
+		"reset": {StreamId: streamId, TopicId: topicId, Reset: []iggcon.TopicOptionKey{iggcon.TopicOptionTieredStorage}},
+	}
+	for name, request := range requests {
+		_, err := request.MarshalBinary()
+		var refused ierror.OptionNotUpdatable
+		if !errors.As(err, &refused) || refused.Key != string(iggcon.TopicOptionTieredStorage) {
+			t.Errorf("%s: error = %v, want OptionNotUpdatable for tiered_storage", name, err)
+		}
+	}
+}
+
+func TestCreateTopic_TopicTypeAndGeoModeFieldsRideTheBlockAsStrings(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	geoOptions := func(options iggcon.TopicOptions) map[string]iggcon.HeaderValue {
+		t.Helper()
+		command := CreateTopic{StreamId: streamId, Name: "topic", Options: options}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		entries, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		byKey := make(map[string]iggcon.HeaderValue, len(entries))
+		for _, entry := range entries {
+			byKey[string(entry.Key.Value)] = entry.Value
+		}
+		return byKey
+	}
+
+	topicType := iggcon.TopicTypeGeo
+	geoMode := iggcon.GeoModeGeoTiered
+	options := geoOptions(iggcon.TopicOptions{TopicType: &topicType, GeoMode: &geoMode})
+	if value := options[string(iggcon.TopicOptionTopicType)]; value.Kind != iggcon.String || string(value.Value) != "geo" {
+		t.Errorf("topic_type = %+v, want String %q", value, "geo")
+	}
+	if value := options[string(iggcon.TopicOptionGeoMode)]; value.Kind != iggcon.String || string(value.Value) != "geo_tiered" {
+		t.Errorf("geo_mode = %+v, want String %q", value, "geo_tiered")
+	}
+
+	options = geoOptions(iggcon.TopicOptions{})
+	for _, key := range []iggcon.TopicOptionKey{iggcon.TopicOptionTopicType, iggcon.TopicOptionGeoMode} {
+		if value, sent := options[string(key)]; sent {
+			t.Errorf("a nil field must leave %s to the server, got %+v", key, value)
+		}
+	}
+}
+
+func TestCreateTopic_GeoDurationsRideTheBlockAsUint64AndZeroIsSent(t *testing.T) {
+	streamId, err := iggcon.NewIdentifier(uint32(1))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	const streamIdSize = 2 + 4
+	geoOptions := func(options iggcon.TopicOptions) map[string]iggcon.HeaderValue {
+		t.Helper()
+		command := CreateTopic{StreamId: streamId, Name: "topic", Options: options}
+		serialized, err := command.MarshalBinary()
+		if err != nil {
+			t.Fatalf("failed to serialize CreateTopic: %v", err)
+		}
+		entries, err := iggcon.DeserializeHeaders(serialized[streamIdSize+4+1+len(command.Name):])
+		if err != nil {
+			t.Fatalf("options block is not valid TLV: %v", err)
+		}
+		byKey := make(map[string]iggcon.HeaderValue, len(entries))
+		for _, entry := range entries {
+			byKey[string(entry.Key.Value)] = entry.Value
+		}
+		return byKey
+	}
+
+	topicType := iggcon.TopicTypeGeo
+	zero := iggcon.Duration(0)
+	grace := iggcon.Hour
+	options := geoOptions(iggcon.TopicOptions{
+		TopicType:                    &topicType,
+		ConsumerOffsetUploadInterval: &zero,
+		TombstoneGrace:               &grace,
+	})
+	if value, sent := options[string(iggcon.TopicOptionConsumerOffsetUploadInterval)]; !sent ||
+		value.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(value.Value) != 0 {
+		t.Errorf("consumer_offset_upload_interval = %+v, sent %v, want Uint64 0", value, sent)
+	}
+	if value := options[string(iggcon.TopicOptionTombstoneGrace)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 3_600_000_000 {
+		t.Errorf("tombstone_grace = %+v, want Uint64 3600000000", value)
+	}
+	for _, key := range []iggcon.TopicOptionKey{
+		iggcon.TopicOptionFreshUploadInterval,
+		iggcon.TopicOptionPositionsPublishInterval,
+		iggcon.TopicOptionPositionsResumeTimeout,
+		iggcon.TopicOptionLongTermRewriteMaxInterval,
+	} {
+		if value, sent := options[string(key)]; sent {
+			t.Errorf("a nil duration must leave %s to the server setting, got %+v", key, value)
+		}
+	}
+}
+
+func TestUpdateTopic_GeoDurationsAreSetOnlyAndZeroIsSent(t *testing.T) {
+	streamId, _ := iggcon.NewIdentifier(uint32(1))
+	topicId, _ := iggcon.NewIdentifier(uint32(2))
+	const prefixSize = 1 + (2 + 4) + (2 + 4) + 1
+	zero := iggcon.Duration(0)
+	interval := 2 * iggcon.Second
+	request := UpdateTopic{
+		StreamId:                 streamId,
+		TopicId:                  topicId,
+		PositionsResumeTimeout:   &zero,
+		PositionsPublishInterval: &interval,
+	}
+	serialized, err := request.MarshalBinary()
+	if err != nil {
+		t.Fatalf("failed to serialize UpdateTopic: %v", err)
+	}
+	entries, err := iggcon.DeserializeHeaders(serialized[prefixSize:])
+	if err != nil {
+		t.Fatalf("options block is not valid TLV: %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("entries = %v, want the two durations that are set", entries)
+	}
+	byKey := make(map[string]iggcon.HeaderValue, len(entries))
+	for _, entry := range entries {
+		byKey[string(entry.Key.Value)] = entry.Value
+	}
+	if value, sent := byKey[string(iggcon.TopicOptionPositionsResumeTimeout)]; !sent ||
+		value.Kind != iggcon.Uint64 || binary.LittleEndian.Uint64(value.Value) != 0 {
+		t.Errorf("positions_resume_timeout = %+v, sent %v, want Uint64 0", value, sent)
+	}
+	if value := byKey[string(iggcon.TopicOptionPositionsPublishInterval)]; value.Kind != iggcon.Uint64 ||
+		binary.LittleEndian.Uint64(value.Value) != 2_000_000 {
+		t.Errorf("positions_publish_interval = %+v, want Uint64 2000000", value)
+	}
+
+	for _, key := range []iggcon.TopicOptionKey{
+		iggcon.TopicOptionFreshUploadInterval,
+		iggcon.TopicOptionConsumerOffsetUploadInterval,
+		iggcon.TopicOptionPositionsPublishInterval,
+		iggcon.TopicOptionTombstoneGrace,
+		iggcon.TopicOptionPositionsResumeTimeout,
+		iggcon.TopicOptionLongTermRewriteMaxInterval,
+	} {
+		reset := UpdateTopic{StreamId: streamId, TopicId: topicId, Reset: []iggcon.TopicOptionKey{key}}
+		_, err := reset.MarshalBinary()
+		var refused ierror.OptionNotResettable
+		if !errors.As(err, &refused) || refused.Key != string(key) {
+			t.Errorf("reset %s: error = %v, want OptionNotResettable", key, err)
 		}
 	}
 }

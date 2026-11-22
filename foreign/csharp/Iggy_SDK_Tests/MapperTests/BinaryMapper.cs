@@ -41,6 +41,12 @@ namespace Apache.Iggy.Tests.MapperTests;
 
 public sealed class BinaryMapper
 {
+    /// <summary>
+    ///     The partition record the Rust encoder pins in get_topic.rs, so every SDK decodes the same bytes.
+    /// </summary>
+    private const string PinnedPartitionHex =
+        "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000000000000000650000000000000003010304020104";
+
     [Theory]
     [InlineData(null)]
     [InlineData("null")]
@@ -142,7 +148,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapStreams_ReturnsValidStreamsResponses()
+    public void MapPage_OfStreams_ReturnsValidStreamsResponses()
     {
         // Arrange
         var (id1, topicsCount1, sizeBytes, messagesCount, name1, createdAt)
@@ -153,15 +159,14 @@ public sealed class BinaryMapper
         var payload2
             = BinaryFactory.CreateStreamPayload(id2, topicsCount2, name2, sizeBytes2, messagesCount2, createdAt2);
 
-        var combinedPayload = new byte[payload1.Length + payload2.Length];
-        payload1.CopyTo(combinedPayload.AsSpan());
-        payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
+        var combinedPayload = BinaryFactory.CreatePagePayload([], payload1, payload2);
 
         // Act
-        IEnumerable<StreamResponse> responses = Mappers.BinaryMapper.MapStreams(combinedPayload).ToList();
+        var page = Mappers.BinaryMapper.MapPage(combinedPayload, Mappers.BinaryMapper.MapToStream);
+        IEnumerable<StreamResponse> responses = page.Items;
 
         // Assert
-        Assert.NotNull(responses);
+        Assert.Null(page.Next);
         Assert.Equal(2, responses.Count());
 
         var response1 = responses.ElementAt(0);
@@ -226,7 +231,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapTopics_ReturnsValidTopicsResponses()
+    public void MapPage_OfTopics_ReturnsValidTopicsResponses()
     {
         // Arrange
         var (id1, partitionsCount1, name1, _, sizeBytesTopic1, messagesCountTopic1, createdAt, _) =
@@ -239,17 +244,14 @@ public sealed class BinaryMapper
             sizeBytesTopic2, messagesCountTopic2, createdAt2,
             BinaryFactory.CreateOptionEntry(2, "compression_algorithm", 2, "gzip"u8.ToArray()));
 
-        // GetTopics replies start with the topics count.
-        var combinedPayload = new byte[4 + payload1.Length + payload2.Length];
-        BinaryPrimitives.WriteUInt32LittleEndian(combinedPayload.AsSpan(0, 4), 2);
-        payload1.CopyTo(combinedPayload.AsSpan(4));
-        payload2.CopyTo(combinedPayload.AsSpan(4 + payload1.Length));
+        var combinedPayload = BinaryFactory.CreatePagePayload([], payload1, payload2);
 
         // Act
-        IReadOnlyList<TopicResponse> responses = Mappers.BinaryMapper.MapTopics(combinedPayload);
+        var page = Mappers.BinaryMapper.MapPage(combinedPayload, Mappers.BinaryMapper.MapToTopic);
+        IReadOnlyList<TopicResponse> responses = page.Items;
 
         // Assert
-        Assert.NotNull(responses);
+        Assert.Null(page.Next);
         Assert.Equal(2, responses.Count());
 
         var response1 = responses.ElementAt(0);
@@ -279,17 +281,22 @@ public sealed class BinaryMapper
             sizeBytes, messagesCount, createdAt2,
             BinaryFactory.CreateOptionEntry(2, "message_expiry", 12, BitConverter.GetBytes((ulong)messageExpiry)),
             BinaryFactory.CreateOptionEntry(2, "max_topic_size", 12, BitConverter.GetBytes(maxTopicSize)));
-
-        var combinedPayload = new byte[topicPayload.Length];
-        topicPayload.CopyTo(combinedPayload.AsSpan());
+        byte[] payload =
+        [
+            ..topicPayload,
+            ..Enumerable.Range(0, (int)partitionsCount).SelectMany(partitionId =>
+                BinaryFactory.CreatePartitionPayload((uint)partitionId, createdAt2, 1, 0, 0, 0,
+                    new PartitionContext(1, 0, 2), [0], [0]))
+        ];
 
         // Act
-        var response = Mappers.BinaryMapper.MapTopic(combinedPayload);
+        var response = Mappers.BinaryMapper.MapTopic(payload);
 
         // Assert
         Assert.NotNull(response);
         Assert.Equal(messagesCount, response.MessagesCount);
         Assert.Equal(partitionsCount, response.PartitionsCount);
+        Assert.Equal((int)partitionsCount, response.Partitions!.Count());
         Assert.Equal(sizeBytes, response.Size);
         Assert.Equal(topicId, response.Id);
         Assert.Equal(topicName, response.Name);
@@ -301,14 +308,13 @@ public sealed class BinaryMapper
     [Fact]
     public void MapTopic_ReadsAPartitionRecordWithItsContext()
     {
-        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
             TopicFactory.CreateTopicResponseFields();
         var context = new PartitionContext(17, 9, 52);
         byte[] payload =
         [
-            ..BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName, sizeBytes, messagesCount,
-                createdAt),
-            ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context)
+            ..BinaryFactory.CreateTopicPayload(topicId, 1, topicName, sizeBytes, messagesCount, createdAt),
+            ..BinaryFactory.CreatePartitionPayload(3, createdAt, 7, 101, 2048, 102, context, [0, 1, 2], [0])
         ];
 
         var response = Mappers.BinaryMapper.MapTopic(payload);
@@ -324,18 +330,179 @@ public sealed class BinaryMapper
     }
 
     [Fact]
+    public void MapTopic_DecodesThePinnedPartitionVector()
+    {
+        var partitionBytes = Convert.FromHexString(PinnedPartitionHex);
+        byte[] payload = [.. PinnedTopicHeader(1), .. partitionBytes];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(71, partitionBytes.Length);
+        Assert.Equal(partitionBytes, PinnedPartition(1, [1, 3, 4], [1, 4]));
+        var partition = Assert.Single(response.Partitions!);
+        Assert.Equal(1u, partition.Id);
+        Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1_710_000_000), partition.CreatedAt);
+        Assert.Equal(2u, partition.SegmentsCount);
+        Assert.Equal(99ul, partition.CurrentOffset);
+        Assert.Equal(1024ul, partition.Size);
+        Assert.Equal(100ul, partition.MessagesCount);
+        Assert.Equal(new PartitionContext(23, 0, 101), partition.Context);
+        Assert.Equal(new byte[] { 1, 3, 4 }, partition.Members);
+        Assert.Equal(new byte[] { 1, 4 }, partition.InSyncMembers);
+    }
+
+    [Fact]
+    public void MapTopic_DecodesAPartitionWithEmptyNodeLists()
+    {
+        var pinned = Convert.FromHexString(PinnedPartitionHex);
+        byte[] partitionBytes = [.. pinned[..64], 0, 0];
+        byte[] payload = [.. PinnedTopicHeader(1), .. partitionBytes];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(66, partitionBytes.Length);
+        var partition = Assert.Single(response.Partitions!);
+        Assert.Equal(1u, partition.Id);
+        Assert.Equal(new PartitionContext(23, 0, 101), partition.Context);
+        Assert.Empty(partition.Members);
+        Assert.Empty(partition.InSyncMembers);
+    }
+
+    [Fact]
+    public void MapTopic_AdvancesByTheLengthEachPartitionTakes()
+    {
+        byte[] payload =
+        [
+            ..PinnedTopicHeader(3),
+            ..PinnedPartition(1, [1, 3, 4], [1, 4]),
+            ..PinnedPartition(2, [], []),
+            ..PinnedPartition(3, [0, 1, 2], [0])
+        ];
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        var partitions = response.Partitions!.ToList();
+        Assert.Equal([1u, 2u, 3u], partitions.Select(partition => partition.Id));
+        Assert.All(partitions, partition => Assert.Equal(100ul, partition.MessagesCount));
+        Assert.All(partitions, partition => Assert.Equal(new PartitionContext(23, 0, 101), partition.Context));
+        Assert.Equal(new byte[] { 1, 3, 4 }, partitions[0].Members);
+        Assert.Equal(new byte[] { 1, 4 }, partitions[0].InSyncMembers);
+        Assert.Empty(partitions[1].Members);
+        Assert.Empty(partitions[1].InSyncMembers);
+        Assert.Equal(new byte[] { 0, 1, 2 }, partitions[2].Members);
+        Assert.Equal(new byte[] { 0 }, partitions[2].InSyncMembers);
+    }
+
+    [Fact]
+    public void MapTopic_WithAPartitionCutShort_Throws()
+    {
+        var header = PinnedTopicHeader(1);
+        byte[] payload = [.. header, .. Convert.FromHexString(PinnedPartitionHex)];
+
+        for (var length = header.Length; length < payload.Length; length++)
+        {
+            var truncated = payload[..length];
+            Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(truncated));
+        }
+    }
+
+    [Fact]
+    public void MapTopic_WithFewerPartitionsThanItsCount_Throws()
+    {
+        byte[] payload =
+        [
+            ..PinnedTopicHeader(2),
+            ..PinnedPartition(1, [1, 3, 4], [1, 4]),
+            ..PinnedPartition(2, [1, 3, 4], [1, 4])[..70]
+        ];
+
+        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopic(payload));
+    }
+
+    [Fact]
+    public void MapTopic_ReadsTheTypeAndModeOfAGeoTopic()
+    {
+        const byte stringKind = 2;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            BinaryFactory.CreateOptionEntry(stringKind, "topic_type", stringKind, "geo"u8.ToArray()),
+            BinaryFactory.CreateOptionEntry(stringKind, "geo_mode", stringKind, "geo_tiered"u8.ToArray()));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(TopicType.Geo, response.TopicType);
+        Assert.Equal(GeoMode.GeoTiered, response.GeoMode);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsNoGeoModeOnANormalTopic()
+    {
+        const byte stringKind = 2;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            derivedOptions: BinaryFactory.CreateOptionEntry(stringKind, "topic_type", stringKind, "normal"u8.ToArray()));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(TopicType.Normal, response.TopicType);
+        Assert.Null(response.GeoMode);
+    }
+
+    [Fact]
+    public void MapTopic_ReadsTheDurationsAGeoTopicSetsAndNullForTheOthers()
+    {
+        const byte stringKind = 2;
+        const byte uint64Kind = 12;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        byte[] options =
+        [
+            ..BinaryFactory.CreateOptionEntry(stringKind, "topic_type", stringKind, "geo"u8.ToArray()),
+            ..BinaryFactory.CreateOptionEntry(stringKind, "consumer_offset_upload_interval", uint64Kind,
+                BitConverter.GetBytes(0UL)),
+            ..BinaryFactory.CreateOptionEntry(stringKind, "tombstone_grace", uint64Kind,
+                BitConverter.GetBytes(3_600_000_000UL))
+        ];
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            options, BinaryFactory.CreateOptionEntry(stringKind, "geo_mode", stringKind, "geo"u8.ToArray()));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(TimeSpan.Zero, response.ConsumerOffsetUploadInterval);
+        Assert.Equal(TimeSpan.FromHours(1), response.TombstoneGrace);
+        Assert.Null(response.FreshUploadInterval);
+        Assert.Null(response.PositionsPublishInterval);
+        Assert.Null(response.PositionsResumeTimeout);
+        Assert.Null(response.LongTermRewriteMaxInterval);
+    }
+
+    private static byte[] PinnedTopicHeader(uint partitionsCount)
+    {
+        return BinaryFactory.CreateTopicPayload(7, partitionsCount, "replicated", 2048, 300, 1_710_000_000_000);
+    }
+
+    /// <summary>The counters of <see cref="PinnedPartitionHex" /> under its own id and node lists.</summary>
+    private static byte[] PinnedPartition(uint id, byte[] members, byte[] inSyncMembers)
+    {
+        return BinaryFactory.CreatePartitionPayload(id, 1_710_000_000_000, 2, 99, 1024, 100,
+            new PartitionContext(23, 0, 101), members, inSyncMembers);
+    }
+
+    [Fact]
     public void MapTopic_WithAnOptionOfAnUnknownKind_KeepsTheOtherEntries()
     {
         // Arrange: an option kind a newer server may introduce, between two this build knows.
         const byte stringKind = 2;
         const byte unknownKind = 200;
-        var (topicId, partitionsCount, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
             TopicFactory.CreateTopicResponseFields();
         var options = new List<byte>();
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "segment_size", stringKind, "1GB"u8.ToArray()));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "future_option", unknownKind, [0xAA, 0xBB]));
         options.AddRange(BinaryFactory.CreateOptionEntry(stringKind, "preallocate_segments", 3, [1]));
-        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, partitionsCount, topicName,
+        var topicPayload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName,
             sizeBytes, messagesCount, createdAt, options.ToArray());
 
         // Act
@@ -421,7 +588,7 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapConsumerGroups_ReturnsValidConsumerGroupsResponses()
+    public void MapPage_OfConsumerGroups_ReturnsValidConsumerGroupsResponses()
     {
         // Arrange
         var (id1, membersCount1, partitionsCount1, name) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
@@ -429,15 +596,14 @@ public sealed class BinaryMapper
         var (id2, membersCount2, partitionsCount2, name2) = ConsumerGroupFactory.CreateConsumerGroupResponseFields();
         var payload2 = BinaryFactory.CreateGroupPayload(id2, membersCount2, partitionsCount2, name2);
 
-        var combinedPayload = new byte[payload1.Length + payload2.Length];
-        payload1.CopyTo(combinedPayload.AsSpan());
-        payload2.CopyTo(combinedPayload.AsSpan(payload1.Length));
+        var combinedPayload = BinaryFactory.CreatePagePayload([], payload1, payload2);
 
         // Act
-        List<ConsumerGroupResponse> responses = Mappers.BinaryMapper.MapConsumerGroups(combinedPayload);
+        var page = Mappers.BinaryMapper.MapPage(combinedPayload, Mappers.BinaryMapper.MapToConsumerGroup);
+        IReadOnlyList<ConsumerGroupResponse> responses = page.Items;
 
         // Assert
-        Assert.NotNull(responses);
+        Assert.Null(page.Next);
         Assert.Equal(2, responses.Count);
 
         var response1 = responses[0];
@@ -515,15 +681,13 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapConsumerGroups_MultiByteName_KeepsWalkAligned()
+    public void MapPage_OfConsumerGroupsWithAMultiByteName_KeepsWalkAligned()
     {
         var first = BinaryFactory.CreateGroupPayload(1, 2, 3, "grüppe");
         var second = BinaryFactory.CreateGroupPayload(2, 4, 5, "other");
-        var combined = new byte[first.Length + second.Length];
-        first.CopyTo(combined, 0);
-        second.CopyTo(combined, first.Length);
+        var combined = BinaryFactory.CreatePagePayload([], first, second);
 
-        var responses = Mappers.BinaryMapper.MapConsumerGroups(combined);
+        var responses = Mappers.BinaryMapper.MapPage(combined, Mappers.BinaryMapper.MapToConsumerGroup).Items;
 
         Assert.Equal(2, responses.Count);
         Assert.Equal("grüppe", responses[0].Name);
@@ -968,12 +1132,13 @@ public sealed class BinaryMapper
     }
 
     [Fact]
-    public void MapTopics_OversizedTopicsCount_Throws()
+    public void MapPage_OversizedTopicsCount_Throws()
     {
-        var payload = new byte[4];
-        BinaryPrimitives.WriteUInt32LittleEndian(payload, uint.MaxValue);
+        var payload = BinaryFactory.CreatePagePayload([]);
+        BinaryPrimitives.WriteUInt32LittleEndian(payload.AsSpan(1), uint.MaxValue);
 
-        Assert.Throws<MalformedResponseException>(() => Mappers.BinaryMapper.MapTopics(payload));
+        Assert.Throws<MalformedResponseException>(() =>
+            Mappers.BinaryMapper.MapPage(payload, Mappers.BinaryMapper.MapToTopic));
     }
 
     [Fact]

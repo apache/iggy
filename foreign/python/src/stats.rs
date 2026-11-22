@@ -28,7 +28,7 @@ use pyo3_stub_gen::derive::{gen_stub_pyclass, gen_stub_pymethods};
 /// Hashable and comparable, so it can key the `Stats.cache_metrics` dict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[gen_stub_pyclass]
-#[pyclass(eq, frozen, hash, skip_from_py_object)]
+#[pyclass(eq, frozen, hash)]
 pub struct CacheMetricsKey {
     /// The unique identifier (numeric) of the stream.
     #[pyo3(get)]

@@ -16,18 +16,45 @@
 // under the License.
 
 pub mod builder;
+pub mod commit_batch;
 pub mod config;
 pub mod coordinator;
 pub mod host;
 pub mod metrics;
 mod partition_io;
-pub use partition_io::{PartitionIoLimits, PartitionIoLimitsError};
+pub use partition_io::{DEFAULT_PARTITION_IO_CAPACITY, PartitionIoLimits, PartitionIoLimitsError};
+mod fresh_writes;
+pub use fresh_writes::{
+    FRESH_CONFIRM_AFTER, FRESH_OBJECT_BYTES, FRESH_PARTITION_PENDING_BYTES_MAX,
+    FRESH_PENDING_BYTES_MAX, FRESH_UPLOAD_INTERVAL, FRESH_UPLOADS, FinishedFreshUpload,
+};
+mod fresh_sweeps;
+pub mod geo_commits;
+pub mod geo_positions;
+pub use fresh_sweeps::{
+    FRESH_SWEEP_INTERVAL, FinishedFreshDelete, FinishedFreshListing, FreshObjectsReport,
+    FreshSweeps,
+};
+pub mod long_term_merges;
+mod long_term_retention;
+mod long_term_rewrites;
+mod manifest_publishes;
+mod object_deletes;
+mod peer_manifest_follows;
+pub mod peers;
 mod poll;
 mod primary_rebalance;
+pub mod rewrite_pacing;
 mod router;
+mod segment_uploads;
+mod served_reads;
 pub mod shards_table;
 #[cfg(test)]
 mod test_support;
+pub mod tier_service;
+mod topic_object_checks;
+pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest};
+mod upload_pacing;
 
 pub use config::CoordinatorConfig;
 pub use host::{NoopHost, ShardHost};
@@ -36,16 +63,20 @@ pub use poll::deferred::{
     OversizedTurn, PollQuotaIdentity, ReadinessTarget, ReadinessWait, ReadinessWatch, ReadyTarget,
     ServedState, WatchedState,
 };
+use poll::deferred::{MirrorSince, MirrorUse};
 pub use poll::{ConsumerAttachment, PollCompleted};
+/// How often the replication gauges and partition reports refresh.
+pub use primary_rebalance::PROBE_INTERVAL as PARTITION_REPORT_INTERVAL;
 pub use router::CONSENSUS_TICK_INTERVAL;
 
 #[cfg(feature = "simulator")]
 use consensus::LocalPipeline;
 use consensus::{
-    AdoptedView, ChunkProgress, CommitOutcome, Consensus, ConsensusClock, DVC_HEADERS_MAX,
-    DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane, PartitionsHandle,
-    Pipeline, Plane, PlaneKind, RepairEvidence, STATE_TRANSFER_MAX_DECODE_RETRIES,
-    STATE_TRANSFER_MAX_STALL_RETRIES, Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
+    AdoptedView, BackupPrefix, ChunkProgress, CommitOutcome, Consensus, ConsensusClock,
+    DVC_HEADERS_MAX, DvcHeaderKind, DvcSuffix, FatalReason, MergedLog, MetadataHandle, MuxPlane,
+    PartitionsHandle, Pipeline, Plane, PlaneKind, RepairEvidence, ReplicaSet, ReplicationSend,
+    ReplicationStats, STATE_TRANSFER_MAX_DECODE_RETRIES, STATE_TRANSFER_MAX_STALL_RETRIES,
+    Sequencer, StartViewRefusal, Status, VsrAction, VsrConsensus,
     build_deny_reply_from_request_header, dvc_blank, dvc_header_kind, encode_prepare_headers,
     fatal, repaired_frontier_update, repaired_prepare_evidence, restamp_prepare_view,
     verify_prepare_integrity,
@@ -53,16 +84,19 @@ use consensus::{
 #[cfg(any(test, feature = "simulator"))]
 use crossfire::AsyncRxTrait;
 use futures::FutureExt;
+use iggy_binary_protocol::primitives::partition_status::{
+    PartitionStatusEntry, decode_status_entries,
+};
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
-    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusHeader, ConsumerSession,
-    ConsumerSessionHeartbeatHeader, DoViewChangeHeader, ForwardCompletionHeader,
-    ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
+    CHECKSUM_UNSEALED, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
+    ConsensusHeader, ConsumerSession, ConsumerSessionHeartbeatHeader, DoViewChangeHeader,
+    ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutResultHeader, ForwardRegisterHeader,
     ForwardRegisterResultHeader, GenericHeader, Operation, PrepareHeader, PrepareOkHeader,
-    RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SegmentDeleteHeader,
-    SegmentDeleteKind, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
-    StateTransferTargetHeader, WireDecode,
+    PrepareProgressHeader, RepairPrepareHeader, RepairRangeReplyHeader, RequestPreparesHeader,
+    RequestStartViewHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, SegmentDeleteHeader, SegmentDeleteKind, StartViewChangeHeader,
+    StartViewHeader, StateChunkHeader, StateTransferTargetHeader, WireDecode,
 };
 #[cfg(feature = "simulator")]
 use iggy_common::PartitionStats;
@@ -82,11 +116,12 @@ use metadata::IggyMetadata;
 use metadata::impls::metadata::{PartitionPlacementView, StreamsFrontend, metadata_wal_head};
 use metadata::stm::StateMachine;
 use metadata::{BoundSession, CommitWalkStop, MetadataSubmitError};
-use partitions::state_transfer::TransferArtifact;
+use partitions::state_transfer::{PrefixSeed, TransferArtifact};
 use partitions::{
     FatalCommit, IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer,
-    RepairIngest,
+    RepairIngest, SentReport,
 };
+use served_reads::{LandedRead, ServedReadKey};
 use server_common::sharding::{
     IggyNamespace, LIST_CLIENTS_GATHER_TIMEOUT, PartitionLocation, ShardId,
 };
@@ -95,8 +130,11 @@ use shards_table::ShardsTable;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::future::Future;
+use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 pub type ShardPlane<B, J, S, M, SB = PingPongSuperblock> =
@@ -140,6 +178,11 @@ pub struct PartitionMaterialisation {
     created_view: u32,
     first_initialization: bool,
     consumer_offsets_max: usize,
+    /// `None` when every node stores the partition.
+    members: Option<ReplicaSet>,
+    /// The metadata op that created the incarnation, see
+    /// `IggyPartition::start_at_create_op`.
+    created_op: u64,
 }
 
 #[cfg(feature = "simulator")]
@@ -151,12 +194,26 @@ impl PartitionMaterialisation {
             created_view,
             first_initialization,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
+            members: None,
+            created_op: 0,
         }
     }
 
     #[must_use]
     pub const fn with_consumer_offsets_max(mut self, consumer_offsets_max: usize) -> Self {
         self.consumer_offsets_max = consumer_offsets_max;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_members(mut self, members: Option<ReplicaSet>) -> Self {
+        self.members = members;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_created_op(mut self, created_op: u64) -> Self {
+        self.created_op = created_op;
         self
     }
 }
@@ -251,6 +308,18 @@ pub enum MetadataSubmit {
         reply: Sender<Result<u64, IggyError>>,
     },
     ForwardedSegmentDelete(Message<SegmentDeleteHeader>),
+    /// The primary of a tiered partition decided that retention removes its
+    /// segments up to `up_to_offset`. Shard 0 commits that as a
+    /// `TruncatePartition` when this node leads the metadata group, and
+    /// relays it to the node that does otherwise. No reply: the next timed
+    /// pass decides again.
+    RetentionTruncate {
+        namespace: IggyNamespace,
+        /// The incarnation the offset was read from. Slab ids are reused
+        /// after a delete, so the namespace alone can name a later partition.
+        created_revision: u64,
+        up_to_offset: u64,
+    },
     /// Replica-link liveness report routed to shard 0; no proposal or reply.
     ConsumerSessionHeartbeat(Message<ConsumerSessionHeartbeatHeader>),
     BindSession {
@@ -414,9 +483,19 @@ pub struct GatheredClients<T = ConnectedClientInfo> {
 pub enum PartitionRead {
     Primary,
     DeferredPoll(Box<DeferredPollRequest>),
-    SessionRetired {
-        identity: iggy_binary_protocol::requests::system::SessionIdentity,
+    /// Whether the replica holds a whole retirement batch retired; see
+    /// [`partitions::IggyPartition::sessions_retired`]. Shared because every
+    /// partition a walk visits reads the same batch.
+    SessionsRetired {
+        ended: Arc<[iggy_binary_protocol::requests::system::SessionIdentity]>,
+        retired_through: u64,
         created_revision: u64,
+    },
+    /// Arm the incarnation's session gate for `debt_op` and report whether it
+    /// is paid; see [`partitions::IggyPartition::observe_retirement_debt`].
+    RetirementDebt {
+        created_revision: u64,
+        debt_op: u64,
     },
     /// A bound poll. A group read is served only to the partition's installed
     /// owner.
@@ -456,7 +535,7 @@ pub enum PartitionRead {
     },
     /// An external group's stored offset. Not a `PollingConsumer`: the kind is never polled.
     ExternalGroupOffsetOnPrimary {
-        group_id: u32,
+        group: ExternalGroupRead,
         metadata: metadata::stm::stream::PollMetadata,
     },
     /// Cooperative-rebalance classification: the group's last-polled and
@@ -474,6 +553,17 @@ pub enum PartitionRead {
     },
 }
 
+/// The group whose external offset an [`PartitionRead::ExternalGroupOffsetOnPrimary`] returns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalGroupRead {
+    /// A group of this cluster, by its id.
+    Group(u32),
+    /// A group that this cluster does not have, by its name. On a geo or
+    /// shadow topic, a position that another datacenter published for its
+    /// external offsets answers it.
+    Missing(String),
+}
+
 impl PartitionRead {
     pub(crate) const fn requires_primary(&self) -> bool {
         matches!(
@@ -484,6 +574,18 @@ impl PartitionRead {
                 | Self::ExternalGroupOffsetOnPrimary { .. }
                 | Self::ResolveSegmentDeleteOffset { .. }
         )
+    }
+
+    /// The consumer whose messages the read polls, `None` for any other
+    /// read.
+    #[must_use]
+    pub(crate) const fn polling_consumer(&self) -> Option<PollingConsumer> {
+        match self {
+            Self::PollOnPrimary { consumer, .. }
+            | Self::UnboundPollOnPrimary { consumer, .. }
+            | Self::Poll { consumer, .. } => Some(*consumer),
+            _ => None,
+        }
     }
 
     /// Whether the read returns polled messages or a stored consumer offset.
@@ -499,7 +601,8 @@ impl PartitionRead {
             | Self::UnboundPollOnPrimary { .. }
             | Self::Poll { .. } => true,
             Self::Primary
-            | Self::SessionRetired { .. }
+            | Self::SessionsRetired { .. }
+            | Self::RetirementDebt { .. }
             | Self::GroupOffsetState { .. }
             | Self::ResolveSegmentDeleteOffset { .. } => false,
         }
@@ -519,12 +622,14 @@ pub struct ConsumerOffsetRead {
 /// Reply to a [`PartitionRead`].
 #[derive(Debug)]
 pub enum PartitionReadReply {
-    /// The partition group's view on this replica and the primary of that view.
+    /// The partition group's view on this replica and the node id of that
+    /// view's primary.
     Primary {
         view: u32,
         primary: u8,
     },
-    SessionRetired(bool),
+    SessionsRetired(partitions::BatchRetirement),
+    RetirementDebt(partitions::RetirementDebtStatus),
     /// Permanent failure of this incarnation. It is not a retirement proof
     /// until the caller durably fences the incarnation against future serving.
     SessionRetirementFailed {
@@ -626,6 +731,14 @@ impl Drop for ParkedReadiness<'_> {
 /// with expiry can still leave an unknown outcome. Must stay below the SDK's
 /// 30s request deadline.
 const PARTITION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long a poll may wait on the object store, counted from its dispatch.
+///
+/// Half the read timeout: the other half is for the reply and, over HTTP, for
+/// the relay to the primary, which started its own read timeout earlier. A
+/// poll that reaches it returns the messages it has, or asks for a retry.
+const COLD_POLL_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+const _: () = assert!(COLD_POLL_BUDGET.as_millis() * 2 <= PARTITION_READ_TIMEOUT.as_millis());
 
 /// Budget for a partition write's wait on its committed reply. Longer than a
 /// read: the wait spans replication quorum plus any park-and-promote the
@@ -1081,8 +1194,10 @@ pub enum LifecycleFrame {
     /// the per-shard reconciler. No payload: reconciler re-reads target
     /// state. Drops covered by the periodic safety tick.
     MetadataCommitTick,
-    /// Last-known serving views, retried by a bounded sweep on each owning shard.
-    PartitionPlacementViews(Vec<PartitionPlacementView>),
+    /// Serving views that changed, with the statuses of the partitions this
+    /// node leads. A status with no node in sync retracts one this node
+    /// stopped leading.
+    PartitionPlacementViews(Vec<PartitionPlacementView>, Vec<PartitionStatusEntry>),
     PrimaryRebalance(Box<primary_rebalance::LocalRebalance>),
     PartitionPersistenceCompleted(partitions::PersistenceCompletion),
     /// Wake marker for the reconciler-to-pump funnel. Pump drains the
@@ -1100,6 +1215,24 @@ pub enum LifecycleFrame {
         message_expiry: IggyExpiry,
         max_bytes: Option<u64>,
     },
+    /// Per-shard pass over a partition of a tiered topic: the primary works
+    /// out what the topic's retention removes, over local and remote segments
+    /// alike, and hands the offset to shard 0 to commit as a
+    /// `TruncatePartition`. Nothing is deleted here, and a backup does
+    /// nothing. The timer task resolves the same inputs as for
+    /// `CleanPartition`, plus the watermark already committed, so a decision
+    /// that commits nothing new is dropped on the pump.
+    RetainPartition {
+        namespace: IggyNamespace,
+        /// The incarnation the policy was read for. Slab ids are reused after
+        /// a delete, so by the time the pump takes the frame the namespace
+        /// can name a recreated partition with another policy.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    },
     /// Reconciler-staged enforcement of a committed `TruncatePartition`
     /// watermark: delete sealed segments up to `up_to_offset` on the pump,
     /// serialized with reads. Each replica applies the committed offset
@@ -1108,6 +1241,267 @@ pub enum LifecycleFrame {
         namespace: IggyNamespace,
         up_to_offset: u64,
     },
+    /// Per-shard pass over a partition of a tiered topic: evict the sealed
+    /// segments below the tiered floor that left `envelope`. The timer task
+    /// resolves the envelope from the topic and stamps `now`. Local and
+    /// unreplicated, like `CleanPartition`: each replica reclaims its own
+    /// disk.
+    EvictPartition {
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        envelope: partitions::LocalEnvelope,
+    },
+    /// Per-shard pass over a partition of a tiered topic: start the upload of
+    /// its oldest sealed segment the store does not hold, when this replica
+    /// is the primary, no upload is in flight, the shard's byte budget covers
+    /// the segment and the partition is not waiting out a failed upload. Does
+    /// nothing on a shard without an uploader.
+    UploadSegments {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for. Slab ids are reused after
+        /// a delete, so by the time the pump takes the frame the namespace
+        /// can name a recreated partition that `committed_up_to` says
+        /// nothing about.
+        created_revision: u64,
+        /// Whether the pass also sends the floor advance that a stored
+        /// segment still owes. The pass that follows a finished upload leaves
+        /// it out, since that advance was sent a moment ago.
+        resend_advance: bool,
+        /// The truncation watermark metadata holds, on the pass the timer
+        /// task stages. Any other pass has no metadata to read it from, and
+        /// leaves the partition with the last one a timed pass brought.
+        committed_up_to: Option<u64>,
+    },
+    /// The result of an upload that an [`Self::UploadSegments`] pass started,
+    /// sent by the task that ran it.
+    SegmentUploadFinished(Box<FinishedSegmentUpload>),
+    /// Per-shard pass over a partition of a tiered topic: start the next
+    /// object-store job of its deletes, when this replica is the primary and
+    /// none is in flight. The timer task stamps `now` and reads the
+    /// truncation watermark metadata holds. Does nothing on a shard without
+    /// a deleter.
+    DeleteObjects {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for, as on
+        /// [`Self::UploadSegments`]: `committed_up_to` bounds what a sweep
+        /// may delete, and says nothing about a recreated partition.
+        created_revision: u64,
+        now: IggyTimestamp,
+        committed_up_to: u64,
+    },
+    /// The result of a job that a [`Self::DeleteObjects`] pass started, sent
+    /// by the task that ran it.
+    ObjectDeleteFinished(Box<FinishedObjectDelete>),
+    /// Per-shard pass over a partition of a tiered topic: store its manifest,
+    /// when this replica is the primary, no publish is in flight, and the
+    /// manifest changed. The timer task stamps `now`. Does nothing on a shard
+    /// without a publisher.
+    PublishManifest {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+        now: IggyTimestamp,
+    },
+    /// The result of a publish that a [`Self::PublishManifest`] pass started,
+    /// sent by the task that ran it.
+    ManifestPublishFinished(Box<FinishedManifestPublish>),
+    /// The result of an attempt at the upload of a fresh object, sent by the
+    /// task that ran it.
+    FreshUploadFinished(Box<FinishedFreshUpload>),
+    /// Per-shard pass over a partition that places its batches: rewrite its
+    /// committed batches above the long-term floor into a segment, when this
+    /// replica is the primary and no rewrite is in flight, or send the
+    /// command of a stored segment again. Does nothing on a shard without a
+    /// writer.
+    RewriteSegments {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+    },
+    /// The result of a rewrite that a [`Self::RewriteSegments`] pass
+    /// started, sent by the task that ran it.
+    SegmentRewriteFinished(Box<FinishedSegmentRewrite>),
+    /// Start a sweep of the fresh objects of this replica, on its first
+    /// shard: list them, when no sweep is in flight. The shard's tick starts
+    /// its sweeps without this frame, which is for a caller that wants one
+    /// at a `now` of its own. Does nothing on another shard or on one
+    /// without a sweeper.
+    SweepFreshObjects {
+        now: IggyTimestamp,
+    },
+    /// The listing that a [`Self::SweepFreshObjects`] pass started, sent by
+    /// the task that ran it.
+    FreshObjectsListed(Box<FinishedFreshListing>),
+    /// The first shard asks every shard which fresh objects its partitions
+    /// still name, for the sweep `sweep`.
+    ReportFreshObjects {
+        sweep: u64,
+    },
+    /// A shard's answer to [`Self::ReportFreshObjects`], sent to the first
+    /// shard by the task that read the partitions.
+    FreshObjectsReported(Box<FreshObjectsReport>),
+    /// The result of one delete job of a sweep, sent by the task that ran
+    /// it.
+    FreshObjectsDeleted(Box<FinishedFreshDelete>),
+    /// Per-shard pass over the partitions of geo topics: start the read of
+    /// the topic's object on each whose primary this replica is and that
+    /// does not take messages yet. The timer task stamps `now`. Does nothing
+    /// on a shard without topic objects.
+    CheckTopicObjects {
+        now: IggyTimestamp,
+    },
+    /// The result of a read that a [`Self::CheckTopicObjects`] pass started,
+    /// sent by the task that ran it.
+    TopicObjectCheckFinished(Box<FinishedTopicObjectCheck>),
+    /// Shard 0 hands the shard the manifests that a listing of the geo peer
+    /// `origin` found for the shadow partitions the shard owns. The shard
+    /// reads each one its partition has not committed, on the partitions
+    /// whose primary this replica is.
+    PeerManifestsListed {
+        origin: String,
+        now: IggyTimestamp,
+        manifests: Vec<ListedPeerManifest>,
+    },
+    /// The result of a read that a [`Self::PeerManifestsListed`] pass
+    /// started, sent by the task that ran it.
+    PeerManifestRead(Box<FinishedPeerManifestRead>),
+    /// Per-shard pass over a shadow partition whose origin retired: every
+    /// replica forgets what it knew of the partition's manifests, and the
+    /// primary commits what the retention of the topic in the peer removes
+    /// from the committed manifest.
+    RetainRetiredPeer {
+        namespace: IggyNamespace,
+        /// The incarnation the retention was read for.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
+    /// Shard 0 asks the shard for the consumer group positions of its geo
+    /// and shadow partitions, for the round `round`, of the topics in
+    /// `scope` by stream and topic id, or of every log. The primaries here
+    /// propose to fold what their groups committed first.
+    ReportGeoPositions {
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    },
+    /// The folds that a [`Self::ReportGeoPositions`] proposed ended: answer
+    /// the round with the partitions' positions now.
+    ReportGeoPositionsFolded {
+        round: u64,
+        scope: Option<Vec<(usize, usize)>>,
+    },
+    /// A shard's answer to [`Self::ReportGeoPositions`], sent to shard 0.
+    GeoPositionsReported(Box<geo_positions::GeoPositionsReport>),
+    /// What the store took of a round's objects, sent to shard 0 by the task
+    /// that stored them.
+    GeoPositionsStored(Box<geo_positions::FinishedPositionsStore>),
+    /// Shard 0 hands the shard the positions that a geo peer publishes for
+    /// the partitions it owns. The primaries here commit those that win.
+    PeerPositionsListed(Box<geo_positions::PeerPositions>),
+    /// A group poll waits for the position of its name to be bound to it:
+    /// fold the groups of the partition of `namespace` now.
+    NoteGeoPositions {
+        namespace: IggyNamespace,
+    },
+    /// A consumer group's own offset store committed on a geo or shadow
+    /// partition here: hold its reply until the node's store holds its
+    /// position. Sent by the task that waited for the commit.
+    GeoCommitHeld(Box<geo_commits::HeldGeoCommit>),
+    /// A shard holds commits of `topics`, by stream and topic id: shard 0
+    /// starts a round of them when it may.
+    GeoCommitsWaiting {
+        topics: Vec<(usize, usize)>,
+    },
+    /// Shard 0 tells a shard whose report to `round` carried held commits
+    /// which logs' objects the store took in that round.
+    GeoPositionsPublished {
+        round: u64,
+        stored: Vec<iggy_object_store::GeoLog>,
+    },
+    /// The result of a merge of long-term segments that the pump's tick
+    /// started, sent by the task that ran it.
+    SegmentMergeFinished(Box<FinishedSegmentMerge>),
+    /// Per-shard pass over a partition that places its batches: every
+    /// replica removes its local segments at or below the trim point of the
+    /// long-term log, and the primary works out what the topic's retention
+    /// removes from that log and commits it as a trim. The timer task
+    /// resolves the same inputs as for `CleanPartition`.
+    RetainLongTerm {
+        namespace: IggyNamespace,
+        /// The incarnation the policy was read for.
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    },
+}
+
+/// What the task merging long-term segments hands back to the pump.
+pub struct FinishedSegmentMerge {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the merge. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the merge.
+    pub id: u64,
+    pub outcome: partitions::MergeOutcome,
+}
+
+/// What the task rewriting a segment hands back to the pump.
+pub struct FinishedSegmentRewrite {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the rewrite. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the rewrite.
+    pub id: u64,
+    pub outcome: partitions::RewriteOutcome,
+}
+
+/// What the task reading a geo topic's object hands back to the pump.
+pub struct FinishedTopicObjectCheck {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the read.
+    pub created_revision: u64,
+    /// The partition's number for the read.
+    pub id: u64,
+    pub outcome: partitions::TopicObjectOutcome<iggy_object_store::TopicRead>,
+}
+
+/// What the task publishing a manifest hands back to the pump.
+pub struct FinishedManifestPublish {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the publish. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the publish.
+    pub id: u64,
+    pub outcome: partitions::ManifestPublishOutcome,
+}
+
+/// What the task running an object-delete job hands back to the pump.
+pub struct FinishedObjectDelete {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the job. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the job.
+    pub id: u64,
+    pub outcome: partitions::ObjectDeleteOutcome,
+}
+
+/// What the task running a segment upload hands back to the pump.
+pub struct FinishedSegmentUpload {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the upload. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The attempt the partition started. A segment is started again after a
+    /// cancelled upload, so the record alone can name a later attempt.
+    pub attempt: partitions::SegmentUploadAttempt,
+    pub record: partitions::segment_chain::SegmentRecord,
+    pub outcome: partitions::UploadOutcome,
 }
 
 /// Reconciler-staged partition mutation.
@@ -1128,7 +1522,8 @@ where
         partition: Box<IggyPartition<B, SB>>,
         epoch: u64,
     },
-    /// Seed a routing row for a partition owned by a peer shard.
+    /// Seed a routing row for a partition owned by a peer shard. The owner
+    /// also rewrites its own row this way when a live partition lost it.
     InsertRouted {
         namespace: IggyNamespace,
         owner: ShardId,
@@ -1142,6 +1537,21 @@ where
     ConfirmRemove { namespace: IggyNamespace },
     /// Drop a routing row (peer's partition gone from committed metadata).
     RemoveRouted { namespace: IggyNamespace },
+}
+
+impl<B, SB> ReconcileOp<B, SB>
+where
+    B: MessageBus,
+{
+    #[must_use]
+    pub const fn namespace(&self) -> IggyNamespace {
+        match self {
+            Self::InsertOwned { namespace, .. }
+            | Self::InsertRouted { namespace, .. }
+            | Self::ConfirmRemove { namespace }
+            | Self::RemoveRouted { namespace } => *namespace,
+        }
+    }
 }
 
 /// Inter-shard channel envelope.
@@ -1219,6 +1629,16 @@ impl ShardFrame {
 /// Runtime default; the server overrides the live ceiling per shard from
 /// `[cluster] repair_chunk_max` at bootstrap.
 pub const REPAIR_CHUNK_MAX: u64 = 128;
+
+/// Prepare bytes one partition `RequestPrepares` round serves.
+///
+/// Bodies that the ring released come back in one detached read per round,
+/// and a shard runs one such read at a time, so this bounds the bytes that
+/// read holds. Bodies that lie back to back in a segment come back in one
+/// read. Resident responses share the bound so receivers can reserve WAL
+/// space. The first body always goes, so a batch above the budget still
+/// makes progress.
+const REPAIR_BYTES_MAX: u64 = 8 * 1024 * 1024;
 
 /// One in-flight metadata journal-repair stream (shard 0 only).
 #[derive(Debug, Clone, Copy)]
@@ -1305,6 +1725,13 @@ const DEFAULT_BUS_MAX_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// protocol has no completion frame) or gave up.
 const STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE: u32 = 10;
 
+/// A parked partition transfer request waits for its plan pin for at most the
+/// repair-retry interval divided by this. A requester re-sends a request that
+/// one whole interval left unanswered, and that re-send burns a stall retry.
+/// The refusal goes out with half the interval to spare for the network and
+/// for the tick skew between the nodes.
+const PARKED_TRANSFER_REQUEST_WAIT_DIVISOR: u32 = 2;
+
 /// Lifetime of a FULLY SERVED offer, as a multiple of the repair-retry
 /// interval. It only has to outlive the receiver re-requesting a lost final
 /// chunk, but the receiver's stall re-request fires at exactly one such
@@ -1312,6 +1739,16 @@ const STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE: u32 = 10;
 /// a network hop -- and losing the race costs a full re-pull (`UnknownOffer`
 /// drops the session with every byte already downloaded).
 const STATE_TRANSFER_SERVED_EXPIRY_MULTIPLE: u32 = 3;
+
+/// A receiver waits for local work, a reuse scan or a prefix read, for at
+/// most the serving offer's idle lifetime divided by this. The wait counts
+/// from the last chunk request. A scan and a read can follow each other with
+/// no request between them, so the bound covers both. The pull sends nothing
+/// while it waits, so the offer ages the whole time. The other half of the
+/// lifetime lets the first request after the wait reach the offer before it
+/// expires. A scan that is asked to stop still finishes the file operation
+/// that it runs.
+const LOCAL_WORK_WAIT_DIVISOR: u32 = 2;
 
 /// One in-flight metadata state transfer (shard 0 only): a cluster-restart
 /// rejoin replacing its snapshot-shaped state (metadata snapshot + client
@@ -1619,6 +2056,16 @@ impl<'a> TransferDescriptor<'a> {
     }
 }
 
+/// A partition `RequestStateTransfer` that waits on the serving side for its
+/// plan pin. The pin lands in an I/O turn after the request arrives. A refusal
+/// costs the requester a whole re-arm interval, because a transient refusal
+/// does not tell it that only the pin is missing.
+struct ParkedTransferRequest {
+    header: RequestStateTransferHeader,
+    /// Ticks since the first arrival of this nonce.
+    waited_ticks: u32,
+}
+
 /// What `on_request_state_chunk` decided inside its offers borrow; the wire
 /// sends run after the borrow drops.
 enum ChunkReply {
@@ -1724,6 +2171,16 @@ where
     /// clock as an idle offer, since a requester that walked away leaves
     /// nothing else to release the slot.
     partition_offer_builds: RefCell<HashMap<u64, u32>>,
+    /// Partition groups refused a served transfer for want of a slot, in the
+    /// order of their first refusal, each with the ticks since its last
+    /// refused request. Free slots go to the front of this queue, and a group
+    /// that stops asking ages out on the clock of an abandoned build.
+    partition_transfer_waiters: RefCell<Vec<(u64, u32)>>,
+    /// Partition transfer requests that wait for their plan pin, keyed like
+    /// `state_transfer_offers`. The tick answers each one. [`BTreeMap`], not
+    /// `HashMap`: the tick answers in key order, so a replay stays
+    /// deterministic.
+    parked_partition_transfer_requests: RefCell<BTreeMap<(u64, u8), ParkedTransferRequest>>,
 
     /// See [`ServedSegmentCache`].
     served_segment_cache: RefCell<ServedSegmentCache>,
@@ -1779,6 +2236,8 @@ where
     /// displace their results. Only the owner pump validates completions.
     poll_completions: poll::completion::PollCompletionLane,
     partition_io: partition_io::PartitionIoLane<SB>,
+    /// Disk reads that answer peers, which the pump serves once they land.
+    served_reads: served_reads::ServedReads,
     cooperative_events: Cell<usize>,
     deferred_polls: poll::deferred::DeferredPolls,
 
@@ -1803,10 +2262,104 @@ where
     /// wires it; pre-wire ticks drop with a metric bump.
     metadata_tick_handler: RefCell<Option<Rc<dyn Fn()>>>,
 
+    /// Late-bound uploader of sealed segments. `None` on a shard without an
+    /// object store, where every upload pass is a no-op. No boot path sets
+    /// it, so uploads run only where a caller of
+    /// [`Self::set_segment_uploader`] supplies one.
+    segment_uploader: RefCell<Option<Rc<dyn partitions::SegmentUploader>>>,
+
+    /// Upload results whose frame the inbox refused. The partition counts
+    /// such an upload as in flight until it sees the result, so the next
+    /// upload pass takes them from here.
+    undelivered_segment_uploads: Rc<RefCell<Vec<FinishedSegmentUpload>>>,
+
+    /// What holds an upload back on this shard: the byte budget every upload
+    /// draws from, and the wait of each partition whose upload failed.
+    upload_pacing: RefCell<upload_pacing::UploadPacing>,
+
+    /// Late-bound deleter of the objects of removed segments. `None` on a
+    /// shard without an object store, where every delete pass is a no-op. No
+    /// boot path sets it, so deletes run only where a caller of
+    /// [`Self::set_object_deleter`] supplies one.
+    object_deleter: RefCell<Option<Rc<dyn partitions::ObjectDeleter>>>,
+
+    /// Results of object-delete jobs whose frame the inbox refused. The
+    /// partition counts such a job as in flight until it sees the result, so
+    /// the next delete pass takes them from here.
+    undelivered_object_deletes: Rc<RefCell<Vec<FinishedObjectDelete>>>,
+
+    /// Late-bound publisher of the manifests of tiered partitions. `None` on
+    /// a shard without an object store, where every manifest pass is a no-op.
+    manifest_publisher: RefCell<Option<Rc<dyn partitions::ManifestPublisher>>>,
+
+    /// Results of manifest publishes whose frame the inbox refused. The
+    /// partition counts such a publish as in flight until it sees the result,
+    /// so the next manifest pass takes them from here.
+    undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
+
+    /// The partitions whose changed manifest waits out
+    /// [`partitions::MANIFEST_STORE_INTERVAL`], by namespace and incarnation.
+    /// The pump's tick stages each one's pass once it passed, whether the
+    /// shard paces the partition or not, and whether it sleeps.
+    manifests_held: RefCell<BTreeSet<(IggyNamespace, u64)>>,
+
+    /// The upload-first produce path of the partitions here that place their
+    /// batches.
+    fresh_writes: fresh_writes::FreshWrites,
+
+    /// The sweep of the fresh objects of this replica, which its first shard
+    /// runs.
+    fresh_sweeps: fresh_sweeps::FreshSweeps,
+
+    /// Late-bound writer of long-term segments. `None` on a shard without an
+    /// object store, where every rewrite pass is a no-op.
+    long_term_writer: RefCell<Option<Rc<dyn partitions::LongTermWriter>>>,
+
+    /// Results of rewrites whose frame the inbox refused. The partition
+    /// counts such a rewrite as in flight until it sees the result, so the
+    /// next rewrite pass takes them from here.
+    undelivered_segment_rewrites: Rc<RefCell<Vec<FinishedSegmentRewrite>>>,
+
+    /// When the next rewrite pass over each placing partition here is due.
+    rewrite_pacing: RefCell<rewrite_pacing::RewritePacing>,
+
+    /// The reads of geo topic objects by the primaries of the partitions
+    /// here.
+    topic_object_checks: topic_object_checks::TopicObjectChecks,
+
+    /// What the primaries of shadow partitions here know of their peers'
+    /// manifests.
+    peer_manifest_follows: peer_manifest_follows::PeerManifestFollows,
+
+    /// What this shard does with the consumer group positions of its geo
+    /// and shadow partitions.
+    geo_positions: geo_positions::ShardGeoPositions,
+    /// The group offset stores whose replies wait for their positions.
+    geo_commits: geo_commits::ShardGeoCommits,
+
+    /// Late-bound stores of the geo peers, empty on a node without peers.
+    /// See [`Self::set_peer_stores`].
+    peer_stores: RefCell<Rc<peers::PeerStores<B>>>,
+    /// The merges of small long-term segments of the placing partitions
+    /// here: the merger, the results the inbox refused, and when the shard
+    /// looks for the next merge.
+    long_term_merges: long_term_merges::ShardMerges,
+
+    /// Request number of the last floor advance. An advance runs under the
+    /// auto-commit client, which the partition does not deduplicate, so the
+    /// number only tells two advances apart in a prepare.
+    floor_advance_requests: Cell<u64>,
+
     /// Reconciler → pump funnel. Borrow discipline: every push / drain
     /// runs without `.await` inside the borrow.
     reconcile_queue: RefCell<VecDeque<ReconcileOp<B, SB>>>,
+    /// Namespaces the reconciler must check again for a local change that no
+    /// metadata commit announces.
+    reconcile_needed: RefCell<BTreeSet<IggyNamespace>>,
     shutting_down: Cell<bool>,
+    /// How long a graceful stop waits for the checkpoints it serves to
+    /// start. Zero serves none.
+    stop_checkpoint_window: Cell<Duration>,
 
     /// Partition-plane frames that arrived before this shard's reconciler
     /// materialised the namespace (post-`CreateTopic` convergence window).
@@ -1885,14 +2438,27 @@ where
     /// Namespace the next partition sweep starts from: the first group the
     /// per-tick WALK budget turned away last pass, `None` to start at the front.
     ///
-    /// The sweep visits namespaces in `BTreeMap` order, so without a carried
+    /// The sweep visits namespaces in ascending order, so without a carried
     /// cursor the leading groups would spend the whole budget on every pass and
     /// the tail would never be reached. See [`rotate_sweep_to_cursor`].
     partition_walk_cursor: Cell<Option<IggyNamespace>>,
-    partition_placement_cursor: Cell<Option<IggyNamespace>>,
-    /// Namespaces still owed a placement report in the current interval.
-    partition_placement_owed: Cell<usize>,
+    /// Slot that the check for missed wake-ups tested last.
+    partition_sleep_check_cursor: Cell<usize>,
+    partition_missed_wakeup_warn: Cell<WarnPace>,
+    primary_handoff: RefCell<primary_rebalance::PrimaryHandoff>,
+    replication_replay_cursor: Cell<Option<(u64, u8)>>,
+    /// Namespaces whose report to shard 0 changed, oldest first, each once:
+    /// [`partitions::SentReport::queued`] marks the queued ones.
+    partition_reports_queued: RefCell<VecDeque<IggyNamespace>>,
+    /// Retractions of removed partitions, sent ahead of the queue above.
+    partition_retractions: RefCell<VecDeque<PartitionStatusEntry>>,
     primary_rebalance: RefCell<primary_rebalance::PrimaryRebalance>,
+    /// Shard 0: reports of the partitions this node leads, for metadata replies.
+    partition_status_outbox: primary_rebalance::PartitionStatusOutbox,
+    /// Shard 0: when stale directory reports were last dropped.
+    partition_directory_retained_at: Cell<Option<Instant>>,
+    /// Shard 0: where the next chunk of the directory sweep starts.
+    partition_directory_retain_cursor: Cell<Option<u64>>,
 
     /// Consecutive metadata superblock write failures tolerated before the
     /// process fail-stops. Defaults to 0 (disabled) so the simulator and tests
@@ -1964,8 +2530,21 @@ where
     /// discriminant (`Command` derives no `Hash`).
     incarnation_mismatch_warns: RefCell<HashMap<u8, WarnPace>>,
 
-    /// Shard ticks so far: the clock of every [`WarnPace`].
-    ticks: Cell<u64>,
+    /// Shard ticks so far: the clock of every [`WarnPace`] and of the
+    /// heartbeat grid.
+    shard_ticks: Cell<u64>,
+    /// Whether the metadata tick counted the current shard tick, so the
+    /// partition tick does not count it again.
+    metadata_ticked: Cell<bool>,
+    /// The shard tick of the last Commit batch, so a debug build stops when a
+    /// shard sends two Commit batches in one tick.
+    last_commit_flush_tick: Cell<Option<u64>>,
+
+    /// Commits owed to each peer node, sent at the end of the shard tick.
+    commit_outbox: commit_batch::CommitOutbox,
+    /// Replies owed to each peer node, sent at the end of the partition tick
+    /// and at the start of the metadata tick.
+    reply_outbox: commit_batch::ReplyOutbox,
 
     /// Decode failures charged against one snapshot generation, as
     /// `(snapshot_seq, failures)`. `None` until a pulled artifact set first
@@ -2067,7 +2646,7 @@ where
     /// # Panics
     ///
     /// Panics if `poll_completion_capacity` is zero.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub fn new(
         identity: ShardIdentity,
         bus: B,
@@ -2117,6 +2696,7 @@ where
             reply_inbox,
             poll_completions,
             partition_io,
+            served_reads: served_reads::ServedReads::default(),
             cooperative_events: Cell::new(0),
             deferred_polls: poll::deferred::DeferredPolls::new(metrics.deferred_polls.clone()),
             shards_table,
@@ -2124,8 +2704,30 @@ where
             coordinator,
             metrics,
             metadata_tick_handler: RefCell::new(None),
+            segment_uploader: RefCell::new(None),
+            undelivered_segment_uploads: Rc::default(),
+            upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
+            object_deleter: RefCell::new(None),
+            undelivered_object_deletes: Rc::default(),
+            manifest_publisher: RefCell::new(None),
+            undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
+            fresh_writes: fresh_writes::FreshWrites::default(),
+            fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
+            rewrite_pacing: RefCell::default(),
+            topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
+            peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
+            geo_positions: geo_positions::ShardGeoPositions::default(),
+            geo_commits: geo_commits::ShardGeoCommits::default(),
+            peer_stores: RefCell::default(),
+            long_term_merges: long_term_merges::ShardMerges::default(),
+            floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
+            stop_checkpoint_window: Cell::new(Duration::ZERO),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
@@ -2137,6 +2739,8 @@ where
             metadata_walk_stuck_op: Cell::new(0),
             state_transfer_offers: RefCell::new(HashMap::new()),
             partition_offer_builds: RefCell::new(HashMap::new()),
+            partition_transfer_waiters: RefCell::new(Vec::new()),
+            parked_partition_transfer_requests: RefCell::new(BTreeMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             register_forwards: RefCell::new(HashMap::new()),
             logout_forwards: RefCell::new(HashMap::new()),
@@ -2149,9 +2753,16 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
-            partition_placement_cursor: Cell::new(None),
-            partition_placement_owed: Cell::new(0),
+            partition_sleep_check_cursor: Cell::new(0),
+            partition_missed_wakeup_warn: Cell::default(),
+            primary_handoff: RefCell::default(),
+            replication_replay_cursor: Cell::new(None),
+            partition_reports_queued: RefCell::default(),
+            partition_retractions: RefCell::default(),
             primary_rebalance: RefCell::default(),
+            partition_status_outbox: primary_rebalance::PartitionStatusOutbox::default(),
+            partition_directory_retained_at: Cell::new(None),
+            partition_directory_retain_cursor: Cell::new(None),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -2159,7 +2770,11 @@ where
             metadata_repair_conflicts: Cell::new(0),
             metadata_repair_conflict_warn: Cell::default(),
             incarnation_mismatch_warns: RefCell::default(),
-            ticks: Cell::new(0),
+            shard_ticks: Cell::new(0),
+            metadata_ticked: Cell::new(false),
+            last_commit_flush_tick: Cell::new(None),
+            commit_outbox: commit_batch::CommitOutbox::default(),
+            reply_outbox: commit_batch::ReplyOutbox::default(),
             metadata_transfer_decode_failures: Cell::new(None),
         })
     }
@@ -2191,6 +2806,13 @@ where
     /// Bound running file jobs in pump ticks. Zero disables the deadline.
     pub fn set_partition_io_timeout(&self, timeout: Duration) {
         self.partition_io.set_timeout(timeout);
+    }
+
+    /// Set how long a graceful stop waits for the checkpoints it serves to
+    /// start. It must leave the rest of the shard drain budget for the
+    /// checkpoints and the drain of the writers.
+    pub fn set_stop_checkpoint_window(&self, window: Duration) {
+        self.stop_checkpoint_window.set(window);
     }
 
     /// Override the serving-side resident payload budget from configuration.
@@ -2438,6 +3060,15 @@ where
         (gathered, received == shard_count)
     }
 
+    /// This node's id and the cluster's node count.
+    #[must_use]
+    pub const fn replica_topology(&self) -> ReplicaTopology {
+        ReplicaTopology::new(
+            self.partition_consensus.self_replica_id,
+            self.partition_consensus.replica_count,
+        )
+    }
+
     /// Run a partition read on the shard owning `namespace` and await the reply.
     ///
     /// Routes a [`LifecycleFrame::PartitionRead`] through the shards table
@@ -2609,7 +3240,7 @@ where
         read: PartitionRead,
     ) -> Result<(u16, Receiver<PartitionReadReply>), IggyError> {
         let target = self.shards_table.shard_for(namespace).or_else(|| {
-            matches!(read, PartitionRead::SessionRetired { .. }).then(|| {
+            matches!(read, PartitionRead::SessionsRetired { .. }).then(|| {
                 crate::shards_table::calculate_shard_assignment(&namespace, self.shard_count)
             })
         });
@@ -2654,7 +3285,12 @@ where
     /// adds its own targets that hold messages, also below `min_count`. An
     /// empty list means that the wait expired without messages. An owner
     /// that gets an `Offset` target starts to push its state here, so that
-    /// the next waits on it stay on this shard.
+    /// the next waits on it stay on this shard. A mirror without those pushes
+    /// can lag its partition, so a wait that ends on other targets asks the
+    /// owners again for the targets that such a mirror found empty, unless a
+    /// push refreshed the mirror during the wait, in which case the wait reads
+    /// the mirror once more and asks the owner only when the mirror still
+    /// holds nothing and its owner stopped pushing.
     ///
     /// # Errors
     /// Returns the first rejection. A target that no shard owns, or an inbox
@@ -2683,6 +3319,7 @@ where
         let mirrors = !wait.is_zero();
         let mut evaluators: BTreeMap<u16, (Vec<ReadinessTarget>, Vec<IggyNamespace>)> =
             BTreeMap::new();
+        let mut snapshots = Vec::new();
         for target in targets {
             let owner = self
                 .shards_table
@@ -2690,10 +3327,18 @@ where
                 .ok_or(IggyError::TransientNotAccepted)?;
             let mirrorable =
                 mirrors && owner != self.id && target.strategy.kind == PollingKind::Offset;
-            let shard = if mirrorable && self.mirror_serves(owner, &target, context.primary, now) {
-                self.id
+            let mirror = if mirrorable {
+                self.mirror_use(owner, &target, context.primary, now)
             } else {
-                owner
+                MirrorUse::Owner
+            };
+            let shard = match mirror {
+                MirrorUse::Owner => owner,
+                MirrorUse::Current => self.id,
+                MirrorUse::Snapshot { pushes } => {
+                    snapshots.push((target.clone(), pushes));
+                    self.id
+                }
             };
             let (targets, watched) = evaluators.entry(shard).or_default();
             if mirrorable && shard == owner {
@@ -2791,6 +3436,44 @@ where
         }
         if let Some(waiter) = parked.waiters.remove(&self.id) {
             ready.extend(self.take_readiness_wait(waiter)?);
+        }
+        // A push during the wait can land after the last evaluation of the
+        // wait, so a mirror that one refreshed is read once more. One that
+        // still holds nothing is trusted only while its owner keeps pushing.
+        let mut stale = Vec::new();
+        for (target, pushes) in snapshots {
+            if ready
+                .iter()
+                .any(|ready| ready.partition_id == target.partition_id)
+            {
+                continue;
+            }
+            let since = self.mirror_since(target.namespace, pushes);
+            if since != MirrorSince::Unchanged
+                && let Some(found) = self.mirror_ready(context.primary, &target)
+            {
+                ready.push(found);
+            } else if since != MirrorSince::Current {
+                stale.push(target);
+            }
+        }
+        if !ready.is_empty() && !stale.is_empty() {
+            let namespaces = stale.iter().map(|target| target.namespace).collect();
+            let budget = std::time::Duration::from_micros(
+                deadline.saturating_sub(self.bus.monotonic_micros()),
+            );
+            // A zero wait asks the owners and never a mirror. An owner that
+            // cannot answer within the wait leaves the answer as it is.
+            let owners = Box::pin(self.wait_for_messages(
+                context,
+                stale,
+                std::time::Duration::ZERO,
+                ANY_MESSAGE,
+            ));
+            if let Some(Ok(owned)) = bus_timeout(&self.bus, budget, owners).await {
+                ready.extend(owned);
+            }
+            self.hold_mirrors(namespaces);
         }
         Ok(ready)
     }
@@ -2953,6 +3636,7 @@ where
     /// # Panics
     /// Panics when the target cannot address the largest supported partition I/O job.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn without_inbox(
         identity: ShardIdentity,
         bus: B,
@@ -3009,13 +3693,36 @@ where
                     .expect("simulator supports the production partition I/O limits"),
                 &metrics,
             ),
+            served_reads: served_reads::ServedReads::default(),
             cooperative_events: Cell::new(0),
             shards_table,
             partition_consensus,
             metrics,
             metadata_tick_handler: RefCell::new(None),
+            segment_uploader: RefCell::new(None),
+            undelivered_segment_uploads: Rc::default(),
+            upload_pacing: RefCell::new(upload_pacing::UploadPacing::new(Instant::now())),
+            object_deleter: RefCell::new(None),
+            undelivered_object_deletes: Rc::default(),
+            manifest_publisher: RefCell::new(None),
+            undelivered_manifest_publishes: Rc::default(),
+            manifests_held: RefCell::default(),
+            fresh_writes: fresh_writes::FreshWrites::default(),
+            fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
+            long_term_writer: RefCell::new(None),
+            undelivered_segment_rewrites: Rc::default(),
+            rewrite_pacing: RefCell::default(),
+            topic_object_checks: topic_object_checks::TopicObjectChecks::default(),
+            peer_manifest_follows: peer_manifest_follows::PeerManifestFollows::default(),
+            geo_positions: geo_positions::ShardGeoPositions::default(),
+            geo_commits: geo_commits::ShardGeoCommits::default(),
+            peer_stores: RefCell::default(),
+            long_term_merges: long_term_merges::ShardMerges::default(),
+            floor_advance_requests: Cell::new(0),
             reconcile_queue: RefCell::new(VecDeque::new()),
+            reconcile_needed: RefCell::new(BTreeSet::new()),
             shutting_down: Cell::new(false),
+            stop_checkpoint_window: Cell::new(Duration::ZERO),
             pending_partition_frames: RefCell::new(BTreeMap::new()),
             parked_partition_bytes: Cell::new(0),
             redispatch_queue: RefCell::new(VecDeque::new()),
@@ -3027,6 +3734,8 @@ where
             metadata_walk_stuck_op: Cell::new(0),
             state_transfer_offers: RefCell::new(HashMap::new()),
             partition_offer_builds: RefCell::new(HashMap::new()),
+            partition_transfer_waiters: RefCell::new(Vec::new()),
+            parked_partition_transfer_requests: RefCell::new(BTreeMap::new()),
             served_segment_cache: RefCell::new(ServedSegmentCache::default()),
             register_forwards: RefCell::new(HashMap::new()),
             logout_forwards: RefCell::new(HashMap::new()),
@@ -3039,9 +3748,16 @@ where
             repair_gap_debounce_ticks: Cell::new(partitions::REPAIR_RETRY_TICKS),
             partition_repairs_inflight: Cell::new(0),
             partition_walk_cursor: Cell::new(None),
-            partition_placement_cursor: Cell::new(None),
-            partition_placement_owed: Cell::new(0),
+            partition_sleep_check_cursor: Cell::new(0),
+            partition_missed_wakeup_warn: Cell::default(),
+            primary_handoff: RefCell::default(),
+            replication_replay_cursor: Cell::new(None),
+            partition_reports_queued: RefCell::default(),
+            partition_retractions: RefCell::default(),
             primary_rebalance: RefCell::default(),
+            partition_status_outbox: primary_rebalance::PartitionStatusOutbox::default(),
+            partition_directory_retained_at: Cell::new(None),
+            partition_directory_retain_cursor: Cell::new(None),
             superblock_wedged_fatal_failures: Cell::new(0),
             bus_max_message_size: Cell::new(DEFAULT_BUS_MAX_MESSAGE_SIZE),
             metadata_transfer_attempts: Cell::new(0),
@@ -3049,7 +3765,11 @@ where
             metadata_repair_conflicts: Cell::new(0),
             metadata_repair_conflict_warn: Cell::default(),
             incarnation_mismatch_warns: RefCell::default(),
-            ticks: Cell::new(0),
+            shard_ticks: Cell::new(0),
+            metadata_ticked: Cell::new(false),
+            last_commit_flush_tick: Cell::new(None),
+            commit_outbox: commit_batch::CommitOutbox::default(),
+            reply_outbox: commit_batch::ReplyOutbox::default(),
             metadata_transfer_decode_failures: Cell::new(None),
         }
     }
@@ -3125,6 +3845,21 @@ where
     pub fn enqueue_reconcile_op(&self, op: ReconcileOp<B, SB>) {
         self.reconcile_queue.borrow_mut().push_back(op);
         self.wake_reconcile_apply();
+    }
+
+    /// The namespaces recorded for the reconciler since the last call: every
+    /// op the pump applied, and every partition install that finished. An op
+    /// staged before a delete and applied after it leaves a ghost that only
+    /// this record names.
+    #[must_use]
+    pub fn take_reconcile_needed(&self) -> BTreeSet<IggyNamespace> {
+        self.reconcile_needed.take()
+    }
+
+    /// Whether `namespace` is recorded and not yet taken.
+    #[must_use]
+    pub fn reconcile_needed_contains(&self, namespace: IggyNamespace) -> bool {
+        self.reconcile_needed.borrow().contains(&namespace)
     }
 
     /// Wake the pump after off-pump work becomes visible. A refused marker is
@@ -3203,6 +3938,87 @@ where
         }
     }
 
+    /// Stage a retention pass for `namespace`, a partition of a tiered topic,
+    /// on this shard's pump. `created_revision` is the incarnation the policy
+    /// belongs to, and `committed_up_to` the truncation watermark metadata
+    /// already holds for it. A refused frame is picked up by the cleaner's
+    /// next tick.
+    pub fn request_retain_partition(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::RetainPartition {
+            namespace,
+            created_revision,
+            now,
+            message_expiry,
+            max_bytes,
+            committed_up_to,
+        }));
+    }
+
+    /// Run a retention pass over `namespace` on the pump: when its partition
+    /// is the incarnation `created_revision` and a tiered primary whose
+    /// retention removes segments past `committed_up_to`, hand the offset to
+    /// shard 0 to commit.
+    pub(crate) fn on_retain_partition(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+        committed_up_to: u64,
+    ) {
+        // The policy and the watermark belong to `created_revision`. Judged
+        // against any other incarnation they would truncate a topic that
+        // never had this policy.
+        let decision = self
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .filter(|partition| partition.created_revision() == created_revision)
+            .and_then(|partition| partition.total_retention_end(now, message_expiry, max_bytes));
+        // The same decision comes back on every tick until the replicas
+        // enforce it, and committing it again would only wake every
+        // reconciler.
+        if let Some(up_to_offset) = decision
+            && up_to_offset > committed_up_to
+        {
+            self.forward_metadata_submit(MetadataSubmit::RetentionTruncate {
+                namespace,
+                created_revision,
+                up_to_offset,
+            });
+        }
+    }
+
+    /// Stage an eviction pass for `namespace` on this shard's pump. A refused
+    /// frame is picked up by the cleaner's next tick.
+    pub fn request_evict_partition(
+        &self,
+        namespace: IggyNamespace,
+        now: IggyTimestamp,
+        envelope: partitions::LocalEnvelope,
+    ) {
+        let Some(sender) = self.senders.get(self.id as usize) else {
+            return;
+        };
+        let _ = sender.try_send(ShardFrame::lifecycle(LifecycleFrame::EvictPartition {
+            namespace,
+            now,
+            envelope,
+        }));
+    }
+
     /// Stage a `TruncatePartition` enforcement for `namespace` on this shard's
     /// pump: delete sealed segments up to `up_to_offset`. The reconciler calls
     /// this after observing a committed delete watermark for an owned partition.
@@ -3239,6 +4055,7 @@ where
         let partitions = self.plane.partitions();
         let mut confirmed_remove = false;
         for op in staged {
+            self.reconcile_needed.borrow_mut().insert(op.namespace());
             match op {
                 ReconcileOp::InsertOwned {
                     namespace,
@@ -3256,9 +4073,9 @@ where
                     // the first: its VSR group + segment writers leak and `len`
                     // inflates.
                     //
-                    // A backstop, not the mechanism. `reconcile_additions`
-                    // skips a namespace whose `InsertOwned` is already staged
-                    // ([`Self::has_staged_insert_owned`]), so a second op for a
+                    // A backstop, not the mechanism. The reconciler's target
+                    // check skips a namespace whose `InsertOwned` is already
+                    // staged ([`Self::has_staged_insert_owned`]), so a second op for a
                     // live namespace should not be built at all. Dropping one
                     // here is damage control rather than a free no-op: the
                     // build already planted its initial segment over the live
@@ -3328,6 +4145,7 @@ where
                     // inline: its compio file handles close through io_uring
                     // without blocking, and no fsync is wanted on data that is
                     // already gone.
+                    self.retract_removed_partition(namespace);
                     let removed = partitions.remove(&namespace);
                     partitions.untombstone(&namespace);
                     // A topic created then deleted before its `InsertOwned`
@@ -3523,7 +4341,7 @@ where
     (partition.repair_rotations().saturating_add(1) >= other_replicas
         && consensus.is_normal_backup()
         && consensus.commit_min() < consensus.commit_max()
-        && partition.transfer.is_none()
+        && partition.transfer().is_none()
         && partition.transfer_rearm.is_none())
     .then(|| {
         consensus
@@ -3606,9 +4424,11 @@ enum ParkOutcome<H> {
 /// incarnation - and never the frame's provenance.
 struct ParkedFrame {
     epoch: Option<u64>,
-    /// Reconciler passes survived. `reconcile_parked_frames` increments it and
-    /// answers CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the
-    /// simulator's virtual clock controls.
+    /// Reconciler passes survived, counting only a pass that ends a round over
+    /// the work set. `reconcile_parked_frames` increments it and answers
+    /// CLIENT REQUESTS past [`MAX_PARKED_PASSES`], in units the simulator's
+    /// virtual clock controls. A pass that stops at its build cap does not
+    /// count, because the builds it leaves are queued for the next pass.
     ///
     /// Never expires a replicated prepare: no client can retry it, and forcing
     /// the same-view repair backstop to recover a gap is worse than retaining
@@ -3754,11 +4574,13 @@ const fn superblock_wedged(failures: u64, fatal_after: u64) -> bool {
     fatal_after != 0 && failures >= fatal_after
 }
 
-/// Reconciler passes a frame may survive before it is answered rather than held.
+/// Reconciler passes that end a round over the work set, which a frame may
+/// survive before it is answered rather than held.
 ///
 /// Passes, not seconds, and deliberately not described in seconds: a pass fires
-/// on the periodic interval OR on a commit-tick wake, so the wall-clock window
-/// this maps to spans orders of magnitude. `reconcile_periodic_interval` legally
+/// on the periodic interval OR on a commit-tick wake, and a large work set
+/// spreads one round over many passes, so the wall-clock window this maps to
+/// spans orders of magnitude. `reconcile_periodic_interval` legally
 /// reaches 30s, which would put four passes at 120s -- four times the SDK's
 /// response read-timeout, so the client times out first and the bound stops
 /// being the thing that answers it. Commit-tick wakes collapse it the other way,
@@ -3933,9 +4755,18 @@ where
         T: ShardsTable,
     {
         self.fence_rebalance_authority(&message);
+        if !self.partition_frame_source_is_member(&message) {
+            return;
+        }
         match message {
             MessageBag::PrimaryRebalance(message) => {
-                self.on_primary_rebalance(*message.header()).await;
+                let Some(statuses) =
+                    control_suffix_body_verified(&message, message.header().checksum_body)
+                        .and_then(|body| decode_status_entries(body).ok())
+                else {
+                    return;
+                };
+                self.on_primary_rebalance(*message.header(), statuses).await;
             }
             MessageBag::Request(request) => {
                 // One header read for the pair; `header()` casts on every call.
@@ -4018,6 +4849,15 @@ where
                                 && partition.consensus().is_follower()
                                 && !partition.consensus().is_transferring()
                             {
+                                // A retransmit can fill the op that the view-log
+                                // proof waits on. Nothing else runs that proof
+                                // again before journal repair reaches the
+                                // partition.
+                                if partition.consensus().view_log_repair_op() == Some(routing.2)
+                                    && partition.log.journal().inner.holds_op(routing.2)
+                                {
+                                    prove_partition_view_log_again(self.id, partition).await;
+                                }
                                 partition.commit_journal(config).await;
                             }
                         }
@@ -4048,6 +4888,8 @@ where
             MessageBag::DoViewChange(msg) => self.on_do_view_change(msg).await,
             MessageBag::StartView(msg) => self.on_start_view(msg).await,
             MessageBag::Commit(ref msg) => self.on_commit(msg).await,
+            MessageBag::CommitReply(ref msg) => self.on_commit_reply(msg),
+            MessageBag::PrepareProgress(ref msg) => self.on_prepare_progress(msg).await,
             MessageBag::RequestStartView(ref msg) => self.on_request_start_view(msg).await,
             MessageBag::RequestPrepares(ref msg) => self.on_request_prepares(msg).await,
             MessageBag::RepairPrepare(msg) => self.on_repair_prepare(msg).await,
@@ -4328,17 +5170,6 @@ where
         false
     }
 
-    /// Whether any frame is parked. Cheap enough for the reconciler's per-tick
-    /// fast-skip guard: a non-empty buffer means the shard is by definition not
-    /// converged, so the skip must not fire.
-    ///
-    /// Read from the map, not the byte cell: an empty entry is never left
-    /// behind, but keying convergence off bytes makes that a silent invariant.
-    #[must_use]
-    pub fn has_parked_partition_frames(&self) -> bool {
-        !self.pending_partition_frames.borrow().is_empty()
-    }
-
     /// Namespaces currently holding parked frames. The reconciler pairs this
     /// against committed metadata to find the ones that will never materialise,
     /// which no `ConfirmRemove` / `RemoveRouted` can reach: a namespace that was
@@ -4415,15 +5246,17 @@ where
         staged
     }
 
-    /// Age every frame under `namespace` by one pass, answering CLIENT REQUESTS
-    /// past `MAX_PARKED_PASSES`. Returns the number answered.
+    /// Age every frame under `namespace` by one pass that ended a round over
+    /// the work set, answering CLIENT REQUESTS past `MAX_PARKED_PASSES`.
+    /// Returns the number answered.
     ///
     /// Prepares age but never expire. Expiry would manufacture a gap that a
     /// later commit heartbeat must repair (see `ParkedFrame::passes`), and
-    /// passes are commit-driven: a non-empty buffer defeats the reconciler
-    /// fast-skip, so a create burst elapses four in milliseconds across every
-    /// parked namespace rather than the one it concerns. Byte budgets bound
-    /// them instead. Only [`Self::discard_parked_partition_frames`] still
+    /// passes are commit-driven and every pass that ends a round ages every
+    /// parked namespace. On a small work set each pass ends a round, so a
+    /// create burst elapses four in milliseconds across every parked
+    /// namespace rather than the one it concerns. Byte budgets bound them
+    /// instead. Only [`Self::discard_parked_partition_frames`] still
     /// destroys a prepare.
     ///
     /// Passes, not wall-clock, so the simulator's virtual clock governs it.
@@ -4634,7 +5467,7 @@ where
         let parked_bytes = self.parked_partition_bytes.get();
         // Read the entry without `entry().or_default()`: inserting first would
         // leave an empty entry behind on the overflow path below, which reads as
-        // a parked namespace to the reconciler sweep and its fast-skip guard.
+        // a parked namespace to the reconciler sweep.
         let existing = pending.get_mut(&namespace);
         let parked_len = existing.as_ref().map_or(0, |entry| entry.frames.len());
         let namespace_bytes = existing.as_ref().map_or(0, |entry| entry.bytes);
@@ -4932,6 +5765,15 @@ where
                     Self::answer_partition_submit_deny(request.header(), Some(reply), &error);
                     return;
                 }
+                if self.places_send(request.header()) {
+                    let upload_interval = self
+                        .geo_durations(IggyNamespace::from_raw(request.header().group))
+                        .fresh_upload_interval
+                        .map(|interval| interval.get_duration());
+                    self.offer_fresh_send(request, reply, upload_interval);
+                    return;
+                }
+                let hold = self.geo_commit_hold(&request);
                 let (sender, receiver) = consensus::oneshot_channel();
                 self.plane
                     .partitions()
@@ -4945,8 +5787,12 @@ where
                 // Through the bus, not the runtime directly: the simulator
                 // supplies its own executor and virtual clock.
                 self.bus.spawn(async move {
-                    let committed = receiver.await.ok().map(Message::into_generic);
-                    let _ = reply.try_send(committed);
+                    match (receiver.await.ok(), hold) {
+                        (Some(committed), Some(hold)) => hold.keep(committed, reply),
+                        (committed, _) => {
+                            let _ = reply.try_send(committed.map(Message::into_generic));
+                        }
+                    }
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
@@ -5116,6 +5962,45 @@ where
                 .is_some_and(VsrConsensus::has_loopback)
     }
 
+    /// The runtime options that `init_partition` gives the partition of
+    /// `namespace`: those of its topic, or the defaults without one.
+    #[cfg(feature = "simulator")]
+    #[must_use]
+    pub fn topic_runtime_options(
+        &self,
+        namespace: IggyNamespace,
+    ) -> iggy_common::TopicRuntimeOptions
+    where
+        M: metadata::impls::metadata::StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map_or_default(|topic| {
+                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
+                })
+        })
+    }
+
+    /// The durations that the topic of `namespace` sets for itself. All are
+    /// `None` for a normal topic, a shadow topic and a topic that is gone, so
+    /// the shard applies its own settings there.
+    #[must_use]
+    pub fn geo_durations(&self, namespace: IggyNamespace) -> iggy_common::GeoTopicDurations
+    where
+        M: StreamsFrontend,
+    {
+        self.plane.metadata().mux_stm.streams().read(|inner| {
+            inner
+                .items
+                .get(namespace.stream_id())
+                .and_then(|stream| stream.topics.get(namespace.topic_id()))
+                .map_or_default(|topic| topic.resolved.geo_durations)
+        })
+    }
+
     /// Simulator-only: mutates `IggyPartitions` off the pump task, bypassing the
     /// reconciler's `ReconcileOp::InsertOwned` funnel (production's runtime path;
     /// bootstrap recovery uses `load_partition`). VSR replica id comes from
@@ -5154,6 +6039,10 @@ where
     // The feature forwards to `partitions/simulator` instead.
     /// The WAL runs on the simulator's filesystem model. The retained log and
     /// receipts stand in for segment and receipt files, which it does not model.
+    ///
+    /// # Panics
+    /// When the built-in state machines fail to register on the partition it
+    /// just built, which only a duplicate registration could cause.
     #[cfg(feature = "simulator")]
     pub fn init_partition(
         &self,
@@ -5173,16 +6062,20 @@ where
             created_view,
             first_initialization,
             consumer_offsets_max,
+            members,
+            created_op,
         } = materialisation;
         let partitions = self.plane.partitions();
         if partitions.contains(&namespace) {
             return;
         }
 
-        let mut consensus = VsrConsensus::with_clock(
+        let members =
+            members.unwrap_or_else(|| ReplicaSet::all(self.partition_consensus.replica_count));
+        let mut consensus = VsrConsensus::with_members(
             self.partition_consensus.cluster_id,
             self.partition_consensus.self_replica_id,
-            self.partition_consensus.replica_count,
+            members,
             namespace.inner(),
             self.partition_consensus.bus.clone(),
             LocalPipeline::new(),
@@ -5193,8 +6086,7 @@ where
         // Recovered metadata can precede the group's first materialization;
         // missing retained history alone cannot distinguish that from data loss.
         consensus.set_recovery_election_allowed(first_initialization || retained.is_some());
-        let restarted = (retained.is_some() || !first_initialization)
-            && self.partition_consensus.replica_count > 1;
+        let restarted = (retained.is_some() || !first_initialization) && members.len() > 1;
         let consensus::FreshGroupStart {
             join,
             view_fallback,
@@ -5223,18 +6115,11 @@ where
             consensus,
             partitions.config().segment_size,
         );
+        partition
+            .register_builtin_state_machines()
+            .expect("a fresh partition registers its built-in state machines");
         partition.set_created_revision(epoch);
-        let runtime_options = self.plane.metadata().mux_stm.streams().read(|inner| {
-            inner
-                .items
-                .get(namespace.stream_id())
-                .and_then(|stream| stream.topics.get(namespace.topic_id()))
-                .map(|topic| {
-                    iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options)
-                })
-                .unwrap_or_default()
-        });
-        partition.set_runtime_options(runtime_options);
+        partition.set_runtime_options(self.topic_runtime_options(namespace));
         partition.set_consumer_offsets_max(consumer_offsets_max);
         if let Some(superblock) = superblock {
             partition.set_superblock(superblock, recovered_state);
@@ -5266,9 +6151,11 @@ where
         // Match production's solo reservation handling. A replicated WAL may
         // retain a suffix the next view discards; anchoring at its dirty offset
         // would prevent truncation from restoring the earlier append point.
-        if self.partition_consensus.replica_count == 1 && !partition.durability().is_persisted() {
+        if members.len() == 1 && !partition.durability().is_persisted() {
             partition.reanchor_in_memory_to_mint_frontier(partitions.config().segment_size);
         }
+        // After the retained log, whose frontier the adoption assigns.
+        partition.start_at_create_op(created_op);
         partitions.insert(namespace, partition);
         if self.redispatch_parked_frames(namespace, epoch) {
             // This mutation occurs outside the pump, unlike production's
@@ -5295,7 +6182,7 @@ where
             .borrow_mut()
             .entry(frame as u8)
             .or_default()
-            .admit(self.ticks.get())
+            .admit(self.ticks())
         {
             tracing::warn!(
                 shard = self.id,
@@ -5392,6 +6279,7 @@ where
         ) else {
             return;
         };
+        self.note_group_given_up(partition.consensus(), &header);
         if header.view == partition.consensus().view() && partition.consensus().is_normal() {
             return;
         }
@@ -5690,7 +6578,7 @@ where
             // Any stream armed before this adoption belongs to the superseded
             // view. Repair bodies carry no nonce, so drop the receiving session
             // before reconciling or arming the new view's canonical range.
-            partition.repair = None;
+            partition.set_repair(None);
             // Ahead of the local dispatch, which rebuilds the pipeline out of the
             // journal this rewrites. Same position as the metadata arm's twin, and
             // like it, pending-less adoptions (empty StartView suffix) still sweep
@@ -5746,13 +6634,6 @@ where
         B: MessageBus + 'static,
         T: ShardsTable,
     {
-        // Count before borrowing one owner mutably: the scan visits every owner.
-        let transfers_inflight =
-            if Self::may_arm_partition_transfer(self.plane.partitions(), namespace.inner()) {
-                self.partition_transfers_inflight()
-            } else {
-                0
-            };
         // A rejected StartView must not replace an existing transfer session.
         let adopted = !actions.is_empty();
         let partitions = self.plane.partitions();
@@ -5774,10 +6655,8 @@ where
                 peer,
                 "adopted a live view while awaiting transfer; requesting partition state transfer"
             );
-            if self.peer_is_known(peer, "StartView") {
-                let _ = self
-                    .arm_partition_transfer(partition, peer, transfers_inflight)
-                    .await;
+            if self.member_is_known(partition.consensus().replica_count(), peer, "StartView") {
+                self.arm_partition_transfer(partition, peer).await;
             }
             return;
         }
@@ -5794,6 +6673,8 @@ where
         partition.notify_io();
     }
 
+    /// Handle each entry of a Commit batch alone. A bad entry does not stop
+    /// the other entries.
     #[allow(clippy::future_not_send)]
     async fn on_commit(&self, msg: &Message<CommitHeader>)
     where
@@ -5804,7 +6685,27 @@ where
         M: MetadataStm,
         T: ShardsTable,
     {
-        let header = *msg.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitEntry>(msg, msg.header().checksum_body)
+        else {
+            return;
+        };
+        for entry in &entries {
+            self.on_commit_entry(entry).await;
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn on_commit_entry(&self, header: &CommitEntry)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: MetadataStm,
+        T: ShardsTable,
+    {
+        let header = *header;
         let planes = self.plane.inner();
 
         if let Some(ref consensus) = planes.0.consensus
@@ -5813,7 +6714,11 @@ where
             // Ahead of `handle_commit`, which drops a lower-view heartbeat from
             // the real primary once this replica's view climbed alone.
             consensus.observe_primary(header.view, header.replica);
-            match consensus.handle_commit(&header) {
+            let outcome = consensus.handle_commit(&header);
+            if outcome.reply(&header).is_some() {
+                commit_batch::queue_commit_reply(&self.reply_outbox, consensus, &header);
+            }
+            match outcome {
                 CommitOutcome::Advanced => {
                     // Mid-transfer the pre-install STM must not walk: the
                     // snapshot being installed already contains those ops.
@@ -5851,7 +6756,7 @@ where
                         respond_start_view::<B, _, MJ>(consensus).await;
                     }
                 }
-                CommitOutcome::Accepted => {}
+                CommitOutcome::Accepted | CommitOutcome::Ignored => {}
             }
             return;
         }
@@ -5868,11 +6773,18 @@ where
             return;
         };
         let consensus = partition.consensus();
+        if !self.member_is_known(consensus.replica_count(), header.replica, "Commit entry") {
+            return;
+        }
         // Ahead of `handle_commit`: a replica whose view climbed through
         // elections nobody joined drops the real primary's lower-view
         // heartbeats there, and they are how it learns whom to repair from.
         consensus.observe_primary(header.view, header.replica);
-        match consensus.handle_commit(&header) {
+        let outcome = consensus.handle_commit(&header);
+        if outcome.reply(&header).is_some() {
+            commit_batch::queue_commit_reply(&self.reply_outbox, consensus, &header);
+        }
+        match outcome {
             CommitOutcome::Advanced => {
                 if !partition.consensus().is_transferring() {
                     partition.commit_journal(config).await;
@@ -5899,7 +6811,127 @@ where
                     respond_start_view::<B, _, MJ>(consensus).await;
                 }
             }
-            CommitOutcome::Accepted => {}
+            CommitOutcome::Accepted | CommitOutcome::Ignored => {}
+        }
+    }
+
+    /// Count each valid entry of a reply batch. An invalid entry does not stop
+    /// the other entries.
+    fn on_commit_reply(&self, msg: &Message<CommitReplyHeader>) {
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitReplyEntry>(msg, msg.header().checksum_body)
+        else {
+            return;
+        };
+        let planes = self.plane.inner();
+        for entry in &entries {
+            if let Some(consensus) = &planes.0.consensus
+                && consensus.group() == entry.group
+            {
+                consensus.handle_commit_reply(entry);
+            } else if let Some(partition) = self.resolve_partition_target(
+                &planes.1.0,
+                entry.group,
+                entry.partition_incarnation,
+                entry.view,
+                entry.replica,
+                Command::CommitReply,
+            ) && self.member_is_known(
+                partition.consensus().replica_count(),
+                entry.replica,
+                "CommitReply entry",
+            ) {
+                partition.consensus().handle_commit_reply(entry);
+            }
+        }
+    }
+
+    /// Send each peer node every Commit queued for it, in as few frames as
+    /// `[message_bus] max_message_size` allows: the receiving transport closes
+    /// the replica link on a larger frame. Each group then records whether its
+    /// send reached a connected link.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn flush_commit_outbox(&self)
+    where
+        B: MessageBus,
+    {
+        let Some(batches) = self.commit_outbox.take() else {
+            return;
+        };
+        let tick = self.shard_ticks.get();
+        debug_assert_ne!(
+            self.last_commit_flush_tick.replace(Some(tick)),
+            Some(tick),
+            "shard {} sent two Commit batches in shard tick {tick}",
+            self.id
+        );
+        let frame_entries =
+            commit_batch::entries_per_frame::<CommitEntry>(self.bus_max_message_size.get());
+        for (peer, queued) in batches.peers {
+            for frame in queued.chunks(frame_entries) {
+                let entries: Vec<CommitEntry> = frame.iter().map(|queued| queued.entry).collect();
+                let Some(message) =
+                    commit_batch::encode_commit_batch(batches.cluster, batches.sender, &entries)
+                else {
+                    continue;
+                };
+                let sent = self
+                    .bus
+                    .send_to_replica(peer, message.into_generic().into_frozen())
+                    .await;
+                if sent.is_ok() {
+                    self.metrics.record_commit_batch_sent(entries.len());
+                }
+                let planes = self.plane.inner();
+                for queued in frame {
+                    let group = queued.entry.group;
+                    if let Some(consensus) = &planes.0.consensus
+                        && consensus.group() == group
+                    {
+                        consensus.record_member_send(queued.member, &sent);
+                    } else if let Some(partition) =
+                        planes.1.0.get_by_ns(&IggyNamespace::from_raw(group))
+                    {
+                        partition
+                            .consensus()
+                            .record_member_send(queued.member, &sent);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send each peer node its queued replies, in as few frames as
+    /// `[message_bus] max_message_size` allows. A frame that fails to send is
+    /// dropped: the next Commit from the primary brings a new reply.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn flush_reply_outbox(&self)
+    where
+        B: MessageBus,
+    {
+        let Some(batches) = self.reply_outbox.take() else {
+            return;
+        };
+        let frame_entries =
+            commit_batch::entries_per_frame::<CommitReplyEntry>(self.bus_max_message_size.get());
+        for (peer, entries) in batches.peers {
+            for frame in entries.chunks(frame_entries) {
+                let Some(message) =
+                    commit_batch::encode_commit_reply_batch(batches.cluster, batches.sender, frame)
+                else {
+                    continue;
+                };
+                match self
+                    .bus
+                    .send_to_replica(peer, message.into_generic().into_frozen())
+                    .await
+                {
+                    Ok(()) => self.metrics.record_commit_reply_batch_sent(frame.len()),
+                    Err(error) => {
+                        tracing::debug!(shard = self.id, peer, "reply batch dropped: {error}");
+                    }
+                }
+            }
         }
     }
 
@@ -5967,44 +6999,338 @@ where
         dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions).await;
     }
 
-    /// Serve a repair range from this replica's journal: stream
-    /// `RepairPrepare` frames (stored prepares verbatim, command byte
-    /// rewritten) in op order, prefixed by `RangeEvicted` when the front of
-    /// the range is no longer retained, terminated by `RepairDone`.
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
+    async fn on_prepare_progress(&self, msg: &Message<PrepareProgressHeader>)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        let header = *msg.header();
+        let planes = self.plane.inner();
+        let (consensus, progress) = if let Some(consensus) = &planes.0.consensus
+            && consensus.group() == header.group
+        {
+            if header.kind == PrepareProgressHeader::REPLY {
+                let _ = consensus.handle_prepare_progress(&header);
+                return;
+            }
+            let ready = consensus.is_normal()
+                && !consensus.is_transferring()
+                && !consensus.has_untrusted_log()
+                && consensus.history_certified();
+            let mut received = consensus.commit_min();
+            if ready && let Some(journal) = &planes.0.journal {
+                let journal = journal.handle();
+                while received < consensus.sequencer().current_sequence() {
+                    let next = received + 1;
+                    let Ok(index) = usize::try_from(next) else {
+                        break;
+                    };
+                    if !consensus.view_log_entry_proven(next) || journal.header(index).is_none() {
+                        break;
+                    }
+                    received = next;
+                }
+            }
+            // The metadata walk has no durability test, so one value is both prefixes.
+            let prefix = BackupPrefix {
+                held_op: received,
+                received_op: received,
+            };
+            (consensus, ready.then_some(prefix))
+        } else {
+            let Some(partition) = planes.1.0.get_by_ns(&IggyNamespace::from_raw(header.group))
+            else {
+                return;
+            };
+            let consensus = partition.consensus();
+            if header.kind == PrepareProgressHeader::REPLY {
+                if let Some(progress) = consensus.handle_prepare_progress(&header) {
+                    partition.advance_transfer_tail(header.replica, progress, self.ticks());
+                }
+                return;
+            }
+            (consensus, partition.replication_progress())
+        };
+        if header.kind != PrepareProgressHeader::PROBE
+            || header.nonce == 0
+            || header.cluster != consensus.cluster()
+            || header.view != consensus.view()
+            || header.partition_incarnation != consensus.partition_incarnation()
+            || header.replica != consensus.primary_index(consensus.view())
+            || header.replica == consensus.replica()
+        {
+            return;
+        }
+        if consensus.is_normal() && !consensus.is_transferring() {
+            consensus.advance_commit_max(header.commit_op);
+        }
+        let reply = Message::<PrepareProgressHeader>::new(size_of::<PrepareProgressHeader>())
+            .transmute_header(|_, reply: &mut PrepareProgressHeader| {
+                *reply = header;
+                reply.replica = consensus.replica();
+                reply.kind = PrepareProgressHeader::REPLY;
+                reply.ready = u8::from(progress.is_some());
+                let prefix = progress.unwrap_or_default();
+                reply.held_op = prefix.held_op;
+                reply.received_op = prefix.received_op;
+                reply.seal();
+            });
+        let _ = consensus
+            .send_to_member(header.replica, reply.into_generic().into_frozen())
+            .await;
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn drive_replication(&self, namespaces: &[IggyNamespace])
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        let metadata_group = self
+            .plane
+            .metadata()
+            .consensus
+            .as_ref()
+            .map(VsrConsensus::group);
+        let groups = metadata_group
+            .into_iter()
+            .chain(namespaces.iter().map(IggyNamespace::inner));
+        let cursor = self.replication_replay_cursor.get();
+        // Prefer keys after the cursor even when the commit-walk order rotates.
+        let rank = |key| (cursor.is_some_and(|last| key <= last), key);
+        let mut replay: Option<(u64, u8, u64)> = None;
+        let mut stats = ReplicationStats::default();
+        for group in groups {
+            let Some(consensus) = self.replication_consensus(group) else {
+                continue;
+            };
+            let taken = consensus.take_replication_stats();
+            stats.live_refusals += taken.live_refusals;
+            stats.replayed += taken.replayed;
+            for replica in 0..consensus.replica_count() {
+                if replica == consensus.replica() {
+                    continue;
+                }
+                match consensus.replication_work(replica) {
+                    Some(consensus::ReplicationWork::Probe { nonce, through, .. }) => {
+                        consensus
+                            .send_replication_probe(replica, nonce, through)
+                            .await;
+                    }
+                    Some(consensus::ReplicationWork::Replay { from_op, .. })
+                        if !self.served_reads.reading(ServedReadKey::Prepares {
+                            group,
+                            target: replica,
+                            live: true,
+                        }) && replay.is_none_or(|(selected_group, selected_peer, _)| {
+                            rank((group, replica)) < rank((selected_group, selected_peer))
+                        }) =>
+                    {
+                        replay = Some((group, replica, from_op));
+                    }
+                    Some(consensus::ReplicationWork::Replay { .. }) | None => {}
+                }
+            }
+        }
+        self.metrics.record_replication(stats);
+        // One bounded range per tick keeps replay I/O independent of group count.
+        let Some((group, replica, from_op)) = replay else {
+            return;
+        };
+        self.replication_replay_cursor.set(Some((group, replica)));
+        let request = {
+            let Some(consensus) = self.replication_consensus(group) else {
+                return;
+            };
+            Message::<RequestPreparesHeader>::new(size_of::<RequestPreparesHeader>())
+                .transmute_header(|_, header: &mut RequestPreparesHeader| {
+                    header.command = Command::RequestPrepares;
+                    header.size = u32::try_from(size_of::<RequestPreparesHeader>())
+                        .expect("header size fits u32");
+                    header.replica = replica;
+                    header.group = group;
+                    header.partition_incarnation = consensus.partition_incarnation();
+                    header.from_op = from_op;
+                    header.to_op = consensus.sequencer().current_sequence();
+                })
+        };
+        let served = self.serve_prepares(&request, true, None).await;
+        self.defer_unserved_replay(group, replica, from_op, served);
+    }
+
+    /// A replay that served nothing waits before the next one, so a body or a
+    /// peer that is not there is not asked for on every tick.
+    fn defer_unserved_replay(&self, group: u64, replica: u8, from_op: u64, served: Option<u64>)
+    where
+        B: MessageBus,
+    {
+        if served.is_some_and(|served| served < from_op)
+            && let Some(consensus) = self.replication_consensus(group)
+        {
+            consensus.defer_replication(replica);
+        }
+    }
+
+    /// Serve the oldest request whose disk read landed, against the state of
+    /// now, as the pump serves any request.
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn serve_landed_read(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        match self.served_reads.take_landed() {
+            Some(LandedRead::Prepares {
+                request,
+                live,
+                mut bodies,
+            }) => {
+                let served = self.serve_prepares(&request, live, Some(&mut bodies)).await;
+                if live {
+                    let header = request.header();
+                    self.defer_unserved_replay(
+                        header.group,
+                        header.replica,
+                        header.from_op,
+                        served,
+                    );
+                }
+            }
+            Some(LandedRead::Chunk {
+                header,
+                artifact,
+                load,
+            }) => {
+                self.serve_partition_chunk(header, Some((artifact, load)))
+                    .await;
+            }
+            None => {}
+        }
+    }
+
+    /// Serve landed reads, as the pump does, until no read runs or waits.
+    #[cfg(test)]
+    #[allow(clippy::future_not_send)]
+    pub(crate) async fn settle_served_reads(&self)
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
+        while !self.served_reads.is_empty() {
+            self.served_reads.landed().await;
+            self.serve_landed_read().await;
+        }
+    }
+
+    fn replication_consensus(&self, group: u64) -> Option<&VsrConsensus<B>>
+    where
+        B: MessageBus,
+    {
+        let planes = self.plane.inner();
+        if let Some(consensus) = &planes.0.consensus
+            && consensus.group() == group
+        {
+            return Some(consensus);
+        }
+        let partition = planes.1.0.get_by_ns(&IggyNamespace::from_raw(group))?;
+        (!partition.read_history_is_changing()).then(|| partition.consensus())
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn send_range_prepare(
+        &self,
+        consensus: &VsrConsensus<B>,
+        target: u8,
+        op: u64,
+        entry: Frozen<MESSAGE_ALIGN>,
+        live: bool,
+    ) -> bool
+    where
+        B: MessageBus,
+    {
+        if !live {
+            let Some(node) = consensus.members().node(target) else {
+                return false;
+            };
+            return self.send_repair_prepare(node, entry).await;
+        }
+        send_replayed_prepare(consensus, target, op, entry, ReplicationSend::Replay).await
+    }
+
+    #[allow(clippy::future_not_send)]
     async fn on_request_prepares(&self, msg: &Message<RequestPreparesHeader>)
     where
         B: MessageBus,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
-        M: StreamsFrontend,
+    {
+        self.serve_prepares(msg, false, None).await;
+    }
+
+    /// Serve a repair range from this replica's journal: stream
+    /// `RepairPrepare` frames (stored prepares verbatim, command byte
+    /// rewritten) in op order, prefixed by `RangeEvicted` when the front of
+    /// the range is no longer retained, terminated by `RepairDone`.
+    ///
+    /// Returns the last op served. A partition range that needs bodies the
+    /// ring released sends nothing and returns `None`: a detached read brings
+    /// the bodies back, and the pump serves the request again with them in
+    /// `landed`.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn serve_prepares(
+        &self,
+        msg: &Message<RequestPreparesHeader>,
+        live: bool,
+        mut landed: Option<&mut partitions::ReleasedBodies>,
+    ) -> Option<u64>
+    where
+        B: MessageBus,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
         let header = *msg.header();
         let target = header.replica;
-        // Snapshot the config-overridable chunk ceiling once; both plane
-        // branches below serve the same per-round window.
+        // Pull repair keeps its configured operation limit. Live partition
+        // replay uses the byte bound so small prepares can fill each turn.
         let repair_chunk_max = self.repair_chunk_max.get();
         let planes = self.plane.inner();
         if let Some(ref consensus) = planes.0.consensus
             && consensus.group() == header.group
         {
+            let Some(node) = consensus.members().node(target) else {
+                return Some(header.from_op.saturating_sub(1));
+            };
             // A primary-elect can need bodies held only by ViewChange peers.
             // Other requesters may receive only those peers' committed prefix.
             if consensus.is_transferring() {
                 // Transfer can replace these entries.
-                return;
+                return Some(header.from_op.saturating_sub(1));
             }
             if !matches!(consensus.status(), Status::Normal | Status::ViewChange) {
-                return;
+                return Some(header.from_op.saturating_sub(1));
             }
             let Some(journal) = planes.0.journal.as_ref() else {
-                return;
+                return Some(header.from_op.saturating_sub(1));
             };
             let journal = journal.handle();
             let cluster = consensus.cluster();
             let self_id = consensus.replica();
-            let to_op = repair_serve_ceiling(&header, consensus);
+            let to_op = if live {
+                header.to_op.min(consensus.sequencer().current_sequence())
+            } else {
+                repair_serve_ceiling(&header, consensus)
+            };
             // Skip the compacted prefix (below the snapshot floor) in one
             // RangeEvicted notice, then serve contiguously until the range
             // ends or the WAL runs out.
@@ -6016,13 +7342,16 @@ where
             // servable anyway. The partition arm jumps to `retained_from` likewise.
             let mut from_op = header.from_op.max(journal.snapshot_op() + 1);
             if !consensus.view_log_entry_proven(from_op) {
-                return;
+                return Some(header.from_op.saturating_sub(1));
             }
             #[allow(clippy::cast_possible_truncation)]
             while from_op <= to_op && journal.header(from_op as usize).is_none() {
                 from_op += 1;
             }
             if from_op > to_op {
+                if live {
+                    return Some(header.from_op.saturating_sub(1));
+                }
                 // Nothing in the requested range is retained. Answer the
                 // eviction honestly: a bare `RepairDone(to_op)` here would
                 // claim full coverage while serving zero prepares, and the
@@ -6030,7 +7359,7 @@ where
                 self.send_repair_range_reply(
                     cluster,
                     self_id,
-                    target,
+                    node,
                     Command::RangeEvicted,
                     header.nonce,
                     from_op,
@@ -6041,7 +7370,7 @@ where
                 self.send_repair_range_reply(
                     cluster,
                     self_id,
-                    target,
+                    node,
                     Command::RepairDone,
                     header.nonce,
                     header.from_op.saturating_sub(1),
@@ -6049,13 +7378,16 @@ where
                     consensus.partition_incarnation(),
                 )
                 .await;
-                return;
+                return Some(header.from_op.saturating_sub(1));
             }
             if from_op > header.from_op {
+                if live {
+                    return Some(header.from_op.saturating_sub(1));
+                }
                 self.send_repair_range_reply(
                     cluster,
                     self_id,
-                    target,
+                    node,
                     Command::RangeEvicted,
                     header.nonce,
                     from_op,
@@ -6074,47 +7406,75 @@ where
                 let Some(entry_header) = journal.header(op as usize).map(|h| *h) else {
                     break;
                 };
+                // Each earlier frame of this loop is already sent.
+                if live
+                    && !consensus.replication_window_takes(target, 0, u64::from(entry_header.size))
+                {
+                    break;
+                }
                 let Some(entry) = journal.entry(&entry_header).await else {
                     break;
                 };
                 if !self
-                    .send_repair_prepare(target, entry.into_generic().into_frozen())
+                    .send_range_prepare(
+                        consensus,
+                        target,
+                        op,
+                        entry.into_generic().into_frozen(),
+                        live,
+                    )
                     .await
                 {
                     break;
                 }
                 served_through = op;
             }
-            self.send_repair_range_reply(
-                cluster,
-                self_id,
-                target,
-                Command::RepairDone,
-                header.nonce,
-                served_through,
-                header.group,
-                consensus.partition_incarnation(),
-            )
-            .await;
-            return;
+            if !live {
+                self.send_repair_range_reply(
+                    cluster,
+                    self_id,
+                    node,
+                    Command::RepairDone,
+                    header.nonce,
+                    served_through,
+                    header.group,
+                    consensus.partition_incarnation(),
+                )
+                .await;
+            }
+            return Some(served_through);
         }
         let namespace = IggyNamespace::from_raw(header.group);
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
-            return;
+            return Some(header.from_op.saturating_sub(1));
         };
         if !self.partition_incarnation_matches(
             partition,
             header.partition_incarnation,
             Command::RequestPrepares,
         ) {
-            return;
+            return Some(header.from_op.saturating_sub(1));
         }
         if !matches!(
             partition.consensus().status(),
             Status::Normal | Status::ViewChange
         ) || partition.view_truncation_pending()
         {
-            return;
+            return Some(header.from_op.saturating_sub(1));
+        }
+        let Some(node) = partition.consensus().members().node(target) else {
+            return Some(header.from_op.saturating_sub(1));
+        };
+        let read_key = ServedReadKey::Prepares {
+            group: header.group,
+            target,
+            live,
+        };
+        if landed.is_none() && self.served_reads.reading(read_key) {
+            return None;
+        }
+        if !live {
+            partition.renew_transfer_tail_for_repair(target, self.ticks());
         }
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
@@ -6124,7 +7484,13 @@ where
         // until the body is journaled, and the primary's retransmit is dropped
         // by the backup gap check (adoption already advanced its sequencer to
         // the head), so repair is the only channel that can deliver them.
-        let to_op = repair_serve_ceiling(&header, partition.consensus());
+        let to_op = if live {
+            header
+                .to_op
+                .min(partition.consensus().sequencer().current_sequence())
+        } else {
+            repair_serve_ceiling(&header, partition.consensus())
+        };
         let fence_floor = partition.view_fenced().then(|| partition.fence_floor());
         // `None` means the journal holds NOTHING, not "nothing was evicted":
         // the partition journal is memory-only and `clear_all` wipes the
@@ -6145,13 +7511,90 @@ where
             .unwrap_or_else(|| partition.consensus().commit_min().saturating_add(1));
         let mut from_op = header.from_op;
         if !partition.consensus().view_log_entry_proven(from_op) {
-            return;
+            return Some(header.from_op.saturating_sub(1));
         }
-        if retained_from > from_op {
+        let range_evicted = retained_from > from_op;
+        if range_evicted {
+            if live {
+                return Some(header.from_op.saturating_sub(1));
+            }
+            from_op = retained_from;
+        }
+        let chunk_ops_max = if live {
+            REPAIR_BYTES_MAX / size_of::<PrepareHeader>() as u64
+        } else {
+            repair_chunk_max
+        };
+        let chunk_end = to_op.min(from_op.saturating_add(chunk_ops_max - 1));
+        let journal = &partition.log.journal().inner;
+        // Every op is checked and taken before the first await. A body that the
+        // ring released comes from `landed`, and `None` stands for one that no
+        // read brought back yet.
+        let mut entries = Vec::new();
+        let mut released = Vec::new();
+        let mut response_bytes = 0;
+        for op in from_op..=chunk_end {
+            if !partition.consensus().view_log_entry_proven(op) {
+                break;
+            }
+            let (held, evicted) = match journal.repair_header(op) {
+                Some(held) => (held, None),
+                None => match journal.evicted_header(op) {
+                    Some(evicted) => (*evicted.header(), Some(evicted)),
+                    None => break,
+                },
+            };
+            if !fenced_serve_admits(fence_floor, op, || {
+                partition.consensus().adopted_view_vouches_for(&held)
+            }) {
+                break;
+            }
+            let size = u64::from(held.size);
+            if response_bytes > 0 && response_bytes + size > REPAIR_BYTES_MAX {
+                break;
+            }
+            if live
+                && !partition
+                    .consensus()
+                    .replication_window_takes(target, response_bytes, size)
+            {
+                break;
+            }
+            response_bytes += size;
+            if let Some(evicted) = evicted {
+                let body = landed
+                    .as_deref_mut()
+                    .and_then(|landed| landed.take(&evicted));
+                if body.is_none() {
+                    released.push(evicted);
+                }
+                entries.push(body);
+            } else {
+                let Some(entry) = journal.repair_entry(op) else {
+                    break;
+                };
+                entries.push(Some(entry));
+            }
+        }
+        if landed.is_none() && !released.is_empty() {
+            // Bodies that lie back to back in a segment take one read. Nothing
+            // goes out before they land, so the frames keep op order.
+            let read = partitions::ReleasedRead::new(&partition.log, released);
+            let request = msg.clone();
+            self.served_reads.start(&self.bus, read_key, async move {
+                LandedRead::Prepares {
+                    request,
+                    live,
+                    bodies: read.read().await,
+                }
+            });
+            return None;
+        }
+        if range_evicted {
             self.send_repair_range_reply(
                 cluster,
                 self_id,
-                target,
+                node,
                 Command::RangeEvicted,
                 header.nonce,
                 retained_from,
@@ -6159,50 +7602,73 @@ where
                 partition.created_revision(),
             )
             .await;
-            from_op = retained_from;
         }
-        let chunk_end = to_op.min(from_op.saturating_add(repair_chunk_max - 1));
+        // The serve ends at the first body that no read brought back.
+        let failed = released.first().and_then(|unread| {
+            let error = landed.as_mut()?.take_failure(unread)?;
+            Some((unread.header().op, error))
+        });
         let mut served_through = from_op.saturating_sub(1);
-        for op in from_op..=chunk_end {
-            if !partition.consensus().view_log_entry_proven(op) {
-                break;
-            }
-            let Some(held) = partition.log.journal().inner.repair_header(op) else {
+        for (op, entry) in (from_op..).zip(entries) {
+            let Some(entry) = entry else {
                 break;
             };
-            if !fenced_serve_admits(fence_floor, op, || {
-                partition.consensus().adopted_view_vouches_for(&held)
-            }) {
-                break;
-            }
-            let Some(entry) = partition.log.journal().inner.repair_entry(op) else {
-                break;
-            };
-            if !self.send_repair_prepare(target, entry).await {
+            if !self
+                .send_range_prepare(partition.consensus(), target, op, entry, live)
+                .await
+            {
                 break;
             }
             served_through = op;
         }
-        self.send_repair_range_reply(
-            cluster,
-            self_id,
-            target,
-            Command::RepairDone,
-            header.nonce,
-            served_through,
-            header.group,
-            partition.created_revision(),
-        )
-        .await;
-        tracing::info!(
-            shard = self.id,
-            namespace_raw = header.group,
-            target,
-            from_op = header.from_op,
-            to_op,
-            served_through,
-            "served partition repair range"
-        );
+        if let Some((op, error)) = failed {
+            // Bytes that are not the body and a body that left its file stay
+            // that way. Any other error can pass, so a later round reads again.
+            if matches!(
+                error.kind(),
+                io::ErrorKind::InvalidData | io::ErrorKind::UnexpectedEof | io::ErrorKind::NotFound
+            ) {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = header.group,
+                    op,
+                    %error,
+                    "cannot serve a repair body from its segment, so ops up to it answer RangeEvicted"
+                );
+                journal.forget_released_through(op);
+            } else {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = header.group,
+                    op,
+                    %error,
+                    "cannot read a repair body from its segment, so a later round reads it again"
+                );
+            }
+        }
+        if !live {
+            self.send_repair_range_reply(
+                cluster,
+                self_id,
+                node,
+                Command::RepairDone,
+                header.nonce,
+                served_through,
+                header.group,
+                partition.created_revision(),
+            )
+            .await;
+            tracing::info!(
+                shard = self.id,
+                namespace_raw = header.group,
+                target,
+                from_op = header.from_op,
+                to_op,
+                served_through,
+                "served partition repair range"
+            );
+        }
+        Some(served_through)
     }
 
     /// Ingest one repaired prepare. Metadata journals it into the WAL (the
@@ -6371,7 +7837,7 @@ where
                     self.metadata_repair_conflicts.set(conflicts);
                     let mut pace = self.metadata_repair_conflict_warn.get();
                     // Paced: a slot nothing removes is re-served every retry round.
-                    let admitted = pace.admit(self.ticks.get());
+                    let admitted = pace.admit(self.ticks());
                     self.metadata_repair_conflict_warn.set(pace);
                     if admitted {
                         tracing::warn!(
@@ -6477,9 +7943,7 @@ where
             .is_none_or(|op| op == header.op);
         let ingest = partition.apply_repaired_prepare(msg).await;
         if closes_proof_gap {
-            let pending = partition.consensus().pending_view_log();
-            reconcile_partition_view_divergence(self.id, partition, pending.as_ref()).await;
-            anchor_view_fence_from_view_log(partition, pending.as_ref()).await;
+            prove_partition_view_log_again(self.id, partition).await;
         }
         if ingest == RepairIngest::Unvouched {
             tracing::debug!(
@@ -6565,6 +8029,7 @@ where
                             session.to_op,
                             header.group,
                             consensus.partition_incarnation(),
+                            None,
                         )
                         .await;
                     }
@@ -6713,14 +8178,6 @@ where
             }
             return;
         }
-        // Counted BEFORE the `&mut partition` below exists, and only when an arm
-        // is possible at all: see the StartView site for why the scan is gated
-        // rather than replaced with a counter.
-        let transfers_inflight = if Self::may_arm_partition_transfer(&planes.1.0, header.group) {
-            self.partition_transfers_inflight()
-        } else {
-            0
-        };
         let config = planes.1.0.config().clone();
         let namespace = IggyNamespace::from_raw(header.group);
         let Some(partition) = planes.1.0.get_mut_by_ns(&namespace) else {
@@ -6735,7 +8192,7 @@ where
         }
         // Repair replies do not replace history. complete_repair waits for
         // file results; fencing live prepares here would create another gap.
-        let Some(session) = partition.repair else {
+        let Some(session) = partition.repair().copied() else {
             return;
         };
         if (header.replica, header.nonce) != (session.peer, session.nonce) {
@@ -6747,7 +8204,7 @@ where
         if !consensus::repair_session_live(partition.consensus())
             || partition.consensus().view() != session.view
         {
-            partition.repair = None;
+            partition.set_repair(None);
             return;
         }
         match header.command {
@@ -6759,9 +8216,10 @@ where
                 // delivery on a lossy bus). Proof moves backward through gaps,
                 // then may need a higher canonical header's body. Either change
                 // pulls the next chunk without waiting for the retry timer, and so
-                // do a held run that reached the chunk just requested and a
-                // floor-held resident prefix that grew. A shorter run is left to
-                // the retry timer.
+                // do a held run that reached the chunk just requested, a
+                // floor-held resident prefix that grew and an unproven walk that
+                // gained ops below its hole. A shorter run is left to the retry
+                // timer.
                 if let partitions::RepairConclusion::FloorRefused { floor, to_op } =
                     partition.complete_repair(&config).await
                 {
@@ -6788,15 +8246,13 @@ where
                         );
                         // Same reason as the StartView arm: this id becomes
                         // `session.peer` and later reaches the peer rotation.
-                        if self.peer_is_known(header.replica, "RepairRangeReply") {
+                        if self.member_is_known(
+                            partition.consensus().replica_count(),
+                            header.replica,
+                            "RepairRangeReply",
+                        ) {
                             partition.consensus().begin_state_transfer_await();
-                            let _ = self
-                                .arm_partition_transfer(
-                                    partition,
-                                    header.replica,
-                                    transfers_inflight,
-                                )
-                                .await;
+                            self.arm_partition_transfer(partition, header.replica).await;
                         }
                     } else {
                         // The refusal cleared the repair session, so falling
@@ -6813,7 +8269,7 @@ where
                     }
                     return;
                 }
-                if partition.repair.is_none() {
+                if partition.repair().is_none() {
                     tracing::info!(
                         shard = self.id,
                         namespace_raw = header.group,
@@ -6824,8 +8280,7 @@ where
                     let repaired_through = partition.held_through();
                     let proof_op = partition.consensus().view_log_repair_op();
                     let from_op = partition
-                        .repair
-                        .as_ref()
+                        .repair()
                         .and_then(|live| {
                             proof_op.filter(|&op| op != live.from_op).or_else(|| {
                                 partition_repair_next_chunk(
@@ -6835,9 +8290,14 @@ where
                                 )
                             })
                         })
+                        .or_else(|| partition.next_proof_walk_pull())
                         .or_else(|| partition.next_floor_pull());
                     let next = from_op.and_then(|from_op| {
-                        let live = partition.repair.as_mut()?;
+                        if !partition.repair_fetch_ready() {
+                            partition.repair_mut()?.requested_from = None;
+                            return None;
+                        }
+                        let live = partition.repair_mut()?;
                         live.from_op = from_op;
                         live.requested_from = Some(from_op);
                         Some((live.peer, live.nonce, from_op, live.fetch_to_op))
@@ -6851,6 +8311,7 @@ where
                             to_op,
                             header.group,
                             partition.created_revision(),
+                            partition.note_proof_walk_request(),
                         )
                         .await;
                     }
@@ -6863,7 +8324,8 @@ where
     /// Ask `target` to stream its journaled prepares in `[from_op, to_op]`
     /// for `namespace`; answered by `RepairPrepare` frames terminated with
     /// `RepairDone` (prefixed by `RangeEvicted` when the front of the range
-    /// is no longer retained).
+    /// is no longer retained). `held_below_hole` is the highest op that a
+    /// partition holds below the hole of its unproven proof walk.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::future_not_send, clippy::cast_possible_truncation)]
     async fn send_request_prepares<P>(
@@ -6875,12 +8337,14 @@ where
         to_op: u64,
         namespace: u64,
         partition_incarnation: u64,
+        held_below_hole: Option<u64>,
     ) where
         B: MessageBus,
         P: Pipeline<Entry = consensus::PipelineEntry>,
     {
         // Proof walks backward. End the chunk at its hole instead of re-serving
-        // the already held suffix for every missing predecessor.
+        // the already held suffix for every missing predecessor, and start it
+        // above the ops held below the hole, which the donor would serve first.
         let (from_op, to_op) = consensus
             .view_log_repair_op()
             .map_or((from_op, to_op), |missing| {
@@ -6890,7 +8354,8 @@ where
                 (
                     missing
                         .saturating_sub(self.repair_chunk_max.get() - 1)
-                        .max(consensus.commit_min() + 1),
+                        .max(consensus.commit_min() + 1)
+                        .max(held_below_hole.map_or(0, |held| held + 1)),
                     missing,
                 )
             });
@@ -6911,9 +8376,8 @@ where
                 h.size = size_of::<RequestPreparesHeader>() as u32;
                 h.seal();
             });
-        if self
-            .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+        if consensus
+            .send_to_member(target, msg.into_generic().into_frozen())
             .await
             .is_err()
         {
@@ -6940,7 +8404,7 @@ where
     /// served-through watermark past a failed send, or the terminating
     /// `RepairDone` reports ops that were never delivered.
     #[allow(clippy::future_not_send)]
-    async fn send_repair_prepare(&self, target: u8, entry: Frozen<MESSAGE_ALIGN>) -> bool
+    async fn send_repair_prepare(&self, node: u8, entry: Frozen<MESSAGE_ALIGN>) -> bool
     where
         B: MessageBus,
     {
@@ -6956,7 +8420,7 @@ where
             return false;
         };
         self.bus
-            .send_to_replica(target, message.into_frozen())
+            .send_to_replica(node, message.into_frozen())
             .await
             .is_ok()
     }
@@ -6967,7 +8431,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
-        target: u8,
+        node: u8,
         command: Command,
         nonce: u128,
         op: u64,
@@ -6990,7 +8454,7 @@ where
             });
         let _ = self
             .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+            .send_to_replica(node, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7235,6 +8699,7 @@ where
                     to_op,
                     consensus.group(),
                     consensus.partition_incarnation(),
+                    None,
                 )
                 .await;
             }
@@ -7379,12 +8844,15 @@ where
             to_op,
             consensus.group(),
             consensus.partition_incarnation(),
+            None,
         )
         .await;
     }
 
-    // The shard pump serializes these rewrites with append. The journal's drain
-    // guard excludes concurrent compaction, but does not exclude append itself.
+    // The journal's drain guard excludes concurrent compaction, but does not
+    // exclude append itself, and an in-process submit appends on its caller's
+    // task, not the pump's. The journal gate serializes these rewrites with it:
+    // a write in flight lands first and is reconciled, and none starts during.
     #[allow(clippy::future_not_send)]
     async fn reconcile_metadata_view_divergence(&self)
     where
@@ -7397,6 +8865,7 @@ where
         let (Some(consensus), Some(journal)) = (&metadata.consensus, &metadata.journal) else {
             return;
         };
+        let _journal_writes = metadata.hold_journal_writes().await;
         while reconcile_metadata_view_log(self.id, consensus, journal.handle()).await
             == MetadataViewLogStep::PersistFirst
         {
@@ -7439,6 +8908,10 @@ where
         // Before the coverage scan, and a primary-elect's only shot at it: the repair
         // ingest skips an op it already holds a header for, so a diverging entry would
         // never be replaced. No-op when nothing diverges.
+        //
+        // It also waits for a submit admitted before the election and still in its
+        // append. Nothing awaits from here to `start_pending_view`, so the view
+        // starts on a journal no prepare of an earlier view can still land in.
         self.reconcile_metadata_view_divergence().await;
         if consensus.view_log_unproven() && consensus.view_log_repair_op().is_none() {
             return;
@@ -7579,6 +9052,7 @@ where
             to_op,
             consensus.group(),
             consensus.partition_incarnation(),
+            None,
         )
         .await;
     }
@@ -7684,9 +9158,8 @@ where
                     h.size = size_of::<RequestStateTransferHeader>() as u32;
                     h.seal();
                 });
-        let _ = self
-            .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+        let _ = consensus
+            .send_to_member(target, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7703,6 +9176,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
+        members: ReplicaSet,
         target: u8,
         nonce: u128,
         namespace: u64,
@@ -7740,9 +9214,12 @@ where
             }
             h.seal();
         });
+        let Some(node) = members.node(target) else {
+            return;
+        };
         let _ = self
             .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+            .send_to_replica(node, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7755,6 +9232,7 @@ where
         &self,
         cluster: u128,
         self_id: u8,
+        members: ReplicaSet,
         target: u8,
         nonce: u128,
         namespace: u64,
@@ -7779,9 +9257,12 @@ where
                 h.size = size_of::<RequestStateChunkHeader>() as u32;
                 h.seal();
             });
+        let Some(node) = members.node(target) else {
+            return;
+        };
         let _ = self
             .bus
-            .send_to_replica(target, msg.into_generic().into_frozen())
+            .send_to_replica(node, msg.into_generic().into_frozen())
             .await;
     }
 
@@ -7844,6 +9325,7 @@ where
             self.send_state_transfer_target(
                 cluster,
                 self_id,
+                *consensus.members(),
                 header.replica,
                 header.nonce,
                 header.group,
@@ -7873,6 +9355,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *consensus.members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -7909,6 +9392,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *consensus.members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -8152,6 +9636,7 @@ where
             self.send_request_state_chunk(
                 consensus.cluster(),
                 consensus.replica(),
+                *consensus.members(),
                 peer,
                 nonce,
                 consensus.group(),
@@ -8342,6 +9827,7 @@ where
         };
         let cluster = consensus.cluster();
         let self_id = consensus.replica();
+        let members = *consensus.members();
 
         // Never serve a frame the receiving transport will reject: anything past
         // `max_message_size` tears down the whole replica connection, which reads
@@ -8418,10 +9904,12 @@ where
         };
         match reply {
             Some(ChunkReply::Chunk(chunk)) => {
-                let _ = self
-                    .bus
-                    .send_to_replica(header.replica, chunk.into_generic().into_frozen())
-                    .await;
+                if let Some(node) = members.node(header.replica) {
+                    let _ = self
+                        .bus
+                        .send_to_replica(node, chunk.into_generic().into_frozen())
+                        .await;
+                }
             }
             Some(ChunkReply::Unavailable { transient }) => {
                 tracing::info!(
@@ -8433,6 +9921,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *consensus.members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -8723,6 +10212,12 @@ where
         }
     }
 
+    /// Shard ticks so far: the clock of every [`WarnPace`] and of the
+    /// partition timers.
+    fn ticks(&self) -> u64 {
+        self.plane.partitions().tick_clock().now()
+    }
+
     /// Tick partition consensuses. Loop partitions. No partitions-plane journal.
     #[allow(clippy::future_not_send)]
     #[allow(clippy::too_many_lines)]
@@ -8742,13 +10237,175 @@ where
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
     {
+        let fatal = self.tick_partition_groups(namespace_scratch).await;
+        // One batch per peer node for this shard tick, with the Commits of
+        // both planes.
+        self.flush_commit_outbox().await;
+        self.flush_reply_outbox().await;
+        // After the flushes: a failed send records itself on its partition.
+        self.settle_ticked_partitions(namespace_scratch);
+        namespace_scratch.clear();
+        fatal
+    }
+
+    /// Lets each partition that this tick visited sleep until its next
+    /// timeout when it has nothing to do before, and keeps the others awake.
+    /// The next ticks skip a sleeping partition, see
+    /// [`IggyPartitions::due_namespaces`].
+    ///
+    /// The last step of the tick, with no await: it reads every partition as
+    /// the tick leaves it, so it also sees what a task outside the pump
+    /// changed while the tick awaited.
+    fn settle_ticked_partitions(&self, visited: &[IggyNamespace]) {
+        let partitions = self.plane.partitions();
+        let manifest_now = IggyTimestamp::now();
+        for namespace in visited {
+            let quiet_until = partitions
+                .sent_report(namespace)
+                .and_then(|(partition, sent)| {
+                    self.pace_placing_primary(*namespace, partition);
+                    self.note_fresh_proofs(*namespace, partition);
+                    self.stage_manifest_pass(*namespace, partition, manifest_now);
+                    self.partition_quiet_until(*namespace, partition, sent.get())
+                });
+            partitions.settle(namespace, quiet_until);
+        }
+        // The stop plans its checkpoints once, when it begins.
+        if !self.shutting_down.get() {
+            partitions.queue_reload_checkpoints();
+        }
+        if let Some(bytes_max) = partitions.wal_reload_bytes_max() {
+            self.metrics.set_wal_reload_budget(bytes_max);
+        }
+        self.metrics.set_partition_levels(&partitions.gauge_sums());
+        self.check_sleeping_partitions();
+    }
+
+    /// The tick before which no shard tick has work for `partition`, `None`
+    /// when the next tick can have some.
+    fn partition_quiet_until(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+        sent: SentReport,
+    ) -> Option<u64> {
+        let partitions = self.plane.partitions();
+        // The checkpoint deadline only moves later without an op, and an op
+        // reaches the partition through an accessor that wakes it.
+        let quiet_until = partition.quiet_until().map(|quiet_until| {
+            partitions
+                .checkpoint_delays()
+                .and_then(|delays| partition.checkpoint_deadline(delays))
+                .map_or(quiet_until, |deadline| quiet_until.min(deadline))
+        })?;
+        // The sweep reads the fault of a tombstoned partition, and a queued
+        // report waits for its batch.
+        if sent.queued || partitions.is_tombstoned(&namespace) {
+            return None;
+        }
+        // The in-sync nodes of the report then change with no frame.
+        if partition
+            .consensus()
+            .member_lag_pending(consensus::MEMBER_LAG_MAX)
+        {
+            return None;
+        }
+        let (view, status, next) = self.next_report(namespace, partition, sent);
+        if view.is_some() || status.is_some() || next != sent {
+            return None;
+        }
+        // Only an acting primary reports counters, once per interval.
+        Some(if sent.primary {
+            let interval =
+                u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap_or(u64::MAX);
+            quiet_until.min(sent.checked_at.saturating_add(interval))
+        } else {
+            quiet_until
+        })
+    }
+
+    /// Tests sleeping partitions for work that no wake-up announced. A debug
+    /// build tests all of them on every tick and fails on the first one. A
+    /// release build tests `PARTITION_SLEEP_CHECKS_PER_TICK` in slot order,
+    /// wakes such a partition and counts it.
+    fn check_sleeping_partitions(&self) {
+        let partitions = self.plane.partitions();
+        let slots = partitions.slot_count();
+        let checks = if cfg!(debug_assertions) {
+            slots
+        } else {
+            slots.min(PARTITION_SLEEP_CHECKS_PER_TICK)
+        };
+        let now = self.ticks();
+        let mut slot = self.partition_sleep_check_cursor.get();
+        for _ in 0..checks {
+            slot = if slot + 1 < slots { slot + 1 } else { 0 };
+            let Some(sleeper) = partitions.sleeper(slot, now) else {
+                continue;
+            };
+            let quiet_until = self.partition_quiet_until(
+                sleeper.namespace,
+                sleeper.partition,
+                sleeper.sent_report,
+            );
+            if sleeper.gauge_share_current
+                && quiet_until.is_some_and(|quiet_until| quiet_until >= sleeper.wake_at)
+            {
+                continue;
+            }
+            debug_assert!(
+                false,
+                "partition {} sleeps until tick {} at tick {now} with work: quiet until \
+                 {quiet_until:?}, gauge share current: {}",
+                sleeper.namespace.inner(),
+                sleeper.wake_at,
+                sleeper.gauge_share_current,
+            );
+            self.metrics.record_partition_missed_wakeup();
+            let mut pace = self.partition_missed_wakeup_warn.get();
+            if pace.admit(now) {
+                tracing::warn!(
+                    shard = self.id,
+                    namespace_raw = sleeper.namespace.inner(),
+                    wake_at = sleeper.wake_at,
+                    ?quiet_until,
+                    "a sleeping partition had work that no wake-up announced; waking it"
+                );
+            }
+            self.partition_missed_wakeup_warn.set(pace);
+            partitions.settle(&sleeper.namespace, None);
+        }
+        self.partition_sleep_check_cursor.set(slot);
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn tick_partition_groups(
+        &self,
+        namespace_scratch: &mut Vec<IggyNamespace>,
+    ) -> Option<FatalCommit>
+    where
+        B: MessageBus + 'static,
+        T: ShardsTable,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    {
         debug_assert!(
             namespace_scratch.is_empty(),
             "namespace_scratch must be empty on entry",
         );
-        self.ticks.set(self.ticks.get().wrapping_add(1));
+        // The metadata tick of this shard tick already counted it.
+        if !self.metadata_ticked.replace(false) {
+            self.shard_ticks.set(self.shard_ticks.get().wrapping_add(1));
+        }
         let partitions = self.plane.partitions();
+        partitions.tick_clock().advance();
         let repair_retry_ticks = self.repair_retry_ticks.get();
+        // The serving side ages an idle offer on this clock, `max(1)` included.
+        let local_work_ticks_max = repair_retry_ticks
+            .max(1)
+            .saturating_mul(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE)
+            / LOCAL_WORK_WAIT_DIVISOR;
         self.partition_io.tick();
         for identity in self.partition_io.interrupted() {
             if let Some(partition) = partitions.get_io_owner(&identity.namespace) {
@@ -8756,13 +10413,19 @@ where
             }
         }
         let gap_debounce_ticks = self.repair_gap_debounce_ticks.get();
-        // Fan out over every group (each partition's heartbeat/retransmit timer
-        // must advance), so the keyed single-namespace lookup the control-frame
-        // handlers use does not apply here. The namespaces are snapshotted into
-        // the pump's owned scratch (as `process_loopback` does) so no
-        // partitions-plane borrow is held across the tick `.await`.
-        namespace_scratch.extend(partitions.namespaces().copied());
-        self.publish_partition_views(namespace_scratch);
+        // Fan out over every group that is awake or whose timeout came, so the
+        // keyed single-namespace lookup the control-frame handlers use does not
+        // apply here. A quiet group sleeps, see `settle_ticked_partitions`. The
+        // namespaces are snapshotted into the pump's owned scratch (as
+        // `process_loopback` does) so no partitions-plane borrow is held
+        // across the tick `.await`. The table walks in slot order, but the
+        // sweep cursor resumes by namespace order, so the snapshot is sorted.
+        // Ahead of the snapshot, so a requested partition starts this tick.
+        partitions.request_queued_checkpoints(PARTITION_WALKS_PER_TICK_MAX);
+        partitions.due_namespaces(self.ticks(), namespace_scratch);
+        namespace_scratch.sort_unstable();
+        self.metrics
+            .record_partition_tick_visits(namespace_scratch.len());
         // Resume where the last sweep ran out of walk budget, so the cap below
         // spreads over every group instead of replaying the same prefix.
         rotate_sweep_to_cursor(namespace_scratch, self.partition_walk_cursor.get());
@@ -8773,6 +10436,9 @@ where
                     let _ = partition.extend_offset_reservation().await;
                 }
                 let _ = partition.persist_superblock_if_needed().await;
+                if partition.view_persist_pending() {
+                    partition.consensus().hold_peer_timeouts();
+                }
             }
             if let Some(partition) = partitions.get_io_owner(namespace)
                 && partition.needs_io_retry()
@@ -8781,20 +10447,43 @@ where
             }
         }
 
+        // These counts cover the visited partitions. They are exact, because
+        // a partition in a state that one of them counts never sleeps.
         let mut persistence_metrics = partitions::PersistenceMetrics::default();
-        let mut repair_ring_entries = 0usize;
-        let mut repair_ring_bytes = 0u64;
         let mut untrusted_logs = 0usize;
+        // Against `PARTITION_VIEW_CHANGES_INFLIGHT_MAX`. View changes that
+        // start in a frame handler show up in the count of the next sweep.
+        let mut view_changes_inflight = 0usize;
+        // The gauge counts the view changes that the limit skips too, so a
+        // group that lost its quorum stays visible.
+        let mut view_changes = 0usize;
+        let mut owing_retirement = 0usize;
+        // The replication gauges are scraped, not driven: once per report
+        // interval is enough.
+        let replication_due =
+            u128::from(self.ticks()).is_multiple_of(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS);
         for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_mut_by_ns(namespace) {
+                partition.expire_transfer_tails(
+                    self.ticks(),
+                    u64::from(repair_retry_ticks.max(1))
+                        * u64::from(STATE_TRANSFER_OFFER_EXPIRY_MULTIPLE),
+                );
                 partition.drive_persistence().await;
-                untrusted_logs += usize::from(partition.consensus().has_untrusted_log());
-                let (entries, bytes) = partition.repair_ring_occupancy();
-                repair_ring_entries += entries;
-                repair_ring_bytes += bytes;
+                // The stop plans its checkpoints once, when it begins.
+                if !self.shutting_down.get()
+                    && let Some(delays) = partitions.checkpoint_delays()
+                    && let Some(trigger) = partition.take_due_checkpoint(self.ticks(), delays)
+                {
+                    partitions.enqueue_checkpoint(*namespace, trigger);
+                }
+                let consensus = partition.consensus();
+                untrusted_logs += usize::from(consensus.has_untrusted_log());
+                view_changes_inflight += usize::from(consensus.view_change_in_flight());
+                view_changes += usize::from(consensus.status() == Status::ViewChange);
+                owing_retirement +=
+                    usize::from(replication_due && partition.owes_session_retirement());
                 if let Some(metrics) = partition.take_persistence_metrics() {
-                    persistence_metrics.disk_bytes += metrics.disk_bytes;
-                    persistence_metrics.retained_bytes += metrics.retained_bytes;
                     persistence_metrics.queued_bytes += metrics.queued_bytes;
                     persistence_metrics.in_flight_bytes += metrics.in_flight_bytes;
                     persistence_metrics.checkpoints_pending += metrics.checkpoints_pending;
@@ -8806,28 +10495,40 @@ where
                 }
             }
         }
+        if let Some(shed) = partitions.shed_repair_rings() {
+            self.metrics.record_repair_ring_shed(&shed);
+        }
+        self.drive_replication(namespace_scratch).await;
         self.metrics.record_persistence(&persistence_metrics);
+        self.metrics.set_checkpoint_queue(
+            partitions.checkpoint_queue_len(),
+            partitions.queued_checkpoints_in_flight(),
+        );
         self.partition_io.record_metrics(&self.metrics);
         self.metrics
             .record_replica_reads(&self.bus.take_replica_read_stats());
         self.metrics
             .record_replica_link_stats(&self.bus.take_replica_link_stats());
-        self.metrics
-            .set_repair_ring(repair_ring_entries, repair_ring_bytes);
         self.metrics.set_partitions_untrusted_log(untrusted_logs);
+        if replication_due {
+            // Counted once for the cluster, so a partition whose primary is down
+            // or stepped down is not left to a node that no longer leads it.
+            let replication = self.primary_rebalance.borrow().partition_replication();
+            self.metrics.set_partition_replication(
+                replication.under_replicated,
+                replication.below_write_quorum,
+            );
+            self.metrics
+                .set_partitions_owing_retirement(owing_retirement);
+        }
 
-        // Counted at most ONCE per sweep and only if a re-arm actually fires,
-        // then tracked locally as arms land. Counting per namespace is a full
-        // scan per partition, so with per-partition groups the sweep would be
-        // O(P^2) exactly when every group is re-arming at once (node-wide view
-        // change or rejoin) -- and counting eagerly every tick pays that scan on
-        // every quiet tick too, since the re-arm branch is rare. A slot freed
-        // mid-sweep is seen on the next tick, the same latency a capped arm
-        // already accepts.
-        let mut transfers_inflight: Option<usize> = None;
         // Repair sessions this sweep has opened, against
         // `PARTITION_REPAIR_ARMS_PER_TICK_MAX`.
         let mut repair_arms = 0usize;
+        // Heartbeat votes this sweep has cast, against
+        // `PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX`.
+        let mut view_change_votes = 0usize;
+        let mut view_change_votes_held = 0usize;
         // Commit walks this sweep has run, against
         // `PARTITION_WALKS_PER_TICK_MAX`.
         let mut walks = 0usize;
@@ -8850,7 +10551,7 @@ where
         let mut walk_cursor: Option<IggyNamespace> = None;
 
         let mut fatal: Option<FatalCommit> = None;
-        for namespace in namespace_scratch.drain(..) {
+        for &namespace in namespace_scratch.iter() {
             let Some(partition) = partitions.get_by_ns(&namespace) else {
                 if fatal.is_none() {
                     fatal = partitions
@@ -8913,8 +10614,22 @@ where
                 refresh_partition_dvc_suffix(partition);
             }
             partition.ensure_materialization_recovery();
-            let actions = consensus
-                .tick_with_history_fence(PlaneKind::Partitions, partition.history_writes_pending());
+            let grid_tick = consensus
+                .heartbeat_schedule()
+                .is_grid_tick(self.shard_ticks.get());
+            let vote_held = view_change_votes >= PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX
+                || view_changes_inflight >= PARTITION_VIEW_CHANGES_INFLIGHT_MAX;
+            let voted_before = consensus.votes_to_leave_view();
+            let history_fenced = partition.history_writes_pending();
+            let actions = consensus.tick_with_grid(
+                PlaneKind::Partitions,
+                history_fenced,
+                grid_tick,
+                vote_held,
+            );
+            view_change_votes += usize::from(!voted_before && consensus.votes_to_leave_view());
+            view_change_votes_held +=
+                usize::from(vote_held && !history_fenced && consensus.heartbeat_timed_out());
             partition.ensure_materialization_recovery();
             // The tick emits view-scoped sends (heartbeats, view-change
             // retransmits), so it persists first like every dispatch site;
@@ -8923,8 +10638,13 @@ where
             // Locals to the partition dispatcher only; see the view-change
             // sites for the rationale.
             dispatch_partition_journal_actions(consensus, partition, &local_actions).await;
-            dispatch_partition_wire_actions::<B, _, MJ, _>(consensus, partition, wire_actions)
-                .await;
+            dispatch_partition_wire_actions_batched::<B, _, MJ, _>(
+                consensus,
+                partition,
+                wire_actions,
+                Some(&self.commit_outbox),
+            )
+            .await;
 
             // Finish a view change whose quorum decided ahead of the local log.
             self.advance_pending_partition_view(namespace).await;
@@ -8950,7 +10670,11 @@ where
                 if partition.needs_persistence_checkpoint() {
                     if walks < PARTITION_WALKS_PER_TICK_MAX {
                         walks += 1;
-                        partition.checkpoint_persistence(partitions.config()).await;
+                        if let Some(trigger) =
+                            partition.checkpoint_persistence(partitions.config()).await
+                        {
+                            self.metrics.record_checkpoint_start(trigger);
+                        }
                     } else {
                         walk_cursor.get_or_insert(namespace);
                     }
@@ -8981,7 +10705,7 @@ where
                 // two ingest sites, so the arming side and the ingest side cannot
                 // drift apart.
                 let session_live = consensus::repair_session_live(partition.consensus());
-                let repair_finished = partition.repair.is_some_and(|session| {
+                let repair_finished = partition.repair().is_some_and(|session| {
                     if !session_live || consensus_view != session.view {
                         return true;
                     }
@@ -9003,7 +10727,7 @@ where
                     commit_min >= session.commit_to_op && fetch_complete
                 });
                 if repair_finished {
-                    partition.repair = None;
+                    partition.set_repair(None);
                     partition.transfer_rearm = None;
                     tracing::info!(
                         shard = self.id,
@@ -9015,8 +10739,9 @@ where
                     continue;
                 }
                 let proof_op = partition.consensus().view_log_repair_op();
-                let retry_due = partition.repair.as_mut().is_some_and(|session| {
-                    if !session_live {
+                let fetch_ready = partition.repair_fetch_ready();
+                let retry_due = partition.repair_mut().is_some_and(|session| {
+                    if !session_live || !fetch_ready {
                         return false;
                     }
                     session.idle_ticks += 1;
@@ -9035,8 +10760,7 @@ where
                 // move until the whole window is held.
                 let pull_from = retry_due.then(|| partition.repair_pull_from()).flatten();
                 let due = partition
-                    .repair
-                    .as_mut()
+                    .repair_mut()
                     .filter(|_| retry_due)
                     .and_then(|session| {
                         let floor_pending = session.floor.is_some_and(|floor| floor > commit_min);
@@ -9088,10 +10812,6 @@ where
                         .get_by_ns(&namespace)
                         .and_then(spent_repair_ring_transfer_peer)
                 {
-                    // Counted here, before the `&mut partition` below exists: the
-                    // scan takes shared borrows of every partition.
-                    let inflight = *transfers_inflight
-                        .get_or_insert_with(|| self.partition_transfers_inflight());
                     let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                         continue;
                     };
@@ -9105,12 +10825,7 @@ where
                         "partition repair stalled past the ring budget; converting to state transfer"
                     );
                     partition.consensus().begin_state_transfer_await();
-                    if self
-                        .arm_partition_transfer(partition, primary, inflight)
-                        .await
-                    {
-                        transfers_inflight = Some(inflight + 1);
-                    }
+                    self.arm_partition_transfer(partition, primary).await;
                     continue;
                 }
                 if rotate {
@@ -9128,7 +10843,7 @@ where
                         "partition repair stalled past its retry budget; re-arming from \
                          another replica"
                     );
-                    partition.repair = None;
+                    partition.set_repair(None);
                     // A parked view change re-arms from the merged log's senders,
                     // not around the cluster ring:
                     // `maybe_request_partition_repair` refuses outside `Normal`,
@@ -9180,6 +10895,7 @@ where
                     to_op,
                     namespace.inner(),
                     partition.created_revision(),
+                    partition.note_proof_walk_request(),
                 )
                 .await;
             }
@@ -9333,12 +11049,53 @@ where
             // the rejoin behind it) forever. Budget-bounded: a peer that died
             // mid-transfer is abandoned back to journal repair, which
             // re-targets the current primary.
+            let mut prefix_read_expired = false;
+            let mut reuse_scan_expired = false;
+            let mut local_work_landed = false;
+            let mut local_work_keepalive = None;
             let transfer_stalled = {
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
-                partition.transfer.as_mut().and_then(|session| {
+                partition.transfer_mut().and_then(|session| {
                     session.idle_ticks += 1;
+                    // A nonce-preserving retry renews the same pinned offer
+                    // while this node validates or syncs its local files.
+                    if session.target_accepted
+                        && (session.scan.is_some()
+                            || session.spill.is_some()
+                            || matches!(session.seed, Some(PrefixSeed::Reading { .. })))
+                        && session.idle_ticks.is_multiple_of(repair_retry_ticks.max(1))
+                    {
+                        local_work_keepalive = Some((session.peer, session.nonce));
+                    }
+                    // Local work, not the peer, holds the pull, so a slow disk
+                    // burns no retry of the peer. Work that outlives its bound
+                    // is asked to stop, and the pull goes on once it lands. A
+                    // stopped prefix read thus frees its artifact buffer before
+                    // the pull fetches the whole artifact into a new one, and a
+                    // stopped reuse scan leaves the rest to the pull. Work that
+                    // landed resumes the pull here when no I/O turn did.
+                    if let Some(scan) = &session.scan {
+                        if scan.landed() {
+                            local_work_landed = true;
+                        } else if session.idle_ticks >= local_work_ticks_max && scan.stop() {
+                            reuse_scan_expired = true;
+                        }
+                        return None;
+                    }
+                    if let Some(spill) = &session.spill {
+                        local_work_landed = spill.work.landed();
+                        return None;
+                    }
+                    if let Some(PrefixSeed::Reading { read, .. }) = &session.seed {
+                        if read.landed() {
+                            local_work_landed = true;
+                        } else if session.idle_ticks >= local_work_ticks_max && read.stop() {
+                            prefix_read_expired = true;
+                        }
+                        return None;
+                    }
                     if session.idle_ticks < repair_retry_ticks {
                         return None;
                     }
@@ -9346,6 +11103,31 @@ where
                     Some((session.peer, session.nonce, session.target_accepted))
                 })
             };
+            if reuse_scan_expired {
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    "the reuse scan outlived its bound, so the pull fetches the segments \
+                     that it did not reuse"
+                );
+            }
+            if prefix_read_expired {
+                tracing::info!(
+                    shard = self.id,
+                    namespace_raw = namespace.inner(),
+                    "the local segment prefix read outlived its bound, so it is asked to \
+                     stop before the pull goes on"
+                );
+            }
+            if let Some((peer, nonce)) = local_work_keepalive
+                && let Some(partition) = partitions.get_by_ns(&namespace)
+            {
+                self.send_request_state_transfer(partition.consensus(), peer, nonce)
+                    .await;
+            }
+            if local_work_landed {
+                self.on_partition_transfer_progress(namespace.inner()).await;
+            }
             if let Some((peer, nonce, target_accepted)) = transfer_stalled {
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
@@ -9359,8 +11141,8 @@ where
                     );
                     // Staging files are KEPT: a later attempt adopts every
                     // segment whose manifest entry still matches. The shared
-                    // path charges the failure, rotates the peer, schedules
-                    // the re-arm, and re-arms journal repair meanwhile.
+                    // path charges the failure, rotates the peer and schedules
+                    // the re-arm.
                     self.abandon_or_rearm_partition_transfer(partition, peer)
                         .await;
                 } else if target_accepted {
@@ -9375,25 +11157,31 @@ where
             // Scheduled transfer re-arm: count the backoff down and fire
             // once nothing else recovered the partition in the meantime (a
             // live session or a non-Idle stage owns the slot; the pending
-            // entry is then dropped as superseded).
+            // entry is then dropped as superseded). A journal that holds every
+            // op through `commit_max` is recovered as well, by the live stream
+            // or by repair, and the commit walk owns the rest. That re-arm
+            // stands down at once, not at the end of its backoff: while it
+            // waits, every repair route stays closed, so a gap that opens
+            // meanwhile heals only through a transfer.
             let rearm_peer = {
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
+                let journal_recovered = partition.transfer_rearm.is_some()
+                    && !partition.requires_state_transfer()
+                    && partition.held_through() >= partition.consensus().commit_max();
                 match partition.transfer_rearm.as_mut() {
-                    Some(pending) if pending.after_ticks > 0 => {
+                    Some(pending) if pending.after_ticks > 0 && !journal_recovered => {
                         pending.after_ticks -= 1;
                         None
                     }
                     Some(pending) => {
                         let peer = pending.peer;
                         partition.transfer_rearm = None;
-                        if partition.transfer.is_none()
+                        if partition.transfer().is_none()
                             && partition.consensus().state_transfer_stage()
                                 == consensus::StateTransferStage::Idle
-                            && (partition.requires_state_transfer()
-                                || partition.consensus().commit_min()
-                                    < partition.consensus().commit_max())
+                            && !journal_recovered
                         {
                             Some(peer)
                         } else {
@@ -9404,18 +11192,11 @@ where
                 }
             };
             if let Some(peer) = rearm_peer {
-                // Counted here, before the `&mut partition` below exists: the
-                // scan takes shared borrows of every partition.
-                let inflight =
-                    *transfers_inflight.get_or_insert_with(|| self.partition_transfers_inflight());
                 let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
                     continue;
                 };
                 partition.consensus().begin_state_transfer_await();
-                let armed = self.arm_partition_transfer(partition, peer, inflight).await;
-                if armed {
-                    transfers_inflight = Some(inflight + 1);
-                }
+                self.arm_partition_transfer(partition, peer).await;
             }
         }
 
@@ -9430,95 +11211,204 @@ where
         // A stranded key stays until its own store or delete succeeds, so a
         // gauge that never falls is the operator's only signal.
         let mut stranded = [0usize; ConsumerKind::COUNT];
-        for namespace in partitions.namespaces() {
+        for namespace in namespace_scratch.iter() {
             if let Some(partition) = partitions.get_by_ns(namespace) {
-                repairs_live += usize::from(partition.repair.is_some());
+                repairs_live += usize::from(partition.repair().is_some());
                 for kind in ConsumerKind::ALL {
                     stranded[kind.index()] += partition.stranded_consumer_offset_count(kind);
                 }
             }
         }
         self.partition_repairs_inflight.set(repairs_live);
+        self.metrics
+            .set_partition_view_changes(view_changes, view_change_votes_held);
         for kind in ConsumerKind::ALL {
             self.metrics
                 .set_consumer_offsets_stranded(kind, stranded[kind.index()]);
         }
+        self.publish_partition_views(namespace_scratch);
 
         fatal
     }
 
-    /// Re-read a bounded range on retry so a full inbox retains no stale payload.
-    /// Each interval visits every namespace once, in batches over consecutive ticks.
-    /// A batch holds `PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN` namespaces, or more
-    /// when the shard owns too many for that pace to finish within the interval.
-    fn publish_partition_views(&self, namespaces: &[IggyNamespace]) {
-        if namespaces.is_empty() {
-            self.partition_placement_cursor.set(None);
-            return;
-        }
-        if u128::from(self.ticks.get().saturating_sub(1))
-            .is_multiple_of(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS)
-        {
-            self.partition_placement_owed.set(namespaces.len());
-        }
-        let owed = self.partition_placement_owed.get();
-        if owed == 0 {
-            return;
-        }
+    /// Queue each visited partition whose report to shard 0 changed, then send
+    /// the retractions of removed partitions and the oldest queued reports, one
+    /// batch per tick. A batch holds
+    /// `PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN` reports, or more when the
+    /// shard owns too many partitions for that pace to report them all within
+    /// one interval. A full inbox keeps them queued.
+    fn publish_partition_views(&self, visited: &[IggyNamespace]) {
         let Some(sender) = self.senders.first() else {
             return;
         };
-        let start = self.partition_placement_cursor.get().map_or(0, |cursor| {
-            namespaces.partition_point(|namespace| *namespace < cursor) % namespaces.len()
-        });
-        let batch = namespaces
+        let partitions = self.plane.partitions();
+        // The sweep leaves many visits early and skips tombstoned partitions,
+        // so one pass after it checks every visited partition.
+        for namespace in visited {
+            if let Some((partition, sent)) = partitions.sent_report(namespace) {
+                self.queue_changed_report(*namespace, partition, sent);
+            }
+        }
+        let batch = partitions
             .len()
             .div_ceil(
                 usize::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap_or(usize::MAX),
             )
             .max(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN);
-        let visited = owed.min(namespaces.len()).min(batch);
-        let partitions = self.plane.partitions();
-        let mut reports = Vec::with_capacity(visited);
-        for namespace in namespaces[start..]
-            .iter()
-            .chain(&namespaces[..start])
-            .take(visited)
-        {
-            let Some(partition) = partitions.get_by_ns(namespace) else {
+        let mut queued = self.partition_reports_queued.borrow_mut();
+        let mut retractions = self.partition_retractions.borrow_mut();
+        let removed = retractions.len().min(batch);
+        let taken = queued.len().min(batch - removed);
+        let mut views = Vec::new();
+        let mut statuses: Vec<_> = retractions.range(..removed).copied().collect();
+        let mut previous = Vec::with_capacity(taken);
+        for namespace in queued.range(..taken) {
+            // A removed partition left its retraction behind, and a namespace
+            // created again queued itself, maybe twice: the first entry clears
+            // the flag.
+            let Some((partition, report)) = partitions
+                .sent_report(namespace)
+                .filter(|(_, report)| report.get().queued)
+            else {
                 continue;
             };
-            let consensus = partition.consensus();
-            let view = consensus.view();
-            if partition.fatal().is_none()
-                && consensus.is_normal()
-                && !consensus.is_transferring()
-                && !(consensus.has_ceded_primaryship()
-                    && consensus.primary_index(view) == consensus.replica())
-            {
-                reports.push(PartitionPlacementView {
-                    namespace: *namespace,
-                    created_revision: partition.created_revision(),
-                    view,
-                });
-            }
+            let (view, status, next) = self.next_report(*namespace, partition, report.get());
+            views.extend(view);
+            statuses.extend(status);
+            previous.push((report, report.replace(next)));
         }
-        if !reports.is_empty()
+        if !(views.is_empty() && statuses.is_empty())
             && let Err(error) = sender.try_send(ShardFrame::lifecycle(
-                LifecycleFrame::PartitionPlacementViews(reports),
+                LifecycleFrame::PartitionPlacementViews(views, statuses),
             ))
         {
             self.metrics.record_frame_drop(
                 metrics::frame_drop_variant::PARTITION_PLACEMENT_VIEWS,
                 coordinator::classify_try_send_err(&error),
             );
-            // The cursor stays, so the next interval resumes at this range.
-            self.partition_placement_owed.set(0);
+            for (report, previous) in previous {
+                report.set(previous);
+            }
             return;
         }
-        self.partition_placement_cursor
-            .set(Some(namespaces[(start + visited) % namespaces.len()]));
-        self.partition_placement_owed.set(owed - visited);
+        queued.drain(..taken);
+        retractions.drain(..removed);
+    }
+
+    /// Queue `namespace` once shard 0 holds other than what it would report
+    /// now.
+    fn queue_changed_report(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+        sent: &Cell<SentReport>,
+    ) {
+        let report = sent.get();
+        if report.queued {
+            return;
+        }
+        let (view, status, next) = self.next_report(namespace, partition, report);
+        if view.is_some() || status.is_some() {
+            sent.set(SentReport {
+                queued: true,
+                ..report
+            });
+            self.partition_reports_queued
+                .borrow_mut()
+                .push_back(namespace);
+        } else if next != report {
+            // The counters are the same, so they wait another interval.
+            sent.set(next);
+        }
+    }
+
+    /// What `namespace` reports to shard 0 after `sent`, with what shard 0
+    /// then holds:
+    /// - its view, once it serves one it has not reported,
+    /// - a status while it acts as primary, once its view or in-sync nodes
+    ///   move, or once its counters move, checked once per report interval,
+    /// - a retraction, a status with no node in sync, once it stops acting as
+    ///   primary.
+    fn next_report(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+        sent: SentReport,
+    ) -> (
+        Option<PartitionPlacementView>,
+        Option<PartitionStatusEntry>,
+        SentReport,
+    ) {
+        let now = self.ticks();
+        let consensus = partition.consensus();
+        let view = consensus.view();
+        let serving = !self.plane.partitions().is_tombstoned(&namespace)
+            && partition.fatal().is_none()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && !(consensus.has_ceded_primaryship()
+                && consensus.primary_index(view) == consensus.replica());
+        let mut next = SentReport {
+            queued: false,
+            ..sent
+        };
+        let placement = (serving && !(sent.placed && sent.view == view)).then(|| {
+            next.view = view;
+            next.placed = true;
+            PartitionPlacementView {
+                namespace,
+                created_revision: partition.created_revision(),
+                view,
+            }
+        });
+        // `Some` exactly for an acting primary: the checks above leave no
+        // other kind of primary.
+        let in_sync_nodes = serving
+            .then(|| consensus.in_sync_nodes(consensus::MEMBER_LAG_MAX))
+            .flatten();
+        let status = in_sync_nodes.map_or_else(
+            // A retraction keeps the view it retracts, so a successor's report
+            // of a newer view still wins over it.
+            || {
+                sent.primary
+                    .then(|| status_entry(namespace, partition, sent.view, 0))
+            },
+            |in_sync_nodes| {
+                let moved =
+                    !sent.primary || sent.view != view || sent.in_sync_nodes != in_sync_nodes;
+                // Retention moves the counters with no commit, so all of them
+                // count.
+                let counters_due = u128::from(now.saturating_sub(sent.checked_at))
+                    >= PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS;
+                if !(moved || counters_due) {
+                    return None;
+                }
+                let status = status_entry(namespace, partition, view, in_sync_nodes);
+                next.checked_at = now;
+                next.counters = counters_hash(&status);
+                (moved || next.counters != sent.counters).then_some(status)
+            },
+        );
+        if let Some(status) = &status {
+            next.primary = in_sync_nodes.is_some();
+            next.in_sync_nodes = status.in_sync_nodes;
+        }
+        (placement, status, next)
+    }
+
+    /// A removal drops the slot that records what shard 0 holds, so a
+    /// partition that last reported as acting primary leaves its retraction
+    /// to the next batch.
+    fn retract_removed_partition(&self, namespace: IggyNamespace) {
+        let Some((partition, sent)) = self.plane.partitions().sent_report(&namespace) else {
+            return;
+        };
+        let sent = sent.get();
+        if sent.primary {
+            self.partition_retractions
+                .borrow_mut()
+                .push_back(status_entry(namespace, partition, sent.view, 0));
+        }
     }
 
     /// Whether this shard may build a partition offer for `namespace` without
@@ -9570,45 +11460,115 @@ where
         usize::try_from(slots).unwrap_or(usize::MAX).max(1)
     }
 
-    fn may_serve_another_partition_transfer(&self, namespace: u64) -> bool {
+    /// Admit a served transfer of `namespace`, or queue the group for a free
+    /// slot. A group with a build under way or an offer still being pulled
+    /// holds a slot, and its requesters share it. A fully served offer holds
+    /// none: nothing pulls its payload any more, so the cache evicts it ahead
+    /// of the payloads that live pulls keep using. Free slots go to refused
+    /// groups in the order of their first refusal, so a group whose transfer
+    /// just finished queues behind the groups that waited while it was served.
+    fn admit_partition_transfer(&self, namespace: u64) -> bool {
         let builds = self.partition_offer_builds.borrow();
-        if builds.contains_key(&namespace) {
-            return true;
-        }
         let offers = self.state_transfer_offers.borrow();
-        let mut served: Vec<u64> = offers
-            .iter()
-            .filter(|(_, served)| matches!(served.offer, ServedOffer::Partition(_)))
-            .map(|((offer_namespace, _), _)| *offer_namespace)
-            .collect();
-        if served.contains(&namespace) {
-            return true;
-        }
         // Builds count too. A multi-round checksum pass holds no offer yet, so
         // counting only completed offers admitted every requester's whole
         // in-flight set at once and let each run its own pass: the frame bodies
         // stay bounded, but the pump carries N budgets per round-cycle and
         // every other frame, produce included, queues behind them.
-        served.extend(builds.keys().copied());
-        served.sort_unstable();
-        served.dedup();
-        served.len() < self.partition_transfer_admission_cap()
+        let mut holders: Vec<u64> = offers
+            .iter()
+            .filter(|(_, served)| {
+                !served.fully_served && matches!(served.offer, ServedOffer::Partition(_))
+            })
+            .map(|((offer_namespace, _), _)| *offer_namespace)
+            .chain(builds.keys().copied())
+            .collect();
+        if holders.contains(&namespace) {
+            return true;
+        }
+        holders.sort_unstable();
+        holders.dedup();
+        let free = self
+            .partition_transfer_admission_cap()
+            .saturating_sub(holders.len());
+        let mut waiters = self.partition_transfer_waiters.borrow_mut();
+        let queued = waiters.iter().position(|(waiter, _)| *waiter == namespace);
+        if queued.unwrap_or(waiters.len()) < free {
+            if let Some(position) = queued {
+                waiters.remove(position);
+            }
+            return true;
+        }
+        match queued {
+            Some(position) => waiters[position].1 = 0,
+            None => waiters.push((namespace, 0)),
+        }
+        false
     }
 
     /// Serve one partition `RequestStateTransfer`: build (or re-serve) this
     /// group's offer and answer with the descriptor.
-    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    #[allow(clippy::future_not_send)]
     async fn on_partition_request_state_transfer(&self, msg: &Message<RequestStateTransferHeader>)
     where
         B: MessageBus,
     {
-        let header = *msg.header();
-        // Before anything keyed by the requester: the offer map's documented
-        // bound is the replica count, and an unvalidated id makes it 256 entries
-        // per served group, each pinning an offer for its full expiry.
-        if !self.peer_is_known(header.replica, "RequestStateTransfer") {
-            return;
+        self.serve_partition_transfer_request(*msg.header(), None)
+            .await;
+    }
+
+    /// Answer the parked partition transfer requests: with the offer once the
+    /// plan is pinned, or with a refusal once a request waited its bound.
+    ///
+    /// A tick starts at most one offer build, because a build reads and hashes
+    /// up to a whole round budget, and the ticks and heartbeats of every group
+    /// on this shard wait for the tick to end. The other pinned requests stay
+    /// parked, and their wait keeps counting.
+    ///
+    /// The bound refuses only a request that still waits for its pin, so a
+    /// pinned request builds on a later tick even past its bound. It is late
+    /// by at most one tick per other pinned request. Admission holds the
+    /// parked requests to its cap times the requesters of a group, 2 x 2 for 3
+    /// replicas at the defaults, so the answer still arrives inside the half
+    /// retry interval that the bound leaves before the requester re-sends.
+    /// With a larger cap, a request can miss that window, and its re-send then
+    /// builds the offer in its own frame.
+    #[allow(clippy::future_not_send)]
+    async fn serve_parked_partition_transfer_requests(&self)
+    where
+        B: MessageBus,
+    {
+        let parked = std::mem::take(&mut *self.parked_partition_transfer_requests.borrow_mut());
+        let mut build_started = false;
+        for (key, mut request) in parked {
+            request.waited_ticks += 1;
+            let builds = self
+                .plane
+                .partitions()
+                .get_by_ns(&IggyNamespace::from_raw(key.0))
+                .is_some_and(IggyPartition::transfer_plan_pinned);
+            if builds && build_started {
+                self.parked_partition_transfer_requests
+                    .borrow_mut()
+                    .insert(key, request);
+                continue;
+            }
+            build_started |= builds;
+            self.serve_partition_transfer_request(request.header, Some(request.waited_ticks))
+                .await;
         }
+    }
+
+    /// `parked_wait` holds the ticks that a parked request waited when the
+    /// tick answers it, and `None` for a request from the wire.
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn serve_partition_transfer_request(
+        &self,
+        header: RequestStateTransferHeader,
+        parked_wait: Option<u32>,
+    ) where
+        B: MessageBus,
+    {
         let planes = self.plane.inner();
         let config = planes.1.0.config().clone();
         let Some(partition) = planes
@@ -9625,6 +11585,26 @@ where
         ) {
             return;
         }
+        // Before anything keyed by the requester: an unvalidated id makes the
+        // offer map 256 entries per served group, each pinning an offer for its
+        // full expiry.
+        if !self.member_is_known(
+            partition.consensus().replica_count(),
+            header.replica,
+            "RequestStateTransfer",
+        ) {
+            return;
+        }
+        // Only a request that passed the gates replaces a parked one. A re-send
+        // keeps the wait that its nonce already spent parked, so re-sends
+        // cannot hold the build slot past the bound.
+        let waited_ticks = parked_wait.unwrap_or_else(|| {
+            self.parked_partition_transfer_requests
+                .borrow_mut()
+                .remove(&(header.group, header.replica))
+                .filter(|parked| parked.header.nonce == header.nonce)
+                .map_or(0, |parked| parked.waited_ticks)
+        });
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
         // First-wins per (requester, nonce), exactly as the metadata arm: a
@@ -9644,11 +11624,41 @@ where
                 served.idle_ticks = 0;
                 Some(Rc::clone(offer))
             });
+        let serves_transfer = partition.serves_state_transfer();
+        let admitted =
+            cached.is_some() || !serves_transfer || self.admit_partition_transfer(header.group);
+        let tail_available = !serves_transfer
+            || (admitted
+                && partition.retain_transfer_tail(header.replica, header.nonce, self.ticks()));
 
         // One resolve, one send: the three outcomes differ only in the
         // descriptor they produce, and duplicating the send made it possible for
         // them to drift on the progress they advertise.
         let offer = match cached {
+            _ if !tail_available => {
+                if !admitted {
+                    tracing::info!(
+                        shard = self.id,
+                        namespace_raw = header.group,
+                        requester = header.replica,
+                        "already serving as many partition transfers as the served-payload \
+                         budget holds; refusing until a free slot reaches this group"
+                    );
+                }
+                let (view, commit_max) = serving_progress(partition);
+                self.send_state_transfer_target(
+                    cluster,
+                    self_id,
+                    *partition.consensus().members(),
+                    header.replica,
+                    header.nonce,
+                    header.group,
+                    partition.created_revision(),
+                    TransferDescriptor::unavailable(true, view, commit_max),
+                )
+                .await;
+                return;
+            }
             Some(offer) => {
                 tracing::debug!(
                     shard = self.id,
@@ -9659,37 +11669,6 @@ where
                 );
                 Some(offer)
             }
-            None if !self.may_serve_another_partition_transfer(header.group) => {
-                // Admission control, because the served-payload budget is a
-                // BYTE budget and the pulls that overrun it do not degrade
-                // gracefully. Each concurrent pull holds a different segment
-                // resident, so admitting more distinct groups than the budget
-                // has max-size slots makes them evict each other on every
-                // chunk: every request then re-reads and re-hashes a whole
-                // segment to serve one 256 KiB range, and a per-chunk serve
-                // that outruns the requester's stall interval exhausts its
-                // retry budget, so the pull rotates peers and never converges.
-                // Refusing the surplus is what makes the admitted ones finish.
-                tracing::info!(
-                    shard = self.id,
-                    namespace_raw = header.group,
-                    requester = header.replica,
-                    "already serving as many partition transfers as the served-payload \
-                     budget holds; refusing until one completes"
-                );
-                let (view, commit_max) = serving_progress(partition);
-                self.send_state_transfer_target(
-                    cluster,
-                    self_id,
-                    header.replica,
-                    header.nonce,
-                    header.group,
-                    partition.created_revision(),
-                    TransferDescriptor::unavailable(true, view, commit_max),
-                )
-                .await;
-                return;
-            }
             None => {
                 // Claim the admission slot for the whole build, not just for a
                 // completed offer: the checksum pass runs over several rounds
@@ -9697,7 +11676,15 @@ where
                 self.partition_offer_builds
                     .borrow_mut()
                     .insert(header.group, 0);
-                match partition.state_transfer_offer(&config).await {
+                let built = partition.state_transfer_offer(&config).await.and_then(|offer| {
+                    if partition.transfer_tail_available(header.replica, header.nonce, offer.commit_op) {
+                        Ok(offer)
+                    } else {
+                        partition.clear_state_transfer_offer_cache();
+                        Err(partitions::state_transfer::PartitionTransferUnavailable::RepairTailExpired)
+                    }
+                });
+                match built {
                     Ok(offer) => {
                         self.partition_offer_builds
                             .borrow_mut()
@@ -9721,6 +11708,23 @@ where
                             },
                         );
                         Some(offer)
+                    }
+                    // Only the plan pin is missing, and an I/O turn pins it
+                    // soon. The build slot stays claimed, as for any resumable
+                    // refusal, and the tick answers the request.
+                    Err(partitions::state_transfer::PartitionTransferUnavailable::FlushPending)
+                        if waited_ticks
+                            < self.repair_retry_ticks.get()
+                                / PARKED_TRANSFER_REQUEST_WAIT_DIVISOR =>
+                    {
+                        self.parked_partition_transfer_requests.borrow_mut().insert(
+                            (header.group, header.replica),
+                            ParkedTransferRequest {
+                                header,
+                                waited_ticks,
+                            },
+                        );
+                        return;
                     }
                     Err(reason) => {
                         // The ACTUAL reason: "not the caught-up primary" is routine
@@ -9752,6 +11756,7 @@ where
                         self.send_state_transfer_target(
                             cluster,
                             self_id,
+                            *partition.consensus().members(),
                             header.replica,
                             header.nonce,
                             header.group,
@@ -9777,6 +11782,7 @@ where
         self.send_state_transfer_target(
             cluster,
             self_id,
+            *partition.consensus().members(),
             header.replica,
             header.nonce,
             header.group,
@@ -9786,27 +11792,44 @@ where
         .await;
     }
 
+    #[allow(clippy::future_not_send)]
+    async fn on_partition_request_state_chunk(&self, msg: &Message<RequestStateChunkHeader>)
+    where
+        B: MessageBus,
+    {
+        self.serve_partition_chunk(*msg.header(), None).await;
+    }
+
     /// Serve one partition chunk. Segment payloads are loaded from disk on
     /// demand into the shard-wide [`ServedSegmentCache`] (content-addressed,
     /// so simultaneous rejoiners share one resident copy); a load or
     /// re-verification failure (GC unlinked the file, bytes changed) evicts
     /// the offer and tells the requester to restart with a fresh one --
     /// which then reflects the current segment set, so the retry converges.
+    ///
+    /// A detached read loads the segment bytes, and the pump serves the
+    /// request again with them in `loaded`, beside the artifact they came from.
     #[allow(
         clippy::future_not_send,
         clippy::cast_possible_truncation,
         clippy::too_many_lines
     )]
-    async fn on_partition_request_state_chunk(&self, msg: &Message<RequestStateChunkHeader>)
-    where
+    async fn serve_partition_chunk(
+        &self,
+        header: RequestStateChunkHeader,
+        mut loaded: Option<(
+            consensus::StateArtifact,
+            Result<Vec<u8>, partitions::state_transfer::SegmentLoadError>,
+        )>,
+    ) where
         B: MessageBus,
     {
-        // TODO: Move partition offer hashing, segment loads and receiver spills
-        // into bounded file-lane jobs so they cannot stall consensus ticks.
+        // TODO: Move partition offer hashing off the pump, so it cannot stall
+        // consensus ticks.
         // Pass 1 inside the borrow decides; a segment artifact that is not
-        // resident exits with its path and is loaded OUTSIDE the borrow (a
-        // RefCell borrow must not be held across an await), then pass 2
-        // stores and serves it.
+        // resident exits with its path and a detached read loads it (a
+        // RefCell borrow must not be held across an await), then pass 2 of
+        // the serve that gets the bytes stores and serves them.
         enum ChunkAttempt {
             Reply(Option<ChunkReply>),
             Load {
@@ -9815,9 +11838,11 @@ where
             },
         }
 
-        let header = *msg.header();
-        // The requester id keys the offer map, whose bound is the replica count.
-        if !self.peer_is_known(header.replica, "RequestStateChunk") {
+        let read_key = ServedReadKey::Chunk {
+            group: header.group,
+            requester: header.replica,
+        };
+        if loaded.is_none() && self.served_reads.reading(read_key) {
             return;
         }
         let planes = self.plane.inner();
@@ -9831,11 +11856,21 @@ where
         ) {
             return;
         }
+        // The requester id keys the offer map, whose bound is the group size.
+        if !self.member_is_known(
+            partition.consensus().replica_count(),
+            header.replica,
+            "RequestStateChunk",
+        ) {
+            return;
+        }
         let cluster = partition.consensus().cluster();
         let self_id = partition.consensus().replica();
+        let members = *partition.consensus().members();
         let serving_view = partition.consensus().view();
         let serving_commit_max = partition.consensus().commit_max();
         let chunk_len_max = self.state_chunk_len_max();
+        let mut loaded_chunk = None;
         let reply = loop {
             let attempt = 'attempt: {
                 let mut offers = self.state_transfer_offers.borrow_mut();
@@ -9847,6 +11882,11 @@ where
                         transient: true,
                     }));
                 };
+                if !partition.touch_transfer_tail(header.replica, header.nonce, self.ticks()) {
+                    break 'attempt ChunkAttempt::Reply(Some(ChunkReply::Unavailable {
+                        transient: true,
+                    }));
+                }
                 let ServedOffer::Partition(offer) = &served.offer else {
                     break 'attempt ChunkAttempt::Reply(Some(ChunkReply::Unavailable {
                         transient: true,
@@ -9856,11 +11896,15 @@ where
                 let artifact = header.artifact as usize;
                 // Keeps a segment payload alive past the cache borrow below.
                 let segment_payload: Rc<Vec<u8>>;
-                let artifact_bytes: &[u8] = match offer.artifact_at(artifact) {
-                    Some(partitions::state_transfer::PartitionArtifactSource::Offsets(bytes)) => {
-                        bytes
-                    }
+                let (artifact_bytes, start): (&[u8], usize) = match offer.artifact_at(artifact) {
+                    Some(
+                        partitions::state_transfer::PartitionArtifactSource::Offsets(bytes)
+                        | partitions::state_transfer::PartitionArtifactSource::Chain(bytes),
+                    ) => (bytes, header.offset as usize),
                     Some(partitions::state_transfer::PartitionArtifactSource::Segment(source)) => {
+                        if header.offset >= source.entry.len || header.len == 0 {
+                            break 'attempt ChunkAttempt::Reply(None);
+                        }
                         match self
                             .served_segment_cache
                             .borrow_mut()
@@ -9868,20 +11912,23 @@ where
                         {
                             Some(payload) => {
                                 segment_payload = payload;
-                                &segment_payload
+                                (&segment_payload, header.offset as usize)
                             }
                             None => {
-                                break 'attempt ChunkAttempt::Load {
-                                    log_path: source.log_path.clone(),
-                                    entry: source.entry,
-                                };
+                                if let Some(bytes) = loaded_chunk.as_deref() {
+                                    (bytes, 0)
+                                } else {
+                                    break 'attempt ChunkAttempt::Load {
+                                        log_path: source.log_path.clone(),
+                                        entry: source.entry,
+                                    };
+                                }
                             }
                         }
                     }
                     // Index past the manifest: requester bug or stale frame.
                     None => break 'attempt ChunkAttempt::Reply(None),
                 };
-                let start = header.offset as usize;
                 // `start >= len` is the empty-chunk livelock refusal; see the
                 // metadata arm for the full story.
                 if start >= artifact_bytes.len() {
@@ -9931,24 +11978,54 @@ where
             match attempt {
                 ChunkAttempt::Reply(reply) => break reply,
                 ChunkAttempt::Load { log_path, entry } => {
-                    // Chunked read + incremental hash: this runs on the pump to
-                    // answer ONE 256 KiB chunk request, so a whole-file read
-                    // plus a single hash pass over up to a segment would be one
-                    // long uninterruptible CPU+IO block. The chunking keeps the
-                    // REACTOR moving; this shard's consensus ticks are a sibling
-                    // select arm of the same task and stay frozen either way.
-                    let loaded = partitions::state_transfer::load_verified_segment_artifact(
-                        &log_path, &entry,
-                    )
-                    .await;
-                    let reason = match loaded {
+                    // A whole-segment read can outlive the requester's retry
+                    // budget. Cache only artifacts that fit one chunk; the
+                    // receiver verifies larger artifacts before install.
+                    let cache_whole = header.offset == 0 && entry.len <= chunk_len_max as u64;
+                    // The offer can change while a read runs. Bytes of another
+                    // artifact must never serve, or fill the cache for, this one.
+                    let Some(load) = loaded
+                        .take()
+                        .and_then(|(artifact, load)| (artifact == entry).then_some(load))
+                    else {
+                        let len = u64::from(header.len)
+                            .min(chunk_len_max as u64)
+                            .min(entry.len - header.offset)
+                            as usize;
+                        self.served_reads.start(&self.bus, read_key, async move {
+                            let load = if cache_whole {
+                                partitions::state_transfer::load_verified_segment_artifact(
+                                    &log_path, &entry,
+                                )
+                                .await
+                            } else {
+                                partitions::state_transfer::load_segment_chunk(
+                                    &log_path,
+                                    header.offset,
+                                    len,
+                                )
+                                .await
+                            };
+                            LandedRead::Chunk {
+                                header,
+                                artifact: entry,
+                                load,
+                            }
+                        });
+                        return;
+                    };
+                    let reason = match load {
                         Ok(bytes) => {
-                            self.served_segment_cache.borrow_mut().insert(
-                                header.group,
-                                entry.checksum,
-                                Rc::new(bytes),
-                                self.served_segment_cache_bytes_max.get(),
-                            );
+                            if cache_whole {
+                                self.served_segment_cache.borrow_mut().insert(
+                                    header.group,
+                                    entry.checksum,
+                                    Rc::new(bytes),
+                                    self.served_segment_cache_bytes_max.get(),
+                                );
+                            } else {
+                                loaded_chunk = Some(bytes);
+                            }
                             continue;
                         }
                         Err(reason) => reason,
@@ -9981,10 +12058,12 @@ where
         };
         match reply {
             Some(ChunkReply::Chunk(chunk)) => {
-                let _ = self
-                    .bus
-                    .send_to_replica(header.replica, chunk.into_generic().into_frozen())
-                    .await;
+                if let Some(node) = members.node(header.replica) {
+                    let _ = self
+                        .bus
+                        .send_to_replica(node, chunk.into_generic().into_frozen())
+                        .await;
+                }
             }
             Some(ChunkReply::Unavailable { transient }) => {
                 tracing::info!(
@@ -9997,6 +12076,7 @@ where
                 self.send_state_transfer_target(
                     cluster,
                     self_id,
+                    *partition.consensus().members(),
                     header.replica,
                     header.nonce,
                     header.group,
@@ -10028,58 +12108,19 @@ where
     const PARTITION_TRANSFER_TOTAL_LEN_MAX: u64 = 1 << 40;
 
     /// Bound the buffered offset and dedup state plus one maximum-sized
-    /// checkpoint prepare and its length prefix before allocating the artifact.
-    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 =
-        (32 << 20) + journal::partition_journal::PREPARE_BYTES_MAX as u64 + 4;
+    /// checkpoint prepare and state-machine snapshot, each with its length
+    /// prefix, before allocating the artifact.
+    const CONSUMER_OFFSETS_ARTIFACT_LEN_MAX: u64 = (32 << 20)
+        + journal::partition_journal::PREPARE_BYTES_MAX as u64
+        + 4
+        + partitions::state_machine::SNAPSHOT_BYTES_MAX as u64
+        + 4;
 
     /// Concurrent partition transfers this shard will run as a RECEIVER. A
     /// whole-node rejoin arms one per lagging partition; unbounded, the sum
     /// of in-flight buffers and staging writes is partitions x segment
     /// size. Capped-out arms retry via the scheduled re-arm sweep.
     const PARTITION_TRANSFERS_INFLIGHT_MAX: usize = 4;
-
-    /// Whether arming a transfer for `namespace` is even possible right now.
-    ///
-    /// Takes a SHARED borrow and drops it before returning, so a caller may form
-    /// its `&mut partition` afterwards. The point is to keep the in-flight scan
-    /// -- which borrows every partition on the shard -- off frames that cannot
-    /// arm anything: a namespace this shard does not own, and the ordinary case
-    /// of a group that is neither awaiting a transfer nor idle-with-no-re-arm.
-    fn may_arm_partition_transfer(partitions: &IggyPartitions<B, SB>, namespace_raw: u64) -> bool
-    where
-        B: MessageBus,
-    {
-        partitions
-            .get_by_ns(&IggyNamespace::from_raw(namespace_raw))
-            .is_some_and(|partition| {
-                partition.transfer.is_none()
-                    && matches!(
-                        partition.consensus().state_transfer_stage(),
-                        consensus::StateTransferStage::AwaitingTarget
-                            | consensus::StateTransferStage::Idle
-                    )
-            })
-    }
-
-    /// Receiving-side transfers currently in flight on this shard.
-    ///
-    /// One scan per call, so callers hoist it: with per-partition groups a
-    /// per-namespace call inside the tick sweep is O(P^2) exactly during a
-    /// node-wide view change or rejoin, and capped arms reschedule on the flat
-    /// retry interval, so the losers stay phase-locked and the sweep repeats
-    /// every interval for the whole rejoin.
-    fn partition_transfers_inflight(&self) -> usize {
-        let partitions = self.plane.partitions();
-        let namespaces: Vec<_> = partitions.namespaces().copied().collect();
-        namespaces
-            .iter()
-            .filter(|namespace| {
-                partitions
-                    .get_by_ns(namespace)
-                    .is_some_and(|partition| partition.transfer.is_some())
-            })
-            .count()
-    }
 
     /// Drop every trace of `namespace`'s current bytes from the serving side:
     /// the partition's own offer cache, this shard's cached offers, and the
@@ -10116,15 +12157,8 @@ where
             .evict_namespace(namespace);
     }
 
-    /// Whether a peer-supplied source replica id names a replica of this
-    /// cluster.
-    ///
-    /// `header.replica` arrives unvalidated on every frame, and the partition
-    /// transfer paths turn it into ring arithmetic ([`next_transfer_peer`], where
-    /// id 255 panics in debug and wraps to replica 0 in release -- a silent
-    /// retarget) and into the served-offer map key, whose documented bound is the
-    /// replica count rather than 256 entries per served group. One check at the
-    /// frame's ingress closes both.
+    /// Whether a peer-supplied source node id names a node of this cluster.
+    /// Partition frames carry member indices instead; see [`Self::member_is_known`].
     fn peer_is_known(&self, replica: u8, frame: &'static str) -> bool {
         let replica_count = self.partition_consensus.replica_count;
         if replica < replica_count {
@@ -10135,7 +12169,46 @@ where
             frame,
             replica,
             replica_count,
-            "dropping a partition frame whose source replica is outside this cluster"
+            "dropping a frame whose source replica is outside this cluster"
+        );
+        false
+    }
+
+    /// Whether a partition-group frame names a sender inside its group, as far
+    /// as this shard knows the group. Every consensus handler indexes per-member
+    /// state by that field.
+    fn partition_frame_source_is_member(&self, message: &MessageBag) -> bool {
+        let Some(replica) = message.partition_source_replica() else {
+            return true;
+        };
+        let (_, group) = message.routing();
+        let Some(group_size) = self
+            .plane
+            .partitions()
+            .get_by_ns(&IggyNamespace::from_raw(group))
+            .map(|partition| partition.consensus().replica_count())
+        else {
+            return true;
+        };
+        self.member_is_known(group_size, replica, "partition consensus frame")
+    }
+
+    /// Whether a peer-supplied member index names a replica of a partition
+    /// group of `group_size` members.
+    ///
+    /// `header.replica` arrives unvalidated, and the transfer paths turn it into
+    /// ring arithmetic ([`next_transfer_peer`]) and into the served-offer map
+    /// key, whose bound is the group size.
+    fn member_is_known(&self, group_size: u8, replica: u8, frame: &'static str) -> bool {
+        if replica < group_size {
+            return true;
+        }
+        tracing::warn!(
+            shard = self.id,
+            frame,
+            replica,
+            group_size,
+            "dropping a partition frame whose source replica is outside its group"
         );
         false
     }
@@ -10232,37 +12305,24 @@ where
 
     /// Arm a fresh partition transfer session against `peer` and request its
     /// descriptor. Every partition arming site goes through here. Drops any
-    /// repair session (transfer supersedes repair; a transfer-unavailable
-    /// fallback re-arms repair fresh) and leaves the stage to its callers (they
-    /// own the `AwaitingTarget` transition).
+    /// repair session (transfer supersedes repair) and leaves the stage to its
+    /// callers (they own the `AwaitingTarget` transition).
     ///
     /// Refuses past [`Self::PARTITION_TRANSFERS_INFLIGHT_MAX`]: the arm
     /// converts to a scheduled re-arm (no failure charged -- the local slot
-    /// shortage is not the peer's fault) and the stage returns to Idle so
-    /// journal repair keeps the gap visible meanwhile.
-    ///
-    /// `transfers_inflight` is computed by the caller BEFORE it formed its
-    /// `&mut partition`: the counting scan takes shared borrows of every
-    /// partition, and deriving a sibling `&` to the element the caller's
-    /// protected `&mut` points at is UB under both stacked and tree borrows,
-    /// however innocuous the generated code is today. Returns whether a session
-    /// was armed, so a caller sweeping many groups can carry the count forward
-    /// instead of re-scanning per group.
+    /// shortage is not the peer's fault) and the stage returns to Idle, which
+    /// is the stage the re-arm fires from.
     #[allow(clippy::future_not_send)]
-    async fn arm_partition_transfer(
-        &self,
-        partition: &mut IggyPartition<B, SB>,
-        peer: u8,
-        transfers_inflight: usize,
-    ) -> bool
+    async fn arm_partition_transfer(&self, partition: &mut IggyPartition<B, SB>, peer: u8)
     where
         B: MessageBus,
     {
         if self.shutting_down.get() || partition.is_shutting_down() {
-            return false;
+            return;
         }
-        if partition.transfer.is_none()
-            && transfers_inflight >= Self::PARTITION_TRANSFERS_INFLIGHT_MAX
+        let partitions = self.plane.partitions();
+        if partition.transfer().is_none()
+            && partitions.transfers_inflight() >= Self::PARTITION_TRANSFERS_INFLIGHT_MAX
         {
             tracing::info!(
                 shard = self.id,
@@ -10279,23 +12339,26 @@ where
                 peer,
                 after_ticks: self.repair_retry_ticks.get(),
             });
-            return false;
+            return;
         }
-        partition.repair = None;
+        partition.set_repair(None);
         partition.restart_repair_budget();
         let nonce = iggy_common::random_id::get_uuid();
-        let armed = partition.transfer.is_none();
-        partition.transfer = Some(partitions::state_transfer::PartitionTransferSession {
+        partition.set_transfer(Some(partitions::state_transfer::PartitionTransferSession {
             nonce,
             peer,
             commit_op: 0,
             artifacts: Vec::new(),
             target_accepted: false,
             idle_ticks: 0,
-        });
+            spill: None,
+            scan: None,
+            seed: None,
+            pulled_len: 0,
+            slot: partitions.transfer_slot(),
+        }));
         self.send_request_state_transfer(partition.consensus(), peer, nonce)
             .await;
-        armed
     }
 
     /// Arm partition journal repair when this replica is lagging its group
@@ -10321,9 +12384,14 @@ where
         B: MessageBus + 'static,
         T: ShardsTable,
     {
+        // A scheduled transfer re-arm owns recovery, as at the gap detector and
+        // the floor-refused arm: it exists because repair could not fill the
+        // gap, and frames that a session journals above the gap meanwhile only
+        // wait for the install to wipe them.
         if !partition.consensus().is_normal()
             || partition.consensus().is_transferring()
-            || partition.repair.is_some()
+            || partition.transfer_rearm.is_some()
+            || partition.repair().is_some()
             || partition.view_truncation_pending()
         {
             return false;
@@ -10426,7 +12494,7 @@ where
         partition.gap_ticks.set(0);
         self.partition_repairs_inflight
             .set(self.partition_repairs_inflight.get() + 1);
-        partition.repair = Some(partitions::RepairSession {
+        partition.set_repair(Some(partitions::RepairSession {
             nonce,
             view: consensus.view(),
             from_op,
@@ -10437,7 +12505,7 @@ where
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(from_op),
-        });
+        }));
         tracing::info!(
             shard = self.id,
             namespace_raw = partition.consensus().group(),
@@ -10455,6 +12523,7 @@ where
             fetch_to_op,
             partition.consensus().group(),
             partition.created_revision(),
+            partition.note_proof_walk_request(),
         )
         .await;
         true
@@ -10475,8 +12544,7 @@ where
             return;
         };
         let next = partition
-            .repair
-            .as_mut()
+            .repair_mut()
             .filter(|live| proof_op > live.from_op)
             .map(|live| {
                 live.from_op = proof_op;
@@ -10494,6 +12562,7 @@ where
             to_op,
             partition.consensus().group(),
             partition.created_revision(),
+            partition.note_proof_walk_request(),
         )
         .await;
     }
@@ -10515,8 +12584,7 @@ where
             .view_log_repair_op()
             .unwrap_or_else(|| consensus.commit_min() + 1);
         let retarget = partition
-            .repair
-            .as_mut()
+            .repair_mut()
             .filter(|session| session.peer != primary)
             .map(|session| {
                 session.peer = primary;
@@ -10545,6 +12613,7 @@ where
             to_op,
             partition.consensus().group(),
             partition.created_revision(),
+            partition.note_proof_walk_request(),
         )
         .await;
     }
@@ -10571,7 +12640,7 @@ where
     ) where
         B: MessageBus,
     {
-        if partition.repair.is_some() || from_op > to_op {
+        if partition.repair().is_some() || from_op > to_op {
             return;
         }
         if self.partition_repairs_inflight.get() >= PARTITION_REPAIRS_INFLIGHT_MAX {
@@ -10598,7 +12667,7 @@ where
         let view = consensus.view();
         self.partition_repairs_inflight
             .set(self.partition_repairs_inflight.get() + 1);
-        partition.repair = Some(partitions::RepairSession {
+        partition.set_repair(Some(partitions::RepairSession {
             nonce,
             view,
             from_op,
@@ -10612,7 +12681,7 @@ where
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(from_op),
-        });
+        }));
         tracing::info!(
             shard = self.id,
             namespace_raw = namespace,
@@ -10629,6 +12698,7 @@ where
             to_op,
             namespace,
             partition.created_revision(),
+            partition.note_proof_walk_request(),
         )
         .await;
     }
@@ -10644,11 +12714,6 @@ where
         M: StreamsFrontend,
     {
         let header = *msg.header();
-        // The peer id reaches `next_transfer_peer`'s ring arithmetic through the
-        // re-arm below, so it is validated before anything uses it.
-        if !self.peer_is_known(header.replica, "StateTransferTarget") {
-            return;
-        }
         let planes = self.plane.inner();
         let Some(partition) = planes
             .1
@@ -10664,13 +12729,21 @@ where
         ) {
             return;
         }
+        // The peer id reaches `next_transfer_peer`'s ring arithmetic through the
+        // re-arm below, so it is validated before anything uses it.
+        if !self.member_is_known(
+            partition.consensus().replica_count(),
+            header.replica,
+            "StateTransferTarget",
+        ) {
+            return;
+        }
         if partition.history_is_busy() {
             partition.defer_view_transition(MessageBag::StateTransferTarget(msg.clone()));
             return;
         }
         let session_matches = partition
-            .transfer
-            .as_ref()
+            .transfer()
             .is_some_and(|session| session.nonce == header.nonce);
         if !session_matches {
             return;
@@ -10803,6 +12876,9 @@ where
             consensus::artifact_kind::CONSUMER_OFFSETS => {
                 entry.len <= Self::CONSUMER_OFFSETS_ARTIFACT_LEN_MAX
             }
+            consensus::artifact_kind::SEGMENT_CHAIN => {
+                entry.len <= partitions::segment_chain::CHAIN_ARTIFACT_LEN_MAX
+            }
             _ => false,
         });
         if !kind_capped || total_len > Self::PARTITION_TRANSFER_TOTAL_LEN_MAX {
@@ -10815,8 +12891,7 @@ where
             return;
         }
         if partition
-            .transfer
-            .as_ref()
+            .transfer()
             .is_some_and(|session| session.target_accepted)
         {
             // A crossed stall-retry descriptor: first-wins already served the
@@ -10824,36 +12899,20 @@ where
             // and re-run the staging scan for nothing.
             return;
         }
-        let reused = partition.reuse_staged_segments(&entries).await;
-        if !reused.is_empty() {
-            tracing::info!(
-                shard = self.id,
-                namespace_raw = header.group,
-                peer = header.replica,
-                adopted = reused.len(),
-                artifacts = entries.len(),
-                "adopted staged segments from an earlier transfer attempt"
-            );
-        }
-        // Re-check the nonce AFTER the await: the staging scan yields, and a
-        // session re-minted underneath it must not get stamped with this
-        // (now stale) offer's commit_op and manifest.
-        let Some(session) = partition
-            .transfer
-            .as_mut()
-            .filter(|session| session.nonce == header.nonce)
-        else {
+        let scan = partition.begin_reuse_scan(&entries);
+        let Some(session) = partition.transfer_mut() else {
             return;
         };
         session.target_accepted = true;
         session.commit_op = header.commit_op;
+        session.scan = Some(scan);
         // No reservation here: the manifest's total is bounded only by
         // `PARTITION_TRANSFER_TOTAL_LEN_MAX` (1 TiB), so reserving every
         // artifact up front is an eager address-space commit of the whole
         // manifest -- times the in-flight cap -- which turns fatal under strict
         // overcommit, `RLIMIT_AS`, or cgroup accounting, and contradicts the
         // session's own promise to bound receiver memory to ONE in-flight
-        // artifact. Artifacts adopted by the reuse scan below would also be
+        // artifact. Artifacts that the reuse scan adopts would also be
         // reserved and then overwritten with `Staged`, making the retry path's
         // reservation pure waste. `append_chunk` reserves the declared length on
         // an artifact's FIRST chunk instead, and only ever for the artifact the
@@ -10868,9 +12927,6 @@ where
             })
             .collect();
         session.idle_ticks = 0;
-        for (index, meta) in reused {
-            session.artifacts[index as usize] = TransferArtifact::Staged(meta);
-        }
         let consensus = partition.consensus();
         if consensus.state_transfer_stage() == consensus::StateTransferStage::AwaitingTarget {
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Fetching);
@@ -10904,7 +12960,7 @@ where
             return;
         }
         {
-            let Some(session) = partition.transfer.as_mut() else {
+            let Some(session) = partition.transfer_mut() else {
                 return;
             };
             if session.nonce != header.nonce || !session.target_accepted {
@@ -10921,6 +12977,9 @@ where
             if session.peer != header.replica {
                 return;
             }
+            if session.spill.is_some() {
+                return;
+            }
             let payload = &msg.as_slice()[size_of::<StateChunkHeader>()..header.size as usize];
             if !consensus::append_chunk(
                 &mut session.artifacts,
@@ -10931,6 +12990,7 @@ where
                 return;
             }
             session.idle_ticks = 0;
+            session.pulled_len += payload.len() as u64;
         }
         partition.note_transfer_progress();
         self.on_partition_transfer_progress(header.group).await;
@@ -10944,7 +13004,6 @@ where
     where
         B: MessageBus + 'static,
         T: ShardsTable,
-        M: StreamsFrontend,
     {
         let planes = self.plane.inner();
         let config = planes.1.0.config().clone();
@@ -10961,20 +13020,76 @@ where
         // would assert. Detect the out-from-under abandon and drop the
         // session here (staging files are KEPT for reuse).
         if partition.consensus().state_transfer_stage() != consensus::StateTransferStage::Fetching {
-            if partition.transfer.is_some() {
+            if partition.transfer().is_some() {
                 tracing::info!(
                     shard = self.id,
                     namespace_raw = namespace,
                     "partition state transfer was abandoned out from under its session; dropping it"
                 );
-                partition.transfer = None;
+                partition.set_transfer(None);
             }
             return;
         }
-        let Some(session) = partition.transfer.as_ref() else {
+        let Some(session) = partition.transfer() else {
             return;
         };
         if !session.target_accepted {
+            return;
+        }
+        // The reuse scan writes the staging names that a spill writes, so
+        // nothing spills or installs before it lands.
+        if self.drive_reuse_scan(partition, namespace) {
+            return;
+        }
+        let landed_spill = partition.transfer_mut().and_then(|session| {
+            let spill = session.spill.as_ref()?;
+            let result = spill.work.result.borrow_mut().take()?;
+            let artifact = spill.artifact;
+            let seeded = spill.seeded;
+            session.spill = None;
+            Some((artifact, seeded, session.peer, result))
+        });
+        if let Some((index, seeded, peer, result)) = landed_spill {
+            match result {
+                Ok(spilled) => {
+                    let meta = partition.accept_transfer_segment_spill(spilled);
+                    if let Some(session) = partition.transfer_mut() {
+                        session.artifacts[index] = TransferArtifact::Staged(meta);
+                    }
+                }
+                // The local prefix is not a prefix of the offered segment. The
+                // spill took the buffer, so the artifact pulls again from its
+                // first byte, and nothing about the peer is charged.
+                Err(partitions::state_transfer::SpillError::ManifestChecksum { .. }) if seeded => {
+                    tracing::warn!(
+                        shard = self.id,
+                        namespace_raw = namespace,
+                        artifact = index,
+                        "the local segment prefix does not match the offered artifact, \
+                         so the pull fetches the whole artifact"
+                    );
+                    return Box::pin(self.on_partition_transfer_progress(namespace)).await;
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        shard = self.id,
+                        namespace_raw = namespace,
+                        artifact = index,
+                        %reason,
+                        "partition transfer segment failed validation at spill"
+                    );
+                    self.abandon_or_rearm_partition_transfer(partition, peer)
+                        .await;
+                    return;
+                }
+            }
+            return Box::pin(self.on_partition_transfer_progress(namespace)).await;
+        }
+        let Some(session) = partition.transfer() else {
+            return;
+        };
+
+        if session.spill.is_some() {
             return;
         }
 
@@ -10993,48 +13108,41 @@ where
                     .then_some(index)
             });
         if let Some(index) = spill_candidate {
-            let (entry, bytes, peer, nonce) = {
-                let Some(session) = partition.transfer.as_mut() else {
+            let (entry, bytes, prefix) = {
+                let Some(session) = partition.transfer_mut() else {
                     return;
+                };
+                let prefix = match session.seed.take() {
+                    Some(partitions::state_transfer::PrefixSeed::Seeded { artifact, prefix })
+                        if artifact as usize == index =>
+                    {
+                        Some(prefix)
+                    }
+                    seed => {
+                        session.seed = seed;
+                        None
+                    }
                 };
                 let Some(progress) = session.artifacts[index].pending_mut() else {
                     return;
                 };
                 let bytes = std::mem::take(&mut progress.buf);
-                (progress.entry, bytes, session.peer, session.nonce)
+                (progress.entry, bytes, prefix)
             };
-            match partition.spill_transfer_segment(&entry, bytes).await {
-                Ok(meta) => {
-                    // Nonce re-check across the spill await: a session
-                    // re-minted underneath it has a fresh (possibly empty)
-                    // artifact vec, and the stale index would panic. Pump-
-                    // serial today, but nothing enforces that.
-                    if let Some(session) = partition
-                        .transfer
-                        .as_mut()
-                        .filter(|session| session.nonce == nonce)
-                    {
-                        session.artifacts[index] = TransferArtifact::Staged(meta);
-                    }
-                }
-                Err(reason) => {
-                    tracing::warn!(
-                        shard = self.id,
-                        namespace_raw = namespace,
-                        artifact = index,
-                        %reason,
-                        "partition transfer segment failed validation at spill"
-                    );
-                    self.abandon_or_rearm_partition_transfer(partition, peer)
-                        .await;
-                    return;
-                }
+            let seeded = prefix.is_some();
+            let work = partition.begin_transfer_segment_spill(&entry, bytes, prefix);
+            if let Some(session) = partition.transfer_mut() {
+                session.idle_ticks = 0;
+                session.spill = Some(partitions::state_transfer::SegmentSpill {
+                    artifact: index,
+                    seeded,
+                    work,
+                });
             }
-            // Tail-call for the next candidate / chunk request.
-            return Box::pin(self.on_partition_transfer_progress(namespace)).await;
+            return;
         }
 
-        let Some(session) = partition.transfer.as_ref() else {
+        let Some(session) = partition.transfer() else {
             return;
         };
         let all_done = session.artifacts.iter().all(ChunkProgress::complete);
@@ -11049,13 +13157,21 @@ where
         }
 
         // Everything present: verify + decode the offsets artifact, install.
-        let Some(session) = partition.transfer.take() else {
+        let Some(session) = partition.take_transfer() else {
             return;
         };
+        tracing::info!(
+            shard = self.id,
+            namespace_raw = namespace,
+            artifacts = session.artifacts.len(),
+            pulled_len = session.pulled_len,
+            "partition transfer pulled every artifact"
+        );
         let commit_op = session.commit_op;
         let peer = session.peer;
         let mut offsets_bytes: Option<Vec<u8>> = None;
         let mut offsets_frontier: Option<u64> = None;
+        let mut chain_bytes: Option<Vec<u8>> = None;
         let mut damaged = false;
         let mut staged = Vec::new();
         for artifact in session.artifacts {
@@ -11077,6 +13193,15 @@ where
                     } else {
                         offsets_frontier = Some(progress.entry.frontier);
                         offsets_bytes = Some(progress.buf);
+                    }
+                }
+                consensus::artifact_kind::SEGMENT_CHAIN
+                    if consensus::verify_state_artifact(&progress.entry, &progress.buf) =>
+                {
+                    if chain_bytes.is_some() {
+                        damaged = true;
+                    } else {
+                        chain_bytes = Some(progress.buf);
                     }
                 }
                 // An unknown kind is refused, never skipped: skipping would
@@ -11116,13 +13241,25 @@ where
             .consensus()
             .set_state_transfer_stage(consensus::StateTransferStage::Installing);
         let outcome = if partition.has_io_dispatcher() {
-            match partition.queue_state_transfer_install(commit_op, staged, &offsets_bytes, peer) {
+            match partition.queue_state_transfer_install_with_chain(
+                commit_op,
+                staged,
+                &offsets_bytes,
+                chain_bytes.as_deref(),
+                peer,
+            ) {
                 Ok(()) => return,
                 Err(error) => Err(error),
             }
         } else {
             partition
-                .install_state_transfer(&config, commit_op, staged, &offsets_bytes)
+                .install_state_transfer_with_chain(
+                    &config,
+                    commit_op,
+                    staged,
+                    &offsets_bytes,
+                    chain_bytes.as_deref(),
+                )
                 .await
         };
         self.finish_partition_install(namespace, peer, outcome)
@@ -11152,6 +13289,11 @@ where
             .set_state_transfer_stage(consensus::StateTransferStage::Idle);
         match outcome {
             Ok(outcome) => {
+                // The installed chain can start below the committed delete
+                // watermark, and only the reconciler trims to it.
+                self.reconcile_needed
+                    .borrow_mut()
+                    .insert(IggyNamespace::from_raw(namespace));
                 partition.note_transfer_progress();
                 partition.note_transfer_installed();
                 partition.transfer_rearm = None;
@@ -11200,7 +13342,7 @@ where
                     shard = self.id,
                     namespace_raw = namespace,
                     %error,
-                    "partition state transfer install failed; falling back to journal repair"
+                    "partition state transfer install failed; scheduling a re-arm"
                 );
                 self.abandon_or_rearm_partition_transfer(partition, peer)
                     .await;
@@ -11214,8 +13356,8 @@ where
     /// undecodable artifact) re-ran the full pull -- including the serving
     /// primary's whole-segment reads -- at network round-trip rate, and the
     /// generation-keyed budget never exhausted on a committing cluster.
-    /// Journal repair is re-armed in the meantime so the gap stays visible
-    /// and anything repairable heals without waiting out the backoff.
+    /// Journal repair does not run meanwhile: the re-arm owns recovery (see
+    /// [`Self::maybe_request_partition_repair`]).
     #[allow(clippy::future_not_send)]
     async fn abandon_or_rearm_partition_transfer(
         &self,
@@ -11309,9 +13451,8 @@ where
         rotate: bool,
     ) where
         B: MessageBus + 'static,
-        T: ShardsTable,
     {
-        partition.transfer = None;
+        partition.set_transfer(None);
         let consensus = partition.consensus();
         if consensus.state_transfer_stage() != consensus::StateTransferStage::Idle {
             consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
@@ -11346,7 +13487,6 @@ where
         });
         let config = self.plane.partitions().config().clone();
         partition.commit_journal(&config).await;
-        self.maybe_request_partition_repair(partition, peer).await;
     }
 
     /// Ask for the next missing partition chunk (first unspilled, incomplete
@@ -11375,22 +13515,39 @@ where
         else {
             return;
         };
-        let request = partition.transfer.as_ref().and_then(|session| {
+        if partition
+            .transfer()
+            .is_some_and(|session| session.spill.is_some())
+        {
+            return;
+        }
+        if self.drive_reuse_scan(partition, namespace) || partition.drive_prefix_seed() {
+            return;
+        }
+        let request = partition.transfer_mut().and_then(|session| {
             if !session.target_accepted {
                 return None;
             }
             let (index, offset, len) =
                 consensus::next_pending_chunk(&session.artifacts, chunk_len_max)?;
+            // The serving offer ages from the last chunk that it served, and
+            // the bound on local work counts the same span.
+            session.idle_ticks = 0;
             Some((session.nonce, session.peer, index, offset, len))
         });
         let consensus_ids = {
             let consensus = partition.consensus();
-            (consensus.cluster(), consensus.replica())
+            (
+                consensus.cluster(),
+                consensus.replica(),
+                *consensus.members(),
+            )
         };
         if let Some((nonce, peer, artifact, offset, len)) = request {
             self.send_request_state_chunk(
                 consensus_ids.0,
                 consensus_ids.1,
+                consensus_ids.2,
                 peer,
                 nonce,
                 namespace,
@@ -11401,6 +13558,47 @@ where
             )
             .await;
         }
+    }
+
+    /// Hand a landed reuse scan to its session and log what it staged.
+    /// Returns `true` while the scan runs, because the pull waits for it.
+    fn drive_reuse_scan(&self, partition: &mut IggyPartition<B, SB>, namespace: u64) -> bool
+    where
+        B: MessageBus,
+    {
+        let Some(peer) = partition.transfer().map(|session| session.peer) else {
+            return false;
+        };
+        let Poll::Ready(reused) = partition.drive_reuse_scan() else {
+            return true;
+        };
+        let Some(reused) = reused else {
+            return false;
+        };
+        if reused.adopted > 0 {
+            tracing::info!(
+                shard = self.id,
+                namespace_raw = namespace,
+                peer,
+                adopted = reused.adopted,
+                adopted_len = reused.adopted_len,
+                artifacts = reused.artifacts,
+                "adopted staged segments from an earlier transfer attempt"
+            );
+        }
+        if reused.linked > 0 {
+            tracing::info!(
+                shard = self.id,
+                namespace_raw = namespace,
+                peer,
+                reused = reused.linked,
+                reused_len = reused.linked_len,
+                artifacts = reused.artifacts,
+                total_len = reused.total_len,
+                "reused segments that this node already holds"
+            );
+        }
+        false
     }
 
     /// Drop serving-side state-transfer offers that stopped being pulled.
@@ -11445,6 +13643,15 @@ where
                     abandoned.push(*namespace);
                 }
                 live
+            });
+        // A waiter that stopped asking (it installed from another peer,
+        // re-targeted or crashed) would otherwise keep the next free slot
+        // reserved for good.
+        self.partition_transfer_waiters
+            .borrow_mut()
+            .retain_mut(|(_, idle_ticks)| {
+                *idle_ticks += 1;
+                *idle_ticks < idle_expiry_ticks
             });
         let mut offers = self.state_transfer_offers.borrow_mut();
         let namespaces_before: Vec<u64> = offers.keys().map(|(namespace, _)| *namespace).collect();
@@ -11511,9 +13718,10 @@ where
     /// tick's walk has advanced, and at or under `commit_max`, so a quorum
     /// holds it and repair can serve it back.
     ///
-    /// SERIALIZATION: same argument as `reconcile_metadata_view_divergence`,
-    /// which is the other shard-side `truncate_from` caller. This runs on the
-    /// pump between frames, so no append is in flight for these ops.
+    /// SERIALIZATION: holds the journal gate, as
+    /// `reconcile_metadata_view_divergence` does, the other shard-side
+    /// `truncate_from` caller. An in-process submit appends on its caller's
+    /// task, so running on the pump does not keep an append off these ops.
     #[allow(clippy::future_not_send)]
     async fn drop_unwalkable_metadata_entry<P>(
         &self,
@@ -11536,15 +13744,16 @@ where
         let Ok(slot) = usize::try_from(stuck_op) else {
             return;
         };
+        let view = consensus.view();
+        let _journal_writes = self.plane.metadata().hold_journal_writes().await;
         let Some(header) = journal.handle().header(slot).map(|header| *header) else {
             return;
         };
-        let view = consensus.view();
         if journal.handle().entry(&header).await.is_some() {
             return;
         }
-        // The read can yield to a pipeline driver or a view change. Never
-        // truncate a suffix another driver owns, even when this body is absent.
+        // The gate and the read can yield to a pipeline driver or a view change.
+        // Never truncate a suffix another driver owns, even when this body is absent.
         if consensus.view() != view
             || consensus.view_log_unproven()
             || consensus.is_transferring()
@@ -11679,6 +13888,17 @@ where
                 metadata::stm::snapshot::MetadataSnapshot,
             >,
     {
+        // The flag is still set when the previous shard tick ran only the
+        // metadata plane. Then no partition tick sent its Commit batch, so
+        // this tick sends it first, under the number of the previous tick.
+        // Otherwise the partition tick at the end of this tick sends one batch
+        // with all entries.
+        if self.metadata_ticked.get() {
+            self.flush_commit_outbox().await;
+        }
+        self.shard_ticks.set(self.shard_ticks.get().wrapping_add(1));
+        self.metadata_ticked.set(true);
+        self.flush_reply_outbox().await;
         let metadata = self.plane.metadata();
         let Some(ref consensus) = metadata.consensus else {
             return;
@@ -11688,14 +13908,19 @@ where
         if consensus.status() != Status::Normal {
             refresh_metadata_dvc_suffix(consensus, metadata.journal.as_ref());
         }
-        let actions = consensus.tick(PlaneKind::Metadata);
+        consensus.tick_clock().advance();
+        let grid_tick = consensus
+            .heartbeat_schedule()
+            .is_grid_tick(self.shard_ticks.get());
+        let actions = consensus.tick_with_grid(PlaneKind::Metadata, false, grid_tick, false);
         if !consensus.is_primary() || !primary_rebalance::consensus_ready(consensus) {
             self.primary_rebalance.borrow_mut().reset_authority();
         }
 
-        let (local_actions, wire_actions) = split_local_actions(actions);
+        let (local_actions, mut wire_actions) = split_local_actions(actions);
         dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &local_actions).await;
         if metadata.persist_superblock_if_needed(consensus).await {
+            commit_batch::queue_commits(&self.commit_outbox, consensus, &mut wire_actions);
             dispatch_vsr_actions(consensus, metadata.journal.as_ref(), &wire_actions).await;
         }
         let superblock_failures = metadata.superblock_write_failures();
@@ -11727,7 +13952,6 @@ where
         self.tick_primary_rebalance().await;
 
         self.advance_pending_metadata_view().await;
-        self.expire_idle_state_transfer_offers();
 
         // Level-triggered gap detector, the metadata twin of the one in
         // `tick_partitions`, and starvable in exactly the same way:
@@ -12347,6 +14571,34 @@ const PARTITION_REPAIR_ARMS_PER_TICK_MAX: usize = 3;
 /// debounce satisfied, so they arm as sessions complete.
 const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 
+/// Heartbeat votes the partition tick sweep lets its backups CAST per pass.
+///
+/// A node that dies takes the primary of every group it led, and the heartbeat
+/// timers of those groups fire on a few ticks. Each vote that a peer joins
+/// becomes a view change: two superblock writes per replica through the
+/// partition I/O lane. A replica that waits `view_change_status_timeout` for
+/// the writes of its peers votes for the next view, so more view changes than
+/// the lane finishes in that time turn into a second round of them.
+///
+/// Only the vote of the heartbeat timeout is held, and its timer stays fired,
+/// so the sweep asks again on every tick. A backup with a held vote still joins
+/// the vote of a peer, so a group waits for the first of its backups to get a
+/// turn, not for all of them.
+const PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX: usize = 4;
+
+/// Groups in view change this shard holds before it casts no more heartbeat
+/// votes.
+///
+/// The concurrency half of the pair: the rate cap above cannot see how fast
+/// the I/O lane finishes view changes. View changes that a peer or a primary
+/// transfer started count too, and nothing here delays them.
+///
+/// A view change stops counting once this replica votes to leave it
+/// ([`consensus::VsrConsensus::view_change_in_flight`]). A group that lost
+/// its quorum never ends its view change, so without that rule enough of them
+/// would hold every heartbeat vote of the shard until their peers return.
+const PARTITION_VIEW_CHANGES_INFLIGHT_MAX: usize = 128;
+
 /// Commit walks the partition tick sweep will RUN per pass.
 ///
 /// Same correlated-fan-out argument as the repair arm, and the walk is the
@@ -12366,13 +14618,56 @@ const PARTITION_REPAIRS_INFLIGHT_MAX: usize = 8;
 /// `ceil(groups / cap)` ticks however many groups are owed at once.
 const PARTITION_WALKS_PER_TICK_MAX: usize = 16;
 
-/// Placement observations need only keep pace with rebalance probes.
+/// Sleeping partitions that a release build tests per tick for a missed
+/// wake-up. A shard with a million of them tests each one about every
+/// twenty minutes.
+const PARTITION_SLEEP_CHECKS_PER_TICK: usize = 8;
+
+/// A primary's counters reach shard 0 at most once per interval: the metadata
+/// probes and replies that carry them on run no more often.
 const PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS: u128 =
     primary_rebalance::PROBE_INTERVAL.as_millis() / CONSENSUS_TICK_INTERVAL.as_millis();
 
-/// The smallest lifecycle batch sent per tick until the interval's pass ends.
-/// The cursor also bounds visits to ineligible groups.
+/// The smallest batch of queued reports sent per tick.
 const PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN: usize = 64;
+
+/// The status of `partition` at `view` with its counters as they are now. No
+/// node in sync makes it a retraction.
+fn status_entry<B, SB>(
+    namespace: IggyNamespace,
+    partition: &IggyPartition<B, SB>,
+    view: u32,
+    in_sync_nodes: u32,
+) -> PartitionStatusEntry
+where
+    B: MessageBus,
+    SB: SuperblockStore,
+{
+    let stats = &partition.stats;
+    PartitionStatusEntry {
+        namespace: namespace.inner(),
+        created_revision: partition.created_revision(),
+        view,
+        commit: partition.consensus().commit_min(),
+        current_offset: stats.current_offset(),
+        messages_count: stats.messages_count_inconsistent(),
+        size_bytes: stats.size_bytes_inconsistent(),
+        segments_count: stats.segments_count_inconsistent(),
+        in_sync_nodes,
+    }
+}
+
+/// [`SentReport::counters`] of `status`. The compare needs the same keys on
+/// every call: `DefaultHasher` has fixed keys, a `RandomState` does not.
+fn counters_hash(status: &PartitionStatusEntry) -> u64 {
+    BuildHasherDefault::<DefaultHasher>::default().hash_one((
+        status.commit,
+        status.current_offset,
+        status.messages_count,
+        status.size_bytes,
+        status.segments_count,
+    ))
+}
 
 /// Floor under the gap detector's debounce, in ticks.
 ///
@@ -12701,13 +14996,13 @@ where
     let consensus = partition.consensus();
     let commit_min = consensus.commit_min();
     let commit_max = consensus.commit_max();
-    let recovery_owned = partition.transfer.is_some()
+    let recovery_owned = partition.transfer().is_some()
         || partition.transfer_rearm.is_some()
-        || partition.repair.is_some();
+        || partition.repair().is_some();
     let normal = consensus.is_normal();
     let transferring = consensus.is_transferring();
     // Residency last, and only once the guards both predicates share already
-    // hold. This runs for every group on the shard on every tick, and the
+    // hold. This runs for every group that a tick visits, and the
     // caught-up steady state (`commit_min == commit_max`) would otherwise pay
     // a journal lookup whose answer both predicates discard.
     //
@@ -13195,13 +15490,13 @@ async fn reconcile_partition_view_divergence<B, SB>(
                 // journal already held the adopted head, no repair frame moves the
                 // anchor, which then names a dropped op the WAL cannot certify.
                 // A durable commit point survives only in the repair ring.
-                if let Some(head) = partition
-                    .log
-                    .journal()
-                    .inner
-                    .repair_header(consensus.sequencer().current_sequence())
-                {
+                let head_op = consensus.sequencer().current_sequence();
+                if let Some(head) = partition.log.journal().inner.repair_header(head_op) {
                     consensus.set_last_prepare_checksum(head.checksum);
+                } else if head_op == 0 {
+                    // An empty log has no header to take the anchor from, and the
+                    // WAL certifies op 0 only with a zero checksum.
+                    consensus.set_last_prepare_checksum(0);
                 }
                 return;
             }
@@ -13228,6 +15523,19 @@ async fn reconcile_partition_view_divergence<B, SB>(
             }
         }
     }
+}
+
+/// Run the view-log proof again after a prepare, repaired or live, that can
+/// close its gap.
+#[allow(clippy::future_not_send)]
+async fn prove_partition_view_log_again<B, SB>(shard: u16, partition: &mut IggyPartition<B, SB>)
+where
+    B: MessageBus,
+    SB: journal::superblock::SuperblockStore,
+{
+    let pending = partition.consensus().pending_view_log();
+    reconcile_partition_view_divergence(shard, partition, pending.as_ref()).await;
+    anchor_view_fence_from_view_log(partition, pending.as_ref()).await;
 }
 
 /// The lowest header in a view's suffix that can anchor a fence. A blank slot
@@ -13529,13 +15837,12 @@ async fn dispatch_vsr_actions<B, P, J>(
 {
     use std::mem::size_of;
 
-    let bus = consensus.message_bus();
     let self_id = consensus.replica();
     let cluster = consensus.cluster();
     let replica_count = consensus.replica_count();
 
     let send = |target: u8, msg: Frozen<MESSAGE_ALIGN>| async move {
-        if let Err(e) = bus.send_to_replica(target, msg).await {
+        if let Err(e) = consensus.send_to_member(target, msg).await {
             tracing::debug!(replica = self_id, target, "bus send failed: {e}");
         }
     };
@@ -13760,7 +16067,14 @@ async fn dispatch_vsr_actions<B, P, J>(
                         continue;
                     };
                     for replica in replicas {
-                        send(*replica, frozen.clone()).await;
+                        let _ = send_replayed_prepare(
+                            consensus,
+                            *replica,
+                            header.op,
+                            frozen.clone(),
+                            ReplicationSend::Retransmit,
+                        )
+                        .await;
                     }
                 }
             }
@@ -13785,28 +16099,50 @@ async fn dispatch_vsr_actions<B, P, J>(
             // Handled by the caller, which owns the plane's journal. Metadata
             // ignores `RetryLocalWrite` and re-acks via `repair_primary_self_acks`.
             VsrAction::CommitJournal | VsrAction::RetryLocalWrite { .. } => {}
+            // The ticks queue Commits and replies in the shard outboxes. Any
+            // that reach this point leave at once as a batch of one entry.
+            VsrAction::SendCommitReply {
+                view,
+                group,
+                timestamp_monotonic,
+                target,
+            } => {
+                let entry = CommitReplyEntry::new(
+                    *group,
+                    consensus.partition_incarnation(),
+                    *view,
+                    *timestamp_monotonic,
+                    self_id,
+                );
+                if let Some(message) =
+                    commit_batch::encode_commit_reply_batch(cluster, consensus.node_id(), &[entry])
+                {
+                    send(*target, message.into_generic().into_frozen()).await;
+                }
+            }
             VsrAction::SendCommit {
                 view,
                 commit,
                 group,
                 timestamp_monotonic,
+                heartbeat_state,
                 target,
             } => {
-                let msg = Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-                    |_, h: &mut CommitHeader| {
-                        h.command = Command::Commit;
-                        h.partition_incarnation = consensus.partition_incarnation();
-                        h.cluster = cluster;
-                        h.replica = self_id;
-                        h.view = *view;
-                        h.commit = *commit;
-                        h.group = *group;
-                        h.timestamp_monotonic = *timestamp_monotonic;
-                        h.size = size_of::<CommitHeader>() as u32;
-                        h.seal();
-                    },
+                let entry = CommitEntry::new(
+                    *group,
+                    consensus.partition_incarnation(),
+                    *view,
+                    *commit,
+                    *timestamp_monotonic,
+                    *heartbeat_state,
+                    self_id,
                 );
-                let frozen = msg.into_generic().into_frozen();
+                let Some(message) =
+                    commit_batch::encode_commit_batch(cluster, consensus.node_id(), &[entry])
+                else {
+                    continue;
+                };
+                let frozen = message.into_generic().into_frozen();
                 match target {
                     Some(replica) => send(*replica, frozen).await,
                     None => broadcast(frozen).await,
@@ -13820,7 +16156,27 @@ async fn dispatch_vsr_actions<B, P, J>(
 async fn dispatch_partition_wire_actions<B, P, J, SB>(
     consensus: &VsrConsensus<B, P>,
     partition: &IggyPartition<B, SB>,
+    actions: Vec<VsrAction>,
+) where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+    J: JournalHandle,
+    J::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    SB: SuperblockStore,
+{
+    dispatch_partition_wire_actions_batched::<B, P, J, SB>(consensus, partition, actions, None)
+        .await;
+}
+
+/// [`dispatch_partition_wire_actions`] that queues each `Commit` in `commits`
+/// for the next batch. The superblock save comes first, so a group whose save
+/// fails sends its `Commit` in a later batch.
+#[allow(clippy::future_not_send)]
+async fn dispatch_partition_wire_actions_batched<B, P, J, SB>(
+    consensus: &VsrConsensus<B, P>,
+    partition: &IggyPartition<B, SB>,
     mut actions: Vec<VsrAction>,
+    commits: Option<&commit_batch::CommitOutbox>,
 ) where
     B: MessageBus,
     P: Pipeline<Entry = consensus::PipelineEntry>,
@@ -13835,15 +16191,23 @@ async fn dispatch_partition_wire_actions<B, P, J, SB>(
     if partition.requires_state_transfer() {
         actions.retain(sendable_while_awaiting_transfer);
     }
+    if let Some(outbox) = commits {
+        commit_batch::queue_commits(outbox, consensus, &mut actions);
+    }
     dispatch_vsr_actions::<B, P, J>(consensus, None, &actions).await;
     dispatch_partition_journal_actions(consensus, partition, &actions).await;
 }
 
 /// Wire actions a partition awaiting a state transfer may still send: its
-/// probe, and the empty vote that vouches for no history but lets a group
-/// whose every log is untrusted start a view.
+/// probe, the empty vote that vouches for no history but lets a group whose
+/// every log is untrusted start a view, and the reply to a primary's heartbeat
+/// in the view it adopted. Without that reply a two-member primary loses its
+/// heartbeat quorum and steps down before it can serve the transfer.
 fn sendable_while_awaiting_transfer(action: &VsrAction) -> bool {
-    matches!(action, VsrAction::SendRequestStartView { .. }) || action.is_empty_vote()
+    matches!(
+        action,
+        VsrAction::SendRequestStartView { .. } | VsrAction::SendCommitReply { .. }
+    ) || action.is_empty_vote()
 }
 
 #[allow(
@@ -13860,15 +16224,8 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
     P: Pipeline<Entry = consensus::PipelineEntry>,
     SB: SuperblockStore,
 {
-    let bus = consensus.message_bus();
     let self_id = consensus.replica();
     let journal = &partition.log.journal().inner;
-
-    let send = |target: u8, msg: Frozen<MESSAGE_ALIGN>| async move {
-        if let Err(e) = bus.send_to_replica(target, msg).await {
-            tracing::debug!(replica = self_id, target, "bus send failed: {e}");
-        }
-    };
 
     // Same durable-before-send tripwire as `dispatch_vsr_actions`: this
     // dispatcher emits view-scoped `SendPrepareOk` too, and all callers are
@@ -13918,7 +16275,14 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
                         continue;
                     };
                     for replica in replicas {
-                        send(*replica, prepare.clone()).await;
+                        let _ = send_replayed_prepare(
+                            consensus,
+                            *replica,
+                            header.op,
+                            prepare.clone(),
+                            ReplicationSend::Retransmit,
+                        )
+                        .await;
                     }
                 }
             }
@@ -13938,6 +16302,32 @@ async fn dispatch_partition_journal_actions<B, P, SB>(
             _ => {}
         }
     }
+}
+
+#[allow(clippy::future_not_send)]
+async fn send_replayed_prepare<B, P>(
+    consensus: &VsrConsensus<B, P>,
+    target: u8,
+    op: u64,
+    entry: Frozen<MESSAGE_ALIGN>,
+    send: ReplicationSend,
+) -> bool
+where
+    B: MessageBus,
+    P: Pipeline<Entry = consensus::PipelineEntry>,
+{
+    if !consensus.is_primary() || !consensus.is_normal() || consensus.is_transferring() {
+        return false;
+    }
+    let Some(entry) = restamp_prepare_view(entry, consensus.view()) else {
+        return false;
+    };
+    matches!(
+        consensus
+            .send_replicated_prepare(target, op, entry, send)
+            .await,
+        Ok(true)
+    )
 }
 
 #[cfg(test)]
@@ -14917,15 +17307,15 @@ mod dvc_suffix_window_tests {
 #[cfg(test)]
 mod installed_transfer_dvc_tests {
     //! A lagging replica adopts a `StartView` and later installs a state
-    //! transfer below that view's head. The install rewinds the sequencer to
-    //! the transfer's op and keeps the adopted view. Each `DoViewChange` the
-    //! replica sends from then on carries the transfer op in its header but
-    //! starts its suffix at the adopted head, and its peers drop every one as
-    //! unreadable. With a third replica down, or back with an untrusted log,
-    //! no quorum of readable votes forms and the view change never ends.
+    //! transfer below that view's head. The install keeps that head, so each
+    //! `DoViewChange` the replica sends afterwards stays readable and
+    //! describes every uncommitted op of the adopted view. With a third
+    //! replica down, or back with an untrusted log, the view change has no
+    //! other quorum of readable votes.
 
     use super::*;
-    use consensus::{LocalPipeline, dvc_suffix_decode};
+    use crate::test_support::advance_and_tick;
+    use consensus::{LocalPipeline, TimeoutManager, dvc_suffix_decode};
     use iggy_common::{IggyByteSize, PartitionStats};
     use journal::prepare_journal::PrepareJournal;
     use message_bus::IggyMessageBus;
@@ -14946,10 +17336,9 @@ mod installed_transfer_dvc_tests {
     const COMMIT: u64 = HEAD - 2;
 
     #[compio::test]
-    #[ignore = "known bug: a transfer installed below the adopted view head makes the replica's DoViewChange unreadable; run with --ignored"]
     async fn given_a_transfer_installed_below_the_adopted_head_when_a_view_change_follows_should_send_a_readable_do_view_change()
      {
-        // Inside the 128-entry window, so only the head disagrees.
+        // Inside the 128-entry window: only the header op can disagree with the suffix.
         let transfer = HEAD - 100;
         // Boxed: the setup future carries a whole partition.
         let (vote, message) = Box::pin(vote_after_install(transfer)).await;
@@ -14976,7 +17365,6 @@ mod installed_transfer_dvc_tests {
     }
 
     #[compio::test]
-    #[ignore = "known bug: a transfer installed far below the adopted view head leaves uncommitted ops outside the DoViewChange window; run with --ignored"]
     async fn given_a_transfer_installed_far_below_the_adopted_head_when_a_view_change_follows_should_describe_every_uncommitted_op()
      {
         // Past the 128-entry window.
@@ -14998,9 +17386,35 @@ mod installed_transfer_dvc_tests {
         );
     }
 
+    #[compio::test]
+    async fn given_a_transfer_installed_above_the_adopted_head_when_the_view_log_is_reconciled_should_prove_the_log_at_the_checkpoint()
+     {
+        let transfer = HEAD + 3;
+        // Boxed: the setup future carries a whole partition.
+        let mut partition = Box::pin(lagging_after_install(IggyMessageBus::new(0), transfer)).await;
+
+        // `finish_partition_install`: the repair pass reconciles an open proof.
+        let pending = partition.consensus().pending_view_log();
+        reconcile_partition_view_divergence(0, &mut partition, pending.as_ref()).await;
+
+        let consensus = partition.consensus();
+        assert!(
+            !consensus.view_log_unproven(),
+            "the checkpoint at op {transfer} holds every op of the adopted view up to its head \
+             {HEAD}, so nothing is left to prove"
+        );
+        assert!(
+            !consensus.view_log_is_pending(),
+            "the adopted log still ends at op {HEAD}, below the commit point {}",
+            consensus.commit_min(),
+        );
+        assert_eq!(consensus.sequencer().current_sequence(), transfer);
+    }
+
     /// The lagging replica's vote for `NEXT_VIEW`, and the frame the shard sends
-    /// for it. Before the vote, the replica adopts the `ADOPTED_VIEW` `StartView`
-    /// and then installs a peer's state transfer at `transfer`.
+    /// for it. Before the vote, the replica adopts the `ADOPTED_VIEW` `StartView`,
+    /// installs a peer's state transfer at `transfer`, and then stops hearing the
+    /// primary of `ADOPTED_VIEW`, which is down.
     #[allow(clippy::future_not_send)]
     async fn vote_after_install(transfer: u64) -> (VsrAction, Message<DoViewChangeHeader>) {
         let bus = IggyMessageBus::new(0);
@@ -15013,6 +17427,47 @@ mod installed_transfer_dvc_tests {
         for peer in (0..REPLICA_COUNT).filter(|&peer| peer != LAGGING) {
             crate::test_support::connect_replica_on(&bus, peer, 1);
         }
+        let partition = Box::pin(lagging_after_install(bus, transfer)).await;
+
+        // The heartbeat timeout votes to leave the view, so the `StartViewChange`
+        // of replica 1 completes a quorum of votes.
+        let voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .flat_map(|_| advance_and_tick(partition.consensus(), PlaneKind::Partitions))
+            .any(|action| {
+                matches!(action, VsrAction::SendStartViewChange { view, .. } if view == NEXT_VIEW)
+            });
+        assert!(voted, "the lagging replica votes to leave the view");
+
+        // `on_start_view_change`: snapshot the suffix, then vote.
+        refresh_partition_dvc_suffix(&partition);
+        let consensus = partition.consensus();
+        let actions =
+            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
+        let vote = actions
+            .iter()
+            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
+            .cloned()
+            .expect("the lagging replica votes");
+        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
+            .await;
+        let message = sent
+            .borrow()
+            .iter()
+            .find_map(|frame| {
+                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                    .ok()
+            })
+            .expect("the vote goes out on the wire");
+        (vote, message)
+    }
+
+    /// The lagging replica on `bus`, after it adopts the `ADOPTED_VIEW` `StartView`
+    /// and then installs a peer's state transfer at `transfer`.
+    #[allow(clippy::future_not_send)]
+    async fn lagging_after_install(
+        bus: IggyMessageBus,
+        transfer: u64,
+    ) -> IggyPartition<IggyMessageBus> {
         let consensus = VsrConsensus::new(
             CLUSTER,
             LAGGING,
@@ -15045,10 +17500,9 @@ mod installed_transfer_dvc_tests {
 
         // Repair finds the gap evicted at every peer, so a transfer follows. The
         // install cannot run here: its offsets artifact is a type private to
-        // `partitions`. So these are its journal wipe and then the steps of
-        // `publish_installed_consensus`, in its order, with a checkpoint prepare
-        // built here in place of the origin's. They rewind the sequencer to
-        // `transfer` and keep the adopted view.
+        // `partitions`. So these are its journal wipe and then the consensus step
+        // of `publish_installed_consensus`, with a checkpoint prepare built here in
+        // place of the origin's.
         let checkpoint = Message::<PrepareHeader>::new(size_of::<PrepareHeader>())
             .transmute_header(|_, header: &mut PrepareHeader| {
                 *header = prepare_header(transfer, 0);
@@ -15057,35 +17511,13 @@ mod installed_transfer_dvc_tests {
         partition.log.journal().inner.restore_checkpoint_prepare(
             transfer,
             Owned::<MESSAGE_ALIGN>::copy_from_slice(checkpoint.as_slice()).into(),
+            None,
         );
-        let consensus = partition.consensus();
-        consensus.set_commit_floor(transfer);
-        consensus.sequencer().set_sequence(transfer);
-        consensus.set_last_prepare_checksum(checkpoint.header().checksum);
-        consensus.clear_pipeline();
-        consensus.advance_commit_max(transfer);
-
-        // `on_start_view_change`: snapshot the suffix, then vote.
-        refresh_partition_dvc_suffix(&partition);
-        let consensus = partition.consensus();
-        let actions =
-            consensus.handle_start_view_change(PlaneKind::Partitions, start_view_change().header());
-        let vote = actions
-            .iter()
-            .find(|action| matches!(action, VsrAction::SendDoViewChange { .. }))
-            .cloned()
-            .expect("the lagging replica votes");
-        dispatch_partition_wire_actions::<_, _, PrepareJournal, _>(consensus, &partition, actions)
-            .await;
-        let message = sent
-            .borrow()
-            .iter()
-            .find_map(|frame| {
-                Message::<DoViewChangeHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
-                    .ok()
-            })
-            .expect("the vote goes out on the wire");
-        (vote, message)
+        partition.consensus().note_journal_mutation();
+        partition
+            .consensus()
+            .install_checkpoint(transfer, Some(checkpoint.header().checksum));
+        partition
     }
 
     /// The `ADOPTED_VIEW` `StartView`: its head and commit point, with the
@@ -15161,10 +17593,11 @@ mod adopted_view_retention_tests {
     //! above its commit point the merge reads a header without a body as a nack.
 
     use super::{adopted_view_headers, build_dvc_suffix, refresh_metadata_dvc_suffix};
+    use crate::test_support::advance_and_tick;
     use consensus::{
         CLIENTS_TABLE_MAX, ClientTable, Consensus, JoinMode, LocalPipeline, PlaneKind, Project,
-        Sequencer, StateTransferStage, ViewLogProof, ViewRestore, VsrAction, VsrConsensus,
-        encode_prepare_headers, send_prepare_ok, view_log_proof,
+        Sequencer, StateTransferStage, TimeoutManager, ViewLogProof, ViewRestore, VsrAction,
+        VsrConsensus, encode_prepare_headers, send_prepare_ok, view_log_proof,
     };
     use iggy_binary_protocol::{
         Command, DoViewChangeHeader, Operation, PrepareHeader, PrepareOkHeader,
@@ -15377,6 +17810,8 @@ mod adopted_view_retention_tests {
         };
         lagging.fence_view_log(op, unproven_through);
 
+        vote_on_heartbeat_timeout(&restarted, NEXT_VIEW);
+        vote_on_heartbeat_timeout(&lagging, NEXT_VIEW);
         refresh_suffix(&restarted, journal);
         refresh_suffix(&lagging, lagging_journal);
         let vote = restarted
@@ -15555,6 +17990,8 @@ mod adopted_view_retention_tests {
         });
         reconcile(&lagging, lagging_journal);
 
+        vote_on_heartbeat_timeout(restarted, NEXT_VIEW);
+        vote_on_heartbeat_timeout(&lagging, NEXT_VIEW);
         refresh_metadata_dvc_suffix(restarted, metadata.journal.as_ref());
         refresh_suffix(&lagging, lagging_journal);
         let vote = restarted
@@ -15652,31 +18089,26 @@ mod adopted_view_retention_tests {
                     COMMITTED
                 );
                 old_primary.advance_commit_min(COMMITTED);
-                let heartbeat = Message::<iggy_binary_protocol::CommitHeader>::new(size_of::<
-                    iggy_binary_protocol::CommitHeader,
-                >(
-                ))
-                .transmute_header(
-                    |_, header: &mut iggy_binary_protocol::CommitHeader| {
-                        header.command = Command::Commit;
-                        header.size =
-                            u32::try_from(size_of::<iggy_binary_protocol::CommitHeader>()).unwrap();
-                        header.view = OLD_VIEW;
-                        header.replica = old_primary.replica();
-                        header.group = METADATA_GROUP;
-                        header.commit = COMMITTED;
-                    },
-                );
-                next_primary.handle_commit(heartbeat.header());
+                next_primary.handle_commit(&iggy_binary_protocol::CommitEntry::new(
+                    METADATA_GROUP,
+                    0,
+                    OLD_VIEW,
+                    COMMITTED,
+                    0,
+                    iggy_binary_protocol::HeartbeatState::Busy,
+                    old_primary.replica(),
+                ));
                 next_primary.advance_commit_min(COMMITTED);
-                let mut replacement = original.clone();
+                let replacement = original.clone();
                 let abandoned = projected_stream(&old_primary, "abandoned");
                 old_primary.pipeline_message(PlaneKind::Metadata, &abandoned);
                 original.push(*abandoned.header());
                 old_primary.extend_history_certificate(HEAD, abandoned.header().checksum);
 
                 // Replica 1 is isolated. The two remaining replicas decide view 11
-                // through timer-produced SVCs and the DVCs their handlers emit.
+                // through the votes of their heartbeat timeouts and the DVCs their
+                // handlers emit.
+                vote_on_heartbeat_timeout(&lagging, ADOPTED_VIEW);
                 elect_from_handlers(
                     &next_primary,
                     &lagging,
@@ -15689,32 +18121,9 @@ mod adopted_view_retention_tests {
                 assert_eq!(lagging.log_view_claim(), ADOPTED_VIEW);
                 assert!(lagging.view_log_unproven());
                 let uncommitted = projected_stream(&next_primary, "replacement");
-                next_primary.pipeline_message(PlaneKind::Metadata, &uncommitted);
-                replacement.push(*uncommitted.header());
-                next_primary.extend_history_certificate(HEAD, uncommitted.header().checksum);
                 assert_ne!(abandoned.header().checksum, uncommitted.header().checksum);
 
-                // Drop all repair traffic to replica 0 and the intermediate elections.
-                // Its timer eventually nominates replica 2 again. One body plus one nack
-                // retains the uncommitted replacement, which that primary announces.
-                elect_from_handlers(
-                    &next_primary,
-                    &lagging,
-                    &replacement,
-                    &lagging_journal,
-                    LATER_VIEW,
-                );
-                assert_eq!(next_primary.pending_view_log().unwrap().op_head, HEAD);
-                announce_from_handler(&next_primary, &lagging, &replacement, &lagging_journal);
-                assert_eq!(lagging.log_view_claim(), LATER_VIEW);
-                assert_eq!(lagging.commit_min(), COMMON);
-                assert_eq!(
-                    lagging.pending_view_log().unwrap().headers[0].checksum,
-                    uncommitted.header().checksum
-                );
-
-                let lagging = if restart {
-                    let record = lagging.vsr_state(COMMON, 0);
+                let restore = |record: &consensus::VsrState| {
                     let record =
                         consensus::VsrState::try_from(record.to_bytes().as_slice()).unwrap();
                     let mut recovered = replica(BACKUP);
@@ -15736,6 +18145,37 @@ mod adopted_view_retention_tests {
                     recovered.resume_adopted_view();
                     recovered.init_as_backup();
                     recovered.begin_view_probe();
+                    recovered
+                };
+
+                // A restarted replica whose probes go unanswered enters the next view
+                // alone, so a replica that restarts while cut off can reach a view that
+                // no quorum voted for, and the merge of its stitched unproven headers
+                // must still hold. Replica 0 adopted the `LATER_VIEW` `StartView` of
+                // replica 2, which kept the uncommitted replacement above `COMMITTED`,
+                // and later restarted in the view before `target_view`.
+                let lagging = restore(&consensus::VsrState {
+                    view: target_view - 1,
+                    log_view: LATER_VIEW,
+                    adopted_view: Some(consensus::AdoptedView {
+                        view: LATER_VIEW,
+                        group: METADATA_GROUP,
+                        partition_incarnation: 0,
+                        op_head: HEAD,
+                        commit_max: COMMITTED,
+                        headers: vec![*uncommitted.header(), *committed.header()],
+                    }),
+                    ..lagging.vsr_state(COMMON, 0)
+                });
+                assert_eq!(lagging.log_view_claim(), LATER_VIEW);
+                assert_eq!(lagging.commit_min(), COMMON);
+                assert_eq!(
+                    lagging.pending_view_log().unwrap().headers[0].checksum,
+                    uncommitted.header().checksum
+                );
+
+                let lagging = if restart {
+                    let recovered = restore(&lagging.vsr_state(COMMON, 0));
                     assert_eq!(recovered.adopted_view_head(), Some((LATER_VIEW, HEAD)));
                     assert!(!recovered.history_certified());
                     recovered
@@ -15823,8 +18263,7 @@ mod adopted_view_retention_tests {
         };
         let svc = (0..TICK_BUDGET)
             .find_map(|_| {
-                initiator
-                    .tick(PlaneKind::Metadata)
+                advance_and_tick(initiator, PlaneKind::Metadata)
                     .into_iter()
                     .find_map(|action| {
                         if let VsrAction::SendStartViewChange {
@@ -15976,6 +18415,22 @@ mod adopted_view_retention_tests {
             adopted.as_ref().map(|log| log.headers.as_slice()),
             consensus.view_log_unproven_range(),
         ));
+    }
+
+    /// Tick `consensus` until its heartbeat timeout fires. The replica no longer
+    /// hears its primary, so it votes for `view`, and the `StartViewChange` of a
+    /// survivor that votes the same completes a quorum of votes.
+    fn vote_on_heartbeat_timeout(consensus: &VsrConsensus, view: u32) {
+        let voted = (0..TimeoutManager::NORMAL_HEARTBEAT_TICKS)
+            .flat_map(|_| advance_and_tick(consensus, PlaneKind::Metadata))
+            .any(|action| {
+                matches!(action, VsrAction::SendStartViewChange { view: next, .. } if next == view)
+            });
+        assert!(
+            voted,
+            "replica {} votes for view {view}",
+            consensus.replica()
+        );
     }
 
     /// The proof `reconcile_metadata_view_divergence` takes of an adopted view
@@ -17020,7 +19475,7 @@ mod partition_placement_tests {
     use std::mem::size_of;
     use std::sync::Arc;
 
-    type PlacementShard = IggyShard<
+    pub type PlacementShard = IggyShard<
         Rc<IggyMessageBus>,
         PrepareJournal,
         IggySnapshot,
@@ -17029,20 +19484,30 @@ mod partition_placement_tests {
     >;
 
     pub fn owner(shard_id: u16) -> (PlacementShard, Receiver<ShardFrame>) {
+        owner_with_repair_memory(shard_id, None)
+    }
+
+    pub fn owner_with_repair_memory(
+        shard_id: u16,
+        repair_memory: Option<Arc<partitions::RepairMemoryBudget>>,
+    ) -> (PlacementShard, Receiver<ShardFrame>) {
         let bus = Rc::new(IggyMessageBus::new(shard_id));
         let segment_size = IggyByteSize::from(1_048_576_u64);
-        let partitions = IggyPartitions::new(
-            ShardId::new(shard_id),
-            PartitionsConfig {
-                messages_required_to_save: 100,
-                size_of_messages_required_to_save: segment_size,
-                validate_checksum: true,
-                segment_size,
-                preallocate_segments: false,
-                key_context: Arc::default(),
-                path_layout: PartitionPathLayout::default(),
-            },
-        );
+        let config = PartitionsConfig {
+            messages_required_to_save: 100,
+            size_of_messages_required_to_save: segment_size,
+            validate_checksum: true,
+            segment_size,
+            preallocate_segments: false,
+            key_context: Arc::default(),
+            path_layout: PartitionPathLayout::default(),
+        };
+        let partitions = match repair_memory {
+            Some(budget) => {
+                IggyPartitions::new(ShardId::new(shard_id), config).with_repair_memory(budget)
+            }
+            None => IggyPartitions::new(ShardId::new(shard_id), config),
+        };
         let metadata = IggyMetadata::new(
             None,
             None,
@@ -17065,7 +19530,7 @@ mod partition_placement_tests {
         (shard, target)
     }
 
-    fn insert(shard: &PlacementShard, id: usize, revision: u64, view: u32) -> IggyNamespace {
+    pub fn insert(shard: &PlacementShard, id: usize, revision: u64, view: u32) -> IggyNamespace {
         let namespace = IggyNamespace::new(0, 0, id);
         let mut consensus = VsrConsensus::new(
             1,
@@ -17087,107 +19552,240 @@ mod partition_placement_tests {
         namespace
     }
 
+    /// Publish as a sweep that visited every partition.
     fn publish(shard: &PlacementShard) {
-        let namespaces: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
-        shard.publish_partition_views(&namespaces);
+        let visited: Vec<_> = shard.plane.partitions().namespaces().copied().collect();
+        shard.publish_partition_views(&visited);
     }
 
-    fn receive(inbox: &Receiver<ShardFrame>) -> Vec<PartitionPlacementView> {
-        let ShardFrame::Lifecycle(LifecycleFrame::PartitionPlacementViews(reports)) =
+    /// Advance the shard clock to `tick`, one tick at a time as the pump does.
+    fn advance_to(shard: &PlacementShard, tick: u64) {
+        let clock = shard.plane.partitions().tick_clock();
+        while clock.now() < tick {
+            clock.advance();
+        }
+    }
+
+    fn receive(
+        inbox: &Receiver<ShardFrame>,
+    ) -> (Vec<PartitionPlacementView>, Vec<PartitionStatusEntry>) {
+        let ShardFrame::Lifecycle(LifecycleFrame::PartitionPlacementViews(reports, statuses)) =
             inbox.try_recv().expect("placement report queued")
         else {
             panic!("expected partition placement observations");
         };
         assert!(inbox.try_recv().is_err(), "at most one batch per sweep");
-        reports
+        (reports, statuses)
     }
 
-    #[compio::test]
-    async fn given_unchanged_placement_when_ticks_advance_should_report_at_probe_intervals() {
-        let (shard, inbox) = owner(1);
-        insert(&shard, 0, 7, 0);
-        shard.ticks.set(1);
-        publish(&shard);
-        assert_eq!(receive(&inbox).len(), 1);
-        let interval = u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap();
-        for tick in 2..=interval {
-            shard.ticks.set(tick);
-            publish(&shard);
+    /// Publish once per tick up to `tick`, expecting no report.
+    fn assert_quiet_until(shard: &PlacementShard, inbox: &Receiver<ShardFrame>, tick: u64) {
+        let clock = shard.plane.partitions().tick_clock();
+        while clock.now() < tick {
+            clock.advance();
+            publish(shard);
             assert!(
                 inbox.try_recv().is_err(),
-                "placement report repeated at tick {tick}"
+                "a report at tick {}",
+                clock.now()
             );
         }
-        shard.ticks.set(interval + 1);
-        publish(&shard);
-        assert_eq!(receive(&inbox).len(), 1);
+    }
+
+    fn interval() -> u64 {
+        u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap()
     }
 
     #[compio::test]
-    async fn given_more_groups_than_one_batch_when_an_interval_starts_should_report_each_group_within_it()
-     {
+    async fn given_a_quiet_backup_when_ticks_advance_should_report_its_view_once() {
         let (shard, inbox) = owner(1);
-        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * 2 + 3;
-        for id in 0..count {
-            insert(&shard, id, 7, 0);
-        }
-        let batches =
-            u64::try_from(count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN)).unwrap();
-        let mut observed = BTreeSet::new();
-        for tick in 1..=batches {
-            shard.ticks.set(tick);
-            publish(&shard);
-            observed.extend(
-                receive(&inbox)
-                    .into_iter()
-                    .map(|report| report.namespace.partition_id()),
-            );
-        }
-        assert_eq!(observed, (0..count).collect());
-        shard.ticks.set(batches + 1);
+        insert(&shard, 0, 7, 1);
+        advance_to(&shard, 1);
         publish(&shard);
+        let (reports, statuses) = receive(&inbox);
+        assert_eq!(reports.len(), 1);
+        assert!(statuses.is_empty(), "a backup reports no status");
+        assert_quiet_until(&shard, &inbox, 3 * interval());
+    }
+
+    #[compio::test]
+    async fn given_a_quiet_acting_primary_when_it_becomes_eligible_should_report_once() {
+        let (shard, inbox) = owner(1);
+        let namespace = insert(&shard, 0, 7, 0);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        partition.stats.increment_messages_count(3);
+        partition.consensus().begin_view_probe();
+        assert_quiet_until(&shard, &inbox, interval());
+
+        partition.consensus().init();
+        advance_to(&shard, interval() + 1);
+        publish(&shard);
+        let (reports, statuses) = receive(&inbox);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].namespace, namespace.inner());
+        assert_eq!(statuses[0].messages_count, 3);
+        assert_ne!(
+            statuses[0].in_sync_nodes, 0,
+            "a primary is in sync with itself"
+        );
+        assert_quiet_until(&shard, &inbox, 4 * interval());
+    }
+
+    #[compio::test]
+    async fn given_an_acting_primary_when_its_view_or_in_sync_nodes_move_should_report_each_once() {
+        let (shard, inbox) = owner(1);
+        let namespace = insert(&shard, 0, 7, 0);
+        publish(&shard);
+        let (_, statuses) = receive(&inbox);
+        assert_eq!(statuses[0].in_sync_nodes, 0b111);
+
+        // A view change that ends between two checks: replica 0 leads views 0
+        // and 3, and the shard keeps what it sent.
+        let partitions = shard.plane.partitions();
+        let sent = partitions.sent_report(&namespace).unwrap().1.get();
+        insert(&shard, 0, 7, 3);
+        partitions.sent_report(&namespace).unwrap().1.set(sent);
+        publish(&shard);
+        let (reports, statuses) = receive(&inbox);
+        assert_eq!(
+            reports.iter().map(|report| report.view).collect::<Vec<_>>(),
+            [3]
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|status| (status.view, status.in_sync_nodes))
+                .collect::<Vec<_>>(),
+            [(3, 0b111)],
+            "the same nodes in sync"
+        );
+        assert_quiet_until(&shard, &inbox, interval());
+
+        let partition = partitions.get_by_ns(&namespace).unwrap();
+        let frame = Message::<GenericHeader>::new(size_of::<GenericHeader>()).into_frozen();
         assert!(
-            inbox.try_recv().is_err(),
-            "a finished pass waits for the next interval"
+            partition
+                .consensus()
+                .send_to_member(1, frame)
+                .await
+                .is_err()
+        );
+        publish(&shard);
+        let (reports, statuses) = receive(&inbox);
+        assert!(reports.is_empty(), "the view did not move");
+        assert_eq!(
+            statuses
+                .iter()
+                .map(|status| (status.view, status.in_sync_nodes))
+                .collect::<Vec<_>>(),
+            [(3, 0b101)],
+            "node 1 left the in-sync nodes"
+        );
+        assert_quiet_until(&shard, &inbox, 3 * interval());
+    }
+
+    #[compio::test]
+    async fn given_moving_counters_when_ticking_should_report_them_at_most_once_per_interval() {
+        let (shard, inbox) = owner(1);
+        let namespace = insert(&shard, 0, 7, 0);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        let mut reported = Vec::new();
+        for tick in 1..=3 * interval() {
+            advance_to(&shard, tick);
+            partition.stats.increment_messages_count(1);
+            publish(&shard);
+            if !inbox.is_empty() {
+                let (_, statuses) = receive(&inbox);
+                reported.extend(statuses.iter().map(|status| (tick, status.messages_count)));
+            }
+        }
+        let first = 1;
+        assert_eq!(
+            reported,
+            [
+                (first, first),
+                (first + interval(), first + interval()),
+                (first + 2 * interval(), first + 2 * interval()),
+            ]
         );
     }
 
     #[compio::test]
-    async fn given_more_groups_than_an_interval_of_batches_when_an_interval_runs_should_report_each_group_within_it()
+    async fn given_unchanged_counters_when_intervals_pass_should_report_only_after_retention_moves_them()
      {
+        const SIZE_BYTES: u64 = 4096;
+        const RETAINED_BYTES: u64 = 1024;
         let (shard, inbox) = owner(1);
-        let interval = u64::try_from(PARTITION_PLACEMENT_REPORT_INTERVAL_TICKS).unwrap();
-        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * usize::try_from(interval).unwrap()
-            + PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN
-            + 3;
-        for id in 0..count {
-            insert(&shard, id, 7, 0);
-        }
-        let mut observed = BTreeSet::new();
-        for tick in 1..=interval {
-            shard.ticks.set(tick);
+        let namespace = insert(&shard, 0, 7, 0);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        partition.stats.increment_size_bytes(SIZE_BYTES);
+        publish(&shard);
+        let (_, statuses) = receive(&inbox);
+        let reported = statuses[0];
+        assert_quiet_until(&shard, &inbox, 3 * interval());
+
+        // Retention removes bytes and commits nothing.
+        partition.stats.decrement_size_bytes(RETAINED_BYTES);
+        let mut statuses = Vec::new();
+        for tick in 3 * interval() + 1..=6 * interval() {
+            advance_to(&shard, tick);
             publish(&shard);
             if !inbox.is_empty() {
-                observed.extend(
-                    receive(&inbox)
-                        .into_iter()
-                        .map(|report| report.namespace.partition_id()),
-                );
+                statuses.extend(receive(&inbox).1);
             }
         }
         assert_eq!(
-            observed.len(),
-            count,
-            "every group reports within one interval"
+            statuses,
+            [PartitionStatusEntry {
+                size_bytes: SIZE_BYTES - RETAINED_BYTES,
+                ..reported
+            }]
         );
+    }
 
-        shard.ticks.set(interval + 1);
-        publish(&shard);
-        assert_eq!(
-            receive(&inbox)[0].namespace,
-            IggyNamespace::new(0, 0, 0),
-            "the next interval starts a new pass at the front"
-        );
+    #[compio::test]
+    async fn given_an_acting_primary_when_it_stops_acting_should_retract_its_status_once() {
+        const MESSAGES: u64 = 5;
+        for exit in ["ceded", "tombstoned", "removed"] {
+            let (shard, inbox) = owner(1);
+            let namespace = insert(&shard, 0, 7, 0);
+            let partitions = shard.plane.partitions();
+            let partition = partitions.get_by_ns(&namespace).unwrap();
+            partition.stats.increment_messages_count(MESSAGES);
+            publish(&shard);
+            let (_, statuses) = receive(&inbox);
+            let reported = statuses[0];
+
+            match exit {
+                "ceded" => partition.consensus().init_as_backup(),
+                "tombstoned" => partitions.tombstone(namespace),
+                "removed" => {
+                    partitions.tombstone(namespace);
+                    shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
+                    shard.apply_reconcile_ops();
+                }
+                _ => unreachable!(),
+            }
+            publish(&shard);
+            let (reports, statuses) = receive(&inbox);
+            assert!(reports.is_empty(), "{exit}");
+            assert_eq!(
+                statuses,
+                [PartitionStatusEntry {
+                    in_sync_nodes: 0,
+                    ..reported
+                }],
+                "{exit}: the last view with the counters it holds"
+            );
+            assert_quiet_until(&shard, &inbox, 3 * interval());
+            if exit == "tombstoned" {
+                shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove { namespace });
+                shard.apply_reconcile_ops();
+                publish(&shard);
+                assert!(inbox.try_recv().is_err(), "one retraction per status");
+            }
+        }
     }
 
     #[compio::test]
@@ -17219,7 +19817,7 @@ mod partition_placement_tests {
 
             assert!(shard.tick_partitions(&mut Vec::new()).await.is_none());
 
-            let reports = receive(&inbox);
+            let (reports, _) = receive(&inbox);
             assert_eq!(reports.len(), 2);
             assert_eq!(reports[0].namespace, IggyNamespace::new(0, 0, 0));
             assert_eq!(reports[0].view, 0, "a normal primary contributes");
@@ -17232,44 +19830,116 @@ mod partition_placement_tests {
         }
     }
 
+    /// The gauge counts the partitions that a report tick visits, so a
+    /// partition that owes a retirement stays awake to be counted.
     #[compio::test]
-    async fn given_more_groups_than_one_batch_when_publishing_should_bound_batches_and_cover_the_tail()
+    async fn given_a_quiet_backup_that_owes_retirement_when_report_ticks_pass_should_stay_counted()
+    {
+        let (shard, inbox) = owner(1);
+        let namespace = insert(&shard, 0, 7, 1);
+        let _ = shard
+            .plane
+            .partitions()
+            .get_by_ns(&namespace)
+            .unwrap()
+            .observe_retirement_debt(1);
+        let mut scratch = Vec::new();
+        for _ in 0..2 * interval() {
+            assert!(shard.tick_partitions(&mut scratch).await.is_none());
+            while inbox.try_recv().is_ok() {}
+        }
+        assert_eq!(shard.metrics.partitions_owing_retirement_value(), 1);
+    }
+
+    /// A quiet partition costs a visit per timeout, not a visit per tick.
+    #[compio::test]
+    async fn given_quiet_partitions_when_ticks_run_should_visit_each_once_per_timeout() {
+        const PARTITIONS: usize = 32;
+        const TICKS: u64 = 300;
+        let (shard, inbox) = owner(1);
+        for id in 0..PARTITIONS {
+            // Primaries and backups in turn.
+            insert(&shard, id, 7, u32::from(id % 2 == 1));
+        }
+        let mut scratch = Vec::new();
+        for _ in 0..TICKS {
+            assert!(shard.tick_partitions(&mut scratch).await.is_none());
+            // A full inbox keeps a report queued, and its partition awake.
+            while inbox.try_recv().is_ok() {}
+        }
+
+        let visits = shard.metrics.partition_tick_visits_value();
+        let partitions = u64::try_from(PARTITIONS).unwrap();
+        assert!(visits >= partitions, "every partition has a first visit");
+        assert!(
+            visits <= partitions * TICKS / 10,
+            "{visits} visits of {PARTITIONS} quiet partitions in {TICKS} ticks"
+        );
+    }
+
+    #[compio::test]
+    async fn given_more_groups_than_one_batch_when_publishing_should_report_each_once_in_bounded_batches()
      {
         let (shard, inbox) = owner(1);
         let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * 2 + 3;
         for id in 0..count {
-            insert(&shard, id, 7, 0);
+            insert(&shard, id, 7, 1);
         }
-        let mut observed = BTreeSet::new();
-        for _ in 0..count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN) {
+        let removed = IggyNamespace::new(0, 0, count - 1);
+        let batches =
+            u64::try_from(count.div_ceil(PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN)).unwrap();
+        let mut observed = Vec::new();
+        for tick in 1..=batches {
+            advance_to(&shard, tick);
             publish(&shard);
-            let reports = receive(&inbox);
-            assert_eq!(reports.len(), PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN);
-            observed.extend(
-                reports
-                    .into_iter()
-                    .map(|report| report.namespace.partition_id()),
-            );
+            let (reports, _) = receive(&inbox);
+            assert!(reports.len() <= PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN);
+            observed.extend(reports.iter().map(|report| report.namespace.partition_id()));
+            if tick == 1 {
+                // Removed while it waits in the queue.
+                shard.plane.partitions().remove(&removed);
+            }
         }
-        assert_eq!(observed, (0..count).collect());
-
-        let removed = shard.partition_placement_cursor.get().unwrap();
-        shard.plane.partitions().remove(&removed);
-        publish(&shard);
-        let reports = receive(&inbox);
-        assert_eq!(
-            reports[0].namespace.partition_id(),
-            removed.partition_id() + 1
-        );
-        assert!(reports.iter().all(|report| report.namespace != removed));
+        assert_eq!(observed, (0..count - 1).collect::<Vec<_>>());
+        assert_quiet_until(&shard, &inbox, 2 * interval());
     }
 
     #[compio::test]
-    async fn given_a_full_inbox_when_retried_should_publish_current_incarnation_without_skipping_groups()
+    async fn given_more_groups_than_an_interval_of_batches_when_publishing_should_report_each_within_an_interval()
      {
         let (shard, inbox) = owner(1);
+        let count = PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN * usize::try_from(interval()).unwrap()
+            + PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN
+            + 3;
+        for id in 0..count {
+            insert(&shard, id, 7, 1);
+        }
+        let mut observed = BTreeSet::new();
+        for tick in 1..=interval() {
+            advance_to(&shard, tick);
+            publish(&shard);
+            if !inbox.is_empty() {
+                observed.extend(
+                    receive(&inbox)
+                        .0
+                        .into_iter()
+                        .map(|report| report.namespace.partition_id()),
+                );
+            }
+        }
+        assert_eq!(
+            observed.len(),
+            count,
+            "every group reports within one interval"
+        );
+        assert_quiet_until(&shard, &inbox, 2 * interval());
+    }
+
+    #[compio::test]
+    async fn given_a_full_inbox_when_publishing_should_keep_reports_queued_for_the_next_tick() {
+        let (shard, inbox) = owner(1);
         let namespace = insert(&shard, 0, 7, 0);
-        insert(&shard, 1, 7, 0);
+        insert(&shard, 1, 7, 1);
         assert!(
             shard.senders[0]
                 .try_send(ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick))
@@ -17277,12 +19947,7 @@ mod partition_placement_tests {
         );
 
         publish(&shard);
-        assert_eq!(shard.partition_placement_cursor.get(), None);
-        assert_eq!(
-            inbox.len(),
-            1,
-            "no deferred report queue grows behind the full inbox"
-        );
+        assert_eq!(inbox.len(), 1, "the full inbox took no report");
         assert!(matches!(
             inbox.try_recv(),
             Ok(ShardFrame::Lifecycle(LifecycleFrame::MetadataCommitTick))
@@ -17290,21 +19955,63 @@ mod partition_placement_tests {
         shard.plane.partitions().remove(&namespace);
         insert(&shard, 0, 11, 9);
 
+        advance_to(&shard, 1);
         publish(&shard);
-        let reports = receive(&inbox);
-        assert_eq!(reports.len(), 2);
-        assert_eq!(reports[0].namespace, namespace);
-        assert_eq!(reports[0].created_revision, 11);
+        let (reports, _) = receive(&inbox);
         assert_eq!(
-            reports[0].view, 9,
-            "retry rereads rather than retaining the old observation"
+            reports
+                .iter()
+                .map(|report| (report.namespace, report.created_revision, report.view))
+                .collect::<Vec<_>>(),
+            [(namespace, 11, 9), (IggyNamespace::new(0, 0, 1), 7, 1)],
+            "the retry reads the current incarnation"
         );
-        assert_eq!(reports[1].namespace, IggyNamespace::new(0, 0, 1));
     }
 
     #[compio::test]
-    async fn given_an_ineligible_prefix_when_publishing_should_bound_visits_and_reach_live_groups()
-    {
+    async fn given_more_retractions_than_one_batch_when_the_inbox_frees_should_send_them_in_removal_order()
+     {
+        let (shard, inbox) = owner(1);
+        let namespaces: Vec<_> = (0..=PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN)
+            .map(|id| insert(&shard, id, 7, 0))
+            .collect();
+        for _ in 0..2 {
+            publish(&shard);
+            receive(&inbox);
+        }
+        for namespace in namespaces.iter().rev() {
+            shard.plane.partitions().tombstone(*namespace);
+            shard.enqueue_reconcile_op(ReconcileOp::ConfirmRemove {
+                namespace: *namespace,
+            });
+        }
+        shard.apply_reconcile_ops();
+        assert!(
+            shard.senders[0]
+                .try_send(ShardFrame::lifecycle(LifecycleFrame::MetadataCommitTick))
+                .is_ok()
+        );
+        publish(&shard);
+        assert_eq!(inbox.len(), 1, "the full inbox took no retraction");
+        inbox.try_recv().unwrap();
+
+        let mut retracted = Vec::new();
+        for _ in 0..2 {
+            publish(&shard);
+            retracted.extend(receive(&inbox).1.iter().map(|status| status.namespace));
+        }
+        assert_eq!(
+            retracted,
+            namespaces
+                .iter()
+                .rev()
+                .map(IggyNamespace::inner)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[compio::test]
+    async fn given_an_ineligible_prefix_when_publishing_should_report_the_live_group_at_once() {
         let (shard, inbox) = owner(1);
         for id in 0..=PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN {
             let namespace = insert(&shard, id, 7, 0);
@@ -17319,17 +20026,13 @@ mod partition_placement_tests {
             }
         }
         publish(&shard);
-        assert!(
-            inbox.try_recv().is_err(),
-            "one sweep visits at most its bounded range"
-        );
-
-        publish(&shard);
-        let reports = receive(&inbox);
-        assert_eq!(reports.len(), 1);
+        let (reports, _) = receive(&inbox);
         assert_eq!(
-            reports[0].namespace.partition_id(),
-            PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN
+            reports
+                .iter()
+                .map(|report| report.namespace.partition_id())
+                .collect::<Vec<_>>(),
+            [PARTITION_PLACEMENT_REPORTS_PER_TICK_MIN]
         );
     }
 
@@ -17976,5 +20679,364 @@ mod untrusted_do_view_change_tests {
                 group: GROUP,
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod replication_flow_tests {
+    use super::*;
+    use crate::partition_placement_tests::{PlacementShard, insert, owner_with_repair_memory};
+    use consensus::REPLICATION_BATCH_BYTES_MAX;
+    use journal::prepare_journal::PrepareJournal;
+    use message_bus::IggyMessageBus;
+    use server_common::iobuf::Owned;
+    use server_common::sharding::METADATA_GROUP;
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
+    type SentFrames = Rc<RefCell<Vec<(u8, Frozen<MESSAGE_ALIGN>)>>>;
+
+    fn recording_shard() -> (PlacementShard, SentFrames) {
+        const REPAIR_MEMORY_BYTES_MAX: usize = 64 * 1024;
+        let (shard, _) = owner_with_repair_memory(
+            0,
+            Some(Arc::new(partitions::RepairMemoryBudget::new(
+                REPAIR_MEMORY_BYTES_MAX,
+            ))),
+        );
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let captured = Rc::clone(&sent);
+        shard
+            .bus
+            .set_replica_forward_fn(Box::new(move |replica, _, frame| {
+                captured.borrow_mut().push((replica, frame));
+                Ok(())
+            }));
+        for replica in 1..3 {
+            crate::test_support::connect_replica_on(&shard.bus, replica, 1);
+        }
+        (shard, sent)
+    }
+
+    fn prepare(group: u64, op: u64) -> Message<PrepareHeader> {
+        Message::<PrepareHeader>::new(size_of::<PrepareHeader>()).transmute_header(
+            |_, header: &mut PrepareHeader| {
+                header.command = Command::Prepare;
+                header.operation = Operation::StoreConsumerOffset;
+                header.cluster = 1;
+                header.group = group;
+                header.op = op;
+                header.timestamp = op;
+                header.size = u32::try_from(size_of::<PrepareHeader>()).unwrap();
+                header.checksum = header.identity_checksum();
+            },
+        )
+    }
+
+    fn ready_reply(
+        consensus: &VsrConsensus<Rc<IggyMessageBus>>,
+        replica: u8,
+        nonce: u64,
+        observed_op: u64,
+        received_op: u64,
+    ) -> Message<PrepareProgressHeader> {
+        Message::<PrepareProgressHeader>::new(size_of::<PrepareProgressHeader>()).transmute_header(
+            |_, header: &mut PrepareProgressHeader| {
+                header.command = Command::PrepareProgress;
+                header.cluster = consensus.cluster();
+                header.group = consensus.group();
+                header.view = consensus.view();
+                header.partition_incarnation = consensus.partition_incarnation();
+                header.replica = replica;
+                header.kind = PrepareProgressHeader::REPLY;
+                header.ready = 1;
+                header.nonce = nonce;
+                header.observed_op = observed_op;
+                header.held_op = received_op;
+                header.received_op = received_op;
+                header.size = u32::try_from(size_of::<PrepareProgressHeader>()).unwrap();
+                header.seal();
+            },
+        )
+    }
+
+    #[compio::test]
+    async fn given_a_full_transfer_admission_when_another_group_requests_should_not_pin_its_repair_tail()
+     {
+        const NONCE: u128 = 1;
+        let (shard, _) = recording_shard();
+        let namespace = insert(&shard, 0, 0, 0);
+        let busy = insert(&shard, 1, 0, 0);
+        shard.served_segment_cache_bytes_max.set(0);
+        shard
+            .partition_offer_builds
+            .borrow_mut()
+            .insert(busy.inner(), 0);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        assert!(partition.serves_state_transfer());
+        assert!(!partition.touch_transfer_tail(1, NONCE, 0));
+        let request =
+            Message::<RequestStateTransferHeader>::new(size_of::<RequestStateTransferHeader>())
+                .transmute_header(|_, header: &mut RequestStateTransferHeader| {
+                    header.command = Command::RequestStateTransfer;
+                    header.cluster = 1;
+                    header.replica = 1;
+                    header.group = namespace.inner();
+                    header.partition_incarnation = partition.consensus().partition_incarnation();
+                    header.nonce = NONCE;
+                    header.size = u32::try_from(size_of::<RequestStateTransferHeader>()).unwrap();
+                    header.seal();
+                });
+
+        shard
+            .serve_partition_transfer_request(*request.header(), None)
+            .await;
+
+        assert!(
+            !partition.touch_transfer_tail(1, NONCE, 0),
+            "a refused transfer must not retain a live repair-tail lease"
+        );
+        assert_eq!(
+            shard.partition_transfer_waiters.borrow().as_slice(),
+            &[(namespace.inner(), 0)]
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_delayed_progress_probe_when_prepares_retransmit_should_share_credit_and_resume_after_its_reply()
+     {
+        let (shard, sent) = recording_shard();
+        let namespace = insert(&shard, 0, 0, 0);
+        let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+        let entry = prepare(namespace.inner(), 1);
+        let header = *entry.header();
+        partition
+            .log
+            .journal()
+            .inner
+            .append(entry.into_frozen())
+            .await
+            .unwrap();
+        let consensus = partition.consensus();
+        consensus.sequencer().set_sequence(1);
+        assert!(consensus.admit_replication(
+            1,
+            1,
+            REPLICATION_BATCH_BYTES_MAX,
+            ReplicationSend::Live
+        ));
+        let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) = consensus
+            .record_replication_send(1, 1, REPLICATION_BATCH_BYTES_MAX, ReplicationSend::Live)
+        else {
+            panic!("a full window must send a checkpoint behind its last frame");
+        };
+        let retry = VsrAction::RetransmitPrepares {
+            targets: vec![(header, vec![1, 2])],
+        };
+
+        dispatch_partition_journal_actions(consensus, partition, &[retry]).await;
+
+        assert_eq!(
+            sent.borrow()
+                .iter()
+                .map(|(replica, _)| *replica)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(
+            !consensus.admit_replication(
+                2,
+                2,
+                REPLICATION_BATCH_BYTES_MAX,
+                ReplicationSend::Retransmit
+            ),
+            "a successful timeout retry must consume the same byte credit as replay"
+        );
+        let reply = ready_reply(consensus, 1, nonce, through, 1);
+        assert!(consensus.handle_prepare_progress(reply.header()).is_some());
+        assert_eq!(
+            consensus.commit_max(),
+            0,
+            "progress is not a PrepareOk vote"
+        );
+        sent.borrow_mut().clear();
+        dispatch_partition_journal_actions(
+            consensus,
+            partition,
+            &[VsrAction::RetransmitPrepares {
+                targets: vec![(header, vec![1])],
+            }],
+        )
+        .await;
+        assert_eq!(
+            sent.borrow().len(),
+            1,
+            "the duplicate must still recover a lost PrepareOk"
+        );
+        assert_eq!(sent.borrow()[0].0, 1);
+    }
+
+    #[compio::test]
+    async fn given_a_metadata_progress_probe_when_prepares_retransmit_should_share_the_peer_window()
+    {
+        const JOURNAL_SLOTS: usize = 128;
+        let (shard, sent) = recording_shard();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            Rc::clone(&shard.bus),
+            consensus::LocalPipeline::new(),
+        );
+        consensus.init();
+        let directory = tempfile::tempdir().unwrap();
+        let journal = PrepareJournal::open_with_slots(
+            &directory.path().join("journal.wal"),
+            0,
+            JOURNAL_SLOTS,
+        )
+        .await
+        .unwrap();
+        let entry = prepare(METADATA_GROUP, 1);
+        let header = *entry.header();
+        journal.append(entry).await.unwrap();
+        consensus.sequencer().set_sequence(1);
+        assert!(consensus.admit_replication(
+            1,
+            1,
+            REPLICATION_BATCH_BYTES_MAX,
+            ReplicationSend::Live
+        ));
+        let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) = consensus
+            .record_replication_send(1, 1, REPLICATION_BATCH_BYTES_MAX, ReplicationSend::Live)
+        else {
+            panic!("a full metadata window must send a checkpoint behind its last frame");
+        };
+        dispatch_vsr_actions(
+            &consensus,
+            Some(&journal),
+            &[VsrAction::RetransmitPrepares {
+                targets: vec![(header, vec![1, 2])],
+            }],
+        )
+        .await;
+        assert_eq!(
+            sent.borrow()
+                .iter()
+                .map(|(replica, _)| *replica)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert!(!consensus.admit_replication(
+            2,
+            2,
+            REPLICATION_BATCH_BYTES_MAX,
+            ReplicationSend::Retransmit
+        ));
+        let reply = ready_reply(&consensus, 1, nonce, through, 1);
+        assert!(consensus.handle_prepare_progress(reply.header()).is_some());
+        sent.borrow_mut().clear();
+        dispatch_vsr_actions(
+            &consensus,
+            Some(&journal),
+            &[VsrAction::RetransmitPrepares {
+                targets: vec![(header, vec![1])],
+            }],
+        )
+        .await;
+        assert_eq!(
+            sent.borrow().len(),
+            1,
+            "metadata retries resume after the correlated reply"
+        );
+    }
+
+    #[compio::test]
+    async fn given_several_groups_and_peers_in_replay_when_ticks_advance_should_bound_each_turn_and_visit_every_pair()
+     {
+        const GROUPS: usize = 3;
+        const OPS: u64 = 3;
+        const PULL_ROUND_OPS_MAX: u64 = 1;
+        let (shard, sent) = recording_shard();
+        shard.repair_chunk_max.set(PULL_ROUND_OPS_MAX);
+        let mut expected = BTreeSet::new();
+        for id in 0..GROUPS {
+            let namespace = insert(&shard, id, 0, 0);
+            let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+            for op in 1..=OPS {
+                partition
+                    .log
+                    .journal()
+                    .inner
+                    .append(prepare(namespace.inner(), op).into_frozen())
+                    .await
+                    .unwrap();
+            }
+            let consensus = partition.consensus();
+            consensus.sequencer().set_sequence(OPS);
+            for replica in 1..3 {
+                assert!(consensus.admit_replication(
+                    replica,
+                    1,
+                    size_of::<PrepareHeader>() as u64,
+                    ReplicationSend::Live
+                ));
+                consensus.record_replication_failure(replica, 1);
+                let Some(consensus::ReplicationWork::Probe { nonce, through, .. }) =
+                    consensus.replication_work(replica)
+                else {
+                    panic!("a missing prefix must request progress");
+                };
+                let reply = ready_reply(consensus, replica, nonce, through, 0);
+                assert!(consensus.handle_prepare_progress(reply.header()).is_some());
+                expected.insert((namespace.inner(), replica));
+            }
+        }
+        let mut observed = BTreeSet::new();
+        for tick in 1..=expected.len() {
+            let op = OPS + u64::try_from(tick).unwrap();
+            for id in 0..GROUPS {
+                let namespace = IggyNamespace::new(0, 0, id);
+                let partition = shard.plane.partitions().get_by_ns(&namespace).unwrap();
+                partition
+                    .log
+                    .journal()
+                    .inner
+                    .append(prepare(namespace.inner(), op).into_frozen())
+                    .await
+                    .unwrap();
+                partition.consensus().sequencer().set_sequence(op);
+            }
+            sent.borrow_mut().clear();
+            assert!(shard.tick_partitions(&mut Vec::new()).await.is_none());
+            let frames = sent.borrow();
+            let prepares: Vec<_> = frames
+                .iter()
+                .filter_map(|(replica, frame)| {
+                    let message = Message::<PrepareHeader>::try_from(Owned::copy_from_slice(
+                        frame.as_slice(),
+                    ))
+                    .ok()?;
+                    let header = message.header();
+                    (header.command == Command::Prepare).then_some((header.group, *replica))
+                })
+                .collect();
+            assert!(
+                u64::try_from(prepares.len()).unwrap() > PULL_ROUND_OPS_MAX,
+                "live replay must not inherit the pull repair operation-count limit"
+            );
+            let pairs: BTreeSet<_> = prepares.into_iter().collect();
+            assert_eq!(
+                pairs.len(),
+                1,
+                "one shard tick must drive only one bounded replay range"
+            );
+            assert!(
+                observed.insert(*pairs.first().unwrap()),
+                "a busy pair must not starve another pair"
+            );
+        }
+        assert_eq!(observed, expected);
     }
 }

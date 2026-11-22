@@ -16,10 +16,15 @@
 // under the License.
 
 mod args;
+mod artifacts;
 mod cache;
+mod config;
+mod dedicated_thread;
+mod embed_cache;
 mod error;
 mod github;
 mod handlers;
+mod omb;
 mod render;
 
 use crate::cache::CacheWatcher;
@@ -31,12 +36,18 @@ use actix_web::{
     middleware::{Compress, Logger},
     web,
 };
-use args::{IggyBenchDashboardServerArgs, PollGithub};
-use cache::BenchmarkCache;
-use github::IggyBenchDashboardGithubPoller;
+use args::IggyBenchDashboardServerArgs;
+use bench_dashboard_shared::config::DashboardConfig;
+use cache::{BenchmarkCache, SeriesBuilder};
+use embed_cache::{BYTES_PER_GIB, EMBED_CACHE_DIR, EmbedCache};
+use github::StarCount;
 use handlers::AppState;
+use handlers::omb::OmbState;
+use omb::OmbCache;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, info};
+use std::time::Instant;
+use tracing::{error, info, warn};
 use tracing_subscriber::{
     EnvFilter,
     fmt::{self, format::Format},
@@ -48,7 +59,14 @@ use tracing_subscriber::{
 struct ServerState {
     cache: Arc<BenchmarkCache>,
     _watcher: Arc<CacheWatcher>,
+    series_builder: Arc<SeriesBuilder>,
     render_pool: Arc<render::PngRenderPool>,
+    embed_cache: Arc<EmbedCache>,
+    cache_dir: PathBuf,
+    config: Arc<DashboardConfig>,
+    omb_cache: Option<Arc<OmbCache>>,
+    _omb_watcher: Option<Arc<CacheWatcher>>,
+    github_stars: Arc<StarCount>,
 }
 
 async fn index() -> actix_web::Result<NamedFile> {
@@ -73,17 +91,26 @@ async fn main() -> Result<(), std::io::Error> {
     let addr = args.server_addr();
     let cors_origins = args.cors_origins_list();
 
-    let cache = Arc::new(BenchmarkCache::new(results_dir.clone()).await);
+    let config = match config::load(&args.config) {
+        Ok(config) => Arc::new(config),
+        Err(e) => {
+            error!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let cache = Arc::new(BenchmarkCache::new(results_dir.clone(), config.thresholds));
     info!("Starting cache load...");
     let start = std::time::Instant::now();
-    if let Err(e) = cache.load().await {
+    if let Err(e) = cache.load() {
         error!("Failed to load cache: {}", e);
         std::process::exit(1);
     }
     let duration = start.elapsed();
     info!("Cache loaded in {:.2?}", duration);
 
-    let watcher = match CacheWatcher::new(Arc::clone(&cache), results_dir.clone()) {
+    let reload = Arc::clone(&cache);
+    let watcher = match CacheWatcher::new(move || reload.load(), results_dir.clone()) {
         Ok(w) => Arc::new(w),
         Err(e) => {
             error!("Failed to initialize file watcher: {}", e);
@@ -91,33 +118,69 @@ async fn main() -> Result<(), std::io::Error> {
         }
     };
 
-    let poller = if let Some(poller) = args.github {
-        match poller {
-            PollGithub::PollGithub(args) => {
-                info!("Starting GithubPoller for branch {}", args.branch);
+    let (omb_cache, omb_watcher) = args.omb_results_dir.as_deref().map(start_omb_cache).unzip();
 
-                Some(IggyBenchDashboardGithubPoller::start(
-                    results_dir.clone(),
-                    args.branch,
-                    args.interval_seconds,
-                    cache.clone(),
-                ))
-            }
+    let series_builder = match SeriesBuilder::start(Arc::clone(&cache)) {
+        Ok(builder) => Arc::new(builder),
+        Err(e) => {
+            error!("Failed to start the series build thread: {}", e);
+            std::process::exit(1);
         }
-    } else {
-        None
     };
 
-    let render_pool = Arc::new(render::PngRenderPool::default_pool());
+    let render_pool = match render::PngRenderPool::new() {
+        Ok(pool) => Arc::new(pool),
+        Err(e) => {
+            error!("Failed to start the PNG render thread: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let build = embed_cache::build_stamp().unwrap_or_else(|e| {
+        let stamp = embed_cache::start_stamp();
+        warn!(
+            "Failed to hash the server binary for the embed cache: {e}. The cache uses the stamp \
+             {stamp} of this start, so after a restart every embed file is built again"
+        );
+        stamp
+    });
+    let embed_cache = match EmbedCache::open(
+        args.cache_dir.join(EMBED_CACHE_DIR),
+        args.embed_cache_max_gib.saturating_mul(BYTES_PER_GIB),
+        build,
+    ) {
+        Ok(cache) => Arc::new(cache),
+        Err(e) => {
+            error!("Failed to open the embed cache: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let github_stars = Arc::new(StarCount::default());
+    Arc::clone(&github_stars).refresh_hourly();
 
     let state = ServerState {
         cache: Arc::clone(&cache),
         _watcher: Arc::clone(&watcher),
+        series_builder,
         render_pool,
+        embed_cache,
+        cache_dir: args.cache_dir.clone(),
+        config,
+        omb_cache,
+        _omb_watcher: omb_watcher,
+        github_stars,
     };
 
     info!("Starting server on {}", addr);
     info!("Results directory: {}", results_dir.display());
+    match &args.omb_results_dir {
+        Some(omb_results_dir) => info!("OMB results directory: {}", omb_results_dir.display()),
+        None => info!("OMB results directory: not set"),
+    }
+    info!("Cache directory: {}", args.cache_dir.display());
+    info!("Embed cache limit: {} GiB", args.embed_cache_max_gib);
+    info!("Config file: {}", args.config.display());
     info!("Log level: {}", args.log_level);
     info!("CORS origins: {}", args.cors_origins);
 
@@ -153,20 +216,37 @@ async fn main() -> Result<(), std::io::Error> {
             .wrap(Compress::default())
             .app_data(web::Data::new(AppState {
                 cache: Arc::clone(&state.cache),
+                series_builder: Arc::clone(&state.series_builder),
                 render_pool: Arc::clone(&state.render_pool),
+                embed_cache: Arc::clone(&state.embed_cache),
+                cache_dir: state.cache_dir.clone(),
+                config: Arc::clone(&state.config),
             }))
+            .app_data(web::Data::new(OmbState {
+                cache: state.omb_cache.clone(),
+            }))
+            .app_data(web::Data::from(Arc::clone(&state.github_stars)))
             .service(handlers::health_check)
-            .service(handlers::list_hardware)
-            .service(handlers::list_gitrefs_for_hardware)
-            .service(handlers::get_recent_benchmarks) // Register this before the generic gitref endpoint
-            .service(handlers::list_benchmarks_for_gitref)
-            .service(handlers::list_benchmarks_for_hardware_and_gitref)
+            .service(handlers::list_benchmark_summaries)
+            .service(handlers::get_dashboard_config)
+            .service(handlers::get_github_stars)
             .service(handlers::get_benchmark_report_full)
             .service(handlers::get_benchmark_report_light)
-            .service(handlers::get_benchmark_trend)
+            .service(handlers::get_benchmark_series)
             .service(handlers::get_test_artifacts_zip)
+            // Only `/embed/omb/chart.png` matches an OMB and an iggy-bench embed route. Both answer
+            // 400 for it, and this order names the missing OMB run id in the error.
+            .service(handlers::omb::embed_omb_chart_png)
+            .service(handlers::omb::embed_omb_chart)
             .service(handlers::embed_chart_png)
             .service(handlers::embed_chart)
+            .service(handlers::omb::list_omb_runs)
+            .service(handlers::omb::get_omb_run)
+            .service(handlers::omb::download_omb_result)
+            .service(handlers::omb::download_omb_setup)
+            // Keep this after every /api handler: actix matches services in registration order,
+            // so the scope hides an /api handler registered after it.
+            .service(web::scope("/api").default_service(web::to(handlers::unknown_api_path)))
             .service(
                 fs::Files::new("/", "frontend/dist")
                     .index_file("index.html")
@@ -179,9 +259,27 @@ async fn main() -> Result<(), std::io::Error> {
 
     server.await?;
 
-    if let Some(poller) = poller {
-        poller.shutdown().await;
-    }
-
     Ok(())
+}
+
+/// Loads the OMB runs and watches their directory, or ends the process, as `main` does for the
+/// iggy-bench runs.
+fn start_omb_cache(omb_results_dir: &Path) -> (Arc<OmbCache>, Arc<CacheWatcher>) {
+    let cache = Arc::new(OmbCache::new(omb_results_dir.to_path_buf()));
+    info!("Starting OMB run cache load...");
+    let start = Instant::now();
+    if let Err(e) = cache.load() {
+        error!("Failed to load OMB run cache: {}", e);
+        std::process::exit(1);
+    }
+    info!("OMB run cache loaded in {:.2?}", start.elapsed());
+
+    let reload = Arc::clone(&cache);
+    match CacheWatcher::new(move || reload.load(), omb_results_dir.to_path_buf()) {
+        Ok(watcher) => (cache, Arc::new(watcher)),
+        Err(e) => {
+            error!("Failed to initialize the OMB file watcher: {}", e);
+            std::process::exit(1);
+        }
+    }
 }

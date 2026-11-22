@@ -42,6 +42,14 @@ final class RawCommandTest extends TestCase
     private const INVALID_SIZE_BYTES_CODE = 80;
     private const INVALID_MESSAGES_COUNT_CODE = 4009;
     private const MAX_POLL_WAIT_MICROS = 600_000_000;
+    private const GEO_DURATION_FIELDS = [
+        'fresh_upload_interval_micros',
+        'consumer_offset_upload_interval_micros',
+        'positions_publish_interval_micros',
+        'tombstone_grace_micros',
+        'positions_resume_timeout_micros',
+        'long_term_rewrite_max_interval_micros',
+    ];
 
     #[TestDox('A raw ping command returns an empty successful response')]
     public function testRawPingReturnsEmptyResponse(): void
@@ -220,9 +228,18 @@ final class RawCommandTest extends TestCase
                     'compression_algorithm' => null, 'message_expiry_micros' => null,
                     'max_topic_size' => null, 'segment_size' => null, 'durability' => null,
                     'consumer_offset_durability' => null, 'messages_required_to_save' => null,
-                    'size_of_messages_required_to_save' => null, 'preallocate_segments' => null],
+                    'size_of_messages_required_to_save' => null, 'preallocate_segments' => null,
+                    'replication_factor' => null, 'segment_max_age_micros' => null,
+                    'tiered_storage' => null, 'local_retention_age_micros' => null,
+                    'local_retention_size' => null],
                 ['message_expiry_micros', 'max_topic_size', 'segment_size',
-                    'messages_required_to_save', 'size_of_messages_required_to_save'],
+                    'messages_required_to_save', 'size_of_messages_required_to_save', 'replication_factor',
+                    'segment_max_age_micros', 'local_retention_age_micros', 'local_retention_size',
+                    ...self::GEO_DURATION_FIELDS],
+            ],
+            'updateTopic' => [
+                ['stream' => 's', 'topic' => 't'],
+                self::GEO_DURATION_FIELDS,
             ],
             'consumerGroup' => [
                 ['name' => 'g', 'stream' => 's', 'topic' => 't', 'polling_strategy' => null,
@@ -263,8 +280,10 @@ final class RawCommandTest extends TestCase
                 assert_throws(static fn () => $client->$method(...$arguments), $field);
             }
         }
-        $arguments = array_replace($methods['createTopic'][0], ['messages_required_to_save' => 4294967296]);
-        assert_throws(static fn () => $client->createTopic(...$arguments), 'messages_required_to_save');
+        foreach (['messages_required_to_save', 'replication_factor'] as $field) {
+            $arguments = array_replace($methods['createTopic'][0], [$field => 4294967296]);
+            assert_throws(static fn () => $client->createTopic(...$arguments), $field);
+        }
     }
 
     public function testPollOptionsKeepDefaultsAndRefuseInvalidLimits(): void

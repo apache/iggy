@@ -63,6 +63,7 @@ pub mod dispatch;
 pub mod error;
 pub mod framing;
 pub mod namespace;
+pub mod placement;
 pub mod primitives;
 pub mod requests;
 pub mod responses;
@@ -70,18 +71,21 @@ pub mod version;
 
 pub use codec::{WireDecode, WireEncode};
 pub use consensus::{
-    CHECKSUM_UNSEALED, Command, CommitHeader, ConsensusError, ConsensusHeader, ConsumerSession,
+    CHECKSUM_UNSEALED, COMMIT_BATCH_ENTRIES_MAX, COMMIT_BATCH_FRAME_MAX,
+    COMMIT_REPLY_BATCH_ENTRIES_MAX, Command, CommitEntry, CommitHeader, CommitReplyEntry,
+    CommitReplyHeader, ConsensusError, ConsensusHeader, ConsumerSession,
     ConsumerSessionHeartbeatHeader, DVC_HEADERS_MAX, DoViewChangeHeader, EvictionHeader,
     EvictionReason, ForwardCompletionHeader, ForwardLogoutHeader, ForwardLogoutOutcome,
     ForwardLogoutResultHeader, ForwardRegisterHeader, ForwardRegisterOutcome,
-    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, LIFECYCLE_BATCH_HEADER_SIZE,
-    LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX, MAX_CONSUMER_SESSIONS_PER_HEARTBEAT,
-    Operation, PrepareHeader, PrepareOkHeader, PrimaryRebalanceHeader, PrimaryRebalanceKind,
-    REJECTION_SECTION_LEN, RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader,
-    ReplyHeader, RequestHeader, RequestPreparesHeader, RequestStartViewHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET,
-    SegmentDeleteHeader, SegmentDeleteKind, StartViewChangeHeader, StartViewHeader,
-    StateChunkHeader, StateTransferTargetHeader, frame_body, frame_checksum_bytes,
+    ForwardRegisterResultHeader, GenericHeader, HEADER_SIZE, HeartbeatState,
+    LIFECYCLE_BATCH_HEADER_SIZE, LIFECYCLE_COMPLETION_SIZE, LIFECYCLE_COMPLETIONS_MAX,
+    MAX_CONSUMER_SESSIONS_PER_HEARTBEAT, Operation, PrepareHeader, PrepareOkHeader,
+    PrepareProgressHeader, PrimaryRebalanceHeader, PrimaryRebalanceKind, REJECTION_SECTION_LEN,
+    RESERVED_COMMAND_LEN, RepairPrepareHeader, RepairRangeReplyHeader, ReplyHeader, RequestHeader,
+    RequestPreparesHeader, RequestStartViewHeader, RequestStateChunkHeader,
+    RequestStateTransferHeader, RoutedRequestHeader, SIZE_FIELD_OFFSET, SegmentDeleteHeader,
+    SegmentDeleteKind, StartViewChangeHeader, StartViewHeader, StateChunkHeader,
+    StateTransferTargetHeader, batch_entries, batch_frame_size, frame_body, frame_checksum_bytes,
     prepare_identity_checksum_bytes, read_size_field, result_code, result_section_len,
     write_rejection_section,
 };
@@ -109,7 +113,7 @@ pub use primitives::user_headers::{
 };
 pub use version::{
     ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, ProtocolVersion,
-    is_protocol_compatible,
+    REPLICA_WIRE_REVISION, is_protocol_compatible,
 };
 
 /// Maximum number of partitions allowed in a single create/delete request.

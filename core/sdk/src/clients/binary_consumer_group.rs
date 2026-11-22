@@ -19,7 +19,8 @@ use crate::prelude::IggyClient;
 use async_dropper::AsyncDrop;
 use async_trait::async_trait;
 use iggy_common::{
-    ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError, locking::IggyRwLockFn,
+    ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupDetails, Identifier, IggyError,
+    NamedPageQuery, Page, locking::IggyRwLockFn,
 };
 use iggy_common::{ConsumerGroupClient, UserClient};
 
@@ -40,6 +41,15 @@ impl ConsumerGroupClient for IggyClient {
         topic_id: &Identifier,
     ) -> Result<Vec<ConsumerGroup>, IggyError> {
         super::with_client!(self, client => client.get_consumer_groups(stream_id, topic_id).await)
+    }
+
+    async fn get_consumer_groups_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<ConsumerGroup>, IggyError> {
+        super::with_client!(self, client => client.get_consumer_groups_page(stream_id, topic_id, query).await)
     }
 
     async fn create_consumer_group(
@@ -76,6 +86,15 @@ impl ConsumerGroupClient for IggyClient {
         group_id: &Identifier,
     ) -> Result<(), IggyError> {
         super::with_client!(self, client => client.leave_consumer_group(stream_id, topic_id, group_id).await)
+    }
+
+    async fn sync_consumer_group(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
+        super::with_client!(self, client => client.sync_consumer_group(stream_id, topic_id, group_id).await)
     }
 }
 

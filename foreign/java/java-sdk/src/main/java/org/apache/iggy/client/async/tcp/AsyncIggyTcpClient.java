@@ -185,6 +185,7 @@ public class AsyncIggyTcpClient {
     private final Optional<File> tlsCertificate;
     private final Optional<IoEventLoopGroup> sharedEventLoopGroup;
     private IoEventLoopGroup eventLoopGroup;
+    private final EventLoopShutdown eventLoopShutdown;
     private final org.apache.iggy.client.async.tcp.vsr.ConsensusSession session =
             new org.apache.iggy.client.async.tcp.vsr.ConsensusSession();
     private final int ioThreads;
@@ -285,7 +286,8 @@ public class AsyncIggyTcpClient {
                 false,
                 Optional.empty(),
                 Optional.empty(),
-                AsyncTcpConnection.DEFAULT_IO_THREADS);
+                AsyncTcpConnection.DEFAULT_IO_THREADS,
+                EventLoopShutdown.resolve(null, null));
     }
 
     @SuppressWarnings("checkstyle:ParameterNumber")
@@ -303,7 +305,8 @@ public class AsyncIggyTcpClient {
             boolean enableTls,
             Optional<File> tlsCertificate,
             Optional<IoEventLoopGroup> sharedEventLoopGroup,
-            int ioThreads) {
+            int ioThreads,
+            EventLoopShutdown eventLoopShutdown) {
         this.connectionInfo = new ConnectionInfo(host, port);
         this.seedConnectionInfo = this.connectionInfo;
         this.username = Optional.ofNullable(username);
@@ -322,6 +325,7 @@ public class AsyncIggyTcpClient {
         this.tlsCertificate = tlsCertificate;
         this.sharedEventLoopGroup = sharedEventLoopGroup;
         this.ioThreads = ioThreads;
+        this.eventLoopShutdown = eventLoopShutdown;
 
         var poolConfigBuilder = TcpConnectionPoolConfig.builder();
         this.acquireTimeout.ifPresent(timeout -> poolConfigBuilder.setAcquireTimeoutMillis(timeout.toMillis()));
@@ -366,10 +370,11 @@ public class AsyncIggyTcpClient {
         Supplier<AsyncTcpConnection> currentConnection = connection::get;
         return newConnection.connect().thenRun(() -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
-            var messages = new MessagesTcpClient(currentConnection, routingState, pollRouter);
+            var consumerGroups = new ConsumerGroupsTcpClient(currentConnection);
+            var messages = new MessagesTcpClient(currentConnection, routingState, pollRouter, consumerGroups);
             var offsets = new ConsumerOffsetsTcpClient(currentConnection, pollRouter);
             messagesClient = messages;
-            consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
+            consumerGroupsClient = consumerGroups;
             consumerOffsetsClient = offsets;
             rawRequests = new RawPartitionRequests(currentConnection, pollRouter, messages, offsets);
             // One partition can be cached under its name and under its id, so
@@ -563,6 +568,11 @@ public class AsyncIggyTcpClient {
         }
     }
 
+    /** The highest metadata op that a reply of the client reported as committed, as an unsigned value. */
+    long metadataWatermark() {
+        return session.metadataWatermark();
+    }
+
     /**
      * Releases local recovery state and frees the pending operation slot at once. This does not prove that the
      * operation was uncommitted. A replay of the operation that is already running keeps its lane until the replay
@@ -735,7 +745,8 @@ public class AsyncIggyTcpClient {
     /**
      * Closes the TCP connection and releases the Netty resources that this client owns.
      *
-     * <p>If the client created its own event loop group, it shuts that group down gracefully.
+     * <p>If the client created its own event loop group, it shuts that group down gracefully,
+     * see {@link AsyncIggyTcpClientBuilder#shutdownQuietPeriod(Duration)}.
      * The client does not shut down a group supplied through
      * {@link AsyncIggyTcpClientBuilder#eventLoopGroup(IoEventLoopGroup)}. The caller shuts
      * that group down. After you call this method, you cannot reuse the client. If you need
@@ -773,7 +784,7 @@ public class AsyncIggyTcpClient {
                         return CompletableFuture.completedFuture(null);
                     }
                     CompletableFuture<Void> stopped = new CompletableFuture<>();
-                    owned.shutdownGracefully().addListener(done -> {
+                    eventLoopShutdown.shutdown(owned).addListener(done -> {
                         if (done.isSuccess()) {
                             stopped.complete(null);
                         } else {

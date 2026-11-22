@@ -64,16 +64,6 @@ enum Responses {
         }
     }
 
-    static func streams(_ body: ArraySlice<UInt8>) throws -> [StreamInfo] {
-        try decode(body) { reader in
-            var streams: [StreamInfo] = []
-            while !reader.isAtEnd {
-                streams.append(try stream(from: &reader))
-            }
-            return streams
-        }
-    }
-
     // MARK: Topics
 
     static func topic(from reader: inout ByteReader) throws -> Topic {
@@ -98,10 +88,19 @@ enum Responses {
         let sizeBytes = try reader.readUInt64()
         let messagesCount = try reader.readUInt64()
         let context = try PartitionContext.decode(from: &reader)
+        let members = try nodes(from: &reader)
+        let inSyncMembers = try nodes(from: &reader)
         return Partition(
             id: id, createdAt: IggyTimestamp(microseconds: createdAt),
             segmentsCount: segmentsCount, currentOffset: currentOffset,
-            sizeBytes: sizeBytes, messagesCount: messagesCount, context: context)
+            sizeBytes: sizeBytes, messagesCount: messagesCount, context: context,
+            members: members, inSyncMembers: inSyncMembers)
+    }
+
+    /// `[count: u8][ids: count x u8]`, one node list of a partition.
+    private static func nodes(from reader: inout ByteReader) throws -> [UInt8] {
+        let count = Int(try reader.readUInt8())
+        return Array(try reader.readBytes(count))
     }
 
     static func topicDetails(_ body: ArraySlice<UInt8>) throws -> TopicDetails {
@@ -113,18 +112,6 @@ enum Responses {
             }
             partitions.sort { $0.id < $1.id }
             return TopicDetails(topic: topic, partitions: partitions)
-        }
-    }
-
-    static func topics(_ body: ArraySlice<UInt8>) throws -> [Topic] {
-        try decode(body) { reader in
-            let count = try reader.readUInt32()
-            var topics: [Topic] = []
-            for _ in 0..<count {
-                topics.append(try topic(from: &reader))
-            }
-            topics.sort { $0.id < $1.id }
-            return topics
         }
     }
 
@@ -153,16 +140,6 @@ enum Responses {
             }
             return ConsumerGroupDetails(
                 id: group.id, name: group.name, partitionsCount: group.partitionsCount, membersCount: group.membersCount, members: members)
-        }
-    }
-
-    static func consumerGroups(_ body: ArraySlice<UInt8>) throws -> [ConsumerGroup] {
-        try decode(body) { reader in
-            var groups: [ConsumerGroup] = []
-            while !reader.isAtEnd {
-                groups.append(try consumerGroup(from: &reader))
-            }
-            return groups
         }
     }
 
@@ -261,16 +238,6 @@ enum Responses {
             }
             return UserInfoDetails(
                 id: user.id, createdAt: user.createdAt, status: user.status, username: user.username, permissions: permissions, options: user.options)
-        }
-    }
-
-    static func users(_ body: ArraySlice<UInt8>) throws -> [UserInfo] {
-        try decode(body) { reader in
-            var users: [UserInfo] = []
-            while !reader.isAtEnd {
-                users.append(try user(from: &reader))
-            }
-            return users
         }
     }
 
@@ -417,6 +384,32 @@ enum Responses {
                 specs.append(OptionSpec(key: key, kind: kind, flags: flags, defaultValue: defaultValue, description: description))
             }
             return specs
+        }
+    }
+
+    // MARK: List pages
+
+    /// Decodes the reply of a list command, `[next_len:u8][next][count:u32][item]*`,
+    /// with the item decoder of its command. A body short of `count` items, or
+    /// with bytes after them, is refused. A next of no bytes marks the last
+    /// page. Any other next keeps its bytes as they came, because only the
+    /// server reads them.
+    static func page<Item: Sendable & Hashable>(_ body: ArraySlice<UInt8>, item: (inout ByteReader) throws -> Item) throws -> Page<Item> {
+        try decode(body) { reader in
+            let nextLength = Int(try reader.readUInt8())
+            let next = PageCursor(bytes: Array(try reader.readBytes(nextLength)))
+            let count = try reader.readCount()
+            var items: [Item] = []
+            // A server sends at most maxLimit items, so a larger count does
+            // not size the allocation.
+            items.reserveCapacity(min(count, Int(PageQuery.maxLimit)))
+            for _ in 0..<count {
+                items.append(try item(&reader))
+            }
+            guard reader.isAtEnd else {
+                throw WireError.validation("\(reader.remaining) trailing bytes after a page")
+            }
+            return Page(items: items, next: next)
         }
     }
 
@@ -623,6 +616,17 @@ enum Responses {
             let context = try PartitionContext.decode(from: &reader)
             let messages = try Batch.decodeMessages(reader.rest, expectedCount: count, verifyChecksums: verifyChecksums)
             return PolledMessages(partitionID: partitionID, currentOffset: currentOffset, count: count, messages: messages, context: context)
+        }
+    }
+
+    /// The partition context of a poll reply. It comes before the messages,
+    /// so a message that does not decode leaves it readable.
+    static func polledContext(_ body: ArraySlice<UInt8>) throws -> PartitionContext {
+        try decode(body) { reader in
+            _ = try reader.readUInt32()
+            _ = try reader.readUInt64()
+            _ = try reader.readUInt32()
+            return try PartitionContext.decode(from: &reader)
         }
     }
 }

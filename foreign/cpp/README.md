@@ -35,12 +35,20 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 ## Resource options
 
-Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog.
+Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog. A topic update can change `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize`, reset each of them, and turn `TieredStorage` on, never off.
+
+A geo topic also takes six durations, each a `std::chrono::microseconds` that overrides the server
+setting of the same name on every node: `SetFreshUploadInterval`, `SetConsumerOffsetUploadInterval`,
+`SetPositionsPublishInterval`, `SetTombstoneGrace`, `SetPositionsResumeTimeout` and
+`SetLongTermRewriteMaxInterval`. Zero is a value and is sent as zero. A normal topic refuses them
+with `invalid_option_value`. An update can set them on a geo topic, the only settings it changes
+there, but cannot reset them. `Topic` and `TopicDetails` read each one back. If the topic leaves a
+duration to the server setting, its getter returns `std::nullopt`.
 
 ```cpp
 const std::string key_base64 = LoadStreamKey();
@@ -100,6 +108,7 @@ errors from these methods:
 
 - `Login`, `Logout`, `ResolveOperation`, and `AbandonOperation`.
 - `CreateUser`, `UpdateUser`, and `DeleteUser`.
+- `DeletePersonalAccessToken`.
 - `CreateStream`, `UpdateStream`, and `DeleteStream`.
 - `CreateTopic`, `UpdateTopic`, and `DeleteTopic`.
 - `CreatePartitions`, `DeletePartitions`, and `DeleteSegments`.
@@ -107,10 +116,12 @@ errors from these methods:
 - `StoreConsumerOffset`, `StoreConsumerPosition`, `DeleteConsumerOffset`, and `DeleteConsumerPosition`.
 - `PollMessages`, `PendingPoll::Wait`, `Reader`, and the calls of `PartitionReader`.
 - `GetMetadataChanges`.
+- `GetStreamsPage`, `GetTopicsPage`, `GetPartitionsPage`, `GetConsumerGroupsPage`, and `GetUsersPage`.
 
-Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` is the exception: it reports every invalid query as `invalid_command`, including one the bridge refuses.
+Other methods, including `Connect`, `Disconnect`, and `Shutdown`, report errors through the exception message only. C++ and bridge-local argument errors also leave `Code()` and `OperationId()` empty and `Kind()` empty, including for the methods listed above. `GetMetadataChanges` and the page methods are the exception: they report every invalid query as `invalid_command`, including one the bridge refuses.
 
-Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`.
+Direct generated-bridge callers pass a local `iggy::ffi::ErrorInfo` as the last argument to login/logout, mutations, polls, raw commands, recovery calls, and the metadata change functions. The page functions take it as the last argument too.
+It is reset at entry and populated only when the Rust SDK returns an `IggyError`. Bridge-local argument errors leave it empty, except in the metadata change functions, which record invalid input as `invalid_command`. The page functions record an invalid query as `invalid_command` too.
 
 `send_binary_request_to_replica(code, payload, replica_id, error_info)` sends a raw command to one node of a cluster, named by the replica id that cluster metadata returns.
 
@@ -146,10 +157,16 @@ reader.Close();
 - `Next` waits up to its timeout and returns `std::nullopt` when the time runs out.
 - `Commit` stores a checkpoint that the reader delivered, and under `CommitPolicy::Auto` `Mark` counts one for the policy to store.
 - `Seek` moves a partition to a `PollingStrategy`, or to a `Continuation` of that partition.
+- C++ cannot cancel `Commit` and `Seek`, so each one ends at a deadline 10 s after its start. The `Commit` and `Seek` of an `IggyConsumer` do the same.
 - A failed read throws `ReadException`, which names its partition. After a message that does not decode, its `Skip()` holds the continuation past it.
+- A lost read can commit messages that the reader cannot read again. Then the reader throws `fetch_progress_uncertain` once. `Lost()` holds the first and last offset of those messages. This error stops nothing and needs no `Seek`. A `Seek` after it drops the batch that follows the range. If the reader stopped the partition, the error that stopped it comes after that batch.
+  Earlier versions gave this error a `Skip()` after the range. Code that handles `fetch_progress_uncertain` with `AbandonOperation` and a `Seek` must now check `Lost()` first and do neither for this error.
+- Under every commit policy, two errors stop a partition until a `Seek`. The first is `history_unavailable` (87) for a position whose history is gone. The second is the sixth refusal in a row that a retry does not change, such as `unauthorized` (41), and `IsLastingRefusal()` is then true. While a lost read is still pending, such a stop throws `fetch_progress_uncertain` (14010) with an empty `Lost()` in place of its own error.
+- Under `CommitPolicy::OnRead`, the reader also stops a partition that the client holds blocked. Its error is `partition_lane_blocked` (14009) for a block that another call on the client left. Over HTTP it is `fetch_progress_uncertain` (14010) for a lost read of the reader itself. Call `AbandonOperation` with the `OperationId()` of the error, and then call `Seek`. A `Seek` of a partition that is still blocked fails with `partition_lane_blocked`.
+- Under `CommitPolicy::OnRead`, a read from the stored offset whose reply does not decode also stops its partition until a `Seek`. Its error has no `Skip()`, because the reader does not know where that reply started.
 - `Close` stops the reader, and a second `Close` does nothing. Destroying a reader without `Close` moves no offset back and does not leave the group.
 
-A consumer group reader joins its group in `Reader` and leaves it in `Close`.
+A consumer group reader joins its group in `Reader` and leaves it in `Close`. A group create or join with an unknown outcome throws its error, and the next `Reader` or `GroupConsumer` joins again. A join that landed keeps its member in the group until the session ends.
 
 `IggyBlockingClient::StandaloneConsumer` and `GroupConsumer` build an `IggyConsumer`, which hands over one `ReceivedMessage` at a time through a reader, with the commit policy of the `PollOptions` of its `ConsumerOptions`. A standalone consumer reads the partitions of its options. A group consumer creates its group when it is missing, joins it, and leaves it in `Close`.
 
@@ -171,6 +188,40 @@ frozen request bytes. Configure both limits with
 `max_pending_operation_bytes` query parameters for TCP, QUIC, and WebSocket.
 HTTP continues to use its configured transport behavior and has no retained
 operation recovery.
+
+## List pages
+
+`GetStreamsPage()`, `GetTopicsPage()`, `GetPartitionsPage()`, `GetConsumerGroupsPage()` and `GetUsersPage()` read one page of a list. A page holds `Items()` and `Next()`, the cursor text of the next page. `Next()` is absent on the last page.
+
+A `PageQuery` sets the order, the direction, the limit and the cursor. The order is `PageOrder::Id` or `PageOrder::Created`, and the limit is 1 to 1000, 100 by default. A `NamedPageQuery` holds a `PageQuery` in `Page()` and adds a name filter. The streams, topics, consumer groups and users page methods take a `NamedPageQuery`. `GetPartitionsPage()` takes a `PageQuery`, which has no name.
+
+```cpp
+// Reads every stream whose name holds "orders", 50 streams per page.
+void PrintOrderStreams(iggy::IggyBlockingClient &client) {
+    iggy::NamedPageQuery query(iggy::PageQuery().SetLimit(50));
+    query.SetName("orders");
+    while (true) {
+        const auto page = client.GetStreamsPage(query);
+        for (const auto &stream : page.Items()) {
+            Print(stream);
+        }
+        if (!page.Next()) {
+            break;
+        }
+        query.Page().SetCursor(*page.Next());
+    }
+}
+```
+
+A cursor is valid only with the order, direction, name and parent of the query that returned it. If you pass `Next()` back, keep the other settings of the query. A page can be short or empty and still have a `Next()`. The name filter is case-sensitive text of 1 to 255 bytes.
+
+An invalid query is refused with `invalid_command` (3) before anything is sent. Over TCP, QUIC and WebSocket, the server refuses a cursor of another order with `invalid_command` too. Over HTTP, a refusal of the server arrives as `http_response_error` (300).
+
+Each transport reads pages through the Rust SDK, and the Rust integration tests cover all four transports. The E2E tests of this binding read pages over TCP only.
+
+`GetStreams()`, `GetTopics()`, `GetConsumerGroups()` and `GetUsers()` return the whole list. Over TCP, QUIC and WebSocket, they read pages of 1000 in id order, so the result is not one consistent read. If the server answers a page with the cursor it was sent, they throw, because such a walk never ends. Over HTTP, the server builds the list from its pages and sends one reply.
+
+Over TCP, QUIC and WebSocket, the `GetTopic()` reply of a topic with very many partitions can be too large. The server then sends the error `reply_too_large` (97) in place of the reply. `GetTopic()` reports it through the exception message only. `GetPartitionsPage()` reads those partitions in smaller replies.
 
 ## Metadata changes
 

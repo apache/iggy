@@ -524,7 +524,130 @@ func TestDeserializeToTopic_ResolvesMissingSettingsToTheCatalogDefaults(t *testi
 	require.NoError(t, err)
 	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.MessageExpiry)
 	assert.Equal(t, uint64(math.MaxUint64), topic.MaxTopicSize)
+	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.SegmentMaxAge)
+	assert.False(t, topic.TieredStorage)
+	assert.Equal(t, iggcon.Duration(86_400_000_000), topic.LocalRetentionAge)
+	assert.Equal(t, uint64(math.MaxUint64), topic.LocalRetentionSize)
 	assert.Equal(t, uint8(iggcon.CompressionAlgorithmNone), topic.CompressionAlgorithm)
+	assert.Equal(t, iggcon.TopicTypeNormal, topic.TopicType)
+	assert.Nil(t, topic.GeoMode)
+	assert.Nil(t, topic.FreshUploadInterval)
+	assert.Nil(t, topic.ConsumerOffsetUploadInterval)
+	assert.Nil(t, topic.PositionsPublishInterval)
+	assert.Nil(t, topic.TombstoneGrace)
+	assert.Nil(t, topic.PositionsResumeTimeout)
+	assert.Nil(t, topic.LongTermRewriteMaxInterval)
+}
+
+func TestDeserializeToTopic_ReadsTheDurationsOfAGeoTopic(t *testing.T) {
+	const nameLenOffset = 32
+	stringEntry := func(key, value string) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+		}
+	}
+	uint64Entry := func(key string, value uint64) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: binary.LittleEndian.AppendUint64(nil, value)},
+		}
+	}
+	topic := func(topicType string) iggcon.Topic {
+		t.Helper()
+		payload := make([]byte, nameLenOffset+2)
+		payload[nameLenOffset] = 1
+		payload[nameLenOffset+1] = 't'
+		explicit := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{
+			uint64Entry("consumer_offset_upload_interval", 0),
+			uint64Entry("tombstone_grace", 3_600_000_000),
+			stringEntry("topic_type", topicType),
+		})
+		payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicit)))
+		payload = append(payload, explicit...)
+		payload = binary.LittleEndian.AppendUint32(payload, 0)
+		topic, readBytes, err := DeserializeToTopic(payload, 0)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), readBytes)
+		return topic
+	}
+
+	geo := topic("geo")
+	require.NotNil(t, geo.ConsumerOffsetUploadInterval, "a zero duration is a value")
+	assert.Equal(t, iggcon.Duration(0), *geo.ConsumerOffsetUploadInterval)
+	require.NotNil(t, geo.TombstoneGrace)
+	assert.Equal(t, iggcon.Hour, *geo.TombstoneGrace)
+	assert.Nil(t, geo.FreshUploadInterval, "an unset duration leaves the server setting")
+	assert.Nil(t, geo.PositionsPublishInterval)
+	assert.Nil(t, geo.PositionsResumeTimeout)
+	assert.Nil(t, geo.LongTermRewriteMaxInterval)
+
+	normal := topic("normal")
+	assert.Nil(t, normal.ConsumerOffsetUploadInterval, "a normal topic has no durations")
+	assert.Nil(t, normal.TombstoneGrace)
+}
+
+func TestDeserializeToTopic_ReadsTheTopicTypeAndGeoMode(t *testing.T) {
+	const nameLenOffset = 32
+	stringEntry := func(key, value string) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+		}
+	}
+	geo := iggcon.GeoModeGeo
+	geoTiered := iggcon.GeoModeGeoTiered
+	for _, tc := range []struct {
+		name              string
+		explicit, derived []iggcon.HeaderEntry
+		topicType         iggcon.TopicType
+		geoMode           *iggcon.GeoMode
+	}{
+		{
+			name:      "a geo topic with an explicit mode",
+			explicit:  []iggcon.HeaderEntry{stringEntry("topic_type", "geo"), stringEntry("geo_mode", "geo_tiered")},
+			topicType: iggcon.TopicTypeGeo,
+			geoMode:   &geoTiered,
+		},
+		{
+			name:      "a geo topic with the derived mode",
+			explicit:  []iggcon.HeaderEntry{stringEntry("topic_type", "geo")},
+			derived:   []iggcon.HeaderEntry{stringEntry("geo_mode", "geo")},
+			topicType: iggcon.TopicTypeGeo,
+			geoMode:   &geo,
+		},
+		{
+			name:      "a geo topic with a mode this build cannot read",
+			explicit:  []iggcon.HeaderEntry{stringEntry("topic_type", "geo"), stringEntry("geo_mode", "geo_future")},
+			topicType: iggcon.TopicTypeGeo,
+			geoMode:   &geo,
+		},
+		{
+			name:      "a normal topic with a stored mode",
+			explicit:  []iggcon.HeaderEntry{stringEntry("geo_mode", "geo")},
+			derived:   []iggcon.HeaderEntry{stringEntry("topic_type", "normal")},
+			topicType: iggcon.TopicTypeNormal,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := make([]byte, nameLenOffset+2)
+			payload[nameLenOffset] = 1
+			payload[nameLenOffset+1] = 't'
+			explicit := iggcon.GetHeadersBytes(tc.explicit)
+			payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicit)))
+			payload = append(payload, explicit...)
+			derived := iggcon.GetHeadersBytes(tc.derived)
+			payload = binary.LittleEndian.AppendUint32(payload, uint32(len(derived)))
+			payload = append(payload, derived...)
+
+			topic, readBytes, err := DeserializeToTopic(payload, 0)
+
+			require.NoError(t, err)
+			assert.Equal(t, len(payload), readBytes)
+			assert.Equal(t, tc.topicType, topic.TopicType)
+			assert.Equal(t, tc.geoMode, topic.GeoMode)
+		})
+	}
 }
 
 func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.T) {
@@ -570,4 +693,129 @@ func TestDeserializeToTopic_RejectsAnOptionsLengthPastTheBuffer(t *testing.T) {
 	derivedLies = binary.LittleEndian.AppendUint32(derivedLies, 0xFFFFFFFF)
 	_, _, err = DeserializeToTopic(derivedLies, 0)
 	assert.Error(t, err, "a derived options length of 0xFFFFFFFF must not panic or pass")
+}
+
+// pinnedPartition is the partition the Rust encoder pins in
+// core/binary_protocol/src/responses/topics/get_topic.rs: id 1, members
+// [1 3 4] and in-sync members [1 4].
+const pinnedPartition = "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000000000000000650000000000000003010304020104"
+
+// encodePartition writes the pinned partition's counters under the given id
+// and node lists.
+func encodePartition(id uint32, members, inSyncMembers []uint8) []byte {
+	entry := binary.LittleEndian.AppendUint32(nil, id)
+	entry = binary.LittleEndian.AppendUint64(entry, 1710000000000)
+	entry = binary.LittleEndian.AppendUint32(entry, 2)
+	entry = binary.LittleEndian.AppendUint64(entry, 99)
+	entry = binary.LittleEndian.AppendUint64(entry, 1024)
+	entry = binary.LittleEndian.AppendUint64(entry, 100)
+	entry = binary.LittleEndian.AppendUint64(entry, 23)
+	entry = binary.LittleEndian.AppendUint64(entry, 0)
+	entry = binary.LittleEndian.AppendUint64(entry, 101)
+	entry = append(entry, uint8(len(members)))
+	entry = append(entry, members...)
+	entry = append(entry, uint8(len(inSyncMembers)))
+	return append(entry, inSyncMembers...)
+}
+
+// encodeTopicHeader writes a topic named "t" with empty options blocks.
+func encodeTopicHeader(partitionsCount uint32) []byte {
+	header := binary.LittleEndian.AppendUint32(nil, 9)
+	header = binary.LittleEndian.AppendUint64(header, 1710000000000)
+	header = binary.LittleEndian.AppendUint32(header, partitionsCount)
+	header = binary.LittleEndian.AppendUint64(header, 0)
+	header = binary.LittleEndian.AppendUint64(header, 0)
+	header = append(header, 1, 't')
+	header = binary.LittleEndian.AppendUint32(header, 0)
+	return binary.LittleEndian.AppendUint32(header, 0)
+}
+
+func TestDeserializePartition_DecodesThePinnedVector(t *testing.T) {
+	payload, err := hex.DecodeString(pinnedPartition)
+	require.NoError(t, err)
+	require.Len(t, payload, 71)
+
+	partition, readBytes, err := DeserializePartition(payload, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, iggcon.PartitionContract{
+		Context:       iggcon.PartitionContext{Incarnation: 23, OwnerGeneration: 0, MetadataOp: 101},
+		Id:            1,
+		MessagesCount: 100,
+		CreatedAt:     1710000000000,
+		SegmentsCount: 2,
+		CurrentOffset: 99,
+		SizeBytes:     1024,
+		Members:       []uint8{1, 3, 4},
+		InSyncMembers: []uint8{1, 4},
+	}, partition)
+	assert.Equal(t, len(payload), readBytes)
+	assert.Equal(t, payload, encodePartition(1, []uint8{1, 3, 4}, []uint8{1, 4}),
+		"the test encoder must write the pinned bytes")
+}
+
+func TestDeserializePartition_ReadsEmptyNodeListsAsTwoCountBytes(t *testing.T) {
+	payload := encodePartition(1, nil, nil)
+	require.Len(t, payload, 66)
+
+	partition, readBytes, err := DeserializePartition(payload, 0)
+	require.NoError(t, err)
+	assert.Equal(t, 66, readBytes)
+	assert.Empty(t, partition.Members)
+	assert.Empty(t, partition.InSyncMembers)
+	assert.Equal(t, uint64(99), partition.CurrentOffset)
+}
+
+func TestDeserializePartition_RejectsEveryTruncation(t *testing.T) {
+	payload, err := hex.DecodeString(pinnedPartition)
+	require.NoError(t, err)
+
+	for length := 0; length < len(payload); length++ {
+		_, _, err := DeserializePartition(payload[:length], 0)
+		assert.Error(t, err, "a partition truncated to %d bytes must not decode", length)
+	}
+}
+
+func TestDeserializeTopic_AdvancesByEachPartitionsEncodedLength(t *testing.T) {
+	payload := encodeTopicHeader(3)
+	payload = append(payload, encodePartition(1, []uint8{1, 3, 4}, []uint8{1, 4})...)
+	payload = append(payload, encodePartition(2, nil, nil)...)
+	payload = append(payload, encodePartition(3, []uint8{0, 1, 2}, []uint8{0})...)
+
+	details, err := DeserializeTopic(payload)
+	require.NoError(t, err)
+
+	require.Len(t, details.Partitions, 3)
+	assert.Equal(t, []uint32{1, 2, 3},
+		[]uint32{details.Partitions[0].Id, details.Partitions[1].Id, details.Partitions[2].Id})
+	assert.Equal(t, []uint8{1, 3, 4}, details.Partitions[0].Members)
+	assert.Equal(t, []uint8{1, 4}, details.Partitions[0].InSyncMembers)
+	assert.Empty(t, details.Partitions[1].Members)
+	assert.Empty(t, details.Partitions[1].InSyncMembers)
+	assert.Equal(t, []uint8{0, 1, 2}, details.Partitions[2].Members)
+	assert.Equal(t, []uint8{0}, details.Partitions[2].InSyncMembers)
+	for _, partition := range details.Partitions {
+		assert.Equal(t, uint64(1710000000000), partition.CreatedAt, "partition %d", partition.Id)
+		assert.Equal(t, uint64(101), partition.Context.MetadataOp, "partition %d", partition.Id)
+	}
+}
+
+func TestDeserializeTopic_RejectsABodyShortOfThePartitionsCount(t *testing.T) {
+	payload := encodeTopicHeader(2)
+	payload = append(payload, encodePartition(1, []uint8{0}, []uint8{0})...)
+
+	_, err := DeserializeTopic(payload)
+	assert.Error(t, err, "a declared partition the body does not carry must surface")
+}
+
+func TestDeserializeTopic_RejectsEveryTruncationOfThePartitions(t *testing.T) {
+	payload := encodeTopicHeader(2)
+	headerLength := len(payload)
+	payload = append(payload, encodePartition(1, []uint8{1, 3, 4}, []uint8{1, 4})...)
+	payload = append(payload, encodePartition(2, []uint8{2}, nil)...)
+
+	for length := headerLength; length < len(payload); length++ {
+		_, err := DeserializeTopic(payload[:length])
+		assert.Error(t, err, "a topic truncated to %d bytes must not decode", length)
+	}
 }

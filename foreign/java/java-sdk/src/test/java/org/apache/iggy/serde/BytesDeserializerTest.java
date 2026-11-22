@@ -32,9 +32,12 @@ import org.apache.iggy.message.HeaderKey;
 import org.apache.iggy.message.HeaderKind;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.message.PolledMessages;
+import org.apache.iggy.partition.Partition;
 import org.apache.iggy.partition.PartitionContext;
 import org.apache.iggy.stream.EncryptionKeySource;
 import org.apache.iggy.system.CacheMetricsKey;
+import org.apache.iggy.topic.GeoMode;
+import org.apache.iggy.topic.TopicType;
 import org.apache.iggy.user.UserStatus;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -73,6 +76,7 @@ import static org.apache.iggy.serde.BytesDeserializer.readUserInfo;
 import static org.apache.iggy.serde.BytesDeserializer.readUserInfoDetails;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 class BytesDeserializerTest {
 
@@ -87,16 +91,31 @@ class BytesDeserializerTest {
     }
 
     private static void writeTopicData(ByteBuf buffer) {
+        writeTopicData(buffer, 4);
+    }
+
+    private static void writeTopicData(ByteBuf buffer, int partitionsCount) {
+        writeTopicData(
+                buffer,
+                partitionsCount,
+                Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)),
+                Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+    }
+
+    private static void writeTopicData(
+            ByteBuf buffer,
+            int partitionsCount,
+            Map<HeaderKey, HeaderValue> options,
+            Map<HeaderKey, HeaderValue> derivedOptions) {
         buffer.writeIntLE(10); // topic ID
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
-        buffer.writeIntLE(4); // partitions count
+        buffer.writeIntLE(partitionsCount);
         writeU64(buffer, BigInteger.valueOf(500)); // size
         writeU64(buffer, BigInteger.valueOf(50)); // messages count
         buffer.writeByte(4); // name length
         buffer.writeBytes("test".getBytes());
-        writeOptionsBlock(
-                buffer, Map.of(HeaderKey.fromString("max_topic_size"), HeaderValue.fromUint64(BigInteger.TEN)));
-        writeOptionsBlock(buffer, Map.of(HeaderKey.fromString("segment_size"), HeaderValue.fromString("1 GiB")));
+        writeOptionsBlock(buffer, options);
+        writeOptionsBlock(buffer, derivedOptions);
     }
 
     private static void writeTopicDataWithUnknownOptionKind(ByteBuf buffer) {
@@ -132,13 +151,22 @@ class BytesDeserializerTest {
     }
 
     private static void writePartitionData(ByteBuf buffer) {
-        buffer.writeIntLE(1); // partition ID
+        writePartitionData(buffer, 1, List.of(), List.of());
+    }
+
+    private static void writePartitionData(
+            ByteBuf buffer, int partitionId, List<Integer> members, List<Integer> inSyncMembers) {
+        buffer.writeIntLE(partitionId);
         writeU64(buffer, BigInteger.valueOf(1000)); // created at
         buffer.writeIntLE(5); // segments count
         writeU64(buffer, BigInteger.valueOf(99)); // current offset
         writeU64(buffer, BigInteger.valueOf(200)); // size
         writeU64(buffer, BigInteger.valueOf(20)); // messages count
         buffer.writeZero(24);
+        buffer.writeByte(members.size());
+        members.forEach(buffer::writeByte);
+        buffer.writeByte(inSyncMembers.size());
+        inSyncMembers.forEach(buffer::writeByte);
     }
 
     @Nested
@@ -279,11 +307,76 @@ class BytesDeserializerTest {
         }
 
         @Test
+        void shouldReadTheTypeAndModeOfAGeoTopic() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("geo")),
+                    Map.of(HeaderKey.fromString("geo_mode"), HeaderValue.fromString("geo_tiered")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topic.topicType()).contains(TopicType.GEO);
+            assertThat(topic.geoMode()).contains(GeoMode.GEO_TIERED);
+            assertThat(topicDetails.topicType()).contains(TopicType.GEO);
+            assertThat(topicDetails.geoMode()).contains(GeoMode.GEO_TIERED);
+        }
+
+        @Test
+        void shouldReadNoGeoModeOnANormalTopic() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer, 4, Map.of(), Map.of(HeaderKey.fromString("topic_type"), HeaderValue.fromString("normal")));
+
+            var topic = readTopic(buffer);
+
+            assertThat(topic.topicType()).contains(TopicType.NORMAL);
+            assertThat(topic.geoMode()).isEmpty();
+        }
+
+        @Test
+        void shouldReadTheDurationsAGeoTopicSetsAndNoneItLeavesUnset() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(
+                    buffer,
+                    1,
+                    Map.of(
+                            HeaderKey.fromString("topic_type"),
+                            HeaderValue.fromString("geo"),
+                            HeaderKey.fromString("consumer_offset_upload_interval"),
+                            HeaderValue.fromUint64(BigInteger.ZERO),
+                            HeaderKey.fromString("tombstone_grace"),
+                            HeaderValue.fromUint64(BigInteger.valueOf(3_600_000_000L))),
+                    Map.of(HeaderKey.fromString("geo_mode"), HeaderValue.fromString("geo")));
+            writePartitionData(buffer);
+            ByteBuf topicOnly = buffer.copy();
+
+            var topic = readTopic(topicOnly);
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topic.consumerOffsetUploadInterval()).contains(BigInteger.ZERO);
+            assertThat(topic.tombstoneGrace()).contains(BigInteger.valueOf(3_600_000_000L));
+            assertThat(topic.freshUploadInterval()).isEmpty();
+            assertThat(topic.positionsPublishInterval()).isEmpty();
+            assertThat(topic.positionsResumeTimeout()).isEmpty();
+            assertThat(topic.longTermRewriteMaxInterval()).isEmpty();
+            assertThat(topicDetails.consumerOffsetUploadInterval()).contains(BigInteger.ZERO);
+            assertThat(topicDetails.tombstoneGrace()).contains(BigInteger.valueOf(3_600_000_000L));
+            assertThat(topicDetails.freshUploadInterval()).isEmpty();
+            assertThat(topicDetails.positionsPublishInterval()).isEmpty();
+            assertThat(topicDetails.positionsResumeTimeout()).isEmpty();
+            assertThat(topicDetails.longTermRewriteMaxInterval()).isEmpty();
+        }
+
+        @Test
         void shouldDeserializeTopicDetails() {
             // given
             ByteBuf buffer = Unpooled.buffer();
-            writeTopicData(buffer);
-            // Write one partition
+            writeTopicData(buffer, 1);
             writePartitionData(buffer);
 
             // when
@@ -293,10 +386,51 @@ class BytesDeserializerTest {
             assertThat(topicDetails.id()).isEqualTo(10L);
             assertThat(topicDetails.partitions()).hasSize(1);
         }
+
+        @Test
+        void shouldAdvanceByEachPartitionsEncodedLength() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(buffer, 3);
+            buffer.writeBytes(HexFormat.of().parseHex(PartitionDeserialization.PINNED_PARTITION));
+            writePartitionData(buffer, 2, List.of(), List.of());
+            writePartitionData(buffer, 3, List.of(0, 1, 2), List.of(0));
+
+            var topicDetails = readTopicDetails(buffer);
+
+            assertThat(topicDetails.partitions())
+                    .extracting(Partition::id, Partition::members, Partition::inSyncMembers)
+                    .containsExactly(
+                            tuple(1L, List.of(1, 3, 4), List.of(1, 4)),
+                            tuple(2L, List.of(), List.of()),
+                            tuple(3L, List.of(0, 1, 2), List.of(0)));
+            assertThat(topicDetails.partitions())
+                    .extracting(Partition::segmentsCount)
+                    .containsExactly(2L, 5L, 5L);
+            assertThat(buffer.readableBytes()).isZero();
+        }
+
+        @Test
+        void shouldRejectPartitionsCountBeyondPayload() {
+            ByteBuf buffer = Unpooled.buffer();
+            writeTopicData(buffer, 2);
+            buffer.writeBytes(HexFormat.of().parseHex(PartitionDeserialization.PINNED_PARTITION));
+
+            assertThatThrownBy(() -> readTopicDetails(buffer))
+                    .isInstanceOf(IggyMalformedResponseException.class)
+                    .hasMessageContaining("Topic partitions count 2");
+        }
     }
 
     @Nested
     class PartitionDeserialization {
+        // The pinned bytes of the Rust encoder's sample partition: id 1, context (23, 0, 101), members [1, 3, 4]
+        // and in-sync members [1, 4].
+        static final String PINNED_PARTITION =
+                "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000"
+                        + "000000000000650000000000000003010304020104";
+        static final String EMPTY_LISTS_PARTITION =
+                "01000000004cf1238e0100000200000063000000000000000004000000000000640000000000000017000000000000000000"
+                        + "00000000000065000000000000000000";
 
         @Test
         void shouldDeserializePartition() {
@@ -311,6 +445,67 @@ class BytesDeserializerTest {
             assertThat(partition.id()).isEqualTo(1L);
             assertThat(partition.segmentsCount()).isEqualTo(5L);
             assertThat(partition.currentOffset()).isEqualTo(BigInteger.valueOf(99));
+        }
+
+        @Test
+        void shouldDecodeThePinnedPartition() {
+            byte[] pinned = HexFormat.of().parseHex(PINNED_PARTITION);
+            ByteBuf buffer = Unpooled.wrappedBuffer(pinned);
+
+            var partition = readPartition(buffer);
+
+            assertThat(pinned).hasSize(71);
+            assertThat(buffer.readableBytes()).isZero();
+            assertThat(partition.id()).isEqualTo(1L);
+            assertThat(partition.createdAt()).isEqualTo(BigInteger.valueOf(1_710_000_000_000L));
+            assertThat(partition.segmentsCount()).isEqualTo(2L);
+            assertThat(partition.currentOffset()).isEqualTo(BigInteger.valueOf(99));
+            assertThat(partition.size()).isEqualTo("1024");
+            assertThat(partition.messagesCount()).isEqualTo(BigInteger.valueOf(100));
+            assertThat(partition.context())
+                    .isEqualTo(new PartitionContext(BigInteger.valueOf(23), BigInteger.ZERO, BigInteger.valueOf(101)));
+            assertThat(partition.members()).containsExactly(1, 3, 4);
+            assertThat(partition.inSyncMembers()).containsExactly(1, 4);
+        }
+
+        @Test
+        void shouldDecodeEmptyNodeListsFromOneCountByteEach() {
+            byte[] empty = HexFormat.of().parseHex(EMPTY_LISTS_PARTITION);
+            ByteBuf buffer = Unpooled.wrappedBuffer(empty);
+
+            var partition = readPartition(buffer);
+
+            assertThat(empty).hasSize(66);
+            assertThat(buffer.readableBytes()).isZero();
+            assertThat(partition.messagesCount()).isEqualTo(BigInteger.valueOf(100));
+            assertThat(partition.members()).isEmpty();
+            assertThat(partition.inSyncMembers()).isEmpty();
+        }
+
+        @Test
+        void shouldDecodeNodeIdsAboveSignedByteRange() {
+            ByteBuf buffer = Unpooled.buffer();
+            buffer.writeBytes(HexFormat.of().parseHex(EMPTY_LISTS_PARTITION), 0, 64);
+            buffer.writeByte(1).writeByte(200);
+            buffer.writeByte(1).writeByte(255);
+
+            var partition = readPartition(buffer);
+
+            assertThat(partition.members()).containsExactly(200);
+            assertThat(partition.inSyncMembers()).containsExactly(255);
+        }
+
+        @Test
+        void shouldRejectTruncatedPartitions() {
+            byte[] pinned = HexFormat.of().parseHex(PINNED_PARTITION);
+            // Cut inside the counters, inside members, before the in-sync count and inside the in-sync list.
+            for (int length : new int[] {40, 66, 68, 69, 70}) {
+                ByteBuf buffer = Unpooled.wrappedBuffer(pinned, 0, length);
+
+                assertThatThrownBy(() -> readPartition(buffer))
+                        .as("partition cut at %d bytes", length)
+                        .isInstanceOf(IggyMalformedResponseException.class);
+            }
         }
     }
 

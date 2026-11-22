@@ -187,6 +187,7 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
 
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
+            RETIRE_GEO_ORIGIN_CODE => client.retire_geo_origin("dc-a").await,
             DESCRIBE_OPTIONS_CODE => client
                 .describe_options(OptionsScope::Topic)
                 .await
@@ -290,6 +291,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                     .delete_partitions(&ctx.stream_id, &ctx.topic_id, 1)
                     .await
             }
+            GET_PARTITIONS_CODE => client
+                .get_partitions_page(&ctx.stream_id, &ctx.topic_id, &PageQuery::default())
+                .await
+                .map(|_| ()),
 
             // Messages
             GET_PARTITION_ROUTE_CODE => client

@@ -16,12 +16,28 @@
 # under the License.
 
 name: setup-swift
-description: Install the Swift toolchain and cache the SwiftPM dependency checkouts and build products
+description: Install the Swift toolchain and restore the SwiftPM build directory
 inputs:
   cache-key:
     description: "Cache key segment naming the package that builds in the job; one constant per package so every lane shares one cache"
     required: false
     default: "sdk"
+  package-path:
+    description: "Directory of the SwiftPM package whose build directory is cached"
+    required: false
+    default: "foreign/swift"
+  read-cache:
+    description: "Whether to restore the SwiftPM build directory"
+    required: false
+    default: "true"
+
+outputs:
+  cache-key:
+    description: "Key the caller saves the build directory under with actions/cache/save after its build"
+    value: ${{ steps.cache.outputs.cache-primary-key }}
+  cache-hit:
+    description: "Whether the restored build directory matched the key exactly"
+    value: ${{ steps.cache.outputs.cache-hit }}
 
 runs:
   using: "composite"
@@ -76,18 +92,18 @@ runs:
       shell: bash
       run: swift --version
 
-    # Package.resolved pins the dependency graph, so it keys the cache; the
-    # build directories hold the compiled dependencies, and SwiftPM's
-    # incremental build reuses them across source changes.
-    - name: Cache SwiftPM dependencies and build products
-      uses: actions/cache@v6.1.0
+    # Package.resolved pins the dependency graph, so it keys the cache. The
+    # whole build directory is restored: without workspace-state.json SwiftPM
+    # recreates every checkout, and .build/debug is only a symlink into
+    # .build/out. A nested composite action hands the post step of
+    # actions/cache the wrong context (actions/runner#2009), so the caller
+    # saves with actions/cache/save once its build succeeds.
+    - name: Restore SwiftPM build directory
+      id: cache
+      if: inputs.read-cache == 'true'
+      uses: actions/cache/restore@v6.1.0
       with:
-        path: |
-          foreign/swift/.build/checkouts
-          foreign/swift/.build/repositories
-          foreign/swift/.build/artifacts
-          foreign/swift/.build/debug
-          foreign/swift/.build/release
-        key: swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-${{ hashFiles('foreign/swift/Package.resolved') }}
+        path: ${{ inputs.package-path }}/.build
+        key: swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-${{ hashFiles(format('{0}/Package.resolved', inputs.package-path)) }}
         restore-keys: |
           swiftpm-${{ runner.os }}-${{ steps.swift.outputs.version }}-${{ inputs.cache-key }}-

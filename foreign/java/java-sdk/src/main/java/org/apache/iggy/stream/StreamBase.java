@@ -30,8 +30,9 @@ import java.util.Optional;
  * A stream as the server reports it.
  *
  * <p>{@code options} carries the keys the creating client set, {@code derivedOptions} the values the
- * server filled or computes, such as the encryption key source and fingerprints. Both are keyed by option
- * name and keep the kind the server reports, on every transport. The stream key itself is never returned.
+ * server filled or computes, such as the encryption key source and fingerprints and the origin of a shadow
+ * stream. Both are keyed by option name and keep the kind the server reports, on every transport. The stream
+ * key itself is never returned.
  */
 public record StreamBase(
         Long id,
@@ -60,5 +61,10 @@ public record StreamBase(
     /** Fingerprints of the server keys that wrap the stream's key, empty for a plaintext stream. */
     public List<String> encryptionKekFingerprints() {
         return EncryptionProjection.kekFingerprints(options, derivedOptions);
+    }
+
+    /** The geo origin whose topics this shadow stream serves, empty for any other stream. */
+    public Optional<String> shadowOrigin() {
+        return ShadowProjection.origin(options, derivedOptions);
     }
 }

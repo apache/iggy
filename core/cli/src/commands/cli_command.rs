@@ -15,9 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::io::{self, Write};
+
 use anyhow::{Error, Result};
 use async_trait::async_trait;
+use iggy::clients::client::IggyClient;
 use iggy_common::Client;
+use serde::Serialize;
 
 pub static PRINT_TARGET: &str = "iggy::cli::output";
 
@@ -28,7 +32,9 @@ pub static PRINT_TARGET: &str = "iggy::cli::output";
 pub static DIAGNOSTIC_TARGET: &str = "iggy::cli::diagnostic";
 
 #[async_trait]
-pub trait CliCommand {
+/// `main` awaits `execute_with_iggy_client` through `Box<dyn CliCommand>`, and the
+/// `async_trait` future of that default method needs `Self: Send`.
+pub trait CliCommand: Send {
     fn explain(&self) -> String;
     fn use_tracing(&self) -> bool {
         true
@@ -52,4 +58,33 @@ pub trait CliCommand {
         false
     }
     async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
+    async fn execute_with_iggy_client(&mut self, client: &IggyClient) -> Result<(), Error> {
+        self.execute_cmd(client).await
+    }
+}
+
+/// Print `value` as pretty JSON to stdout.
+///
+/// Bypasses [`PRINT_TARGET`] on purpose: JSON was asked for explicitly, so
+/// `--quiet` must not hide it.
+pub(crate) fn print_json<T: Serialize + ?Sized>(value: &T) -> Result<()> {
+    let stdout = io::stdout();
+    writeln!(stdout.lock(), "{}", serde_json::to_string_pretty(value)?)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::print_json;
+
+    #[test]
+    fn given_non_string_map_keys_when_printing_json_should_return_serialization_error() {
+        let value = BTreeMap::from([([1, 2], "value")]);
+
+        let error = print_json(&value).unwrap_err();
+
+        assert!(error.is::<serde_json::Error>(), "{error:#}");
+    }
 }

@@ -15,11 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConsumerGroup, ConsumerGroupDetails, Identifier, IggyError};
+use crate::{
+    ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupDetails, Identifier, IggyError,
+    NamedPageQuery, Page,
+};
 use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the consumer group module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait ConsumerGroupClient {
     /// Get the info about a specific consumer group by unique ID or name for the given stream and topic by unique IDs or names.
     ///
@@ -30,7 +34,13 @@ pub trait ConsumerGroupClient {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<Option<ConsumerGroupDetails>, IggyError>;
-    /// Get the info about all the consumer groups for the given stream and topic by unique IDs or names.
+    /// Get the info about all the consumer groups for the given stream and topic by unique IDs or names, in id order.
+    ///
+    /// The list is read page by page, so it is not one consistent read. A group
+    /// that someone creates or deletes during the read can appear or not
+    /// appear.
+    /// A server that answers a page with the cursor it was sent fails the read
+    /// with `IggyError::InvalidFormat`.
     ///
     /// Authentication is required, and the permission to read the streams or topics.
     async fn get_consumer_groups(
@@ -38,6 +48,17 @@ pub trait ConsumerGroupClient {
         stream_id: &Identifier,
         topic_id: &Identifier,
     ) -> Result<Vec<ConsumerGroup>, IggyError>;
+    /// One page of the consumer groups of a topic, in id order. Read the next
+    /// page with [`NamedPageQuery::next`] until the page has no `next`. Group ids
+    /// follow creation, so `PageOrder::Created` walks in id order too.
+    ///
+    /// Authentication is required, and the permission to read the streams or topics.
+    async fn get_consumer_groups_page(
+        &self,
+        stream_id: &Identifier,
+        topic_id: &Identifier,
+        query: &NamedPageQuery,
+    ) -> Result<Page<ConsumerGroup>, IggyError>;
     /// Create a new consumer group for the given stream and topic by unique IDs or names.
     ///
     /// Authentication is required, and the permission to manage the streams or topics.
@@ -74,4 +95,20 @@ pub trait ConsumerGroupClient {
         topic_id: &Identifier,
         group_id: &Identifier,
     ) -> Result<(), IggyError>;
+    /// Sync this client's own assignment in a consumer group by unique ID or name for the given stream and topic by unique IDs or names.
+    ///
+    /// Returns `None` when this client is not a member of the group, or the stream, the topic or
+    /// the group does not exist. A member that holds no partition gets `Some` with an empty list.
+    /// The answer also replaces the assignment that this client's group polls use.
+    ///
+    /// Authentication is required. TCP, QUIC and WebSocket support it. HTTP keeps no membership
+    /// and returns `FeatureUnavailable`.
+    async fn sync_consumer_group(
+        &self,
+        _stream_id: &Identifier,
+        _topic_id: &Identifier,
+        _group_id: &Identifier,
+    ) -> Result<Option<ConsumerGroupAssignment>, IggyError> {
+        Err(IggyError::FeatureUnavailable)
+    }
 }

@@ -50,7 +50,8 @@ export const StreamOptionKey = {
   EncryptionKey: 'encryption_key',
   EncryptionKeySource: 'encryption_key_source',
   EncryptionKeyFingerprint: 'encryption_key_fingerprint',
-  EncryptionKekFingerprint: 'encryption_kek_fingerprint'
+  EncryptionKekFingerprint: 'encryption_kek_fingerprint',
+  ShadowOrigin: 'shadow_origin'
 } as const;
 
 export type StreamOptionKey = typeof StreamOptionKey[keyof typeof StreamOptionKey];
@@ -67,7 +68,20 @@ export const TopicOptionKey = {
   PartitionResizePolicy: 'partition_resize_policy',
   MessagesRequiredToSave: 'messages_required_to_save',
   SizeOfMessagesRequiredToSave: 'size_of_messages_required_to_save',
-  PreallocateSegments: 'preallocate_segments'
+  PreallocateSegments: 'preallocate_segments',
+  ReplicationFactor: 'replication_factor',
+  SegmentMaxAge: 'segment_max_age',
+  TieredStorage: 'tiered_storage',
+  LocalRetentionAge: 'local_retention_age',
+  LocalRetentionSize: 'local_retention_size',
+  TopicType: 'topic_type',
+  GeoMode: 'geo_mode',
+  FreshUploadInterval: 'fresh_upload_interval',
+  ConsumerOffsetUploadInterval: 'consumer_offset_upload_interval',
+  PositionsPublishInterval: 'positions_publish_interval',
+  TombstoneGrace: 'tombstone_grace',
+  PositionsResumeTimeout: 'positions_resume_timeout',
+  LongTermRewriteMaxInterval: 'long_term_rewrite_max_interval'
 } as const;
 
 export type TopicOptionKey = typeof TopicOptionKey[keyof typeof TopicOptionKey];
@@ -86,7 +100,12 @@ export type OptionDescriptor = {
   /** `OptionFlag` bits, as `describeOptions` reports them */
   flags: number,
   /** Written only by the server, never accepted and never returned */
-  internal: boolean
+  internal: boolean,
+  /**
+   * A bool an update may set to `true`, never to `false`, and may not reset.
+   * `describeOptions` reports such a key as updatable and not resettable.
+   */
+  enableOnly?: true
 };
 
 const { Topic, Stream, User } = OptionsScope;
@@ -107,11 +126,25 @@ export const OPTION_CATALOG: ReadonlyMap<string, OptionDescriptor> = new Map([
   ['messages_required_to_save', { scopes: [Topic], flags: 0, internal: false }],
   ['size_of_messages_required_to_save', { scopes: [Topic], flags: 0, internal: false }],
   ['preallocate_segments', { scopes: [Topic], flags: 0, internal: false }],
+  ['replication_factor', { scopes: [Topic], flags: 0, internal: false }],
   ['encryption_key', { scopes: [Stream], flags: Secret | Critical, internal: false }],
   ['encryption_key_wrapped', { scopes: [Stream], flags: Critical, internal: true }],
   ['encryption_key_source', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['encryption_key_fingerprint', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['encryption_kek_fingerprint', { scopes: [Stream], flags: ReadOnly, internal: false }],
+  ['segment_max_age', { scopes: [Topic], flags: Critical, internal: false }],
+  ['tiered_storage', { scopes: [Topic], flags: Updatable | Critical, internal: false, enableOnly: true }],
+  ['local_retention_age', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
+  ['local_retention_size', { scopes: [Topic], flags: Updatable | Resettable, internal: false }],
+  ['topic_type', { scopes: [Topic], flags: Critical, internal: false }],
+  ['geo_mode', { scopes: [Topic], flags: Critical, internal: false }],
+  ['fresh_upload_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['consumer_offset_upload_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['positions_publish_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['tombstone_grace', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['positions_resume_timeout', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['long_term_rewrite_max_interval', { scopes: [Topic], flags: Updatable, internal: false }],
+  ['shadow_origin', { scopes: [Stream], flags: ReadOnly, internal: false }],
   ['critical_keys', { scopes: [Stream, Topic, User], flags: 0, internal: true }]
 ]);
 

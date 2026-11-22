@@ -18,6 +18,8 @@
 import { randomBytes } from 'node:crypto';
 import { after, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { isDeepStrictEqual } from 'node:util';
 import type { Client } from '../client/client.js';
 import { HeaderValue } from '../wire/message/header.utils.js';
 import { ResponseError } from '../wire/error.utils.js';
@@ -32,6 +34,12 @@ const FINGERPRINT = /^[0-9a-f]{16}$/;
 const UNLIMITED = 18446744073709551615n;
 const UNSUPPORTED_OPTION_KEY = 4041;
 const OPTION_NOT_UPDATABLE = 4103;
+const INVALID_REPLICATION_FACTOR = 2018;
+/**
+ * A partition's primary reports who is in sync once it runs, so a read right
+ * after the create may list nobody.
+ */
+const IN_SYNC_TIMEOUT_MS = 15_000;
 
 type Credentials = { username: string, password: string };
 
@@ -298,12 +306,61 @@ export const describeResourceOptions = (
     }
   });
 
+  it('given replication factor when creating topic should place every partition on one node', async () => {
+    const nodes = (await c.cluster.getClusterMetadata()).nodes.map(({ replicaId }) => replicaId);
+    const stream = await c.stream.create({ name: `${prefix}-factor` });
+    try {
+      const created = await c.topic.create({
+        streamId: stream.id, name: 'replicated', partitionCount: 2, replicationFactor: 1
+      });
+      const topic = await c.topic.get({ streamId: stream.id, topicId: created.id });
+      assert.ok(topic);
+      assert.equal(topic.options.replication_factor, 1);
+      assert.deepEqual(topic.partitions.map(({ id }) => id), [0, 1]);
+      for (const { id, members } of topic.partitions) {
+        assert.equal(members.length, 1, `partition ${id} members ${members}`);
+        assert.ok(nodes.includes(members[0]), `partition ${id} member ${members[0]} is not in ${nodes}`);
+      }
+
+      const members = topic.partitions.map((partition) => partition.members);
+      const inSyncMembers = async () => (
+        await c.topic.get({ streamId: stream.id, topicId: created.id })
+      )?.partitions.map((partition) => partition.inSyncMembers);
+      const deadline = Date.now() + IN_SYNC_TIMEOUT_MS;
+      let inSync = await inSyncMembers();
+      while (!isDeepStrictEqual(inSync, members) && Date.now() < deadline) {
+        await sleep(100);
+        inSync = await inSyncMembers();
+      }
+      assert.deepEqual(inSync, members);
+    } finally {
+      await c.stream.delete({ streamId: stream.id });
+    }
+  });
+
+  it('given replication factor above node count when creating topic should refuse with 2018', async () => {
+    const nodes = (await c.cluster.getClusterMetadata()).nodes.length;
+    const stream = await c.stream.create({ name: `${prefix}-factor-refused` });
+    try {
+      await assert.rejects(
+        c.topic.create({
+          streamId: stream.id, name: 'over', partitionCount: 1, replicationFactor: nodes + 1
+        }),
+        (error: unknown) => error instanceof ResponseError &&
+          error.errorCode === INVALID_REPLICATION_FACTOR && error.fromServer
+      );
+      assert.equal(await c.topic.get({ streamId: stream.id, topicId: 'over' }), null);
+    } finally {
+      await c.stream.delete({ streamId: stream.id });
+    }
+  });
+
   it('given stream scope when describing options should report sensitivity and mutability', async () => {
     const specs = await c.system.describeOptions({ scope: OptionsScope.Stream });
     const byKey = new Map(specs.map((spec) => [spec.key, spec]));
     assert.deepEqual([...byKey.keys()], [
       'name', 'encryption_key', 'encryption_key_source',
-      'encryption_key_fingerprint', 'encryption_kek_fingerprint'
+      'encryption_key_fingerprint', 'encryption_kek_fingerprint', 'shadow_origin'
     ]);
     assert.equal(byKey.get('name')?.updatable, true);
     assert.equal(byKey.get('name')?.secret, false);
@@ -311,6 +368,7 @@ export const describeResourceOptions = (
     assert.equal(byKey.get('encryption_key')?.secret, true);
     assert.equal(byKey.get('encryption_key')?.critical, true);
     assert.equal(byKey.get('encryption_key_fingerprint')?.readOnly, true);
+    assert.equal(byKey.get('shadow_origin')?.readOnly, true);
   });
 
   it(`${label}::cleanup`, async () => {

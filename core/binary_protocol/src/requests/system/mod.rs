@@ -26,6 +26,7 @@ pub mod get_metadata_changes;
 pub mod get_snapshot;
 pub mod get_stats;
 pub mod ping;
+pub mod retire_geo_origin;
 pub mod retire_sessions;
 pub mod update_resource;
 
@@ -33,7 +34,7 @@ pub use bind_session::{BindSessionRequest, SessionIdentity};
 pub use describe_options::{
     DescribeOptionsRequest, OPTIONS_SCOPE_STREAM, OPTIONS_SCOPE_TOPIC, OPTIONS_SCOPE_USER,
 };
-pub use finalize_session::FinalizeSessionRequest;
+pub use finalize_session::{FinalizeSessionRequest, RetirementDebt};
 pub use get_client::GetClientRequest;
 pub use get_clients::GetClientsRequest;
 pub use get_cluster_metadata::GetClusterMetadataRequest;
@@ -42,5 +43,6 @@ pub use get_metadata_changes::{GetMetadataChangesRequest, WireMetadataChangeStar
 pub use get_snapshot::GetSnapshotRequest;
 pub use get_stats::GetStatsRequest;
 pub use ping::PingRequest;
+pub use retire_geo_origin::RetireGeoOriginRequest;
 pub use retire_sessions::{MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest};
 pub use update_resource::{MAX_RESET_KEYS, ResourceTarget, UpdateResourceRequest, WireResetKeys};

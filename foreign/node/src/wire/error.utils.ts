@@ -17,6 +17,7 @@
 
 import { translateCommandCode } from './command.code.js';
 import { translateErrorCode } from './error.code.js';
+import type { PartitionContext } from './vsr/header.js';
 
 export class ResponseError extends Error {
   readonly commandCode: number;
@@ -54,6 +55,11 @@ export type DeserializeErrorOptions = {
 export class DeserializeError extends Error {
   readonly offset?: bigint;
   readonly record?: Buffer;
+  /**
+   * For the records of a poll reply that do not decode: the context of that
+   * reply, the partition history and owner that served them.
+   */
+  context?: PartitionContext;
 
   constructor(message: string, options?: DeserializeErrorOptions) {
     super(message, options?.cause === undefined ? undefined : { cause: options.cause });

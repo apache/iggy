@@ -16,15 +16,19 @@
 // under the License.
 
 //! `DescribeConfigs` (API key 32).
+//!
+//! A topic reports every key of Kafka 4.4 except `cleanup.policy`: the three keys Iggy stores,
+//! what the gateway applies for some others, and Kafka's default for the rest. A broker reports a
+//! fixed set for this gateway. See `topic_config::keys` and `docs/CONFIGS.md`.
 
 use std::collections::HashSet;
 
 use bytes::Bytes;
-use iggy::prelude::IggyExpiry;
 use kafka_protocol::messages::DescribeConfigsRequest;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
 use kafka_protocol::messages::describe_configs_response::{
     DescribeConfigsResourceResult, DescribeConfigsResponse, DescribeConfigsResult,
+    DescribeConfigsSynonym,
 };
 use kafka_protocol::protocol::StrBytes;
 use tokio::time::Instant;
@@ -38,10 +42,12 @@ use crate::protocol::api::{
     REQUEST_DEADLINE,
 };
 use crate::protocol::bounds_guard::validate_describe_configs_shape;
+use crate::protocol::handlers::topic_config::keys::{
+    BrokerContext, ConfigContext, ConfigEntry, broker_entries, topic_entries,
+};
 use crate::protocol::handlers::topic_config::{
-    CONFIG_SOURCE_TOPIC, CONFIG_TYPE_LONG, ListedKey, ONLY_TOPIC_RESOURCES, RESOURCE_TYPE_TOPIC,
-    RETENTION_DOC, RETENTION_MS, bridge_failure, listed_keys, name_reason, retention_ms,
-    topic_cap_and_duplicates, topic_cap_message,
+    RESOURCE_TYPE_BROKER, RESOURCE_TYPE_TOPIC, bridge_failure, describe_cap_message,
+    exceeds_describe_cap, name_reason, topic_cap_and_duplicates,
 };
 use crate::protocol::handlers::{
     decode_guarded, encode_message, is_supported_version, respond_or_close,
@@ -53,6 +59,8 @@ pub const RANGE: ApiVersionRange = ApiVersionRange {
     min_version: 1,
     max_version: 4,
 };
+
+const ONLY_TOPIC_AND_BROKER_RESOURCES: &str = "only topic and broker resources are supported";
 
 pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> HandleOutcome {
     if !is_supported_version(API_KEY_DESCRIBE_CONFIGS, api_version) {
@@ -77,10 +85,10 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // Checked before the bridge-availability stub, not inside `describe_all`: the cap is a
     // request-shape policy, not a controller-availability one, and a check that only runs once
     // the bridge is up is never exercised by a serverless/stub test.
-    let (exceeds_cap, duplicate_names) = topic_cap_and_duplicates(&req.resources);
-    if exceeds_cap {
-        let message = StrBytes::from(topic_cap_message("DescribeConfigs"));
-        tracing::warn!("DescribeConfigs request addresses too many distinct topics; rejecting");
+    let (_, duplicate_names) = topic_cap_and_duplicates(&req.resources);
+    if exceeds_describe_cap(&req.resources) {
+        let message = StrBytes::from(describe_cap_message());
+        tracing::warn!("DescribeConfigs request asks for too many resources; rejecting");
         let results = req
             .resources
             .iter()
@@ -111,8 +119,13 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
         );
     };
 
+    let broker = BrokerContext {
+        node_id: state.node_id,
+        auto_create_topics: state.auto_topic_creation.is_some(),
+        config: ConfigContext::of(bridge, state.max_frame_size),
+    };
     let deadline = Instant::now() + REQUEST_DEADLINE;
-    let results = describe_all(bridge, &req, &duplicate_names, deadline).await;
+    let results = describe_all(bridge, &broker, &req, &duplicate_names, deadline).await;
     respond_or_close(
         encode_message(&response(results), api_version, 256),
         "DescribeConfigs",
@@ -142,6 +155,7 @@ fn response(results: Vec<DescribeConfigsResult>) -> DescribeConfigsResponse {
 
 async fn describe_all(
     bridge: &IggyBridge,
+    broker: &BrokerContext<'_>,
     req: &DescribeConfigsRequest,
     duplicate_names: &HashSet<&str>,
     deadline: Instant,
@@ -149,10 +163,29 @@ async fn describe_all(
     let mut cache = StreamTopicCache::default();
     let mut results = Vec::with_capacity(req.resources.len());
     let mut deadline_exceeded = false;
+    let shown = Shown {
+        documentation: req.include_documentation,
+        synonyms: req.include_synonyms,
+    };
     for resource in &req.resources {
-        if resource.resource_type == RESOURCE_TYPE_TOPIC
-            && duplicate_names.contains(resource.resource_name.as_str())
-        {
+        match resource.resource_type {
+            RESOURCE_TYPE_TOPIC => {}
+            // Answered from this gateway alone, so the deadline does not apply.
+            RESOURCE_TYPE_BROKER => {
+                results.push(describe_broker(broker, resource, shown));
+                continue;
+            }
+            _ => {
+                results.push(resource_error(
+                    resource,
+                    ERROR_INVALID_REQUEST,
+                    Some(StrBytes::from_static_str(ONLY_TOPIC_AND_BROKER_RESOURCES)),
+                    Vec::new(),
+                ));
+                continue;
+            }
+        }
+        if duplicate_names.contains(resource.resource_name.as_str()) {
             results.push(resource_error(
                 resource,
                 ERROR_INVALID_REQUEST,
@@ -178,11 +211,12 @@ async fn describe_all(
             continue;
         }
 
-        let result = describe_one(
+        let result = describe_topic(
             bridge,
+            &broker.config,
             &mut cache,
             resource,
-            req.include_documentation,
+            shown,
             deadline,
         )
         .await;
@@ -194,21 +228,21 @@ async fn describe_all(
     results
 }
 
-async fn describe_one(
+/// What each entry carries beside its value, as the request asks.
+#[derive(Debug, Clone, Copy)]
+struct Shown {
+    documentation: bool,
+    synonyms: bool,
+}
+
+async fn describe_topic(
     bridge: &IggyBridge,
+    context: &ConfigContext<'_>,
     cache: &mut StreamTopicCache,
     resource: &DescribeConfigsResource,
-    include_documentation: bool,
+    shown: Shown,
     deadline: Instant,
 ) -> DescribeConfigsResult {
-    if resource.resource_type != RESOURCE_TYPE_TOPIC {
-        return resource_error(
-            resource,
-            ERROR_INVALID_REQUEST,
-            Some(StrBytes::from_static_str(ONLY_TOPIC_RESOURCES)),
-            Vec::new(),
-        );
-    }
     let name = resource.resource_name.as_str();
     if let Err(error) = validate_kafka_topic_name("kafka_topic", name) {
         return resource_error(
@@ -236,13 +270,11 @@ async fn describe_one(
         }
     };
 
-    let (configs, unrepresentable) = described_entries(
-        snapshot.message_expiry,
-        snapshot.message_expiry_explicit,
-        resource.configuration_keys.as_deref(),
-        include_documentation,
-    );
-
+    let entries = topic_entries(snapshot, context, resource.configuration_keys.as_deref());
+    // Only a stored expiry that is not a whole number of milliseconds has no Kafka form. It is
+    // still the expiry of the topic, so it is not reported as the never-expire default.
+    let unrepresentable = entries.iter().any(|entry| entry.value.is_none());
+    let configs = described(entries, shown);
     if unrepresentable {
         return resource_error(
             resource,
@@ -256,63 +288,77 @@ async fn describe_one(
     resource_error(resource, ERROR_NONE, None, configs)
 }
 
-#[must_use]
-fn described_entries(
-    message_expiry: IggyExpiry,
-    message_expiry_explicit: bool,
-    configuration_keys: Option<&[StrBytes]>,
-    include_documentation: bool,
-) -> (Vec<DescribeConfigsResourceResult>, bool) {
-    let retention = retention_ms(message_expiry, message_expiry_explicit);
-    let keys = listed_keys(configuration_keys);
-    let mut unrepresentable = false;
-    let mut configs = Vec::with_capacity(keys.len());
-    for key in keys {
-        match key {
-            ListedKey::Retention => {
-                let (value, source) = retention.as_ref().map_or_else(
-                    |()| {
-                        // A stored duration that cannot be shown as retention.ms is still the
-                        // topic's expiry, not the never-expire default.
-                        unrepresentable = true;
-                        (None, CONFIG_SOURCE_TOPIC)
-                    },
-                    |retention| (Some(retention.value.as_str()), retention.source),
-                );
-                configs.push(config_entry(
-                    RETENTION_MS,
-                    value,
-                    false,
-                    source,
-                    CONFIG_TYPE_LONG,
-                    include_documentation.then_some(RETENTION_DOC),
-                ));
-            }
-            // A resource error makes clients drop every returned config, including
-            // retention.ms. An unmodeled name is omitted and the resource stays successful.
-            ListedKey::Unknown => {}
-        }
+/// A BROKER resource, as Kafka answers it: the empty name holds the cluster-wide dynamic
+/// defaults, of which this gateway has none, and a broker id must be this gateway's own. An
+/// admin client sends the describe of a broker to that broker.
+fn describe_broker(
+    broker: &BrokerContext<'_>,
+    resource: &DescribeConfigsResource,
+    shown: Shown,
+) -> DescribeConfigsResult {
+    let name = resource.resource_name.as_str();
+    if name.is_empty() {
+        return resource_error(resource, ERROR_NONE, None, Vec::new());
     }
-    (configs, unrepresentable)
+    match name.parse::<i32>() {
+        Ok(node_id) if node_id == broker.node_id => {
+            let entries = broker_entries(broker, resource.configuration_keys.as_deref());
+            resource_error(resource, ERROR_NONE, None, described(entries, shown))
+        }
+        Ok(_) => resource_error(
+            resource,
+            ERROR_INVALID_REQUEST,
+            Some(StrBytes::from(format!(
+                "Unexpected broker id, expected {} or empty string, but received {name}",
+                broker.node_id
+            ))),
+            Vec::new(),
+        ),
+        Err(_) => resource_error(
+            resource,
+            ERROR_INVALID_REQUEST,
+            Some(StrBytes::from(format!(
+                "Broker id must be an integer, but it is: {name}"
+            ))),
+            Vec::new(),
+        ),
+    }
 }
 
-fn config_entry(
-    name: &str,
-    value: Option<&str>,
-    read_only: bool,
-    source: i8,
-    config_type: i8,
-    documentation: Option<&str>,
-) -> DescribeConfigsResourceResult {
-    DescribeConfigsResourceResult::default()
-        .with_name(StrBytes::from(name.to_string()))
-        .with_value(value.map(|value| StrBytes::from(value.to_string())))
-        .with_read_only(read_only)
-        .with_config_source(source)
-        .with_is_sensitive(false)
-        .with_synonyms(Vec::new())
-        .with_config_type(config_type)
-        .with_documentation(documentation.map(|text| StrBytes::from(text.to_string())))
+/// The wire form of `entries`. With `include_synonyms`, each entry lists itself as its one
+/// synonym, with its value and source, as Kafka lists at least the entry itself. Kafka also lists
+/// the broker keys the value falls back to, which the gateway does not.
+fn described(entries: Vec<ConfigEntry>, shown: Shown) -> Vec<DescribeConfigsResourceResult> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let name = StrBytes::from_static_str(entry.name);
+            let value = entry.value.map(StrBytes::from);
+            let synonyms = if shown.synonyms {
+                vec![
+                    DescribeConfigsSynonym::default()
+                        .with_name(name.clone())
+                        .with_value(value.clone())
+                        .with_source(entry.source),
+                ]
+            } else {
+                Vec::new()
+            };
+            DescribeConfigsResourceResult::default()
+                .with_name(name)
+                .with_value(value)
+                .with_read_only(entry.read_only)
+                .with_config_source(entry.source)
+                .with_is_sensitive(false)
+                .with_synonyms(synonyms)
+                .with_config_type(entry.config_type.code())
+                .with_documentation(
+                    shown
+                        .documentation
+                        .then(|| StrBytes::from_static_str(entry.documentation)),
+                )
+        })
+        .collect()
 }
 
 fn resource_error(
@@ -331,150 +377,117 @@ fn resource_error(
 
 #[cfg(test)]
 mod tests {
-    use std::str::FromStr;
+    use super::*;
+    use crate::bridge::TopicDefaults;
 
-    use iggy::prelude::{
-        HeaderKey, HeaderValue, IggyByteSize, IggyExpiry, IggyTimestamp, OptionValue,
-        ResourceOptions, TopicDetails, topic_option_keys,
-    };
-    use kafka_protocol::messages::describe_configs_response::DescribeConfigsResourceResult;
-    use kafka_protocol::protocol::StrBytes;
+    fn broker_resource(name: &str, keys: Option<Vec<&'static str>>) -> DescribeConfigsResource {
+        DescribeConfigsResource::default()
+            .with_resource_type(RESOURCE_TYPE_BROKER)
+            .with_resource_name(StrBytes::from(name.to_string()))
+            .with_configuration_keys(keys.map(|keys| {
+                keys.into_iter()
+                    .map(StrBytes::from_static_str)
+                    .collect::<Vec<_>>()
+            }))
+    }
 
-    use super::described_entries;
-    use crate::protocol::handlers::topic_config::{
-        CLEANUP_POLICY, RETENTION_MS, message_expiry_is_explicit, parse_retention_ms,
-    };
-
-    fn topic_details(expiry: IggyExpiry, explicit: bool) -> TopicDetails {
-        let mut options = ResourceOptions::new();
-        let key = HeaderKey::from_str(topic_option_keys::MESSAGE_EXPIRY).expect("expiry key");
-        let value = HeaderValue::from(u64::from(expiry));
-        let option = if explicit {
-            OptionValue::explicit(value)
-        } else {
-            OptionValue::derived(value)
-        };
-        options.insert(key, option);
-        TopicDetails {
-            id: 1,
-            created_at: IggyTimestamp::default(),
-            name: "orders".to_string(),
-            size: IggyByteSize::default(),
-            messages_count: 0,
-            partitions_count: 1,
-            partitions: Vec::new(),
-            options,
+    fn context(defaults: &TopicDefaults) -> BrokerContext<'_> {
+        BrokerContext {
+            node_id: 2,
+            auto_create_topics: true,
+            config: ConfigContext {
+                defaults,
+                max_message_bytes: 8 * 1024 * 1024,
+                default_replication_factor: None,
+            },
         }
     }
 
-    fn entries(
-        details: &TopicDetails,
-        configuration_keys: Option<&[StrBytes]>,
-        include_documentation: bool,
-    ) -> (Vec<DescribeConfigsResourceResult>, bool) {
-        described_entries(
-            details.resolved_options().message_expiry,
-            message_expiry_is_explicit(&details.options),
-            configuration_keys,
-            include_documentation,
-        )
-    }
+    const BARE: Shown = Shown {
+        documentation: false,
+        synonyms: false,
+    };
 
-    fn value_of<'a>(configs: &'a [DescribeConfigsResourceResult], name: &str) -> Option<&'a str> {
-        configs
+    #[test]
+    fn given_this_gateway_id_should_describe_the_broker() {
+        let defaults = TopicDefaults::default();
+        let result = describe_broker(&context(&defaults), &broker_resource("2", None), BARE);
+        assert_eq!(result.error_code, ERROR_NONE);
+        let auto_create = result
+            .configs
             .iter()
-            .find(|config| config.name.as_str() == name)
-            .and_then(|config| config.value.as_ref().map(StrBytes::as_str))
-    }
-
-    #[test]
-    fn default_describe_returns_retention_only() {
-        let expiry = parse_retention_ms("120000").expect("2 minutes in ms");
-        let details = topic_details(expiry, true);
-        let (configs, bad) = entries(&details, None, false);
-        assert!(!bad);
+            .find(|config| config.name.as_str() == "auto.create.topics.enable")
+            .expect("reported");
         assert_eq!(
-            configs
+            auto_create.value.as_ref().map(StrBytes::as_str),
+            Some("true")
+        );
+        assert!(
+            result
+                .configs
                 .iter()
-                .map(|config| config.name.as_str())
-                .collect::<Vec<_>>(),
-            vec![RETENTION_MS]
+                .all(|config| config.documentation.is_none())
         );
-        assert_eq!(value_of(&configs, RETENTION_MS), Some("120000"));
+        assert!(result.configs.iter().all(|config| config.read_only));
+
+        assert!(
+            result
+                .configs
+                .iter()
+                .all(|config| config.synonyms.is_empty())
+        );
+
+        let asked = broker_resource("2", Some(vec!["min.insync.replicas"]));
+        let documented = Shown {
+            documentation: true,
+            ..BARE
+        };
+        let result = describe_broker(&context(&defaults), &asked, documented);
+        assert_eq!(result.configs.len(), 1);
+        assert!(result.configs[0].documentation.is_some());
     }
 
     #[test]
-    fn cleanup_policy_is_omitted_even_when_asked_for() {
-        let details = topic_details(IggyExpiry::NeverExpire, false);
-        let only_cleanup = [StrBytes::from_static_str(CLEANUP_POLICY)];
-        let (configs, bad) = entries(&details, Some(&only_cleanup), true);
-        assert!(!bad);
-        assert_eq!(configs, [] as [DescribeConfigsResourceResult; 0]);
-
-        let both = [
-            StrBytes::from_static_str(CLEANUP_POLICY),
-            StrBytes::from_static_str(RETENTION_MS),
-        ];
-        let (configs, bad) = entries(&details, Some(&both), true);
-        assert!(!bad);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name.as_str(), RETENTION_MS);
-    }
-
-    #[test]
-    fn synonyms_are_always_empty() {
-        let expiry = parse_retention_ms("120000").expect("ms");
-        let details = topic_details(expiry, true);
-        let (configs, _) = entries(&details, None, false);
-        assert!(configs.iter().all(|config| config.synonyms.is_empty()));
-    }
-
-    #[test]
-    fn requested_unknown_names_are_omitted_and_known_keys_remain() {
-        let expiry = parse_retention_ms("1500").expect("ms");
-        let details = topic_details(expiry, true);
-        let asked = [
-            StrBytes::from_static_str(RETENTION_MS),
-            StrBytes::from_static_str("no.such"),
-            StrBytes::from_static_str("retention.minutes"),
-            StrBytes::from_static_str("retention.hours"),
-        ];
-        let (configs, bad) = entries(&details, Some(&asked), false);
-        assert!(!bad);
-        assert_eq!(configs.len(), 1);
-        assert_eq!(configs[0].name.as_str(), RETENTION_MS);
+    fn given_include_synonyms_should_list_each_entry_as_its_own_synonym() {
+        let defaults = TopicDefaults::default();
+        let asked = broker_resource("2", Some(vec!["auto.create.topics.enable"]));
+        let with_synonyms = Shown {
+            synonyms: true,
+            ..BARE
+        };
+        let result = describe_broker(&context(&defaults), &asked, with_synonyms);
+        let entry = &result.configs[0];
         assert_eq!(
-            configs[0].value.as_ref().map(StrBytes::as_str),
-            Some("1500")
+            entry.synonyms,
+            [DescribeConfigsSynonym::default()
+                .with_name(entry.name.clone())
+                .with_value(entry.value.clone())
+                .with_source(entry.config_source)]
         );
     }
 
     #[test]
-    fn a_name_repeated_in_the_request_is_returned_once() {
-        let expiry = parse_retention_ms("1500").expect("ms");
-        let details = topic_details(expiry, true);
-        let asked = [
-            StrBytes::from_static_str(RETENTION_MS),
-            StrBytes::from_static_str(RETENTION_MS),
-        ];
-        let (configs, _) = entries(&details, Some(&asked), false);
-        assert_eq!(configs.len(), 1);
+    fn given_the_empty_broker_name_should_report_no_cluster_defaults() {
+        let defaults = TopicDefaults::default();
+        let result = describe_broker(&context(&defaults), &broker_resource("", None), BARE);
+        assert_eq!(result.error_code, ERROR_NONE);
+        assert_eq!(result.configs, [] as [DescribeConfigsResourceResult; 0]);
     }
 
     #[test]
-    fn never_expire_reports_negative_one() {
-        let (configs, bad) = entries(&topic_details(IggyExpiry::NeverExpire, true), None, false);
-        assert!(!bad);
-        assert_eq!(value_of(&configs, RETENTION_MS), Some("-1"));
-    }
-
-    #[test]
-    fn documentation_is_attached_only_when_asked() {
-        let expiry = parse_retention_ms("1500").expect("ms");
-        let details = topic_details(expiry, true);
-        let (configs, _) = entries(&details, None, true);
-        assert!(configs.iter().all(|config| config.documentation.is_some()));
-        let (configs, _) = entries(&details, None, false);
-        assert!(configs.iter().all(|config| config.documentation.is_none()));
+    fn given_another_broker_id_should_answer_kafkas_invalid_request() {
+        let defaults = TopicDefaults::default();
+        let other = describe_broker(&context(&defaults), &broker_resource("7", None), BARE);
+        assert_eq!(other.error_code, ERROR_INVALID_REQUEST);
+        assert_eq!(
+            other.error_message.as_ref().map(StrBytes::as_str),
+            Some("Unexpected broker id, expected 2 or empty string, but received 7")
+        );
+        let named = describe_broker(&context(&defaults), &broker_resource("b1", None), BARE);
+        assert_eq!(named.error_code, ERROR_INVALID_REQUEST);
+        assert_eq!(
+            named.error_message.as_ref().map(StrBytes::as_str),
+            Some("Broker id must be an integer, but it is: b1")
+        );
     }
 }

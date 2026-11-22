@@ -31,16 +31,20 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use iggy::prelude::{Identifier, StreamClient, TopicClient};
+use iggy::prelude::{
+    Durability, Identifier, IggyByteSize, IggyExpiry, MaxTopicSize, StreamClient, TopicClient,
+};
 use serial_test::serial;
 use tokio_util::sync::CancellationToken;
 
 use iggy_gateway_kafka::bridge::IggyBridge;
+use iggy_gateway_kafka::bridge::topic_settings::replication_factor_of;
 use iggy_gateway_kafka::group::{GroupCoordinator, GroupCoordinatorConfig};
 use iggy_gateway_kafka::protocol::api::{
-    ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS, ERROR_INVALID_REPLICA_ASSIGNMENT,
-    ERROR_INVALID_REQUEST, ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_POLICY_VIOLATION,
-    ERROR_REQUEST_TIMED_OUT, ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
+    ConnectionState, ERROR_INVALID_CONFIG, ERROR_INVALID_PARTITIONS,
+    ERROR_INVALID_REPLICA_ASSIGNMENT, ERROR_INVALID_REPLICATION_FACTOR, ERROR_INVALID_REQUEST,
+    ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NONE, ERROR_POLICY_VIOLATION, ERROR_REQUEST_TIMED_OUT,
+    ERROR_TOPIC_ALREADY_EXISTS, GatewayState,
 };
 use iggy_gateway_kafka::protocol::handlers::create_topics;
 
@@ -62,7 +66,7 @@ struct TopicSpec<'a> {
     num_partitions: i32,
     replication_factor: i16,
     assignments: &'a [i32],
-    has_config: bool,
+    configs: &'a [(&'a str, &'a str)],
 }
 
 impl<'a> TopicSpec<'a> {
@@ -72,7 +76,7 @@ impl<'a> TopicSpec<'a> {
             num_partitions,
             replication_factor: 1,
             assignments: &[],
-            has_config: false,
+            configs: &[],
         }
     }
 }
@@ -94,13 +98,11 @@ fn build_request(topics: &[TopicSpec], validate_only: bool) -> Bytes {
             enc.write_empty_tagged_fields();
         }
 
-        if topic.has_config {
-            enc.write_varint(2); // one config
-            enc.write_compact_nullable_string(Some("cleanup.policy"));
-            enc.write_compact_nullable_string(Some("delete"));
+        enc.write_varint((topic.configs.len() + 1) as u64);
+        for (name, value) in topic.configs {
+            enc.write_compact_nullable_string(Some(name));
+            enc.write_compact_nullable_string(Some(value));
             enc.write_empty_tagged_fields();
-        } else {
-            enc.write_varint(1); // empty configs
         }
 
         enc.write_empty_tagged_fields(); // topic tagged fields
@@ -140,16 +142,65 @@ fn decode_all_results(body: Bytes) -> Vec<(Option<String>, i16)> {
         let _error_message = d.read_compact_nullable_string().expect("error_message");
         let _num_partitions = d.read_i32().expect("num_partitions");
         let _replication_factor = d.read_i16().expect("replication_factor");
-        let _configs = d.read_varint().expect("configs array count");
-        let _tagged = d.read_varint().expect("topic tagged fields");
+        let _configs = read_configs(&mut d);
+        d.read_tagged_fields().expect("topic tagged fields");
         results.push((name, error_code));
     }
     results
 }
 
+/// One config of a v5 `CreateTopics` result: name, value and source.
+type CreatedConfig = (String, Option<String>, i8);
+
+/// The configs of one v5 `CreateTopics` result: a compact nullable array.
+fn read_configs(d: &mut Decoder) -> Vec<CreatedConfig> {
+    let count = d.read_varint().expect("configs array count");
+    let mut configs = Vec::new();
+    for _ in 1..count {
+        let name = d
+            .read_compact_nullable_string()
+            .expect("config name")
+            .expect("a config has a name");
+        let value = d.read_compact_nullable_string().expect("config value");
+        let _read_only = d.read_bool().expect("read_only");
+        let source = i8::from_be_bytes([d.read_bytes(1).expect("config_source")[0]]);
+        let _is_sensitive = d.read_bool().expect("is_sensitive");
+        d.read_tagged_fields().expect("config tagged fields");
+        configs.push((name, value, source));
+    }
+    configs
+}
+
+/// The first v5 `CreateTopics` result: error code, message and replication factor.
+fn decode_first_factor(body: Bytes) -> (i16, Option<String>, i16) {
+    let mut d = Decoder::new(body);
+    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
+    let _topics_plus_one = d.read_varint().expect("topics array count");
+    let _name = d.read_compact_nullable_string().expect("topic name");
+    let error_code = d.read_i16().expect("error_code");
+    let error_message = d.read_compact_nullable_string().expect("error_message");
+    let _num_partitions = d.read_i32().expect("num_partitions");
+    let replication_factor = d.read_i16().expect("replication_factor");
+    (error_code, error_message, replication_factor)
+}
+
+/// The first v5 `CreateTopics` result in full: error code, message and configs.
+fn decode_first_in_full(body: Bytes) -> (i16, Option<String>, Vec<CreatedConfig>) {
+    let mut d = Decoder::new(body);
+    let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
+    let _topics_plus_one = d.read_varint().expect("topics array count");
+    let _name = d.read_compact_nullable_string().expect("topic name");
+    let error_code = d.read_i16().expect("error_code");
+    let error_message = d.read_compact_nullable_string().expect("error_message");
+    let _num_partitions = d.read_i32().expect("num_partitions");
+    let _replication_factor = d.read_i16().expect("replication_factor");
+    (error_code, error_message, read_configs(&mut d))
+}
+
 async fn send(state: &GatewayState, topics: &[TopicSpec<'_>], validate_only: bool) -> (i16, i32) {
     let body = build_request(topics, validate_only);
-    let outcome = create_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome =
+        create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_first_result(resp_body)
 }
@@ -160,7 +211,8 @@ async fn send_all(
     validate_only: bool,
 ) -> Vec<(Option<String>, i16)> {
     let body = build_request(topics, validate_only);
-    let outcome = create_topics::handle(state, REQUEST_VERSION, body).await;
+    let outcome =
+        create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
     decode_all_results(resp_body)
 }
@@ -288,29 +340,113 @@ async fn create_topics_zero_partitions_returns_invalid_partitions_and_creates_no
 
 #[tokio::test]
 #[serial]
-async fn create_topics_with_a_per_topic_config_returns_invalid_config_and_creates_nothing() {
+async fn create_topics_with_a_config_iggy_cannot_hold_returns_invalid_config_and_creates_nothing() {
     let data_dir = tempfile::tempdir().expect("tempdir");
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
 
-    let topic = TopicSpec {
-        has_config: true,
-        ..TopicSpec::new("orders", 3)
-    };
-    let (error_code, _) = send(&state, &[topic], false).await;
-    assert_eq!(error_code, ERROR_INVALID_CONFIG);
+    for configs in [
+        &[("message.timestamp.type", "LogAppendTime")][..],
+        &[("cleanup.policy", "compact,")][..],
+        &[("segment.bytes", "1048577")][..],
+        &[("max.message.bytes", "1000")][..],
+        &[("max.message.bytes", "8388609")][..],
+        &[("min.insync.replicas", "2")][..],
+        &[("no.such", "1")][..],
+    ] {
+        let topic = TopicSpec {
+            configs,
+            ..TopicSpec::new("orders", 3)
+        };
+        let body = build_request(&[topic], false);
+        let outcome =
+            create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+        let (error_code, message, created) =
+            decode_first_in_full(outcome.expect_response("CreateTopics answers"));
+        assert_eq!(error_code, ERROR_INVALID_CONFIG, "{configs:?}");
+        assert!(message.is_some(), "{configs:?}: a refusal says why");
+        assert!(
+            created.is_empty(),
+            "{configs:?}: a refusal carries no configs"
+        );
+    }
 
     let raw = raw_client(&server).await;
     let streams = raw.get_streams().await.expect("get_streams call");
     assert!(streams.is_empty());
 }
 
-/// Kafka Connect's idempotent bootstrap sends `createTopics` with `cleanup.policy=compact`
-/// against topics it doesn't know already exist, expecting `TOPIC_ALREADY_EXISTS` for ones that
-/// are - real Kafka's controller checks existence before it looks at configs. This bridge doesn't
-/// support per-topic configs at all, so if it checked configs first, Connect's already-existing
-/// topics would always answer `INVALID_CONFIG` instead, which Connect does not treat as
-/// "already there, fine" the way it treats `TOPIC_ALREADY_EXISTS`.
+/// The three keys Iggy holds reach the Iggy topic, with `retention.bytes` times the partition
+/// count, and a v5 answer lists the configs of the new topic as a describe reports them.
+#[tokio::test]
+#[serial]
+async fn create_topics_stores_the_configs_iggy_holds_and_reports_them() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let topic = TopicSpec {
+        configs: &[
+            ("retention.ms", "60000"),
+            ("retention.bytes", "1073741824"),
+            ("segment.bytes", "67108864"),
+            ("cleanup.policy", "delete"),
+            ("message.timestamp.type", "CreateTime"),
+        ],
+        ..TopicSpec::new("orders", 3)
+    };
+    let body = build_request(&[topic], false);
+    let outcome =
+        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+    let (error_code, _, created) =
+        decode_first_in_full(outcome.expect_response("CreateTopics answers"));
+    assert_eq!(error_code, ERROR_NONE);
+    let reported = |name: &str| {
+        created
+            .iter()
+            .find(|(key, _, _)| key == name)
+            .map(|(_, value, source)| (value.clone(), *source))
+    };
+    assert_eq!(
+        reported("retention.bytes"),
+        Some((Some("1073741824".to_string()), 1))
+    );
+    assert_eq!(
+        reported("retention.ms"),
+        Some((Some("60000".to_string()), 1))
+    );
+    assert_eq!(
+        reported("segment.bytes"),
+        Some((Some("67108864".to_string()), 1))
+    );
+    assert_eq!(
+        reported("min.insync.replicas"),
+        Some((Some("1".to_string()), 5))
+    );
+    assert_eq!(reported("cleanup.policy"), None);
+
+    let raw = raw_client(&server).await;
+    let details = raw
+        .get_topic(
+            &Identifier::named("kafka").expect("stream"),
+            &Identifier::named("orders").expect("topic"),
+        )
+        .await
+        .expect("get_topic call")
+        .expect("the topic exists");
+    let resolved = details.resolved_options();
+    assert_eq!(u64::from(resolved.message_expiry), 60_000_000);
+    assert_eq!(u64::from(resolved.max_topic_size), 3 * 1_073_741_824);
+    assert_eq!(
+        resolved.runtime.effective_segment_size().as_bytes_u64(),
+        67_108_864
+    );
+}
+
+/// Kafka's controller checks existence before it looks at configs, so a create of an existing
+/// topic answers `TOPIC_ALREADY_EXISTS` even with a config the gateway refuses. Kafka Connect's
+/// idempotent bootstrap relies on it: it resends its topic configs against topics it does not know
+/// exist, and treats `TOPIC_ALREADY_EXISTS` as "already there, fine", but not `INVALID_CONFIG`.
 #[tokio::test]
 #[serial]
 async fn create_topics_with_a_config_against_an_existing_topic_answers_already_exists() {
@@ -321,12 +457,190 @@ async fn create_topics_with_a_config_against_an_existing_topic_answers_already_e
     let (first_error, _) = send(&state, &[TopicSpec::new("orders", 3)], false).await;
     assert_eq!(first_error, ERROR_NONE);
 
+    for configs in [
+        &[("message.timestamp.type", "LogAppendTime")][..],
+        &[("cleanup.policy", "compact")][..],
+    ] {
+        let topic = TopicSpec {
+            configs,
+            ..TopicSpec::new("orders", 3)
+        };
+        let (error_code, _) = send(&state, &[topic], false).await;
+        assert_eq!(error_code, ERROR_TOPIC_ALREADY_EXISTS, "{configs:?}");
+    }
+}
+
+/// Iggy does not compact, so a topic created with `compact` keeps every record: no expiry and no
+/// size cap, whatever the retention keys say. The gateway does not store the policy, so the
+/// answer leaves it out, as a describe does.
+#[tokio::test]
+#[serial]
+async fn create_topics_with_compact_keeps_every_record_and_leaves_the_policy_out() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
     let topic = TopicSpec {
-        has_config: true,
-        ..TopicSpec::new("orders", 3)
+        configs: &[
+            ("cleanup.policy", "compact"),
+            ("retention.ms", "60000"),
+            ("retention.bytes", "1048576"),
+            ("min.insync.replicas", "1"),
+        ],
+        ..TopicSpec::new("connect-configs", 1)
     };
-    let (error_code, _) = send(&state, &[topic], false).await;
-    assert_eq!(error_code, ERROR_TOPIC_ALREADY_EXISTS);
+    let body = build_request(&[topic], false);
+    let outcome =
+        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+    let (error_code, message, created) =
+        decode_first_in_full(outcome.expect_response("CreateTopics answers"));
+    assert_eq!(error_code, ERROR_NONE, "{message:?}");
+    let reported = |name: &str| {
+        created
+            .iter()
+            .find(|(key, _, _)| key == name)
+            .map(|(_, value, _)| value.clone())
+    };
+    assert_eq!(reported("retention.ms"), Some(Some("-1".to_string())));
+    assert_eq!(reported("retention.bytes"), Some(Some("-1".to_string())));
+    assert_eq!(reported("min.insync.replicas"), Some(Some("1".to_string())));
+    assert_eq!(reported("cleanup.policy"), None);
+
+    let raw = raw_client(&server).await;
+    let details = raw
+        .get_topic(
+            &Identifier::named("kafka").expect("stream"),
+            &Identifier::named("connect-configs").expect("topic"),
+        )
+        .await
+        .expect("get_topic call")
+        .expect("the topic exists");
+    let resolved = details.resolved_options();
+    assert_eq!(resolved.message_expiry, IggyExpiry::NeverExpire);
+    assert_eq!(resolved.max_topic_size, MaxTopicSize::Unlimited);
+}
+
+/// Kafka accepts a `retention.bytes` below one segment. Iggy keeps one segment of each partition
+/// and refuses a topic cap below one segment, so the topic gets one segment. A flush of every
+/// write makes the topic persisted, and a raised `max.message.bytes` within the largest batch is
+/// accepted.
+#[tokio::test]
+#[serial]
+async fn create_topics_with_a_small_retention_keeps_one_segment_and_a_flush_persists() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+
+    let topic = TopicSpec {
+        configs: &[
+            ("retention.bytes", "1048576"),
+            ("flush.messages", "1"),
+            ("max.message.bytes", "4194304"),
+        ],
+        ..TopicSpec::new("small-retention", 3)
+    };
+    let body = build_request(&[topic], false);
+    let outcome =
+        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
+    let (error_code, message, created) =
+        decode_first_in_full(outcome.expect_response("CreateTopics answers"));
+    assert_eq!(error_code, ERROR_NONE, "{message:?}");
+    let reported = |name: &str| {
+        created
+            .iter()
+            .find(|(key, _, _)| key == name)
+            .map(|(_, value, _)| value.clone())
+    };
+    assert_eq!(
+        reported("retention.bytes"),
+        Some(Some("357913941".to_string())),
+        "one segment of 1 GiB shared by three partitions"
+    );
+    assert_eq!(reported("flush.messages"), Some(Some("1".to_string())));
+    assert_eq!(reported("flush.ms"), Some(Some("0".to_string())));
+
+    let raw = raw_client(&server).await;
+    let details = raw
+        .get_topic(
+            &Identifier::named("kafka").expect("stream"),
+            &Identifier::named("small-retention").expect("topic"),
+        )
+        .await
+        .expect("get_topic call")
+        .expect("the topic exists");
+    let resolved = details.resolved_options();
+    assert_eq!(
+        resolved.max_topic_size,
+        MaxTopicSize::Custom(IggyByteSize::from(1_073_741_824))
+    );
+    assert_eq!(resolved.runtime.durability, Durability::Persisted);
+}
+
+/// Iggy stores the replication factor (#4692), from 1 to the node count. One node holds one copy,
+/// so 1 and -1 give 1, and 2 is refused as Kafka refuses a factor above its broker count, also by
+/// a `validate_only` request.
+#[tokio::test]
+#[serial]
+async fn create_topics_stores_the_replication_factor_up_to_the_node_count() {
+    let data_dir = tempfile::tempdir().expect("tempdir");
+    let server = TestServer::spawn(data_dir.path()).await;
+    let state = connected_state(&server).await;
+    let create = |name: &'static str, replication_factor: i16, validate_only: bool| {
+        let topic = TopicSpec {
+            replication_factor,
+            ..TopicSpec::new(name, 2)
+        };
+        let body = build_request(&[topic], validate_only);
+        let state = &state;
+        async move {
+            let outcome =
+                create_topics::handle(state, &ConnectionState::default(), REQUEST_VERSION, body)
+                    .await;
+            decode_first_factor(outcome.expect_response("CreateTopics answers"))
+        }
+    };
+
+    assert_eq!(create("one", 1, false).await, (ERROR_NONE, None, 1));
+    assert_eq!(
+        create("default", -1, false).await,
+        (ERROR_NONE, None, 1),
+        "the server default on one node"
+    );
+    let too_many = Some(
+        "Unable to replicate the partition 2 time(s): The target replication factor of 2 cannot \
+         be reached because only 1 Iggy node(s) are in the cluster."
+            .to_string(),
+    );
+    for validate_only in [true, false] {
+        let (error_code, message, _) = create("two", 2, validate_only).await;
+        assert_eq!(
+            error_code, ERROR_INVALID_REPLICATION_FACTOR,
+            "{validate_only}"
+        );
+        assert_eq!(message, too_many, "{validate_only}");
+    }
+
+    let raw = raw_client(&server).await;
+    let stream = Identifier::named("kafka").expect("stream");
+    for (name, explicit) in [("one", true), ("default", false)] {
+        let details = raw
+            .get_topic(&stream, &Identifier::named(name).expect("topic"))
+            .await
+            .expect("get_topic call")
+            .expect("the topic exists");
+        assert_eq!(replication_factor_of(&details.options), Some(1), "{name}");
+        let stored = details
+            .options
+            .iter()
+            .find(|(key, _)| key.as_bytes() == b"replication_factor")
+            .map(|(_, value)| value.explicit);
+        assert_eq!(stored, Some(explicit), "{name}");
+    }
+    let missing = raw
+        .get_topic(&stream, &Identifier::named("two").expect("topic"))
+        .await
+        .expect("get_topic call");
+    assert!(missing.is_none(), "a refused factor creates nothing");
 }
 
 /// Builds a v3 `CreateTopics` request for one topic with no assignments and no configs. v3 is
@@ -355,7 +669,13 @@ async fn create_topics_v3_accepts_broker_default_sentinels() {
     let server = TestServer::spawn(data_dir.path()).await;
     let state = connected_state(&server).await;
 
-    let outcome = create_topics::handle(&state, 3, build_v3_request("orders", -1, -1)).await;
+    let outcome = create_topics::handle(
+        &state,
+        &ConnectionState::default(),
+        3,
+        build_v3_request("orders", -1, -1),
+    )
+    .await;
     let mut d = Decoder::new(outcome.expect_response("CreateTopics request always answers"));
     let _throttle_time_ms = d.read_i32().expect("throttle_time_ms");
     assert_eq!(d.read_i32().expect("topics array count"), 1);
@@ -482,7 +802,8 @@ async fn create_topics_error_message_does_not_repeat_the_topic_name() {
     let bad_name = "has a space";
     let topic = TopicSpec::new(bad_name, 1);
     let body = build_request(&[topic], false);
-    let outcome = create_topics::handle(&state, REQUEST_VERSION, body).await;
+    let outcome =
+        create_topics::handle(&state, &ConnectionState::default(), REQUEST_VERSION, body).await;
     let resp_body = outcome.expect_response("CreateTopics request always answers");
 
     let mut d = Decoder::new(resp_body);

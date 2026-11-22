@@ -37,7 +37,8 @@ use server_common::sharding::{PartitionLocation, ShardId};
 
 use crate::poll::completion::PollCompletionLane;
 use crate::poll::test_support::{
-    PollTestMetadata, commit_messages, install_group_owner, partition_with_messages,
+    PollTestMetadata, commit_messages, delete_history, install_group_owner,
+    partition_with_messages, partition_with_messages_at_revision, primary_with_pending_view_write,
     store_consumer_offset,
 };
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
@@ -50,6 +51,7 @@ use crate::{
 const DEADLINE: u64 = 100;
 const REQUEST_DEADLINE: u64 = DEADLINE + iggy_common::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
 const CLIENT: u128 = 41;
+const CREATED_REVISION: u64 = 1;
 /// The metadata op that installs the fixture's consumer group owners.
 const METADATA_OP: u64 = 1;
 fn namespace() -> IggyNamespace {
@@ -67,17 +69,23 @@ async fn owner(payloads: &[&str]) -> TestShard {
 
 /// One owner shard with a partition for each entry of `partitions`.
 async fn owner_of(partitions: &[&[&str]]) -> TestShard {
-    shard_of(0, PollTestBus::default(), partitions).await
+    shard_of(0, PollTestBus::default(), partitions, CREATED_REVISION).await
 }
 
 /// Shard `shard` that owns a partition for each entry of `partitions`.
-async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestShard {
+async fn shard_of(
+    shard: u16,
+    bus: PollTestBus,
+    partitions: &[&[&str]],
+    created_revision: u64,
+) -> TestShard {
     let mut plane = None;
     let mut topic = Topic::default();
     let routes = PapayaShardsTable::new();
     for (id, payloads) in partitions.iter().enumerate() {
         let namespace = partition_namespace(id);
-        let (partition, config) = partition_with_messages(&bus, namespace, payloads).await;
+        let (partition, config) =
+            partition_with_messages_at_revision(&bus, namespace, payloads, created_revision).await;
         plane
             .get_or_insert_with(|| IggyPartitions::new(ShardId::new(shard), config))
             .insert(namespace, partition);
@@ -85,10 +93,13 @@ async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestS
             id,
             namespace.inner(),
             IggyTimestamp::default(),
-            1,
+            created_revision,
             0,
         ));
-        routes.insert(namespace, PartitionLocation::new(ShardId::new(shard), 1));
+        routes.insert(
+            namespace,
+            PartitionLocation::new(ShardId::new(shard), created_revision),
+        );
     }
     let partitions_plane = plane.expect("fixture requires a partition");
     let mut inner = StreamsInner::default();
@@ -97,7 +108,7 @@ async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestS
     let mut member = ConsumerGroupMember::new(0, CLIENT);
     member.session = Some(1);
     group.members.insert(member);
-    group.rebalance_members(&topic.partitions, METADATA_OP, 1);
+    group.rebalance_members(&topic.partitions, METADATA_OP.max(created_revision), 1);
     let config = partitions_plane.config().clone();
     for id in 0..partitions.len() {
         let assignment = &group.assignments[&id];
@@ -114,7 +125,7 @@ async fn shard_of(shard: u16, bus: PollTestBus, partitions: &[&[&str]]) -> TestS
         let op = install_group_owner(partition, &config, installation).await;
         assert!(group.complete_revocation(id, &installation, op));
     }
-    topic.consumer_groups.insert(0, group);
+    topic.consumer_groups.insert(0, Box::new(group));
     stream.topics.insert(topic);
     inner.items.insert(stream);
     let users = Users::default();
@@ -870,6 +881,135 @@ async fn replacement_history_rejects_parked_poll_on_its_next_signal() {
 }
 
 #[compio::test]
+async fn given_a_delete_fence_when_admitting_reads_should_apply_it_only_to_its_incarnation() {
+    const REPLACEMENT_REVISION: u64 = CREATED_REVISION + 2;
+    for revision in [CREATED_REVISION, REPLACEMENT_REVISION] {
+        let owner = shard_of(0, PollTestBus::default(), &[&["new"]], REPLACEMENT_REVISION).await;
+        let (mut partition, config) =
+            partition_with_messages_at_revision(&owner.bus, namespace(), &["old"], revision).await;
+        delete_history(&mut partition, &config, revision + 1).await;
+        owner.plane.partitions().insert(namespace(), partition);
+        owner.shards_table.insert(
+            namespace(),
+            PartitionLocation::new(ShardId::new(0), revision),
+        );
+        let expected = if revision == REPLACEMENT_REVISION {
+            IggyError::HistoryUnavailable
+        } else {
+            IggyError::TransientNotAccepted
+        };
+        for group in [false, true] {
+            for primary in [false, true] {
+                for auto_commit in [false, true] {
+                    let mut request = request(&owner, 1, group, auto_commit);
+                    request.context.primary = primary;
+                    let replies = submit(&owner, request).await;
+                    let reply = replies.try_recv();
+                    assert!(
+                        matches!(&reply, Ok(PartitionReadReply::Rejected(error)) if error == &expected),
+                        "revision {revision}, group {group}, primary {primary}, auto_commit {auto_commit}: {reply:?}"
+                    );
+                    assert_released(&owner);
+                }
+                let target = if group {
+                    group_target(&owner, 0, PollingStrategy::offset(0))
+                } else {
+                    readiness_target(&owner, 0, PollingStrategy::offset(0))
+                };
+                let (reply, replies) = channel(1);
+                owner.admit_readiness_wait(
+                    ReadinessWait {
+                        context: DeferredPollContext {
+                            primary,
+                            ..readiness_caller()
+                        },
+                        targets: vec![target],
+                        deadline: DEADLINE,
+                        min_count: ANY_MESSAGE,
+                    },
+                    &reply,
+                    None,
+                );
+                let reply = replies.try_recv();
+                assert!(
+                    matches!(&reply, Ok(PartitionReadReply::Rejected(error)) if error == &expected),
+                    "readiness, revision {revision}, group {group}, primary {primary}: {reply:?}"
+                );
+                assert_released(&owner);
+            }
+        }
+    }
+}
+
+#[compio::test]
+async fn given_a_stale_incarnation_when_checking_primary_should_wait_for_its_replacement() {
+    const REPLACEMENT_REVISION: u64 = CREATED_REVISION + 1;
+    let owner = shard_of(0, PollTestBus::default(), &[&["new"]], REPLACEMENT_REVISION).await;
+    let request = request(&owner, 1, false, false);
+    for backup in [false, true] {
+        for revision in [CREATED_REVISION, REPLACEMENT_REVISION] {
+            let status = PartitionStatus {
+                deleted: false,
+                backup,
+                unstable: false,
+                view_started: true,
+                primary: !backup,
+                incarnation: Some(revision),
+            };
+            let expected = if revision != REPLACEMENT_REVISION {
+                Err(IggyError::TransientNotAccepted)
+            } else if backup {
+                Err(IggyError::NotPrimary)
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                status.check(
+                    namespace(),
+                    true,
+                    &request.metadata,
+                    request.consumer,
+                    |_| None
+                ),
+                expected,
+                "revision {revision}, backup {backup}"
+            );
+        }
+    }
+}
+
+#[compio::test]
+async fn given_a_pending_view_write_when_checking_a_primary_poll_should_refuse_until_it_lands() {
+    let owner = owner(&["message"]).await;
+    let request = request(&owner, 1, false, false);
+    let partition =
+        primary_with_pending_view_write(PollTestBus::default(), namespace(), CREATED_REVISION);
+    for landed in [false, true] {
+        if landed {
+            assert!(partition.persist_superblock_if_needed().await);
+        }
+        for primary in [false, true] {
+            let expected = if primary && !landed {
+                Err(IggyError::TransientNotAccepted)
+            } else {
+                Ok(true)
+            };
+            assert_eq!(
+                PartitionStatus::of(&partition, Some(CREATED_REVISION)).check(
+                    namespace(),
+                    primary,
+                    &request.metadata,
+                    request.consumer,
+                    |_| None
+                ),
+                expected,
+                "landed {landed}, primary {primary}"
+            );
+        }
+    }
+}
+
+#[compio::test]
 async fn read_budget_caps_a_resident_reply_after_its_first_message() {
     let owner = owner(&["first", "second"]).await;
     owner.set_deferred_poll_config(DeferredPollConfig {
@@ -1077,7 +1217,7 @@ fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
                     offset,
                     String::new(),
                 );
-                partition.consumer_offsets.pin().insert(id, stored);
+                partition.consumer_offsets.borrow_mut().insert(id, stored);
             }
             PollingConsumer::ConsumerGroup(id, _) => {
                 let stored = ConsumerOffset::new(
@@ -1088,7 +1228,7 @@ fn store_offset(owner: &TestShard, consumer: PollingConsumer, offset: u64) {
                 );
                 partition
                     .consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .insert(ConsumerGroupId(id), stored);
             }
         })
@@ -2037,9 +2177,10 @@ async fn watched_by(
     let bus = PollTestBus::default();
     // Boxed: one shard held across the build of another outgrows the
     // `large_futures` cap.
-    let mut shards = vec![Box::pin(shard_of(WATCHER, bus.clone(), partitions)).await];
+    let mut shards =
+        vec![Box::pin(shard_of(WATCHER, bus.clone(), partitions, CREATED_REVISION)).await];
     for owner in OWNER..OWNER + owners {
-        shards.push(Box::pin(shard_of(owner, bus.clone(), partitions)).await);
+        shards.push(Box::pin(shard_of(owner, bus.clone(), partitions, CREATED_REVISION)).await);
     }
     for partition in 0..partitions.len() {
         let namespace = partition_namespace(partition);
@@ -2095,6 +2236,17 @@ async fn pump(shard: &TestShard, inbox: &Inbox) {
     }
     shard.service_deferred_polls().await;
     shard.flush_readiness_pushes();
+}
+
+/// Applies the next push of `inbox` alone, without the service loop that
+/// [`pump`] runs after every frame.
+fn apply_next_push(shard: &TestShard, inbox: &Inbox) {
+    let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessUpdate { from, states })) =
+        inbox.replies.try_recv().or_else(|_| inbox.main.try_recv())
+    else {
+        panic!("a push is next in the inbox");
+    };
+    shard.apply_readiness_update(from, states);
 }
 
 /// A first wait for `partition` goes to the owner. The owner answers it and
@@ -2302,6 +2454,183 @@ async fn frames_from_before_a_renewed_watch_change_nothing() {
         [renewed],
         "a stale unwatch keeps the renewed watch"
     );
+}
+
+#[compio::test]
+async fn wait_that_ends_on_another_ready_target_asks_the_owner_of_a_mirror_without_pushes() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    // No wait parks on the mirror, so the owner pushes nothing of this commit.
+    commit_to(&owner, 1, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    assert!(inboxes[0].replies.try_recv().is_err());
+    let targets = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(1)),
+    ];
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            targets,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            pump(&owner, &inboxes[1]).await;
+            yield_now().await;
+            pump(&owner, &inboxes[1]).await;
+        }
+    );
+
+    assert_eq!(
+        ids(&ready.unwrap()),
+        [0, 1],
+        "the answer names the mirrored partition that holds a record"
+    );
+}
+
+#[compio::test]
+async fn mirror_that_a_wait_found_behind_keeps_its_pushes_while_waits_name_it() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    commit_to(&owner, 1, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    let behind = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(1)),
+    ];
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            behind,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            pump(&owner, &inboxes[1]).await;
+            yield_now().await;
+            pump(&owner, &inboxes[1]).await;
+        }
+    );
+    assert_eq!(ids(&ready.unwrap()), [0, 1]);
+    pump(&owner, &inboxes[1]).await;
+    pump(&watcher, &inboxes[0]).await;
+    // Without a parked wait, only the hold keeps these commits coming.
+    for request in [3, 4] {
+        commit_to(&owner, 1, &["more"], request).await;
+        pump(&owner, &inboxes[1]).await;
+        pump(&watcher, &inboxes[0]).await;
+    }
+    let current = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(3)),
+    ];
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            current,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            yield_now().await;
+            assert!(
+                inboxes[1].main.try_recv().is_err(),
+                "the wait asks the owner nothing"
+            );
+            pump(&owner, &inboxes[1]).await;
+        }
+    );
+
+    assert_eq!(ids(&ready.unwrap()), [0, 1]);
+}
+
+#[compio::test]
+async fn wait_whose_owner_refuses_the_second_evaluation_keeps_its_answer() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    commit_to(&owner, 1, &["second"], 2).await;
+    pump(&owner, &inboxes[1]).await;
+    let targets = vec![
+        readiness_target(&watcher, 0, PollingStrategy::offset(0)),
+        readiness_target(&watcher, 1, PollingStrategy::offset(1)),
+    ];
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            targets,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            pump(&owner, &inboxes[1]).await;
+            // A full inbox refuses the frame that asks the owner again.
+            while watcher.senders[usize::from(OWNER)]
+                .try_send(ShardFrame::lifecycle(LifecycleFrame::ReadinessUnwatch {
+                    from: WATCHER,
+                    watches: Vec::new(),
+                }))
+                .is_ok()
+            {}
+            yield_now().await;
+        }
+    );
+
+    assert_eq!(
+        ids(&ready.unwrap()),
+        [0],
+        "the answer keeps the target that was ready"
+    );
+}
+
+#[compio::test]
+async fn wait_reads_a_mirror_that_a_push_refreshed_after_its_last_evaluation() {
+    let (watcher, owner, inboxes) = watched_pair(&[&["first"], &["first"]]).await;
+    mirror(&watcher, &owner, &inboxes, 0).await;
+    mirror(&watcher, &owner, &inboxes, 1).await;
+    let targets = (0..2)
+        .map(|partition| readiness_target(&watcher, partition, PollingStrategy::offset(1)))
+        .collect();
+
+    let (ready, ()) = futures::join!(
+        watcher.wait_for_messages(
+            readiness_caller(),
+            targets,
+            PARTITION_READ_TIMEOUT,
+            ANY_MESSAGE
+        ),
+        async {
+            // The park asks for pushes, and each commit then comes in a frame of its own.
+            pump(&owner, &inboxes[1]).await;
+            pump(&watcher, &inboxes[0]).await;
+            commit_to(&owner, 0, &["second"], 2).await;
+            pump(&owner, &inboxes[1]).await;
+            commit_to(&owner, 1, &["second"], 3).await;
+            pump(&owner, &inboxes[1]).await;
+            // The first push fires the wait, and the second lands before the wait reads its answer.
+            apply_next_push(&watcher, &inboxes[0]);
+            watcher.service_deferred_polls().await;
+            apply_next_push(&watcher, &inboxes[0]);
+        }
+    );
+
+    assert_eq!(
+        ids(&ready.unwrap()),
+        [0, 1],
+        "the answer names the partition whose push came after the wait fired"
+    );
+    while let Ok(frame) = inboxes[1].main.try_recv() {
+        assert!(
+            !matches!(
+                frame,
+                ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait { .. })
+            ),
+            "the wait asks the owner nothing"
+        );
+    }
 }
 
 #[compio::test]
@@ -2986,4 +3315,192 @@ async fn empty_read_before_the_retained_offsets_moves_to_the_first_one() {
     };
     assert!(fragments.is_empty());
     assert_eq!(next_offset, Some(2));
+}
+
+/// The origin's partition incarnation that a follower reads.
+const ORIGIN_PREFIX: iggy_object_store::ObjectPrefix = iggy_object_store::ObjectPrefix {
+    stream_id: 3,
+    topic_id: 1,
+    partition_id: 0,
+    created_revision: 12,
+};
+
+/// A manifest of [`ORIGIN_PREFIX`] that lists `segments`, by first and last
+/// offset, above `trim_point`.
+fn origin_manifest(
+    trim_point: Option<u64>,
+    segments: &[(u64, u64)],
+) -> iggy_object_store::PartitionManifest {
+    let segments: Vec<_> = segments
+        .iter()
+        .map(
+            |&(start_offset, end_offset)| iggy_object_store::ManifestSegment {
+                start_offset,
+                end_offset,
+                start_timestamp: start_offset,
+                end_timestamp: end_offset,
+                max_timestamp: end_offset,
+                size: (end_offset - start_offset + 1) * 64,
+                crc32c: 0,
+                hash: [0; iggy_object_store::SEGMENT_HASH_LEN],
+            },
+        )
+        .collect();
+    iggy_object_store::PartitionManifest {
+        prefix: ORIGIN_PREFIX,
+        published_at: 1,
+        floor: segments
+            .last()
+            .map(|segment| segment.end_offset)
+            .or(trim_point),
+        trim_point,
+        segments_keyed_by_both_offsets: false,
+        segments,
+    }
+}
+
+/// Put in place of the fixture's partition one that follows another
+/// cluster's log of two segments, read from a store that holds none of
+/// their objects.
+fn follow_a_peer(owner: &TestShard, directory: &std::path::Path) {
+    follow_a_peer_with(owner, directory, &origin_manifest(None, &[(0, 1), (2, 3)]));
+}
+
+/// [`follow_a_peer`] with `manifest` as the first one the partition applies.
+fn follow_a_peer_with(
+    owner: &TestShard,
+    directory: &std::path::Path,
+    manifest: &iggy_object_store::PartitionManifest,
+) {
+    let partitions = owner.plane.partitions();
+    drop(partitions.remove(&namespace()));
+    let consensus = consensus::VsrConsensus::new(
+        1,
+        0,
+        3,
+        namespace().inner(),
+        owner.bus.clone(),
+        consensus::LocalPipeline::new(),
+    );
+    consensus.init();
+    let mut partition = IggyPartition::with_in_memory_storage(
+        Arc::new(iggy_common::PartitionStats::default()),
+        consensus,
+        IggyByteSize::from(1 << 20),
+    );
+    partition.set_created_revision(CREATED_REVISION);
+    partition.set_partition_dir(directory.to_string_lossy().into_owned());
+    partition.follow_peer_log("dc-a", ORIGIN_PREFIX).unwrap();
+    let _ = partition.apply_peer_manifest(manifest).unwrap();
+    partitions.set_peer_remote_segments(vec![(
+        "dc-a".to_owned(),
+        Rc::new(partitions::RemoteSegments::new(
+            Rc::new(iggy_object_store::MemoryStore::new()),
+            iggy_object_store::KeyLayout::new("dc-a").unwrap(),
+        )),
+    )]);
+    partitions.insert(namespace(), partition);
+}
+
+/// A parked poll of the follower whose read of the store failed: the read
+/// that its spawned task makes.
+async fn parked_failed_read(owner: &TestShard) -> (Receiver<PartitionReadReply>, PollReadResult) {
+    let request = request(owner, 4, false, false);
+    let (consumer, args) = (request.consumer, request.args.clone());
+    let replies = submit(owner, request).await;
+    assert_eq!(
+        owner.bus.spawned_tasks.borrow().len(),
+        1,
+        "a read of the store"
+    );
+    owner.bus.spawned_tasks.borrow_mut().clear();
+    let failed = owner
+        .plane
+        .partitions()
+        .build_poll_snapshot(&namespace(), consumer, &args)
+        .unwrap()
+        .execute()
+        .await;
+    assert_eq!(
+        failed.tiered_read_failure(),
+        Some(IggyError::TieredReadFailed)
+    );
+    (replies, failed)
+}
+
+#[compio::test]
+async fn given_a_parked_read_of_a_peer_log_when_a_trim_drops_its_segment_should_ask_for_a_retry() {
+    let owner = owner(&["seed"]).await;
+    let directory = tempfile::tempdir().unwrap();
+    follow_a_peer(&owner, directory.path());
+    let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
+
+    let _ = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .apply_peer_manifest(&origin_manifest(Some(1), &[(2, 3)]))
+        .unwrap();
+    owner.on_deferred_poll_completed(1, failed).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+}
+
+/// [`origin_manifest`] of an origin that keys its segments by both offsets.
+fn keyed_origin_manifest(segments: &[(u64, u64)]) -> iggy_object_store::PartitionManifest {
+    iggy_object_store::PartitionManifest {
+        segments_keyed_by_both_offsets: true,
+        ..origin_manifest(None, segments)
+    }
+}
+
+#[compio::test]
+async fn given_a_parked_read_of_a_peer_log_when_a_merge_replaces_its_segments_should_ask_for_a_retry()
+ {
+    let owner = owner(&["seed"]).await;
+    let directory = tempfile::tempdir().unwrap();
+    follow_a_peer_with(
+        &owner,
+        directory.path(),
+        &keyed_origin_manifest(&[(0, 1), (2, 3)]),
+    );
+    let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
+
+    let applied = owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .apply_peer_manifest(&keyed_origin_manifest(&[(0, 3)]))
+        .unwrap();
+    assert_eq!(applied.replaced, 2);
+    owner.on_deferred_poll_completed(1, failed).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+}
+
+#[compio::test]
+async fn given_a_parked_read_of_a_peer_log_that_failed_without_a_trim_should_report_the_failure() {
+    let owner = owner(&["seed"]).await;
+    let directory = tempfile::tempdir().unwrap();
+    follow_a_peer(&owner, directory.path());
+    let (replies, failed) = Box::pin(parked_failed_read(&owner)).await;
+
+    owner.on_deferred_poll_completed(1, failed).await;
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(IggyError::TieredReadFailed))
+    ));
 }

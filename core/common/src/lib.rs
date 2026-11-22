@@ -77,6 +77,7 @@ pub use http::streams::*;
 pub use http::system::*;
 pub use http::topics::*;
 pub use http::users::*;
+pub use iggy_binary_protocol::batch::BatchProducer;
 pub use iggy_binary_protocol::requests::messages::{
     MAX_DEFERRED_POLL_TIMEOUT_US, MAX_DEFERRED_POLL_WAIT_US, MIN_DEFERRED_POLL_MAX_BYTES,
     MIN_DEFERRED_POLL_REPLY_MARGIN_US,
@@ -88,8 +89,8 @@ pub use traits::binary_client::BinaryClient;
 pub use traits::binary_transport::BinaryTransport;
 #[doc(hidden)]
 pub use traits::binary_transport::{
-    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_operation_deadline,
-    binary_operation_lineage, with_binary_deadline, with_binary_lineage,
+    BINARY_OPERATION_TIMEOUT, BinaryOperationLineage, binary_deadline_in_force,
+    binary_operation_deadline, binary_operation_lineage, with_binary_deadline, with_binary_lineage,
 };
 pub use traits::binary_transport::{VsrSessionControl, VsrSessionSealed, decode_session_binding};
 pub use traits::client::Client;
@@ -108,7 +109,9 @@ pub use traits::topic_client::TopicClient;
 pub use traits::user_client::UserClient;
 pub use traits::validatable::Validatable;
 #[doc(hidden)]
-pub use traits::{BinarySendPartitioning, fetch_binary_messages, send_binary_messages};
+pub use traits::{
+    BinarySendPartitioning, fetch_binary_messages, select_send_partition, send_binary_messages,
+};
 pub use traits::{binary_sign_in, rust_sdk_version_info, sign_in_request};
 pub use traits::{decode_send_confirmations, group_cache_key, sync_group_assignment};
 pub use types::args::*;
@@ -139,11 +142,9 @@ pub use types::configuration::websocket_config::websocket_client_reconnection_co
 pub use types::configuration::websocket_config::websocket_connection_string_options::*;
 pub use types::consumer::consumer_group::*;
 pub use types::consumer::consumer_group_id::*;
-pub use types::consumer::consumer_group_offsets::*;
 pub use types::consumer::consumer_kind::*;
 pub use types::consumer::consumer_offset::*;
 pub use types::consumer::consumer_offset_info::*;
-pub use types::consumer::consumer_offsets::*;
 pub use types::diagnostic::diagnostic_event::DiagnosticEvent;
 pub use types::either::Either;
 pub use types::http::HttpMethod;
@@ -151,6 +152,7 @@ pub use types::identifier::*;
 pub use types::message::*;
 pub use types::metadata_changes::*;
 pub use types::options::*;
+pub use types::page::*;
 pub use types::partition::*;
 pub use types::permissions::permissions_global::*;
 pub use types::permissions::personal_access_token::*;

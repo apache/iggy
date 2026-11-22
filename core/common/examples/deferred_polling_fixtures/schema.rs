@@ -379,6 +379,7 @@ fn commit_outcomes() -> CommitOutcomes {
         IggyError::InvalidOffset(0),
         IggyError::ConsumerGroupPartitionNotOwned(0, 0),
         IggyError::ShardCommunicationError,
+        IggyError::TieredReadFailed,
     ];
     let vectors = |scope: CommitErrorScope| {
         errors

@@ -223,7 +223,7 @@ func (m *PollMessages) MarshalBinary() ([]byte, error) {
 
 // FetchMessages reads the targets of one primary in one deferred request.
 // Each target carries its own cap and partition fence, so the request header
-// carries no partition context.
+// names only the metadata that the session saw.
 type FetchMessages struct {
 	StreamId   iggcon.Identifier
 	TopicId    iggcon.Identifier

@@ -23,18 +23,22 @@ import { dedupeOptions, serializeOptions, sortOptions, type OptionEntry } from '
 import { HeaderValue } from '../message/header.utils.js';
 import {
   isValidCompressionAlgorithm, CompressionAlgorithm, Durability, PartitionResizePolicy,
+  TopicType, GeoMode,
   compressionAlgorithmName,
   deserializeTopic,
+  geoDurationOptions,
+  type GeoTopicDurations,
   type Topic,
   type CompressionAlgorithm as CompressionAlgorithmT
 } from './topic.utils.js';
 
 
 /**
- * Settings a topic takes at create. Only the message expiry and the size cap
- * can change later, through `updateTopic`.
+ * Settings a topic takes at create. Only the message expiry, the size cap,
+ * the local retention, turning tiered storage on and the durations of a geo
+ * topic can change later, through `updateTopic`.
  */
-export type TopicOptions = {
+export type TopicOptions = GeoTopicDurations & {
   /** Compression algorithm label (None or Gzip), stored and reported only */
   compressionAlgorithm?: CompressionAlgorithmT,
   /**
@@ -62,6 +66,60 @@ export type TopicOptions = {
   sizeOfMessagesRequiredToSave?: bigint,
   /** Preallocate segment files when the topic is created */
   preallocateSegments?: boolean,
+  /**
+   * Number of nodes that store each partition of the topic: 1 to 32 and at most
+   * the cluster's node count. Omitted, the server's `[cluster]
+   * default_replication_factor` applies: every node unless an operator set a
+   * number. A write commits on a quorum of those nodes, so 2 keeps two copies
+   * but stops taking writes while either node is down, like Kafka with
+   * `min.insync.replicas=2`. A value out of range is refused with error 2018,
+   * invalid replication factor.
+   */
+  replicationFactor?: number,
+  /**
+   * Rolls the active segment once a batch is stamped this long after the
+   * segment's first batch, in microseconds (u64 max = never). `0n` is not
+   * "never": it omits the key so the server resolves its own default, reported
+   * back as a derived option on `getTopic`. The server refuses values under 10
+   * minutes, and the key alongside `preallocateSegments: true`.
+   */
+  segmentMaxAge?: bigint,
+  /**
+   * Moves sealed segments to the object store and keeps only the local
+   * retention on disk. The server does not offer tiering yet and refuses
+   * `true` with error 5, feature unavailable.
+   */
+  tieredStorage?: boolean,
+  /**
+   * How long a tiered topic keeps an uploaded segment on local disk, in
+   * microseconds (u64 max = never). `0n` is not "never": it omits the key so
+   * the server resolves its own default, reported back as a derived option on
+   * `getTopic`. The server refuses a value above a finite `messageExpiry`.
+   */
+  localRetentionAge?: bigint,
+  /**
+   * Cap in bytes on the uploaded segments a tiered topic keeps on local disk,
+   * split across all partitions (u64 max = unlimited). `0n` is not
+   * "unlimited": it omits the key so the server resolves its own default,
+   * reported back as a derived option on `getTopic`. The server refuses a
+   * value above a finite `maxTopicSize`.
+   */
+  localRetentionSize?: bigint,
+  /**
+   * Whether the topic is normal or geo. The server default is normal. A geo
+   * topic needs an object store on every node of the cluster: while one is
+   * not ready, the server refuses `geo` with error 5, feature unavailable. A
+   * geo topic refuses tiered storage and an encrypted stream, and keeps its
+   * name, options and partition count.
+   */
+  topicType?: TopicType,
+  /**
+   * How a geo topic writes its messages. A geo topic created without one uses
+   * `geo`. The server refuses `geo_tiered` with error 5 for now. Only a geo
+   * topic takes a mode: the server refuses one on a normal topic with error
+   * 4042, invalid option value.
+   */
+  geoMode?: GeoMode,
   /**
    * Option keys with no field of their own, for a key the server catalog gained
    * after this build shipped. A field above wins on collision, since the block
@@ -106,6 +164,19 @@ export const CREATE_TOPIC = {
     messagesRequiredToSave,
     sizeOfMessagesRequiredToSave,
     preallocateSegments,
+    replicationFactor,
+    segmentMaxAge = 0n,
+    tieredStorage,
+    localRetentionAge = 0n,
+    localRetentionSize = 0n,
+    topicType,
+    geoMode,
+    freshUploadInterval,
+    consumerOffsetUploadInterval,
+    positionsPublishInterval,
+    tombstoneGrace,
+    positionsResumeTimeout,
+    longTermRewriteMaxInterval,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -120,9 +191,10 @@ export const CREATE_TOPIC = {
 
     // partitions_count rides the command's own fixed field, never the
     // options block: the server rejects it as an unsupported option key.
-    // Server-default sentinels (expiry 0, size 0, compression none) and
-    // unset optionals are omitted so the server resolves them from its own
-    // config and reports them back as derived options.
+    // Server-default sentinels (expiry, segment age and local retention 0,
+    // size 0, compression none) and unset optionals are omitted so the server resolves them from
+    // its own config and reports them back as derived options. A geo topic's
+    // durations have no sentinel, so their `0n` is sent.
     // Caller keys first so a typed field below overwrites one of them.
     const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
@@ -177,6 +249,45 @@ export const CREATE_TOPIC = {
         key: 'preallocate_segments',
         value: HeaderValue.Bool(preallocateSegments)
       });
+    if (replicationFactor !== undefined)
+      options.push({
+        key: 'replication_factor',
+        value: HeaderValue.Uint32(replicationFactor)
+      });
+    if (segmentMaxAge !== 0n)
+      options.push({
+        key: 'segment_max_age', value: HeaderValue.Uint64(segmentMaxAge)
+      });
+    if (tieredStorage !== undefined)
+      options.push({
+        key: 'tiered_storage', value: HeaderValue.Bool(tieredStorage)
+      });
+    if (localRetentionAge !== 0n)
+      options.push({
+        key: 'local_retention_age', value: HeaderValue.Uint64(localRetentionAge)
+      });
+    if (localRetentionSize !== 0n)
+      options.push({
+        key: 'local_retention_size', value: HeaderValue.Uint64(localRetentionSize)
+      });
+    if (topicType !== undefined) {
+      if (!Object.values<string>(TopicType).includes(topicType))
+        throw new Error(`Invalid topic_type: ${topicType}`);
+      options.push({
+        key: 'topic_type', value: HeaderValue.String(topicType)
+      });
+    }
+    if (geoMode !== undefined) {
+      if (!Object.values<string>(GeoMode).includes(geoMode))
+        throw new Error(`Invalid geo_mode: ${geoMode}`);
+      options.push({
+        key: 'geo_mode', value: HeaderValue.String(geoMode)
+      });
+    }
+    options.push(...geoDurationOptions({
+      freshUploadInterval, consumerOffsetUploadInterval, positionsPublishInterval,
+      tombstoneGrace, positionsResumeTimeout, longTermRewriteMaxInterval
+    }));
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
     b.writeUInt8(bName.length, 4);

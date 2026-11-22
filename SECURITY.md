@@ -3,6 +3,9 @@
 Apache Iggy follows the [Apache Software Foundation security process](https://www.apache.org/security/).
 Please read this before reporting anything you believe is a security issue.
 
+The connectors runtime and the connector plugins live in the
+[apache/iggy-connectors](https://github.com/apache/iggy-connectors) repository. This policy covers them too.
+
 ## Reporting a Vulnerability
 
 **Do not report security vulnerabilities through public channels.** That means no GitHub issues, pull

@@ -108,10 +108,27 @@ const PATCH_MASK: u32 = COMPONENT_MAX;
 /// option blocks), adds derived option blocks to stream and user responses and
 /// a flags byte to each `DescribeOptions` descriptor.
 /// Version 0.12.1 replaces `WaitForMessages` (107) with `FetchMessages` (109).
+/// Version 0.12.2 gives each `GetTopic` partition its `members` and
+/// `in_sync_members` node lists, so a partition record is no longer 64 bytes.
+/// Version 0.12.3 adds a required page block to `GetStreams`, `GetTopics`,
+/// `GetConsumerGroups` and `GetUsers`, answers each of them with one page, and
+/// adds `GetPartitions` (404).
 /// Finalize this number and the minimum during stable release preparation.
 /// Released servers using protocol 0.11.0 accept every 0.11.x patch, so an
 /// incompatible release needs a new minor version for those servers to reject it.
-pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 1);
+pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
+
+/// Revision of what replicas send each other, which clients never see.
+///
+/// Peers refuse each other at the replica handshake unless it matches, so bump
+/// it whenever a build stops decoding what another build sends. Revision 1 adds
+/// partition member lists, partition status bodies on metadata probes and
+/// replies, retirement debt on session finalization and the paid-through mark
+/// on session retirement. Revision 2 batches `Commit` and `CommitReply`
+/// frames, one entry per group. Revision 3 retires ended sessions in batches:
+/// retirement reports and session finalization carry a walk watermark instead
+/// of one session and a namespace revision.
+pub const REPLICA_WIRE_REVISION: u32 = 3;
 
 /// Oldest protocol version this build accepts at login.
 ///
@@ -122,8 +139,11 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 1);
 /// Keep this equal to the current protocol unless compatibility with older
 /// released protocols has been verified. Decide the range per stable release.
 ///
-/// Version 0.12.0 clients can send the retired `WaitForMessages` (107) command.
-pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 12, 1);
+/// Version 0.12.0 clients can send the retired `WaitForMessages` (107) command,
+/// 0.12.1 clients read every `GetTopic` partition as a 64-byte record, and
+/// 0.12.2 clients send the list commands without a page block and read each
+/// list whole.
+pub const IGGY_PROTOCOL_VERSION_MIN: u32 = pack_protocol_version(0, 12, 3);
 const _: () =
     assert!(IGGY_PROTOCOL_VERSION_MIN > 0 && IGGY_PROTOCOL_VERSION_MIN <= IGGY_PROTOCOL_VERSION);
 
@@ -270,8 +290,10 @@ mod tests {
         assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 0)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 11, 1)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 0)));
-        assert!(is_protocol_compatible(pack_protocol_version(0, 12, 1)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 1)));
         assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 2)));
+        assert!(is_protocol_compatible(pack_protocol_version(0, 12, 3)));
+        assert!(!is_protocol_compatible(pack_protocol_version(0, 12, 4)));
     }
 
     #[test]
@@ -281,8 +303,8 @@ mod tests {
     }
 
     #[test]
-    fn min_requires_the_fetch_protocol() {
-        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 12, 1));
+    fn min_requires_the_page_block_protocol() {
+        assert_eq!(IGGY_PROTOCOL_VERSION_MIN, pack_protocol_version(0, 12, 3));
     }
 
     #[test]

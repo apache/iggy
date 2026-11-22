@@ -15,16 +15,21 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Swift BDD runner: builds the Swift SDK and the runner, which parses the
-# mounted feature files and runs their scenarios on the SDK. The toolchain
-# matches .github/actions/utils/setup-swift.
-FROM swift:6.4.0
+# The Swift version and Ubuntu release the Linux CI lanes install.
+FROM swift:6.4.0-resolute
 
 WORKDIR /app
+
+# The SDK is a path dependency of the runner, so it keeps its place
+# relative to the runner as in the repository.
 COPY foreign/swift ./foreign/swift
-COPY bdd/swift ./bdd/swift
-COPY bdd/scenarios/deferred_polling.feature ./features/
+COPY bdd/swift/tests/Package.swift bdd/swift/tests/Package.resolved ./bdd/swift/tests/
 
-RUN cd bdd/swift/runner && swift build --product iggy-bdd
+WORKDIR /app/bdd/swift/tests
+RUN swift package resolve
 
-CMD ["/app/bdd/swift/runner/.build/debug/iggy-bdd", "/app/features"]
+COPY bdd/swift/tests/Sources ./Sources
+COPY bdd/scenarios /app/bdd/scenarios
+RUN swift build -Xswiftc -warnings-as-errors
+
+CMD ["swift", "run", "--skip-build", "iggy-bdd"]

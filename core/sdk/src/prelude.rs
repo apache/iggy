@@ -50,13 +50,14 @@ pub use crate::stream_builder::{IggyStream, IggyStreamConfig};
 pub use crate::tcp::tcp_client::TcpClient;
 pub use crate::websocket::websocket_client::WebSocketClient;
 pub use iggy_common::{
-    Aes256GcmEncryptor, Args, ArgsOptional, AutoCommit, AutoLogin, CacheMetrics, CacheMetricsKey,
-    Checkpoint, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode, ClusterNodeRole,
-    ClusterNodeStatus, CommitAfter, CommitEvery, CommitPolicy, CompressionAlgorithm, Consumer,
-    ConsumerGroup, ConsumerGroupDetails, ConsumerGroupMember, ConsumerKind, Credentials,
-    Durability, EncryptorKind, GlobalPermissions, HeaderField, HeaderKey, HeaderKind, HeaderValue,
-    HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind, Identifier, IdentityInfo,
-    IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
+    Aes256GcmEncryptor, Args, ArgsOptional, AutoCommit, AutoLogin, BatchProducer, CacheMetrics,
+    CacheMetricsKey, Checkpoint, ClientError, ClientInfoDetails, ClusterMetadata, ClusterNode,
+    ClusterNodeRole, ClusterNodeStatus, CommitAfter, CommitEvery, CommitPolicy,
+    CompressionAlgorithm, Consumer, ConsumerGroup, ConsumerGroupAssignment, ConsumerGroupDetails,
+    ConsumerGroupMember, ConsumerKind, Credentials, Durability, EncryptorKind, GeoMode,
+    GeoTopicDurations, GlobalPermissions, HeaderField, HeaderFieldMarker, HeaderKey, HeaderKind,
+    HeaderValue, HttpClientConfig, HttpClientConfigBuilder, HttpMethod, IdKind, Identifier,
+    IdentityInfo, IggyByteSize, IggyDuration, IggyError, IggyExpiry, IggyIndexView, IggyMessage,
     IggyMessageHeader, IggyMessageHeaderView, IggyMessageView, IggyMessageViewIterator,
     IggyTimestamp, MaxTopicSize, NonZeroDurationError, NonZeroIggyDuration, OptionKey, OptionSpec,
     OptionValue, OptionsScope, Partition, PartitionContext, PartitionResizePolicy, Partitioner,
@@ -67,7 +68,7 @@ pub use iggy_common::{
     Stream, StreamCreateOptions, StreamDetails, StreamEncryptionKey, StreamEncryptionSource,
     StreamPermissions, StreamUpdateOptions, SystemSnapshotType, TcpClientConfig,
     TcpClientConfigBuilder, TcpClientReconnectionConfig, Topic, TopicCreateOptions, TopicDetails,
-    TopicPermissions, TopicResolvedOptions, TopicUpdateOptions, TransportEndpoints,
+    TopicPermissions, TopicResolvedOptions, TopicType, TopicUpdateOptions, TransportEndpoints,
     TransportProtocol, UndecodedRecord, UserCreateOptions, UserId, UserInfo, UserInfoDetails,
     UserStatus, UserUpdateOptions, Validatable, WebSocketClientConfig,
     WebSocketClientConfigBuilder, WebSocketClientReconnectionConfig, WebSocketConfig, defaults,
@@ -77,6 +78,10 @@ pub use iggy_common::{
     Client, ClusterClient, ConsumerGroupClient, ConsumerOffsetClient, MessageClient,
     PartitionClient, PersonalAccessTokenClient, SegmentClient, StreamClient, SystemClient,
     TopicClient, UserClient,
+};
+pub use iggy_common::{
+    DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT, NamedPageQuery, PAGE_CURSOR_PREFIX, Page, PageCursor,
+    PageOrder, PageQuery,
 };
 pub use iggy_common::{
     DEFAULT_POLL_MAX_BYTES, IGGY_MESSAGE_CHECKSUM_OFFSET_RANGE, IGGY_MESSAGE_HEADER_SIZE,

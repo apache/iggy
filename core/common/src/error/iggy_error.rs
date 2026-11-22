@@ -197,6 +197,42 @@ pub enum IggyError {
     /// No poll progress was applied. Back off without invalidating the partition route.
     #[error("Deferred poll capacity exceeded; retry after backoff on the same replica")]
     DeferredPollCapacityExceeded = 90,
+    /// This client handed out every producer id of its session. Another
+    /// client, or this one after it signs in again, gets new ids.
+    #[error("This client has no producer ids left in its session")]
+    ProducerIdsExhausted = 91,
+    /// The batch does not follow the last batch that the partition holds for
+    /// its producer. Nothing was written.
+    #[error("The producer batch does not follow the last batch of its producer")]
+    ProducerSequenceOutOfOrder = 92,
+    /// A newer epoch of the producer wrote to the partition. Nothing was
+    /// written.
+    #[error("A newer epoch of the producer fenced this batch")]
+    ProducerEpochFenced = 93,
+    /// The partition holds no state for the producer, and the batch does not
+    /// start at sequence 0. Nothing was written. The producer starts a new
+    /// epoch at sequence 0.
+    #[error(
+        "The partition does not know this producer, and the batch does not start at sequence 0"
+    )]
+    ProducerUnknown = 94,
+    /// A batch of an idempotent producer names no partition. Its sequence
+    /// counts per partition, so `Balanced` and a messages key cannot pick one.
+    #[error("A producer batch must name its partition")]
+    ProducerPartitionRequired = 95,
+    /// The object store refused a read of tiered data for a reason that a
+    /// retry does not change: rejected credentials, an archived or missing
+    /// object, a malformed response, or a bucket that another cluster owns.
+    /// Clients must not send the request again.
+    #[error("Tiered data cannot be read from the object store; a retry does not help")]
+    TieredReadFailed = 96,
+    /// The reply frame of `GetClients` or of a metadata read is larger than
+    /// the reply cap of a client, so the server sent this error in its place.
+    /// The metadata reads are those of streams, topics, partitions, consumer
+    /// groups, users, options, stats and cluster metadata. The connection
+    /// stays open. A paged read returns the same data in smaller replies.
+    #[error("The reply is larger than the reply size limit")]
+    ReplyTooLarge = 97,
     #[error("Client with ID: {0} was not found.")]
     ClientNotFound(u32) = 100,
     #[error("Invalid client ID")]
@@ -267,6 +303,8 @@ pub enum IggyError {
     InvalidTopicSize(MaxTopicSize, IggyByteSize) = 1019,
     #[error("Too many streams")]
     TooManyStreams = 1020,
+    #[error("The stream is a shadow of another cluster's stream and takes no writes")]
+    ShadowStreamReadOnly = 1021,
     #[error("Cannot create topics directory for stream with ID: {0}, Path: {1}")]
     CannotCreateTopicsDirectory(Identifier, String) = 2000,
     #[error("Failed to create directory for topic with ID: {0} for stream with ID: {1}, Path: {2}")]

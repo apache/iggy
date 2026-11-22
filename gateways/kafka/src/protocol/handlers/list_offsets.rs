@@ -19,17 +19,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use kafka_protocol::messages::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
 use kafka_protocol::messages::list_offsets_response::{
     ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
 };
 use kafka_protocol::messages::{ListOffsetsRequest, ListOffsetsResponse, TopicName};
-use tokio::time::Instant;
+use tokio::time::{Instant, timeout_at};
 
-use crate::bridge::iggy_bridge::{FetchSlot, LocatedRecord, PartitionProbe, RecordLookup};
+use crate::bridge::iggy_bridge::{FetchClient, LocatedRecord, PartitionProbe, RecordLookup};
 use crate::bridge::{BridgeError, IggyBridge};
 use crate::error::Result;
 use crate::protocol::api::{
@@ -38,7 +38,10 @@ use crate::protocol::api::{
     REQUEST_DEADLINE, UNKNOWN_OFFSET,
 };
 use crate::protocol::bounds_guard::validate_list_offsets_shape;
-use crate::protocol::handlers::fetch::{Spells, sight_first, sight_loading};
+use crate::protocol::handlers::fetch::{
+    Admit, POLL_DEADLINE, POLLS_AT_ONCE, PollKind, PollRecords, Spells, admit, recheck,
+    record_poll, sight_first, sight_loading,
+};
 use crate::protocol::handlers::{decode_guarded, decode_request, encode_message, respond_or_close};
 
 pub const RANGE: ApiVersionRange = ApiVersionRange {
@@ -69,10 +72,6 @@ const EARLIEST_TIMESTAMP: i64 = -2;
 /// the last record appended.
 const MAX_TIMESTAMP: i64 = -3;
 
-/// Most of the request deadline one record lookup may take, so a partition that stalls leaves
-/// time for the rest.
-const LOOKUP_BUDGET: Duration = Duration::from_secs(REQUEST_DEADLINE.as_secs() / 4);
-
 /// [`IggyBridge::partition_probes`]'s return type, spelled once for [`resolve_one_partition`].
 type PartitionProbesResult = core::result::Result<
     Vec<(u32, core::result::Result<PartitionProbe, BridgeError>)>,
@@ -99,7 +98,13 @@ pub async fn handle(state: &GatewayState, api_version: i16, body: Bytes) -> Hand
     // No `timeout_ms` below v10, so the ceiling is fixed. It bounds the sum of the topic calls.
     let deadline = Instant::now() + REQUEST_DEADLINE;
     let resolved = resolve_all_topics(bridge, &state.loading, &req.topics, deadline).await;
-    let topics = locate_records(bridge, &state.unproven_empty, resolved, deadline).await;
+    let lookups = Lookups {
+        bridge,
+        records: &state.poll_records,
+        unproven_empty: &state.unproven_empty,
+        deadline,
+    };
+    let topics = lookups.locate_records(resolved).await;
     let resp = ListOffsetsResponse::default().with_topics(topics);
     respond_or_close(encode_message(&resp, api_version, 256), "ListOffsets")
 }
@@ -391,122 +396,194 @@ fn not_found_response(partition: i32) -> ListOffsetsPartitionResponse {
         .with_offset(UNKNOWN_OFFSET)
 }
 
-/// Answers every partition [`resolve_all_topics`] left pending, one record lookup at a time
-/// on one Fetch read slot, which each lookup reuses.
-///
-/// Looked up one by one rather than at once: a consumer resetting a group by time asks for every
-/// partition in one request, and running those in parallel would take every read slot from the
-/// consumers that are fetching. A lookup that cannot finish within [`LOOKUP_BUDGET`] or by
-/// `deadline` answers [`ERROR_REQUEST_TIMED_OUT`], which the client retries. Repeated entries are
-/// looked up once.
-async fn locate_records(
-    bridge: &Arc<IggyBridge>,
-    unproven_empty: &Mutex<Spells>,
-    topics: Vec<ResolvedTopic>,
+/// What the record lookups of one request share.
+struct Lookups<'a> {
+    bridge: &'a Arc<IggyBridge>,
+    /// What polls of each partition showed. Fetch shares it. See
+    /// [`PollRecord`](super::fetch::PollRecord).
+    records: &'a Arc<Mutex<PollRecords>>,
+    unproven_empty: &'a Mutex<Spells>,
     deadline: Instant,
-) -> Vec<ListOffsetsTopicResponse> {
-    let mut slot = None;
-    let mut answered: HashMap<(TopicName, PendingLookup), ListOffsetsPartitionResponse> =
-        HashMap::new();
-    let mut responses = Vec::with_capacity(topics.len());
-    for topic in topics {
-        let mut partitions = Vec::with_capacity(topic.partitions.len());
-        for partition in topic.partitions {
-            let pending = match partition {
-                PartitionAnswer::Answered(answer) => {
-                    partitions.push(answer);
-                    continue;
-                }
-                PartitionAnswer::Pending(pending) => pending,
-            };
-            let key = (topic.name.clone(), pending);
-            let answer = if let Some(answer) = answered.get(&key) {
-                answer.clone()
-            } else {
-                let answer = locate_one(
-                    bridge,
-                    unproven_empty,
-                    &mut slot,
-                    &topic.name,
-                    pending,
-                    deadline,
-                )
-                .await;
-                answered.insert(key, answer.clone());
-                answer
-            };
-            partitions.push(answer);
-        }
-        responses.push(
-            ListOffsetsTopicResponse::default()
-                .with_name(topic.name)
-                .with_partitions(partitions),
-        );
-    }
-    drop(slot);
-    responses
 }
 
-/// Answers one `pending` lookup, reusing `slot` or taking a new one into it.
-async fn locate_one(
-    bridge: &Arc<IggyBridge>,
-    unproven_empty: &Mutex<Spells>,
-    slot: &mut Option<FetchSlot>,
-    topic: &str,
-    pending: PendingLookup,
-    request_deadline: Instant,
-) -> ListOffsetsPartitionResponse {
-    let PendingLookup {
-        partition_index,
-        partition,
-        lookup,
-        ..
-    } = pending;
-    let deadline = lookup_deadline(Instant::now(), request_deadline);
-    let Some(found) = poll_record(bridge, slot, topic, partition, lookup, deadline).await else {
-        return error_response(partition_index, ERROR_REQUEST_TIMED_OUT);
-    };
-    let last = match (&found, lookup) {
-        (Ok(None), RecordLookup::AppendedAtOrAfter(_)) => {
-            match poll_record(bridge, slot, topic, partition, RecordLookup::Last, deadline).await {
-                Some(last) => Some(last),
-                None => return error_response(partition_index, ERROR_REQUEST_TIMED_OUT),
+/// The read slot's client that the lookups of a request poll with.
+struct LookupSlot {
+    client: FetchClient,
+    /// [`POLL_DEADLINE`] after the request took the slot. No lookup starts after it, and the
+    /// request waits past it only for a partition whose pages took long.
+    lookups_until: Instant,
+}
+
+/// One record poll of a lookup, or `Err` with the code that its partition answers instead.
+type RecordPoll =
+    core::result::Result<core::result::Result<Option<LocatedRecord>, BridgeError>, i16>;
+
+impl Lookups<'_> {
+    /// Answers every partition [`resolve_all_topics`] left pending. The record lookups of a
+    /// request run on one Fetch read slot, [`POLLS_AT_ONCE`] at a time, so a consumer that resets
+    /// a group by time takes no more of the slots that fetching consumers need. Repeated entries
+    /// are looked up once.
+    ///
+    /// A lookup polls as a Fetch read does: a partition that stalls answers 6 with no poll, and a
+    /// poll that gets no answer in its time stalls its partition. See
+    /// [`PollRecord`](super::fetch::PollRecord). Lookups start only in the first
+    /// [`POLL_DEADLINE`] after the request takes its slot, and the request waits no longer for
+    /// them, apart from a partition whose pages took long. So stalled partitions hold the slot for
+    /// about one poll's time, however many stall. A lookup with no answer by then answers
+    /// [`ERROR_REQUEST_TIMED_OUT`], which the client retries.
+    async fn locate_records(&self, topics: Vec<ResolvedTopic>) -> Vec<ListOffsetsTopicResponse> {
+        let mut lookups: Vec<(TopicName, PendingLookup)> = Vec::new();
+        let mut places: HashMap<(TopicName, PendingLookup), usize> = HashMap::new();
+        for topic in &topics {
+            for partition in &topic.partitions {
+                if let PartitionAnswer::Pending(pending) = partition {
+                    let key = (topic.name.clone(), *pending);
+                    places.entry(key.clone()).or_insert_with(|| {
+                        lookups.push(key);
+                        lookups.len() - 1
+                    });
+                }
             }
         }
-        _ => None,
-    };
-    lookup_answer(unproven_empty, topic, pending, found, last.as_ref())
-}
-
-/// One [`IggyBridge::locate_record`] on `slot`, or on a new slot for the first lookup or after a
-/// timed-out poll lost it.
-/// `None` if `deadline` has passed, no slot frees, or no answer comes by `deadline`.
-async fn poll_record(
-    bridge: &Arc<IggyBridge>,
-    slot: &mut Option<FetchSlot>,
-    topic: &str,
-    partition: u32,
-    lookup: RecordLookup,
-    deadline: Instant,
-) -> Option<core::result::Result<Option<LocatedRecord>, BridgeError>> {
-    // A poll started now would time out at once and drop the slot's client.
-    if Instant::now() >= deadline {
-        return None;
+        let mut found = vec![None; lookups.len()];
+        if !lookups.is_empty()
+            && let Some(slot) = self.bridge.fetch_slot(self.deadline).await
+        {
+            let lookup_slot = LookupSlot {
+                client: slot.client(),
+                lookups_until: Instant::now() + POLL_DEADLINE,
+            };
+            let mut waiting = lookups.iter().enumerate();
+            let mut running: FuturesUnordered<_> = waiting
+                .by_ref()
+                .take(POLLS_AT_ONCE)
+                .map(|(place, (topic, pending))| self.located(&lookup_slot, place, topic, *pending))
+                .collect();
+            while let Some((place, answer)) = running.next().await {
+                found[place] = Some(answer);
+                if let Some((place, (topic, pending))) = waiting.next() {
+                    running.push(self.located(&lookup_slot, place, topic, *pending));
+                }
+            }
+        }
+        topics
+            .into_iter()
+            .map(|topic| {
+                let partitions = topic
+                    .partitions
+                    .into_iter()
+                    .map(|partition| match partition {
+                        PartitionAnswer::Answered(answer) => answer,
+                        PartitionAnswer::Pending(pending) => places
+                            .get(&(topic.name.clone(), pending))
+                            .and_then(|&place| found[place].clone())
+                            .unwrap_or_else(|| {
+                                error_response(pending.partition_index, ERROR_REQUEST_TIMED_OUT)
+                            }),
+                    })
+                    .collect();
+                ListOffsetsTopicResponse::default()
+                    .with_name(topic.name)
+                    .with_partitions(partitions)
+            })
+            .collect()
     }
-    if slot.is_none() {
-        // A poll that timed out frees its old slot as it stops, so for a moment the request can
-        // hold two.
-        *slot = bridge.fetch_slot(deadline).await;
-    }
-    let (located, back) = bridge
-        .locate_record(slot.take()?, topic, partition, lookup, deadline)
-        .await?;
-    *slot = Some(back);
-    Some(located)
-}
 
-fn lookup_deadline(now: Instant, request_deadline: Instant) -> Instant {
-    request_deadline.min(now + LOOKUP_BUDGET)
+    /// [`Self::locate_one`], with the place of the lookup in the request.
+    async fn located(
+        &self,
+        slot: &LookupSlot,
+        place: usize,
+        topic: &str,
+        pending: PendingLookup,
+    ) -> (usize, ListOffsetsPartitionResponse) {
+        (place, self.locate_one(slot, topic, pending).await)
+    }
+
+    /// Answers one `pending` lookup, with the client of `slot`.
+    async fn locate_one(
+        &self,
+        slot: &LookupSlot,
+        topic: &str,
+        pending: PendingLookup,
+    ) -> ListOffsetsPartitionResponse {
+        let partition_index = pending.partition_index;
+        let found = match self.poll_record(slot, topic, pending, pending.lookup).await {
+            Ok(found) => found,
+            Err(code) => return error_response(partition_index, code),
+        };
+        let last = match (&found, pending.lookup) {
+            (Ok(None), RecordLookup::AppendedAtOrAfter(_)) => {
+                match self
+                    .poll_record(slot, topic, pending, RecordLookup::Last)
+                    .await
+                {
+                    Ok(last) => Some(last),
+                    Err(code) => return error_response(partition_index, code),
+                }
+            }
+            _ => None,
+        };
+        lookup_answer(self.unproven_empty, topic, pending, found, last.as_ref())
+    }
+
+    /// One [`IggyBridge::locate_record`] of `lookup` in `pending`'s partition. `Err` with 6 while
+    /// the partition stalls, and with 7 if the poll cannot start in time or gets no answer in its
+    /// time.
+    ///
+    /// The poll runs as a task. If the request stops waiting first, the poll goes on, and what it
+    /// shows still counts for its partition.
+    async fn poll_record(
+        &self,
+        slot: &LookupSlot,
+        topic: &str,
+        pending: PendingLookup,
+        lookup: RecordLookup,
+    ) -> RecordPoll {
+        let (partition, asked) = (pending.partition, Instant::now());
+        if asked >= slot.lookups_until || asked >= self.deadline {
+            return Err(ERROR_REQUEST_TIMED_OUT);
+        }
+        let allowance = match admit(self.records, topic, partition, asked) {
+            Admit::Poll(allowance) => allowance,
+            Admit::Stalled { recheck_due } => {
+                if recheck_due {
+                    let end = pending.high_watermark;
+                    recheck(self.bridge, self.records, topic, partition, end);
+                }
+                return Err(ERROR_NOT_LEADER_OR_FOLLOWER);
+            }
+        };
+        let full = asked + allowance;
+        let deadline = full.min(self.deadline);
+        let (bridge, records) = (Arc::clone(self.bridge), Arc::clone(self.records));
+        let (client, topic) = (slot.client.clone(), topic.to_owned());
+        let poll = tokio::spawn(async move {
+            let located = bridge
+                .locate_record(&client, &topic, partition, lookup, deadline)
+                .await;
+            let now = Instant::now();
+            let answered = match &located {
+                // The request ran out of time first, which proves nothing about the partition.
+                Err(BridgeError::Timeout) if deadline < full => return None,
+                Err(BridgeError::Timeout) => None,
+                _ => Some(now.saturating_duration_since(asked)),
+            };
+            let poll = PollKind::Read;
+            record_poll(&records, &topic, partition, poll, asked, answered, now);
+            Some(located)
+        });
+        // A partition whose pages took long keeps its own time, so its record still comes.
+        let wait_until = if allowance > POLL_DEADLINE {
+            deadline
+        } else {
+            deadline.min(slot.lookups_until)
+        };
+        match timeout_at(wait_until, poll).await {
+            Ok(Ok(Some(located))) if !matches!(located, Err(BridgeError::Timeout)) => Ok(located),
+            _ => Err(ERROR_REQUEST_TIMED_OUT),
+        }
+    }
 }
 
 /// The answer to one `pending` lookup, from what it `found` and, after an empty
@@ -683,6 +760,8 @@ fn stub_partition_response(partition: i32, error_code: i16) -> ListOffsetsPartit
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use iggy::prelude::IggyError;
 
     use crate::protocol::api::ERROR_NONE;
@@ -1152,20 +1231,8 @@ mod tests {
         assert_eq!(resp.error_code, ERROR_NOT_LEADER_OR_FOLLOWER);
     }
 
-    #[test]
-    fn each_lookup_gets_its_own_budget_within_the_request_deadline() {
-        let now = Instant::now();
-        assert_eq!(
-            lookup_deadline(now, now + REQUEST_DEADLINE),
-            now + LOOKUP_BUDGET
-        );
-        assert!(LOOKUP_BUDGET < REQUEST_DEADLINE);
-        let near = now + LOOKUP_BUDGET / 2;
-        assert_eq!(lookup_deadline(now, near), near);
-    }
-
-    #[tokio::test]
-    async fn a_lookup_past_its_deadline_answers_retriable_without_using_a_read_slot() {
+    /// A bridge whose read slots hold a client that never dialed, so a test needs no server.
+    async fn offline_bridge() -> Arc<IggyBridge> {
         let bridge = Arc::new(IggyBridge::offline());
         let client = Arc::new(
             iggy::prelude::IggyClientBuilder::new()
@@ -1175,35 +1242,51 @@ mod tests {
                 .expect("building a client dials nothing"),
         );
         bridge.hold_fetch_clients(&client).await;
-        let held = bridge.held_fetch_clients().await;
-        let later = Instant::now() + Duration::from_secs(5);
-        let mut slot = bridge.fetch_slot(later).await;
-        assert!(slot.is_some());
-        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
-        for lookup in [time, RecordLookup::Last] {
-            let passed = Instant::now();
-            let resp = locate_one(
-                &bridge,
-                &Mutex::default(),
-                &mut slot,
-                "orders",
-                pending(lookup, 42, 42),
-                passed,
-            )
-            .await;
-            assert_eq!(resp.error_code, ERROR_REQUEST_TIMED_OUT, "{lookup:?}");
-            assert!(slot.is_some(), "{lookup:?} kept its slot");
-        }
-        drop(slot);
+        bridge
+    }
 
-        let passed = Instant::now();
-        let topics = vec![ResolvedTopic {
+    fn orders(pending: PendingLookup) -> Vec<ResolvedTopic> {
+        vec![ResolvedTopic {
             name: TopicName(kafka_protocol::protocol::StrBytes::from_static_str(
                 "orders",
             )),
-            partitions: vec![PartitionAnswer::Pending(pending(time, 42, 42))],
-        }];
-        let responses = locate_records(&bridge, &Mutex::default(), topics, passed).await;
+            partitions: vec![PartitionAnswer::Pending(pending)],
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_cannot_start_in_time_answers_retriable_and_keeps_the_slot_client() {
+        let bridge = offline_bridge().await;
+        let held = bridge.held_fetch_clients().await;
+        let records = Arc::default();
+        let lookups = Lookups {
+            bridge: &bridge,
+            records: &records,
+            unproven_empty: &Mutex::default(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let slot = bridge
+            .fetch_slot(lookups.deadline)
+            .await
+            .expect("a free slot");
+        let late = LookupSlot {
+            client: slot.client(),
+            lookups_until: Instant::now(),
+        };
+        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
+        for lookup in [time, RecordLookup::Last] {
+            let resp = lookups
+                .locate_one(&late, "orders", pending(lookup, 42, 42))
+                .await;
+            assert_eq!(resp.error_code, ERROR_REQUEST_TIMED_OUT, "{lookup:?}");
+        }
+        drop(slot);
+
+        let passed = Lookups {
+            deadline: Instant::now(),
+            ..lookups
+        };
+        let responses = passed.locate_records(orders(pending(time, 42, 42))).await;
         assert_eq!(
             responses[0].partitions[0].error_code,
             ERROR_REQUEST_TIMED_OUT
@@ -1212,6 +1295,36 @@ mod tests {
             bridge.held_fetch_clients().await,
             held,
             "every slot kept its client"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lookup_of_a_stalled_partition_answers_6_with_no_poll() {
+        let bridge = offline_bridge().await;
+        let records: Arc<Mutex<PollRecords>> = Arc::default();
+        let asked = Instant::now();
+        // Missed just now, so its re-check is not due yet and no poll goes out.
+        record_poll(&records, "orders", 3, PollKind::Read, asked, None, asked);
+        let lookups = Lookups {
+            bridge: &bridge,
+            records: &records,
+            unproven_empty: &Mutex::default(),
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        let time = RecordLookup::AppendedAtOrAfter(REQUESTED_MILLIS);
+        for lookup in [time, RecordLookup::Last] {
+            let responses = lookups
+                .locate_records(orders(pending(lookup, 42, 42)))
+                .await;
+            assert_eq!(
+                responses[0].partitions[0].error_code, ERROR_NOT_LEADER_OR_FOLLOWER,
+                "{lookup:?}"
+            );
+        }
+        assert_eq!(
+            admit(&records, "orders", 3, Instant::now()),
+            Admit::Stalled { recheck_due: false },
+            "no lookup ended the stall"
         );
     }
 

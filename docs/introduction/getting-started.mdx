@@ -1,0 +1,175 @@
+---
+title: Getting started (Rust)
+description: "A first program with the low-level Rust SDK: create a stream and topic, send messages, then poll them back."
+---
+
+## Before we start
+
+Apache Iggy 0.10.0 skips memory binding on a single-NUMA-node topology. The older Docker Desktop workaround is no longer required for that case. Use `IGGY_SHARDING_CPU_ALLOCATION=all` when you explicitly want CPU pinning without NUMA memory binding.
+
+This tutorial uses the **low-level Rust SDK** to show how things work under the hood - creating streams, topics, sending and polling messages step by step. This is great for understanding the fundamentals.
+
+For real-world applications, you might typically prefer the **[high-level SDK](/docs/sdk/rust/high-level-sdk)**, which provides `IggyProducer` and `IggyConsumer` builders with auto-batching, consumer groups, offset management, reconnection, and retry logic out of the box. Check the [Stream Builder](/docs/sdk/rust/stream-builder) docs for the most ergonomic API.
+
+For examples in other programming languages, see the [SDK section](/docs/sdk/introduction).
+
+## What we will build
+
+We will build a **producer** (publishing messages to a stream) and a **consumer** (reading those messages back). In a real system, a service can be both at the same time - publishing its own events while consuming events from other services.
+
+The completed sample can be found in the [repository](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/getting-started). We will go through the implementation step by step so you get a clear understanding of how it all fits together.
+
+## Starting the Iggy server
+
+For our purpose, we will focus on the basic scenario in order to keep things simple. Before we begin implementing the consumer and producer apps, we need to start the Iggy streaming server.
+
+This guide targets server **0.10.0**. Use its [official Docker image](https://hub.docker.com/r/apache/iggy):
+
+```bash
+docker run --rm \
+  --cap-add=SYS_NICE --security-opt seccomp=unconfined --ulimit memlock=-1:-1 \
+  -p 8090:8090 \
+  -e IGGY_TCP_ADDRESS=0.0.0.0:8090 \
+  -e IGGY_NODE_ADVERTISED_ADDRESS=localhost \
+  -e IGGY_ROOT_USERNAME=iggy -e IGGY_ROOT_PASSWORD=iggy \
+  apache/iggy:0.10.0
+```
+
+The container needs a host kernel of 5.19 or newer, because the server uses `io_uring`. See [System requirements](/docs/server/introduction#system-requirements) if it fails to start. The capabilities, seccomp setting, and memlock limit form a permissive development setup. Production deployments can use narrower syscall permissions and a finite memory budget. See [Docker & Helm](/docs/server/docker#why-these-capabilities) for the details. `IGGY_TCP_ADDRESS` is needed because the server binds to `127.0.0.1` inside the container by default, which a published port cannot reach. `IGGY_NODE_ADVERTISED_ADDRESS` is needed because that wildcard leaves the server with no address to give clients, and it refuses to start rather than publish one nobody can dial. Here the port is published to the host, so `localhost` is that address. Setting the root credentials explicitly means the username and password used later in this guide will work.
+
+Alternatively, build from source by cloning the [repository](https://github.com/apache/iggy) and running:
+
+```bash
+cargo run --bin iggy-server -- --fresh --with-default-root-credentials
+```
+
+A bare `iggy-server` boot does **not** create the root user with the well-known `iggy`/`iggy` pair. A fresh standalone server refuses to start without credentials. A cluster replica without credentials waits for root to be replicated. The `--with-default-root-credentials` flag switches to the development credentials (username: `iggy`, password: `iggy`), and `--fresh` wipes the data directory first, so the root user is created anew with them. You can also set `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` yourself. The environment **takes precedence** over the flag. The credentials initialize the stored root account **only on first creation**. Changing them on a later boot does not reset its password. Supplied environment credentials are still validated on restarts.
+
+All the data used by the server will be persisted under the `local_data` directory, unless specified differently in the configuration.
+
+As long as the Iggy server is running, we're good to go. If you'd like to play with the configuration (e.g. change the addresses, ports, caching or so) you will find `config.toml` under `core/server` in the repository.
+
+## Setting up the project
+
+Create a Rust application with two binaries:
+
+```bash
+cargo new iggy-sample
+cd iggy-sample
+cargo add iggy@0.12.0
+cargo add tokio --features macros,rt-multi-thread,time
+mkdir -p src/bin
+```
+
+Save the producer in `src/bin/producer.rs` and the consumer in `src/bin/consumer.rs`. The programs use resource names, so they do not depend on the IDs assigned to other streams.
+
+## Building the producer
+
+The producer connects, creates missing resources and sends ten messages to partition zero. Resource creation returns errors for existing names, which this example handles separately from other failures.
+
+```rust
+use iggy::prelude::*;
+use std::str::FromStr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = IggyClient::from_connection_string("iggy://iggy:iggy@127.0.0.1:8090")?;
+    client.connect().await?;
+    let stream = Identifier::named("sample-stream")?;
+    let topic = Identifier::named("sample-topic")?;
+
+    match client.create_stream("sample-stream", &StreamCreateOptions::default()).await {
+        Ok(_) | Err(IggyError::StreamNameAlreadyExists(_)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    match client.create_topic(&stream, "sample-topic", &TopicCreateOptions {
+        partitions_count: Some(1),
+        message_expiry: Some(IggyExpiry::NeverExpire),
+        ..TopicCreateOptions::default()
+    }).await {
+        Ok(_) | Err(IggyError::TopicNameAlreadyExists(_, _)) => {}
+        Err(error) => return Err(error.into()),
+    }
+
+    let mut messages = (1..=10)
+        .map(|i| IggyMessage::from_str(&format!("message-{i}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let response = client.send_messages(
+        &stream, &topic, &Partitioning::partition_id(0), &mut messages,
+    ).await?;
+    for confirmation in response.confirmations {
+        println!("Partition {}, base offset {}", confirmation.partition_id, confirmation.base_offset);
+    }
+    client.shutdown().await?;
+    Ok(())
+}
+```
+
+`StreamCreateOptions` configures stream creation. `TopicCreateOptions` selects partitions, retention and storage policies. Omitted optional fields use server defaults. The default message durability is `replicated`. Select `Durability::Persisted` when successful sends must wait for stable storage. See [Topic options](/docs/server/topic-options).
+
+A topic's first partition is zero. `Partitioning::partition_id(0)` selects it explicitly. `balanced()` distributes batches across partitions, and `messages_key()` selects a partition from a key. Ordering applies within a partition.
+
+## Building the consumer
+
+The consumer starts after its stored offset. It waits up to five seconds for messages and processes the returned batch before storing its checkpoint. An empty reply ends this example.
+
+```rust
+use iggy::prelude::*;
+use std::str::FromStr;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = IggyClient::from_connection_string("iggy://iggy:iggy@127.0.0.1:8090")?;
+    client.connect().await?;
+    let stream = Identifier::named("sample-stream")?;
+    let topic = Identifier::named("sample-topic")?;
+    let consumer = Consumer::default();
+    let mut strategy = PollingStrategy::next();
+    let options = PollOptions {
+        count: 10,
+        ..PollOptions::wait(IggyDuration::from_str("5s")?)
+    };
+
+    loop {
+        let batch = client.poll_messages(
+            &stream, &topic, 0, &consumer, &strategy, options,
+        ).await?;
+        if batch.messages.is_empty() {
+            break;
+        }
+        for message in &batch.messages {
+            println!("Offset {}: {}", message.header.offset, std::str::from_utf8(&message.payload)?);
+        }
+        if let Some(checkpoint) = batch.checkpoint() {
+            client.store_consumer_position(&consumer, &stream, &topic, &checkpoint).await?;
+        }
+        strategy = batch.continuation();
+    }
+    client.shutdown().await?;
+    Ok(())
+}
+```
+
+A continuation carries the next position and the partition history that produced it. Do not advance an offset by the number of returned messages because offsets can contain gaps. A checkpoint stores progress under that history. If the partition is recreated, the server refuses a stale checkpoint.
+
+A standalone consumer does not join a group. Two applications using its same identity can change the same stored offset. Use a consumer group to assign partitions among service instances. The [high-level consumer](/docs/sdk/rust/high-level-sdk#consumer) manages those assignments and grouped fetches.
+
+## Run the applications
+
+Run the producer first:
+
+```bash
+cargo run --bin producer
+```
+
+Then run the consumer:
+
+```bash
+cargo run --bin consumer
+```
+
+The consumer prints the messages and stores its progress. Running it again waits and exits if no new messages exist. Running the producer again appends ten more messages. A processing failure before checkpoint storage can cause replay on the next run, so application side effects must tolerate retries.
+
+## Next steps
+
+Use [deferred polling](/docs/sdk/deferred-polling) to tune wait and batch limits. Use the [high-level SDK](/docs/sdk/rust/high-level-sdk) for producers and group consumers. The [examples](/docs/sdk/rust/examples) cover headers, serialization, TLS and stream builders.

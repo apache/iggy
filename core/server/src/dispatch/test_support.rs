@@ -565,6 +565,7 @@ pub fn create_partitions_in(mux_stm: &TestMux, count: u32) -> Vec<IggyNamespace>
                         initial_view: 0,
                         partition_id,
                         consensus_group_id: FIRST_PARTITION_GROUP + u64::from(partition_id),
+                        members: Vec::new(),
                     })
                     .collect(),
             }
@@ -674,6 +675,7 @@ pub fn recreate_topic_in(mux_stm: &TestMux, namespace: IggyNamespace) {
                 partition_id: namespace.partition_id().try_into().unwrap(),
                 consensus_group_id: 2,
                 initial_view: 0,
+                members: Vec::new(),
             }],
         }
         .to_bytes(),

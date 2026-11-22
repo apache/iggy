@@ -23,6 +23,7 @@ use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
 };
 use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+use crate::stm::shadow::{ShadowStream, ShadowTopicRequest};
 use crate::stm::stream::Streams;
 use crate::stm::user::{
     CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES,
@@ -110,6 +111,36 @@ fn given_created_stream_when_applying_should_record_its_identity_and_public_opti
             options: read_projection(OptionsScope::Stream, &stream.options),
         })]
     );
+}
+
+#[test]
+fn given_a_shadow_stream_when_created_should_record_its_origin_as_a_derived_option() {
+    let harness = Harness::new();
+    let committed = harness.commit(
+        SERVER,
+        Operation::ShadowTopic,
+        &ShadowTopicRequest::CreateStream {
+            source: ShadowStream {
+                origin: "dc-a".to_owned(),
+                cluster_uid: 0x0a0a,
+                stream_id: 7,
+            },
+            name: name("__shadow_dc-a_orders"),
+        },
+    );
+
+    let changes = decoded(&committed);
+    let [WireMetadataChange::StreamCreated(body)] = changes.as_slice() else {
+        panic!("one stream created: {changes:?}");
+    };
+    let WireChangeOptions::Readable { derived, .. } = &body.options else {
+        panic!("readable options: {:?}", body.options);
+    };
+    let origin = derived
+        .iter()
+        .find(|entry| entry.key == b"shadow_origin")
+        .expect("the origin is reported");
+    assert_eq!(origin.value, b"dc-a");
 }
 
 #[test]
@@ -1482,6 +1513,9 @@ fn given_state_when_paging_one_item_at_a_time_should_equal_one_page_in_group_and
     );
     let session = harness.register(CLIENT_A, ALICE);
     harness.join(CLIENT_A, session);
+    // A second member makes the walk continue inside the group of its cursor.
+    let second = harness.register(CLIENT_B, ALICE);
+    harness.join(CLIENT_B, second);
     harness.commit(
         ROOT_CALLER,
         Operation::CreatePersonalAccessToken,
@@ -1506,10 +1540,10 @@ fn given_state_when_paging_one_item_at_a_time_should_equal_one_page_in_group_and
     assert_eq!(count(WireMetadataChangeGroup::Topics), 1);
     assert_eq!(count(WireMetadataChangeGroup::Partitions), 1);
     assert_eq!(count(WireMetadataChangeGroup::ConsumerGroups), 2);
-    assert_eq!(count(WireMetadataChangeGroup::ConsumerGroupMembers), 1);
+    assert_eq!(count(WireMetadataChangeGroup::ConsumerGroupMembers), 2);
     assert_eq!(count(WireMetadataChangeGroup::Users), 2);
     assert_eq!(count(WireMetadataChangeGroup::PersonalAccessTokens), 1);
-    assert_eq!(count(WireMetadataChangeGroup::Sessions), 2);
+    assert_eq!(count(WireMetadataChangeGroup::Sessions), 3);
 }
 
 #[test]
@@ -2127,6 +2161,7 @@ fn assignments(count: u32, first_group: u64) -> Vec<CreatedPartitionAssignment> 
             partition_id,
             consensus_group_id: first_group + u64::from(partition_id),
             initial_view: 0,
+            members: Vec::new(),
         })
         .collect()
 }

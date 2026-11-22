@@ -51,6 +51,7 @@ pub struct IggyProducerBuilder {
     topic_durability: Durability,
     partitioning: Option<Partitioning>,
     mode: SendMode,
+    idempotent: bool,
 }
 
 impl IggyProducerBuilder {
@@ -80,6 +81,7 @@ impl IggyProducerBuilder {
             topic_max_size: MaxTopicSize::ServerDefault,
             topic_durability: Durability::default(),
             mode: SendMode::default(),
+            idempotent: false,
         }
     }
 
@@ -191,6 +193,33 @@ impl IggyProducerBuilder {
         }
     }
 
+    /// Turns on the idempotent mode. Each chunk carries this producer's id, an
+    /// epoch and the sequence of its first message, and a partition writes it
+    /// once, also when the producer sends it again from a new session.
+    ///
+    /// The producer gets its id from [`next_producer_id`] during
+    /// [`init()`](IggyProducer::init), so it needs a binary client. It picks the
+    /// partition of a chunk itself, and it sends the chunks of one partition one
+    /// at a time. Released builds of this SDK, of every client that embeds it
+    /// and of the Swift SDK cannot poll the batches that it writes, so upgrade
+    /// every consumer of the topic first. See [`IggyProducer`].
+    ///
+    /// [`next_producer_id`]: iggy_common::MessageClient::next_producer_id
+    pub fn idempotent(self) -> Self {
+        Self {
+            idempotent: true,
+            ..self
+        }
+    }
+
+    /// Turns off the idempotent mode, the default.
+    pub fn without_idempotence(self) -> Self {
+        Self {
+            idempotent: false,
+            ..self
+        }
+    }
+
     /// Sets the producer to use direct message sending.
     /// This mode sends from the calling task without buffering between calls.
     /// `DirectConfig::linger_time` can delay a call before its requests are sent.
@@ -223,6 +252,7 @@ impl IggyProducerBuilder {
             self.topic_max_size,
             self.topic_durability,
             self.mode,
+            self.idempotent,
         )
     }
 }

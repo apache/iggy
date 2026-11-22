@@ -170,6 +170,30 @@ public final class IggyTcpClientBuilder {
     }
 
     /**
+     * Sets how long a close waits for new tasks before it stops the event loop group that the client created for
+     * itself, see {@link AsyncIggyTcpClientBuilder#shutdownQuietPeriod(Duration)}.
+     *
+     * @param shutdownQuietPeriod the quiet period, zero or more
+     * @return this builder
+     */
+    public IggyTcpClientBuilder shutdownQuietPeriod(Duration shutdownQuietPeriod) {
+        asyncBuilder.shutdownQuietPeriod(shutdownQuietPeriod);
+        return this;
+    }
+
+    /**
+     * Sets the longest time that a close waits for the event loop group that the client created for itself to
+     * stop, see {@link AsyncIggyTcpClientBuilder#shutdownTimeout(Duration)}.
+     *
+     * @param shutdownTimeout the shutdown timeout, zero or more
+     * @return this builder
+     */
+    public IggyTcpClientBuilder shutdownTimeout(Duration shutdownTimeout) {
+        asyncBuilder.shutdownTimeout(shutdownTimeout);
+        return this;
+    }
+
+    /**
      * Enables or disables TLS for the TCP connection.
      *
      * @param enableTls whether to enable TLS

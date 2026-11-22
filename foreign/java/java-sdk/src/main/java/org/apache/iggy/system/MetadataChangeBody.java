@@ -22,6 +22,7 @@ package org.apache.iggy.system;
 import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.stream.EncryptionKeySource;
 import org.apache.iggy.stream.EncryptionProjection;
+import org.apache.iggy.stream.ShadowProjection;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserStatus;
 
@@ -240,6 +241,11 @@ public sealed interface MetadataChangeBody {
         /** Fingerprint of the stream's key, empty for a plaintext stream. */
         public Optional<String> encryptionKeyFingerprint() {
             return EncryptionProjection.keyFingerprint(options, derivedOptions);
+        }
+
+        /** The geo origin whose topics this shadow stream serves, empty for any other stream. */
+        public Optional<String> shadowOrigin() {
+            return ShadowProjection.origin(options, derivedOptions);
         }
     }
 

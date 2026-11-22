@@ -168,7 +168,7 @@ func TestDecodeReplyFor_RejectsAFrameAboveTheTransportLimit(t *testing.T) {
 }
 
 func TestDecodeReplyFor_RejectsAnUndeclaredReplyOperation(t *testing.T) {
-	for _, operation := range []Operation{4, 63, 129, 133, 142, 151, 163, 255} {
+	for _, operation := range []Operation{4, 63, 129, 133, 142, 152, 163, 255} {
 		request, reply := exchange(OperationNonReplicated, 0, 0)
 		reply[replyOffsetOperation] = byte(operation)
 
@@ -400,6 +400,7 @@ func TestDecodeReplyFor_ResolvedUpdate(t *testing.T) {
 				"checksum":  func(reply *[HeaderSize]byte) { reply[replyOffsetChecksum] ^= 1 },
 				"operation": func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationCreateTopicWithAssignments) },
 				"rewrap":    func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationRewrapStreamKeys) },
+				"shadow":    func(reply *[HeaderSize]byte) { reply[replyOffsetOperation] = byte(OperationShadowTopic) },
 			} {
 				unrelated := *header
 				mismatch(&unrelated)
@@ -411,6 +412,7 @@ func TestDecodeReplyFor_ResolvedUpdate(t *testing.T) {
 			assert.False(t, ReplyOperationMatches(OperationCreateStream, resolved))
 		}
 		assert.False(t, ReplyOperationMatches(OperationUpdateResource, OperationRewrapStreamKeys))
+		assert.False(t, ReplyOperationMatches(OperationUpdateResource, OperationShadowTopic))
 	})
 }
 

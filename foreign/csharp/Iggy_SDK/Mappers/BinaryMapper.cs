@@ -32,6 +32,9 @@ using Apache.Iggy.Vsr;
 
 namespace Apache.Iggy.Mappers;
 
+/// <summary>Reads one item of a list page at <paramref name="position" /> and returns the bytes it took.</summary>
+internal delegate (T Item, int ReadBytes) PageItemReader<T>(ReadOnlySpan<byte> payload, int position);
+
 internal static partial class BinaryMapper
 {
     private const int CONSUMER_GROUP_HEADER_SIZE = 13;
@@ -40,6 +43,8 @@ internal static partial class BinaryMapper
     private const int CACHE_METRICS_ENTRY_SIZE = 32;
     private const int OPEN_FILES_FIELDS_SIZE = 8 + 8;
     private const int MIN_TOPIC_SIZE = 33 + 4 + 4;
+    private const int PARTITION_COUNTERS_SIZE = 40 + PartitionContext.ENCODED_SIZE;
+    private const int MIN_PARTITION_SIZE = PARTITION_COUNTERS_SIZE + 1 + 1;
     private const int MIN_OPTION_SPEC_SIZE = 1 + 1 + 1 + 4 + 4;
     private const int CLUSTER_NODE_TAIL_SIZE = 4 * 2 + 1 + 1;
     private const int MIN_CLUSTER_NODE_SIZE = 1 + 4 + 4 + CLUSTER_NODE_TAIL_SIZE;
@@ -86,26 +91,6 @@ internal static partial class BinaryMapper
             }, readBytes);
     }
 
-    internal static IReadOnlyList<UserResponse> MapUsers(ReadOnlySpan<byte> payload)
-    {
-        if (payload.Length == 0)
-        {
-            return Array.Empty<UserResponse>();
-        }
-
-        var result = new List<UserResponse>();
-        var length = payload.Length;
-        var position = 0;
-        while (position < length)
-        {
-            var (response, readBytes) = MapToUserResponse(payload, position);
-            result.Add(response);
-            position += readBytes;
-        }
-
-        return result.AsReadOnly();
-    }
-
     internal static UserResponse MapUser(ReadOnlySpan<byte> payload)
     {
         var (response, position) = MapToUserResponse(payload, 0);
@@ -139,7 +124,7 @@ internal static partial class BinaryMapper
         };
     }
 
-    private static (UserResponse response, int position) MapToUserResponse(ReadOnlySpan<byte> payload, int position)
+    internal static (UserResponse response, int position) MapToUserResponse(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
@@ -285,8 +270,22 @@ internal static partial class BinaryMapper
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(span[4..12]);
         var messagesCount = BinaryPrimitives.ReadUInt32LittleEndian(span[12..16]);
         var context = MapPartitionContext(span[16..]);
-        return MapRentedRecords(payload[DeferredPollOptions.POLL_REPLY_HEADER_SIZE..], payloadOwner, partitionId,
-            currentOffset, messagesCount, context, encryptor);
+        // The header decoded, so a caller that needs only the context of the reply can still take it.
+        try
+        {
+            return MapRentedRecords(payload[DeferredPollOptions.POLL_REPLY_HEADER_SIZE..], payloadOwner, partitionId,
+                currentOffset, messagesCount, context, encryptor);
+        }
+        catch (MalformedResponseException error)
+        {
+            error.Context = context;
+            throw;
+        }
+        catch (MessageDecryptionException error)
+        {
+            error.Context = context;
+            throw;
+        }
     }
 
     /// <summary>
@@ -547,7 +546,8 @@ internal static partial class BinaryMapper
             PartitionId = rental.PartitionId,
             Context = rental.Context,
             CurrentOffset = rental.CurrentOffset,
-            Messages = messages
+            Messages = messages,
+            RequestStart = rental.RequestStart
         };
     }
 
@@ -867,20 +867,54 @@ internal static partial class BinaryMapper
         return bytes;
     }
 
-    internal static IReadOnlyList<StreamResponse> MapStreams(ReadOnlySpan<byte> payload)
+    /// <summary>
+    ///     Maps the reply of a list command: <c>[next_len:u8][next][count:u32][item]*</c>. A body that is short of
+    ///     its count of items, or that has bytes after them, is malformed.
+    /// </summary>
+    /// <remarks>
+    ///     The item readers index the payload without bounds checks, so an argument or index fault inside an item is a
+    ///     malformed reply. The next cursor keeps its bytes as they came, because only the server reads them.
+    /// </remarks>
+    internal static Page<T> MapPage<T>(ReadOnlySpan<byte> payload, PageItemReader<T> readItem)
     {
-        List<StreamResponse> streams = new();
-        var length = payload.Length;
-        var position = 0;
-
-        while (position < length)
+        if (payload.Length < 1 || payload.Length - 1 - payload[0] < sizeof(uint))
         {
-            var (stream, readBytes) = MapToStream(payload, position);
-            streams.Add(stream);
-            position += readBytes;
+            throw new MalformedResponseException(
+                $"Malformed page: {payload.Length} bytes cannot hold its next cursor and item count.");
         }
 
-        return streams.AsReadOnly();
+        var nextLength = payload[0];
+        var position = 1 + nextLength;
+        var count = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..]);
+        position += sizeof(uint);
+
+        // A server never sends more than MAX_LIMIT items, so a larger count does not size the allocation.
+        var items = new List<T>((int)Math.Min(count, PageQuery.MAX_LIMIT));
+        try
+        {
+            for (var index = 0u; index < count; index++)
+            {
+                var (item, readBytes) = readItem(payload, position);
+                items.Add(item);
+                position += readBytes;
+            }
+        }
+        catch (Exception error) when (error is ArgumentException or IndexOutOfRangeException)
+        {
+            throw new MalformedResponseException($"Malformed page: item {items.Count} of {count} does not decode.");
+        }
+
+        if (position != payload.Length)
+        {
+            throw new MalformedResponseException(
+                $"Malformed page: its {count} items end at byte {position} of {payload.Length}.");
+        }
+
+        return new Page<T>
+        {
+            Items = items,
+            Next = nextLength == 0 ? null : PageCursor.FromBytes(payload.Slice(1, nextLength))
+        };
     }
 
     /// <summary>
@@ -951,7 +985,7 @@ internal static partial class BinaryMapper
         };
     }
 
-    private static (StreamResponse stream, int readBytes) MapToStream(ReadOnlySpan<byte> payload, int position)
+    internal static (StreamResponse stream, int readBytes) MapToStream(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
@@ -981,30 +1015,14 @@ internal static partial class BinaryMapper
             }, readBytes);
     }
 
-    internal static IReadOnlyList<TopicResponse> MapTopics(ReadOnlySpan<byte> payload)
-    {
-        var topicsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[..4]);
-        var position = 4;
-        List<TopicResponse> topics = new(ValidatedCollectionSize(topicsCount, payload.Length - position,
-            MIN_TOPIC_SIZE, "Topics count"));
-
-        for (var i = 0; i < topicsCount; i++)
-        {
-            var (topic, readBytes) = MapToTopic(payload, position);
-            topics.Add(topic);
-            position += readBytes;
-        }
-
-        return topics.AsReadOnly();
-    }
-
     internal static TopicResponse MapTopic(ReadOnlySpan<byte> payload)
     {
         var (topic, position) = MapToTopic(payload, 0);
-        List<PartitionResponse> partitions = new();
-        var length = payload.Length;
+        var partitionsCount = ValidatedCollectionSize(topic.PartitionsCount, payload.Length - position,
+            MIN_PARTITION_SIZE, "Partitions count");
+        List<PartitionResponse> partitions = new(partitionsCount);
 
-        while (position < length)
+        for (var i = 0; i < partitionsCount; i++)
         {
             var (partition, readBytes) = MapToPartition(payload, position);
             partitions.Add(partition);
@@ -1025,7 +1043,7 @@ internal static partial class BinaryMapper
         };
     }
 
-    private static (TopicResponse topic, int readBytes) MapToTopic(ReadOnlySpan<byte> payload, int position)
+    internal static (TopicResponse topic, int readBytes) MapToTopic(ReadOnlySpan<byte> payload, int position)
     {
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
@@ -1054,43 +1072,59 @@ internal static partial class BinaryMapper
             }, readBytes);
     }
 
-    private static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
+    internal static (PartitionResponse partition, int readBytes) MapToPartition(ReadOnlySpan<byte>
         payload, int position)
     {
+        if (payload.Length - position < MIN_PARTITION_SIZE)
+        {
+            throw new MalformedResponseException($"Partition at byte {position} is truncated.");
+        }
+
         var id = BinaryPrimitives.ReadUInt32LittleEndian(payload[position..(position + 4)]);
         var createdAt = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 4)..(position + 12)]);
         var segmentsCount = BinaryPrimitives.ReadUInt32LittleEndian(payload[(position + 12)..(position + 16)]);
         var currentOffset = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 16)..(position + 24)]);
         var sizeBytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 24)..(position + 32)]);
         var messagesCount = BinaryPrimitives.ReadUInt64LittleEndian(payload[(position + 32)..(position + 40)]);
-        var readBytes = 40 + PartitionContext.ENCODED_SIZE;
+        var context = MapPartitionContext(payload[(position + 40)..]);
+        var end = position + PARTITION_COUNTERS_SIZE;
+        var members = ReadNodeIds(payload, ref end, "Partition members");
+        var inSyncMembers = ReadNodeIds(payload, ref end, "Partition in-sync members");
 
         return (
             new PartitionResponse
             {
-                Context = MapPartitionContext(payload[(position + 40)..]),
+                Context = context,
                 Id = id,
                 SegmentsCount = segmentsCount,
                 CurrentOffset = currentOffset,
                 Size = sizeBytes,
                 CreatedAt = DateTimeOffsetUtils.FromUnixTimeMicroSeconds(createdAt).LocalDateTime,
-                MessagesCount = messagesCount
-            }, readBytes);
+                MessagesCount = messagesCount,
+                Members = members,
+                InSyncMembers = inSyncMembers
+            }, end - position);
     }
 
-    internal static List<ConsumerGroupResponse> MapConsumerGroups(ReadOnlySpan<byte> payload)
+    private static byte[] ReadNodeIds(ReadOnlySpan<byte> payload, ref int position, string field)
     {
-        List<ConsumerGroupResponse> consumerGroups = new();
-        var length = payload.Length;
-        var position = 0;
-        while (position < length)
+        if (position >= payload.Length)
         {
-            var (consumerGroup, readBytes) = MapToConsumerGroup(payload, position);
-            consumerGroups.Add(consumerGroup);
-            position += readBytes;
+            throw new MalformedResponseException($"{field} count at byte {position} is missing.");
         }
 
-        return consumerGroups;
+        var count = payload[position];
+        position += 1;
+        var remaining = payload.Length - position;
+        if (count > remaining)
+        {
+            throw new MalformedResponseException(
+                $"{field} count {count} exceeds remaining payload of {remaining} bytes.");
+        }
+
+        var nodeIds = payload.Slice(position, count).ToArray();
+        position += count;
+        return nodeIds;
     }
 
     internal static StatsResponse MapStats(ReadOnlySpan<byte> payload)
@@ -1265,7 +1299,7 @@ internal static partial class BinaryMapper
             (int)readBytes);
     }
 
-    private static (ConsumerGroupResponse consumerGroup, int readBytes) MapToConsumerGroup(ReadOnlySpan<byte> payload,
+    internal static (ConsumerGroupResponse consumerGroup, int readBytes) MapToConsumerGroup(ReadOnlySpan<byte> payload,
         int position)
     {
         if (position + CONSUMER_GROUP_HEADER_SIZE > payload.Length)

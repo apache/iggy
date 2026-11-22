@@ -240,7 +240,7 @@ impl CommitGate {
 }
 
 /// One partition of a readiness wait, resolved and authorized by the origin.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ReadinessTarget {
     pub namespace: IggyNamespace,
     pub partition_id: u32,
@@ -336,6 +336,8 @@ struct PartitionStatus {
     /// A fault, a read history that changes, a state transfer, or a status
     /// other than normal.
     unstable: bool,
+    /// The view start is applied and the view is persisted. The quorum check
+    /// that bounds the reads of a cut-off primary waits for that write.
     view_started: bool,
     primary: bool,
     /// The incarnation that the owner of the partition serves.
@@ -356,7 +358,7 @@ impl PartitionStatus {
                 || partition.requires_state_transfer()
                 || !consensus.is_normal()
                 || consensus.is_transferring(),
-            view_started: consensus.applied_view_start(),
+            view_started: consensus.applied_view_start() && !consensus.needs_superblock_persist(),
             primary: consensus.is_primary(),
             incarnation,
         }
@@ -373,6 +375,10 @@ impl PartitionStatus {
         consumer: PollingConsumer,
         owner: impl FnOnce(u64) -> Option<ConsumerGroupOwner>,
     ) -> Result<bool, IggyError> {
+        // A reused namespace may still hold the old partition until reconciliation.
+        if !metadata.matches_partition(self.incarnation) {
+            return Err(IggyError::TransientNotAccepted);
+        }
         if self.deleted {
             return Err(IggyError::HistoryUnavailable);
         }
@@ -394,10 +400,7 @@ impl PartitionStatus {
             }
             PollingConsumer::Consumer(..) => true,
         };
-        if self.unstable
-            || (primary && (!self.view_started || !self.primary))
-            || !metadata.matches_partition(self.incarnation)
-        {
+        if self.unstable || (primary && (!self.view_started || !self.primary)) {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(installed)
@@ -640,9 +643,39 @@ struct Mirror {
     used: u64,
     /// When this shard applied the last push.
     pushed: u64,
+    /// The pushes that this shard applied, so that a wait tells whether one
+    /// came after it started.
+    pushes: u64,
     /// The owner took the news that this shard holds a parked wait on the
     /// partition, so its commits come as pushes.
     interest: bool,
+    /// A wait found this mirror behind its partition without a parked wait
+    /// to refresh it, so the pushes go on while waits name the mirror.
+    held: bool,
+}
+
+/// What a mirror received since a wait read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorSince {
+    /// No push.
+    Unchanged,
+    /// A push, and the owner pushes each commit here, so the mirror is as
+    /// current as one that a parked wait refreshed.
+    Current,
+    /// A push that ended the pushes, because it found no parked wait.
+    Pushed,
+}
+
+/// How a wait evaluates a target that another shard owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MirrorUse {
+    /// The owner evaluates it.
+    Owner,
+    /// The mirror evaluates it, and the owner pushes each commit here.
+    Current,
+    /// The mirror evaluates it from its last push, the `pushes`-th, which can
+    /// miss newer records.
+    Snapshot { pushes: u64 },
 }
 
 impl Mirror {
@@ -1216,6 +1249,17 @@ where
         Ok(visibility)
     }
 
+    /// Whether the partition's peer log dropped or replaced a segment that
+    /// `result` walked, see [`partitions::IggyPartition::peer_log_moved_under_read`].
+    fn peer_log_moved_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.peer_log_moved_under_read(result)
+            })
+            .unwrap_or(false)
+    }
+
     fn offset_stored_since(
         &self,
         namespace: IggyNamespace,
@@ -1263,6 +1307,9 @@ where
         let admission = (|| {
             request.options.validate(request.args.count)?;
             let (history, _, view) = self.validate_deferred_context(namespace, &request)?;
+            if let Some(error) = self.geo_position_refusal(namespace, request.consumer) {
+                return Err(error);
+            }
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
@@ -1452,7 +1499,7 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::too_many_lines, clippy::future_not_send)]
     async fn probe_deferred_poll(&self, id: u64, mut waiter: Waiter) {
         let refused_at = self.deferred_polls.take_read_place(id, &mut waiter);
         if waiter.reply.is_disconnected() {
@@ -1505,10 +1552,15 @@ where
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         }
-        let Some(plan) = self.plane.partitions().build_poll_snapshot(
+        let max_selected_bytes = reply_byte_limit(
+            &waiter.request.options,
+            self.deferred_polls.config.borrow().max_read_bytes,
+        );
+        let Some(plan) = self.plane.partitions().build_poll_snapshot_within(
             &waiter.namespace,
             waiter.request.consumer,
             &waiter.request.args,
+            max_selected_bytes,
         ) else {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;
@@ -1519,15 +1571,16 @@ where
             self.accept_deferred_result(id, waiter, result).await;
             return;
         }
+        let Ok(cold) = self.poll_completions.admit(plan.reads_remote()) else {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        };
+        let plan = plan.with_deadline(std::time::Instant::now() + crate::COLD_POLL_BUDGET);
         let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place, read_bytes) else {
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         };
         let max_bytes = walk_bytes(reservation.bytes);
-        let max_selected_bytes = reply_byte_limit(
-            &waiter.request.options,
-            self.deferred_polls.config.borrow().max_read_bytes,
-        );
         let completion =
             match self
                 .poll_completions
@@ -1547,7 +1600,9 @@ where
             .waiters
             .insert(id, waiter);
         self.bus.spawn(async move {
-            completion.complete(plan.execute_with_limit(max_bytes, max_selected_bytes).await);
+            let result = plan.execute_with_limit(max_bytes, max_selected_bytes).await;
+            drop(cold);
+            completion.complete(result);
         });
     }
 
@@ -1576,6 +1631,12 @@ where
                 return;
             }
         };
+        // Whatever the read found in the store, a trim or a merge in the
+        // peer log it covers makes the retry plan from the new log.
+        if self.peer_log_moved_under_read(waiter.namespace, &result) {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        }
         let result = match result.checked() {
             Ok(result) => result,
             Err(error) => {
@@ -2282,7 +2343,7 @@ where
                         .entry(mirror.owner)
                         .or_default()
                         .push((namespace, mirror.seq));
-                } else if parked && !mirror.interest {
+                } else if (parked || mirror.held) && !mirror.interest {
                     // An owner whose inbox refused the news hears it again.
                     interested.push(namespace);
                 }
@@ -2370,12 +2431,13 @@ where
                 // the next wait can still read the mirror.
                 mirror.state = update.state;
                 mirror.pushed = now;
+                mirror.pushes = mirror.pushes.wrapping_add(1);
                 let parked = state.partitions.contains_key(&update.namespace);
                 if mirror.unused(now) && !parked {
                     unused.push((update.namespace, update.seq));
                     continue;
                 }
-                if !parked && mirror.interest {
+                if !parked && mirror.interest && !mirror.held {
                     idle.push(update.namespace);
                 }
                 signals.mark(update.namespace);
@@ -2467,27 +2529,84 @@ where
         }
     }
 
-    /// Whether this shard evaluates `target` against its mirror. A mirror
-    /// that finds an error in the partition, or that lags the install of a
-    /// group owner, sends the target to the owner, so that no wait gets a
-    /// stale error from a mirror.
-    pub(crate) fn mirror_serves(
+    /// How this shard evaluates `target` of `owner`. A mirror that finds an
+    /// error in the partition, or that lags the install of a group owner,
+    /// sends the target to the owner, so that no wait gets a stale error from
+    /// a mirror.
+    pub(crate) fn mirror_use(
         &self,
         owner: u16,
         target: &ReadinessTarget,
         primary: bool,
         now: u64,
-    ) -> bool {
+    ) -> MirrorUse {
         let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
         let Some(mirror) = mirrors.entries.get_mut(&target.namespace) else {
-            return false;
+            return MirrorUse::Owner;
         };
         mirror.used = now;
-        mirror.owner == owner
+        let serves = mirror.owner == owner
             && mirror
                 .state
                 .as_ref()
-                .is_some_and(|state| matches!(state.check(primary, target), Ok(true)))
+                .is_some_and(|state| matches!(state.check(primary, target), Ok(true)));
+        if !serves {
+            MirrorUse::Owner
+        } else if mirror.interest {
+            MirrorUse::Current
+        } else {
+            MirrorUse::Snapshot {
+                pushes: mirror.pushes,
+            }
+        }
+    }
+
+    /// How the mirror of `namespace` changed since a wait read it after its
+    /// `pushes`-th push.
+    pub(crate) fn mirror_since(&self, namespace: IggyNamespace, pushes: u64) -> MirrorSince {
+        match self.deferred_polls.mirrors.borrow().entries.get(&namespace) {
+            Some(mirror) if mirror.pushes == pushes => MirrorSince::Unchanged,
+            Some(mirror) if mirror.interest => MirrorSince::Current,
+            Some(_) => MirrorSince::Pushed,
+            None => MirrorSince::Unchanged,
+        }
+    }
+
+    /// `target` as its mirror finds it now, if it holds messages. A wait reads
+    /// a mirror this way after the pushes that came while it waited, which no
+    /// evaluation of the wait saw.
+    pub(crate) fn mirror_ready(
+        &self,
+        primary: bool,
+        target: &ReadinessTarget,
+    ) -> Option<ReadyTarget>
+    where
+        M: StreamsFrontend,
+    {
+        let readiness = self.evaluate_readiness(primary, target).ok()?;
+        (readiness.available > 0).then_some(ReadyTarget {
+            partition_id: target.partition_id,
+            available: readiness.available,
+            known_bytes: None,
+        })
+    }
+
+    /// Asks the owners of the mirrors of `namespaces` to push each commit
+    /// here until no wait names the mirror, so the next waits on them need
+    /// no second evaluation.
+    pub(crate) fn hold_mirrors(&self, namespaces: Vec<IggyNamespace>)
+    where
+        M: StreamsFrontend,
+    {
+        {
+            let mut mirrors = self.deferred_polls.mirrors.borrow_mut();
+            for namespace in &namespaces {
+                if let Some(mirror) = mirrors.entries.get_mut(namespace) {
+                    mirror.held = true;
+                }
+            }
+        }
+        self.tell_mirror_owners(namespaces, true);
     }
 
     /// Mirrors `namespaces` under `seq`, after `owner` took the frame that
@@ -2508,11 +2627,14 @@ where
                 state: None,
                 used: now,
                 pushed: now,
+                pushes: 0,
                 interest: false,
+                held: false,
             });
             // A new owner holds no news of this shard's parked waits.
             if mirror.owner != owner {
                 mirror.interest = false;
+                mirror.held = false;
             }
             mirror.owner = owner;
             mirror.seq = seq;

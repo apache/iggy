@@ -50,6 +50,15 @@ You must run your code locally before submitting.
 Did you have `prek` installed? It runs automatically on commit and covers all project languages. See [CONTRIBUTING.md](https://github.com/apache/iggy/blob/master/CONTRIBUTING.md).
 -->
 
+## Docs
+
+- Updated `docs/` / no user-facing change
+
+<!--
+A user-facing change, for example a new config key, CLI argument or SDK method, updates `docs/` in the same PR. The connectors docs live in apache/iggy-connectors.
+See https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#docs
+-->
+
 ## AI Usage
 
 <!--
@@ -58,6 +67,9 @@ If AI tools were used, please answer:
 2. Scope of usage? (e.g., autocomplete, generated functions, entire implementation)
 3. How did you verify the generated code works correctly?
 4. Can you explain every line of the code if asked?
+
+Maintainers can close agent-driven PRs without a code review.
+See https://github.com/apache/iggy/blob/master/CONTRIBUTING.md#agent-driven-prs
 
 If no AI tools were used, write "None" or delete this section.
 -->

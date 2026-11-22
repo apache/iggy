@@ -77,6 +77,9 @@ pub struct Packet {
     pub message: Message<GenericHeader>,
     /// Tick at which this packet becomes deliverable.
     pub ready_at: u64,
+    /// Send order. With [`PacketSimulatorOptions::ordered`], each link
+    /// delivers in this order.
+    pub seq: u64,
 }
 
 impl Clone for Packet {
@@ -86,6 +89,7 @@ impl Clone for Packet {
             to: self.to,
             message: self.message.deep_copy(),
             ready_at: self.ready_at,
+            seq: self.seq,
         }
     }
 }
@@ -131,6 +135,10 @@ pub struct PacketSimulatorOptions {
     pub client_count: u8,
     /// PRNG seed for deterministic behavior.
     pub seed: u64,
+    /// Deliver each link in send order, `one_way_delay_min` ticks plus the
+    /// link's extra delay after the send, and never evict: one TCP connection
+    /// on an idle network. `one_way_delay_mean` and `link_capacity` do not apply.
+    pub ordered: bool,
 }
 
 impl Default for PacketSimulatorOptions {
@@ -152,6 +160,7 @@ impl Default for PacketSimulatorOptions {
             node_count: 1,
             client_count: 0,
             seed: 0,
+            ordered: false,
         }
     }
 }
@@ -212,6 +221,20 @@ impl PacketSimulatorOptions {
             ..Self::default()
         }
     }
+}
+
+/// The oldest packet once it is ready, so a later packet never passes an
+/// earlier one, even when the link delay changes between the two sends.
+fn remove_oldest_ready(packets: &mut ReadyQueue<Packet>, tick: u64) -> Option<Packet> {
+    let (index, oldest) = packets
+        .as_slice()
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, packet)| packet.seq)?;
+    if oldest.ready_at > tick {
+        return None;
+    }
+    Some(packets.remove_at(index))
 }
 
 /// Uniform draw over an enum's variants.
@@ -337,11 +360,13 @@ pub struct PacketSimulator {
     /// protocol it exercised, which is the difference between covering a path and
     /// merely compiling it.
     command_counts: [u64; COMMAND_COUNT_MAX],
+    /// [`Packet::seq`] of the next submitted packet.
+    next_seq: u64,
 }
 
 /// One past the highest [`Command`] discriminant, sizing [`COMMAND_LABELS`] and
 /// the delivery counters. Raising it is part of adding a command.
-pub const COMMAND_COUNT_MAX: usize = 35;
+pub const COMMAND_COUNT_MAX: usize = 37;
 
 /// Names for each [`Command`] discriminant, so a coverage report reads as
 /// protocol rather than as integers. Indexed by discriminant; the trailing
@@ -382,6 +407,8 @@ pub const COMMAND_LABELS: [&str; COMMAND_COUNT_MAX] = [
     "ForwardCompletion",
     "PrimaryRebalance",
     "SegmentDelete",
+    "CommitReply",
+    "PrepareProgress",
 ];
 
 const _: () = {
@@ -475,6 +502,7 @@ impl PacketSimulator {
             auto_partition_nodes: (0..node_count).collect(),
             delivered: Vec::new(),
             command_counts: [0; COMMAND_COUNT_MAX],
+            next_seq: 0,
         }
     }
 
@@ -531,11 +559,15 @@ impl PacketSimulator {
     ///
     /// Always enqueues the packet. Loss and replay checks happen at delivery
     /// time in `step()`. If the link is at capacity, a random existing packet
-    /// is evicted to make room.
+    /// is evicted to make room, unless the network is ordered.
     pub fn submit(&mut self, from: ProcessId, to: ProcessId, message: Message<GenericHeader>) {
         let idx = self.link_index(from, to);
-        let delay = Self::calculate_delay(&mut self.prng, &self.options)
-            .saturating_add(self.links[idx].extra_delay);
+        let delay = if self.options.ordered {
+            self.options.one_way_delay_min
+        } else {
+            Self::calculate_delay(&mut self.prng, &self.options)
+        }
+        .saturating_add(self.links[idx].extra_delay);
         let ready_at = self.current_tick.saturating_add(delay);
 
         let packet = Packet {
@@ -543,10 +575,14 @@ impl PacketSimulator {
             to,
             message,
             ready_at,
+            seq: self.next_seq,
         };
+        self.next_seq += 1;
 
         // If at capacity, evict a random existing packet
-        if self.links[idx].packets.len() >= self.options.link_capacity as usize {
+        if !self.options.ordered
+            && self.links[idx].packets.len() >= self.options.link_capacity as usize
+        {
             self.links[idx].packets.remove_random(&mut self.prng);
             tracing::trace!(?from, ?to, "evicted random packet (link at capacity)");
         }
@@ -718,7 +754,12 @@ impl PacketSimulator {
                 }
 
                 loop {
-                    let Some(packet) = link.packets.remove_ready(prng, *current_tick) else {
+                    let next = if options.ordered {
+                        remove_oldest_ready(&mut link.packets, *current_tick)
+                    } else {
+                        link.packets.remove_ready(prng, *current_tick)
+                    };
+                    let Some(packet) = next else {
                         break;
                     };
 

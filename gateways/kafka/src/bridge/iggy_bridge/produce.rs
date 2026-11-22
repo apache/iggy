@@ -21,28 +21,29 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures::future::join_all;
-use iggy::prelude::{IggyClient, IggyError, IggyMessage, MessageClient, Partitioning};
+use iggy::prelude::{
+    BatchProducer, IggyClient, IggyError, IggyMessage, MessageClient, Partitioning,
+};
 use iggy_common::{binary_operation_deadline, with_binary_deadline};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::{Instant, MissedTickBehavior, interval, sleep_until, timeout, timeout_at};
 
 use super::fetch::LazyClient;
-use super::{IggyBridge, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker};
+use super::{
+    IggyBridge, SDK_STOP_ROOM, SLOT_LIMIT, TopicTarget, in_slot, permit_by, resolve_blocker,
+};
 use crate::bridge::config::{IggyBridgeConfig, ProduceSessionLimits};
 use crate::bridge::error::BridgeError;
+use crate::observability::ProduceSessionCensus;
 
 /// Frame bytes besides the messages: request header, batch header and ids.
 const SEND_FRAME_ROOM: u64 = 4 * 1024;
-
-/// How much sooner than its request the SDK stops a send. The SDK's own answer then tells whether
-/// the send went out, before the request gives up on it with 7.
-const SDK_STOP_ROOM: Duration = Duration::from_millis(50);
 
 /// Sessions that connect and sign in at once. A sign-in costs Iggy a password hash on a shard
 /// thread, so a burst of new producers must not start them all together.
@@ -68,6 +69,16 @@ pub enum Producer {
     Id { id: i64, user: Option<String> },
     /// The Kafka connection, for a producer without such an id.
     Connection(u64),
+}
+
+/// The messages of one partition, sent to Iggy in one request.
+#[derive(Debug)]
+pub struct PartitionBatch {
+    /// Passes through unchanged: Kafka and Iggy both count partitions from 0.
+    pub partition: u32,
+    /// The id, epoch and first sequence of an idempotent Kafka producer.
+    pub producer: Option<BatchProducer>,
+    pub messages: Vec<IggyMessage>,
 }
 
 /// One Iggy client. One request holds its turn at a time, so the sends on it reach Iggy in order.
@@ -111,6 +122,8 @@ pub(super) struct ProducePool {
     opens: Arc<Semaphore>,
     /// Whether the log already says that the pool filled up.
     full_logged: AtomicBool,
+    /// Sends whose outcome is unknown. See [`IggyBridge::sends_in_doubt`].
+    in_doubt: AtomicU64,
 }
 
 /// Every producer's seat, and how many of them have a session of their own.
@@ -134,6 +147,17 @@ impl ProducePool {
             limits,
             opens: Arc::new(Semaphore::new(SESSION_OPENS)),
             full_logged: AtomicBool::new(false),
+            in_doubt: AtomicU64::new(0),
+        }
+    }
+
+    /// How the producers sit in the pool now.
+    fn census(&self) -> ProduceSessionCensus {
+        let seats = self.seats.lock().unwrap_or_else(PoisonError::into_inner);
+        ProduceSessionCensus {
+            own: seats.own,
+            limit: self.limits.max,
+            shared: seats.held.len() - seats.own,
         }
     }
 
@@ -351,6 +375,13 @@ impl IggyBridge {
         self.config.max_message_size.saturating_sub(SEND_FRAME_ROOM)
     }
 
+    /// Whether a batch of an idempotent Kafka producer carries its producer to Iggy. See
+    /// [`IggyBridgeConfig::idempotent_producers`](crate::bridge::IggyBridgeConfig::idempotent_producers).
+    #[must_use]
+    pub const fn writes_producers(&self) -> bool {
+        self.config.idempotent_producers
+    }
+
     /// The turn of `producer` on its session. `None` if it does not free by `deadline`: an
     /// earlier request of the producer, or a send that outlived one, still holds it.
     ///
@@ -370,11 +401,27 @@ impl IggyBridge {
         self.produce_pool.forget(&Producer::Connection(connection));
     }
 
-    /// Appends `messages` to `partition` of `target` on the session of `turn`, and returns the
+    /// How the producers sit on the Produce sessions now.
+    #[must_use]
+    pub fn produce_sessions(&self) -> ProduceSessionCensus {
+        self.produce_pool.census()
+    }
+
+    /// Sends since the bridge connected whose outcome is unknown: the send went out, and its
+    /// answer did not come back by the deadline or the connection broke. The client got
+    /// `REQUEST_TIMED_OUT`, and the records may have landed.
+    #[must_use]
+    pub fn sends_in_doubt(&self) -> u64 {
+        self.produce_pool.in_doubt.load(Ordering::Relaxed)
+    }
+
+    /// Appends `batch` to its partition of `target` on the session of `turn`, and returns the
     /// base offset. Hands `turn` and `kept` back with it.
     ///
-    /// `partition` passes through unchanged: both systems count from 0. The server rejects a
-    /// partition the topic lacks, so no round trip checks first.
+    /// With a producer, the batch carries the Kafka producer's id, epoch and first sequence, and
+    /// the partition writes it once. A resend of a batch it holds answers the first offset.
+    ///
+    /// The server rejects a partition the topic lacks, so no round trip checks first.
     ///
     /// `Ok(None)`: committed, but the server named no offset (a duplicate request, or a journal
     /// entry that is gone). Do not retry it.
@@ -384,9 +431,9 @@ impl IggyBridge {
     ///
     /// A send still running at `deadline` keeps `turn` and `kept`, and hands back `None` for
     /// them. So the producer's later requests answer 7 meanwhile and cannot overtake it, and what
-    /// `kept` reserves for `messages` stays reserved. Other producers send on.
+    /// `kept` reserves for the messages stays reserved. Other producers send on.
     ///
-    /// Such a send drops `messages` and `kept` when it ends, at `SLOT_LIMIT` at the latest. Cut
+    /// Such a send drops the messages and `kept` when it ends, at `SLOT_LIMIT` at the latest. Cut
     /// off there, it keeps `turn` until its connection is closed.
     ///
     /// # Errors
@@ -401,10 +448,14 @@ impl IggyBridge {
         turn: ProduceTurn,
         kept: K,
         target: &TopicTarget,
-        partition: u32,
-        mut messages: Vec<IggyMessage>,
+        batch: PartitionBatch,
         deadline: Instant,
     ) -> (Result<Option<u64>, BridgeError>, Option<(ProduceTurn, K)>) {
+        let PartitionBatch {
+            partition,
+            producer,
+            mut messages,
+        } = batch;
         let session = Arc::clone(&turn.seat.session);
         let connect = self.produce_pool.client_of(&session, &self.config);
         let client = match timeout_at(deadline, connect).await {
@@ -431,10 +482,30 @@ impl IggyBridge {
                 async move {
                     let partitioning = Partitioning::partition_id(partition);
                     loop {
-                        match client
-                            .send_messages(&stream_id, &topic_id, &partitioning, &mut messages)
-                            .await
-                        {
+                        let sent = match producer {
+                            Some(producer) => {
+                                client
+                                    .send_producer_messages(
+                                        &stream_id,
+                                        &topic_id,
+                                        partition,
+                                        producer,
+                                        &mut messages,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                client
+                                    .send_messages(
+                                        &stream_id,
+                                        &topic_id,
+                                        &partitioning,
+                                        &mut messages,
+                                    )
+                                    .await
+                            }
+                        };
+                        match sent {
                             Err(IggyError::LaneBlocked(operation)) => {
                                 resolve_blocker(&client, operation, sdk_deadline.into_std())
                                     .await?;
@@ -449,7 +520,11 @@ impl IggyBridge {
         };
         // The SDK cannot cancel a send. One that outlives this call keeps the turn in its task,
         // so the next one waits for it here instead of queueing its batch inside the SDK.
-        let Some(((response, kept), turn)) = in_slot(turn, deadline, send).await else {
+        let finished = in_slot(turn, deadline, send).await;
+        if may_have_landed(finished.as_ref().map(|((response, _), _)| response)) {
+            self.produce_pool.in_doubt.fetch_add(1, Ordering::Relaxed);
+        }
+        let Some(((response, kept), turn)) = finished else {
             return (Err(BridgeError::Timeout), None);
         };
         let base_offset = response.map(|response| {
@@ -495,6 +570,17 @@ const fn send_error(error: IggyError) -> BridgeError {
         }
         error => BridgeError::Iggy(error),
     }
+}
+
+/// Whether a send can have landed although its caller gets an error: it still ran when the
+/// caller gave up (`None`), or it went out and its answer was lost.
+fn may_have_landed<T>(sent: Option<&Result<T, BridgeError>>) -> bool {
+    sent.is_none_or(|response| {
+        matches!(
+            response,
+            Err(BridgeError::SendLost(_) | BridgeError::Iggy(IggyError::OperationUncertain(_)))
+        )
+    })
 }
 
 #[cfg(test)]
@@ -595,8 +681,11 @@ mod tests {
                     .expect("a free turn"),
                 7,
                 &target,
-                0,
-                Vec::new(),
+                PartitionBatch {
+                    partition: 0,
+                    producer: None,
+                    messages: Vec::new(),
+                },
                 Instant::now(),
             )
             .await;
@@ -607,6 +696,71 @@ mod tests {
         assert!(
             matches!(held, Some((_, 7))),
             "nothing runs, so nothing is kept"
+        );
+        assert_eq!(
+            bridge.sends_in_doubt(),
+            0,
+            "a send that never left is not in doubt"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_send_refused_before_it_left_should_not_count_it_in_doubt() {
+        let bridge = IggyBridge::offline();
+        with_client(&bridge.produce_pool.take(id(1)).session).await;
+        let target = bridge.topic_target("orders").expect("a valid topic");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let batch = PartitionBatch {
+            partition: 0,
+            producer: None,
+            messages: Vec::new(),
+        };
+
+        let (sent, _) = bridge
+            .send_records(
+                bridge
+                    .produce_turn(id(1), deadline)
+                    .await
+                    .expect("a free turn"),
+                7,
+                &target,
+                batch,
+                deadline,
+            )
+            .await;
+        assert!(sent.is_err(), "the client never dialed");
+        assert_eq!(bridge.sends_in_doubt(), 0);
+    }
+
+    /// The SDK stops a send 50 ms before its caller does, so only a send that overruns the SDK's
+    /// own deadline is still running when the caller gives up.
+    #[test]
+    fn given_a_send_still_running_at_its_deadline_should_count_it_in_doubt() {
+        assert!(may_have_landed::<u64>(None), "it can still land");
+        assert!(may_have_landed::<u64>(Some(&Err(BridgeError::SendLost(
+            IggyError::Disconnected
+        )))));
+        assert!(may_have_landed::<u64>(Some(&Err(BridgeError::Iggy(
+            IggyError::OperationUncertain(1)
+        )))));
+        assert!(!may_have_landed(Some(&Ok(7_u64))));
+        assert!(
+            !may_have_landed::<u64>(Some(&Err(BridgeError::Iggy(IggyError::NotConnected)))),
+            "a send that never went out cannot land"
+        );
+    }
+
+    #[tokio::test]
+    async fn given_a_full_pool_when_taking_a_census_should_count_own_and_shared_producers() {
+        let pool = pool_of(1);
+        let _own = pool.take(id(1));
+        let _shared = (pool.take(id(2)), pool.take(id(3)));
+
+        let census = pool.census();
+        assert_eq!(
+            (census.own, census.limit, census.shared),
+            (1, 1, 2),
+            "{census:?}"
         );
     }
 

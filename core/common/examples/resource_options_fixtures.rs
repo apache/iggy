@@ -21,7 +21,7 @@ mod schema;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use iggy_binary_protocol::requests::system::DescribeOptionsRequest;
-use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicHeader};
+use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::DescribeOptionsResponse;
 use iggy_binary_protocol::responses::topics::GetTopicResponse;
 use iggy_binary_protocol::responses::users::{UserDetailsResponse, UserResponse};
@@ -30,18 +30,20 @@ use iggy_common::wire_conversions::{resource_options_from_wire, resource_options
 use iggy_common::{
     CATALOG, Durability, HeaderKey, HeaderValue, OptionColumns, OptionKey, OptionStorage,
     OptionValue, OptionVisibility, OptionsScope, ResourceOptions, StreamDetails,
-    StreamEncryptionKey, StreamEncryptionSource, TopicDetails, UserInfoDetails, UserStatus,
-    descriptors_for, public_options, stream_key_fingerprint,
+    StreamEncryptionKey, StreamEncryptionSource, TopicCreateOptions, TopicDetails, TopicType,
+    UserInfoDetails, UserStatus, derived_defaults, descriptors_for, public_options,
+    stream_key_fingerprint,
 };
 use schema::{
     CANONICAL_PATH, CatalogRow, CreateStreamInput, CreateStreamVector, CreateTopicInput,
     CreateTopicVector, CreateUserInput, CreateUserVector, DescribeOptionsVector, DescribedOption,
-    ErrorExpectation, GENERATOR, HttpUpdateVector, IdentifierInput, InvalidKeyVector, KeyInput,
-    LANGUAGE_COPIES, PatchInput, ResourceOptionsFixture, SCHEMA_VERSION, SCOPES, StreamKeyState,
-    StreamKeyVectors, StreamProjection, StreamResponseVector, TargetInput, TopicProjection,
-    TopicResponseVector, UpdateResourceErrorVector, UpdateResourceVector, UserProjection,
-    UserResponseVector, WireConstants, admit_create, admit_update, contains_bytes,
-    describe_options_response, evaluate_http_update, update_resource_request,
+    ErrorExpectation, GENERATOR, GeoDurationsInput, HttpUpdateVector, IdentifierInput,
+    InvalidKeyVector, KeyInput, LANGUAGE_COPIES, PatchInput, ResourceOptionsFixture,
+    SCHEMA_VERSION, SCOPES, StreamKeyState, StreamKeyVectors, StreamProjection,
+    StreamResponseVector, TargetInput, TopicProjection, TopicResponseVector,
+    UpdateResourceErrorVector, UpdateResourceVector, UserProjection, UserResponseVector,
+    WireConstants, admit_create, admit_update, contains_bytes, describe_options_response,
+    evaluate_http_update, update_resource_request,
 };
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -56,6 +58,19 @@ const CREATED_AT_MICROS: u64 = 1_710_000_000_000_000;
 const SEVEN_DAYS_MICROS: &str = "604800000000";
 const ONE_DAY_MICROS: &str = "86400000000";
 const ABOVE_2_POW_53: u64 = (1 << 53) + 1;
+
+/// Every duration of a geo topic. The zero `consumer_offset_upload_interval`
+/// is a value, which an encoder must send rather than drop as a default.
+fn geo_durations() -> GeoDurationsInput {
+    GeoDurationsInput {
+        fresh_upload_interval: Some("50000".to_owned()),
+        consumer_offset_upload_interval: Some("0".to_owned()),
+        positions_publish_interval: Some("2000000".to_owned()),
+        tombstone_grace: Some("3600000000".to_owned()),
+        positions_resume_timeout: Some("30000000".to_owned()),
+        long_term_rewrite_max_interval: Some("20000000".to_owned()),
+    }
+}
 
 type GeneratorResult<T> = Result<T, Box<dyn Error>>;
 
@@ -147,7 +162,7 @@ fn describe_options_vectors() -> GeneratorResult<Vec<DescribeOptionsVector>> {
     SCOPES
         .into_iter()
         .map(|scope| {
-            let bytes = describe_options_response(scope)?.to_bytes();
+            let bytes = describe_options_response(scope, &[])?.to_bytes();
             let entries = DescribeOptionsResponse::decode_from(&bytes)?
                 .entries
                 .iter()
@@ -270,6 +285,15 @@ fn update_resource_vectors() -> GeneratorResult<Vec<UpdateResourceVector>> {
             numeric_topic.clone(),
             PatchInput {
                 reset: vec![OptionKey::MaxTopicSize, OptionKey::MessageExpiry],
+                ..PatchInput::default()
+            },
+        ),
+        (
+            "topic_set_geo_durations",
+            OptionsScope::Topic,
+            numeric_topic.clone(),
+            PatchInput {
+                geo_durations: geo_durations(),
                 ..PatchInput::default()
             },
         ),
@@ -521,32 +545,60 @@ fn create_stream_vectors() -> GeneratorResult<Vec<CreateStreamVector>> {
 }
 
 fn create_topic_vectors() -> GeneratorResult<Vec<CreateTopicVector>> {
-    let input = CreateTopicInput {
-        stream_id: IdentifierInput::Numeric(1),
-        name: "events".to_owned(),
-        partitions_count: 3,
-        compression_algorithm: Some("gzip".to_owned()),
-        message_expiry: Some(SEVEN_DAYS_MICROS.to_owned()),
-        max_topic_size: Some(ABOVE_2_POW_53.to_string()),
-        segment_size: Some((128u64 * 1024 * 1024).to_string()),
-        durability: Durability::Persisted,
-        consumer_offset_durability: Durability::Replicated,
-    };
-    let request = input.request()?;
-    let columns = OptionColumns {
-        name: Some(input.name.clone()),
-        ..OptionColumns::default()
-    };
-    Ok(vec![CreateTopicVector {
-        case: "topic_with_options".to_owned(),
-        wire_options: resource_options_from_wire(&request.options, true)?,
-        body_hex: hex::encode(request.to_bytes()),
-        http_body: input.http_body()?,
-        admission_error: admit_create(OptionsScope::Topic, columns, &request.options)
-            .err()
-            .map(|error| ErrorExpectation::from(&error)),
-        input,
-    }])
+    let cases = [
+        (
+            "topic_with_options",
+            CreateTopicInput {
+                stream_id: IdentifierInput::Numeric(1),
+                name: "events".to_owned(),
+                partitions_count: 3,
+                compression_algorithm: Some("gzip".to_owned()),
+                message_expiry: Some(SEVEN_DAYS_MICROS.to_owned()),
+                max_topic_size: Some(ABOVE_2_POW_53.to_string()),
+                segment_size: Some((128u64 * 1024 * 1024).to_string()),
+                durability: Durability::Persisted,
+                consumer_offset_durability: Durability::Replicated,
+                topic_type: None,
+                geo_durations: GeoDurationsInput::default(),
+            },
+        ),
+        (
+            "geo_topic_with_durations",
+            CreateTopicInput {
+                stream_id: IdentifierInput::Numeric(1),
+                name: "orders".to_owned(),
+                partitions_count: 2,
+                compression_algorithm: None,
+                message_expiry: None,
+                max_topic_size: None,
+                segment_size: None,
+                durability: Durability::Replicated,
+                consumer_offset_durability: Durability::Replicated,
+                topic_type: Some(TopicType::Geo.to_string()),
+                geo_durations: geo_durations(),
+            },
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(case, input)| {
+            let request = input.request()?;
+            let columns = OptionColumns {
+                name: Some(input.name.clone()),
+                ..OptionColumns::default()
+            };
+            Ok(CreateTopicVector {
+                case: case.to_owned(),
+                wire_options: resource_options_from_wire(&request.options, true)?,
+                body_hex: hex::encode(request.to_bytes()),
+                http_body: input.http_body()?,
+                admission_error: admit_create(OptionsScope::Topic, columns, &request.options)
+                    .err()
+                    .map(|error| ErrorExpectation::from(&error)),
+                input,
+            })
+        })
+        .collect()
 }
 
 fn create_user_vectors() -> GeneratorResult<Vec<CreateUserVector>> {
@@ -743,6 +795,7 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
                 data_key: None,
                 kek_config_keys: Vec::new(),
                 stored_extra: ResourceOptions::new(),
+                shadow_origin: None,
             },
         ),
         (
@@ -757,6 +810,7 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
                     HeaderKey::try_from("future_option")?,
                     OptionValue::explicit(HeaderValue::try_from("enabled")?),
                 )]),
+                shadow_origin: None,
             },
         ),
         (
@@ -773,6 +827,19 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
                     SECOND_KEK_CONFIG_KEY.to_owned(),
                 ],
                 stored_extra: ResourceOptions::new(),
+                shadow_origin: None,
+            },
+        ),
+        (
+            "stream_shadow_of_a_geo_peer",
+            4,
+            "__shadow_dc-a_orders",
+            StreamKeyState {
+                encryption_key_source: StreamEncryptionSource::None,
+                data_key: None,
+                kek_config_keys: Vec::new(),
+                stored_extra: ResourceOptions::new(),
+                shadow_origin: Some("dc-a".to_owned()),
             },
         ),
     ];
@@ -781,7 +848,7 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
         .map(|(case, id, name, state)| {
             let stored = state.stored_options()?;
             let (options, derived_options) =
-                resource_options_to_wire_split(&public_options(OptionsScope::Stream, &stored)?)?;
+                resource_options_to_wire_split(&state.public_options()?)?;
             let bytes = GetStreamResponse {
                 stream: StreamResponse {
                     id,
@@ -819,6 +886,53 @@ fn stream_response_vectors() -> GeneratorResult<Vec<StreamResponseVector>> {
 }
 
 fn topic_response_vectors() -> GeneratorResult<Vec<TopicResponseVector>> {
+    Ok(vec![plain_topic_response()?, geo_topic_response()?])
+}
+
+/// A geo topic with every duration set, read back with the defaults that
+/// admission derives for a geo topic.
+fn geo_topic_response() -> GeneratorResult<TopicResponseVector> {
+    let explicit = TopicCreateOptions {
+        topic_type: Some(TopicType::Geo),
+        geo_durations: geo_durations().durations()?,
+        ..TopicCreateOptions::default()
+    }
+    .to_option_map()?;
+    let mut stored = derived_defaults(OptionsScope::Topic, &explicit)?;
+    stored.extend(explicit);
+    let (options, derived_options) =
+        resource_options_to_wire_split(&public_options(OptionsScope::Topic, &stored)?)?;
+    let bytes = GetTopicResponse {
+        topic: TopicResponse {
+            id: 5,
+            created_at: CREATED_AT_MICROS,
+            partitions_count: 0,
+            size_bytes: 0,
+            messages_count: 0,
+            name: WireName::new("orders")?,
+            options,
+            derived_options,
+        },
+        partitions: Vec::new(),
+    }
+    .to_bytes();
+    let expected = TopicProjection::from(&TopicDetails::try_from(GetTopicResponse::decode_from(
+        &bytes,
+    )?)?);
+    ensure_no_secrets(
+        "geo_topic_with_durations",
+        &bytes,
+        &stored,
+        &expected.options,
+    )?;
+    Ok(TopicResponseVector {
+        case: "geo_topic_with_durations".to_owned(),
+        response_hex: hex::encode(&bytes),
+        expected,
+    })
+}
+
+fn plain_topic_response() -> GeneratorResult<TopicResponseVector> {
     let mut stored = ResourceOptions::from([
         (
             HeaderKey::from(OptionKey::CompressionAlgorithm),
@@ -841,7 +955,7 @@ fn topic_response_vectors() -> GeneratorResult<Vec<TopicResponseVector>> {
     let (options, derived_options) =
         resource_options_to_wire_split(&public_options(OptionsScope::Topic, &stored)?)?;
     let bytes = GetTopicResponse {
-        topic: TopicHeader {
+        topic: TopicResponse {
             id: 4,
             created_at: CREATED_AT_MICROS,
             partitions_count: 0,
@@ -863,11 +977,11 @@ fn topic_response_vectors() -> GeneratorResult<Vec<TopicResponseVector>> {
         &stored,
         &expected.options,
     )?;
-    Ok(vec![TopicResponseVector {
+    Ok(TopicResponseVector {
         case: "topic_explicit_and_derived".to_owned(),
         response_hex: hex::encode(&bytes),
         expected,
-    }])
+    })
 }
 
 fn user_response_vectors() -> GeneratorResult<Vec<UserResponseVector>> {
