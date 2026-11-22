@@ -725,6 +725,8 @@ const fn refused_before_apply(error: &BridgeError) -> bool {
                     | IggyError::PartitionIdSpaceExhausted
                     // The op never entered Iggy's pipeline.
                     | IggyError::TransientNotAccepted
+                    // Iggy refuses every write to a shadow at its edge.
+                    | IggyError::ShadowStreamReadOnly
             )
     )
 }
@@ -1178,6 +1180,15 @@ fn bridge_failure(kafka_topic: &str, err: &BridgeError) -> (i16, StrBytes) {
             );
             StrBytes::from_static_str("Iggy has no partition ids left for this topic")
         }
+        BridgeError::Iggy(IggyError::ShadowStreamReadOnly) => {
+            tracing::debug!(
+                kafka_topic,
+                "CreatePartitions refused: the topic is the shadow of another datacenter's geo topic"
+            );
+            StrBytes::from_static_str(
+                "this topic is the read-only shadow of another datacenter's geo topic",
+            )
+        }
         // Iggy refuses writes while a view change or a lifecycle step runs. Routine, and the
         // retriable code already tells the client to try again.
         BridgeError::Iggy(IggyError::TransientNotAccepted) => {
@@ -1241,7 +1252,9 @@ mod tests {
     /// The node id of the gateway under test.
     const NODE_ID: i32 = 1;
     use crate::protocol::acl::PrincipalPermissions;
-    use crate::protocol::api::{ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR};
+    use crate::protocol::api::{
+        ERROR_INVALID_TOPIC_EXCEPTION, ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_UNKNOWN_SERVER_ERROR,
+    };
 
     fn topic(name: &str, count: i32) -> CreatePartitionsTopic {
         CreatePartitionsTopic::default()
@@ -1517,6 +1530,11 @@ mod tests {
                 &BridgeError::Iggy(IggyError::TransientNotAccepted),
                 ERROR_NOT_LEADER_OR_FOLLOWER,
                 "Iggy is not accepting writes right now; retry",
+            ),
+            (
+                &BridgeError::Iggy(IggyError::ShadowStreamReadOnly),
+                ERROR_INVALID_TOPIC_EXCEPTION,
+                "this topic is the read-only shadow of another datacenter's geo topic",
             ),
             (
                 &BridgeError::Timeout,
@@ -1893,7 +1911,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn given_a_refusal_that_changed_nothing_should_answer_without_rereading() {
-        let cases: [(fn() -> BridgeError, i16); 8] = [
+        let cases: [(fn() -> BridgeError, i16); 9] = [
             (
                 || BridgeError::Iggy(IggyError::PartitionResizeDisabled),
                 ERROR_POLICY_VIOLATION,
@@ -1925,6 +1943,10 @@ mod tests {
             (
                 || BridgeError::Iggy(IggyError::TransientNotAccepted),
                 ERROR_NOT_LEADER_OR_FOLLOWER,
+            ),
+            (
+                || BridgeError::Iggy(IggyError::ShadowStreamReadOnly),
+                ERROR_INVALID_TOPIC_EXCEPTION,
             ),
         ];
         for (error, expected_code) in cases {

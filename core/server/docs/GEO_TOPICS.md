@@ -32,6 +32,7 @@ positions](../README.md#consumer-group-positions).
 - [Create a geo topic](#create-a-geo-topic)
   - [Durations of a geo topic](#durations-of-a-geo-topic)
 - [Produce and consume](#produce-and-consume)
+- [Kafka clients](#kafka-clients)
 - [Delays](#delays)
 - [What fails and what is lost](#what-fails-and-what-is-lost)
 - [Failover and failback](#failover-and-failback)
@@ -122,7 +123,7 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 | Positions of plain consumers, and of Kafka groups through the Kafka gateway   | Yes             |
 | The `geo_tiered` mode, and a switch between modes                             | No              |
 | Geo topics in encrypted streams                                               | No              |
-| Create, produce to or read geo topics through the Kafka gateway               | No              |
+| Geo topics and their shadows through the Kafka gateway                        | Yes             |
 
 ## How a message moves
 
@@ -629,6 +630,80 @@ differences:
 A send that was not acknowledged can still have committed. A producer that retries it in another
 datacenter can write it twice, once in each log. Consumers that must not process it twice
 deduplicate on an id of their own, such as the message id that the producer sets.
+
+## Kafka clients
+
+Kafka clients use geo topics through the [Kafka gateway](../../../gateways/kafka/README.md). The
+gateway of a datacenter lists the geo topics of that datacenter under their own names. It lists
+the shadows of the other datacenters' geo topics under the name of the origin, a dot, and the name
+of the topic.
+
+### Create a geo topic with Kafka tools
+
+Create the geo topic in each datacenter that writes, with the topic configuration
+`iggy.topic.type=geo`:
+
+```bash
+kafka-topics.sh --bootstrap-server gateway-dc-a:9092 --create --topic orders \
+  --partitions 4 --config iggy.topic.type=geo
+```
+
+- A topic without this configuration is a normal topic. `DescribeConfigs` shows
+  `iggy.topic.type` for each topic. An alter of it is refused.
+- A geo topic keeps the configuration it was created with. The gateway refuses a configuration
+  alter of it with `INVALID_CONFIG` (40), and a `CreatePartitions` with `POLICY_VIOLATION` (44).
+- A cluster takes geo topics only after its store identity check passes. Until then, and in a
+  cluster without `[geo] origin`, `CreateTopics` answers `POLICY_VIOLATION` (44).
+
+### Produce with Kafka clients
+
+A Kafka producer writes to the geo topic of its own datacenter. The gateway answers `acks=1` and
+`acks=all` once the node's bucket holds the batch, as Iggy answers its own producers. A producer
+with `acks=0` gets no answer, as in Kafka. Idempotent producers work as on a normal topic.
+
+### Shadows for Kafka clients
+
+The gateway of `dc-b` lists the shadow of the geo topic `orders` of `dc-a` as `dc-a.orders`.
+MirrorMaker 2 names the topics that it copies from another cluster in the same way.
+
+- A shadow is read-only. A produce to it, a delete of it and a `CreatePartitions` of it answer
+  `INVALID_TOPIC_EXCEPTION` (17), as Kafka answers a write to an internal topic. A configuration
+  alter answers `INVALID_CONFIG` (40).
+- A `CreateTopics` of the shadow's name answers `TOPIC_ALREADY_EXISTS` (36). So a tool that
+  creates only missing topics takes the shadow. The name of a shadow that the cluster does not
+  hold yet answers `INVALID_TOPIC_EXCEPTION` (17).
+- A topic that the gateway's topic mapping file maps has a shadow under the Kafka name of that
+  topic. Give the gateways of all datacenters the same mapping file.
+- A local topic cannot take the name of a shadow. Once `dc-b` holds a shadow of `dc-a`, the
+  gateway hides each local topic of `dc-b` whose name starts with `dc-a.`.
+- With `IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true`, a client that asks for `dc-a.orders` before
+  `dc-b` holds the shadow creates a local topic of that name. Subscribe with a pattern, or wait
+  until the shadow exists.
+
+### Read the messages of every datacenter
+
+A consumer that wants the messages of every datacenter reads the local topic and the shadows.
+Subscribe with a pattern that matches all of them, for example `(dc-a\.|dc-b\.)?orders`. The same
+pattern works in each datacenter.
+
+- Run one Kafka group in one datacenter. On failover, start it in the other datacenter. It
+  continues each log from the offset that it committed, because a log has the same offsets in each
+  datacenter.
+- Run a group in one datacenter at a time. See
+  [Plain consumers and Kafka groups](#plain-consumers-and-kafka-groups).
+
+### Move from a merged topic
+
+A team that runs active-active on Kafka often copies the topic of each datacenter into the other
+one, with MirrorMaker 2 or a copy job. Its consumers then read one merged topic. With geo topics:
+
+- Producers write to the local geo topic, as before.
+- Consumers subscribe with a pattern to the local topic and the shadows, not to a merged topic.
+- There is no order between datacenters. A consumer gets each log in order, and no order across
+  logs.
+- A log has the same offsets in each datacenter. So a group that moves needs no offset
+  translation.
+- No copy job runs, and no header has to stop a copy from coming back.
 
 ## Delays
 
@@ -1139,8 +1214,9 @@ object is deleted, and 1 hour before an unlisted long-term object is deleted.
 - **No encrypted streams.** A geo topic in a stream with an encryption key is refused with
   `FeatureUnavailable` (5), because its sends reach the bucket before the stream's encryption
   runs.
-- **The Kafka gateway carries only offsets.** It carries the offsets of Kafka groups between
-  datacenters. It does not support geo topics or shadow streams for anything else.
+- **Fixed Kafka names of shadows.** The Kafka gateway lists a shadow as `<origin>.<topic>`. No
+  setting changes this name, and a local topic of that name is hidden. See
+  [Shadows for Kafka clients](#shadows-for-kafka-clients).
 - **No member check for plain consumers and Kafka groups.** A position from another datacenter
   moves them also while they read here. Read a log with one of them in one datacenter at a time.
 - **Frozen partition count and options.** A geo topic keeps its name, its options, including

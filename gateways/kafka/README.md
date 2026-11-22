@@ -893,6 +893,20 @@ so an override-only file with no `default_stream` key fails to load rather than 
 `default_stream` always wins and the env var is ignored entirely: a TOML file is a complete mapping
 document, not an overlay on top of the env var.
 
+### Geo topics
+
+A geo topic keeps one log for each datacenter. The other datacenters read that log from a
+read-only shadow. The operator guide tells how to use them with Kafka clients
+([`GEO_TOPICS.md`](../../core/server/docs/GEO_TOPICS.md#kafka-clients)).
+
+- `CreateTopics` with the topic configuration `iggy.topic.type=geo` creates a geo topic. A geo
+  topic keeps its configuration and its partition count.
+- The gateway lists the shadow of the geo topic `orders` of datacenter `dc-a` as `dc-a.orders`,
+  as MirrorMaker 2 names remote topics. The shadow of an override's topic goes by
+  `dc-a.<override key>`.
+- A shadow is read-only. A produce to it answers `INVALID_TOPIC_EXCEPTION` (17).
+- The gateway does not list a local topic whose name a shadow takes.
+
 ### Provisioning and idempotency
 
 `ensure_stream_and_topic(kafka_topic, partition_count)` creates the mapped Iggy stream and topic

@@ -36,10 +36,14 @@
 //!   level or a compaction setting, and reports the Kafka default.
 //! - It accepts only the Kafka default of `message.timestamp.type`, because another value changes
 //!   the timestamps that clients get and Iggy cannot apply it.
+//!
+//! It also answers one key that Kafka does not have, `iggy.topic.type`. A create with `geo` makes a
+//! geo topic, which Iggy sets only when it creates a topic.
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
 
+use iggy::prelude::TopicType;
 use kafka_protocol::protocol::StrBytes;
 
 use super::{CONFIG_SOURCE_DEFAULT, CONFIG_SOURCE_STATIC_BROKER, CONFIG_SOURCE_TOPIC};
@@ -54,6 +58,7 @@ pub const MIN_INSYNC_REPLICAS: &str = "min.insync.replicas";
 pub const MAX_MESSAGE_BYTES: &str = "max.message.bytes";
 pub const FLUSH_MESSAGES: &str = "flush.messages";
 pub const FLUSH_MS: &str = "flush.ms";
+pub const TOPIC_TYPE: &str = "iggy.topic.type";
 
 const RETENTION_MS_DOC: &str = "How long a sealed segment is kept, in milliseconds. The active \
                                 segment does not expire. -1 means sealed segments never expire.";
@@ -72,6 +77,8 @@ const FLUSH_DOC: &str = "A persisted topic flushes every write. Iggy sets durabi
                          them.";
 const MAX_MESSAGE_BYTES_DOC: &str = "The largest record batch that this gateway takes in every \
                                      topic. It accepts a value from the Kafka default up to it.";
+const TOPIC_TYPE_DOC: &str = "Iggy's topic type. geo makes a geo topic, which keeps a log for each \
+                              datacenter. Iggy sets it only when it creates a topic.";
 const BROKER_DOC: &str = "Fixed for this gateway, which cannot change broker configuration.";
 const RETENTION_MS_DEFAULT_DOC: &str = "retention.ms of each topic the gateway creates without one. Set by \
      IGGY_KAFKA_TOPIC_RETENTION_MS.";
@@ -230,6 +237,8 @@ pub enum TopicKeyKind {
     Ignored,
     /// Reported at Kafka's default, and accepted only at that value, for the reason given.
     Fixed { reason: &'static str },
+    /// Iggy's `topic_type`, which Iggy sets only when it creates a topic. Kafka has no such key.
+    TopicType,
 }
 
 /// One Kafka topic configuration key.
@@ -416,6 +425,12 @@ impl TopicKey {
                 CONFIG_SOURCE_DEFAULT,
                 FIXED_DOC,
             ),
+            TopicKeyKind::TopicType => entry(
+                Some(topic.topic_type.to_string()),
+                true,
+                type_source(topic.topic_type),
+                TOPIC_TYPE_DOC,
+            ),
             TopicKeyKind::CleanupPolicy => None,
         }
     }
@@ -498,6 +513,15 @@ impl TopicKey {
 
 /// The source of a value a topic stores: `DEFAULT_CONFIG` when no client set it,
 /// `STATIC_BROKER_CONFIG` when it equals the gateway default, else `DYNAMIC_TOPIC_CONFIG`.
+/// Where the type of a topic comes from: the default for a normal topic, else the topic.
+fn type_source(topic_type: TopicType) -> i8 {
+    if topic_type == TopicType::Normal {
+        CONFIG_SOURCE_DEFAULT
+    } else {
+        CONFIG_SOURCE_TOPIC
+    }
+}
+
 const fn stored_source(explicit: bool, equals_default: bool) -> i8 {
     if !explicit {
         CONFIG_SOURCE_DEFAULT
@@ -562,8 +586,9 @@ const fn ignored(
     key(name, config_type, default, TopicKeyKind::Ignored, rule)
 }
 
-/// Every topic key of Kafka 4.4 (`LogConfig`), sorted by name for [`topic_key`].
-pub static TOPIC_KEYS: [TopicKey; 37] = [
+/// Every topic key of Kafka 4.4 (`LogConfig`) and `iggy.topic.type`, sorted by name for
+/// [`topic_key`].
+pub static TOPIC_KEYS: [TopicKey; 38] = [
     key(
         CLEANUP_POLICY,
         ConfigType::List,
@@ -632,6 +657,13 @@ pub static TOPIC_KEYS: [TopicKey; 37] = [
         ConfigType::List,
         "",
         Rule::ThrottledReplicas,
+    ),
+    key(
+        TOPIC_TYPE,
+        ConfigType::String,
+        "normal",
+        TopicKeyKind::TopicType,
+        Rule::OneOf(&["geo", "normal"]),
     ),
     ignored(
         "index.interval.bytes",
@@ -1043,7 +1075,7 @@ fn distinct(names: &[StrBytes]) -> impl Iterator<Item = &str> {
 
 #[cfg(test)]
 mod tests {
-    use iggy::prelude::{Durability, IggyByteSize, IggyExpiry, MaxTopicSize};
+    use iggy::prelude::{Durability, IggyByteSize, IggyExpiry, MaxTopicSize, TopicType};
 
     use super::*;
     use crate::bridge::topic_settings::expiry_from_retention_ms;
@@ -1064,6 +1096,7 @@ mod tests {
             segment_size_explicit: false,
             replication_factor: None,
             durability: Durability::Replicated,
+            topic_type: TopicType::Normal,
         }
     }
 
@@ -1207,6 +1240,27 @@ mod tests {
             (1..=6).map(majority).collect::<Vec<_>>(),
             [1, 2, 2, 3, 3, 4]
         );
+    }
+
+    #[test]
+    fn given_a_topic_should_report_its_iggy_type_as_a_read_only_setting() {
+        let defaults = TopicDefaults::default();
+        let asked = [StrBytes::from_static_str(TOPIC_TYPE)];
+        let normal = topic_entries(&snapshot(), &context(&defaults), Some(&asked));
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].value.as_deref(), Some("normal"));
+        assert!(normal[0].read_only);
+        assert_eq!(normal[0].source, CONFIG_SOURCE_DEFAULT);
+
+        let geo = TopicConfigSnapshot {
+            topic_type: TopicType::Geo,
+            ..snapshot()
+        };
+        let entries = topic_entries(&geo, &context(&defaults), None);
+        let entry = value_of(&entries, TOPIC_TYPE).expect("reported with every key");
+        assert_eq!(entry.value.as_deref(), Some("geo"));
+        assert_eq!(entry.source, CONFIG_SOURCE_TOPIC);
+        assert!(known(TOPIC_TYPE).check("GEO").is_err(), "Kafka's case");
     }
 
     #[test]

@@ -94,6 +94,11 @@ pub enum BridgeError {
     /// nothing can produce to, or spend a replicated log entry adding nothing.
     #[error("partition count must be at least 1, got 0 for topic '{kafka_topic}'")]
     InvalidPartitionCount { kafka_topic: String },
+    #[error(
+        "topic '{kafka_topic}' is the read-only shadow of a geo topic of datacenter '{origin}'. \
+         Write to that geo topic, and manage it, in its own datacenter"
+    )]
+    ShadowTopic { kafka_topic: String, origin: String },
     /// The message Iggy holds as the cluster id is not one. Read once, at startup.
     #[error(
         "the earliest stored message of Iggy topic '{stream}/{topic}' is not a Kafka cluster \
@@ -149,7 +154,9 @@ impl BridgeError {
             Self::PartitionOutOfRange { .. } => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
             Self::PartitionLoading { .. } => ERROR_NOT_LEADER_OR_FOLLOWER,
             Self::PartitionCountMismatch { .. } => ERROR_TOPIC_ALREADY_EXISTS,
-            Self::InvalidKafkaTopicName { .. } => ERROR_INVALID_TOPIC_EXCEPTION,
+            Self::InvalidKafkaTopicName { .. } | Self::ShadowTopic { .. } => {
+                ERROR_INVALID_TOPIC_EXCEPTION
+            }
             // Same code the wire-validation layer already uses for this exact condition - this
             // is the same failure reached through a different door, not a new kind of error.
             Self::InvalidPartitionCount { .. } => ERROR_INVALID_PARTITIONS,
@@ -305,6 +312,9 @@ const fn iggy_error_to_kafka_code(err: &IggyError) -> i16 {
         | IggyError::PartitionNotFound(_, _, _)
         | IggyError::ResourceNotFound(_) => ERROR_UNKNOWN_TOPIC_OR_PARTITION,
         IggyError::Unauthorized => ERROR_TOPIC_AUTHORIZATION_FAILED,
+        // A shadow is the read-only copy of another datacenter's geo topic. Kafka refuses a write
+        // to one of its internal topics with the same code.
+        IggyError::ShadowStreamReadOnly => ERROR_INVALID_TOPIC_EXCEPTION,
         IggyError::Disconnected
         | IggyError::EmptyResponse
         | IggyError::Unauthenticated
@@ -564,6 +574,24 @@ mod tests {
             reason: "must not have leading or trailing whitespace".to_string(),
         };
         assert_eq!(err.to_kafka_error_code(), ERROR_INVALID_TOPIC_EXCEPTION);
+    }
+
+    #[test]
+    fn given_a_write_to_a_shadow_should_answer_invalid_topic_as_kafka_does_for_an_internal_topic() {
+        let refused = BridgeError::Iggy(IggyError::ShadowStreamReadOnly);
+        let created = BridgeError::ShadowTopic {
+            kafka_topic: "dc-a.orders".to_string(),
+            origin: "dc-a".to_string(),
+        };
+
+        assert_eq!(
+            refused.to_produce_error_code(),
+            ERROR_INVALID_TOPIC_EXCEPTION
+        );
+        assert_eq!(refused.to_kafka_error_code(), ERROR_INVALID_TOPIC_EXCEPTION);
+        assert_eq!(created.to_kafka_error_code(), ERROR_INVALID_TOPIC_EXCEPTION);
+        assert!(!refused.is_retriable());
+        assert!(created.to_string().contains("datacenter 'dc-a'"));
     }
 
     #[test]

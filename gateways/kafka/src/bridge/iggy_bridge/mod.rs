@@ -47,6 +47,7 @@ mod offsets;
 mod produce;
 mod producer_ids;
 mod reach;
+mod shadows;
 mod topics;
 
 pub use change_log::{DeletedTopic, PermissionBoard, TopicShape, TopicShapes, UserAccess};
@@ -68,6 +69,7 @@ pub use produce::{PartitionBatch, ProduceTurn, Producer};
 pub use producer_ids::{iggy_producer_id, kafka_producer_id};
 pub use reach::Reach;
 use reach::ReachProbe;
+use shadows::ShadowStreams;
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad,
@@ -202,6 +204,8 @@ pub struct IggyBridge {
     topic_changes: Arc<watch::Sender<u64>>,
     /// The Kafka topics the change log shows. See [`IggyBridge::topic_shape`].
     topic_shapes: Arc<watch::Sender<Arc<TopicShapes>>>,
+    /// The shadow streams the bridge last saw, which name resolution reads. See `iggy_names`.
+    shadows: Arc<ShadowStreams>,
     permissions: Arc<PermissionBoard>,
     /// Gets each topic that the change log shows deleted.
     topic_deletions: broadcast::Sender<DeletedTopic>,
@@ -302,6 +306,7 @@ impl IggyBridge {
             follower: FollowerTask::default(),
             topic_changes: Arc::new(watch::Sender::new(0)),
             topic_shapes: Arc::new(watch::Sender::new(Arc::default())),
+            shadows: Arc::default(),
             permissions: Arc::default(),
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
             id_client: LazyClient::default(),
@@ -388,6 +393,7 @@ impl IggyBridge {
             groups: self.group_index.feed(),
             topics: Arc::clone(&self.topic_changes),
             shapes: Arc::clone(&self.topic_shapes),
+            shadows: Arc::clone(&self.shadows),
             permissions: Arc::clone(&self.permissions),
             deletions: self.topic_deletions.clone(),
         };
@@ -403,7 +409,8 @@ impl IggyBridge {
             .unwrap_or_else(PoisonError::into_inner) = Some(tokio::spawn(run));
     }
 
-    /// Checks `kafka_topic` against Kafka's name rules and resolves its Iggy stream and topic.
+    /// Checks `kafka_topic` against Kafka's name rules and resolves its Iggy stream and topic, a
+    /// shadow's among them once the bridge saw its stream. See `iggy_names`.
     ///
     /// Creates nothing. `Metadata` owns topic creation.
     ///
@@ -413,10 +420,10 @@ impl IggyBridge {
     /// [`BridgeError::Iggy`] if a mapped name is not a valid Iggy identifier.
     pub fn topic_target(&self, kafka_topic: &str) -> Result<TopicTarget, BridgeError> {
         validate_kafka_topic_name("kafka_topic", kafka_topic)?;
-        let (stream_name, topic_name) = self.config.topic_mapping.resolve(kafka_topic);
+        let names = self.iggy_names(kafka_topic);
         Ok(TopicTarget {
-            stream_id: Identifier::named(stream_name).map_err(BridgeError::Iggy)?,
-            topic_id: Identifier::named(topic_name).map_err(BridgeError::Iggy)?,
+            stream_id: Identifier::named(&names.stream).map_err(BridgeError::Iggy)?,
+            topic_id: Identifier::named(names.topic).map_err(BridgeError::Iggy)?,
         })
     }
 
@@ -426,8 +433,8 @@ impl IggyBridge {
     /// keyed by this pair.
     #[must_use]
     pub(crate) fn topic_identity(&self, kafka_topic: &str) -> (String, String) {
-        let (stream, topic) = self.config.topic_mapping.resolve(kafka_topic);
-        (stream.to_string(), topic.to_string())
+        let names = self.iggy_names(kafka_topic);
+        (names.stream.into_owned(), names.topic.to_string())
     }
 
     /// Whether `kafka_topic` is no override's key yet resolves to an override's Iggy topic. See
@@ -652,6 +659,7 @@ impl IggyBridge {
             follower: FollowerTask::default(),
             topic_changes: Arc::new(watch::Sender::new(0)),
             topic_shapes: Arc::new(watch::Sender::new(Arc::default())),
+            shadows: Arc::default(),
             permissions: Arc::default(),
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
             id_client: LazyClient::default(),

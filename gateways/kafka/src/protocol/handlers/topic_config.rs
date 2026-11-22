@@ -27,7 +27,7 @@ pub mod keys;
 
 use std::collections::{HashMap, HashSet};
 
-use iggy::prelude::{Durability, IggyError, IggyExpiry, MaxTopicSize};
+use iggy::prelude::{Durability, IggyError, IggyExpiry, MaxTopicSize, TopicType};
 use iggy_common::{DEFAULT_SEGMENT_SIZE, MAX_TOPIC_SEGMENT_SIZE, MIN_TOPIC_SEGMENT_SIZE};
 use kafka_protocol::messages::alter_configs_request::AlterConfigsResource;
 use kafka_protocol::messages::describe_configs_request::DescribeConfigsResource;
@@ -46,8 +46,8 @@ use crate::protocol::api::{
     ERROR_INVALID_CONFIG, ERROR_NONE, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
 };
 use keys::{
-    CLEANUP_POLICY, ConfigContext, ConfigType, ConfigValue, Refusal, TOPIC_KEYS, TopicKey,
-    TopicKeyKind, majority, topic_key,
+    CLEANUP_POLICY, ConfigContext, ConfigType, ConfigValue, Refusal, TOPIC_KEYS, TOPIC_TYPE,
+    TopicKey, TopicKeyKind, majority, topic_key,
 };
 
 /// Kafka `ConfigResource.Type.TOPIC`.
@@ -645,6 +645,7 @@ pub fn plan_create<'a>(
             TopicKeyKind::Ignored | TopicKeyKind::Fixed { .. } => {
                 key.check(value).map_err(|refusal| refused(key, refusal))?;
             }
+            TopicKeyKind::TopicType => settings.topic_type = Some(topic_type(key, value)?),
         }
     }
     Ok(settings)
@@ -708,6 +709,9 @@ pub fn plan_replace<'a>(
         plan_set(&mut update, key, value.unwrap_or_default(), &planned)?;
     }
     for key in TOPIC_KEYS.iter().filter(|key| !named.contains(key.name)) {
+        if key.kind == TopicKeyKind::TopicType {
+            continue;
+        }
         if key.kind == TopicKeyKind::SegmentBytes {
             update.kept_segment_size =
                 (topic.segment_size != DEFAULT_SEGMENT_SIZE).then_some(topic.segment_size);
@@ -716,7 +720,7 @@ pub fn plan_replace<'a>(
         plan_delete(&mut update, key, topic, context, keeps_records)?;
     }
     settle_retention(&mut update, topic);
-    Ok(update)
+    unless_geo(update, topic)
 }
 
 /// What one `IncrementalAlterConfigs` resource writes.
@@ -776,7 +780,7 @@ pub fn plan_incremental(
         }
     }
     settle_retention(&mut update, topic);
-    Ok(update)
+    unless_geo(update, topic)
 }
 
 /// What a `SET` on an existing topic is planned against.
@@ -845,6 +849,11 @@ fn plan_set(
         TopicKeyKind::Ignored | TopicKeyKind::Fixed { .. } => {
             key.check(value).map_err(|refusal| refused(key, refusal))?;
         }
+        TopicKeyKind::TopicType => {
+            if topic_type(key, value)? != topic.topic_type {
+                return Err(invalid(key, value.trim(), set_at_create(topic.topic_type)));
+            }
+        }
     }
     Ok(())
 }
@@ -888,6 +897,11 @@ fn plan_delete(
             }
         }
         TopicKeyKind::CleanupPolicy => update.cleanup_policy = Some(CleanupPolicy::default()),
+        TopicKeyKind::TopicType => {
+            if topic.topic_type != TopicType::Normal {
+                return Err(ConfigFault::Message(set_at_create(topic.topic_type)));
+            }
+        }
         TopicKeyKind::MinInsyncReplicas
         | TopicKeyKind::Flush { .. }
         | TopicKeyKind::MaxMessageBytes
@@ -895,6 +909,34 @@ fn plan_delete(
         | TopicKeyKind::Fixed { .. } => {}
     }
     Ok(())
+}
+
+/// The type that `iggy.topic.type` names.
+fn topic_type(key: &TopicKey, value: &str) -> Result<TopicType, ConfigFault> {
+    key.check(value).map_err(|refusal| refused(key, refusal))?;
+    value
+        .trim()
+        .parse()
+        .map_err(|_| invalid(key, value.trim(), "not an Iggy topic type"))
+}
+
+/// Why `iggy.topic.type` keeps `current`.
+fn set_at_create(current: TopicType) -> String {
+    format!("Iggy sets {TOPIC_TYPE} only when it creates a topic, and this topic is {current}")
+}
+
+/// `update`, unless it writes to a geo topic. A geo topic keeps the configuration it was created
+/// with, and a shadow of another datacenter's geo topic reads as geo.
+fn unless_geo(
+    update: TopicConfigUpdate,
+    topic: &TopicConfigSnapshot,
+) -> Result<TopicConfigUpdate, ConfigFault> {
+    if topic.topic_type == TopicType::Geo && !update.is_empty() {
+        return Err(ConfigFault::Message(
+            "Iggy keeps the configuration of a geo topic as it was created".to_string(),
+        ));
+    }
+    Ok(update)
 }
 
 /// The retention an alter leaves, once every key of it is planned. A policy without `delete`
@@ -1088,6 +1130,7 @@ mod tests {
             segment_size_explicit: false,
             replication_factor: None,
             durability: Durability::Replicated,
+            topic_type: TopicType::Normal,
         }
     }
 
@@ -1648,6 +1691,75 @@ mod tests {
             Some(SettingChange::Set(7))
         );
         assert_eq!(back_to_default(None, 3, true), Some(SettingChange::Reset));
+    }
+
+    #[test]
+    fn given_iggy_topic_type_geo_when_creating_should_make_a_geo_topic() {
+        let settings = create([(TOPIC_TYPE, Some("geo"))]).expect("a known type");
+        assert_eq!(settings.topic_type, Some(TopicType::Geo));
+        let options = settings.create_options(3, &TopicDefaults::default());
+        assert!(options.is_geo());
+
+        let normal = create(NO_CONFIGS).expect("no configs");
+        assert_eq!(normal.topic_type, None);
+        let fault = create([(TOPIC_TYPE, Some("geo_tiered"))]).expect_err("no such type");
+        assert!(
+            matches!(fault, ConfigFault::InvalidValue { ref name, .. } if name == TOPIC_TYPE),
+            "{fault:?}"
+        );
+    }
+
+    #[test]
+    fn given_a_geo_topic_when_altering_should_refuse_each_write_and_keep_its_type() {
+        let geo = TopicConfigSnapshot {
+            topic_type: TopicType::Geo,
+            ..topic()
+        };
+        let defaults = TopicDefaults::default();
+
+        let retention = incremental(&[(RETENTION_MS, 0, Some("60000"))], &geo, &defaults)
+            .expect_err("a geo topic keeps its configuration");
+        assert_eq!(
+            retention.message(),
+            "Iggy keeps the configuration of a geo topic as it was created"
+        );
+        let normal = incremental(&[(TOPIC_TYPE, 0, Some("normal"))], &geo, &defaults)
+            .expect_err("set at create");
+        assert_eq!(
+            normal.message(),
+            "Invalid value normal for configuration iggy.topic.type: Iggy sets iggy.topic.type \
+             only when it creates a topic, and this topic is geo"
+        );
+        assert!(
+            incremental(&[(TOPIC_TYPE, 1, None)], &geo, &defaults).is_err(),
+            "a delete would make it normal"
+        );
+        assert!(
+            incremental(&[(TOPIC_TYPE, 0, Some("geo"))], &geo, &defaults)
+                .expect("no change")
+                .is_empty()
+        );
+        assert!(
+            replace(NO_CONFIGS, &geo, &defaults)
+                .expect("an alter that leaves every key out keeps the type")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn given_a_normal_topic_when_altering_its_type_should_keep_it_normal() {
+        let defaults = TopicDefaults::default();
+        assert!(incremental(&[(TOPIC_TYPE, 0, Some("geo"))], &topic(), &defaults).is_err());
+        assert!(
+            incremental(&[(TOPIC_TYPE, 1, None)], &topic(), &defaults)
+                .expect("already the default")
+                .is_empty()
+        );
+        assert!(
+            replace([(TOPIC_TYPE, Some("normal"))], &topic(), &defaults)
+                .expect("no change")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -303,16 +303,25 @@ async fn create_one_topic(
     if request.validate_only {
         return match bridge.get_kafka_topic(kafka_topic).await {
             Ok(Some(_existing)) => result.with_error_code(ERROR_TOPIC_ALREADY_EXISTS),
-            Ok(None) => beyond_the_cluster(topic.replication_factor, bridge.iggy_node_count())
-                .map_or_else(
-                    || success(requested_or_default),
-                    |reason| {
-                        result
-                            .clone()
-                            .with_error_code(ERROR_INVALID_REPLICATION_FACTOR)
-                            .with_error_message(Some(StrBytes::from(reason)))
-                    },
-                ),
+            Ok(None) => match bridge.iggy_names(kafka_topic).origin {
+                Some(origin) => {
+                    let refused = BridgeError::ShadowTopic {
+                        kafka_topic: kafka_topic.to_string(),
+                        origin: origin.to_string(),
+                    };
+                    bridge_error_result(result, kafka_topic, &refused, None)
+                }
+                None => beyond_the_cluster(topic.replication_factor, bridge.iggy_node_count())
+                    .map_or_else(
+                        || success(requested_or_default),
+                        |reason| {
+                            result
+                                .clone()
+                                .with_error_code(ERROR_INVALID_REPLICATION_FACTOR)
+                                .with_error_message(Some(StrBytes::from(reason)))
+                        },
+                    ),
+            },
             Err(err) => bridge_error_result(result, kafka_topic, &err, None),
         };
     }
@@ -514,6 +523,23 @@ fn bridge_error_result(
                 .with_error_code(error_code)
                 .with_error_message(Some(StrBytes::from(
                     "partition count must be at least 1".to_string(),
+                )))
+        }
+        BridgeError::ShadowTopic { .. } => {
+            tracing::debug!(kafka_topic, "CreateTopics refused the name of a shadow");
+            result
+                .with_error_code(error_code)
+                .with_error_message(Some(StrBytes::from(err.to_string())))
+        }
+        // Only a geo topic asks for what the cluster lacks here.
+        BridgeError::Iggy(IggyError::FeatureUnavailable) => {
+            tracing::debug!(kafka_topic, "CreateTopics: Iggy takes no geo topic now");
+            result
+                .with_error_code(ERROR_POLICY_VIOLATION)
+                .with_error_message(Some(StrBytes::from(
+                    "Iggy refused a geo topic: the cluster has no [geo] origin, its object store \
+                     is not ready yet, or the stream is encrypted"
+                        .to_string(),
                 )))
         }
         BridgeError::Iggy(IggyError::PartitionsLimitReached) => {

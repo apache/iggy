@@ -36,6 +36,7 @@ and accepts only the Kafka default of `message.timestamp.type`.
 | `flush.messages`, `flush.ms` | `durability`, set only at creation | Any value that Kafka accepts. `1` and `0` make a new topic `persisted` |
 | `max.message.bytes` | None | `1048588` up to the largest batch that Produce takes, which a describe reports |
 | `message.timestamp.type` | None | `CreateTime` only, which a describe reports |
+| `iggy.topic.type`, which Kafka does not have | `topic_type`, set only at creation | `normal` or `geo`. `geo` makes a geo topic. A describe reports it as read-only |
 | Any other Kafka 4.4 key, for example `compression.type` | None | Any value that Kafka accepts. A describe reports the Kafka default |
 
 Kafka trims a value and parses it by the type of its key, and so does the gateway. So `+1`,
