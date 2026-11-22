@@ -1,9 +1,9 @@
 ---
 title: External Authentication
-description: "Delegate unknown-user logins to an HTTP service that maps callers to existing Iggy accounts."
+description: "Delegate logins with unknown usernames or personal access tokens to an HTTP service that maps callers to existing Iggy accounts."
 ---
 
-An external authentication callout delegates a login decision to an HTTP service. Iggy calls it only when the submitted username does not exist locally. A wrong password for a local user never falls back to the service. Personal access tokens and HTTP bearer validation use their existing authentication paths.
+An external authentication callout delegates a login decision to an HTTP service. Iggy calls it only when the submitted credential is not valid locally: a username that does not exist locally or, when enabled, a personal access token that is unknown or expired. A wrong password for a local user never falls back to the service. Unknown and expired tokens both go to the service, so the response time does not tell them apart. HTTP bearer validation on each request uses its existing authentication path, so a token the service accepts works for the login request only.
 
 ## Configure the service
 
@@ -15,11 +15,14 @@ enabled = true
 url = "https://auth.example.com/iggy/verify"
 timeout = "5 s"
 max_concurrent_callouts = 64
+credential_types = ["username_password", "personal_access_token"]
 ```
 
-`url` names the HTTPS endpoint. `IGGY_EXTERNAL_AUTH_URL` sets it from the environment and keeps it out of the file. The server sends the submitted password to this endpoint. Protect both the client connection and the callout with TLS.
+`url` names the HTTPS endpoint. `IGGY_EXTERNAL_AUTH_URL` sets it from the environment and keeps it out of the file. The server sends the submitted password or token to this endpoint. Protect both the client connection and the callout with TLS.
 
-The concurrency cap applies per shard, so total in-flight callouts can reach the shard count multiplied by this value. There is no per-client rate limit in the callout. Apply one at the service or network boundary if required.
+`credential_types` selects the logins the service handles. It defaults to `["username_password"]`. Add `personal_access_token` to forward token logins once the service accepts that credential type. `IGGY_EXTERNAL_AUTH_CREDENTIAL_TYPES` sets the list from the environment, for example `[username_password, personal_access_token]`.
+
+The concurrency cap applies per shard, so total in-flight callouts can reach the shard count multiplied by this value. There is no per-client rate limit in the callout. Apply one at the service or network boundary if required. A token login costs the client only a random string, so with `personal_access_token` forwarded, a flood of random tokens can fill the cap and make real external logins fail with a retryable error.
 
 ## Request and response
 
@@ -35,6 +38,15 @@ Iggy sends a JSON `POST`:
     "username": "external-user",
     "password": "submitted-password"
   }
+}
+```
+
+A personal access token login carries the token instead:
+
+```json
+{
+  "type": "personal_access_token",
+  "token": "submitted-token"
 }
 ```
 
@@ -56,6 +68,6 @@ The reason is optional. An allowed username must resolve to the provisioned acco
 
 ## Failure and replay
 
-The normal-status metadata primary performs callouts. Other nodes and view changes can produce retryable errors. Timeouts, network failures, overload, HTTP 429 and HTTP 5xx map to retryable failures. Other unsuccessful HTTP responses and invalid decisions terminate the login.
+The normal-status metadata primary performs callouts. Other nodes and view changes can produce retryable errors. Timeouts, network failures, overload, HTTP 429 and HTTP 5xx map to retryable failures. Other unsuccessful HTTP responses and invalid decisions terminate the login. A denied or terminated login returns the same error as a local rejection: `InvalidCredentials` for a username and password, and `InvalidPersonalAccessToken` (HTTP 401) for a personal access token.
 
 The SDK can replay a login. The service must accept repeated verification of the same credentials safely. One-time passwords that become invalid after the first verification do not survive this replay model. A failed external service never grants access by default.

@@ -18,7 +18,7 @@
 //! A minimal external auth HTTP server for integration tests.
 //!
 //! Spawns a tokio task that accepts external auth callouts over raw TCP and
-//! returns a decision based on the presented username. Binds an ephemeral
+//! returns a decision based on the presented username or token. Binds an ephemeral
 //! port; the drop impl signals the task to shut down.
 //!
 //! The simplified design maps every recognized test user to a pre-provisioned
@@ -42,6 +42,11 @@ pub const EXT_AUTH_IGGY_USERNAME: &str = "iggy-alice";
 
 pub const EXT_DENIED_USERNAME: &str = "ext-denied";
 pub const EXT_DENIED_PASSWORD: &str = "ext-denied-pass";
+
+/// Personal access token the ext-auth service maps to `EXT_AUTH_IGGY_USERNAME`.
+/// No local PAT matches it, so the token login enters the callout path.
+pub const EXT_AUTH_TOKEN: &str = "ext-token-alice";
+pub const EXT_DENIED_TOKEN: &str = "ext-token-denied";
 
 fn allow_response(iggy_username: &str) -> String {
     serde_json::json!({
@@ -188,26 +193,7 @@ async fn handle_connection(stream: tokio::net::TcpStream, mode: Mode) {
         }
         Mode::Normal => {
             let decision = match serde_json::from_slice::<serde_json::Value>(&body) {
-                Ok(req) => {
-                    let creds = req.get("credentials");
-                    let username = creds
-                        .and_then(|c| c.get("username"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let password = creds
-                        .and_then(|c| c.get("password"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    match username {
-                        EXT_AUTH_USERNAME if password == EXT_AUTH_PASSWORD => {
-                            allow_response(EXT_AUTH_IGGY_USERNAME)
-                        }
-                        EXT_DENIED_USERNAME if password == EXT_DENIED_PASSWORD => {
-                            deny_response("access denied by policy")
-                        }
-                        _ => deny_response("unknown user or bad credentials"),
-                    }
-                }
+                Ok(req) => decide(&req),
                 _ => deny_response("malformed request"),
             };
             http_response(200, &decision)
@@ -215,4 +201,27 @@ async fn handle_connection(stream: tokio::net::TcpStream, mode: Mode) {
     };
 
     let _ = writer.write_all(resp.as_bytes()).await;
+}
+
+fn decide(req: &serde_json::Value) -> String {
+    let creds = req.get("credentials");
+    let field = |name: &str| {
+        creds
+            .and_then(|c| c.get(name))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
+    match field("type") {
+        "personal_access_token" => match field("token") {
+            EXT_AUTH_TOKEN => allow_response(EXT_AUTH_IGGY_USERNAME),
+            EXT_DENIED_TOKEN => deny_response("token revoked"),
+            _ => deny_response("unknown token"),
+        },
+        "username_password" => match (field("username"), field("password")) {
+            (EXT_AUTH_USERNAME, EXT_AUTH_PASSWORD) => allow_response(EXT_AUTH_IGGY_USERNAME),
+            (EXT_DENIED_USERNAME, EXT_DENIED_PASSWORD) => deny_response("access denied by policy"),
+            _ => deny_response("unknown user or bad credentials"),
+        },
+        _ => deny_response("unsupported credential type"),
+    }
 }

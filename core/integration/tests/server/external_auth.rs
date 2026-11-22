@@ -27,8 +27,8 @@ use std::time::Duration;
 use iggy::prelude::*;
 use iggy_common::BINARY_OPERATION_TIMEOUT;
 use integration::harness::ext_auth_server::{
-    EXT_AUTH_IGGY_USERNAME, EXT_AUTH_PASSWORD, EXT_AUTH_USERNAME, EXT_DENIED_PASSWORD,
-    EXT_DENIED_USERNAME, ExtAuthServer,
+    EXT_AUTH_IGGY_USERNAME, EXT_AUTH_PASSWORD, EXT_AUTH_TOKEN, EXT_AUTH_USERNAME,
+    EXT_DENIED_PASSWORD, EXT_DENIED_TOKEN, EXT_DENIED_USERNAME, ExtAuthServer,
 };
 use integration::harness::{TestHarness, TestServerConfig, USER_PASSWORD, create_user, login_root};
 use test_case::test_case;
@@ -41,18 +41,63 @@ fn ext_auth_envs(url: &str) -> HashMap<String, String> {
     ])
 }
 
+fn ext_auth_pat_envs(url: &str) -> HashMap<String, String> {
+    let mut envs = ext_auth_envs(url);
+    envs.insert(
+        "IGGY_EXTERNAL_AUTH_CREDENTIAL_TYPES".to_owned(),
+        "[username_password, personal_access_token]".to_owned(),
+    );
+    envs
+}
+
 async fn start_ext_auth_harness(ext_server: &ExtAuthServer) -> TestHarness {
+    start_harness_with_envs(ext_auth_envs(&ext_server.url())).await
+}
+
+async fn start_ext_auth_pat_harness(ext_server: &ExtAuthServer) -> TestHarness {
+    start_harness_with_envs(ext_auth_pat_envs(&ext_server.url())).await
+}
+
+async fn start_harness_with_envs(envs: HashMap<String, String>) -> TestHarness {
     let mut harness = TestHarness::builder()
-        .server(
-            TestServerConfig::builder()
-                .extra_envs(ext_auth_envs(&ext_server.url()))
-                .build(),
-        )
+        .server(TestServerConfig::builder().extra_envs(envs).build())
         .cluster_nodes(1)
         .build()
         .expect("build harness");
     harness.start().await.expect("start server");
     harness
+}
+
+async fn provision_mapped_user(harness: &TestHarness) {
+    let root_client = harness
+        .client_builder_for(TransportProtocol::Tcp)
+        .expect("tcp builder")
+        .connect()
+        .await
+        .expect("root connect");
+    login_root(&root_client).await.expect("root login");
+    create_user(&root_client, EXT_AUTH_IGGY_USERNAME).await;
+}
+
+/// A token the callout rejects must fail with the same error as a token the
+/// server rejects locally.
+fn assert_token_rejected(transport: TransportProtocol, err: &IggyError) {
+    match transport {
+        TransportProtocol::Tcp | TransportProtocol::Quic | TransportProtocol::WebSocket => {
+            assert!(
+                matches!(err, IggyError::InvalidPersonalAccessToken),
+                "expected InvalidPersonalAccessToken, got: {err}"
+            );
+        }
+        // HTTP maps InvalidPersonalAccessToken to 401, which the SDK reports
+        // as Unauthenticated.
+        TransportProtocol::Http => {
+            assert!(
+                matches!(err, IggyError::Unauthenticated),
+                "expected Unauthenticated, got: {err}"
+            );
+        }
+    }
 }
 
 // ── allow login (all transports) ───────────────────────────────────
@@ -237,6 +282,179 @@ async fn given_ext_auth_when_local_user_correct_password_should_succeed(
         .login_user("local-user", USER_PASSWORD)
         .await
         .expect("local user with correct password should succeed");
+}
+
+// ── personal access token allow (all transports) ───────────────────
+
+#[test_case(TransportProtocol::Tcp ; "tcp")]
+#[test_case(TransportProtocol::Http ; "http")]
+#[test_case(TransportProtocol::Quic ; "quic")]
+#[test_case(TransportProtocol::WebSocket ; "websocket")]
+#[tokio::test]
+async fn given_ext_auth_pat_when_allow_token_login_should_authorize(transport: TransportProtocol) {
+    let ext_server = ExtAuthServer::start().await;
+    let harness = start_ext_auth_pat_harness(&ext_server).await;
+    provision_mapped_user(&harness).await;
+
+    let ext_client = harness
+        .client_builder_for(transport)
+        .expect("client builder")
+        .connect()
+        .await
+        .expect("ext connect");
+    ext_client
+        .login_with_personal_access_token(EXT_AUTH_TOKEN)
+        .await
+        .expect("ext-auth token login should succeed");
+
+    let streams = ext_client
+        .get_streams()
+        .await
+        .expect("ext-auth token user should be able to read streams");
+    assert!(streams.is_empty());
+    assert_eq!(ext_server.request_count(), 1);
+}
+
+// ── personal access token deny (all transports) ────────────────────
+
+#[test_case(TransportProtocol::Tcp ; "tcp")]
+#[test_case(TransportProtocol::Http ; "http")]
+#[test_case(TransportProtocol::Quic ; "quic")]
+#[test_case(TransportProtocol::WebSocket ; "websocket")]
+#[tokio::test]
+async fn given_ext_auth_pat_when_deny_token_login_should_reject(transport: TransportProtocol) {
+    let ext_server = ExtAuthServer::start().await;
+    let harness = start_ext_auth_pat_harness(&ext_server).await;
+
+    let client = harness
+        .client_builder_for(transport)
+        .expect("client builder")
+        .connect()
+        .await
+        .expect("connect");
+    let err = client
+        .login_with_personal_access_token(EXT_DENIED_TOKEN)
+        .await
+        .expect_err("denied ext-auth token login should fail");
+    assert_token_rejected(transport, &err);
+    assert_eq!(
+        ext_server.request_count(),
+        1,
+        "an unknown token must reach the ext-auth service"
+    );
+}
+
+// ── personal access token not forwarded by default ─────────────────
+
+#[test_case(TransportProtocol::Tcp ; "tcp")]
+#[test_case(TransportProtocol::Http ; "http")]
+#[tokio::test]
+async fn given_ext_auth_without_pat_type_when_token_login_should_reject_without_callout(
+    transport: TransportProtocol,
+) {
+    let ext_server = ExtAuthServer::start().await;
+    let harness = start_ext_auth_harness(&ext_server).await;
+    provision_mapped_user(&harness).await;
+
+    let client = harness
+        .client_builder_for(transport)
+        .expect("client builder")
+        .connect()
+        .await
+        .expect("connect");
+    let err = client
+        .login_with_personal_access_token(EXT_AUTH_TOKEN)
+        .await
+        .expect_err("token login must fail when tokens are not forwarded");
+    assert_token_rejected(transport, &err);
+    assert_eq!(
+        ext_server.request_count(),
+        0,
+        "tokens must not reach the ext-auth service unless configured"
+    );
+}
+
+// ── local personal access token (all transports) ───────────────────
+
+#[test_case(TransportProtocol::Tcp ; "tcp")]
+#[test_case(TransportProtocol::Http ; "http")]
+#[test_case(TransportProtocol::Quic ; "quic")]
+#[test_case(TransportProtocol::WebSocket ; "websocket")]
+#[tokio::test]
+async fn given_ext_auth_pat_when_local_token_login_should_succeed_without_callout(
+    transport: TransportProtocol,
+) {
+    let ext_server = ExtAuthServer::start().await;
+    let harness = start_ext_auth_pat_harness(&ext_server).await;
+
+    let root_client = harness
+        .client_builder_for(TransportProtocol::Tcp)
+        .expect("tcp builder")
+        .connect()
+        .await
+        .expect("root connect");
+    login_root(&root_client).await.expect("root login");
+    let raw_pat = root_client
+        .create_personal_access_token("local-pat", IggyExpiry::NeverExpire)
+        .await
+        .expect("create local PAT");
+
+    let client = harness
+        .client_builder_for(transport)
+        .expect("client builder")
+        .connect()
+        .await
+        .expect("connect");
+    client
+        .login_with_personal_access_token(&raw_pat.token)
+        .await
+        .expect("local token login should succeed");
+    assert_eq!(
+        ext_server.request_count(),
+        0,
+        "a local token must not reach the ext-auth service"
+    );
+}
+
+// ── expired local personal access token (TCP only) ─────────────────
+
+#[tokio::test]
+async fn given_ext_auth_pat_when_local_token_expired_should_call_out() {
+    let ext_server = ExtAuthServer::start().await;
+    let harness = start_ext_auth_pat_harness(&ext_server).await;
+
+    let root_client = harness
+        .client_builder_for(TransportProtocol::Tcp)
+        .expect("tcp builder")
+        .connect()
+        .await
+        .expect("root connect");
+    login_root(&root_client).await.expect("root login");
+    let raw_pat = root_client
+        .create_personal_access_token(
+            "expiring-pat",
+            IggyExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(1))),
+        )
+        .await
+        .expect("create expiring PAT");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let client = harness
+        .client_builder_for(TransportProtocol::Tcp)
+        .expect("tcp builder")
+        .connect()
+        .await
+        .expect("connect");
+    let err = client
+        .login_with_personal_access_token(&raw_pat.token)
+        .await
+        .expect_err("expired token login should fail");
+    assert_token_rejected(TransportProtocol::Tcp, &err);
+    assert_eq!(
+        ext_server.request_count(),
+        1,
+        "an expired local token must reach the ext-auth service like an unknown one"
+    );
 }
 
 // ── server failure (TCP only, transport-independent behavior) ──────
