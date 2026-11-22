@@ -79,8 +79,9 @@ pub struct User {
     pub password_hash: Arc<str>,
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
-    /// Op of the last credential boundary: the create, a password change, or a
-    /// revocation. A credential verified before it can no longer sign in.
+    /// Op of the last credential boundary: the create, a password change, a
+    /// deactivation or a reactivation. A credential verified before it can no
+    /// longer sign in.
     pub access_revision: u64,
     pub permissions: Option<Arc<Permissions>>,
     pub options: ResourceOptions,
@@ -132,7 +133,8 @@ define_state! {
         // differs across replicas (random seed), so this map MUST only be
         // touched via single-key `.get` / `.insert` / `.remove`. Never
         // iterate. Reach for `BTreeMap` the first time iteration is needed.
-        pub personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
+        // Maps a token hash to its owner, its name and the op that created it.
+        pub personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>, u64)>,
         // Expiry-ordered index of expiring PATs: `(expiry_micros, user_id,
         // name)`. Never-expiring tokens are absent. Unlike the sibling
         // `AHashMap` index above, a `BTreeSet` is safe to iterate (its order
@@ -235,6 +237,13 @@ impl UsersInner {
             return None;
         }
         self.personal_access_tokens.get(owner)?.get(name)
+    }
+
+    /// Whether the token `user_id` created at op `token_id` is live and unexpired at `now`.
+    #[must_use]
+    pub fn holds_live_token(&self, user_id: u32, token_id: u64, now: IggyTimestamp) -> bool {
+        self.token_of(user_id, token_id)
+            .is_some_and(|token| !token.is_expired(now))
     }
 
     /// The op that created the live token `name` of `user_id`.
@@ -854,6 +863,7 @@ impl StateHandler for UpdateUserResolvedRequest {
                 }
             };
         let before = user_body(user);
+        let was_active = user.status == UserStatus::Active;
 
         let Some(user) = state.items.get_mut(user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
@@ -867,8 +877,10 @@ impl StateHandler for UpdateUserResolvedRequest {
             user.status = new_status;
         }
         user.options = options;
-        let revoked = user.status != UserStatus::Active;
-        if revoked {
+        let is_active = user.status == UserStatus::Active;
+        let revoked = was_active && !is_active;
+        // A reactivation moves it too, so a lagging node can tell a token issued after it from a revoked one.
+        if was_active != is_active {
             user.access_revision = state.apply_context.metadata_op;
         }
         // An equal patch commits as ok but changes nothing public.
@@ -1235,7 +1247,7 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
             .insert(token_id, (self.user_id, Arc::clone(&name)));
         state
             .personal_access_token_index
-            .insert(token_hash, (self.user_id, name));
+            .insert(token_hash, (self.user_id, name, token_id));
         let changes = state
             .items
             .get(self.user_id as usize)
@@ -1466,11 +1478,11 @@ impl Snapshotable for Users {
                                     name: pat.name.to_string(),
                                     token: pat.token.to_string(),
                                     expiry_at: pat.expiry_at,
+                                    // A token without an id writes 0, which the checkpoint validation refuses.
                                     id: inner
-                                        .personal_access_token_name_index
-                                        .get(&(user_id, Arc::clone(name)))
-                                        .copied()
-                                        .unwrap_or_default(),
+                                        .personal_access_token_index
+                                        .get(&pat.token)
+                                        .map_or(0, |&(_, _, token_id)| token_id),
                                 },
                             )
                         })
@@ -1551,7 +1563,7 @@ impl UsersInner {
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();
-        let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)> =
+        let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>, u64)> =
             AHashMap::new();
         let mut personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)> =
             BTreeSet::new();
@@ -1575,8 +1587,10 @@ impl UsersInner {
                         Arc::clone(&name),
                     ));
                 }
-                personal_access_token_index
-                    .insert(Arc::clone(&pat.token), (user_id, Arc::clone(&name)));
+                personal_access_token_index.insert(
+                    Arc::clone(&pat.token),
+                    (user_id, Arc::clone(&name), pat_snap.id),
+                );
                 personal_access_token_name_index.insert((user_id, Arc::clone(&name)), pat_snap.id);
                 personal_access_token_id_index.insert(pat_snap.id, (user_id, Arc::clone(&name)));
                 token_map.insert(name, pat);

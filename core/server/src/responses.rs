@@ -394,7 +394,7 @@ where
         GET_STREAM_CODE => {
             let request =
                 GetStreamRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            build_get_stream_response(shard, &request.stream_id).map(|response| {
+            build_get_stream_response(shard, &request.stream_id, user_id).map(|response| {
                 response.map_or(NonReplicatedResponse::Empty, |response| {
                     NonReplicatedResponse::Bytes(response.to_bytes())
                 })
@@ -406,11 +406,13 @@ where
         GET_TOPIC_CODE => {
             let request =
                 GetTopicRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
-            build_get_topic_response(shard, &request.stream_id, &request.topic_id).map(|response| {
-                response.map_or(NonReplicatedResponse::Empty, |response| {
-                    NonReplicatedResponse::Bytes(response.to_bytes())
-                })
-            })
+            build_get_topic_response(shard, &request.stream_id, &request.topic_id, user_id).map(
+                |response| {
+                    response.map_or(NonReplicatedResponse::Empty, |response| {
+                        NonReplicatedResponse::Bytes(response.to_bytes())
+                    })
+                },
+            )
         }
         GET_TOPICS_CODE => Ok(NonReplicatedResponse::Bytes(
             build_get_topics_response(shard, body, user_id)?.to_bytes(),
@@ -633,9 +635,12 @@ where
     })
 }
 
+/// The stream `user_id` may read, checked against grants of the same
+/// checkpoint so a reused id never serves the grant of its predecessor.
 fn build_get_stream_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
+    user_id: Option<u32>,
 ) -> Result<Option<GetStreamResponse>, IggyError>
 where
     B: ShellBus,
@@ -644,25 +649,26 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let stored =
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|streams| -> Result<_, IggyError> {
-                let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
-                    return Ok(None);
-                };
-                let stream = streams
-                    .items
-                    .get(stream_id)
-                    .ok_or(IggyError::InvalidIdentifier)?;
-                Ok(Some((
-                    StoredEntry::from(stream).into_owned(),
-                    stored_topics(stream),
-                )))
-            })?;
+    let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+    let stored = shard.plane.metadata().mux_stm.read_scoped_page(
+        user_id,
+        |streams, permissions| -> Result<_, IggyError> {
+            let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
+                return Ok(None);
+            };
+            if !ReadGrants::for_stream(permissions, Some(stream_id)).reads_stream() {
+                return Err(IggyError::Unauthorized);
+            }
+            let stream = streams
+                .items
+                .get(stream_id)
+                .ok_or(IggyError::InvalidIdentifier)?;
+            Ok(Some((
+                StoredEntry::from(stream).into_owned(),
+                stored_topics(stream),
+            )))
+        },
+    )?;
     let Some((stream, topics)) = stored else {
         return Ok(None);
     };
@@ -893,10 +899,12 @@ fn personal_access_tokens_response(
     Ok(GetPersonalAccessTokensResponse { tokens })
 }
 
+/// The topic `user_id` may read, checked like [`build_get_stream_response`].
 fn build_get_topic_response<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     stream_id: &WireIdentifier,
     topic_id: &WireIdentifier,
+    user_id: Option<u32>,
 ) -> Result<Option<GetTopicResponse>, IggyError>
 where
     B: ShellBus,
@@ -905,44 +913,45 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    let stored =
-        shard
-            .plane
-            .metadata()
-            .mux_stm
-            .streams()
-            .read(|streams| -> Result<_, IggyError> {
-                let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
-                    return Ok(None);
-                };
-                let Some(topic_id) = streams.resolve_topic_id(stream_id, topic_id) else {
-                    return Ok(None);
-                };
-                let stream = streams
-                    .items
-                    .get(stream_id)
-                    .ok_or(IggyError::InvalidIdentifier)?;
-                let topic = stream
-                    .topics
-                    .get(topic_id)
-                    .ok_or(IggyError::InvalidIdentifier)?;
-                let nodes = shard.replica_topology().replica_count;
-                let partitions = topic
-                    .partitions
-                    .iter()
-                    .map(|partition| {
-                        partition_response(
-                            streams,
-                            stream_id,
-                            topic_id,
-                            partition,
-                            shard.plane.metadata().applied_frontier().get(),
-                            nodes,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(Some((StoredEntry::from(topic).into_owned(), partitions)))
-            })?;
+    let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
+    let stored = shard.plane.metadata().mux_stm.read_scoped_page(
+        user_id,
+        |streams, permissions| -> Result<_, IggyError> {
+            let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
+                return Ok(None);
+            };
+            let Some(topic_id) = streams.resolve_topic_id(stream_id, topic_id) else {
+                return Ok(None);
+            };
+            if !ReadGrants::for_stream(permissions, Some(stream_id)).reads_topic(topic_id) {
+                return Err(IggyError::Unauthorized);
+            }
+            let stream = streams
+                .items
+                .get(stream_id)
+                .ok_or(IggyError::InvalidIdentifier)?;
+            let topic = stream
+                .topics
+                .get(topic_id)
+                .ok_or(IggyError::InvalidIdentifier)?;
+            let nodes = shard.replica_topology().replica_count;
+            let partitions = topic
+                .partitions
+                .iter()
+                .map(|partition| {
+                    partition_response(
+                        streams,
+                        stream_id,
+                        topic_id,
+                        partition,
+                        shard.plane.metadata().applied_frontier().get(),
+                        nodes,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some((StoredEntry::from(topic).into_owned(), partitions)))
+        },
+    )?;
     let Some((topic, partitions)) = stored else {
         return Ok(None);
     };
@@ -1224,9 +1233,9 @@ fn partitions_page(
 }
 
 /// One page of the streams the caller may read, and the streams it leaves out
-/// because this build cannot read them. A hidden stream counts against the
-/// scan budget like any walked entry, and is checked before its name, so a
-/// name filter tells nothing about streams the caller cannot read.
+/// because this build cannot read them. A caller without a global read walks
+/// only the streams its grants read, so a hidden stream costs no scan budget
+/// and no cursor names one.
 fn streams_page(
     streams: &StreamsInner,
     page: WirePageQuery,
@@ -1236,8 +1245,7 @@ fn streams_page(
     let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(page)?;
     let start = WalkStart::try_from(&query)?;
     // A caller that reads no stream gets the last page without a walk it would only skip.
-    let Some(permissions) = permissions.filter(|grants| ReadGrants::reads_some_stream(grants))
-    else {
+    let Some(permissions) = permissions else {
         return Ok((
             PageResponse {
                 items: Vec::new(),
@@ -1249,9 +1257,7 @@ fn streams_page(
     let limit = query.limit as usize;
     let mut skipped = Vec::new();
     let project = |stream: &Stream| {
-        if !ReadGrants::for_stream(Some(permissions), Some(stream.id)).reads_stream()
-            || !matches_name(&stream.name, name.as_deref())
-        {
+        if !matches_name(&stream.name, name.as_deref()) {
             return Ok(None);
         }
         servable(
@@ -1262,6 +1268,20 @@ fn streams_page(
             None,
         )
     };
+    if let Some(granted) =
+        ReadGrants::granted_streams(permissions, start.after_id(), query.descending)
+    {
+        let page = granted_page(
+            granted.filter_map(|id| Some((id, streams.items.get(id)?))),
+            |stream| stream.created_at,
+            start,
+            query.descending,
+            limit,
+            budget,
+            project,
+        )?;
+        return Ok((page, skipped));
+    }
     let page = match start {
         WalkStart::Id(after) => collect_page(
             streams
@@ -1292,8 +1312,7 @@ fn streams_page(
 /// the stream was deleted during the walk, so the pages read are not the list.
 /// A cursor cannot prove what an earlier page showed, so a scoped caller gets
 /// the empty last page for a missing stream too, the answer it gets for one it
-/// cannot see. A hidden topic counts against the scan budget like any walked
-/// entry, and is checked before its name.
+/// cannot see. A caller whose grants read only some topics walks just those.
 fn topics_page(
     streams: &StreamsInner,
     request: GetTopicsRequest,
@@ -1319,9 +1338,6 @@ fn topics_page(
         }
         return last_empty_page();
     };
-    if !grants.reads_some_topic() {
-        return last_empty_page();
-    }
     let stream = streams
         .items
         .get(stream_id)
@@ -1329,7 +1345,7 @@ fn topics_page(
     let limit = query.limit as usize;
     let mut skipped = Vec::new();
     let project = |topic: &Topic| {
-        if !grants.reads_topic(topic.id) || !matches_name(&topic.name, name.as_deref()) {
+        if !matches_name(&topic.name, name.as_deref()) {
             return Ok(None);
         }
         servable(
@@ -1340,6 +1356,18 @@ fn topics_page(
             Some(stream_id),
         )
     };
+    if let Some(granted) = grants.granted_topics(start.after_id(), query.descending) {
+        let page = granted_page(
+            granted.filter_map(|id| Some((id, stream.topics.get(id)?))),
+            |topic| topic.created_at,
+            start,
+            query.descending,
+            limit,
+            budget,
+            project,
+        )?;
+        return Ok((page, skipped));
+    }
     let page = match start {
         WalkStart::Id(after) => collect_page(
             stream
@@ -1362,6 +1390,42 @@ fn topics_page(
         }
     }?;
     Ok((page, skipped))
+}
+
+/// One page over `granted`, the entries of a scoped caller in the requested id range.
+fn granted_page<'a, E: 'a, T: WireEncode>(
+    granted: impl Iterator<Item = (usize, &'a E)>,
+    created_at: impl Fn(&E) -> IggyTimestamp,
+    start: WalkStart,
+    descending: bool,
+    limit: usize,
+    budget: PageBudget,
+    project: impl FnMut(&'a E) -> Result<Option<T>, IggyError>,
+) -> Result<PageResponse<T>, IggyError> {
+    match start {
+        WalkStart::Id(_) => collect_page(
+            granted.map(|(id, entry)| (WirePageCursor::Id(id as u64), entry)),
+            limit,
+            budget,
+            project,
+        ),
+        WalkStart::Created(after) => {
+            let key = |id: usize, entry: &E| (created_at(entry).as_micros(), id);
+            let mut granted: Vec<_> = granted.collect();
+            granted.sort_unstable_by_key(|&(id, entry)| key(id, entry));
+            collect_page(
+                slice_after(&granted, |&(id, entry)| key(id, entry), after, descending).map(
+                    |&(id, entry)| {
+                        let (created, id) = key(id, entry);
+                        (created_cursor(created, id), entry)
+                    },
+                ),
+                limit,
+                budget,
+                project,
+            )
+        }
+    }
 }
 
 /// One page of the consumer groups of a topic, in id order. Group ids follow
@@ -1436,9 +1500,19 @@ fn users_page(
 }
 
 /// Where a walk in the order of a query starts.
+#[derive(Clone, Copy)]
 enum WalkStart {
     Id(Option<usize>),
     Created(Option<(u64, usize)>),
+}
+
+impl WalkStart {
+    const fn after_id(self) -> Option<usize> {
+        match self {
+            Self::Id(after) => after,
+            Self::Created(_) => None,
+        }
+    }
 }
 
 impl TryFrom<&PageQuery> for WalkStart {
@@ -1511,7 +1585,11 @@ impl NonReplicatedResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::test_support::{FIRST_BOOT, SpyBus, test_shard};
+    use crate::dispatch::test_support::{
+        FIRST_BOOT, SpyBus, create_one_partition, create_reader_request, prepare_message,
+        test_shard,
+    };
+    use iggy_binary_protocol::Operation;
     use iggy_binary_protocol::primitives::page::WirePageOrder;
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
@@ -1525,9 +1603,9 @@ mod tests {
         TopicPermissions,
     };
     use metadata::permissioner::Permissioner;
-    use metadata::stm::StateHandler;
     use metadata::stm::snapshot::{FillSnapshot, MetadataSnapshot, RestoreSnapshotInPlace};
     use metadata::stm::stream::Partition;
+    use metadata::stm::{StateHandler, StateMachine as _};
     use std::str::FromStr;
 
     #[compio::test]
@@ -1569,6 +1647,49 @@ mod tests {
             .unwrap();
         assert!(build_get_streams_response(&shard, &streams, Some(0)).is_ok());
         assert!(build_get_topics_response(&shard, &topics, Some(0)).is_ok());
+    }
+
+    #[test]
+    fn given_a_reader_without_a_grant_when_getting_a_stream_or_topic_should_refuse_in_the_read() {
+        const READER: u32 = 1;
+        let shard = Rc::new(test_shard(&SpyBus::default(), 0, 1, FIRST_BOOT));
+        let mux_stm = &shard.plane.metadata().mux_stm;
+        create_one_partition(&shard);
+        mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                1,
+                3,
+                &create_reader_request().to_bytes(),
+            ))
+            .unwrap();
+        let stream = WireIdentifier::numeric(0);
+        let topic = WireIdentifier::numeric(0);
+
+        for user_id in [Some(READER), None] {
+            assert!(build_get_stream_response(&shard, &stream, user_id).is_err());
+            assert!(build_get_topic_response(&shard, &stream, &topic, user_id).is_err());
+        }
+        assert!(matches!(
+            build_get_stream_response(&shard, &stream, Some(READER)),
+            Err(IggyError::Unauthorized)
+        ));
+        assert!(matches!(
+            build_get_topic_response(&shard, &stream, &topic, Some(READER)),
+            Err(IggyError::Unauthorized)
+        ));
+        assert!(matches!(
+            build_get_stream_response(&shard, &stream, Some(0)),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            build_get_topic_response(&shard, &stream, &topic, Some(0)),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            build_get_stream_response(&shard, &WireIdentifier::numeric(9), Some(READER)),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -2830,6 +2951,106 @@ mod tests {
         });
         let names: Vec<&str> = found.iter().map(|topic| topic.name.as_str()).collect();
         assert_eq!(names, ["tb"]);
+    }
+
+    #[test]
+    fn given_scoped_reader_when_paging_should_walk_only_what_its_grants_read() {
+        let streams = paged_streams();
+        // Stream ids 1 and 4 hold f and e. Topic ids 1 and 2 of stream 0 hold tb and tc.
+        let read_stream = StreamPermissions {
+            read_stream: true,
+            ..Default::default()
+        };
+        let read_topic = TopicPermissions {
+            read_topic: true,
+            ..Default::default()
+        };
+        let scoped = Permissions {
+            streams: Some(
+                [
+                    (
+                        0,
+                        StreamPermissions {
+                            topics: Some([(1, read_topic.clone()), (2, read_topic)].into()),
+                            ..Default::default()
+                        },
+                    ),
+                    (1, read_stream.clone()),
+                    (4, read_stream),
+                ]
+                .into(),
+            ),
+            ..Default::default()
+        };
+        let read_streams = |budget, page| {
+            streams_page(&streams, page, budget, Some(&scoped))
+                .unwrap()
+                .0
+        };
+        let read_topics = |budget, page| {
+            let request = GetTopicsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                page,
+            };
+            topics_page(&streams, request, budget, Some(&scoped))
+                .unwrap()
+                .0
+        };
+        let stream_name = |stream: &StreamResponse| stream.name.as_str().to_owned();
+        let topic_name = |topic: &TopicResponse| topic.name.as_str().to_owned();
+        for (order, streams_ascending, topics_ascending) in [
+            (WirePageOrder::Id, ["f", "e"], ["tb", "tc"]),
+            (WirePageOrder::Created, ["e", "f"], ["tb", "tc"]),
+        ] {
+            assert_walks(
+                order,
+                &streams_ascending,
+                |page| read_streams(PAGE_BUDGET, page),
+                |stream| stream.name.as_str(),
+            );
+            assert_walks(
+                order,
+                &topics_ascending,
+                |page| read_topics(PAGE_BUDGET, page),
+                |topic| topic.name.as_str(),
+            );
+        }
+
+        let one_scanned = PageBudget {
+            scanned_entries: 1,
+            ..PAGE_BUDGET
+        };
+        let (streams_found, stream_pages) = walk_pages(|cursor| {
+            read_streams(
+                one_scanned,
+                WirePageQuery {
+                    cursor,
+                    ..WirePageQuery::default()
+                },
+            )
+        });
+        let (topics_found, topic_pages) = walk_pages(|cursor| {
+            read_topics(
+                one_scanned,
+                WirePageQuery {
+                    cursor,
+                    ..WirePageQuery::default()
+                },
+            )
+        });
+        assert_eq!(
+            streams_found.iter().map(stream_name).collect::<Vec<_>>(),
+            ["f", "e"]
+        );
+        assert_eq!(
+            topics_found.iter().map(topic_name).collect::<Vec<_>>(),
+            ["tb", "tc"]
+        );
+        assert_eq!(
+            (stream_pages, topic_pages),
+            (2, 2),
+            "every scanned entry is one the caller reads"
+        );
     }
 
     #[test]

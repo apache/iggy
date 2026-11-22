@@ -46,8 +46,8 @@ impl CliCommand for DeletePersonalAccessTokenCmd {
         )
     }
 
-    fn may_end_session(&self) -> bool {
-        true
+    fn deleted_token(&self) -> Option<String> {
+        Some(self.delete_token.name.clone())
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {

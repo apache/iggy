@@ -401,6 +401,17 @@ impl MetadataSnapshot {
         if let Some(users) = &self.users {
             users.validate_credential_ids(self.sequence_number)?;
         }
+        // A session's token was created before the session registered.
+        if self.client_table.as_ref().is_some_and(|table| {
+            table
+                .slots
+                .iter()
+                .any(|(_, entry)| entry.token_id >= entry.epoch)
+        }) {
+            return Err(SnapshotError::InvalidState(
+                "client entry token outside its session history",
+            ));
+        }
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
             streams.validate_partition_members()?;
@@ -713,6 +724,8 @@ mod tests {
         const STREAM_FIELD_COUNT: u32 = 8;
         const STREAMS_FIELD_COUNT: u32 = 5;
         const USER_FIELD_COUNT: u32 = 8;
+        const PERSONAL_ACCESS_TOKEN_FIELD_COUNT: u32 = 5;
+        const CLIENT_ENTRY_FIELD_COUNT: u32 = 8;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
         // treatment or a bump.
@@ -734,6 +747,23 @@ mod tests {
             "ClientTableSnapshot's field count changed; default the new field or bump the version"
         );
         cursor.clear();
+
+        let client_entry = consensus::ClientEntrySnapshot {
+            bind_verifier: [0; 32],
+            ended_op: None,
+            client_id: 0,
+            epoch: 0,
+            user_id: 0,
+            token_id: 0,
+            watermark: 0,
+            reply: Vec::new(),
+        };
+        let encoded = rmp_serde::to_vec(&client_entry).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            CLIENT_ENTRY_FIELD_COUNT,
+            "ClientEntrySnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
 
         let topic = TopicSnapshot {
             id: 0,
@@ -828,6 +858,20 @@ mod tests {
             rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
             USER_FIELD_COUNT,
             "UserSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+
+        let token = PersonalAccessTokenSnapshot {
+            user_id: 0,
+            name: String::new(),
+            token: String::new(),
+            expiry_at: None,
+            id: 0,
+        };
+        let encoded = rmp_serde::to_vec(&token).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            PERSONAL_ACCESS_TOKEN_FIELD_COUNT,
+            "PersonalAccessTokenSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
     }
 

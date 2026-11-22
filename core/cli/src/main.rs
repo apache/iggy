@@ -494,8 +494,9 @@ async fn run() -> Result<(), IggyCmdError> {
     }
     command.execute_with_iggy_client(&client).await?;
 
+    let deleted_token = command.deleted_token();
     tokio::select! {
-        logout = credentials.logout_user(command.may_end_session()) => logout?,
+        logout = credentials.logout_user(deleted_token.as_deref()) => logout?,
         _ = tokio::signal::ctrl_c() => std::process::exit(130),
     }
 

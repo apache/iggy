@@ -269,13 +269,8 @@ async fn given_checkpointed_token_sessions_when_the_primary_changes_should_revok
     harness
         .kill_node(leader)
         .expect("stop the original primary");
-    create_after_failover(harness, replacement, "after-token-failover").await;
-    let new_leader = disk::leader_node_index_via(harness, replacement).await;
-    assert_ne!(new_leader, leader);
-    harness
-        .root_client_for_node(new_leader)
+    create_after_failover(harness, replacement, "after-token-failover")
         .await
-        .expect("new primary")
         .delete_personal_access_token("retire")
         .await
         .expect("delete token");
@@ -336,7 +331,7 @@ async fn node_readers(harness: &TestHarness) -> Vec<IggyClient> {
 
 /// An HTTP client of one node. HTTP reads answer from the node they reach,
 /// so each reader sees that node's own log.
-async fn node_reader(harness: &TestHarness, node: usize) -> IggyClient {
+pub(super) async fn node_reader(harness: &TestHarness, node: usize) -> IggyClient {
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
         let builder = harness.node(node).http_client().expect("HTTP endpoint");
@@ -392,7 +387,7 @@ async fn create_streams(writer: &IggyClient, label: &str, count: usize) {
 /// Create a stream through `node` while the cluster elects a new primary. An
 /// attempt whose reply was lost may have committed, so an existing name
 /// counts as done.
-async fn create_after_failover(harness: &TestHarness, node: usize, name: &str) {
+async fn create_after_failover(harness: &TestHarness, node: usize, name: &str) -> IggyClient {
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
         if let Ok(client) = harness.root_client_for_node(node).await {
@@ -400,7 +395,7 @@ async fn create_after_failover(harness: &TestHarness, node: usize, name: &str) {
                 .create_stream(name, &StreamCreateOptions::default())
                 .await
             {
-                Ok(_) | Err(IggyError::StreamNameAlreadyExists(_)) => return,
+                Ok(_) | Err(IggyError::StreamNameAlreadyExists(_)) => return client,
                 Err(_) => {}
             }
         }

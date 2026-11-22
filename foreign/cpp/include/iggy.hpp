@@ -5126,7 +5126,7 @@ constexpr std::string_view to_string(const MetadataTokenDeletedReason reason) {
 enum class MetadataSessionClosedReason : std::uint8_t {
     Logout  = 0,
     Expired = 1,
-    Revoked = 2,  ///< The user was deactivated or deleted.
+    Revoked = 2,  ///< A user delete, deactivation, password change, or delete of the session's token.
 };
 
 constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {

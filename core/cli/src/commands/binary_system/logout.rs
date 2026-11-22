@@ -24,12 +24,14 @@ use tracing::{Level, event};
 
 pub struct LogoutCmd {
     server_session: ServerSession,
+    deleted_session_token: bool,
 }
 
 impl LogoutCmd {
     pub fn new(server_address: String) -> Self {
         Self {
             server_session: ServerSession::new(server_address),
+            deleted_session_token: false,
         }
     }
 }
@@ -40,8 +42,9 @@ impl CliCommand for LogoutCmd {
         "logout command".to_owned()
     }
 
-    fn may_end_session(&self) -> bool {
-        true
+    fn deleted_token(&self) -> Option<String> {
+        self.deleted_session_token
+            .then(|| self.server_session.get_token_name())
     }
 
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
@@ -56,6 +59,7 @@ impl CliCommand for LogoutCmd {
                     )
                 })?;
 
+            self.deleted_session_token = true;
             self.server_session.delete()?;
         }
         event!(target: PRINT_TARGET, Level::INFO, "Successfully logged out from Iggy server {}", self.server_session.get_server_address());

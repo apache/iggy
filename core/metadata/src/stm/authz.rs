@@ -113,21 +113,35 @@ where
     Ok(reply)
 }
 
-/// An admitted request can commit after its user was deleted or disabled.
+/// An admitted request can commit after its user was deleted or disabled, or
+/// after the token its session was opened with expired while it waited.
 /// Check the replicated session table before resolving the reused user ID.
+/// `token_live` tells whether a user's token is live at the prepare timestamp.
 /// Partition completions use a synthetic session without a client-table entry.
 pub(crate) fn reject_stale_session(
     header: &PrepareHeader,
     client_table: &ClientTable,
+    token_live: impl FnOnce(u32, u64) -> bool,
 ) -> Option<ApplyReply> {
     if matches!(
         header.operation,
         Operation::CompleteConsumerGroupRevocation | Operation::CompleteLifecycle
-    ) {
+    ) || header.session == 0
+    {
         return None;
     }
-    (header.session != 0 && client_table.get_epoch(header.client) != Some(header.session))
-        .then(|| ApplyReply::err(IggyError::StaleClient.as_code()))
+    let stale = || Some(ApplyReply::err(IggyError::StaleClient.as_code()));
+    if client_table.get_epoch(header.client) != Some(header.session) {
+        return stale();
+    }
+    let token_id = client_table.token_id(header.client);
+    if token_id == 0 {
+        return None;
+    }
+    match client_table.get_user_id(header.client) {
+        Some(user_id) if token_live(user_id, token_id) => None,
+        _ => stale(),
+    }
 }
 
 /// Generic entry point to `gated_apply` for the WAL-replay path.
@@ -156,6 +170,9 @@ pub trait GatedApply:
         credential: &CredentialProof,
         now: IggyTimestamp,
     ) -> bool;
+
+    /// Whether the token `user_id` created at op `token_id` is live at the prepare timestamp `now`.
+    fn holds_live_token(&self, user_id: u32, token_id: u64, now: IggyTimestamp) -> bool;
 
     /// Rebinds the consumer group memberships of the client a replayed
     /// Register committed to `session`, returning the handover records.
@@ -188,6 +205,11 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
     ) -> bool {
         self.users()
             .read(|users| users.accepts_credential_at(user_id, credential, now))
+    }
+
+    fn holds_live_token(&self, user_id: u32, token_id: u64, now: IggyTimestamp) -> bool {
+        self.users()
+            .read(|users| users.holds_live_token(user_id, token_id, now))
     }
 
     fn refresh_session(
@@ -616,6 +638,10 @@ impl GatedApply for MuxStateMachine<()> {
         _credential: &CredentialProof,
         _now: IggyTimestamp,
     ) -> bool {
+        true
+    }
+
+    fn holds_live_token(&self, _user_id: u32, _token_id: u64, _now: IggyTimestamp) -> bool {
         true
     }
 
@@ -1137,7 +1163,7 @@ mod tests {
                     ..Default::default()
                 };
                 assert_eq!(
-                    reject_stale_session(&header, &table)
+                    reject_stale_session(&header, &table, |_, _| true)
                         .expect("a reserved ID must not bypass session fencing")
                         .code,
                     IggyError::StaleClient.as_code(),

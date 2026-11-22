@@ -195,7 +195,7 @@ where
                 MetadataSubmitError::NotCaughtUp,
             ));
         }
-        let Some((user_id, token_name)) =
+        let Some((user_id, token_name, token_id)) =
             users.personal_access_token_index.get(token_hash.as_str())
         else {
             return Err(LoginRegisterError::InvalidToken);
@@ -213,9 +213,6 @@ where
         let Some(user) = users.items.get(*user_id as usize) else {
             return Err(LoginRegisterError::InvalidToken);
         };
-        let Some(token_id) = users.token_id_of(*user_id, token_name) else {
-            return Err(LoginRegisterError::InvalidToken);
-        };
         if user.status != UserStatus::Active || check_critical_options(&user.options).is_err() {
             return Err(LoginRegisterError::UserInactive);
         }
@@ -226,7 +223,7 @@ where
             .map_or(u64::MAX, |expiry_at| expiry_at.as_micros());
         Ok((
             user.id,
-            CredentialProof::token(user.created_at.as_micros(), token_id),
+            CredentialProof::token(user.created_at.as_micros(), *token_id),
             expiry,
         ))
     })
@@ -1422,7 +1419,11 @@ async fn try_external_auth_login<B, MJ, S, SB>(
                         error = %iggy_error,
                         "ext-auth user resolution failed"
                     );
-                    LoginRegisterError::InvalidCredentials
+                    if iggy_error == IggyError::TransientNotAccepted {
+                        LoginRegisterError::CredentialChanged
+                    } else {
+                        LoginRegisterError::InvalidCredentials
+                    }
                 }
             }
         }
@@ -1561,6 +1562,11 @@ mod tests {
     fn terminal_vs_transient() {
         assert!(LoginRegisterError::InvalidCredentials.is_terminal());
         assert!(LoginRegisterError::InvalidToken.is_terminal());
+        assert!(!LoginRegisterError::CredentialChanged.is_terminal());
+        assert_eq!(
+            transient_login_code(&LoginRegisterError::CredentialChanged),
+            IggyError::TransientNotAccepted
+        );
         assert!(LoginRegisterError::UserInactive.is_terminal());
         assert!(LoginRegisterError::Binding(IggyError::Unauthenticated).is_terminal());
         // Transient is the only recoverable variant: never terminal.

@@ -31,7 +31,7 @@ use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyTimestamp};
 use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use journal::superblock::{
@@ -785,8 +785,11 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        let mut reply = reject_stale_session(header, &client_table)
-            .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
+        let prepared_at = IggyTimestamp::from(header.timestamp);
+        let mut reply = reject_stale_session(header, &client_table, |user_id, token_id| {
+            mux_stm.holds_live_token(user_id, token_id, prepared_at)
+        })
+        .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
         let revocations = reply
             .revoked_user
             .map(|user| Revocation::of_user(user, reply.kept_session_client))
@@ -2682,10 +2685,11 @@ mod tests {
         const TOKEN_ID: u64 = 3;
         const TOKEN_SESSION: u64 = 4;
         const PASSWORD_SESSION: u64 = 5;
-        const DELETE_OP: u64 = 6;
-        // The refused late registration takes op 7.
-        const OTHER_SESSION: u64 = 8;
-        const CHANGE_OP: u64 = 9;
+        const EXPIRED_WRITE: u64 = 6;
+        const DELETE_OP: u64 = 7;
+        // The refused late registration takes op 8.
+        const OTHER_SESSION: u64 = 9;
+        const CHANGE_OP: u64 = 10;
         const TOKEN_HASH: [u8; PAT_TOKEN_HASH_BYTES] = [b'c'; PAT_TOKEN_HASH_BYTES];
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
         let directory = tempdir().unwrap();
@@ -2726,7 +2730,7 @@ mod tests {
                 CreatePersonalAccessTokenRequest {
                     user_id: USER,
                     name: WireName::new("ci").unwrap(),
-                    expiry: 0,
+                    expiry: EXPIRED_WRITE - TOKEN_ID,
                     token_hash: TOKEN_HASH,
                 }
                 .to_bytes(),
@@ -2741,6 +2745,19 @@ mod tests {
                 PASSWORD_CLIENT,
                 USER,
                 0,
+            ),
+            (
+                Operation::CreatePersonalAccessToken,
+                CreatePersonalAccessTokenRequest {
+                    user_id: USER,
+                    name: WireName::new("after-expiry").unwrap(),
+                    expiry: 0,
+                    token_hash: [b'd'; PAT_TOKEN_HASH_BYTES],
+                }
+                .to_bytes(),
+                CLIENT,
+                USER,
+                TOKEN_SESSION,
             ),
             (
                 Operation::DeletePersonalAccessToken,
@@ -2789,6 +2806,7 @@ mod tests {
         let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
         let live_log = MetadataChangeLog::new(ChangeLogCapacities::default());
         let mut parent = 0;
+        let mut before_delete = None;
         {
             let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
                 .await
@@ -2819,10 +2837,24 @@ mod tests {
                 parent = prepare.header().checksum;
                 let committed =
                     apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                if op == EXPIRED_WRITE {
+                    assert_eq!(
+                        result_code(committed.reply.body()),
+                        Some(IggyError::StaleClient.as_code())
+                    );
+                }
                 live_log
                     .append(prepare.header(), committed.changes)
                     .expect("live ops append in order");
                 journal.append(prepare).await.unwrap();
+                // Both sessions are open and the token is live, so the restored
+                // token ids alone decide which sessions the replayed delete ends.
+                if op == PASSWORD_SESSION {
+                    let mut checkpoint = <IggySnapshot as Snapshot>::create(&stm, op, 0).unwrap();
+                    checkpoint.snapshot_mut().client_table = Some(table.borrow().to_snapshot());
+                    checkpoint.snapshot_mut().change_log = live_log.snapshot();
+                    before_delete = Some(checkpoint);
+                }
             }
             journal.storage_ref().fsync().await.unwrap();
         }
@@ -2903,6 +2935,37 @@ mod tests {
                     IggyTimestamp::from(100)
                 )),
             "the deleted token must not come back from the checkpoint"
+        );
+        drop(restarted);
+
+        before_delete
+            .expect("a checkpoint before the delete")
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .await
+            .unwrap();
+        let replayed = recover::<UserStm>(
+            directory.path(),
+            SOLO,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |stm| stm.users().ensure_root_user("root", "hash"),
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .expect("restart must replay the delete over the earlier checkpoint");
+        assert_eq!(replayed.last_applied_op, Some(last_op));
+        // A restored entry keeps only its latest reply, so compare the checkpoint forms.
+        let checkpointed = |table: &ClientTable| {
+            rmp_serde::to_vec(&table.to_snapshot()).expect("the table encodes")
+        };
+        assert!(
+            checkpointed(&replayed.client_table) == checkpointed(&table.borrow()),
+            "replay over the checkpoint must rebuild the live table"
+        );
+        assert_eq!(
+            replayed.change_log.snapshot(),
+            live_log.snapshot(),
+            "replay over the checkpoint must rebuild the live change log"
         );
     }
 

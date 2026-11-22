@@ -1693,7 +1693,7 @@ class IggyClient:
         """
     def get_streams(self) -> collections.abc.Awaitable[list[Stream]]:
         r"""
-        Return all streams, in id order.
+        Return the streams the user may read, in id order.
 
         The list is read in pages of 1,000, so it is not one consistent read.
         A stream that someone creates or deletes during the read can appear or
@@ -1715,7 +1715,7 @@ class IggyClient:
         name: builtins.str | None = None,
     ) -> collections.abc.Awaitable[StreamsPage]:
         r"""
-        Reads one page of the streams.
+        Reads one page of the streams the user may read.
 
         Pass the page's `next` as `cursor`, with the same other arguments, to
         read the next page. The read ends at the first page whose `next` is
@@ -1848,11 +1848,14 @@ class IggyClient:
         self, stream_id: builtins.str | builtins.int
     ) -> collections.abc.Awaitable[list[Topic]]:
         r"""
-        Get all topics in a stream, in id order.
+        Get the topics of a stream, in id order. The list holds only the
+        topics the user may read.
 
         The list is read in pages of 1,000, so it is not one consistent read.
         A topic that someone creates or deletes during the read can appear or
-        not appear. `get_topics_page` reads one page.
+        not appear. If the stream goes missing after the first page, the read
+        fails for a user with a global read grant, and ends there for any other
+        user. `get_topics_page` reads one page.
 
         Args:
             stream_id: Stream identifier as `str | int`.
@@ -1874,8 +1877,10 @@ class IggyClient:
         name: builtins.str | None = None,
     ) -> collections.abc.Awaitable[TopicsPage]:
         r"""
-        Reads one page of the topics of a stream. A missing stream gives an
-        empty page without `next`.
+        Reads one page of the topics of a stream. A missing stream, or one the
+        user may read no topic of, gives an empty page without `next`. For a
+        user with a global read grant, a page read with a cursor raises
+        `IggyError` instead, because the stream was deleted during the walk.
 
         Takes the keyword arguments of `get_streams_page`, with the same
         cursor rules.
@@ -3613,7 +3618,7 @@ class MetadataSessionClosedReason:
     Expired: typing.ClassVar[MetadataSessionClosedReason]
     Revoked: typing.ClassVar[MetadataSessionClosedReason]
     r"""
-    The user was deactivated or deleted.
+    A user delete, deactivation, password change, or delete of the session's token.
     """
     def __str__(self) -> builtins.str: ...
 

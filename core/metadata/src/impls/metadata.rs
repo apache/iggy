@@ -79,7 +79,7 @@ use iggy_common::calculate_checksum;
 use iggy_common::variadic;
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
 use iggy_common::{
-    HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
+    HeaderKey, HeaderValue, IggyError, IggyTimestamp, MetadataChangeStart, MetadataChangesQuery,
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, Permissions, ResourceOptions, ServerKeyContext,
     TopicCreateOptions, TopicResolvedOptions, UserId, UserStatus, admit, admit_geo_topic,
@@ -528,6 +528,7 @@ pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
 
 /// The encoded snapshot and the checksum over exactly those bytes.
 fn encode_with_checksum(snapshot: &IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
+    snapshot.snapshot.validate()?;
     let encoded = snapshot.encode()?;
     let checksum = checkpoint_checksum(&encoded);
     Ok((encoded, checksum))
@@ -1107,14 +1108,19 @@ where
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
     // the reply body, replayed on retry.
-    let mut apply = reject_stale_session(&header, &client_table.borrow())
-        .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
-        .unwrap_or_else(|err| {
-            panic!(
-                "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
-                header.op
-            );
-        });
+    let prepared_at = IggyTimestamp::from(header.timestamp);
+    let mut apply = reject_stale_session(&header, &client_table.borrow(), |user_id, token_id| {
+        mux_stm
+            .users()
+            .read(|users| users.holds_live_token(user_id, token_id, prepared_at))
+    })
+    .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
+    .unwrap_or_else(|err| {
+        panic!(
+            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+            header.op
+        );
+    });
     if let Some(user) = apply.revoked_user {
         let ended = apply_user_revocation(
             mux_stm,
@@ -1218,13 +1224,12 @@ fn apply_user_revocation<M: StreamsFrontend>(
     revocation: Revocation,
     header: &PrepareHeader,
 ) -> Vec<AppliedChange> {
-    if table_mutations_allowed {
-        revocation.end_sessions(&mut client_table.borrow_mut(), header.op);
-    }
     let user = revocation.user();
-    // A transferred table may already contain this end marker while the
-    // streams snapshot still needs the matching membership release.
-    let mut sessions: Vec<SessionIdentity> = {
+    let mut sessions: Vec<SessionIdentity> = if table_mutations_allowed {
+        revocation.end_sessions(&mut client_table.borrow_mut(), header.op)
+    } else {
+        // A transferred table may already contain this end marker while the
+        // streams snapshot still needs the matching membership release.
         let table = client_table.borrow();
         table
             .ended_sessions()
@@ -13566,6 +13571,38 @@ mod tests {
         assert_eq!(coordinator.last_checkpoint(), (0, 0));
         assert!(!coordinator.snapshot_path().exists());
         assert!(!coordinator.checkpoint_pending.get());
+    }
+
+    #[compio::test]
+    async fn given_state_recovery_would_refuse_when_persisting_a_checkpoint_should_write_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let metadata: IggyMetadata<(), (), (), TestMux> = IggyMetadata::new(
+            None,
+            None,
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        // Root carries the revision of op 1, which a checkpoint at op 0 cannot hold.
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+
+        let persisted = coordinator
+            .persist_snapshot(
+                &*metadata.mux_stm,
+                0,
+                0,
+                None,
+                metadata.change_log.snapshot(),
+            )
+            .await;
+
+        assert!(matches!(persisted, Err(SnapshotError::InvalidState(_))));
+        assert!(!coordinator.snapshot_path().exists());
+        assert_eq!(coordinator.last_checkpoint(), (0, 0));
     }
 
     #[compio::test]

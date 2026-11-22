@@ -17,6 +17,7 @@
 
 pub mod permissioner_rules;
 
+use crate::stm::walk::{Directed, range_after};
 use ahash::{AHashMap, AHashSet};
 use iggy_common::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions, UserId};
 
@@ -48,6 +49,39 @@ impl<'a> ReadGrants<'a> {
                     .reads_stream()
                 })
             })
+    }
+
+    /// The streams `permissions` read through stream grants after the id cursor, or
+    /// `None` when a global grant reads every stream.
+    #[must_use]
+    pub fn granted_streams(
+        permissions: &'a Permissions,
+        after: Option<usize>,
+        descending: bool,
+    ) -> Option<impl Iterator<Item = usize> + 'a> {
+        if Self::for_stream(Some(permissions), None).reads_stream() {
+            return None;
+        }
+        Some(
+            permissions
+                .streams
+                .as_ref()
+                .into_iter()
+                .flat_map(move |streams| {
+                    Directed::new(
+                        streams.range(range_after(after.as_ref(), descending)),
+                        descending,
+                    )
+                })
+                .filter(|(_, stream)| {
+                    Self {
+                        global: None,
+                        stream: Some(stream),
+                    }
+                    .reads_stream()
+                })
+                .map(|(&stream_id, _)| stream_id),
+        )
     }
 
     #[must_use]
@@ -85,6 +119,32 @@ impl<'a> ReadGrants<'a> {
                 .stream
                 .and_then(|stream| stream.topics.as_ref()?.get(&topic_id))
                 .is_some_and(Self::reads_topic_grant)
+    }
+
+    /// The topics the topic grants read after the id cursor, or `None` when the grants
+    /// read every topic of the stream.
+    #[must_use]
+    pub fn granted_topics(
+        &self,
+        after: Option<usize>,
+        descending: bool,
+    ) -> Option<impl Iterator<Item = usize> + 'a> {
+        if self.reads_every_topic() {
+            return None;
+        }
+        Some(
+            self.stream
+                .and_then(|stream| stream.topics.as_ref())
+                .into_iter()
+                .flat_map(move |topics| {
+                    Directed::new(
+                        topics.range(range_after(after.as_ref(), descending)),
+                        descending,
+                    )
+                })
+                .filter(|(_, grant)| Self::reads_topic_grant(grant))
+                .map(|(&topic_id, _)| topic_id),
+        )
     }
 
     fn reads_every_topic(&self) -> bool {

@@ -494,15 +494,23 @@ impl HttpInner {
             .ok_or(IggyError::Unauthenticated)
     }
 
-    /// Whether `credential` names a revision of its account this node has not
-    /// applied. Revisions only grow, so until it applies that one the node
-    /// cannot tell a token issued after a change from a revoked one.
+    /// Whether `credential` names a revision of its account or a token this
+    /// node has not applied. Revisions only grow and a token id is the op that
+    /// created it, so until it applies that op the node cannot tell a token
+    /// issued after a change from a revoked one.
     pub(in crate::http) fn lags_behind(&self, user_id: u32, credential: &CredentialProof) -> bool {
+        let applied_op = self.shard.plane.metadata().applied_frontier().get();
         self.shard.plane.metadata().mux_stm.users().read(|users| {
-            users.items.get(user_id as usize).is_some_and(|user| {
-                user.created_at.as_micros() == credential.user_created_at
-                    && credential.access_revision > user.access_revision
-            })
+            let Some(user) = users
+                .items
+                .get(user_id as usize)
+                .filter(|user| user.created_at.as_micros() == credential.user_created_at)
+            else {
+                return credential.access_revision.max(credential.token_id) > applied_op;
+            };
+            credential.access_revision > user.access_revision
+                || (credential.token_id > applied_op
+                    && users.token_of(user_id, credential.token_id).is_none())
         })
     }
 
@@ -524,9 +532,10 @@ impl HttpInner {
             })
             .map_err(|rejection| {
                 // A revision that moved during verification says nothing about the configured account.
-                if rejection != AccountRejection::CredentialChanged {
-                    issuer.warn_invalid_account();
+                if rejection == AccountRejection::CredentialChanged {
+                    return IggyError::TransientNotAccepted;
                 }
+                issuer.warn_invalid_account();
                 IggyError::Unauthenticated
             })
     }

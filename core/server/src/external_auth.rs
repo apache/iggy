@@ -412,8 +412,9 @@ impl std::fmt::Display for AccountRejection {
 }
 
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
-/// user. Logs the specific rejection reason; the wire error is always
-/// `InvalidCredentials`.
+/// user. Logs the specific rejection reason. The wire error is
+/// `TransientNotAccepted` when the credentials changed during verification,
+/// which a retry can pass, and `InvalidCredentials` otherwise.
 pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
@@ -425,7 +426,11 @@ pub fn resolve_username(
     };
     check_account_policy(user, started_at_op).map_err(|reason| {
         tracing::warn!(username, user_id = user.id, reason = %reason, "ext-auth account rejected");
-        iggy_common::IggyError::InvalidCredentials
+        if reason == AccountRejection::CredentialChanged {
+            iggy_common::IggyError::TransientNotAccepted
+        } else {
+            iggy_common::IggyError::InvalidCredentials
+        }
     })
 }
 
@@ -460,6 +465,11 @@ fn check_account_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::{TestMux, create_reader_request, prepare_message};
+    use iggy_binary_protocol::{Operation, WireEncode};
+    use iggy_common::IggyError;
+    use metadata::impls::metadata::StreamsFrontend as _;
+    use metadata::stm::StateMachine as _;
 
     /// Deserialize JSON and validate, same as `callout_external_auth` does
     /// after receiving the HTTP body.
@@ -743,6 +753,33 @@ mod tests {
             Err(AccountRejection::CredentialChanged)
         );
         assert!(validate_provisioned_account(Some(&user), 12).is_ok());
+    }
+
+    #[test]
+    fn given_revision_moved_during_verification_when_resolving_username_should_refuse_as_retryable()
+    {
+        let mux_stm = TestMux::default();
+        mux_stm.users().ensure_root_user("root", "hash");
+        // The reader commits at op 1, so it holds revision 1.
+        mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                1,
+                1,
+                &create_reader_request().to_bytes(),
+            ))
+            .expect("the reader commits");
+        let resolve = |username: &str, started_at_op| {
+            mux_stm
+                .users()
+                .read(|users| resolve_username(users, username, started_at_op))
+                .map(|_| ())
+        };
+
+        assert_eq!(resolve("reader", 0), Err(IggyError::TransientNotAccepted));
+        assert_eq!(resolve("reader", 1), Ok(()));
+        assert_eq!(resolve("root", 1), Err(IggyError::InvalidCredentials));
+        assert_eq!(resolve("nobody", 1), Err(IggyError::InvalidCredentials));
     }
 
     #[test]

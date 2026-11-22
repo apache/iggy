@@ -83,7 +83,7 @@ public interface StreamsClient {
     CompletableFuture<Optional<StreamDetails>> getStream(StreamId streamId);
 
     /**
-     * Gets a list of all streams on the server.
+     * Gets a list of the streams the caller may read.
      *
      * <p>Returns basic information about each stream without topic details. Use
      * {@link #getStream(StreamId)} for full details about a specific stream. The
@@ -94,12 +94,12 @@ public interface StreamsClient {
      * the server answers the page cursor it was sent.
      *
      * @return a {@link CompletableFuture} that completes with a list of {@link StreamBase}
-     *         objects for all streams
+     *         objects for the streams the caller may read
      */
     CompletableFuture<List<StreamBase>> getStreams();
 
     /**
-     * Gets one page of streams.
+     * Gets one page of the streams the caller may read.
      *
      * @param query the order, limit, cursor and name filter of the page
      * @return a {@link CompletableFuture} that completes with the page, or fails with an

@@ -403,7 +403,7 @@ namespace Iggy {
         public function getStream(mixed $stream_id): ?\Iggy\StreamDetails {}
 
         /**
-         * Reads one page of the streams.
+         * Reads one page of the streams the caller may read.
          *
          * `order` is `Iggy\PageOrder::Id` when null, and `descending` reverses it. `limit` is 1 to
          * 1000, 100 when null. `cursor` is the `next` of the previous page, null for the first
@@ -437,8 +437,11 @@ namespace Iggy {
         public function getTopic(mixed $stream_id, mixed $topic_id): ?\Iggy\TopicDetails {}
 
         /**
-         * Reads one page of the topics of a stream. A missing stream gives an empty page without
-         * `next`. The other arguments are those of getStreamsPage().
+         * Reads one page of the topics the caller may read in a stream. A missing stream, or one the
+         * caller may read no topic of, gives an empty page without `next`. For a caller with a global
+         * read grant, a page read with a cursor throws code 1009 instead, which HTTP reports as code
+         * 300, because the stream was deleted during the walk. The other arguments are those of
+         * getStreamsPage().
          *
          * @param mixed $stream_id
          * @param \Iggy\PageOrder|null $order
@@ -1869,7 +1872,7 @@ namespace Iggy {
       case Logout = 'logout';
       case Expired = 'expired';
     /**
-     * The user was deactivated or deleted.
+     * A user delete, deactivation, password change, or delete of the session's token.
      */
       case Revoked = 'revoked';
     }

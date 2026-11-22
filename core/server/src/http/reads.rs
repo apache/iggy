@@ -680,7 +680,9 @@ pub(in crate::http) mod tests {
     use metadata::stm::authz::GatedApply;
     use metadata::stm::stream::StreamsInner;
     use metadata::stm::user::ROOT_USER_CREATED_AT_MICROS;
-    use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
+    use metadata::stm::user::{
+        CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES,
+    };
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use send_wrapper::SendWrapper;
     use server_common::sharding::{METADATA_GROUP, PartitionLocation, ShardId};
@@ -1229,6 +1231,77 @@ pub(in crate::http) mod tests {
         );
 
         assert!(resolve_credential(&state, &ahead).await.is_ok());
+    }
+
+    #[compio::test]
+    async fn given_token_exchanged_from_a_token_this_node_has_not_applied_when_presented_should_ask_for_a_retry()
+     {
+        const TOKEN_ID: u64 = READER_CREATED_AT + 5;
+        let state = read_state();
+        let exchanged = CredentialProof {
+            token_id: TOKEN_ID,
+            ..CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT)
+        };
+        let token = state
+            .jwt
+            .generate(READER_ID, exchanged, u64::MAX)
+            .unwrap()
+            .access_token;
+        assert!(matches!(
+            resolve_credential(&state, &token).await,
+            Err(AuthError::SessionNotAccepted)
+        ));
+
+        commit_user_request(
+            &state,
+            READER_CREATED_AT,
+            Operation::CreateUser,
+            &create_reader_request().to_bytes(),
+        );
+        assert!(matches!(
+            resolve_credential(&state, &token).await,
+            Err(AuthError::SessionNotAccepted)
+        ));
+
+        commit_user_request(
+            &state,
+            TOKEN_ID,
+            Operation::CreatePersonalAccessToken,
+            &CreatePersonalAccessTokenRequest {
+                user_id: READER_ID,
+                name: WireName::new("ci").unwrap(),
+                expiry: 0,
+                token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+            }
+            .to_bytes(),
+        );
+        assert!(resolve_credential(&state, &token).await.is_ok());
+
+        // The fixture applies ops without moving the frontier, as the commit path does.
+        state
+            .shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(TOKEN_ID + 1);
+        commit_user_request(
+            &state,
+            TOKEN_ID + 1,
+            Operation::DeletePersonalAccessToken,
+            &DeletePersonalAccessTokenRequest {
+                user_id: READER_ID,
+                name: WireName::new("ci").unwrap(),
+                only_if_expired: false,
+            }
+            .to_bytes(),
+        );
+        assert!(
+            matches!(
+                resolve_credential(&state, &token).await,
+                Err(AuthError::Unauthenticated(_))
+            ),
+            "a deleted token is refused for good once its delete is applied"
+        );
     }
 
     #[compio::test]

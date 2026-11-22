@@ -61,8 +61,8 @@ type Client interface {
 	// Authentication is required, and the permission to read the streams.
 	GetStream(ctx context.Context, streamId Identifier) (*StreamDetails, error)
 
-	// GetStreams get the info about all the streams. It reads every page of
-	// the list, so the result is not one consistent read. Every page keeps the
+	// GetStreams get the info about the streams the caller may read. It reads
+	// every page of the list, so the result is not one consistent read. Every page keeps the
 	// sign-in and the deadline that the call started with. If the Next of a
 	// page is the cursor that its request sent, the call fails with
 	// ierror.ErrInvalidFormat.
@@ -98,11 +98,13 @@ type Client interface {
 	// Authentication is required, and the permission to read the topics.
 	GetTopic(ctx context.Context, streamId, topicId Identifier) (*TopicDetails, error)
 
-	// GetTopics get the info about all the topics. It reads every page of the
-	// list, so the result is not one consistent read. Every page keeps the
-	// sign-in and the deadline that the call started with. If the Next of a
-	// page is the cursor that its request sent, the call fails with
-	// ierror.ErrInvalidFormat.
+	// GetTopics get the info about the topics the caller may read in a
+	// stream. It reads every page of the list, so the result is not one
+	// consistent read. Every page keeps the sign-in and the deadline that the
+	// call started with. If the stream goes missing after the first page, the
+	// call fails as GetTopicsPage does for a caller with a global read grant,
+	// and ends there for any other caller. If the Next of a page is the cursor
+	// that its request sent, the call fails with ierror.ErrInvalidFormat.
 	// Authentication is required. The list holds the topics the caller may read.
 	GetTopics(ctx context.Context, streamId Identifier) ([]Topic, error)
 

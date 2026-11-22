@@ -22,13 +22,13 @@ Or use the `--with-default-root-credentials` flag for development (sets root cre
 
 These variables initialize the root account only when it is first created. Supplied values are still validated on later starts, but they do not replace the stored credentials. Use the password-change API or `iggy user password` with the current password to change an existing account. The `--fresh` flag deletes all data. It is not needed for a password change.
 
-In server 0.10.1-edge.2, changing a password ends every session of the account except the TCP, QUIC or WebSocket session that submitted the change. It invalidates every access token Iggy issued before the change, including the caller's token and tokens exchanged from personal access tokens. An HTTP caller using one of those tokens must sign in again. A valid raw personal access token can open a fresh session.
+In server 0.10.1-edge.2, changing a password ends every session of the account except the TCP, QUIC or WebSocket session that submitted the change. It invalidates every access token Iggy issued before the change, including the caller's token and tokens exchanged from personal access tokens. An HTTP caller using one of those tokens must sign in again. A valid raw personal access token can open a fresh session. The Kafka gateway closes an existing connection when it reads the password change from the metadata change log. If the bridge cannot read the log or misses the change because its log position expired, the connection can remain open until it reconnects.
 
 Deactivation ends every session, invalidates access tokens the server previously issued to the account, and deletes the account's personal access tokens. After reactivation, sign in again and issue new personal access tokens.
 
-A node decides from the metadata it has applied, so a node that lags behind a change serves the old credential until it applies the change. It answers an access token issued after a password change it has not applied yet with a retryable error. When two changes of one password race, the one verified against the replaced password is refused.
+A node decides from the metadata it has applied, so a node that lags behind a change serves the old credential until it applies the change. It answers an access token issued after a password change, a reactivation or the creation of the personal access token it was exchanged from with a retryable error until it applies that change. When two changes of one password race, the one verified against the replaced password is refused.
 
-A trusted issuer controls the lifetime of its own tokens. Each new sign-in still requires an eligible local account. If that account's credential revision changes during verification, the caller must authenticate again.
+A trusted issuer controls the lifetime of its own tokens. Each new sign-in still requires an eligible local account. If that account's credentials change during the verification of a trusted issuer token or an external sign-in, the attempt is refused with a retryable error.
 
 The root user **cannot be deleted**, and its permissions are fixed: it always holds every permission.
 

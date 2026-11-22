@@ -138,7 +138,7 @@ public sealed interface MetadataChangeBody {
         LOGOUT(0, "logout"),
         /** The session lease expired. */
         EXPIRED(1, "expired"),
-        /** The user was deactivated or deleted. */
+        /** A user delete, deactivation, password change, or delete of the session's token. */
         REVOKED(2, "revoked");
 
         private final int code;

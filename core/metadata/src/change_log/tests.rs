@@ -2550,6 +2550,82 @@ fn given_deleted_token_when_a_same_name_replacement_exists_should_refuse_only_th
 }
 
 #[test]
+fn given_token_session_write_prepared_after_the_token_expired_when_committing_should_refuse_it() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    // Each op is stamped op * 1000 micros, so the token expires between the two writes.
+    let token = |token_name: &str, expiry| CreatePersonalAccessTokenRequest {
+        user_id: ALICE,
+        name: name(token_name),
+        expiry,
+        token_hash: [token_name.as_bytes()[0]; PAT_TOKEN_HASH_BYTES],
+    };
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &token("ci", 2_500),
+    );
+    let created_at = harness.user(ALICE).created_at.as_micros();
+    let token_id = harness.token_id(ALICE, "ci");
+    harness.commit_register(
+        CLIENT_A,
+        ALICE,
+        CredentialProof::token(created_at, token_id),
+    );
+    let token_session = harness
+        .client_table
+        .borrow()
+        .get_epoch(CLIENT_A)
+        .expect("live");
+    let caller = |client, session| Caller {
+        client,
+        user_id: ALICE,
+        session,
+    };
+
+    harness.commit(
+        caller(CLIENT_A, token_session),
+        Operation::CreatePersonalAccessToken,
+        &token("before", 0),
+    );
+    let password_session = harness.register(CLIENT_B, ALICE);
+    harness.commit(
+        caller(CLIENT_A, token_session),
+        Operation::CreatePersonalAccessToken,
+        &token("after", 0),
+    );
+    harness.commit(
+        caller(CLIENT_B, password_session),
+        Operation::CreatePersonalAccessToken,
+        &token("password", 0),
+    );
+
+    let live = |token_name| {
+        harness
+            .mux
+            .users()
+            .read(|users| users.token_id_of(ALICE, token_name))
+            .is_some()
+    };
+    assert!(
+        live("before"),
+        "a write prepared while the token lived commits"
+    );
+    assert!(
+        !live("after"),
+        "a write prepared after the token expired is refused"
+    );
+    assert!(
+        live("password"),
+        "a password session of the same user is untouched"
+    );
+}
+
+#[test]
 fn given_token_expired_at_the_prepare_timestamp_when_registering_should_refuse_and_cleaner_should_end_sessions()
  {
     let harness = Harness::new();
@@ -2655,11 +2731,20 @@ fn given_password_proof_from_before_deactivation_when_reactivated_should_refuse_
         &status(UserStatus::Inactive),
     );
     let deactivated_at = harness.last_op();
+    let inactive_rename = UpdateUserResolvedRequest {
+        username: Some(name("alicja")),
+        status: None,
+        ..status(UserStatus::Active)
+    };
+    let inactive_patch =
+        harness.commit(ROOT_CALLER, Operation::UpdateUserResolved, &inactive_rename);
+    let inactive_revision = harness.user(ALICE).access_revision;
     harness.commit(
         ROOT_CALLER,
         Operation::UpdateUserResolved,
         &status(UserStatus::Active),
     );
+    let reactivated_at = harness.last_op();
     let stale = harness.commit_register(
         CLIENT_A,
         ALICE,
@@ -2675,7 +2760,16 @@ fn given_password_proof_from_before_deactivation_when_reactivated_should_refuse_
     assert_eq!(token, NO_CHANGES);
     assert!(!harness.client_table.borrow().contains(CLIENT_B));
     assert_eq!(renamed.access_revision, before.access_revision);
-    assert_eq!(harness.user(ALICE).access_revision, deactivated_at);
+    assert_eq!(inactive_revision, deactivated_at);
+    assert!(
+        !decoded(&inactive_patch).iter().any(|record| matches!(
+            record,
+            WireMetadataChange::SessionClosed(_)
+                | WireMetadataChange::PersonalAccessTokenDeleted(_)
+        )),
+        "a patch of an inactive user revokes nothing"
+    );
+    assert_eq!(harness.user(ALICE).access_revision, reactivated_at);
     assert_eq!(stale, NO_CHANGES);
     assert!(!harness.client_table.borrow().contains(CLIENT_A));
 }

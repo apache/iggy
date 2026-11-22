@@ -24,20 +24,39 @@ namespace Apache.Iggy.Tests.ClientTests;
 
 public sealed class HttpLogoutTests
 {
+    private const string Unauthenticated =
+        "{\"id\":40,\"code\":\"unauthenticated\",\"reason\":\"Unauthenticated\",\"field\":null}";
+
+    private const string ServerError = "{\"id\":1,\"code\":\"error\",\"reason\":\"Error\",\"field\":null}";
+
     [Fact]
     public async Task given_a_refused_token_when_logging_out_should_succeed_and_drop_it()
     {
-        var http = SignedIn(HttpStatusCode.Unauthorized);
+        var http = SignedIn(HttpStatusCode.Unauthorized, Unauthenticated);
 
         await new HttpMessageStream(http).LogoutUserAsync(TestContext.Current.CancellationToken);
 
         Assert.Null(http.DefaultRequestHeaders.Authorization);
     }
 
+    [Theory]
+    [InlineData("<html><body>401 Authorization Required</body></html>")]
+    [InlineData("{\"id\":42,\"code\":\"unauthorized\",\"reason\":\"Unauthorized\",\"field\":null}")]
+    public async Task given_a_refusal_that_is_not_unauthenticated_when_logging_out_should_surface_it_and_keep_the_token(
+        string body)
+    {
+        var http = SignedIn(HttpStatusCode.Unauthorized, body);
+
+        await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
+            new HttpMessageStream(http).LogoutUserAsync(TestContext.Current.CancellationToken));
+
+        Assert.Equal("token", http.DefaultRequestHeaders.Authorization?.Parameter);
+    }
+
     [Fact]
     public async Task given_no_token_when_logging_out_should_surface_the_refusal()
     {
-        var http = SignedIn(HttpStatusCode.Unauthorized);
+        var http = SignedIn(HttpStatusCode.Unauthorized, Unauthenticated);
         http.DefaultRequestHeaders.Authorization = null;
 
         await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
@@ -47,7 +66,7 @@ public sealed class HttpLogoutTests
     [Fact]
     public async Task given_a_server_failure_when_logging_out_should_keep_the_token()
     {
-        var http = SignedIn(HttpStatusCode.InternalServerError);
+        var http = SignedIn(HttpStatusCode.InternalServerError, ServerError);
 
         await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() =>
             new HttpMessageStream(http).LogoutUserAsync(TestContext.Current.CancellationToken));
@@ -55,23 +74,23 @@ public sealed class HttpLogoutTests
         Assert.Equal("token", http.DefaultRequestHeaders.Authorization?.Parameter);
     }
 
-    private static HttpClient SignedIn(HttpStatusCode logoutStatus)
+    private static HttpClient SignedIn(HttpStatusCode logoutStatus, string logoutBody)
     {
-        return new HttpClient(new StatusHandler(logoutStatus))
+        return new HttpClient(new StatusHandler(logoutStatus, logoutBody))
         {
             BaseAddress = new Uri("http://localhost"),
             DefaultRequestHeaders = { Authorization = new AuthenticationHeaderValue("Bearer", "token") }
         };
     }
 
-    private sealed class StatusHandler(HttpStatusCode status) : HttpMessageHandler
+    private sealed class StatusHandler(HttpStatusCode status, string body) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             return Task.FromResult(new HttpResponseMessage(status)
             {
                 RequestMessage = request,
-                Content = new StringContent("{}")
+                Content = new StringContent(body)
             });
         }
     }

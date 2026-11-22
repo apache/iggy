@@ -237,7 +237,8 @@ await client.ConnectAsync();
 
 - **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
   authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
-  Disconnecting removes only that binding. Logout, committed lease expiry or user deactivation ends the session.
+  Disconnecting removes only that binding. Logout, committed lease expiry, a user delete or deactivation, a password
+  change from another session, or a delete of the token the session was opened with ends the session.
   A `StaleClient` eviction also removes only the binding of that link. The reconnect binds the same session
   again, so its consumer-group memberships stay.
   A committed `StaleClient` result means that the server ended the session, for example because the user was

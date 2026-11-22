@@ -33,7 +33,8 @@ pub const REGISTER_REQUEST_BYTES: usize = CREDENTIAL_PROOF_BYTES + BIND_SECRET_B
 pub struct CredentialProof {
     /// Creation time of the account, because a deleted user's id goes to the next user created.
     pub user_created_at: u64,
-    /// Op of the account's last password change or revocation, zero for a raw personal access token.
+    /// Op of the account's creation or of its last password change, deactivation or reactivation,
+    /// zero for a raw personal access token.
     pub access_revision: u64,
     /// Op that created the personal access token the credential derives from, zero for any other.
     pub token_id: u64,
