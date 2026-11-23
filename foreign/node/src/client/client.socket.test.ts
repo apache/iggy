@@ -1711,6 +1711,31 @@ describe('VSR client socket', () => {
     }
   });
 
+  for (const order of ['before', 'after'] as const) {
+    it(`suppresses eviction when destroyed ${order} the socket's data handler`, async () => {
+      const server = await startVsrServer((frame, socket) => singleNodeHandler(server.port)(frame, socket));
+      const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+      try {
+        await client.sendCommand(COMMAND_CODE.Ping, Buffer.alloc(0));
+        const socket = client.getReadStream();
+        const peer = [...server.sockets].find((candidate) => candidate.remotePort === socket.localPort);
+        assert.ok(peer);
+        const events: string[] = [];
+        client.on('eviction', () => events.push('eviction'));
+        client.on('end', () => events.push('end'));
+        const ended = once(client, 'end', { signal: AbortSignal.timeout(WAIT_LIMIT_MS) });
+        if (order === 'before') socket.prependOnceListener('data', () => client.destroy());
+        else socket.once('data', () => client.destroy());
+        peer.write(evictionFrame(EvictionReason.SessionError));
+        await ended;
+        assert.deepEqual(events, ['end']);
+      } finally {
+        client.destroy();
+        await server.close();
+      }
+    });
+  }
+
   it('reports whether a session reset ended a signed-in session', async () => {
     let registers = 0;
     const server = await startVsrServer((frame, socket) => {
