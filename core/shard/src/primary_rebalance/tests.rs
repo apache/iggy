@@ -2110,6 +2110,42 @@ async fn given_a_held_probe_when_a_later_probe_arrives_before_its_commit_is_appl
     );
 }
 
+/// An idle primary repeats the commit that a slow backup has not applied.
+/// Each of those probes proves a later contact with the quorum, so the credit
+/// must be that of the newest one, or it ends early for no reason.
+#[compio::test]
+async fn given_a_held_probe_when_a_later_probe_of_the_same_commit_arrives_should_credit_the_younger_evidence()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let epoch = shard.bus.monotonic_now();
+    let mut probe = probe_header(consensus, 100);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    let mut previous = probe;
+    previous.nonce -= 1;
+    probe.commit = COMMITTED;
+    shard.on_primary_rebalance(previous, Vec::new()).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+
+    // The evidence of a probe is as old as the receipt of the one before
+    // it, so the second repeat is the first that is younger than the held one.
+    for repeat in 1..=2 {
+        shard.bus.now.set(Some(epoch + PROBE_INTERVAL * repeat));
+        probe.nonce += 1;
+        shard.on_primary_rebalance(probe, Vec::new()).await;
+    }
+    frontier.advance(COMMITTED);
+    shard.tick_primary_rebalance().await;
+
+    assert!(
+        frontier.partition_requests_allowed(epoch + FRESHNESS_WINDOW),
+        "the credit is that of the newest probe"
+    );
+    assert!(!frontier.partition_requests_allowed(epoch + PROBE_INTERVAL + FRESHNESS_WINDOW));
+}
+
 /// A probe held across a view change stands for the old view.
 #[compio::test]
 async fn given_a_held_probe_when_the_view_changes_before_its_commit_is_applied_should_drop_it() {

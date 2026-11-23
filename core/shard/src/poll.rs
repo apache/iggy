@@ -317,15 +317,19 @@ where
         }
         if matches!(read, PartitionRead::Primary | PartitionRead::PrimaryNow) {
             // The caller of `PrimaryNow` serves at the primary that the answer
-            // names, and a primary here that still starts refuses that read.
-            let starts = matches!(read, PartitionRead::PrimaryNow)
+            // names. A primary here that still starts refuses that read, and
+            // so does the owner for an older incarnation of the ids.
+            let cannot_serve = matches!(read, PartitionRead::PrimaryNow)
                 && self
                     .plane
                     .partitions()
-                    .with_partition(&namespace, Self::starting_revision)
+                    .with_partition(&namespace, |partition| {
+                        self.superseding_revision(namespace, partition)
+                            .or_else(|| Self::starting_revision(partition))
+                    })
                     .flatten()
                     .is_some();
-            let answer = if starts {
+            let answer = if cannot_serve {
                 PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
             } else {
                 self.primary_read_reply(namespace)
@@ -635,6 +639,7 @@ where
     /// Hands a held read back to the inbox of this shard, where it runs as a
     /// read that arrives now, except that a new hold ends where this one does
     /// and that it runs only on the incarnation that this hold waited for.
+    /// A node whose metadata is no longer fresh refuses it.
     fn resubmit_held_read(&self, namespace: IggyNamespace, held: HeldRead) {
         let HeldRead {
             read,
@@ -661,15 +666,27 @@ where
                 created_revision,
             }),
         });
-        let sent = self
-            .senders
-            .get(self.id as usize)
-            .is_some_and(|sender| sender.try_send(frame).is_ok());
+        let sent = self.partition_requests_allowed()
+            && self
+                .senders
+                .get(self.id as usize)
+                .is_some_and(|sender| sender.try_send(frame).is_ok());
         if !sent {
             let _ = refused.try_send(PartitionReadReply::Rejected(
                 IggyError::TransientNotAccepted,
             ));
         }
+    }
+
+    /// Whether this node still has proof that its metadata is fresh. Dispatch
+    /// tests that before a read reaches this shard, and a hold can end after
+    /// the proof does. Session and permission tests on stale metadata prove
+    /// nothing, so a held read must not serve then.
+    fn partition_requests_allowed(&self) -> bool {
+        self.plane
+            .metadata()
+            .applied_frontier()
+            .partition_requests_allowed(self.bus.monotonic_now())
     }
 
     /// Ends the holds whose partition can serve now, and those that reached
@@ -912,10 +929,13 @@ where
     /// answered entry by entry, so the partition that cannot serve refuses
     /// only its own entry. Every other read is refused as transient, never
     /// `NotFound`: HTTP maps the `NotFound` of those reads to a permanent 404.
+    /// So is a batch on a node whose metadata is no longer fresh.
     fn answer_unheld(&self, namespace: IggyNamespace, held: HeldRead) {
         let answer = match held.read {
             PartitionRead::Primary => self.lookup_answer(namespace, held.created_revision),
-            PartitionRead::ConsumerOffsetsOnPrimary { reads, .. } => {
+            PartitionRead::ConsumerOffsetsOnPrimary { reads, .. }
+                if self.partition_requests_allowed() =>
+            {
                 self.consumer_offsets_reply(reads)
             }
             _ => PartitionReadReply::Rejected(IggyError::TransientNotAccepted),

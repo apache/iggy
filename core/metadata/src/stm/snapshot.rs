@@ -534,7 +534,7 @@ enum CaptureStep {
     Users(UsersEncoder),
     Streams(StreamsEncoder),
     ClientTable,
-    ClientSlots(std::vec::IntoIter<(u32, consensus::ClientEntrySnapshot)>),
+    ClientSlots(ArraySteps<(u32, consensus::ClientEntrySnapshot)>),
     ChangeLog(ChangeLogEncoder),
     Done,
 }
@@ -569,17 +569,14 @@ impl CaptureEncoder {
                 self.next = if let Some(table) = self.capture.client_table.take() {
                     encode_array_len(out, CLIENT_TABLE_SNAPSHOT_FIELDS)?;
                     encode_value(out, &table.capacity)?;
-                    encode_array_len(out, table.slots.len())?;
-                    CaptureStep::ClientSlots(table.slots.into_iter())
+                    CaptureStep::ClientSlots(ArraySteps::from(table.slots))
                 } else {
                     encode_value(out, &None::<consensus::ClientTableSnapshot>)?;
                     self.change_log_step()
                 };
             }
             CaptureStep::ClientSlots(slots) => {
-                if let Some(slot) = slots.next() {
-                    encode_value(out, &slot)?;
-                } else {
+                if !slots.encode_next(out)? {
                     self.next = self.change_log_step();
                 }
             }

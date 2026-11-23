@@ -1524,7 +1524,8 @@ fn partition_hop(
 
 /// The primary of the partition group in this replica's view. `None` while the
 /// group has no usable view here: view change, state transfer, a partition
-/// that is not materialized yet, or a primary here that still starts its view.
+/// that is not materialized yet, a primary here that still starts its view, or
+/// an older incarnation of the ids that the owner has not replaced yet.
 ///
 /// The owner must not hold this lookup. [`serve_partition`] tells a refusal
 /// from before the group had a primary by a lookup that returned `None`, and

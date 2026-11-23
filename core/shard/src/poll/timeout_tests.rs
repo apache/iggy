@@ -29,8 +29,8 @@ use iggy_common::{Durability, IggyError, PartitionStats, PollingStrategy};
 use message_bus::{
     BusMessage, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn, SendError,
 };
-use metadata::IggyMetadata;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::{AppliedFrontier, IggyMetadata};
 use partitions::{IggyPartition, IggyPartitions, PollFragments, PollingArgs, PollingConsumer};
 use server_common::MESSAGE_ALIGN;
 use server_common::iobuf::Frozen;
@@ -630,6 +630,45 @@ async fn given_unbuilt_partition_when_polling_on_the_owner_should_run_after_inse
     assert!(resubmitted, "the held poll went back to the inbox");
 }
 
+/// Dispatch tests the freshness of metadata before a poll reaches the owner,
+/// and a hold can end after that proof does. The owner then cannot tell
+/// whether the session and the permission of the poll still stand.
+#[compio::test]
+async fn given_held_poll_when_its_partition_is_built_without_fresh_metadata_should_refuse_it() {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (mut owner, created_revision) =
+        unbuilt_partition_owner(&bus, namespace, &[], frontier_without_fresh_metadata(&bus));
+    let (senders, mut inboxes, _reply_inboxes) = shard_mesh_channels(1, 4, 1);
+    owner.attach_senders(senders);
+    let owner_inbox = inboxes[0].take().unwrap();
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(namespace, offset_poll(), reply, None)
+        .await;
+    assert_eq!(owner.held_read_count(), 1);
+
+    insert_built_partition(&owner, &bus, namespace, created_revision);
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
+    let resubmitted = std::iter::from_fn(|| owner_inbox.try_recv().ok()).any(|frame| {
+        matches!(
+            frame,
+            ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { .. })
+        )
+    });
+    assert!(
+        !resubmitted,
+        "the held poll must not run without fresh metadata"
+    );
+    assert_eq!(owner.held_read_count(), 0);
+}
+
 /// A poll without metadata has no fence of its own. A delete and a create
 /// between two ticks put another incarnation where it waited, and there it
 /// must not run, because it can store an offset.
@@ -962,6 +1001,53 @@ async fn given_unbuilt_partition_when_looking_up_the_primary_now_should_answer_a
         Ok(PartitionReadReply::NotFound)
     ));
     assert_eq!(owner.held_read_count(), 0);
+}
+
+/// A delete and a create that reuse the ids of a partition commit while this
+/// owner still has the old incarnation. HTTP serves at the primary that this
+/// lookup names, and the owner refuses a write of the committed incarnation
+/// there, after HTTP answered a send without ack.
+#[compio::test]
+async fn given_older_incarnation_here_when_looking_up_the_primary_now_should_name_no_primary() {
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (owner, created_revision) = owner_with_unbuilt_partition(&bus, namespace, &[]);
+    let old_revision = created_revision
+        .checked_sub(1)
+        .expect("the seed commits above revision 0");
+    insert_built_partition(&owner, &bus, namespace, old_revision);
+    let look_up = async || {
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(namespace, PartitionRead::PrimaryNow, reply, None)
+            .await;
+        replies.try_recv()
+    };
+
+    let superseded = look_up().await;
+
+    assert!(
+        matches!(
+            superseded,
+            Ok(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted
+            ))
+        ),
+        "the old incarnation must not name a primary: {superseded:?}"
+    );
+    assert_eq!(owner.held_read_count(), 0);
+
+    begin_teardown(&owner, namespace);
+    confirm_remove(&owner, namespace);
+    insert_built_partition(&owner, &bus, namespace, created_revision);
+
+    assert!(matches!(
+        look_up().await,
+        Ok(PartitionReadReply::Primary {
+            view: 0,
+            primary: 0
+        })
+    ));
 }
 
 /// The requester of a deferred poll stops its wait at the request deadline.
@@ -1389,6 +1475,53 @@ async fn given_held_offset_batch_when_its_hold_deadline_passes_should_refuse_onl
         ),
         "only the entry of the unbuilt partition is refused, not {offsets:?}"
     );
+    assert_eq!(owner.held_read_count(), 0);
+}
+
+/// The end of a hold answers a batch without a new pass through the inbox,
+/// so that answer needs the freshness test of its own.
+#[compio::test]
+async fn given_held_offset_batch_when_its_hold_ends_without_fresh_metadata_should_refuse_it() {
+    const HOLD_UNTIL: u64 = 400_000;
+    assert!(Duration::from_micros(HOLD_UNTIL) < PARTITION_BUILD_HOLD);
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = PollTestBus::default();
+    let (owner, _) =
+        unbuilt_partition_owner(&bus, namespace, &[], frontier_without_fresh_metadata(&bus));
+    let read = ConsumerOffsetRead {
+        namespace,
+        consumer: Some(PollingConsumer::Consumer(7, 0)),
+        metadata: owner
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .poll_metadata(namespace, None, 7)
+            .expect("metadata names the partition"),
+    };
+    let (reply, replies) = channel(1);
+    owner
+        .on_partition_read(
+            namespace,
+            PartitionRead::ConsumerOffsetsOnPrimary {
+                reads: vec![read],
+                hold_until: HOLD_UNTIL,
+            },
+            reply,
+            None,
+        )
+        .await;
+    assert_eq!(owner.held_read_count(), 1);
+
+    bus.now.set(HOLD_UNTIL);
+    owner.expire_held_reads();
+
+    assert!(matches!(
+        replies.try_recv(),
+        Ok(PartitionReadReply::Rejected(
+            IggyError::TransientNotAccepted
+        ))
+    ));
     assert_eq!(owner.held_read_count(), 0);
 }
 
@@ -1909,7 +2042,18 @@ fn owner_with_unbuilt_partition(
     namespace: IggyNamespace,
     members: &[u8],
 ) -> (PollTestShard, u64) {
-    let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None);
+    unbuilt_partition_owner(bus, namespace, members, AppliedFrontier::default())
+}
+
+/// [`owner_with_unbuilt_partition`] on a node with `frontier`.
+fn unbuilt_partition_owner(
+    bus: &PollTestBus,
+    namespace: IggyNamespace,
+    members: &[u8],
+    frontier: AppliedFrontier,
+) -> (PollTestShard, u64) {
+    let metadata = IggyMetadata::new(None, None, None, None, PollTestMetadata::default(), None)
+        .with_applied_frontier(Arc::new(frontier));
     let owner = PollTestShard::without_inbox(
         ShardIdentity::new(0, "held-read-test".to_string()),
         bus.clone(),
@@ -1930,6 +2074,13 @@ fn owner_with_unbuilt_partition(
         .created_revision_for_namespace(namespace)
         .expect("the seed committed the partition");
     (owner, created_revision)
+}
+
+/// The frontier of a node that must prove fresh metadata and has no proof:
+/// nothing credited it, which reads the same as a proof that ended.
+fn frontier_without_fresh_metadata(bus: &PollTestBus) -> AppliedFrontier {
+    const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+    AppliedFrontier::default().with_partition_freshness(bus.monotonic_now(), HEARTBEAT_TIMEOUT)
 }
 
 /// Sends a `Primary` read to the pump handler of `owner`.

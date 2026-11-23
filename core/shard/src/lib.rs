@@ -491,7 +491,8 @@ pub enum PartitionRead {
     Primary,
     /// As `Primary`, but the owner never holds it. For a caller that waits in
     /// a loop of its own, and must see that the group has no primary yet. A
-    /// primary on this node that cannot serve yet counts as none.
+    /// primary on this node that cannot serve yet counts as none, and so does
+    /// that of an older incarnation of the ids.
     PrimaryNow,
     DeferredPoll(Box<DeferredPollRequest>),
     /// Whether the replica holds a whole retirement batch retired; see
@@ -4966,10 +4967,7 @@ where
             return false;
         };
         match message {
-            MessageBag::Prepare(prepare) => {
-                let operation = prepare.header().operation;
-                operation.is_plane_routable() && !operation.is_partition()
-            }
+            MessageBag::Prepare(prepare) => prepare.header().operation.is_metadata_plane(),
             MessageBag::RepairPrepare(repair) => {
                 claims_metadata_group(consensus.group(), &repair.header().0)
             }

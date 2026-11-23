@@ -630,7 +630,12 @@ pub fn attach_root_session(shard: &TestShard, client_id: u128, session: u64) -> 
 }
 
 /// Applies `body` as committed metadata op `op`.
-fn apply_metadata_op(mux_stm: &TestMux, op: u64, operation: Operation, body: &[u8]) -> ApplyReply {
+pub fn apply_metadata_op(
+    mux_stm: &TestMux,
+    op: u64,
+    operation: Operation,
+    body: &[u8],
+) -> ApplyReply {
     mux_stm
         .update(prepare_message(operation, 0, op, body).transmute_header(
             |old, header: &mut iggy_binary_protocol::PrepareHeader| {

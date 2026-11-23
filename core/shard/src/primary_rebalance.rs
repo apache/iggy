@@ -518,6 +518,14 @@ struct HeldProbe {
     received: Instant,
 }
 
+impl HeldProbe {
+    /// Upper bound of the age of the evidence at `now`.
+    fn evidence_age_at(&self, now: Instant) -> Duration {
+        self.evidence_age
+            .saturating_add(now.saturating_duration_since(self.received))
+    }
+}
+
 impl Default for PrimaryRebalance {
     fn default() -> Self {
         Self {
@@ -1565,8 +1573,13 @@ where
                 let held = &mut self.primary_rebalance.borrow_mut().held_probe;
                 // The commit of an earlier probe is applied first. A backup
                 // that applies later than the next probe arrives would never
-                // reach the commit of the newest one.
-                if held.is_none_or(|held| held.view != header.view) {
+                // reach the commit of the newest one. A probe of the same
+                // commit takes the place when its evidence is younger.
+                if held.is_none_or(|held| {
+                    held.view != header.view
+                        || (held.commit == header.commit
+                            && evidence_age < held.evidence_age_at(now))
+                }) {
                     *held = Some(HeldProbe {
                         view: header.view,
                         commit: header.commit,
@@ -1611,13 +1624,7 @@ where
         self.primary_rebalance.borrow_mut().held_probe = None;
         if applied == Some(true) {
             let now = self.bus.monotonic_now();
-            self.credit_partition_admission(
-                consensus,
-                now,
-                probe
-                    .evidence_age
-                    .saturating_add(now.saturating_duration_since(probe.received)),
-            );
+            self.credit_partition_admission(consensus, now, probe.evidence_age_at(now));
         }
     }
 

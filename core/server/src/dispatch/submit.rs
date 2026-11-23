@@ -521,10 +521,13 @@ pub async fn await_created_partitions<B, MJ, S, SB>(
             continue;
         }
         let mut read = Box::pin(shard.partition_read(namespace, PartitionRead::Primary));
-        // The first poll sends the read, and a `Rejected` on that poll means
-        // that the owner inbox refused it. A full inbox refuses the next
-        // reads too and logs each refusal, so the other partitions of that
-        // owner get no read and no wait. Those of the other owners still do.
+        // The first poll sends the read. A `Rejected` on that poll comes from
+        // an owner inbox that refused it, or from an owner that answered
+        // before the poll ended: the reply does not tell them apart. A full
+        // inbox refuses the next reads too and logs each refusal, so the
+        // other partitions of that owner get no read and no wait. At worst
+        // the reply leaves before their build, and the owner then holds the
+        // first request for them. The other owners still get their reads.
         match futures::poll!(read.as_mut()) {
             Poll::Ready(Some(PartitionReadReply::Rejected(_))) => refusing_owners.push(owner),
             Poll::Ready(_) => {}

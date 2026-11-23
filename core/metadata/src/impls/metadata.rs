@@ -112,7 +112,7 @@ use std::mem::size_of;
 #[cfg(feature = "simulator")]
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 #[cfg(any(test, feature = "simulator"))]
 use std::task::Poll;
@@ -152,6 +152,10 @@ pub struct CheckpointJob {
     lease: OwnedLocalGateGuard,
     capture: MetadataCapture,
     capture_time: Duration,
+    /// Whether a requester held an offer of the snapshot that this job
+    /// replaces. The job then leaves the WAL in place, see
+    /// [`IggyMetadata::run_checkpoint_job`].
+    keeps_wal: bool,
 }
 
 /// A WAL trim that waits for the journal gate or holds it, from
@@ -1629,6 +1633,10 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// checkpoint clears it at its capture and each writer of `snapshot.bin`
     /// after its rename, so it never serves a replaced file to a later requester.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Every offer built, to tell which snapshots a requester can still pull:
+    /// the shard that serves an offer holds it until it expires. See
+    /// [`Self::offer_needs_wal_above`].
+    served_offers: RefCell<Vec<Weak<StateTransferOffer>>>,
     /// Moves on every clear of `transfer_offer_cache`. An offer whose read of
     /// `snapshot.bin` spans a move may hold a file that is replaced or about to
     /// be, so it refuses rather than reach the cache or a peer.
@@ -1734,6 +1742,7 @@ where
             client_table_frontier: Cell::new(0),
             replay_client_table: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
+            served_offers: RefCell::new(Vec::new()),
             snapshot_generation: Cell::new(0),
             #[cfg(feature = "simulator")]
             state_transfer_offers_refused: Cell::new(false),
@@ -1902,6 +1911,18 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.transfer_offer_cache.borrow_mut().take();
         self.snapshot_generation
             .set(self.snapshot_generation.get().wrapping_add(1));
+    }
+
+    /// Whether an offer that is still held, by a shard that serves it or by
+    /// the cache, needs the WAL above `floor`, the last op that the journal
+    /// trimmed. A requester installs the snapshot of its offer and then
+    /// repairs from the op after it.
+    fn offer_needs_wal_above(&self, floor: u64) -> bool {
+        self.served_offers
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|offer| offer.snapshot_seq >= floor)
     }
 
     /// Whether `checkpoint_lock` is held: by a checkpoint job from its capture to
@@ -2866,6 +2887,10 @@ where
     /// checkpoint here has begun to replace. The refusal is transient and ends
     /// with the checkpoint.
     ///
+    /// A checkpoint can also start after the offer left, while its requester
+    /// still pulls it. The job of that checkpoint then leaves the WAL in place,
+    /// see [`Self::run_checkpoint_job`].
+    ///
     /// Served below the recovery barrier too, see
     /// [`consensus::is_caught_up_primary_except_barrier`]: everything shipped is at
     /// or below `commit_min`, and the requester may be the only replica left that
@@ -2956,6 +2981,10 @@ where
             ],
         });
         *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
+        let mut served = self.served_offers.borrow_mut();
+        served.retain(|offer| offer.strong_count() > 0);
+        served.push(Rc::downgrade(&offer));
+        drop(served);
         Ok(offer)
     }
 
@@ -5348,11 +5377,23 @@ where
             lease,
             capture,
             capture_time: capture_started.elapsed(),
+            // After the capture, which dropped the cache: only a shard that
+            // serves an offer holds one now, and no offer is built before the
+            // superblock write of this job.
+            keeps_wal: self.offer_needs_wal_above(journal.handle().snapshot_op()),
         });
     }
 
     /// Make a captured checkpoint durable, then trim the WAL to it. The server
     /// spawns this on shard 0 through [`Self::set_checkpoint_spawner`].
+    ///
+    /// The job trims nothing when a requester held an offer of the replaced
+    /// snapshot at the capture. That requester installs the snapshot and then
+    /// repairs from the op after it, also when its offer expires during the
+    /// writes of this job. A trim past that op sends it into another transfer,
+    /// and under a steady load into one after the other. The trim falls to the
+    /// margin, which the journal reaches before the next job is due: that trim
+    /// is short, and it bounds the time that the requester has.
     ///
     /// The job holds its lease of `checkpoint_lock` through the snapshot and
     /// superblock writes and releases it before it waits for `journal_gate`. A margin
@@ -5364,6 +5405,7 @@ where
             lease,
             capture,
             capture_time,
+            keeps_wal,
         } = job;
         let (Some(consensus), Some(journal), Some(coordinator)) = (
             self.consensus.as_ref(),
@@ -5395,6 +5437,9 @@ where
         lease.release();
         #[cfg(test)]
         if checkpoint_boundary(CheckpointBoundary::SuperblockWritten).is_err() {
+            return;
+        }
+        if keeps_wal {
             return;
         }
 
@@ -12860,6 +12905,93 @@ mod tests {
         let offer = md.state_transfer_offer().await.unwrap();
         assert_eq!(offer.snapshot_seq, JOB_TRIGGER_OP);
         assert!(journal_floor(&md) <= offer.snapshot_seq);
+    }
+
+    /// A requester that pulls an offer installs its snapshot and then repairs
+    /// from the op after it. A job that trims the WAL to its own, newer
+    /// checkpoint meanwhile leaves the requester nothing to repair from, and it
+    /// starts over. The shard drops a pulled offer after a short time, which
+    /// can be before the job ends its writes and before the requester asks.
+    #[compio::test]
+    async fn given_an_offer_held_at_the_capture_when_it_is_dropped_during_the_job_should_leave_the_wal_to_the_margin()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        let coordinator = md.coordinator.as_ref().unwrap();
+        persist_initial_snapshot(&md).await;
+        let served = md.state_transfer_offer().await.unwrap();
+        let served_op = served.snapshot_seq;
+        let held = SNAPSHOT_IO.lock().await;
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(jobs.borrow().len(), 1, "the job waits in its write");
+
+        drop(served);
+        drop(held);
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(coordinator.superblock_checkpoint_op.get(), JOB_TRIGGER_OP);
+        assert_eq!(
+            journal_floor(&md),
+            served_op,
+            "the requester repairs from the op after the snapshot that it pulled"
+        );
+        assert_eq!(COMPLETED_CHECKPOINTS.get(), 0);
+
+        commit_on_primary(&md, JOB_TRIGGER_OP + 1..=JOB_MARGIN_OP + 1).await;
+
+        assert_eq!(
+            journal_floor(&md),
+            JOB_TRIGGER_OP - 1,
+            "the journal must not run out of slots for a requester"
+        );
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Margin))
+        );
+        assert!(jobs.borrow().is_empty(), "the margin trims without a job");
+    }
+
+    /// An offer that nobody holds at the capture needs no WAL.
+    #[compio::test]
+    async fn given_an_offer_dropped_before_the_capture_when_a_checkpoint_job_ends_should_trim_the_wal()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        persist_initial_snapshot(&md).await;
+        drop(md.state_transfer_offer().await.unwrap());
+
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Job))
+        );
+    }
+
+    /// The journal already trimmed past the snapshot of this offer, so its
+    /// requester cannot repair here any more, and a kept WAL gives it nothing.
+    #[compio::test]
+    async fn given_a_held_offer_below_the_journal_floor_when_a_checkpoint_job_ends_should_trim_the_wal()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        persist_initial_snapshot(&md).await;
+        let served = md.state_transfer_offer().await.unwrap();
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(await_jobs(&jobs).await, 1);
+        commit_on_primary(&md, JOB_TRIGGER_OP + 1..=JOB_MARGIN_OP + 1).await;
+        assert!(served.snapshot_seq < journal_floor(&md));
+
+        commit_on_primary(&md, JOB_MARGIN_OP + 2..=2 * JOB_TRIGGER_OP).await;
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(journal_floor(&md), 2 * JOB_TRIGGER_OP - 1);
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Job))
+        );
     }
 
     #[compio::test]

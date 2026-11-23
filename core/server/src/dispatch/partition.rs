@@ -318,7 +318,11 @@ where
     // key the poll path auto-commits under and the read path resolves), so
     // rewrite the consumer id before replication -- the apply layer has no
     // metadata access to resolve it.
-    let request = match maybe_rewrite_consumer_offset_request(shard, request) {
+    let request = match maybe_rewrite_consumer_offset_request(
+        shard,
+        request,
+        IggyNamespace::from_raw(namespace),
+    ) {
         Ok(rewritten) => rewritten,
         // Metadata can change during the routing wait, so a previously valid
         // group may be missing now. Preserve the typed failure before submit.
@@ -1908,7 +1912,7 @@ where
 mod tests {
     use super::*;
     use crate::dispatch::test_support::{
-        SpyBus, TestMux, TestShard, attach_root_session, create_consumer_group,
+        SpyBus, TestMux, TestShard, apply_metadata_op, attach_root_session, create_consumer_group,
         create_one_partition, create_reader_request, prepare_message, request_message,
         route_one_partition, stored_batch_record, test_shard, test_shard_with_frontier,
     };
@@ -1937,6 +1941,7 @@ mod tests {
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+        UpdateTopicResolvedRequest,
     };
     use iggy_binary_protocol::{
         Command, ConsensusHeader, GenericHeader, PrepareOkHeader, ReplyHeader, SegmentDeleteHeader,
@@ -2664,7 +2669,8 @@ mod tests {
             ];
             for write in writes {
                 let operation = write.header().operation;
-                let write = maybe_rewrite_consumer_offset_request(&shard, write).unwrap();
+                let write =
+                    maybe_rewrite_consumer_offset_request(&shard, write, namespace).unwrap();
                 assert_eq!(
                     offset_write_consumer(&write).map(|(kind, consumer_id)| (
                         namespace.inner(),
@@ -2676,6 +2682,95 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Dispatch resolves the namespace of an offset write, waits, and then
+    /// rewrites the group name to its id. Two topics that swap their names
+    /// during that wait must not move the write to the group of the other
+    /// topic. The owner of the first topic keys the offset by that id, and
+    /// nothing there ties the id of an external group to its name.
+    #[compio::test]
+    async fn given_topics_that_swap_names_after_the_namespace_resolved_when_rewriting_an_external_group_write_should_keep_the_group_of_its_topic()
+     {
+        const GROUP_OF_FIRST_TOPIC: usize = 1;
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        let namespace = create_one_partition(&shard);
+        let mux_stm = &shard.plane.metadata().mux_stm;
+        let mut op = 2;
+        let mut apply = |operation, body: Bytes| {
+            op += 1;
+            assert_eq!(
+                apply_metadata_op(mux_stm, op, operation, &body).code,
+                0,
+                "{operation:?} at op {op}"
+            );
+        };
+        let create_group = |topic_id, name| {
+            CreateConsumerGroupRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(topic_id),
+                name: WireName::new(name).unwrap(),
+            }
+            .to_bytes()
+        };
+        let rename_topic = |topic_id, name| {
+            UpdateTopicResolvedRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(topic_id),
+                name: Some(WireName::new(name).unwrap()),
+                explicit_options: WireOptions::empty(),
+                derived_options: WireOptions::empty(),
+            }
+            .to_bytes()
+        };
+        apply(Operation::CreateConsumerGroup, create_group(0, "other"));
+        apply(Operation::CreateConsumerGroup, create_group(0, "group"));
+        apply(
+            Operation::CreateTopicWithAssignments,
+            CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("second").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    partition_id: 0,
+                    consensus_group_id: 2,
+                    initial_view: 0,
+                    members: Vec::new(),
+                }],
+            }
+            .to_bytes(),
+        );
+        apply(Operation::CreateConsumerGroup, create_group(1, "group"));
+        apply(Operation::UpdateTopicResolved, rename_topic(0, "first"));
+        apply(Operation::UpdateTopicResolved, rename_topic(1, "topic"));
+        let write = request_message(
+            Operation::StoreConsumerOffset,
+            1,
+            1,
+            2,
+            &StoreConsumerOffsetRequest {
+                consumer: WireConsumer::external_group(WireIdentifier::named("group").unwrap()),
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::named("topic").unwrap(),
+                partition_id: Some(0),
+                offset: 1,
+                ack: iggy_binary_protocol::AckLevel::Quorum,
+            }
+            .to_bytes(),
+        );
+
+        let write = maybe_rewrite_consumer_offset_request(&shard, write, namespace).unwrap();
+
+        assert_eq!(
+            offset_write_consumer(&write),
+            Some((KIND_EXTERNAL_GROUP, GROUP_OF_FIRST_TOPIC)),
+            "the name of the topic now leads to the other topic, whose group has id 0"
+        );
     }
 
     #[compio::test]
