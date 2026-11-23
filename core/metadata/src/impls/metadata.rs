@@ -22,6 +22,7 @@ use crate::change_log::{
     change_actor, change_page, current_page, session_closed, session_registered, session_revoked,
 };
 use crate::impls::placement::{PlacementCounts, PlacementState};
+use crate::permissioner::GrantsByCreation;
 use crate::stm::authz::{
     PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
 };
@@ -151,14 +152,18 @@ pub trait StreamsFrontend {
     fn read_scoped_page<T>(
         &self,
         user_id: u32,
-        project: impl FnOnce(&StreamsInner, Option<&Permissions>) -> Result<T, IggyError>,
+        project: impl FnOnce(
+            &StreamsInner,
+            Option<&Permissions>,
+            Option<&GrantsByCreation>,
+        ) -> Result<T, IggyError>,
     ) -> Result<T, IggyError>
     where
         Self: Sized,
     {
         // A normal delete prunes grants before a second stream publication can reuse the id.
         self.streams().read(|streams| {
-            let permissions = self.users().read(|users| {
+            let (permissions, ordered) = self.users().read(|users| {
                 if streams.installed_snapshot_op != users.installed_snapshot_op {
                     return Err(IggyError::TransientNotAccepted);
                 }
@@ -166,10 +171,15 @@ pub trait StreamsFrontend {
                     .items
                     .get(user_id as usize)
                     .filter(|user| user.status == UserStatus::Active)
-                    .map(|user| user.permissions.clone())
+                    .map(|user| {
+                        (
+                            user.permissions.clone(),
+                            users.grants_by_creation.get(&user.id).cloned(),
+                        )
+                    })
                     .ok_or(IggyError::Unauthenticated)
             })?;
-            project(streams, permissions.as_deref())
+            project(streams, permissions.as_deref(), ordered.as_deref())
         })
     }
 }

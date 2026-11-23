@@ -738,20 +738,6 @@ impl Stream {
         }
     }
 
-    /// The topics in creation order, keyed by `(created_at micros, topic id)`.
-    /// A stream holds at most `MAX_TOPICS` topics, so a page sorts them for
-    /// each read in place of an index that every topic apply keeps.
-    #[must_use]
-    pub fn topics_by_created(&self) -> Vec<((u64, usize), &Topic)> {
-        let mut topics: Vec<_> = self
-            .topics
-            .iter()
-            .map(|(id, topic)| ((topic.created_at.as_micros(), id), topic))
-            .collect();
-        topics.sort_unstable_by_key(|(key, _)| *key);
-        topics
-    }
-
     pub fn topics_by_created_after(
         &self,
         after: Option<(u64, usize)>,
@@ -9513,12 +9499,6 @@ mod tests {
                     .map(|((_, id), _)| id)
                     .collect::<Vec<_>>()
             };
-            let full: Vec<_> = stream
-                .topics_by_created()
-                .into_iter()
-                .map(|((_, id), _)| id)
-                .collect();
-            assert_eq!(ids(None, false), full);
             assert_eq!(ids(None, false), [1, 2, 0]);
             assert_eq!(ids(Some((50, 0)), true), [2, 1]);
         }

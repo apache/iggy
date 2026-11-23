@@ -23,9 +23,10 @@
 //! also verifies external RS256/EC tokens against the issuer's JWKS
 //! ([`super::jwks`]) and maps them onto the configured iggy username.
 //! The refresh-token route re-issues by composing `decode_for_refresh` (verify
-//! plus a refusal of trusted-issuer tokens) with `generate` at the handler;
-//! without a revocation list that refresh is stateless, so the token it was
-//! minted from stays valid until its own `exp`. The claim set (`JwtClaims`) is
+//! plus a refusal of trusted-issuer tokens) with `generate` at the handler.
+//! Refresh leaves the original token usable until it expires, the account
+//! revision changes, or its source personal access token is revoked or expires.
+//! The claim set (`JwtClaims`) is
 //! the legacy one plus `user_created_at`, which names the account a
 //! self-issued token was issued to, `access_revision`, which a password change
 //! or a revocation moves past, and `token_id` for a token exchanged from a

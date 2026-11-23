@@ -618,7 +618,7 @@ impl IggyClient {
     /// Reads one page of the topics the caller may read in a stream. A missing stream, or one the
     /// caller may read no topic of, gives an empty page without `next`. For a caller with a global
     /// read grant, a page read with a cursor throws code 1009 instead, which HTTP reports as code
-    /// 300, because the stream was deleted during the walk. The other arguments are those of
+    /// 20 (ResourceNotFound), because the stream was deleted during the walk. The other arguments are those of
     /// getStreamsPage().
     #[php(defaults(descending = false))]
     pub fn get_topics_page(

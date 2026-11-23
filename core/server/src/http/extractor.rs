@@ -66,6 +66,7 @@ const PAT_KEY_PREFIX: &str = "pat:";
 #[derive(Clone)]
 pub(in crate::http) struct VerifiedBearer {
     pub jwt_id: Option<String>,
+    pub trusted_issuer: bool,
     pub user_id: u32,
     pub credential: CredentialProof,
     pub expiry: u64,
@@ -255,6 +256,7 @@ pub struct Credential {
     key: String,
     pub user_id: u32,
     proof: CredentialProof,
+    trusted_issuer: bool,
     expiry: u64,
 }
 
@@ -273,6 +275,12 @@ impl Credential {
         state
             .resolve_session(&self.key, self.user_id, self.proof, self.expiry)
             .await
+            .map_err(|error| match error {
+                AuthError::Unauthenticated(IggyError::Unauthenticated) if self.trusted_issuer => {
+                    AuthError::SessionNotAccepted
+                }
+                error => error,
+            })
     }
 }
 
@@ -294,6 +302,7 @@ impl FromRequestParts<HttpState> for Credential {
             ),
             user_id: verified.user_id,
             proof: verified.credential,
+            trusted_issuer: verified.trusted_issuer,
             expiry: verified.expiry,
         })
     }
@@ -419,6 +428,7 @@ pub(in crate::http) async fn resolve_credential(
 ) -> Result<VerifiedBearer, AuthError> {
     let started_at_op = state.shard.plane.metadata().applied_frontier().get();
     if let Ok(token) = state.jwt.decode(bearer).await {
+        let trusted_issuer = matches!(token.subject, TokenSubject::TrustedIssuer(_));
         let (user_id, credential) = match token.subject {
             TokenSubject::Account {
                 user_id,
@@ -437,6 +447,7 @@ pub(in crate::http) async fn resolve_credential(
         };
         return Ok(VerifiedBearer {
             jwt_id: Some(token.jti),
+            trusted_issuer,
             user_id,
             credential,
             expiry: token.exp.saturating_mul(1_000_000),
@@ -447,6 +458,7 @@ pub(in crate::http) async fn resolve_credential(
         .map_err(|_| IggyError::Unauthenticated)?;
     Ok(VerifiedBearer {
         jwt_id: None,
+        trusted_issuer: false,
         user_id,
         credential,
         expiry,
@@ -501,6 +513,29 @@ mod tests {
 
     const LAYER_USER_ID: u32 = 7;
 
+    #[compio::test]
+    async fn given_refused_account_proof_when_registering_should_allow_a_trusted_issuer_to_retry() {
+        let state = read_state();
+        for trusted_issuer in [false, true] {
+            let credential = Credential {
+                key: "test".to_owned(),
+                user_id: LAYER_USER_ID,
+                proof: CredentialProof::account(1, 1),
+                trusted_issuer,
+                expiry: u64::MAX,
+            };
+            let result = credential.session(&state).await;
+            if trusted_issuer {
+                assert!(matches!(result, Err(AuthError::SessionNotAccepted)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AuthError::Unauthenticated(IggyError::Unauthenticated))
+                ));
+            }
+        }
+    }
+
     /// The partition route layer verifies the bearer before its handler runs,
     /// so the extractor behind it reuses that proof. A bearer that would not
     /// verify shows the extractor did not verify it again.
@@ -509,6 +544,7 @@ mod tests {
         let state = read_state();
         let verified = VerifiedBearer {
             jwt_id: Some("layer-jti".to_owned()),
+            trusted_issuer: false,
             user_id: LAYER_USER_ID,
             credential: CredentialProof::account(1, 1),
             expiry: u64::MAX,

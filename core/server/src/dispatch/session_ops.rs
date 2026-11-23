@@ -36,6 +36,7 @@ use crate::dispatch::failure::{
     ClientOrigin, FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
+use crate::external_auth::AccountRejection;
 use crate::reply_frame::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
 };
@@ -1408,23 +1409,12 @@ async fn try_external_auth_login<B, MJ, S, SB>(
                                 error = %error,
                                 "ext-auth login/register failed"
                             );
-                            error
+                            error.after_external_verification()
                         }
                     }
                 }
-                Err(iggy_error) => {
-                    warn!(
-                        transport_client_id,
-                        ext_username = %username,
-                        error = %iggy_error,
-                        "ext-auth user resolution failed"
-                    );
-                    if iggy_error == IggyError::TransientNotAccepted {
-                        LoginRegisterError::CredentialChanged
-                    } else {
-                        LoginRegisterError::InvalidCredentials
-                    }
-                }
+                Err(AccountRejection::CredentialChanged) => LoginRegisterError::CredentialChanged,
+                Err(_) => LoginRegisterError::InvalidCredentials,
             }
         }
         ValidatedDecision::Deny { reason } => {
@@ -1571,6 +1561,30 @@ mod tests {
         assert!(LoginRegisterError::Binding(IggyError::Unauthenticated).is_terminal());
         // Transient is the only recoverable variant: never terminal.
         assert!(!LoginRegisterError::Transient(MetadataSubmitError::PipelineFull).is_terminal());
+    }
+
+    #[test]
+    fn given_refused_register_or_bind_when_externally_verified_should_retry_at_the_right_stage() {
+        for (error, expected) in [
+            (
+                LoginRegisterError::Transient(MetadataSubmitError::Unauthenticated),
+                IggyError::TransientNotAccepted,
+            ),
+            (
+                LoginRegisterError::Binding(IggyError::Unauthenticated),
+                IggyError::TransientNotCommitted,
+            ),
+        ] {
+            assert!(error.is_terminal());
+            let external = error.after_external_verification();
+            assert!(!external.is_terminal());
+            assert_eq!(transient_login_code(&external), expected);
+        }
+        assert!(
+            LoginRegisterError::Transient(MetadataSubmitError::ClientIdOwnedByAnotherUser)
+                .after_external_verification()
+                .is_terminal()
+        );
     }
 
     /// The reasons this module emits must map back to the credential

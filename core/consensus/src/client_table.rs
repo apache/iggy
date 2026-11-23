@@ -753,22 +753,7 @@ impl ClientTable {
         kept_client: u128,
         ended_op: u64,
     ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
-        let mut ended = Vec::new();
-        for entry in self.slots.iter_mut().flatten() {
-            if entry.user_id == user_id
-                && entry.client_id != kept_client
-                && entry.ended_op.is_none()
-            {
-                entry.ended_op = Some(ended_op);
-                entry.attachment = None;
-                ended.push(iggy_binary_protocol::requests::system::SessionIdentity {
-                    client_id: entry.client_id,
-                    session: entry.epoch,
-                    metadata_watermark: ended_op,
-                });
-            }
-        }
-        ended
+        self.end_sessions(user_id, ended_op, |entry| entry.client_id != kept_client)
     }
 
     /// End the live sessions `user_id` opened with the token created at op
@@ -779,9 +764,18 @@ impl ClientTable {
         token_id: u64,
         ended_op: u64,
     ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
+        self.end_sessions(user_id, ended_op, |entry| entry.token_id == token_id)
+    }
+
+    fn end_sessions(
+        &mut self,
+        user_id: u32,
+        ended_op: u64,
+        matches: impl Fn(&ClientEntry) -> bool,
+    ) -> Vec<iggy_binary_protocol::requests::system::SessionIdentity> {
         let mut ended = Vec::new();
         for entry in self.slots.iter_mut().flatten() {
-            if entry.user_id == user_id && entry.token_id == token_id && entry.ended_op.is_none() {
+            if entry.user_id == user_id && entry.ended_op.is_none() && matches(entry) {
                 entry.ended_op = Some(ended_op);
                 entry.attachment = None;
                 ended.push(iggy_binary_protocol::requests::system::SessionIdentity {

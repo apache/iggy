@@ -39,7 +39,6 @@ use message_bus::InstanceToken;
 use message_bus::MessageBus;
 use metadata::MetadataSubmitError;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::user::User;
 use send_wrapper::SendWrapper;
 use tokio::sync::Mutex;
 use tracing::warn;
@@ -528,7 +527,7 @@ impl HttpInner {
 
     /// The account a trusted issuer's tokens act as and its current proof: the
     /// user named by the issuer, looked up per request. See
-    /// [`trusted_issuer_account`].
+    /// [`validate_provisioned_account`].
     pub(in crate::http) fn trusted_issuer_user(
         &self,
         issuer: &TrustedIssuer,
@@ -540,7 +539,10 @@ impl HttpInner {
             .mux_stm
             .users()
             .read(|users| {
-                trusted_issuer_account(users.user_by_name(&issuer.config.username), started_at_op)
+                validate_provisioned_account(
+                    users.user_by_name(&issuer.config.username),
+                    started_at_op,
+                )
             })
             .map_err(|rejection| {
                 // A revision that moved during verification says nothing about the configured account.
@@ -865,19 +867,9 @@ pub(in crate::http) fn ensure_active_user(
         .ok_or(IggyError::Unauthenticated)
 }
 
-/// The id and current proof of `user` when a trusted issuer may act as it:
-/// active and not root. A deleted user's id goes to the next user created, so
-/// the issuer is matched by username, and an external issuer never holds root.
-fn trusted_issuer_account(
-    user: Option<&User>,
-    started_at_op: u64,
-) -> Result<(u32, CredentialProof), AccountRejection> {
-    validate_provisioned_account(user, started_at_op)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MetadataWatermarks, register_submit_auth_error, trusted_issuer_account};
+    use super::{MetadataWatermarks, register_submit_auth_error, validate_provisioned_account};
     use crate::external_auth::AccountRejection;
     use crate::http::error::AuthError;
     use iggy_binary_protocol::requests::users::login_register::CredentialProof;
@@ -954,16 +946,16 @@ mod tests {
         let root = user(DEFAULT_ROOT_USER_ID, UserStatus::Active);
         let inactive = user(1, UserStatus::Inactive);
         assert_eq!(
-            trusted_issuer_account(Some(&root), 9),
+            validate_provisioned_account(Some(&root), 9),
             Err(AccountRejection::Root),
             "an external issuer must never act as root"
         );
         assert_eq!(
-            trusted_issuer_account(Some(&inactive), 9),
+            validate_provisioned_account(Some(&inactive), 9),
             Err(AccountRejection::Inactive)
         );
         assert_eq!(
-            trusted_issuer_account(None, 9),
+            validate_provisioned_account(None, 9),
             Err(AccountRejection::NotFound)
         );
     }
@@ -972,7 +964,7 @@ mod tests {
     fn given_active_user_when_trusted_issuer_maps_onto_it_should_resolve_its_account() {
         let active = user(1, UserStatus::Active);
         assert_eq!(
-            trusted_issuer_account(Some(&active), 9),
+            validate_provisioned_account(Some(&active), 9),
             Ok((
                 1,
                 CredentialProof::account(active.created_at.as_micros(), active.access_revision)
@@ -994,7 +986,7 @@ mod tests {
             OptionValue::derived(HeaderValue::try_from("future_secret").unwrap()),
         );
         assert_eq!(
-            trusted_issuer_account(Some(&with_critical), 9),
+            validate_provisioned_account(Some(&with_critical), 9),
             Err(AccountRejection::CriticalOptions),
             "a user with unrecognized critical options must be rejected"
         );

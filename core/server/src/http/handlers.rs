@@ -258,12 +258,7 @@ pub(in crate::http) struct RefreshToken {
 /// `POST /users/refresh-token`: re-issue an access token from a still-valid one,
 /// answering the same `IdentityInfo` shape as login.
 ///
-/// Stateless by design: server has no replicated revocation list (the P3
-/// roadmap item), so refreshing cannot invalidate the presented token - it stays
-/// valid until its own `exp`, the same posture as logout ending a session
-/// without revoking its bearer. Per-node revocation would be false security in a
-/// cluster, so legacy's one-shot revoke-old-jti behavior is deliberately dropped
-/// rather than ported.
+/// Refresh leaves the presented token subject to its original expiry and credential checks.
 pub(in crate::http) async fn refresh_token(
     State(state): State<HttpState>,
     Json(command): Json<RefreshToken>,
@@ -2430,7 +2425,8 @@ async fn try_external_auth_http_login(
     client_addr: &crate::http::ClientAddr,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     use crate::external_auth::{
-        Credentials, ExternalAuthRequest, HTTP_TRANSPORT, ValidatedDecision, callout_external_auth,
+        AccountRejection, Credentials, ExternalAuthRequest, HTTP_TRANSPORT, ValidatedDecision,
+        callout_external_auth,
     };
 
     let ext_config = &state.server_config.external_auth;
@@ -2468,11 +2464,9 @@ async fn try_external_auth_http_login(
                 .read(|users| {
                     crate::external_auth::resolve_username(users, &ext_username, started_at_op)
                 })
-                .inspect_err(|_| {
-                    tracing::warn!(
-                        ext_username = %ext_username,
-                        "ext-auth user resolution failed"
-                    );
+                .map_err(|reason| match reason {
+                    AccountRejection::CredentialChanged => IggyError::TransientNotAccepted,
+                    _ => IggyError::InvalidCredentials,
                 })?;
             issue_identity(state, user_id, &credential)
         }

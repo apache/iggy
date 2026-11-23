@@ -81,7 +81,7 @@ use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::change_log::{MAX_PAGE_BYTES, MAX_SCANNED_ENTRIES};
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::permissioner::ReadGrants;
+use metadata::permissioner::{GrantsByCreation, ReadGrants};
 use metadata::stm::stream::{ResourceCounts, Stream, StreamsInner, Topic};
 use metadata::stm::user::{User, UsersInner};
 use metadata::stm::walk::slice_after;
@@ -90,7 +90,6 @@ use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -653,7 +652,7 @@ where
     let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
     let stored = shard.plane.metadata().mux_stm.read_scoped_page(
         user_id,
-        |streams, permissions| -> Result<_, IggyError> {
+        |streams, permissions, _| -> Result<_, IggyError> {
             let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
                 return Ok(None);
             };
@@ -695,11 +694,12 @@ where
     let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
     let request = GetStreamsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
     let metadata = shard.plane.metadata();
-    let (page, skipped) = metadata
-        .mux_stm
-        .read_scoped_page(user_id, |streams, permissions| {
-            streams_page(streams, request.page, PAGE_BUDGET, permissions)
-        })?;
+    let (page, skipped) =
+        metadata
+            .mux_stm
+            .read_scoped_page(user_id, |streams, permissions, ordered| {
+                streams_page(streams, request.page, PAGE_BUDGET, permissions, ordered)
+            })?;
     log_skipped(&skipped);
     Ok(page)
 }
@@ -917,7 +917,7 @@ where
     let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
     let stored = shard.plane.metadata().mux_stm.read_scoped_page(
         user_id,
-        |streams, permissions| -> Result<_, IggyError> {
+        |streams, permissions, _| -> Result<_, IggyError> {
             let Some(stream_id) = streams.resolve_stream_id(stream_id) else {
                 return Ok(None);
             };
@@ -979,11 +979,12 @@ where
     let user_id = user_id.ok_or(IggyError::Unauthenticated)?;
     let request = GetTopicsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
     let metadata = shard.plane.metadata();
-    let (page, skipped) = metadata
-        .mux_stm
-        .read_scoped_page(user_id, |streams, permissions| {
-            topics_page(streams, request, PAGE_BUDGET, permissions)
-        })?;
+    let (page, skipped) =
+        metadata
+            .mux_stm
+            .read_scoped_page(user_id, |streams, permissions, ordered| {
+                topics_page(streams, request, PAGE_BUDGET, permissions, ordered)
+            })?;
     log_skipped(&skipped);
     Ok(page)
 }
@@ -1233,15 +1234,14 @@ fn partitions_page(
     })
 }
 
-/// One page of the streams the caller may read, and the streams it leaves out
-/// because this build cannot read them. A caller without a global read walks
-/// only the streams its grants read, so a hidden stream costs no scan budget
-/// and no cursor names one.
+/// A scoped walk seeks into the caller's read grants in the requested order.
+/// Only readable streams count toward the scan budget, including those that miss the name filter.
 fn streams_page(
     streams: &StreamsInner,
     page: WirePageQuery,
     budget: PageBudget,
     permissions: Option<&Permissions>,
+    ordered: Option<&GrantsByCreation>,
 ) -> Result<(PageResponse<StreamResponse>, Vec<SkippedEntry>), IggyError> {
     let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(page)?;
     let start = WalkStart::try_from(&query)?;
@@ -1269,24 +1269,29 @@ fn streams_page(
             None,
         )
     };
-    let grant_count = permissions.streams.as_ref().map_or(0, BTreeMap::len);
-    if start.walk_grants(grant_count, streams.items.len(), limit, budget)
-        && let Some(granted) =
-            ReadGrants::granted_streams(permissions, start.after_id(), query.descending)
-    {
-        let page = granted_page(
-            granted.filter_map(|id| Some((id, streams.items.get(id)?))),
-            |stream| stream.created_at,
-            start,
-            query.descending,
-            limit,
-            budget,
-            project,
-        )?;
-        return Ok((page, skipped));
-    }
-    let reads_all = ReadGrants::for_stream(Some(permissions), None).reads_stream();
     let page = match start {
+        WalkStart::Id(after)
+            if let Some(ids) =
+                ReadGrants::granted_streams(permissions, after, query.descending) =>
+        {
+            collect_page(
+                ids.filter_map(|id| Some((WirePageCursor::Id(id as u64), streams.items.get(id)?))),
+                limit,
+                budget,
+                project,
+            )
+        }
+        WalkStart::Created(after)
+            if !ReadGrants::for_stream(Some(permissions), None).reads_stream() =>
+        {
+            let keys = ordered.map_or(&[][..], |ordered| ordered.streams.as_slice());
+            collect_page(
+                created_grant_walk(keys, after, query.descending, |id| streams.items.get(id)),
+                limit,
+                budget,
+                project,
+            )
+        }
         WalkStart::Id(after) => collect_page(
             streams
                 .items
@@ -1299,9 +1304,6 @@ fn streams_page(
         WalkStart::Created(after) => collect_page(
             streams
                 .streams_by_created(after, query.descending)
-                .filter(|((_, id), _)| {
-                    reads_all || ReadGrants::for_stream(Some(permissions), Some(*id)).reads_stream()
-                })
                 .map(|((created_at, id), stream)| (created_cursor(created_at, id), stream)),
             limit,
             budget,
@@ -1325,6 +1327,7 @@ fn topics_page(
     request: GetTopicsRequest,
     budget: PageBudget,
     permissions: Option<&Permissions>,
+    ordered: Option<&GrantsByCreation>,
 ) -> Result<(PageResponse<TopicResponse>, Vec<SkippedEntry>), IggyError> {
     let NamedPageQuery { page: query, name } = NamedPageQuery::try_from(request.page)?;
     let start = WalkStart::try_from(&query)?;
@@ -1363,25 +1366,26 @@ fn topics_page(
             Some(stream_id),
         )
     };
-    if start.walk_grants(
-        grants.topic_grant_count(),
-        stream.topics.len(),
-        limit,
-        budget,
-    ) && let Some(granted) = grants.granted_topics(start.after_id(), query.descending)
-    {
-        let page = granted_page(
-            granted.filter_map(|id| Some((id, stream.topics.get(id)?))),
-            |topic| topic.created_at,
-            start,
-            query.descending,
-            limit,
-            budget,
-            project,
-        )?;
-        return Ok((page, skipped));
-    }
     let page = match start {
+        WalkStart::Id(after) if let Some(ids) = grants.granted_topics(after, query.descending) => {
+            collect_page(
+                ids.filter_map(|id| Some((WirePageCursor::Id(id as u64), stream.topics.get(id)?))),
+                limit,
+                budget,
+                project,
+            )
+        }
+        WalkStart::Created(after) if !grants.reads_every_topic() => {
+            let keys = ordered
+                .and_then(|ordered| ordered.topics.get(&stream_id))
+                .map_or(&[][..], Vec::as_slice);
+            collect_page(
+                created_grant_walk(keys, after, query.descending, |id| stream.topics.get(id)),
+                limit,
+                budget,
+                project,
+            )
+        }
         WalkStart::Id(after) => collect_page(
             stream
                 .topics
@@ -1394,7 +1398,6 @@ fn topics_page(
         WalkStart::Created(after) => collect_page(
             stream
                 .topics_by_created_after(after, query.descending)
-                .filter(|((_, id), _)| grants.reads_topic(*id))
                 .map(|((created_at, id), topic)| (created_cursor(created_at, id), topic)),
             limit,
             budget,
@@ -1404,40 +1407,14 @@ fn topics_page(
     Ok((page, skipped))
 }
 
-/// One page over `granted`, the entries of a scoped caller in the requested id range.
-fn granted_page<'a, E: 'a, T: WireEncode>(
-    granted: impl Iterator<Item = (usize, &'a E)>,
-    created_at: impl Fn(&E) -> IggyTimestamp,
-    start: WalkStart,
+fn created_grant_walk<E>(
+    keys: &[(u64, usize)],
+    after: Option<(u64, usize)>,
     descending: bool,
-    limit: usize,
-    budget: PageBudget,
-    project: impl FnMut(&'a E) -> Result<Option<T>, IggyError>,
-) -> Result<PageResponse<T>, IggyError> {
-    match start {
-        WalkStart::Id(_) => collect_page(
-            granted.map(|(id, entry)| (WirePageCursor::Id(id as u64), entry)),
-            limit,
-            budget,
-            project,
-        ),
-        WalkStart::Created(after) => {
-            let key = |id: usize, entry: &E| (created_at(entry).as_micros(), id);
-            let mut granted: Vec<_> = granted.collect();
-            granted.sort_unstable_by_key(|&(id, entry)| key(id, entry));
-            collect_page(
-                slice_after(&granted, |&(id, entry)| key(id, entry), after, descending).map(
-                    |&(id, entry)| {
-                        let (created, id) = key(id, entry);
-                        (created_cursor(created, id), entry)
-                    },
-                ),
-                limit,
-                budget,
-                project,
-            )
-        }
-    }
+    mut entry: impl FnMut(usize) -> Option<E>,
+) -> impl Iterator<Item = (WirePageCursor, E)> {
+    slice_after(keys, |&key| key, after, descending)
+        .filter_map(move |&(time, id)| Some((created_cursor(time, id), entry(id)?)))
 }
 
 /// One page of the consumer groups of a topic, in id order. Group ids follow
@@ -1516,26 +1493,6 @@ fn users_page(
 enum WalkStart {
     Id(Option<usize>),
     Created(Option<(u64, usize)>),
-}
-
-impl WalkStart {
-    const fn walk_grants(
-        self,
-        grant_count: usize,
-        catalog_count: usize,
-        limit: usize,
-        budget: PageBudget,
-    ) -> bool {
-        let small_grant_set = grant_count <= limit || grant_count <= catalog_count.isqrt();
-        matches!(self, Self::Id(_)) || (small_grant_set && grant_count <= budget.scanned_entries)
-    }
-
-    const fn after_id(self) -> Option<usize> {
-        match self {
-            Self::Id(after) => after,
-            Self::Created(_) => None,
-        }
-    }
 }
 
 impl TryFrom<&PageQuery> for WalkStart {
@@ -2339,6 +2296,28 @@ mod tests {
     const GRANTED_STREAM: u32 = 0;
     const GRANTED_TOPIC: usize = 1;
 
+    fn streams_page(
+        streams: &StreamsInner,
+        page: WirePageQuery,
+        budget: PageBudget,
+        permissions: Option<&Permissions>,
+    ) -> Result<(PageResponse<StreamResponse>, Vec<SkippedEntry>), IggyError> {
+        let ordered =
+            permissions.map(|permissions| GrantsByCreation::from_catalog(permissions, streams));
+        super::streams_page(streams, page, budget, permissions, ordered.as_ref())
+    }
+
+    fn topics_page(
+        streams: &StreamsInner,
+        request: GetTopicsRequest,
+        budget: PageBudget,
+        permissions: Option<&Permissions>,
+    ) -> Result<(PageResponse<TopicResponse>, Vec<SkippedEntry>), IggyError> {
+        let ordered =
+            permissions.map(|permissions| GrantsByCreation::from_catalog(permissions, streams));
+        super::topics_page(streams, request, budget, permissions, ordered.as_ref())
+    }
+
     /// No grant, then each global, stream and topic grant alone, on [`GRANTED_STREAM`] and [`GRANTED_TOPIC`].
     fn single_grants() -> Vec<Permissions> {
         let global = |grant: fn(&mut GlobalPermissions)| {
@@ -2977,16 +2956,25 @@ mod tests {
     }
 
     #[test]
-    fn given_creation_order_when_choosing_a_walk_should_bound_grant_sorts_and_avoid_scanning_sparse_catalogs()
-     {
-        let start = WalkStart::Created(None);
-        assert!(start.walk_grants(2, 100_000, 1, PAGE_BUDGET));
-        assert!(!start.walk_grants(10_000, 100_000, 1_000, PAGE_BUDGET));
+    fn given_sparse_creation_grants_when_a_page_misses_its_filter_should_bound_catalog_lookups() {
+        let keys = [(10, 17), (20, 500_000), (30, 900_000)];
         let budget = PageBudget {
-            scanned_entries: 3,
+            scanned_entries: 1,
             ..PAGE_BUDGET
         };
-        assert!(!start.walk_grants(4, 100_000, 10, budget));
+        for descending in [false, true] {
+            let mut looked_up = Vec::new();
+            let walk = created_grant_walk(&keys, None, descending, |id| {
+                looked_up.push(id);
+                Some(id)
+            });
+            let page: PageResponse<WireName> =
+                collect_page(walk, 10, budget, |_| Ok(None)).unwrap();
+            let first = if descending { keys[2] } else { keys[0] };
+            assert_eq!(looked_up, [first.1, keys[1].1]);
+            assert_eq!(page.next, Some(created_cursor(first.0, first.1)));
+            assert_eq!(page.items, Vec::<WireName>::new());
+        }
     }
 
     #[test]

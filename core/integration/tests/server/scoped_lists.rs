@@ -45,6 +45,21 @@ async fn given_one_readable_stream_when_listing_should_return_that_stream(harnes
         },
     )
     .await;
+    let page = reader
+        .get_streams_page(
+            &PageQuery {
+                order: PageOrder::Created,
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await
+        .expect("creation-order page");
+    assert_eq!(
+        page.items.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+        [stream.id]
+    );
+    assert!(page.next.is_none());
     let visible = reader.get_streams().await.expect("list readable streams");
     assert_eq!(
         visible
@@ -86,6 +101,22 @@ async fn given_one_readable_topic_when_listing_should_return_that_topic(harness:
         },
     )
     .await;
+    let page = reader
+        .get_topics_page(
+            &stream_id,
+            &PageQuery {
+                order: PageOrder::Created,
+                ..Default::default()
+            }
+            .into(),
+        )
+        .await
+        .expect("creation-order page");
+    assert_eq!(
+        page.items.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+        [topic.id]
+    );
+    assert!(page.next.is_none());
     let visible = reader
         .get_topics(&stream_id)
         .await

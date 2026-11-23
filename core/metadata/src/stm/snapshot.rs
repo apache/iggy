@@ -29,10 +29,8 @@ use crate::stm::user::UsersSnapshot;
 /// fields change, including nested fields: `MessagePack` encodes structs
 /// positionally, so a layout change can reinterpret bytes without an error.
 ///
-/// [`MetadataSnapshot::decode`] accepts versions from
-/// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] through this version. Older accepted
-/// formats rely on defaulted trailing fields; incompatible versions outside
-/// that range are refused before payload deserialization.
+/// [`MetadataSnapshot::decode`] accepts only version 21. It checks the version
+/// before deserializing the payload.
 ///
 /// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
 /// `namespace` word before it), which the client table's cached replies embed as raw
@@ -581,7 +579,7 @@ impl<S> RestoreSnapshot<S> for () {
 /// ```
 #[macro_export]
 macro_rules! impl_fill_restore {
-    ($wrapper:ident, $field:ident) => {
+    ($wrapper:ident, $field:ident $(, $index:ident)?) => {
         impl $crate::stm::snapshot::FillSnapshot<$crate::stm::snapshot::MetadataSnapshot>
             for $wrapper
         {
@@ -610,6 +608,7 @@ macro_rules! impl_fill_restore {
                         stringify!($field)
                     )))
                 })?;
+                $(let snap = snap.$index(snapshot);)?
                 Self::from_snapshot(snap)
             }
         }
@@ -630,6 +629,7 @@ macro_rules! impl_fill_restore {
                             format_args!("Snapshot Restore Error: {}", stringify!($field)),
                         ))
                     })?;
+                    $(let snap = snap.$index(snapshot);)?
                     self.inner
                         .try_apply([<$wrapper Command>]::RestoreSnapshot(snap, snapshot.sequence_number))
                         .map_err(|err| {
@@ -1331,6 +1331,7 @@ mod tests {
         use crate::stm::user::{PermissionerSnapshot, UsersSnapshot};
 
         let users_snap = UsersSnapshot {
+            grants_by_creation: ahash::AHashMap::new(),
             items: vec![
                 (0, user_snapshot_fixture(0, "alice", "hash_a")),
                 (2, user_snapshot_fixture(2, "charlie", "hash_c")),

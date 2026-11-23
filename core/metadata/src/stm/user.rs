@@ -16,14 +16,14 @@
 // under the License.
 
 use crate::change_log::{AppliedChange, change_actor, user_body};
-use crate::permissioner::Permissioner;
+use crate::permissioner::{GrantsByCreation, Permissioner};
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
     DeletePersonalAccessTokenResult, DeleteUserResult, DeletedResource, RevokedToken,
     UpdatePermissionsResult, UpdateUserResult,
 };
-use crate::stm::snapshot::{SnapshotError, Snapshotable};
+use crate::stm::snapshot::{MetadataSnapshot, SnapshotError, Snapshotable};
 use crate::stm::stream::{PatchError, patched_options, public_reply_options};
 use crate::stm::walk::{Directed, range_after};
 use crate::stm::{ApplyContext, StateHandler};
@@ -79,9 +79,9 @@ pub struct User {
     pub password_hash: Arc<str>,
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
-    /// Op of the last credential boundary: the create, a password change, a
-    /// deactivation or a reactivation. A credential verified before it can no
-    /// longer sign in.
+    /// Op of account creation, the last password change or the last activation change.
+    /// Account proofs must match this revision. A raw personal access token proves
+    /// its own creation op and survives a password change.
     pub access_revision: u64,
     pub permissions: Option<Arc<Permissions>>,
     pub options: ResourceOptions,
@@ -149,6 +149,7 @@ define_state! {
         // reusable, so only this op tells a replacement from the token it replaced.
         pub(crate) personal_access_token_id_index: BTreeMap<u64, (UserId, Arc<str>)>,
         pub(crate) permissioner: Permissioner,
+        pub(crate) grants_by_creation: AHashMap<UserId, Arc<GrantsByCreation>>,
         // `(created_at micros, user id)` of every user, so a page in creation
         // order seeks by key. Never persisted, rebuilt on restore.
         pub(crate) created_index: BTreeSet<(u64, usize)>,
@@ -185,7 +186,7 @@ collect_handlers! {
         CreatePersonalAccessToken,
         DeletePersonalAccessToken,
     }
-    internal { RemoveGrants }
+    internal { RemoveGrants, IndexReadGrants }
 }
 
 impl UsersInner {
@@ -218,10 +219,20 @@ impl UsersInner {
         {
             return None;
         }
-        if credential.token_id == 0 {
+        self.token_deadline_at(user_id, credential.token_id, now)
+    }
+
+    #[must_use]
+    pub fn token_deadline_at(
+        &self,
+        user_id: u32,
+        token_id: u64,
+        now: IggyTimestamp,
+    ) -> Option<u64> {
+        if token_id == 0 {
             return Some(u64::MAX);
         }
-        let token = self.token_of(user_id, credential.token_id)?;
+        let token = self.token_of(user_id, token_id)?;
         (!token.is_expired(now)).then(|| {
             token
                 .expiry_at
@@ -248,6 +259,7 @@ impl UsersInner {
 
     /// The op that created the live token `name` of `user_id`.
     #[must_use]
+    #[cfg(test)]
     pub fn token_id_of(&self, user_id: u32, name: &str) -> Option<u64> {
         self.personal_access_token_name_index
             .get(&(user_id, Arc::from(name)))
@@ -380,7 +392,7 @@ impl UsersInner {
     }
 
     /// The checks `CreateUserRequest::apply` makes before it mutates state, and
-    /// the decoded options when they pass. `reject_dangling_grant` runs them
+    /// the decoded options when they pass. `apply_scoped_grants` runs them
     /// before it checks the grants, so their refusal wins.
     pub(crate) fn validate_create_user(
         &self,
@@ -402,7 +414,7 @@ impl UsersInner {
     }
 
     /// Slab id of the user whose grants `UpdatePermissionsRequest::apply`
-    /// replaces, or the refusal of that apply. `reject_dangling_grant` runs this
+    /// replaces, or the refusal of that apply. `apply_scoped_grants` runs this
     /// before it checks the grants, so the refusal wins.
     pub(crate) fn permissions_target(
         &self,
@@ -471,6 +483,22 @@ impl Users {
         rule: impl FnOnce(&Permissioner) -> Result<(), IggyError>,
     ) -> Result<(), IggyError> {
         self.read(|inner| inner.authorize(rule))
+    }
+
+    pub(crate) fn apply_with_read_grants(
+        &self,
+        command: UsersCommand,
+        index: IndexReadGrantsRequest,
+        timestamp: IggyTimestamp,
+        context: ApplyContext,
+    ) -> Result<ApplyReply, IggyError> {
+        self.inner
+            .try_apply_all([
+                command,
+                UsersCommand::IndexReadGrants(index, timestamp, context),
+            ])
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+        Ok(self.read(|users| users.last_result.clone().unwrap_or_default()))
     }
 
     /// Drop every grant on a stream or topic that a committed delete removed.
@@ -958,6 +986,7 @@ impl StateHandler for DeleteUserRequest {
                 .created_index
                 .remove(&(removed.created_at.as_micros(), user_id));
             state.index.remove(&username);
+            state.grants_by_creation.remove(&(user_id as UserId));
             state.remove_personal_access_tokens(user_id as UserId);
             state
                 .permissioner
@@ -1030,6 +1059,7 @@ impl StateHandler for UpdatePermissionsRequest {
             Err(result) => return ApplyReply::err(result),
         };
 
+        state.grants_by_creation.remove(&(user_id as UserId));
         let mut changes = Vec::new();
         if let Some(user) = state.items.get_mut(user_id) {
             let before = user.permissions.as_deref().map(permissions_to_wire);
@@ -1061,6 +1091,31 @@ impl StateHandler for UpdatePermissionsRequest {
             changes,
             ..ApplyReply::ok(Bytes::new())
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexReadGrantsRequest {
+    pub(crate) user_id: WireIdentifier,
+    pub(crate) index: Arc<GrantsByCreation>,
+}
+
+impl StateHandler for IndexReadGrantsRequest {
+    type State = UsersInner;
+
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        let reply = state
+            .last_result
+            .take()
+            .expect("index follows the permission change in one publication");
+        if reply.code == 0
+            && let Some(id) = state.resolve_user_id(&self.user_id)
+        {
+            state
+                .grants_by_creation
+                .insert(state.items[id].id, Arc::clone(&self.index));
+        }
+        reply
     }
 }
 
@@ -1114,6 +1169,9 @@ impl StateHandler for RemoveGrantsRequest {
                         }
                     }
                 }
+            }
+            if let Some(index) = state.grants_by_creation.get_mut(&user.id) {
+                Arc::make_mut(index).remove(self.deleted);
             }
             user.permissions = Some(Arc::new(pruned));
             if let Ok(username) = WireName::new(user.username.as_ref()) {
@@ -1393,9 +1451,45 @@ pub struct UsersSnapshot {
     pub items: Vec<(usize, UserSnapshot)>,
     pub personal_access_tokens: Vec<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)>,
     pub permissioner: PermissionerSnapshot,
+    #[serde(skip)]
+    pub(crate) grants_by_creation: AHashMap<UserId, Arc<GrantsByCreation>>,
 }
 
 impl UsersSnapshot {
+    pub(crate) fn index_read_grants(mut self, snapshot: &MetadataSnapshot) -> Self {
+        let Some(streams) = &snapshot.streams else {
+            return self;
+        };
+        if !self.items.iter().any(|(_, user)| {
+            user.permissions
+                .as_ref()
+                .is_some_and(|permissions| permissions.streams.is_some())
+        }) {
+            return self;
+        }
+        let mut stream_times = AHashMap::new();
+        let mut topic_times = AHashMap::new();
+        for (id, stream) in &streams.items {
+            stream_times.insert(*id, stream.created_at.as_micros());
+            for (topic_id, topic) in &stream.topics {
+                topic_times.insert((*id, *topic_id), topic.created_at.as_micros());
+            }
+        }
+        for (_, user) in &self.items {
+            if let Some(permissions) = &user.permissions
+                && permissions.streams.is_some()
+            {
+                let ordered = GrantsByCreation::from_grants(
+                    permissions,
+                    |id| stream_times.get(&id).copied(),
+                    |id, topic| topic_times.get(&(id, topic)).copied(),
+                );
+                self.grants_by_creation.insert(user.id, Arc::new(ordered));
+            }
+        }
+        self
+    }
+
     pub(crate) fn validate_credential_ids(
         &self,
         sequence_number: u64,
@@ -1513,6 +1607,7 @@ impl Snapshotable for Users {
                 items,
                 personal_access_tokens,
                 permissioner,
+                grants_by_creation: AHashMap::new(),
             }
         })
     }
@@ -1617,6 +1712,7 @@ impl UsersInner {
             personal_access_token_name_index,
             personal_access_token_id_index,
             permissioner,
+            grants_by_creation: snapshot.grants_by_creation,
             installed_snapshot_op: 0,
             last_result: None,
             apply_context: ApplyContext::default(),
@@ -1624,7 +1720,7 @@ impl UsersInner {
     }
 }
 
-impl_fill_restore!(Users, users);
+impl_fill_restore!(Users, users, index_read_grants);
 
 #[cfg(test)]
 mod tests {

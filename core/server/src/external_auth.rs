@@ -387,9 +387,7 @@ pub fn validate_provisioned_account(
     check_account_policy(user.ok_or(AccountRejection::NotFound)?, started_at_op)
 }
 
-/// Why a pre-provisioned account was rejected. Logged for debugging but
-/// never exposed on the wire (the caller maps every variant to
-/// `InvalidCredentials`).
+/// Why a pre-provisioned account was rejected during external verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountRejection {
     NotFound,
@@ -412,26 +410,20 @@ impl std::fmt::Display for AccountRejection {
 }
 
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
-/// user. Logs the specific rejection reason. The wire error is
-/// `TransientNotAccepted` when the credentials changed during verification,
-/// which a retry can pass, and `InvalidCredentials` otherwise.
+/// user and log the reason for a refused account.
+///
+/// # Errors
+/// Returns the account policy that refused the login.
 pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
     started_at_op: u64,
-) -> Result<(u32, CredentialProof), iggy_common::IggyError> {
-    let Some(user) = users.user_by_name(username) else {
-        tracing::warn!(username, reason = %AccountRejection::NotFound, "ext-auth account rejected");
-        return Err(iggy_common::IggyError::InvalidCredentials);
-    };
-    check_account_policy(user, started_at_op).map_err(|reason| {
-        tracing::warn!(username, user_id = user.id, reason = %reason, "ext-auth account rejected");
-        if reason == AccountRejection::CredentialChanged {
-            iggy_common::IggyError::TransientNotAccepted
-        } else {
-            iggy_common::IggyError::InvalidCredentials
-        }
-    })
+) -> Result<(u32, CredentialProof), AccountRejection> {
+    validate_provisioned_account(users.user_by_name(username), started_at_op).inspect_err(
+        |reason| {
+            tracing::warn!(username, %reason, "ext-auth account rejected");
+        },
+    )
 }
 
 /// The proof names the account's current access revision: the external
@@ -467,7 +459,6 @@ mod tests {
     use super::*;
     use crate::dispatch::test_support::{TestMux, create_reader_request, prepare_message};
     use iggy_binary_protocol::{Operation, WireEncode};
-    use iggy_common::IggyError;
     use metadata::impls::metadata::StreamsFrontend as _;
     use metadata::stm::StateMachine as _;
 
@@ -776,10 +767,13 @@ mod tests {
                 .map(|_| ())
         };
 
-        assert_eq!(resolve("reader", 0), Err(IggyError::TransientNotAccepted));
+        assert_eq!(
+            resolve("reader", 0),
+            Err(AccountRejection::CredentialChanged)
+        );
         assert_eq!(resolve("reader", 1), Ok(()));
-        assert_eq!(resolve("root", 1), Err(IggyError::InvalidCredentials));
-        assert_eq!(resolve("nobody", 1), Err(IggyError::InvalidCredentials));
+        assert_eq!(resolve("root", 1), Err(AccountRejection::Root));
+        assert_eq!(resolve("nobody", 1), Err(AccountRejection::NotFound));
     }
 
     #[test]

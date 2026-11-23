@@ -1421,17 +1421,7 @@ where
         if !active {
             return None;
         }
-        if token_id == 0 {
-            return Some(u64::MAX);
-        }
-        users
-            .token_of(user_id, token_id)
-            .filter(|token| !token.is_expired(now))
-            .map(|token| {
-                token
-                    .expiry_at
-                    .map_or(u64::MAX, |expiry_at| expiry_at.as_micros())
-            })
+        users.token_deadline_at(user_id, token_id, now)
     });
     let Some(expires_at) = expires_at else {
         return Err(IggyError::Unauthenticated);

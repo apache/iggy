@@ -1058,7 +1058,7 @@ Each page is a separate read of one node. An entity that exists during the whole
 
 `GetStreams` and `GetTopics` need only an authenticated caller. They list the streams `GetStream` serves the caller and the topics `GetTopic` serves it, so a caller without a grant reads an empty last page. A stream or topic grant lists its stream or topic.
 
-A caller that reads a stream only through topic grants does not see the stream in `GetStreams`, because a stream entry carries totals over all its topics, and lists those topics with `GetTopics` under the stream id it knows. A hidden entry still counts against the 65536 entries a page walks, so a page can end empty with a cursor.
+A caller that reads a stream only through topic grants does not see the stream in `GetStreams`, because a stream entry carries totals over all its topics, and lists those topics with `GetTopics` under the stream id it knows. In either sort order, a scoped page counts only entries covered by the caller's read grants toward the 65536-entry scan limit. A name filter can still leave a page empty with a cursor.
 
 `GetTopics` for a stream that does not exist, or that no grant of the caller reaches, answers an empty last page without walking it. With a cursor, a caller with a global read grant gets `StreamIdNotFound` (1009) for a missing stream, because the stream was deleted during the walk. Every other caller gets the empty last page, so a missing and a hidden stream read the same. `GetPartitions` and `GetConsumerGroups` answer the not-found error of the missing stream or topic.
 

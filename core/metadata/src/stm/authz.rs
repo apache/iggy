@@ -36,11 +36,11 @@
 use crate::MuxStateMachine;
 use crate::change_log::{AppliedChange, change_actor};
 use crate::impls::metadata::StreamsFrontend;
-use crate::permissioner::Permissioner;
+use crate::permissioner::{GrantsByCreation, Permissioner};
 use crate::stm::consumer_group::{JoinConsumerGroupRequest, LeaveConsumerGroupRequest};
 use crate::stm::result::{ApplyReply, CreateUserResult, UpdatePermissionsResult};
 use crate::stm::stream::{Streams, TruncatePartitionRequest};
-use crate::stm::user::{ChangePasswordRequest, Users};
+use crate::stm::user::{ChangePasswordRequest, IndexReadGrantsRequest, Users, UsersCommand};
 use crate::stm::{ApplyContext, StateMachine};
 use consensus::ClientTable;
 use iggy_binary_protocol::primitives::metadata_changes::WireUserKey;
@@ -60,6 +60,7 @@ use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissions
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, WireName};
 use iggy_common::{IggyError, IggyTimestamp, variadic};
 use server_common::Message;
+use std::sync::Arc;
 
 /// Gate a committed prepare, then apply it. A denial commits as an
 /// `Unauthorized` no-op (the gate never mutates state); an allow proceeds to
@@ -89,8 +90,8 @@ where
     if let Some(denied) = authorize(&prepare, mux.users(), mux.streams()) {
         return Ok(denied);
     }
-    if let Some(rejected) = reject_dangling_grant(&prepare, mux.users(), mux.streams()) {
-        return Ok(rejected);
+    if let Some(result) = apply_scoped_grants(&prepare, mux.users(), mux.streams()) {
+        return result;
     }
     let header = prepare.header();
     let timestamp = IggyTimestamp::from(header.timestamp);
@@ -495,49 +496,80 @@ pub(crate) fn authorize(
 /// the streams, and at apply time, so it sees a delete committed just before.
 /// An op that apply refuses for another reason passes through, so the client
 /// gets that code, as with `admits_partitions_create`.
-fn reject_dangling_grant(
+fn apply_scoped_grants(
     prepare: &Message<PrepareHeader>,
     users: &Users,
     streams: &Streams,
-) -> Option<ApplyReply> {
-    let body = prepare.body();
-    let (permissions, stream_not_found, topic_not_found) = match prepare.header().operation {
+) -> Option<Result<ApplyReply, IggyError>> {
+    let header = prepare.header();
+    let timestamp = IggyTimestamp::from(header.timestamp);
+    let context = ApplyContext::from(header);
+    let (command, user_id, stream_not_found, topic_not_found) = match header.operation {
         Operation::CreateUser => {
-            let request = CreateUserRequest::decode_from(body).ok()?;
+            let request = CreateUserRequest::decode_from(prepare.body()).ok()?;
             users
                 .read(|inner| inner.validate_create_user(&request))
                 .ok()?;
+            let id = WireIdentifier::String(request.username.clone());
             (
-                request.permissions?,
+                UsersCommand::CreateUser(request, timestamp, context),
+                id,
                 u32::from(CreateUserResult::StreamNotFound),
                 u32::from(CreateUserResult::TopicNotFound),
             )
         }
         Operation::UpdatePermissions => {
-            let request = UpdatePermissionsRequest::decode_from(body).ok()?;
+            let request = UpdatePermissionsRequest::decode_from(prepare.body()).ok()?;
             users
                 .read(|inner| inner.permissions_target(&request.user_id))
                 .ok()?;
+            let id = request.user_id.clone();
             (
-                request.permissions?,
+                UsersCommand::UpdatePermissions(request, timestamp, context),
+                id,
                 u32::from(UpdatePermissionsResult::StreamNotFound),
                 u32::from(UpdatePermissionsResult::TopicNotFound),
             )
         }
         _ => return None,
     };
-    streams.read(|inner| {
-        permissions.streams.iter().find_map(|grant| {
-            let Some(stream) = inner.items.get(grant.stream_id as usize) else {
-                return Some(ApplyReply::err(stream_not_found));
-            };
-            grant
+    let permissions = match &command {
+        UsersCommand::CreateUser(request, ..) => request.permissions.as_ref()?,
+        UsersCommand::UpdatePermissions(request, ..) => request.permissions.as_ref()?,
+        _ => unreachable!(),
+    };
+    if permissions.streams.is_empty() {
+        return None;
+    }
+    let ordered = streams.read(|inner| {
+        for grant in &permissions.streams {
+            let stream = inner
+                .items
+                .get(grant.stream_id as usize)
+                .ok_or(stream_not_found)?;
+            if grant
                 .topics
                 .iter()
                 .any(|topic| !stream.topics.contains(topic.topic_id as usize))
-                .then(|| ApplyReply::err(topic_not_found))
-        })
-    })
+            {
+                return Err(topic_not_found);
+            }
+        }
+        Ok(GrantsByCreation::from_catalog(
+            &permissions.clone().into(),
+            inner,
+        ))
+    });
+    let index = match ordered {
+        Ok(index) => Arc::new(index),
+        Err(code) => return Some(Ok(ApplyReply::err(code))),
+    };
+    Some(users.apply_with_read_grants(
+        command,
+        IndexReadGrantsRequest { user_id, index },
+        timestamp,
+        context,
+    ))
 }
 
 /// What a create that `[metadata] partitions_max` counts adds partitions to.
@@ -683,6 +715,9 @@ impl GatedApply for MuxStateMachine<()> {
 mod tests {
     use super::*;
     use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+    use crate::stm::snapshot::{
+        FillSnapshot, MetadataSnapshot, RestoreSnapshot, RestoreSnapshotInPlace,
+    };
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::primitives::permissions::{
         WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
@@ -1363,6 +1398,17 @@ mod tests {
                 .is_ok(),
             "the grant on the live topic stays"
         );
+        mux.read_scoped_page(ALICE, |_, _, index| {
+            assert_eq!(
+                index.unwrap().topics[&0]
+                    .iter()
+                    .map(|key| key.1)
+                    .collect::<Vec<_>>(),
+                [1]
+            );
+            Ok(())
+        })
+        .unwrap();
         let topic_ids = stream_grants_of(&mux, ALICE)
             .and_then(|mut streams| streams.remove(&0))
             .and_then(|stream| stream.topics)
@@ -1372,6 +1418,53 @@ mod tests {
             Some(vec![1]),
             "the user record must drop the topic grant too, or a snapshot restore rebuilds it"
         );
+    }
+
+    #[test]
+    fn given_scoped_grants_when_replaced_restored_and_pruned_should_index_only_readable_entries() {
+        let live = mux();
+        let stream_ids = |mux: &MuxStateMachine<variadic!(Users, Streams)>| {
+            mux.read_scoped_page(ALICE, |_, _, ordered| {
+                Ok(ordered
+                    .into_iter()
+                    .flat_map(|index| index.streams.iter().map(|key| key.1))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+        };
+        commit_as_root(&live, 1, Operation::CreateStream, &create_stream_body("a"));
+        commit_as_root(&live, 2, Operation::CreateStream, &create_stream_body("b"));
+        commit_as_root(
+            &live,
+            3,
+            Operation::CreateUser,
+            &create_user_body("alice", no_grants(), vec![stream_read(1)]),
+        );
+        assert_eq!(stream_ids(&live), [1]);
+        commit_as_root(
+            &live,
+            4,
+            Operation::UpdatePermissions,
+            &update_permissions_body("alice", vec![stream_read(0), stream_manage_topics(1)]),
+        );
+        assert_eq!(stream_ids(&live), [0]);
+        let mut snapshot = MetadataSnapshot::new(4);
+        live.fill_snapshot(&mut snapshot).unwrap();
+        let snapshot = MetadataSnapshot::decode(&snapshot.encode().unwrap()).unwrap();
+        let restored = MuxStateMachine::restore_snapshot(&snapshot).unwrap();
+        let installed = mux();
+        installed.restore_snapshot_in_place(&snapshot).unwrap();
+        for state in [&live, &restored, &installed] {
+            assert_eq!(stream_ids(state), [0]);
+            commit_as_root(state, 5, Operation::DeleteStream, &delete_stream_body(0));
+            commit_as_root(
+                state,
+                6,
+                Operation::CreateStream,
+                &create_stream_body("replacement"),
+            );
+            assert_eq!(stream_ids(state), Vec::<usize>::new());
+        }
     }
 
     #[test]
