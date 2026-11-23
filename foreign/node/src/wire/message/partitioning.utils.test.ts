@@ -70,6 +70,21 @@ describe('Partitioning', () => {
         3, 3, 0, 255, 128
       ]));
     });
+
+    it('serializes a maximum-length 255-byte message key', () => {
+      const key = Buffer.alloc(255, 0xab);
+      assert.deepEqual(
+        serializePartitioning(Partitioning.MessageKey(key)),
+        Buffer.concat([Buffer.from([3, 255]), Buffer.alloc(255, 0xab)])
+      );
+    });
+
+    it('rejects a 256-byte message key because the length header is one byte', () => {
+      assert.throws(
+        () => serializePartitioning(Partitioning.MessageKey(Buffer.alloc(256, 0xab))),
+        RangeError
+      );
+    });
   });
 
   describe('serializePartitioningValue', () => {
@@ -91,15 +106,15 @@ describe('Partitioning', () => {
   });
 
   describe('serializeMessageKey', () => {
-    it('serializes a number into four little-endian bytes', () => {
-      assert.deepEqual(serializeMessageKey(0x12345678), Buffer.from([
-        0x78, 0x56, 0x34, 0x12
+    it('serializes the maximum uint32 message key', () => {
+      assert.deepEqual(serializeMessageKey(0xffffffff), Buffer.from([
+        0xff, 0xff, 0xff, 0xff
       ]));
     });
 
-    it('serializes a bigint into eight little-endian bytes', () => {
-      assert.deepEqual(serializeMessageKey(0x0102030405060708n), Buffer.from([
-        8, 7, 6, 5, 4, 3, 2, 1
+    it('serializes the maximum uint64 message key', () => {
+      assert.deepEqual(serializeMessageKey(0xffffffffffffffffn), Buffer.from([
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff
       ]));
     });
 
