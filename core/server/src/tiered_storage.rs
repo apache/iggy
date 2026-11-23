@@ -265,13 +265,13 @@ pub fn start(
         config.fresh_pending_bytes.as_bytes_u64(),
         config.fresh_partition_pending_bytes.as_bytes_u64(),
     );
-    shard
-        .plane
-        .partitions()
-        .set_remote_segments(Rc::new(RemoteSegments::new(
+    shard.plane.partitions().set_remote_segments(Rc::new(
+        RemoteSegments::new(
             Rc::new(ExecutorObjects::new(service.clone())),
             layout.clone(),
-        )));
+        )
+        .with_runtime(Rc::new(Rc::clone(bus))),
+    ));
     shard
         .plane
         .metadata()

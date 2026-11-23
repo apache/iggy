@@ -145,7 +145,7 @@ where
             partition.finish_topic_object_check(
                 finished.id,
                 &finished.outcome,
-                IggyTimestamp::now(),
+                IggyTimestamp::from(self.bus.realtime_micros()),
             );
         }
     }

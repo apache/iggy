@@ -188,6 +188,12 @@ where
         &self.inner.store
     }
 
+    /// The bus that runs the service's jobs and times them.
+    #[must_use]
+    pub fn bus(&self) -> &B {
+        &self.inner.bus
+    }
+
     #[must_use]
     pub fn load(&self, class: TierJobClass) -> ClassLoad {
         let classes = self.inner.classes.borrow();

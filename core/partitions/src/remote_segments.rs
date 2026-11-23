@@ -50,6 +50,7 @@ use tracing::{error, warn};
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
+use crate::read_runtime::{CompioRuntime, ReadRuntime};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -457,20 +458,37 @@ impl FreshReads {
 pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
     layout: KeyLayout,
+    runtime: Rc<dyn ReadRuntime>,
     /// See [`INDEX_GET_TIMEOUT`].
     pub(crate) index_get_timeout: Duration,
     fresh: RefCell<FreshCache>,
 }
 
 impl RemoteSegments {
+    /// Reads of `objects` that run on the compio runtime and the system
+    /// clock, until [`Self::with_runtime`] gives them another.
     #[must_use]
     pub fn new(objects: Rc<dyn RemoteObjects>, layout: KeyLayout) -> Self {
         Self {
             objects,
             layout,
+            runtime: Rc::new(CompioRuntime),
             index_get_timeout: INDEX_GET_TIMEOUT,
             fresh: RefCell::new(FreshCache::new(FRESH_CACHE_BYTES)),
         }
+    }
+
+    /// Run the reads on `runtime`. The polls that read through these segments
+    /// must take their deadlines from its clock.
+    #[must_use]
+    pub fn with_runtime(mut self, runtime: Rc<dyn ReadRuntime>) -> Self {
+        self.runtime = runtime;
+        self
+    }
+
+    /// The clock, the timer and the task spawner of the reads.
+    pub(crate) fn runtime(&self) -> &dyn ReadRuntime {
+        &*self.runtime
     }
 
     /// Keep at most `budget` bytes of fresh objects in memory.
@@ -751,9 +769,11 @@ impl RemoteSegments {
         let mut whole: Option<(String, u64)> = None;
         loop {
             let get = self.objects.get_range(key, at..at + INDEX_FETCH_CHUNK);
-            let object = compio::time::timeout(self.index_get_timeout, get)
+            let object = self
+                .runtime()
+                .timeout(self.index_get_timeout, get)
                 .await
-                .map_err(|_| {
+                .ok_or_else(|| {
                     warn!(
                         target: "iggy.partitions.diag",
                         plane = "partitions",
@@ -1126,17 +1146,20 @@ impl IndexFetch {
         let (done, fetched) = oneshot::channel();
         let (dropping, dropped) = oneshot::channel();
         let state = Rc::clone(&task.state);
-        compio::runtime::spawn(async move {
-            let result = remote
-                .fetch_index(&log, task.start_offset, &partition_dir, &index_path, &task)
-                .await;
-            task.state.succeeded.set(result.is_ok());
-            // Teardown may go on as soon as the waiters hear of the end.
-            drop(task);
-            // Every poll that waited may have reached its deadline.
-            let _ = done.send(result);
-        })
-        .detach();
+        let runtime = Rc::clone(&remote.runtime);
+        runtime.spawn(
+            async move {
+                let result = remote
+                    .fetch_index(&log, task.start_offset, &partition_dir, &index_path, &task)
+                    .await;
+                task.state.succeeded.set(result.is_ok());
+                // Teardown may go on as soon as the waiters hear of the end.
+                drop(task);
+                // Every poll that waited may have reached its deadline.
+                let _ = done.send(result);
+            }
+            .boxed_local(),
+        );
         Self {
             fetched: fetched.shared(),
             dropped: dropped.shared(),

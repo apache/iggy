@@ -342,7 +342,9 @@ where
                     if let MergeSettled::Committed { replaced } = settled {
                         self.metrics.record_long_term_merge(replaced);
                     }
-                    match partition.begin_segment_merge(pass, IggyTimestamp::now()) {
+                    match partition
+                        .begin_segment_merge(pass, IggyTimestamp::from(self.bus.realtime_micros()))
+                    {
                         Some(MergeStart::Merge(id, merge, scope)) => {
                             MergeStep::Start((id, merge, scope))
                         }

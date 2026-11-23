@@ -353,6 +353,7 @@ where
     #[must_use]
     pub fn remote_segments(&self) -> RemoteSegments {
         RemoteSegments::new(Rc::new(self.objects()), self.layout.clone())
+            .with_runtime(Rc::new(self.service.bus().clone()))
     }
 
     /// Where the primaries of this peer's shadow partitions read its

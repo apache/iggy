@@ -159,13 +159,10 @@ fn wire_store(sim: &Simulator, replica: u8, store: &Shared) {
             store.clone(),
             layout(),
         ))));
-        shard
-            .plane
-            .partitions()
-            .set_remote_segments(Rc::new(RemoteSegments::new(
-                Rc::new(ExecutorObjects::new(store.clone())),
-                layout(),
-            )));
+        shard.plane.partitions().set_remote_segments(Rc::new(
+            RemoteSegments::new(Rc::new(ExecutorObjects::new(store.clone())), layout())
+                .with_runtime(Rc::new(shard.bus.clone())),
+        ));
     }
 }
 

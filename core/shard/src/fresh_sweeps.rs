@@ -66,7 +66,7 @@ use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, VecDeque};
 use std::rc::Rc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// How often the first shard starts a sweep.
 ///
@@ -521,10 +521,12 @@ where
             let settled = state.settle(listing, in_use, now, FRESH_OBJECT_GRACE);
             (settled, state.len())
         };
-        let oldest = listing
-            .oldest
-            .and_then(|oldest| SystemTime::now().duration_since(oldest).ok())
-            .unwrap_or_default();
+        let oldest = listing.oldest.map_or(Duration::ZERO, |oldest| {
+            Duration::from_micros(
+                now.as_micros()
+                    .saturating_sub(IggyTimestamp::from(oldest).as_micros()),
+            )
+        });
         self.metrics
             .set_fresh_objects(listing.objects().len(), listing.bytes, oldest, unnamed);
         sweeps.held.set(None);

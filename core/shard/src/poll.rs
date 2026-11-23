@@ -466,7 +466,7 @@ where
                             );
                             return;
                         };
-                        let plan = plan.with_deadline(std::time::Instant::now() + COLD_POLL_BUDGET);
+                        let plan = plan.with_deadline(self.bus.monotonic_now() + COLD_POLL_BUDGET);
                         let Some(completion) = self
                             .poll_completions
                             .try_reserve(namespace, reply, attachment)

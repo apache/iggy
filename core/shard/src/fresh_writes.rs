@@ -75,7 +75,7 @@ use consensus::PartitionsHandle;
 use iggy_binary_protocol::batch::BatchHeader;
 use iggy_binary_protocol::placement::{self, Placement};
 use iggy_binary_protocol::{GenericHeader, Operation, PrepareHeader, RoutedRequestHeader};
-use iggy_common::{IggyError, IggyTimestamp};
+use iggy_common::IggyError;
 use iggy_object_store::{
     ErrorClass, FRESH_OBJECT_BATCHES_MAX, FRESH_OBJECT_DATA_BYTES_MAX, FRESH_OBJECT_PROOFS_MAX,
     FreshBatch, FreshObjectHeader, FreshObjectId, FreshPartition, FreshProducer, FreshProofRow,
@@ -366,8 +366,10 @@ pub struct FreshWrites {
     proof_walk_retry_at: RefCell<BTreeMap<IggyNamespace, u64>>,
 }
 
-impl Default for FreshWrites {
-    fn default() -> Self {
+impl FreshWrites {
+    /// The state of a shard that started at `started_at`, in bus
+    /// microseconds since the Unix epoch.
+    pub(crate) fn new(started_at: u64) -> Self {
         Self {
             uploader: RefCell::new(None),
             window: RefCell::new(None),
@@ -385,7 +387,7 @@ impl Default for FreshWrites {
             interval_micros: Cell::new(micros(FRESH_UPLOAD_INTERVAL)),
             last_upload_started_at: Cell::new(None),
             sequence: Cell::new(0),
-            started_at: IggyTimestamp::now().as_micros(),
+            started_at,
             undelivered: Rc::default(),
             awaited: Rc::default(),
             cursors: RefCell::default(),

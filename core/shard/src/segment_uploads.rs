@@ -181,7 +181,7 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        let now = Instant::now();
+        let now = self.bus.monotonic_now();
         // The watermark belongs to `created_revision`. Noted into any other
         // incarnation it would let a floor advance pass over offsets nothing
         // committed as deleted there. The finished uploads are still settled:
@@ -330,7 +330,7 @@ where
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
         M: RestorableMetadataStm,
     {
-        self.segment_upload_finished_at(finished, Instant::now())
+        self.segment_upload_finished_at(finished, self.bus.monotonic_now())
             .await;
     }
 
