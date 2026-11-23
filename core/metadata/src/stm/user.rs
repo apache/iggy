@@ -1480,9 +1480,10 @@ impl Snapshotable for Users {
                                     expiry_at: pat.expiry_at,
                                     // A token without an id writes 0, which the checkpoint validation refuses.
                                     id: inner
-                                        .personal_access_token_index
-                                        .get(&pat.token)
-                                        .map_or(0, |&(_, _, token_id)| token_id),
+                                        .personal_access_token_name_index
+                                        .get(&(user_id, Arc::clone(name)))
+                                        .copied()
+                                        .unwrap_or(0),
                                 },
                             )
                         })
@@ -1896,6 +1897,7 @@ mod tests {
     #[test]
     fn given_token_lifecycle_when_indexing_names_should_follow_every_change_and_restore() {
         let mut users = UsersInner::new();
+        users.apply_context.metadata_op = 1;
         create_user(&mut users, "alice");
         let token = |name: &str| CreatePersonalAccessTokenRequest {
             user_id: 0,
@@ -1910,9 +1912,16 @@ mod tests {
                 .map(|(user_id, name)| (*user_id, name.to_string()))
                 .collect::<Vec<_>>()
         };
-        for name in ["ci", "build"] {
+        for (op, name) in [(2, "ci"), (3, "build")] {
+            users.apply_context.metadata_op = op;
             token(name).apply(&mut users, IggyTimestamp::zero());
         }
+        let snapshot = Users::from(users.clone()).to_snapshot();
+        snapshot.validate_credential_ids(3).unwrap();
+        let restored = UsersInner::inner_from_snapshot(snapshot);
+        assert_eq!(restored.token_id_of(0, "ci"), Some(2));
+        assert_eq!(restored.token_id_of(0, "build"), Some(3));
+
         DeletePersonalAccessTokenRequest {
             user_id: 0,
             name: WireName::new("ci").unwrap(),
@@ -1923,6 +1932,7 @@ mod tests {
 
         let restored = UsersInner::inner_from_snapshot(Users::from(users.clone()).to_snapshot());
         assert_eq!(names(&restored), names(&users));
+        assert_eq!(restored.token_id_of(0, "build"), Some(3));
 
         users.remove_personal_access_tokens(0);
         assert_eq!(names(&users), [] as [(UserId, String); 0]);

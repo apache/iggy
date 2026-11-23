@@ -90,6 +90,7 @@ use server_common::sharding::IggyNamespace;
 use shard::ConnectedClientInfo;
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -1268,8 +1269,10 @@ fn streams_page(
             None,
         )
     };
-    if let Some(granted) =
-        ReadGrants::granted_streams(permissions, start.after_id(), query.descending)
+    let grant_count = permissions.streams.as_ref().map_or(0, BTreeMap::len);
+    if start.walk_grants(grant_count, streams.items.len(), limit, budget)
+        && let Some(granted) =
+            ReadGrants::granted_streams(permissions, start.after_id(), query.descending)
     {
         let page = granted_page(
             granted.filter_map(|id| Some((id, streams.items.get(id)?))),
@@ -1282,6 +1285,7 @@ fn streams_page(
         )?;
         return Ok((page, skipped));
     }
+    let reads_all = ReadGrants::for_stream(Some(permissions), None).reads_stream();
     let page = match start {
         WalkStart::Id(after) => collect_page(
             streams
@@ -1295,6 +1299,9 @@ fn streams_page(
         WalkStart::Created(after) => collect_page(
             streams
                 .streams_by_created(after, query.descending)
+                .filter(|((_, id), _)| {
+                    reads_all || ReadGrants::for_stream(Some(permissions), Some(*id)).reads_stream()
+                })
                 .map(|((created_at, id), stream)| (created_cursor(created_at, id), stream)),
             limit,
             budget,
@@ -1356,7 +1363,13 @@ fn topics_page(
             Some(stream_id),
         )
     };
-    if let Some(granted) = grants.granted_topics(start.after_id(), query.descending) {
+    if start.walk_grants(
+        grants.topic_grant_count(),
+        stream.topics.len(),
+        limit,
+        budget,
+    ) && let Some(granted) = grants.granted_topics(start.after_id(), query.descending)
+    {
         let page = granted_page(
             granted.filter_map(|id| Some((id, stream.topics.get(id)?))),
             |topic| topic.created_at,
@@ -1378,16 +1391,15 @@ fn topics_page(
             budget,
             project,
         ),
-        WalkStart::Created(after) => {
-            let topics = stream.topics_by_created();
-            collect_page(
-                slice_after(&topics, |(key, _)| *key, after, query.descending)
-                    .map(|&((created_at, id), topic)| (created_cursor(created_at, id), topic)),
-                limit,
-                budget,
-                project,
-            )
-        }
+        WalkStart::Created(after) => collect_page(
+            stream
+                .topics_by_created_after(after, query.descending)
+                .filter(|((_, id), _)| grants.reads_topic(*id))
+                .map(|((created_at, id), topic)| (created_cursor(created_at, id), topic)),
+            limit,
+            budget,
+            project,
+        ),
     }?;
     Ok((page, skipped))
 }
@@ -1507,6 +1519,17 @@ enum WalkStart {
 }
 
 impl WalkStart {
+    const fn walk_grants(
+        self,
+        grant_count: usize,
+        catalog_count: usize,
+        limit: usize,
+        budget: PageBudget,
+    ) -> bool {
+        let small_grant_set = grant_count <= limit || grant_count <= catalog_count.isqrt();
+        matches!(self, Self::Id(_)) || (small_grant_set && grant_count <= budget.scanned_entries)
+    }
+
     const fn after_id(self) -> Option<usize> {
         match self {
             Self::Id(after) => after,
@@ -2951,6 +2974,19 @@ mod tests {
         });
         let names: Vec<&str> = found.iter().map(|topic| topic.name.as_str()).collect();
         assert_eq!(names, ["tb"]);
+    }
+
+    #[test]
+    fn given_creation_order_when_choosing_a_walk_should_bound_grant_sorts_and_avoid_scanning_sparse_catalogs()
+     {
+        let start = WalkStart::Created(None);
+        assert!(start.walk_grants(2, 100_000, 1, PAGE_BUDGET));
+        assert!(!start.walk_grants(10_000, 100_000, 1_000, PAGE_BUDGET));
+        let budget = PageBudget {
+            scanned_entries: 3,
+            ..PAGE_BUDGET
+        };
+        assert!(!start.walk_grants(4, 100_000, 10, budget));
     }
 
     #[test]

@@ -1215,6 +1215,40 @@ async fn given_ungranted_user_when_reading_or_producing_should_be_forbidden(harn
     );
 }
 
+#[iggy_harness(cluster_nodes = 1, server(
+    http.jwt.encoding_secret = "0123456789abcdef0123456789abcdef",
+    http.jwt.decoding_secret = "0123456789abcdef0123456789abcdef"
+))]
+async fn given_a_persistent_jwt_key_when_restarting_should_accept_tokens_only_from_the_same_history(
+    harness: &mut TestHarness,
+) {
+    let root = HttpClient::login_root(harness).await;
+    root.create_user("reader", "reader-password").await;
+    let reader = root.login("reader", "reader-password").await;
+
+    harness.restart_server().await.unwrap();
+    let restarted = HttpClient::login_root(harness).await;
+    assert_eq!(
+        restarted.refresh(&reader.token).await.status(),
+        StatusCode::OK
+    );
+
+    harness.restart_node_from_clean_slate(0).unwrap();
+    let fresh = HttpClient::login_root(harness).await;
+    assert_eq!(
+        fresh.refresh(&reader.token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        fresh
+            .with_token(reader.token)
+            .delete("/users/logout")
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
 #[iggy_harness]
 async fn given_valid_access_token_when_refreshing_should_issue_working_token_without_revoking_old(
     harness: &TestHarness,

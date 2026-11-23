@@ -863,17 +863,6 @@ pub(in crate::http) mod tests {
             &create_reader_request().to_bytes(),
         );
         let metadata = state.shard.plane.metadata();
-        metadata
-            .change_log()
-            .append(
-                &PrepareHeader {
-                    op: 1,
-                    checksum: 0x5eed,
-                    ..PrepareHeader::default()
-                },
-                Vec::new(),
-            )
-            .unwrap();
         metadata.advance_applied_frontier(1);
         let query = |pairs: &[(&str, &str)]| {
             Query(
@@ -1041,6 +1030,7 @@ pub(in crate::http) mod tests {
                     .generate(
                         READER_ID,
                         CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                        CLUSTER_UID,
                         u64::MAX,
                     )
                     .unwrap();
@@ -1157,7 +1147,7 @@ pub(in crate::http) mod tests {
         let issued = CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT);
         let before = state
             .jwt
-            .generate(READER_ID, issued, u64::MAX)
+            .generate(READER_ID, issued, CLUSTER_UID, u64::MAX)
             .unwrap()
             .access_token;
         assert!(resolve_credential(&state, &before).await.is_ok());
@@ -1186,10 +1176,49 @@ pub(in crate::http) mod tests {
         let current = CredentialProof::account(READER_CREATED_AT, CHANGED_AT);
         let after = state
             .jwt
-            .generate(READER_ID, current, u64::MAX)
+            .generate(READER_ID, current, CLUSTER_UID, u64::MAX)
             .unwrap()
             .access_token;
         assert!(resolve_credential(&state, &after).await.is_ok());
+    }
+
+    #[compio::test]
+    async fn given_token_from_another_history_when_logging_out_or_refreshing_should_return_unauthorized()
+     {
+        let state = read_state();
+        let token = state
+            .jwt
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID + 1,
+                u64::MAX,
+            )
+            .unwrap()
+            .access_token;
+        let service = TowerToHyperService::new(router(
+            state.clone(),
+            state.forward.body_limit,
+            None,
+            None,
+            false,
+        ));
+        let logout = Request::delete("/users/logout")
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let refresh = Request::post("/users/refresh-token")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({ "token": token }).to_string(),
+            ))
+            .unwrap();
+        for request in [logout, refresh] {
+            assert_eq!(
+                service.call(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
     }
 
     #[compio::test]
@@ -1208,6 +1237,7 @@ pub(in crate::http) mod tests {
             .generate(
                 READER_ID,
                 CredentialProof::account(READER_CREATED_AT, CHANGED_AT),
+                CLUSTER_UID,
                 u64::MAX,
             )
             .unwrap()
@@ -1244,7 +1274,7 @@ pub(in crate::http) mod tests {
         };
         let token = state
             .jwt
-            .generate(READER_ID, exchanged, u64::MAX)
+            .generate(READER_ID, exchanged, CLUSTER_UID, u64::MAX)
             .unwrap()
             .access_token;
         assert!(matches!(
@@ -1332,6 +1362,7 @@ pub(in crate::http) mod tests {
                 .generate(
                     READER_ID,
                     CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                    CLUSTER_UID,
                     u64::MAX,
                 )
                 .unwrap();
@@ -1438,6 +1469,7 @@ pub(in crate::http) mod tests {
             .generate(
                 READER_ID,
                 CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
                 u64::MAX,
             )
             .unwrap();
@@ -1950,6 +1982,8 @@ pub(in crate::http) mod tests {
         );
     }
 
+    pub(in crate::http) const CLUSTER_UID: u128 = 0x5eed;
+
     pub(in crate::http) fn read_state() -> HttpState {
         read_state_on(None, None)
     }
@@ -1993,6 +2027,17 @@ pub(in crate::http) mod tests {
         mux.users().ensure_root_user("iggy", "hash");
         let metadata = ServerMetadata::new(Some(consensus), None, None, None, mux, None)
             .with_applied_frontier(frontier);
+        metadata
+            .change_log()
+            .append(
+                &PrepareHeader {
+                    op: 1,
+                    checksum: CLUSTER_UID,
+                    ..PrepareHeader::default()
+                },
+                Vec::new(),
+            )
+            .unwrap();
         let partitions = IggyPartitions::new(
             ShardId::new(0),
             PartitionsConfig {
@@ -2063,6 +2108,7 @@ pub(in crate::http) mod tests {
             .generate(
                 user_id,
                 CredentialProof::account(created_at, created_at),
+                CLUSTER_UID,
                 u64::MAX,
             )
             .unwrap();

@@ -59,6 +59,7 @@ use crate::http::session::{
     forget_if_same, live_entry, sweep_expired,
 };
 use crate::shell::ServerShard;
+use crate::store_identity::own_cluster_uid;
 
 /// Response header carrying the current VSR view number. Stamped by
 /// `insert_view_header` on success and redirect responses only (never on
@@ -498,9 +499,20 @@ impl HttpInner {
     /// node has not applied. Revisions only grow and a token id is the op that
     /// created it, so until it applies that op the node cannot tell a token
     /// issued after a change from a revoked one.
-    pub(in crate::http) fn lags_behind(&self, user_id: u32, credential: &CredentialProof) -> bool {
+    pub(in crate::http) fn lags_behind(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        cluster_uid: u128,
+    ) -> Result<bool, IggyError> {
+        let Some(local_uid) = own_cluster_uid(&self.shard) else {
+            return Ok(true);
+        };
+        if cluster_uid != local_uid {
+            return Err(IggyError::Unauthenticated);
+        }
         let applied_op = self.shard.plane.metadata().applied_frontier().get();
-        self.shard.plane.metadata().mux_stm.users().read(|users| {
+        Ok(self.shard.plane.metadata().mux_stm.users().read(|users| {
             let Some(user) = users
                 .items
                 .get(user_id as usize)
@@ -511,7 +523,7 @@ impl HttpInner {
             credential.access_revision > user.access_revision
                 || (credential.token_id > applied_op
                     && users.token_of(user_id, credential.token_id).is_none())
-        })
+        }))
     }
 
     /// The account a trusted issuer's tokens act as and its current proof: the

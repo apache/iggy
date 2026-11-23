@@ -17,6 +17,8 @@
 
 pub mod permissioner_rules;
 
+use std::collections::BTreeMap;
+
 use crate::stm::walk::{Directed, range_after};
 use ahash::{AHashMap, AHashSet};
 use iggy_common::{GlobalPermissions, Permissions, StreamPermissions, TopicPermissions, UserId};
@@ -119,6 +121,13 @@ impl<'a> ReadGrants<'a> {
                 .stream
                 .and_then(|stream| stream.topics.as_ref()?.get(&topic_id))
                 .is_some_and(Self::reads_topic_grant)
+    }
+
+    #[must_use]
+    pub fn topic_grant_count(&self) -> usize {
+        self.stream
+            .and_then(|stream| stream.topics.as_ref())
+            .map_or(0, BTreeMap::len)
     }
 
     /// The topics the topic grants read after the id cursor, or `None` when the grants

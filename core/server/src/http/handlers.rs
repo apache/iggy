@@ -274,9 +274,9 @@ pub(in crate::http) async fn refresh_token(
     // Refresh rejects trusted-issuer tokens (they keep their own lifecycle);
     // `decode_for_refresh` is `!Send` (a trusted-issuer token may await a JWKS
     // fetch), so bridge it like every other shard-0 path (see [`logout_user`]).
-    let (user_id, credential) =
+    let (user_id, credential, cluster_uid) =
         SendWrapper::new(state.jwt.decode_for_refresh(&command.token)).await?;
-    if state.lags_behind(user_id, &credential) {
+    if state.lags_behind(user_id, &credential, cluster_uid)? {
         return Err(IggyError::TransientNotAccepted.into());
     }
     issue_identity(&state, user_id, &credential)
@@ -2407,7 +2407,11 @@ fn issue_identity(
     credential: &CredentialProof,
 ) -> Result<Json<IdentityInfo>, CustomError> {
     let (credential, source_expiry) = inner.issuable_credential(user_id, credential)?;
-    let generated = inner.jwt.generate(user_id, credential, source_expiry)?;
+    let cluster_uid = crate::store_identity::own_cluster_uid(&inner.shard)
+        .ok_or(IggyError::TransientNotAccepted)?;
+    let generated = inner
+        .jwt
+        .generate(user_id, credential, cluster_uid, source_expiry)?;
     Ok(Json(IdentityInfo {
         user_id: generated.user_id,
         access_token: Some(TokenInfo {

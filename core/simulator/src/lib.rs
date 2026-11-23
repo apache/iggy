@@ -11763,6 +11763,10 @@ mod tests {
             "{}",
             oracle::quiesce_failure_report(&sim, &workload),
         );
+        assert!(
+            (0..usize::from(replica_count)).any(|replica| snapshot_floor(&sim, replica) > 0),
+            "the raw metadata workload must advance the checkpoint"
+        );
     }
 
     #[test]

@@ -423,8 +423,9 @@ pub(in crate::http) async fn resolve_credential(
             TokenSubject::Account {
                 user_id,
                 credential,
+                cluster_uid,
             } => {
-                if state.lags_behind(user_id, &credential) {
+                if state.lags_behind(user_id, &credential, cluster_uid)? {
                     return Err(AuthError::SessionNotAccepted);
                 }
                 ensure_active_user(&state.shard, user_id, &credential)?;

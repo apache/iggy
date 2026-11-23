@@ -1732,7 +1732,7 @@ mod tests {
     use crate::http::admission::MAX_IN_FLIGHT_RELAY_TARGETS;
     use crate::http::handlers::HTTP_UNREGISTERED_CLIENT_ID;
     use crate::http::reads::tests::{
-        READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
+        CLUSTER_UID, READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
         read_state_with_frontier,
     };
     use crate::http::router;
@@ -1860,6 +1860,7 @@ mod tests {
             .generate(
                 READER_ID,
                 CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
                 u64::MAX,
             )
             .unwrap();
@@ -2391,6 +2392,7 @@ mod tests {
             .generate(
                 READER_ID,
                 CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
                 u64::MAX,
             )
             .expect("a token for the reader");
@@ -2536,6 +2538,7 @@ mod tests {
             .generate(
                 READER_ID,
                 CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
                 u64::MAX,
             )
             .expect("a token for the reader")
