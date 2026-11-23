@@ -110,6 +110,7 @@ NEVER_RETURNED_KEYS = set(FIXTURE["constants"]["never_returned_keys"])
 FINGERPRINT_LENGTH = 16
 U64_MAX = 2**64 - 1
 MICROS_PER_HOUR = 3_600_000_000
+MIB = 1024**2
 GIB = 1024**3
 
 
@@ -126,6 +127,16 @@ class GeoDurations(TypedDict, total=False):
 
 # In catalog order, the order the hints are declared in.
 GEO_DURATION_KEYS = tuple(get_type_hints(GeoDurations))
+
+
+class ReadCache(TypedDict, total=False):
+    """A topic's read cache settings, as `TopicOptions` and `update_topic` take them."""
+
+    read_cache_size: int
+    read_ahead: int
+
+
+READ_CACHE_KEYS = tuple(get_type_hints(ReadCache))
 
 
 @pytest.mark.usefixtures("iggy_client")
@@ -275,7 +286,7 @@ class TestTopicOptions:
     """Typed topic create options and generic topic updates."""
 
     @pytest.mark.asyncio
-    async def test_given_keyword_topic_options_when_creating_should_preserve_all_sixteen_settings(  # noqa: E501
+    async def test_given_keyword_topic_options_when_creating_should_preserve_all_eighteen_settings(  # noqa: E501
         self, transport_client: IggyClient, unique_name
     ):
         """Every known create setting has a typed field and reads back explicit."""
@@ -310,6 +321,8 @@ class TestTopicOptions:
                 # A geo topic is refused while the server has no object
                 # store, and a normal topic refuses any geo_mode.
                 topic_type=TopicType.Normal,
+                read_cache_size=MIB,
+                read_ahead=0,
             ),
         )
 
@@ -333,6 +346,8 @@ class TestTopicOptions:
             "local_retention_age": MICROS_PER_HOUR // 2,
             "local_retention_size": GIB // 2,
             "topic_type": "normal",
+            "read_cache_size": MIB,
+            "read_ahead": 0,
         }
         assert topic.derived_options.to_scalar_dict() == {}
         assert topic.compression_algorithm == "gzip"
@@ -341,6 +356,7 @@ class TestTopicOptions:
         assert topic.topic_type == TopicType.Normal
         assert topic.geo_mode is None
         assert all(getattr(topic, key) is None for key in GEO_DURATION_KEYS)
+        assert (topic.read_cache_size, topic.read_ahead) == (MIB, 0)
 
     @pytest.mark.asyncio
     async def test_given_geo_durations_on_normal_topic_when_creating_or_updating_should_refuse_each(  # noqa: E501
@@ -371,6 +387,30 @@ class TestTopicOptions:
         topic = await transport_client.get_topic(stream_name, topic_name)
         assert topic is not None
         assert all(getattr(topic, key) is None for key in GEO_DURATION_KEYS)
+
+    @pytest.mark.asyncio
+    async def test_given_read_cache_update_on_normal_topic_when_reading_should_keep_zero(  # noqa: E501
+        self, transport_client: IggyClient, unique_name
+    ):
+        """Any topic takes the read cache settings, and zero reads back as a value."""
+        stream_name = unique_name()
+        topic_name = unique_name()
+        settings = read_cache(
+            fixture_case("update_resource", "topic_set_read_cache")["input"]
+        )
+        await transport_client.create_stream(stream_name)
+        await transport_client.create_topic(stream_name, topic_name)
+        topic = await transport_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert all(getattr(topic, key) is None for key in READ_CACHE_KEYS)
+
+        await transport_client.update_topic(stream_name, topic_name, **settings)
+
+        topic = await transport_client.get_topic(stream_name, topic_name)
+        assert topic is not None
+        assert {key: getattr(topic, key) for key in READ_CACHE_KEYS} == settings
+        explicit = topic.options.to_scalar_dict()
+        assert {key: explicit[key] for key in READ_CACHE_KEYS} == settings
 
     @pytest.mark.asyncio
     async def test_given_topic_reset_when_updating_should_preserve_unmentioned_values(  # noqa: E501
@@ -694,6 +734,30 @@ class TestSharedVectors:
             assert_option_error(refusal.value, "option_not_resettable")
 
     @pytest.mark.unit
+    def test_given_read_cache_vectors_when_building_typed_options_should_keep_zero_and_refuse_reset_before_io(  # noqa: E501
+        self,
+    ):
+        """Zero is a value, and neither setting can be reset."""
+        created = read_cache(
+            fixture_case("create_topic", "topic_with_read_cache")["input"]
+        )
+        updated = read_cache(
+            fixture_case("update_resource", "topic_set_read_cache")["input"]
+        )
+        assert list(created) == list(updated) == list(READ_CACHE_KEYS)
+        assert 0 in created.values()
+        assert 0 in updated.values()
+        TopicOptions(**created)
+
+        client = IggyClient("127.0.0.1:1")
+        for key in READ_CACHE_KEYS:
+            with pytest.raises(
+                OptionError, match=ERROR_MESSAGES["option_not_resettable"]
+            ) as refusal:
+                client.update_topic(1, 2, reset=[option_key(key)])
+            assert_option_error(refusal.value, "option_not_resettable")
+
+    @pytest.mark.unit
     def test_given_invalid_key_when_encoding_should_reject_before_network_io(
         self,
     ):
@@ -829,6 +893,14 @@ def geo_durations(values: dict) -> GeoDurations:
     )
 
 
+def read_cache(values: dict) -> ReadCache:
+    """Return the read cache settings a fixture input sets, in catalog order."""
+    return cast(
+        ReadCache,
+        {key: int(values[key]) for key in READ_CACHE_KEYS if key in values},
+    )
+
+
 def typed_update(client: IggyClient, vector: dict):
     """Issue the typed update a fixture vector describes."""
     target = vector["target"]
@@ -851,6 +923,7 @@ def typed_update(client: IggyClient, vector: dict):
             else MaxTopicSize.Custom(bytes=int(max_size)),
             reset=reset,
             **geo_durations(values),
+            **read_cache(values),
         )
     if vector["scope"] == "stream":
         return client.update_stream(

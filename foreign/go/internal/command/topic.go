@@ -72,8 +72,9 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 // option: it fills the command's own fixed field. Keys carrying the
 // server-default sentinel (expiry 0, size 0, compression none) are omitted so
 // the server derives them and returns them as derived entries. A geo topic's
-// durations have no such sentinel, so a zero one is sent. Both durability
-// keys are always sent, replicated unless named otherwise.
+// durations and the read cache sizes have no such sentinel, so a zero one is
+// sent. Both durability keys are always sent, replicated unless named
+// otherwise.
 func (t *CreateTopic) options() ([]iggcon.HeaderEntry, error) {
 	typed, err := t.typedOptions()
 	if err != nil {
@@ -165,6 +166,12 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 		geoDuration{iggcon.TopicOptionPositionsResumeTimeout, options.PositionsResumeTimeout},
 		geoDuration{iggcon.TopicOptionLongTermRewriteMaxInterval, options.LongTermRewriteMaxInterval},
 	)
+	if options.ReadCacheSize != nil {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionReadCacheSize), *options.ReadCacheSize))
+	}
+	if options.ReadAhead != nil {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionReadAhead), *options.ReadAhead))
+	}
 	return typed, nil
 }
 
@@ -247,6 +254,8 @@ type UpdateTopic struct {
 	TombstoneGrace               *iggcon.Duration
 	PositionsResumeTimeout       *iggcon.Duration
 	LongTermRewriteMaxInterval   *iggcon.Duration
+	ReadCacheSize                *uint64
+	ReadAhead                    *uint64
 	Reset                        []iggcon.TopicOptionKey
 	RawReset                     []string
 	Options                      []iggcon.HeaderEntry
@@ -258,7 +267,8 @@ func (u *UpdateTopic) Code() Code {
 
 // MarshalBinary encodes the patch. A zero expiry, retention or size is the
 // server-default sentinel and changes nothing, Reset returns a key to its
-// default. A zero duration of a geo topic is a value and is sent.
+// default. A zero duration of a geo topic or read cache size is a value and is
+// sent.
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	var typed []iggcon.HeaderEntry
 	if u.Name != nil {
@@ -287,6 +297,12 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 		geoDuration{iggcon.TopicOptionPositionsResumeTimeout, u.PositionsResumeTimeout},
 		geoDuration{iggcon.TopicOptionLongTermRewriteMaxInterval, u.LongTermRewriteMaxInterval},
 	)
+	if u.ReadCacheSize != nil {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionReadCacheSize), *u.ReadCacheSize))
+	}
+	if u.ReadAhead != nil {
+		typed = append(typed, uint64Option(string(iggcon.TopicOptionReadAhead), *u.ReadAhead))
+	}
 	reset := make([]string, 0, len(u.Reset))
 	for _, key := range u.Reset {
 		reset = append(reset, string(key))

@@ -87,7 +87,8 @@ impl StubLiteral for StreamOptionKey {
 ///
 /// Only `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize` are
 /// resettable in this release. The server refuses every other case with its own category. The
-/// durations of a geo topic, from `FreshUploadInterval` on, have no default to return to.
+/// durations of a geo topic, from `FreshUploadInterval` on, and the read cache settings,
+/// `ReadCacheSize` and `ReadAhead`, have no default to return to.
 #[php_enum]
 #[php(name = "Iggy\\TopicOptionKey")]
 #[derive(Clone, Copy)]
@@ -140,6 +141,10 @@ pub enum TopicOptionKey {
     PositionsResumeTimeout,
     #[php(value = "long_term_rewrite_max_interval")]
     LongTermRewriteMaxInterval,
+    #[php(value = "read_cache_size")]
+    ReadCacheSize,
+    #[php(value = "read_ahead")]
+    ReadAhead,
 }
 
 impl From<TopicOptionKey> for OptionKey {
@@ -169,6 +174,8 @@ impl From<TopicOptionKey> for OptionKey {
             TopicOptionKey::TombstoneGrace => Self::TombstoneGrace,
             TopicOptionKey::PositionsResumeTimeout => Self::PositionsResumeTimeout,
             TopicOptionKey::LongTermRewriteMaxInterval => Self::LongTermRewriteMaxInterval,
+            TopicOptionKey::ReadCacheSize => Self::ReadCacheSize,
+            TopicOptionKey::ReadAhead => Self::ReadAhead,
         }
     }
 }
@@ -201,6 +208,8 @@ impl StubLiteral for TopicOptionKey {
             Self::TombstoneGrace => "TombstoneGrace",
             Self::PositionsResumeTimeout => "PositionsResumeTimeout",
             Self::LongTermRewriteMaxInterval => "LongTermRewriteMaxInterval",
+            Self::ReadCacheSize => "ReadCacheSize",
+            Self::ReadAhead => "ReadAhead",
         };
         format!("\\Iggy\\TopicOptionKey::{case}")
     }

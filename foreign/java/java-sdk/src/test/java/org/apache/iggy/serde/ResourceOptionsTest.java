@@ -98,6 +98,9 @@ class ResourceOptionsTest {
             TopicOptionKey.POSITIONS_RESUME_TIMEOUT,
             TopicOptionKey.LONG_TERM_REWRITE_MAX_INTERVAL);
 
+    private static final List<TopicOptionKey> READ_CACHE_SIZES =
+            List.of(TopicOptionKey.READ_CACHE_SIZE, TopicOptionKey.READ_AHEAD);
+
     @Test
     void givenSharedVectorsWhenEncodingShouldMatchServerContract() {
         for (JsonNode vector : section("update_resource")) {
@@ -274,6 +277,28 @@ class ResourceOptionsTest {
         // A reset by name travels raw, and the server refuses it for a key without a default.
         assertThat(TopicUpdate.builder().rawReset("tombstone_grace").build().resetKeys())
                 .containsExactly("tombstone_grace");
+    }
+
+    @Test
+    void givenReadCacheSizesWhenBuildingUpdateShouldSendZeroAndRefuseAReset() {
+        TopicUpdate update = TopicUpdate.builder()
+                .readCacheSize(BigInteger.ZERO)
+                .readAhead(BigInteger.valueOf(1_048_576L))
+                .maxTopicSize(BigInteger.ZERO)
+                .build();
+
+        // A zero size cap is the sentinel for no change, while a zero read cache size is a value.
+        assertThat(update.entries())
+                .isEqualTo(Map.of(
+                        "read_cache_size",
+                        HeaderValue.fromUint64(BigInteger.ZERO),
+                        "read_ahead",
+                        HeaderValue.fromUint64(BigInteger.valueOf(1_048_576L))));
+        assertThat(TopicUpdate.builder().readAhead(BigInteger.ZERO).build().entries())
+                .containsOnlyKeys("read_ahead");
+        for (TopicOptionKey key : READ_CACHE_SIZES) {
+            assertRefusal(() -> TopicUpdate.builder().reset(key).build(), IggyErrorCode.OPTION_NOT_RESETTABLE);
+        }
     }
 
     @Test
@@ -484,6 +509,13 @@ class ResourceOptionsTest {
             assertThat(geoDurations(BytesDeserializer.readTopicDetails(responseOf(vector))))
                     .as(name)
                     .isEqualTo(durations);
+            Map<String, Optional<BigInteger>> sizes = new LinkedHashMap<>();
+            READ_CACHE_SIZES.forEach(key -> sizes.put(
+                    key.value(), textOrEmpty(expected.get(key.value())).map(BigInteger::new)));
+            assertThat(readCacheSizes(topic)).as(name).isEqualTo(sizes);
+            assertThat(readCacheSizes(BytesDeserializer.readTopicDetails(responseOf(vector))))
+                    .as(name)
+                    .isEqualTo(sizes);
         }
         for (JsonNode vector : section("user_responses")) {
             JsonNode expected = vector.get("expected");
@@ -705,6 +737,20 @@ class ResourceOptionsTest {
         durations.put("positions_resume_timeout", topic.positionsResumeTimeout());
         durations.put("long_term_rewrite_max_interval", topic.longTermRewriteMaxInterval());
         return durations;
+    }
+
+    private static Map<String, Optional<BigInteger>> readCacheSizes(Topic topic) {
+        Map<String, Optional<BigInteger>> sizes = new LinkedHashMap<>();
+        sizes.put("read_cache_size", topic.readCacheSize());
+        sizes.put("read_ahead", topic.readAhead());
+        return sizes;
+    }
+
+    private static Map<String, Optional<BigInteger>> readCacheSizes(TopicDetails topic) {
+        Map<String, Optional<BigInteger>> sizes = new LinkedHashMap<>();
+        sizes.put("read_cache_size", topic.readCacheSize());
+        sizes.put("read_ahead", topic.readAhead());
+        return sizes;
     }
 
     private static Optional<String> optionText(JsonNode expected, String key) {

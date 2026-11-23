@@ -168,6 +168,19 @@ describe('CreateTopic', () => {
         assert.equal(key in options, false, key);
     });
 
+    it('serialize the read cache settings as uint64 options, sending 0n and omitting an unset one', () => {
+      const t = { ...t1, readAhead: 0n };
+      const options = deserializeOptions(CREATE_TOPIC.serialize(t), fixedSize + t.name.length);
+      assert.equal(options.read_ahead, 0n);
+      assert.equal('read_cache_size' in options, false);
+      assert.equal(
+        deserializeOptions(
+          CREATE_TOPIC.serialize({ ...t1, readCacheSize: 16_777_216n }), fixedSize + t1.name.length
+        ).read_cache_size,
+        16_777_216n
+      );
+    });
+
     it('throw on an unknown topicType or geoMode', () => {
       assert.throws(
         () => CREATE_TOPIC.serialize({ ...t1, topicType: 'tiered' as TopicType }),

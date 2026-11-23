@@ -546,9 +546,17 @@ Settings fixed at creation, such as compression, cannot be updated. `DescribeOpt
 A geo topic also takes six durations: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`,
 `PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and
 `LongTermRewriteMaxInterval`. Each one overrides the server setting of the same name on every node.
-Zero is a value for them, so the SDK sends it. On a geo topic, an update can set them, and they are
-the only options that it can change there. An update cannot reset them. The server refuses them on a
+Zero is a value for them, so the SDK sends it. On a geo topic, an update can set them and the two
+read cache settings below, and nothing else. An update cannot reset them. The server refuses them on a
 normal topic. When the topic does not set a duration, its property on `TopicResponse` is null.
+
+Any topic can also take two byte sizes for the reads that fetch from the object store.
+`ReadCacheSize` is the memory each node keeps for what those reads fetch, divided between the
+topic's partitions, and zero keeps nothing. `ReadAhead` is the most that readahead fetches in front
+of a sequential reader, and zero turns readahead off. Zero is a value for them, so the SDK sends it.
+When the topic does not set one, each node applies its `[tiered_storage]` setting of the same name,
+and its property on `TopicResponse` is null. An update can change them on any topic, geo included,
+but cannot reset them.
 
 Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
 

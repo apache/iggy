@@ -1,11 +1,11 @@
 ---
 title: Topic Options
-description: "Per-topic retention, durability and segment layout options, set when the topic is created."
+description: "Per-topic retention, durability, storage and read cache options, which ones an update can change, and their defaults."
 ---
 
 Retention, durability, and segment layout are per-topic decisions, made when the topic is created. They used to be server-wide `[system.*]` keys, which gave every knob two homes. The server now [refuses to boot](/docs/server/configuration#relocated-configuration-keys) on the old keys, and each topic carries its own values instead.
 
-Options are key-value pairs sent with `CreateTopic`. Unknown keys are **rejected at the edge, never skipped**: a silently ignored knob would leave the client on server defaults with no way to find out. Streams and users have their own catalogs. See [Stream options](/docs/server/stream-options) for stream keys and names. User updates accept `username` and `status`.
+Options are key-value pairs sent with `CreateTopic`, and some of them can change later with an update. Unknown keys are **rejected at the edge, never skipped**: a silently ignored knob would leave the client on server defaults with no way to find out. Streams and users have their own catalogs. See [Stream options](/docs/server/stream-options) for stream keys and names. User updates accept `username` and `status`.
 
 ## The catalog
 
@@ -22,6 +22,20 @@ Options are key-value pairs sent with `CreateTopic`. Unknown keys are **rejected
 | `messages_required_to_save` | 1024 | non-zero, at most 16777216 | Flush the journal once it holds this many messages. |
 | `size_of_messages_required_to_save` | 1 MiB | 0 selects the default. At most 1 GiB | Flush the journal once it holds this many bytes. Paired with the message count. Whichever threshold trips first flushes. |
 | `preallocate_segments` | `false` | `segment_size` x partitions at most 64 GiB per create | Reserve each segment's bytes up front where the filesystem supports it. |
+| `segment_max_age` | never | at least 10 minutes, or `never`. Refused with `preallocate_segments` | Start a new segment once a batch is stamped this long after the first batch of the active segment, so retention and tiering reach a slow partition. A fully idle partition keeps its segment open. |
+| `tiered_storage` | `false` | needs an object store on every node of the cluster | Move sealed segments to the object store and keep only the local retention on disk. |
+| `local_retention_age` | 1 day, or a shorter `message_expiry` | at most a finite `message_expiry` | How long a tiered topic keeps an uploaded segment on local disk. No effect without `tiered_storage`. |
+| `local_retention_size` | unlimited, or a finite `max_topic_size` | at most a finite `max_topic_size` | Topic-wide cap on the uploaded segments a tiered topic keeps on local disk, divided across partitions. No effect without `tiered_storage`. |
+| `topic_type` | `normal` | `normal` or `geo` | A geo topic's messages also become readable in other datacenters through the object store. It needs an object store on every node, and refuses `tiered_storage` and an encrypted stream. |
+| `geo_mode` | `geo` on a geo topic | only on a geo topic. `geo_tiered` is refused for now | How a geo topic writes its messages. |
+| `fresh_upload_interval` | the node's `[tiered_storage]` setting | only on a geo topic. `0` to 10 s | The longest time a send waits for the upload of its fresh object to start. |
+| `consumer_offset_upload_interval` | the node's `[geo]` setting | only on a geo topic. `0` to 1 s | The shortest time between two uploads of the positions that the offsets a group stores itself wait for. |
+| `positions_publish_interval` | the node's `[geo]` setting | only on a geo topic. Longer than `0` | How often a node uploads the changed positions of the topic's consumer groups. |
+| `tombstone_grace` | the node's `[geo]` setting | only on a geo topic. Longer than `0` | How long the tombstone and the objects of the deleted topic stay in the object store. |
+| `positions_resume_timeout` | the node's `[geo]` setting | only on a geo topic | How long, after a node starts, the group polls of the topic wait for the positions of the geo peers. |
+| `long_term_rewrite_max_interval` | the node's `[geo]` setting | only on a geo topic. At least 1 s | The longest wait between two rewrites of a partition's committed messages into long-term segments. |
+| `read_cache_size` | the node's `[tiered_storage]` setting | `0`, or at least 512 KiB | Memory that each node keeps for what the topic's reads fetch from the object store, divided across partitions. See [Read cache](#read-cache). |
+| `read_ahead` | the node's `[tiered_storage]` setting | `0`, or at least 128 KiB. At most an eighth of a `read_cache_size` the topic sets | The most bytes that readahead fetches from the object store in front of a sequential reader of the topic. See [Read cache](#read-cache). |
 
 Both retention policies can be active at once. The active segment is **never touched**, and its bytes are excluded from the size limit. A segment whose end offset exceeds the lowest stored consumer or consumer-group offset is retained. With no stored offsets, this barrier is absent. Deletion is done by the server's segment cleaner (`[data_maintenance.messages]`, enabled by default).
 
@@ -50,9 +64,36 @@ SDKs expose typed durability values in their topic creation options. In Rust, se
 
 Keys absent from the wire request are resolved by the admitting server and stored as **derived** entries. Typed SDKs can send their default durability values explicitly. Binary `GetTopic` responses carry explicit and derived blocks. HTTP reports an `explicit` flag per option. Both report option values and the provenance of the request. Updates preserve the values and provenance of keys outside the patch.
 
+## Read cache
+
+A poll of data that a topic keeps in the object store, such as the tiered segments of a topic with `tiered_storage` or the long-term segments of a geo topic, reads it through the read cache of the partition's shard. Each shard has one, sized by the node's `[tiered_storage] read_cache_size`, and it reads ahead of a sequential reader by up to `[tiered_storage] read_ahead`. A topic can override both for itself, with options of the same names:
+
+- `read_cache_size` is divided evenly across the topic's partitions. Each share is a limit on what that partition keeps, drawn from the shard's shared budget, not a reservation: what a quiet partition leaves unused is there for the others, and a partition over its limit evicts its own blocks. A share below 8 blocks of the node's `read_cache_block_size` keeps nothing.
+- `read_ahead` replaces the node's readahead for the topic's readers. A partition reads ahead at most an eighth of its share of `read_cache_size`.
+- `0` turns either off for the topic: with `read_cache_size` at `0`, its reads go to the store each time and nothing they fetch is kept.
+- Unset, each node applies its own `[tiered_storage]` setting of the same name, and only the shard's budget bounds the topic's partitions.
+
+Both keys work the same on normal and geo topics. A topic without `tiered_storage` accepts them, and they apply once its data is read from the store. An update can change either one, and the next poll reads with the new value, with no restart. Neither can be reset, because the default is each node's own setting and `0` is a value: set the node's value to follow it again. The fresh objects that a shard uploads for geo topics are held for the polls at the tail whatever a topic sets.
+
+```bash
+iggy topic create my-stream archive 4 none --set tiered_storage=true --set read_cache_size=64MiB
+iggy topic update my-stream archive --set read_ahead=0
+```
+
 ## Create-only vs updatable
 
-Updates use UpdateResource with a set/reset patch. SDKs retain resource-specific update methods, but these methods send the shared command. Only `name`, `message_expiry` and `max_topic_size` can change on a topic.
+Updates use UpdateResource with a set/reset patch. SDKs retain resource-specific update methods, but these methods send the shared command. These keys can change on a topic:
+
+| Option | Update | Reset |
+|--------|--------|-------|
+| `name` | yes | no |
+| `message_expiry`, `max_topic_size` | yes | yes |
+| `local_retention_age`, `local_retention_size` | yes | yes |
+| `tiered_storage` | turn on only, never off | no |
+| `read_cache_size`, `read_ahead` | yes | no |
+| `fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`, `tombstone_grace`, `positions_resume_timeout`, `long_term_rewrite_max_interval` | yes, only on a geo topic | no |
+
+A geo topic keeps its name and every other option: an update of a geo topic may carry only its durations and `read_cache_size` and `read_ahead`.
 
 An absent key keeps its value. In HTTP, `null` also leaves a value unchanged. A name in `reset` returns that option to the server default and marks it as derived. Do not send the same key in both sets. Unknown keys, read-only keys and create-only changes are rejected. An empty patch, including a patch with only null values or zero sentinels, is rejected.
 
@@ -71,7 +112,7 @@ HTTP updates use a flat JSON object, not a nested `options` object:
 }
 ```
 
-`compression_algorithm`, `segment_size`, both durability policies, flush thresholds, `preallocate_segments`, `partition_resize_policy` and `replication_factor` are create-only. Select them before creating the topic. A finite size limit must still be at least the segment size.
+`compression_algorithm`, `segment_size`, both durability policies, flush thresholds, `preallocate_segments`, `partition_resize_policy`, `replication_factor`, `segment_max_age`, `topic_type` and `geo_mode` are create-only. Select them before creating the topic. A finite size limit must still be at least the segment size.
 
 ## Replication factor
 

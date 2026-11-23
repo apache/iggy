@@ -478,6 +478,22 @@ public sealed class BinaryMapper
         Assert.Null(response.LongTermRewriteMaxInterval);
     }
 
+    [Fact]
+    public void MapTopic_ReadsAZeroReadCacheAsZeroAndAnUnsetReadAheadAsNull()
+    {
+        const byte stringKind = 2;
+        const byte uint64Kind = 12;
+        var (topicId, _, topicName, _, sizeBytes, messagesCount, createdAt, _) =
+            TopicFactory.CreateTopicResponseFields();
+        var payload = BinaryFactory.CreateTopicPayload(topicId, 0, topicName, sizeBytes, messagesCount, createdAt,
+            BinaryFactory.CreateOptionEntry(stringKind, "read_cache_size", uint64Kind, BitConverter.GetBytes(0UL)));
+
+        var response = Mappers.BinaryMapper.MapTopic(payload);
+
+        Assert.Equal(0UL, response.ReadCacheSize);
+        Assert.Null(response.ReadAhead);
+    }
+
     private static byte[] PinnedTopicHeader(uint partitionsCount)
     {
         return BinaryFactory.CreateTopicPayload(7, partitionsCount, "replicated", 2048, 300, 1_710_000_000_000);

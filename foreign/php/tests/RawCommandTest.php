@@ -235,11 +235,11 @@ final class RawCommandTest extends TestCase
                 ['message_expiry_micros', 'max_topic_size', 'segment_size',
                     'messages_required_to_save', 'size_of_messages_required_to_save', 'replication_factor',
                     'segment_max_age_micros', 'local_retention_age_micros', 'local_retention_size',
-                    ...self::GEO_DURATION_FIELDS],
+                    ...self::GEO_DURATION_FIELDS, 'read_cache_size', 'read_ahead'],
             ],
             'updateTopic' => [
                 ['stream' => 's', 'topic' => 't'],
-                self::GEO_DURATION_FIELDS,
+                [...self::GEO_DURATION_FIELDS, 'read_cache_size', 'read_ahead'],
             ],
             'consumerGroup' => [
                 ['name' => 'g', 'stream' => 's', 'topic' => 't', 'polling_strategy' => null,

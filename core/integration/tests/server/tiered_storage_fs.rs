@@ -122,6 +122,139 @@ async fn given_segments_read_once_from_the_store_when_reading_them_again_should_
     );
 }
 
+/// A topic that keeps nothing it reads from the store asks the store again
+/// on every pass. An update that gives it a cache takes effect at its next
+/// read, with no restart, and its second pass after it reads from memory.
+#[tokio::test]
+async fn given_a_tiered_topic_that_caches_nothing_when_an_update_gives_it_a_cache_should_serve_its_next_second_pass_from_the_cache()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let http = HttpClient::login_root(&harness).await;
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    let read_cache = |size: &str| TopicReadCache {
+        size: Some(size.parse().expect("a byte size")),
+        read_ahead: None,
+    };
+    create_tiered_topic_with(
+        &client,
+        &stream,
+        &TopicCreateOptions {
+            read_cache: read_cache("0"),
+            ..tiered_topic_options()
+        },
+    )
+    .await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_until_only_the_open_segment_is_local(store.path(), &harness.server().data_path()).await;
+
+    for pass in ["first", "second"] {
+        if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
+            panic!("{pass} pass without a cache: {error}");
+        }
+    }
+    // The sealed segments are only in the store, and no read went through
+    // the cache, so each pass read the store.
+    let uncached = settled_read_cache_counts(&http, METRICS_DEADLINE, |_| true).await;
+    assert_eq!(
+        (
+            uncached.block_hits,
+            uncached.block_misses,
+            uncached.demand_bytes,
+            uncached.blocks_fetched_ahead
+        ),
+        (0, 0, 0, 0),
+        "a topic that caches nothing read through the cache: {uncached:?}"
+    );
+
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &TopicUpdateOptions {
+                read_cache: read_cache("32 MiB"),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .expect("the topic takes a read cache");
+    if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
+        panic!("first pass with a cache: {error}");
+    }
+    let first =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.demand_bytes > 0).await;
+    if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
+        panic!("second pass with a cache: {error}");
+    }
+    let second =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != first).await;
+
+    assert!(
+        second.block_hits > first.block_hits,
+        "the second pass took no block from the read cache: {first:?}, then {second:?}"
+    );
+    assert_eq!(
+        second.demand_bytes, first.demand_bytes,
+        "the second pass asked the store again: {first:?}, then {second:?}"
+    );
+}
+
+/// A topic whose read cache is smaller than what one pass reads keeps no
+/// more than it: its older blocks leave the cache for its newer ones.
+#[tokio::test]
+async fn given_a_tiered_topic_with_a_small_read_cache_when_a_pass_reads_more_than_it_should_evict_its_own_blocks()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let http = HttpClient::login_root(&harness).await;
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    // Eight blocks of the default block size, the least a partition keeps.
+    let limit: IggyByteSize = "2 MiB".parse().expect("a byte size");
+    create_tiered_topic_with(
+        &client,
+        &stream,
+        &TopicCreateOptions {
+            read_cache: TopicReadCache {
+                size: Some(limit),
+                read_ahead: None,
+            },
+            ..tiered_topic_options()
+        },
+    )
+    .await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_until_only_the_open_segment_is_local(store.path(), &harness.server().data_path()).await;
+
+    if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
+        panic!("pass: {error}");
+    }
+    let counts =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.demand_bytes > 0).await;
+
+    assert!(
+        counts.demand_bytes > limit.as_bytes_u64(),
+        "the pass read no more than the limit, so nothing had to leave: {counts:?}"
+    );
+    assert!(
+        counts.limit_evictions > 0,
+        "no block left the cache for the topic's limit: {counts:?}"
+    );
+}
+
 fn server_with_fs_store(store: &Path) -> TestHarness {
     TestHarness::builder()
         .server(
@@ -242,11 +375,13 @@ fn is_start_offset(name: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReadCacheCounts {
     pub(crate) block_hits: u64,
+    pub(crate) block_misses: u64,
     pub(crate) demand_bytes: u64,
     pub(crate) blocks_fetched_ahead: u64,
     pub(crate) held_bytes: u64,
     pub(crate) fresh_releases: u64,
     pub(crate) carried_bytes: u64,
+    pub(crate) limit_evictions: u64,
 }
 
 /// The counts once two scrapes a poll interval apart agree and `ready`
@@ -282,11 +417,13 @@ async fn read_cache_counts(http: &HttpClient) -> ReadCacheCounts {
         .expect("metrics text");
     ReadCacheCounts {
         block_hits: summed(&exposition, "remote_read_block_hits_total"),
+        block_misses: summed(&exposition, "remote_read_block_misses_total"),
         demand_bytes: summed(&exposition, "remote_read_demand_bytes_total"),
         blocks_fetched_ahead: summed(&exposition, "remote_read_blocks_fetched_ahead_total"),
         held_bytes: summed(&exposition, "remote_read_held_bytes"),
         fresh_releases: summed(&exposition, "remote_read_fresh_releases_total"),
         carried_bytes: summed(&exposition, "remote_read_carried_bytes_total"),
+        limit_evictions: summed(&exposition, "remote_read_limit_evictions_total"),
     }
 }
 

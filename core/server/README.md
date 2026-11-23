@@ -529,10 +529,22 @@ exactly its bytes from the store and nothing it fetches is kept, but the shard
 still holds what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes
 are served only while the node reads that peer, and never across a change of
 the cluster that owns its root. The budget is shared by every partition of the
-shard. A size of a topic's own, once a topic can set one, is a limit on what
-each of its partitions keeps, not a reservation: a partition over its limit
-evicts its own blocks, and what a quiet partition leaves unused is there for
-the others. The
+shard.
+
+A topic can set `read_cache_size` and `read_ahead` for itself, on a normal and
+on a geo topic, and an update can change them without a restart. The topic's
+`read_cache_size` is shared evenly between its partitions, and each share is a
+limit on what that partition keeps within the cache of its shard, not a
+reservation: a partition over its limit evicts its own blocks, and what a quiet
+partition leaves unused is there for the others. A share below 8 blocks of the
+node's `read_cache_block_size` keeps nothing. The topic's `read_ahead` replaces
+the node's for its readers, and a partition reads ahead at most an eighth of
+its share. `0` turns either off for the topic. Unset, each node applies its own
+setting: only the cache of the shard bounds the topic's partitions, and they
+read ahead the node's `read_ahead`. Neither can be reset. The fresh objects a
+shard uploads are held for the polls at the tail whatever a topic sets. A
+topic without `tiered_storage` accepts both, and they apply once its reads go
+to the store. The
 counters `remote_read_block_hits`, `remote_read_block_misses`,
 `remote_read_ahead_hits`, `remote_read_blocks_fetched_ahead`,
 `remote_read_demand_bytes`, `remote_read_ahead_bytes`,
@@ -1052,7 +1064,7 @@ A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `no
 
 Only a geo topic has a `geo_mode`: `geo` or `geo_tiered`. A geo topic without one is stored with `geo`. Clients cannot pick `geo_tiered` yet, and the server refuses it with `FeatureUnavailable` (5). The server refuses a normal topic that sets a mode with `InvalidOptionValue` (4042).
 
-A geo topic keeps its name, its partition count and its options, all but its durations. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or of any other option returns `OptionNotUpdatable` (4103).
+A geo topic keeps its name, its partition count and its options, all but its durations and its `read_cache_size` and `read_ahead`. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or of any other option returns `OptionNotUpdatable` (4103).
 
 A geo topic can set six durations, each of which overrides the server setting of the same name for this topic: `fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`, `tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`.
 Unset, each node applies its own setting. An update can change them, and a reset of one returns `OptionNotResettable` (4104). A normal topic that sets one returns `InvalidOptionValue` (4042). See [durations of a geo topic](docs/GEO_TOPICS.md#durations-of-a-geo-topic).
@@ -1061,7 +1073,11 @@ A create that sets `tiered_storage` to `true`, or a `partition_resize_policy` ot
 
 Both keys are critical. A node on a build without them refuses a topic that sets them, and does not serve it as a normal topic.
 
-The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. The durations of a geo topic are updatable too. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
+Any topic can set `read_cache_size` and `read_ahead`, each of which overrides the `[tiered_storage]` setting of the same name for this topic, see [tiered storage](#tiered-storage). `0` is a value that turns the setting off for the topic. Unset, each node applies its own setting.
+An update can change them, and a reset of one returns `OptionNotResettable` (4104). A create or an update that leaves the topic with both set refuses a `read_ahead` above an eighth of a `read_cache_size` other than `0` with `InvalidOptionValue` (4042).
+
+The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry`, `max_topic_size`, `local_retention_age`, `local_retention_size`, `read_cache_size` and `read_ahead`. An update can turn a topic's `tiered_storage` on, never off. The durations of a geo topic are updatable too.
+Only `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 
 Only root may rename the root user or change its status. Root cannot deactivate itself. These requests return `CannotModifyRootUser` (4108), and a rejected update leaves root active with its existing username.
 

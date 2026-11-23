@@ -539,6 +539,98 @@ async fn given_a_geo_topic_with_its_own_durations_when_reading_and_changing_them
     );
 }
 
+/// A geo topic takes a change of its read cache, which a read of it reports
+/// once the topic sets it and as it was set, a zero included.
+#[tokio::test]
+async fn given_a_geo_topic_when_changing_its_read_cache_should_report_each_change() {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_geo_topic(&client, &stream, TOPIC, None)
+        .await
+        .expect("create the geo topic");
+    let read_cache = || async {
+        client
+            .get_topic(&stream, &topic)
+            .await
+            .expect("get topic")
+            .expect("the topic exists")
+            .resolved_options()
+            .read_cache
+    };
+    let bytes = |text: &str| Some(text.parse::<IggyByteSize>().expect("a byte size"));
+    let update = |read_cache: TopicReadCache| TopicUpdateOptions {
+        read_cache,
+        ..TopicUpdateOptions::default()
+    };
+    assert_eq!(
+        read_cache().await,
+        TopicReadCache::default(),
+        "unset, each node applies its own settings"
+    );
+
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &update(TopicReadCache {
+                read_ahead: bytes("1 MiB"),
+                ..TopicReadCache::default()
+            }),
+        )
+        .await
+        .expect("a geo topic takes a change of its readahead");
+    assert_eq!(
+        read_cache().await,
+        TopicReadCache {
+            size: None,
+            read_ahead: bytes("1 MiB"),
+        }
+    );
+    client
+        .update_topic(
+            &stream,
+            &topic,
+            &update(TopicReadCache {
+                size: bytes("0"),
+                ..TopicReadCache::default()
+            }),
+        )
+        .await
+        .expect("a geo topic takes a change of its read cache size");
+    assert_eq!(
+        read_cache().await,
+        TopicReadCache {
+            size: bytes("0"),
+            read_ahead: bytes("1 MiB"),
+        }
+    );
+
+    let error = client
+        .update_topic(
+            &stream,
+            &topic,
+            &TopicUpdateOptions {
+                raw_reset: ["read_cache_size".to_owned()].into(),
+                ..TopicUpdateOptions::default()
+            },
+        )
+        .await
+        .expect_err("a geo topic refuses a reset of its read cache size");
+    assert_eq!(
+        error.as_code(),
+        IggyError::OptionNotResettable(String::new()).as_code()
+    );
+    assert_eq!(read_cache().await.size, bytes("0"));
+}
+
 /// The offsets that a group stores itself are answered once the bucket holds
 /// them, and each geo topic spaces those uploads by its own interval.
 #[tokio::test]

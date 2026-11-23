@@ -375,9 +375,16 @@ A geo topic also takes six durations in microseconds: `freshUploadInterval`,
 `consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`,
 `positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each one overrides the server setting of
 the same name on every node. Zero is a value for them, so the SDK sends it. On a geo topic, an
-update can set them, and they are the only options that it can change there. An update cannot reset
-them. The server refuses them on a normal topic. When the topic does not set a duration, a topic
-read returns an empty `Optional` for it.
+update can set them. An update cannot reset them. The server refuses them on a normal topic. When the
+topic does not set a duration, a topic read returns an empty `Optional` for it.
+
+Any topic, normal or geo, takes two byte sizes for its reads from the object store.
+`readCacheSize` is the memory each node keeps for what the topic's reads fetch, divided between its
+partitions, and zero keeps nothing. `readAhead` is the most bytes that readahead fetches in front of a
+sequential reader, and zero turns readahead off. Zero is a value for them, so the SDK sends it. Left
+unset, each node applies its `[tiered_storage]` setting of the same name, and a topic read returns an
+empty `Optional`. An update can change them on any topic, geo included, but cannot reset them. They
+and the six durations are the only options that an update can change on a geo topic.
 
 ### Metadata Changes
 

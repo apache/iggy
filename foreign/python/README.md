@@ -218,9 +218,16 @@ A geo topic (`topic_type=TopicType.Geo`) also takes six durations as `datetime.t
 `fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`,
 `tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`. Each overrides
 the server setting of the same name on every node. Zero is a value, and a topic that does not set
-one reads it as `None`. `update_topic` can change them, they are the only options it changes on a
-geo topic, and none of them can be reset. A normal topic refuses them with an `OptionError` of kind
-`"invalid_option_value"`.
+one reads it as `None`. `update_topic` can change them, and none of them can be reset. A normal
+topic refuses them with an `OptionError` of kind `"invalid_option_value"`.
+
+Any topic takes two byte sizes as `int`. `read_cache_size` is the memory each node keeps for what
+the topic's reads fetch from the object store, divided between its partitions, and zero keeps
+nothing they fetch. `read_ahead` is the most bytes readahead fetches in front of a sequential
+reader of the topic, and zero turns readahead off. A topic that does not set one reads it as
+`None`, and each node applies its `[tiered_storage]` setting of the same name. `update_topic` can
+change both on any topic, a geo topic included, but cannot reset them. On a geo topic, these and
+the six durations are the only options an update changes.
 
 The update methods also take `options` and `raw_reset`, which send keys and reset names verbatim, so a key newer than this build can be set or reset. The server decides those. A refused option raises `OptionError`, a `RuntimeError` whose `code` and `kind` name the refusal, for example `4103` and `"option_not_updatable"`, the same on every transport.
 

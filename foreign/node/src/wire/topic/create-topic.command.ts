@@ -27,7 +27,9 @@ import {
   compressionAlgorithmName,
   deserializeTopic,
   geoDurationOptions,
+  readCacheOptions,
   type GeoTopicDurations,
+  type TopicReadCache,
   type Topic,
   type CompressionAlgorithm as CompressionAlgorithmT
 } from './topic.utils.js';
@@ -35,10 +37,10 @@ import {
 
 /**
  * Settings a topic takes at create. Only the message expiry, the size cap,
- * the local retention, turning tiered storage on and the durations of a geo
- * topic can change later, through `updateTopic`.
+ * the local retention, turning tiered storage on, the read cache settings and
+ * the durations of a geo topic can change later, through `updateTopic`.
  */
-export type TopicOptions = GeoTopicDurations & {
+export type TopicOptions = GeoTopicDurations & TopicReadCache & {
   /** Compression algorithm label (None or Gzip), stored and reported only */
   compressionAlgorithm?: CompressionAlgorithmT,
   /**
@@ -177,6 +179,8 @@ export const CREATE_TOPIC = {
     tombstoneGrace,
     positionsResumeTimeout,
     longTermRewriteMaxInterval,
+    readCacheSize,
+    readAhead,
     options: extraOptions = []
   }: CreateTopic
   ) => {
@@ -194,7 +198,8 @@ export const CREATE_TOPIC = {
     // Server-default sentinels (expiry, segment age and local retention 0,
     // size 0, compression none) and unset optionals are omitted so the server resolves them from
     // its own config and reports them back as derived options. A geo topic's
-    // durations have no sentinel, so their `0n` is sent.
+    // durations and the read cache settings have no sentinel, so their `0n` is
+    // sent.
     // Caller keys first so a typed field below overwrites one of them.
     const options: OptionEntry[] = [...extraOptions];
     if (compressionAlgorithm !== CompressionAlgorithm.None)
@@ -288,6 +293,7 @@ export const CREATE_TOPIC = {
       freshUploadInterval, consumerOffsetUploadInterval, positionsPublishInterval,
       tombstoneGrace, positionsResumeTimeout, longTermRewriteMaxInterval
     }));
+    options.push(...readCacheOptions({ readCacheSize, readAhead }));
     const b = Buffer.allocUnsafe(4 + 1);
     b.writeUInt32LE(partitionCount, 0);
     b.writeUInt8(bName.length, 4);

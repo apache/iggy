@@ -19,7 +19,7 @@ use iggy::prelude::{
     CompressionAlgorithm, GeoMode as RustGeoMode, GeoTopicDurations, IggyByteSize, IggyError,
     IggyExpiry as RustIggyExpiry, MaxTopicSize as RustMaxTopicSize, OptionKey as RustOptionKey,
     PartitionResizePolicy as RustPartitionResizePolicy, StreamCreateOptions, StreamEncryptionKey,
-    TopicCreateOptions, TopicType as RustTopicType, UserCreateOptions,
+    TopicCreateOptions, TopicReadCache, TopicType as RustTopicType, UserCreateOptions,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -137,6 +137,12 @@ pub enum OptionKey {
     /// Longest wait between two long-term rewrites of a geo topic's
     /// partition. An update can set it, not reset it.
     LongTermRewriteMaxInterval,
+    /// Memory each node keeps for what a topic's reads fetch from the object
+    /// store. An update can set it, not reset it.
+    ReadCacheSize,
+    /// Most bytes readahead fetches in front of a sequential reader of a
+    /// topic. An update can set it, not reset it.
+    ReadAhead,
     /// The geo origin a shadow stream serves, computed by the server.
     ShadowOrigin,
 }
@@ -262,8 +268,8 @@ impl TopicOptions {
     /// Every setting left as `None` resolves against the server default at
     /// admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
     /// `local_retention_age`, `local_retention_size`, the six durations of a
-    /// geo topic and the name can change after creation, through
-    /// `update_topic`.
+    /// geo topic, `read_cache_size`, `read_ahead` and the name can change
+    /// after creation, through `update_topic`.
     ///
     /// The six durations, `fresh_upload_interval` to
     /// `long_term_rewrite_max_interval`, are `datetime.timedelta | None` and
@@ -345,6 +351,19 @@ impl TopicOptions {
     ///         geo peers. Zero does not wait.
     ///     long_term_rewrite_max_interval: Longest wait between two long-term
     ///         rewrites of a partition, at least 1 second.
+    ///     read_cache_size: Memory in bytes as `int | None` that each node
+    ///         keeps for what the topic's reads fetch from the object store,
+    ///         divided between its partitions. A partition's share is a limit
+    ///         within the read cache of its shard, not a reservation. Zero
+    ///         keeps nothing they fetch, otherwise at least 512 KiB. `None`
+    ///         leaves it unset, so each node applies its `[tiered_storage]`
+    ///         setting of the same name. Any topic type takes it.
+    ///     read_ahead: Most bytes as `int | None` that readahead fetches in
+    ///         front of a sequential reader of the topic. Zero turns readahead
+    ///         off, otherwise at least 128 KiB, and at most an eighth of a
+    ///         `read_cache_size` above zero. `None` leaves it unset, so each
+    ///         node applies its `[tiered_storage]` setting of the same name.
+    ///         Any topic type takes it.
     ///     raw: Additional option keys as `dict[str, str]`, sent as string
     ///         values so a key newer than this build can be set. A typed field
     ///         wins on collision.
@@ -358,7 +377,7 @@ impl TopicOptions {
     ///     TypeError: If a durability is not a `Durability`.
     #[new]
     #[pyo3(
-        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, segment_max_age = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, topic_type = None, geo_mode = None, fresh_upload_interval = None, consumer_offset_upload_interval = None, positions_publish_interval = None, tombstone_grace = None, positions_resume_timeout = None, long_term_rewrite_max_interval = None, raw = None)
+        signature = (*, partitions_count = 1, compression_algorithm = None, message_expiry = None, max_topic_size = None, segment_size = None, durability = None, consumer_offset_durability = None, partition_resize_policy = None, messages_required_to_save = None, size_of_messages_required_to_save = None, preallocate_segments = None, replication_factor = None, segment_max_age = None, tiered_storage = None, local_retention_age = None, local_retention_size = None, topic_type = None, geo_mode = None, fresh_upload_interval = None, consumer_offset_upload_interval = None, positions_publish_interval = None, tombstone_grace = None, positions_resume_timeout = None, long_term_rewrite_max_interval = None, read_cache_size = None, read_ahead = None, raw = None)
     )]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -414,6 +433,8 @@ impl TopicOptions {
         positions_resume_timeout: Option<Py<PyDelta>>,
         #[gen_stub(override_type(type_repr = "datetime.timedelta | None", imports=("datetime")))]
         long_term_rewrite_max_interval: Option<Py<PyDelta>>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_cache_size: Option<u64>,
+        #[gen_stub(override_type(type_repr = "builtins.int | None"))] read_ahead: Option<u64>,
         #[gen_stub(override_type(type_repr = "builtins.dict[builtins.str, builtins.str] | None"))]
         raw: Option<BTreeMap<String, String>>,
     ) -> PyResult<Self> {
@@ -472,6 +493,7 @@ impl TopicOptions {
                     positions_resume_timeout,
                     long_term_rewrite_max_interval,
                 ])?,
+                read_cache: topic_read_cache(read_cache_size, read_ahead),
                 raw: raw.unwrap_or_default(),
             },
         })
@@ -554,6 +576,15 @@ pub(crate) fn geo_topic_durations(
     Ok(parsed)
 }
 
+/// The read cache settings of a topic in bytes, as `TopicOptions` and
+/// `update_topic` take them. A `None` stays unset and zero is a value.
+pub(crate) fn topic_read_cache(size: Option<u64>, read_ahead: Option<u64>) -> TopicReadCache {
+    TopicReadCache {
+        size: size.map(IggyByteSize::from),
+        read_ahead: read_ahead.map(IggyByteSize::from),
+    }
+}
+
 impl From<OptionKey> for RustOptionKey {
     fn from(key: OptionKey) -> Self {
         match key {
@@ -587,6 +618,8 @@ impl From<OptionKey> for RustOptionKey {
             OptionKey::TombstoneGrace => Self::TombstoneGrace,
             OptionKey::PositionsResumeTimeout => Self::PositionsResumeTimeout,
             OptionKey::LongTermRewriteMaxInterval => Self::LongTermRewriteMaxInterval,
+            OptionKey::ReadCacheSize => Self::ReadCacheSize,
+            OptionKey::ReadAhead => Self::ReadAhead,
             OptionKey::ShadowOrigin => Self::ShadowOrigin,
         }
     }
@@ -789,6 +822,16 @@ mod tests {
                         "{key}"
                     );
                 }
+                // Likewise a read cache setting, where zero stays a value.
+                for key in TopicReadCache::KEYS {
+                    let key: &str = key.into();
+                    assert_eq!(
+                        attribute::<Option<u64>>(topic.as_any(), key)
+                            .map(|bytes| bytes.to_string()),
+                        expected[key].as_str().map(str::to_owned),
+                        "{key}"
+                    );
+                }
                 assert_options(topic.as_any(), options);
             }
 
@@ -933,6 +976,47 @@ mod tests {
     }
 
     #[test]
+    fn given_read_cache_update_vector_when_encoding_typed_options_should_match_wire_bytes() {
+        let vector = case("update_resource", "topic_set_read_cache");
+        let input = &vector["input"];
+        assert!(
+            input
+                .as_object()
+                .expect("input object")
+                .keys()
+                .all(|key| is_read_cache_key(key)),
+            "the vector sets only read cache settings"
+        );
+        let [size, read_ahead] = TopicReadCache::KEYS.map(|key| decimal(&input[<&str>::from(key)]));
+        let options = TopicUpdateOptions {
+            read_cache: topic_read_cache(Some(size), Some(read_ahead)),
+            ..TopicUpdateOptions::default()
+        };
+
+        let patch = options.to_patch().expect("patch encodes");
+        let target = &vector["target"];
+        let request = UpdateResourceRequest {
+            target: ResourceTarget::Topic {
+                stream_id: wire_identifier(&target["stream_id"]),
+                topic_id: wire_identifier(&target["topic_id"]),
+            },
+            reset: patch.reset,
+            options: patch.set,
+        };
+        assert_eq!(
+            request.to_bytes().as_ref(),
+            decode_hex(&vector["body_hex"]).as_slice()
+        );
+        // HTTP sends each setting as a JSON number of bytes, zero included.
+        let body = serde_json::to_value(options.to_update_body().expect("HTTP body encodes"))
+            .expect("HTTP body serializes");
+        for key in TopicReadCache::KEYS {
+            let key: &str = key.into();
+            assert_eq!(body[key], json!(decimal(&input[key])), "{key}");
+        }
+    }
+
+    #[test]
     fn given_zero_and_unset_durations_when_encoding_should_send_zero_and_omit_unset() {
         Python::initialize();
         Python::attach(|py| {
@@ -1070,6 +1154,9 @@ mod tests {
                 .expect("topic type")
                 .into_any(),
                 duration if is_geo_duration(duration) => delta(py, value).into_any(),
+                setting if is_read_cache_key(setting) => {
+                    decimal(value).into_pyobject(py).expect("int").into_any()
+                }
                 other => panic!("no typed argument for {other}"),
             };
             kwargs.set_item(key, argument).expect("argument");
@@ -1089,6 +1176,12 @@ mod tests {
         GeoTopicDurations::KEYS
             .into_iter()
             .any(|duration| <&str>::from(duration) == key)
+    }
+
+    fn is_read_cache_key(key: &str) -> bool {
+        TopicReadCache::KEYS
+            .into_iter()
+            .any(|setting| <&str>::from(setting) == key)
     }
 
     /// `Durability` checks its argument against the class in the

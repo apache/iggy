@@ -537,6 +537,8 @@ func TestDeserializeToTopic_ResolvesMissingSettingsToTheCatalogDefaults(t *testi
 	assert.Nil(t, topic.TombstoneGrace)
 	assert.Nil(t, topic.PositionsResumeTimeout)
 	assert.Nil(t, topic.LongTermRewriteMaxInterval)
+	assert.Nil(t, topic.ReadCacheSize)
+	assert.Nil(t, topic.ReadAhead)
 }
 
 func TestDeserializeToTopic_ReadsTheDurationsOfAGeoTopic(t *testing.T) {
@@ -585,6 +587,53 @@ func TestDeserializeToTopic_ReadsTheDurationsOfAGeoTopic(t *testing.T) {
 	normal := topic("normal")
 	assert.Nil(t, normal.ConsumerOffsetUploadInterval, "a normal topic has no durations")
 	assert.Nil(t, normal.TombstoneGrace)
+}
+
+func TestDeserializeToTopic_ReadsTheReadCacheSizesOfAnyTopic(t *testing.T) {
+	const nameLenOffset = 32
+	stringEntry := func(key, value string) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+		}
+	}
+	uint64Entry := func(key string, value uint64) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: binary.LittleEndian.AppendUint64(nil, value)},
+		}
+	}
+	topic := func(entries ...iggcon.HeaderEntry) iggcon.Topic {
+		t.Helper()
+		payload := make([]byte, nameLenOffset+2)
+		payload[nameLenOffset] = 1
+		payload[nameLenOffset+1] = 't'
+		explicit := iggcon.GetHeadersBytes(entries)
+		payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicit)))
+		payload = append(payload, explicit...)
+		payload = binary.LittleEndian.AppendUint32(payload, 0)
+		topic, readBytes, err := DeserializeToTopic(payload, 0)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), readBytes)
+		return topic
+	}
+
+	for _, topicType := range []string{"normal", "geo"} {
+		both := topic(
+			uint64Entry("read_cache_size", 0),
+			uint64Entry("read_ahead", 2<<20),
+			stringEntry("topic_type", topicType),
+		)
+		require.NotNil(t, both.ReadCacheSize, "%s: a zero size is a value", topicType)
+		assert.Equal(t, uint64(0), *both.ReadCacheSize, topicType)
+		require.NotNil(t, both.ReadAhead, topicType)
+		assert.Equal(t, uint64(2<<20), *both.ReadAhead, topicType)
+
+		unset := topic(uint64Entry("read_cache_size", 16<<20), stringEntry("topic_type", topicType))
+		require.NotNil(t, unset.ReadCacheSize, topicType)
+		assert.Equal(t, uint64(16<<20), *unset.ReadCacheSize, topicType)
+		assert.Nil(t, unset.ReadAhead, "%s: an unset size leaves the server setting", topicType)
+	}
 }
 
 func TestDeserializeToTopic_ReadsTheTopicTypeAndGeoMode(t *testing.T) {

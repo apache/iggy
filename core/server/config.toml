@@ -1536,9 +1536,11 @@ handshake_grace = "10 s"
 # reads go to the store each time. It never stops the shard from holding what
 # it uploads, which then takes a fixed 64 MiB of its own. Otherwise at least 8
 # blocks of 'read_cache_block_size'. Every partition of the shard reads within
-# it. A size of a topic's own, once a topic can set one, is a limit on what
-# each of its partitions keeps, not a reservation: what a quiet partition
-# leaves unused is there for the others.
+# it. A topic can override it with its own 'read_cache_size' option, which is
+# shared evenly between the topic's partitions. Each share is a limit on what
+# that partition keeps, not a reservation: what a quiet partition leaves
+# unused is there for the others. A topic that sets none is bounded by this
+# budget alone.
 #read_cache_size = "64 MiB"
 # The piece of a segment that the cache fetches and keeps. A smaller block
 # wastes less on a small or random read. A larger block means fewer entries
@@ -1550,7 +1552,8 @@ handshake_grace = "10 s"
 # fetches take the speculative fetch caps of [tiered_storage.jobs] and start
 # only while no poll waits for the store. "0" turns readahead off. Otherwise
 # at least 2 blocks, and at most an eighth of 'read_cache_size', the part of
-# the cache where the fetched bytes wait for their poll.
+# the cache where the fetched bytes wait for their poll. A topic can override
+# it with its own 'read_ahead' option.
 #read_ahead = "2 MiB"
 # The shortest time between the starts of two uploads of fresh objects on one
 # shard, so a shard creates at most one object per interval, plus the objects

@@ -12426,6 +12426,73 @@ mod tests {
         assert_eq!(sent_groups, groups);
     }
 
+    /// The read cache that a topic sets reaches each of its partitions: its
+    /// size shared between them, its readahead as it is, and zero as a value
+    /// that keeps nothing. What the topic leaves unset is the shard's.
+    #[test]
+    fn given_a_topic_that_sets_its_read_cache_when_its_partitions_read_should_share_the_size_between_them()
+     {
+        const MIB: u64 = 1 << 20;
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let settings_of = |read_cache: iggy_common::TopicReadCache| {
+            let (owner, _) = test_owner_shaped(&bus, None, (None, None), |topic| {
+                topic.resolved.read_cache = read_cache;
+            });
+            let settings: Vec<_> = (0..TEST_PARTITIONS)
+                .map(|partition_id| {
+                    owner.partition_read_settings(IggyNamespace::new(0, 0, partition_id))
+                })
+                .collect();
+            assert!(
+                settings.windows(2).all(|pair| pair[0] == pair[1]),
+                "every partition of the topic reads alike"
+            );
+            assert_eq!(
+                owner.partition_read_settings(IggyNamespace::new(0, 1, 0)),
+                partitions::PartitionReadSettings::SHARD,
+                "a topic that is gone leaves it to the shard"
+            );
+            settings[0]
+        };
+        let bytes = |value: u64| Some(IggyByteSize::from(value));
+
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache::default()),
+            partitions::PartitionReadSettings::SHARD
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: bytes(3 * 4 * MIB),
+                read_ahead: bytes(MIB),
+            }),
+            partitions::PartitionReadSettings {
+                limit: Some(usize::try_from(4 * MIB).unwrap()),
+                read_ahead: Some(MIB),
+            }
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: bytes(0),
+                read_ahead: bytes(0),
+            }),
+            partitions::PartitionReadSettings {
+                limit: Some(0),
+                read_ahead: Some(0),
+            }
+        );
+        assert_eq!(
+            settings_of(iggy_common::TopicReadCache {
+                size: None,
+                read_ahead: bytes(MIB),
+            }),
+            partitions::PartitionReadSettings {
+                limit: None,
+                read_ahead: Some(MIB),
+            },
+            "an unset size sets no limit, whatever the shard's cache is"
+        );
+    }
+
     mod fresh_proofs;
     mod fresh_writes;
     mod geo_commits;

@@ -44,8 +44,8 @@ use iggy_common::{
     OptionValue, OptionVisibility, OptionsPatch, OptionsScope, OptionsUpdate, ResourceOptions,
     STREAM_KEY_LENGTH, ServerKeyContext, StreamCreateOptions, StreamDetails, StreamEncryptionKey,
     StreamEncryptionSource, StreamKeyOrigin, StreamUpdateOptions, TopicCreateOptions, TopicDetails,
-    TopicUpdateOptions, UserCreateOptions, UserInfoDetails, UserStatus, UserUpdateOptions, WrapSet,
-    admit, critical_keys_marker, project_shadow_origin, public_options,
+    TopicReadCache, TopicUpdateOptions, UserCreateOptions, UserInfoDetails, UserStatus,
+    UserUpdateOptions, WrapSet, admit, critical_keys_marker, project_shadow_origin, public_options,
 };
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -272,6 +272,18 @@ pub struct PatchInput {
     pub reset: Vec<OptionKey>,
     #[serde(flatten)]
     pub geo_durations: GeoDurationsInput,
+    #[serde(flatten)]
+    pub read_cache: ReadCacheInput,
+}
+
+/// The read cache settings of a topic, each a decimal number of bytes and
+/// absent when unset. Zero is a value, never dropped as a default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReadCacheInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_cache_size: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_ahead: Option<String>,
 }
 
 /// The durations of a geo topic, each a decimal number of microseconds and
@@ -354,6 +366,8 @@ pub struct CreateTopicInput {
     pub topic_type: Option<String>,
     #[serde(flatten)]
     pub geo_durations: GeoDurationsInput,
+    #[serde(flatten)]
+    pub read_cache: ReadCacheInput,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -479,6 +493,10 @@ pub struct TopicProjection {
     /// The durations of a geo topic, as its typed read reports them.
     #[serde(flatten)]
     pub geo_durations: GeoDurationsInput,
+    /// The read cache settings the topic sets, as its typed read reports
+    /// them.
+    #[serde(flatten)]
+    pub read_cache: ReadCacheInput,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -618,6 +636,7 @@ impl PatchInput {
                 message_expiry: decimal(self.message_expiry.as_deref())?.map(IggyExpiry::from),
                 max_topic_size: decimal(self.max_topic_size.as_deref())?.map(MaxTopicSize::from),
                 geo_durations: self.geo_durations.durations()?,
+                read_cache: self.read_cache.read_cache()?,
                 reset,
                 ..TopicUpdateOptions::default()
             }
@@ -714,6 +733,7 @@ impl CreateTopicInput {
                 .transpose()
                 .map_err(|_| IggyError::InvalidFormat)?,
             geo_durations: self.geo_durations.durations()?,
+            read_cache: self.read_cache.read_cache()?,
             ..TopicCreateOptions::default()
         })
     }
@@ -925,6 +945,7 @@ impl From<&TopicDetails> for TopicProjection {
             message_expiry: u64::from(resolved.message_expiry).to_string(),
             max_topic_size: u64::from(resolved.max_topic_size).to_string(),
             geo_durations: GeoDurationsInput::from(resolved.geo_durations),
+            read_cache: ReadCacheInput::from(resolved.read_cache),
         }
     }
 }
@@ -958,6 +979,27 @@ impl From<GeoTopicDurations> for GeoDurationsInput {
             tombstone_grace: text(durations.tombstone_grace),
             positions_resume_timeout: text(durations.positions_resume_timeout),
             long_term_rewrite_max_interval: text(durations.long_term_rewrite_max_interval),
+        }
+    }
+}
+
+impl ReadCacheInput {
+    /// The typed read cache settings of the SDK's options.
+    pub fn read_cache(&self) -> Result<TopicReadCache, IggyError> {
+        Ok(TopicReadCache {
+            size: decimal(self.read_cache_size.as_deref())?.map(IggyByteSize::from),
+            read_ahead: decimal(self.read_ahead.as_deref())?.map(IggyByteSize::from),
+        })
+    }
+}
+
+impl From<TopicReadCache> for ReadCacheInput {
+    fn from(read_cache: TopicReadCache) -> Self {
+        let text =
+            |bytes: Option<IggyByteSize>| bytes.map(|bytes| bytes.as_bytes_u64().to_string());
+        Self {
+            read_cache_size: text(read_cache.size),
+            read_ahead: text(read_cache.read_ahead),
         }
     }
 }

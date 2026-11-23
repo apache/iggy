@@ -357,6 +357,30 @@ impl Topic {
         )
     }
 
+    /// Memory in bytes each node keeps for what the topic's reads fetch from
+    /// the object store, or `None` when the topic leaves it to each node's
+    /// server setting. Zero keeps nothing they fetch.
+    #[getter]
+    pub fn read_cache_size(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .size
+            .map(|size| size.as_bytes_u64())
+    }
+
+    /// Most bytes readahead fetches in front of a sequential reader of the
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting. Zero turns readahead off.
+    #[getter]
+    pub fn read_ahead(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .read_ahead
+            .map(|read_ahead| read_ahead.as_bytes_u64())
+    }
+
     /// Options the creating client set explicitly.
     ///
     /// The same `dict[HeaderKey, HeaderValue]` that `ReceiveMessage.user_headers`
@@ -563,6 +587,30 @@ impl TopicDetails {
                 .geo_durations
                 .long_term_rewrite_max_interval,
         )
+    }
+
+    /// Memory in bytes each node keeps for what the topic's reads fetch from
+    /// the object store, or `None` when the topic leaves it to each node's
+    /// server setting. Zero keeps nothing they fetch.
+    #[getter]
+    pub fn read_cache_size(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .size
+            .map(|size| size.as_bytes_u64())
+    }
+
+    /// Most bytes readahead fetches in front of a sequential reader of the
+    /// topic, or `None` when the topic leaves it to each node's server
+    /// setting. Zero turns readahead off.
+    #[getter]
+    pub fn read_ahead(&self) -> Option<u64> {
+        self.inner
+            .resolved_options()
+            .read_cache
+            .read_ahead
+            .map(|read_ahead| read_ahead.as_bytes_u64())
     }
 
     /// Options the creating client set explicitly.
@@ -809,6 +857,63 @@ mod tests {
                     }
                 }
             });
+        }
+    }
+
+    #[test]
+    fn given_read_cache_options_when_reading_should_keep_zero_and_return_none_when_unset() {
+        const MIB: u64 = 1024 * 1024;
+        let sized = |entries: &[(OptionKey, u64)]| -> ResourceOptions {
+            entries
+                .iter()
+                .map(|(key, bytes)| {
+                    (
+                        HeaderKey::from(*key),
+                        OptionValue::explicit(HeaderValue::from(*bytes)),
+                    )
+                })
+                .collect()
+        };
+        let mut geo = topic_options(&[(OptionKey::TopicType, RustTopicType::Geo.as_ref())]);
+        geo.extend(sized(&[(OptionKey::ReadAhead, 0)]));
+
+        for (options, read_cache_size, read_ahead) in [
+            (sized(&[(OptionKey::ReadCacheSize, 0)]), Some(0), None),
+            (
+                sized(&[
+                    (OptionKey::ReadCacheSize, 16 * MIB),
+                    (OptionKey::ReadAhead, 0),
+                ]),
+                Some(16 * MIB),
+                Some(0),
+            ),
+            (geo, None, Some(0)),
+            (ResourceOptions::new(), None, None),
+        ] {
+            let topic = Topic::from(RustTopic {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 1,
+                options: options.clone(),
+            });
+            let details = TopicDetails::from(RustTopicDetails {
+                id: 1,
+                created_at: IggyTimestamp::from(11),
+                name: "orders".to_owned(),
+                size: IggyByteSize::from(0),
+                messages_count: 0,
+                partitions_count: 0,
+                partitions: Vec::new(),
+                options,
+            });
+
+            assert_eq!(topic.read_cache_size(), read_cache_size);
+            assert_eq!(topic.read_ahead(), read_ahead);
+            assert_eq!(details.read_cache_size(), read_cache_size);
+            assert_eq!(details.read_ahead(), read_ahead);
         }
     }
 

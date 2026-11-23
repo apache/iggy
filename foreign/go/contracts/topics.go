@@ -74,6 +74,13 @@ type Topic struct {
 	TombstoneGrace               *Duration `json:"tombstoneGrace,omitempty"`
 	PositionsResumeTimeout       *Duration `json:"positionsResumeTimeout,omitempty"`
 	LongTermRewriteMaxInterval   *Duration `json:"longTermRewriteMaxInterval,omitempty"`
+
+	// ReadCacheSize and ReadAhead are the byte sizes a normal or geo topic
+	// sets for its reads from the object store, see TopicOptions. Each is nil
+	// where the topic sets none: each node then applies its own
+	// [tiered_storage] setting of the same name. Zero is a value.
+	ReadCacheSize *uint64 `json:"readCacheSize,omitempty"`
+	ReadAhead     *uint64 `json:"readAhead,omitempty"`
 }
 
 type TopicDetails struct {

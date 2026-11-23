@@ -22,8 +22,8 @@ use iggy::prelude::{
     NamedPageQuery, OptionKey, Page, PageQuery, PartitionClient, Partitioning,
     PersonalAccessTokenClient, PollOptions, PollingKind, PollingStrategy, SegmentClient,
     StreamClient, StreamCreateOptions, StreamUpdateOptions, SystemClient, SystemSnapshotType,
-    TopicClient, TopicCreateOptions, TopicUpdateOptions, UserClient, UserCreateOptions, UserStatus,
-    UserUpdateOptions,
+    TopicClient, TopicCreateOptions, TopicReadCache, TopicUpdateOptions, UserClient,
+    UserCreateOptions, UserStatus, UserUpdateOptions,
 };
 use requests::*;
 use rmcp::{
@@ -904,6 +904,7 @@ impl TryFrom<UpdateTopic> for TopicUpdateOptions {
             local_retention_age: None,
             local_retention_size: None,
             geo_durations: GeoTopicDurations::default(),
+            read_cache: TopicReadCache::default(),
             reset,
             raw_reset,
             raw: update.options,

@@ -387,6 +387,18 @@ pub mod topic_option_keys {
     /// The longest wait between two long-term rewrites of a geo topic's
     /// partition, at least [`super::LONG_TERM_REWRITE_MAX_INTERVAL_MIN`].
     pub const LONG_TERM_REWRITE_MAX_INTERVAL: &str = "long_term_rewrite_max_interval";
+    /// The bytes of what the topic's reads fetch from the object store that
+    /// the nodes keep in memory, divided between its partitions: `Uint64` or
+    /// a byte-size string, zero for none, otherwise at least
+    /// [`super::TOPIC_READ_CACHE_SIZE_MIN`]. Overrides `[tiered_storage]
+    /// read_cache_size`. On every topic type, where an update can change it
+    /// but not reset it.
+    pub const READ_CACHE_SIZE: &str = "read_cache_size";
+    /// The most bytes that readahead fetches in front of a sequential reader
+    /// of the topic, zero for none, otherwise at least
+    /// [`super::TOPIC_READ_AHEAD_MIN`]. Overrides `[tiered_storage]
+    /// read_ahead`, and changes as [`READ_CACHE_SIZE`] does.
+    pub const READ_AHEAD: &str = "read_ahead";
 }
 
 /// Values an absent topic option resolves to at admission.
@@ -438,6 +450,31 @@ pub const CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX: Duration = Duration::from_secs(1)
 /// manifest is stored at most once a second and a rewrite more often publishes
 /// nothing sooner.
 pub const LONG_TERM_REWRITE_MAX_INTERVAL_MIN: Duration = Duration::from_secs(1);
+
+/// The smallest `read_cache_block_size` of a node: the smallest piece a poll
+/// reads from the object store. Mirrors `partitions::DISK_POLL_CHUNK_MIN`.
+pub const READ_CACHE_BLOCK_SIZE_MIN: u64 = 64 * 1024;
+
+/// What `read_ahead` is at most, as a part of `read_cache_size`: one in this
+/// many. Bytes that readahead fetched wait for their reader in that part of
+/// the cache. Mirrors `iggy_object_store::AHEAD_SHARE`.
+pub const READ_AHEAD_CACHE_SHARE: u64 = 8;
+
+/// The fewest blocks of `read_cache_block_size` that a `read_ahead` other
+/// than zero holds: the blocks of the first readahead in front of a reader.
+/// Mirrors `partitions::READ_AHEAD_START_BLOCKS`.
+pub const READ_AHEAD_BLOCKS_MIN: u64 = 2;
+
+/// The smallest `read_cache_size` of a topic other than zero: the smallest
+/// read cache a node with the smallest blocks may have. A topic cannot know
+/// the block size of each node, so a node with larger blocks keeps nothing
+/// for a partition whose share is under [`READ_AHEAD_CACHE_SHARE`] of its
+/// blocks.
+pub const TOPIC_READ_CACHE_SIZE_MIN: u64 = READ_AHEAD_CACHE_SHARE * READ_CACHE_BLOCK_SIZE_MIN;
+
+/// The smallest `read_ahead` of a topic other than zero, the first readahead
+/// on a node with the smallest blocks.
+pub const TOPIC_READ_AHEAD_MIN: u64 = READ_AHEAD_BLOCKS_MIN * READ_CACHE_BLOCK_SIZE_MIN;
 
 /// Largest partition group consensus supports.
 pub const MAX_REPLICATION_FACTOR: u32 = 32;
@@ -558,6 +595,31 @@ pub fn validate_local_retention(stored: &ResourceOptions) -> Result<(), IggyErro
     {
         return Err(IggyError::InvalidOptionValue(
             topic_option_keys::LOCAL_RETENTION_SIZE.to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a topic's readahead that does not fit the part of its read cache
+/// that holds what readahead fetched. Only a pair the topic sets is judged: a
+/// node's own settings passed its config checks, and a topic that sets one
+/// key cannot know the other on each node.
+///
+/// `stored` is the topic's whole map, as the topic would store it.
+///
+/// # Errors
+///
+/// `InvalidOptionValue` naming `read_ahead` when both keys are set,
+/// `read_cache_size` is not zero, and `read_ahead` is above one part in
+/// [`READ_AHEAD_CACHE_SHARE`] of it.
+pub fn validate_read_cache(stored: &ResourceOptions) -> Result<(), IggyError> {
+    let read_cache = TopicCreateOptions::from_resource_options(stored).read_cache;
+    if let (Some(size), Some(read_ahead)) = (read_cache.size, read_cache.read_ahead)
+        && size.as_bytes_u64() > 0
+        && read_ahead.as_bytes_u64() > size.as_bytes_u64() / READ_AHEAD_CACHE_SHARE
+    {
+        return Err(IggyError::InvalidOptionValue(
+            topic_option_keys::READ_AHEAD.to_string(),
         ));
     }
     Ok(())
@@ -930,6 +992,9 @@ pub struct TopicUpdateOptions {
     /// The durations to change on a geo topic. A `None` keeps the stored
     /// value. None of them can be reset.
     pub geo_durations: GeoTopicDurations,
+    /// The read cache settings to change, on any topic. A `None` keeps the
+    /// stored value. Neither can be reset.
+    pub read_cache: TopicReadCache,
     /// Keys to reset to their defaults: `message_expiry`, `max_topic_size`,
     /// `local_retention_age` or `local_retention_size`.
     pub reset: BTreeSet<OptionKey>,
@@ -1083,12 +1148,93 @@ impl GeoTopicDurations {
     }
 }
 
+/// What a topic sets for the reads of its data that nodes fetch from the
+/// object store, over the server settings of the same name on each node. Each
+/// is `None` when the topic sets none, and the node then applies its own
+/// setting. Zero is a value: it turns the setting off for the topic.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TopicReadCache {
+    /// The bytes of what reads fetched that the nodes keep in memory for the
+    /// topic, divided between its partitions. Each partition's share is a
+    /// limit within the shared cache of its shard, not a reservation. Unset,
+    /// only the cache of the shard bounds it.
+    pub size: Option<IggyByteSize>,
+    /// The most bytes that readahead fetches in front of a sequential reader
+    /// of the topic.
+    pub read_ahead: Option<IggyByteSize>,
+}
+
+impl TopicReadCache {
+    /// The option key of each setting, in catalog order.
+    pub const KEYS: [OptionKey; 2] = [OptionKey::ReadCacheSize, OptionKey::ReadAhead];
+
+    /// The setting that `key` names, `None` when it is unset or `key` is no
+    /// read cache setting.
+    #[must_use]
+    pub const fn get(&self, key: OptionKey) -> Option<IggyByteSize> {
+        match key {
+            OptionKey::ReadCacheSize => self.size,
+            OptionKey::ReadAhead => self.read_ahead,
+            _ => None,
+        }
+    }
+
+    /// Set the setting that `key` names. Any other key changes nothing.
+    pub const fn set(&mut self, key: OptionKey, bytes: IggyByteSize) {
+        let slot = match key {
+            OptionKey::ReadCacheSize => &mut self.size,
+            OptionKey::ReadAhead => &mut self.read_ahead,
+            _ => return,
+        };
+        *slot = Some(bytes);
+    }
+
+    /// The keys of the settings that are set, in catalog order.
+    pub fn keys(&self) -> impl Iterator<Item = OptionKey> + '_ {
+        Self::KEYS
+            .into_iter()
+            .filter(|key| self.get(*key).is_some())
+    }
+
+    /// Each setting that `self` sets, the others from `defaults`.
+    #[must_use]
+    pub const fn or(self, defaults: Self) -> Self {
+        Self {
+            size: match self.size {
+                Some(bytes) => Some(bytes),
+                None => defaults.size,
+            },
+            read_ahead: match self.read_ahead {
+                Some(bytes) => Some(bytes),
+                None => defaults.read_ahead,
+            },
+        }
+    }
+
+    fn insert_into(&self, options: &mut ResourceOptions) -> Result<(), IggyError> {
+        for key in Self::KEYS {
+            if let Some(bytes) = self.get(key) {
+                options.insert(HeaderKey::from(key), OptionValue::explicit(bytes.encode()?));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl OptionKey {
-    /// Whether the key is one of the [`GeoTopicDurations`], the only options
-    /// an update can change on a geo topic.
+    /// Whether the key is one of the [`GeoTopicDurations`], which only a geo
+    /// topic has.
     #[must_use]
     pub fn is_geo_duration(self) -> bool {
         GeoTopicDurations::KEYS.contains(&self)
+    }
+
+    /// Whether an update can change the key on a geo topic: one of its
+    /// [`GeoTopicDurations`] or of the [`TopicReadCache`] settings. A geo
+    /// topic keeps its name and every other option.
+    #[must_use]
+    pub fn is_geo_updatable(self) -> bool {
+        self.is_geo_duration() || TopicReadCache::KEYS.contains(&self)
     }
 }
 
@@ -1123,6 +1269,8 @@ pub struct TopicResolvedOptions {
     pub geo_mode: Option<GeoMode>,
     /// All `None` unless `topic_type` is geo.
     pub geo_durations: GeoTopicDurations,
+    /// On every topic type.
+    pub read_cache: TopicReadCache,
     /// The partition-facing knobs, with the shard-default semantics of
     /// [`TopicRuntimeOptions`].
     pub runtime: TopicRuntimeOptions,
@@ -1311,6 +1459,7 @@ impl TopicUpdateOptions {
             );
         }
         self.geo_durations.insert_into(&mut options)?;
+        self.read_cache.insert_into(&mut options)?;
         Ok(options)
     }
 }
@@ -1450,6 +1599,7 @@ impl From<&ResourceOptions> for TopicResolvedOptions {
                 TopicType::Geo => parsed.geo_durations,
                 TopicType::Normal => GeoTopicDurations::default(),
             },
+            read_cache: parsed.read_cache,
             runtime: TopicRuntimeOptions::from(&parsed),
         }
     }
@@ -1707,6 +1857,9 @@ pub struct TopicCreateOptions {
     /// The durations of a geo topic that override the server settings of
     /// each node. A normal topic refuses them.
     pub geo_durations: GeoTopicDurations,
+    /// The read cache settings that override the server settings of each
+    /// node, on any topic.
+    pub read_cache: TopicReadCache,
     /// String-valued keys with no typed field above, parsed server-side
     /// through each key's `FromStr`. Lets a client reach a key added to the
     /// server catalog after this build shipped. Outbound only: a typed field
@@ -1869,6 +2022,10 @@ impl TopicCreateOptions {
                 self.geo_durations
                     .set(option, IggyDuration::decode(option, entry)?);
             }
+            OptionKey::ReadCacheSize | OptionKey::ReadAhead => {
+                self.read_cache
+                    .set(option, IggyByteSize::decode(option, entry)?);
+            }
             OptionKey::Name
             | OptionKey::Username
             | OptionKey::Status
@@ -1921,6 +2078,7 @@ impl TopicCreateOptions {
             topic_type: self.topic_type.or(defaults.topic_type),
             geo_mode: self.geo_mode.or(defaults.geo_mode),
             geo_durations: self.geo_durations.or(defaults.geo_durations),
+            read_cache: self.read_cache.or(defaults.read_cache),
             raw: BTreeMap::new(),
         }
     }
@@ -2073,6 +2231,7 @@ impl TopicCreateOptions {
             );
         }
         self.geo_durations.insert_into(&mut options)?;
+        self.read_cache.insert_into(&mut options)?;
         Ok(options)
     }
 
@@ -2263,13 +2422,14 @@ mod tests {
             // A server setting decides the replication factor's default, and
             // only a geo topic has a mode, so the catalog derives neither and
             // admission stores the resolved value. A geo topic's durations
-            // stay unset, for each node to apply its own setting.
+            // and a topic's read cache settings stay unset, for each node to
+            // apply its own setting.
             let Some(default) = descriptor.default_value().expect("default encodes") else {
                 assert!(
                     matches!(
                         descriptor.key,
                         OptionKey::ReplicationFactor | OptionKey::GeoMode
-                    ) || descriptor.key.is_geo_duration(),
+                    ) || descriptor.key.is_geo_updatable(),
                     "{} has no default",
                     descriptor.key
                 );
@@ -2460,6 +2620,117 @@ mod tests {
         assert_eq!(resolved.local_retention_size, MaxTopicSize::from(GIB));
     }
 
+    const MIB: u64 = 1 << 20;
+
+    #[test]
+    fn given_a_read_ahead_above_an_eighth_of_the_read_cache_when_validating_should_refuse_it() {
+        let size = OptionKey::ReadCacheSize;
+        let ahead = OptionKey::ReadAhead;
+        assert_eq!(
+            validate_read_cache(&stored_topic(&[(size, 8 * MIB), (ahead, MIB + 1)])),
+            Err(IggyError::InvalidOptionValue(
+                topic_option_keys::READ_AHEAD.to_string(),
+            ))
+        );
+        for accepted in [
+            stored_topic(&[(size, 8 * MIB), (ahead, MIB)]),
+            // A cache of zero keeps nothing, so no readahead runs at all.
+            stored_topic(&[(size, 0), (ahead, 64 * MIB)]),
+            stored_topic(&[(size, 8 * MIB), (ahead, 0)]),
+            // Alone, either is judged against each node's own setting.
+            stored_topic(&[(ahead, 64 * MIB)]),
+            stored_topic(&[(size, TOPIC_READ_CACHE_SIZE_MIN)]),
+            stored_topic(&[]),
+        ] {
+            assert_eq!(validate_read_cache(&accepted), Ok(()));
+        }
+    }
+
+    #[test]
+    fn given_read_cache_keys_when_resolving_should_keep_zero_on_every_topic_type() {
+        for topic_type in ["normal", "geo"] {
+            let mut stored =
+                stored_topic(&[(OptionKey::ReadCacheSize, 0), (OptionKey::ReadAhead, MIB)]);
+            stored.insert(
+                HeaderKey::from(OptionKey::TopicType),
+                OptionValue::explicit(HeaderValue::try_from(topic_type).unwrap()),
+            );
+            assert_eq!(
+                TopicResolvedOptions::from(&stored).read_cache,
+                TopicReadCache {
+                    size: Some(IggyByteSize::from(0u64)),
+                    read_ahead: Some(IggyByteSize::from(MIB)),
+                },
+                "{topic_type}"
+            );
+        }
+        assert_eq!(
+            TopicResolvedOptions::from(&stored_topic(&[])).read_cache,
+            TopicReadCache::default(),
+            "an unset key leaves each node its own setting"
+        );
+    }
+
+    #[test]
+    fn given_read_cache_keys_when_updating_should_send_zero_and_keep_unset_keys_out() {
+        let update = TopicUpdateOptions {
+            read_cache: TopicReadCache {
+                size: Some(IggyByteSize::from(0u64)),
+                read_ahead: None,
+            },
+            ..TopicUpdateOptions::default()
+        };
+        let set = crate::wire_conversions::resource_options_from_wire(
+            &update.to_patch().expect("the patch encodes").set,
+            true,
+        )
+        .expect("the set block decodes");
+        assert_eq!(
+            set.get(&HeaderKey::from(OptionKey::ReadCacheSize)),
+            Some(&OptionValue::explicit(HeaderValue::from(0u64)))
+        );
+        assert!(!set.contains_key(&HeaderKey::from(OptionKey::ReadAhead)));
+        let body = update.to_update_body().expect("the body builds");
+        assert!(body.set.contains_key(topic_option_keys::READ_CACHE_SIZE));
+        let below_floor = TopicUpdateOptions {
+            read_cache: TopicReadCache {
+                size: None,
+                read_ahead: Some(IggyByteSize::from(TOPIC_READ_AHEAD_MIN - 1)),
+            },
+            ..TopicUpdateOptions::default()
+        };
+        assert_eq!(
+            below_floor.to_patch(),
+            Err(IggyError::InvalidOptionValue(
+                topic_option_keys::READ_AHEAD.to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn given_the_typed_read_cache_view_when_merging_should_take_each_set_key_over_the_defaults() {
+        let sized = TopicReadCache {
+            size: Some(IggyByteSize::from(MIB)),
+            read_ahead: None,
+        };
+        let defaults = TopicReadCache {
+            size: Some(IggyByteSize::from(2 * MIB)),
+            read_ahead: Some(IggyByteSize::from(0u64)),
+        };
+        let merged = sized.or(defaults);
+        assert_eq!(merged.size, Some(IggyByteSize::from(MIB)));
+        assert_eq!(merged.read_ahead, Some(IggyByteSize::from(0u64)));
+        assert_eq!(
+            merged.keys().collect::<Vec<_>>(),
+            TopicReadCache::KEYS.to_vec()
+        );
+        assert_eq!(sized.keys().collect::<Vec<_>>(), [OptionKey::ReadCacheSize]);
+        let mut set = TopicReadCache::default();
+        set.set(OptionKey::TombstoneGrace, IggyByteSize::from(MIB));
+        assert_eq!(set, TopicReadCache::default(), "no other key lands in it");
+        assert_eq!(set.get(OptionKey::MessageExpiry), None);
+    }
+
     #[test]
     fn given_tiered_storage_when_a_request_turns_it_on_should_admit_it_only_in_a_ready_cluster() {
         let request = |enabled: bool| -> ResourceOptions {
@@ -2509,6 +2780,10 @@ mod tests {
                 tombstone_grace: Some(IggyDuration::from(3_600_000_000u64)),
                 positions_resume_timeout: Some(IggyDuration::from(0u64)),
                 long_term_rewrite_max_interval: Some(IggyDuration::from(30_000_000u64)),
+            },
+            read_cache: TopicReadCache {
+                size: Some(IggyByteSize::from(0u64)),
+                read_ahead: Some(IggyByteSize::from(1_048_576u64)),
             },
             partitions_count: None,
             consumer_offset_durability: Durability::Replicated,

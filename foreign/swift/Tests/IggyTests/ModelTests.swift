@@ -628,4 +628,40 @@ struct TopicOptionsTests {
         let normal = topic([TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000))])
         #expect(normal.freshUploadInterval == nil)
     }
+
+    /// The read cache settings travel as bytes on any topic. Zero turns one
+    /// off, so it is sent, and an unset one is left out. An update sets
+    /// them, zero included, but never resets them.
+    @Test func readCacheSendsZeroOnAnyTopicAndIsNeverReset() throws {
+        let create = try TopicCreateOptions(readAheadBytes: 0).toResourceOptions()
+        #expect(create[TopicOptionKey.readAhead.rawValue] == .explicit(.uint64(0)))
+        #expect(create[TopicOptionKey.readCacheSize.rawValue] == nil)
+        #expect(create[TopicOptionKey.topicType.rawValue] == nil)
+
+        let patch = try TopicUpdateOptions(readCacheSizeBytes: 0).toPatch()
+        #expect(patch.set == [TopicOptionKey.readCacheSize.rawValue: .explicit(.uint64(0))])
+        #expect(patch.reset.isEmpty)
+        for key in [TopicOptionKey.readCacheSize, .readAhead] {
+            #expect(throws: IggyError(.optionNotResettable), "\(key)") { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// A read reports the read cache settings a topic of either type sets,
+    /// zero as a value, and nil for one it leaves to each node.
+    @Test func readCacheReadsKeepZeroAndAreNilWhenUnset() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "archive", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let normal = topic([TopicOptionKey.readCacheSize.rawValue: .explicit(.uint64(0))])
+        #expect(normal.readCacheSizeBytes == 0)
+        #expect(normal.readAheadBytes == nil)
+        let geo = topic([
+            TopicOptionKey.topicType.rawValue: .explicit("geo"),
+            TopicOptionKey.readAhead.rawValue: .explicit(.uint64(1_048_576)),
+        ])
+        #expect(geo.readCacheSizeBytes == nil)
+        #expect(geo.readAheadBytes == 1_048_576)
+    }
 }

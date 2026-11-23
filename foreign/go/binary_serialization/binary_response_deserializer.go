@@ -544,6 +544,8 @@ func DeserializeToTopic(payload []byte, position int) (iggcon.Topic, int, error)
 	topic.SegmentMaxAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionSegmentMaxAge, uint64(iggcon.IggyExpiryNeverExpire)))
 	topic.LocalRetentionAge = iggcon.Duration(topicUint64Option(topic, iggcon.TopicOptionLocalRetentionAge, defaultLocalRetentionAge))
 	topic.LocalRetentionSize = topicUint64Option(topic, iggcon.TopicOptionLocalRetentionSize, math.MaxUint64)
+	topic.ReadCacheSize = topicByteSizeOption(topic, iggcon.TopicOptionReadCacheSize)
+	topic.ReadAhead = topicByteSizeOption(topic, iggcon.TopicOptionReadAhead)
 	if value, ok := topicOption(topic, iggcon.TopicOptionTieredStorage); ok && value.Kind == iggcon.Bool && len(value.Value) == 1 {
 		topic.TieredStorage = value.Value[0] != 0
 	}
@@ -626,6 +628,17 @@ func topicDurationOption(topic iggcon.Topic, key iggcon.TopicOptionKey) *iggcon.
 	}
 	duration := iggcon.Duration(binary.LittleEndian.Uint64(value.Value))
 	return &duration
+}
+
+// topicByteSizeOption reads a Uint64 byte size that has no default, nil when
+// the server reported none.
+func topicByteSizeOption(topic iggcon.Topic, key iggcon.TopicOptionKey) *uint64 {
+	value, ok := topicOption(topic, key)
+	if !ok || value.Kind != iggcon.Uint64 || len(value.Value) != 8 {
+		return nil
+	}
+	size := binary.LittleEndian.Uint64(value.Value)
+	return &size
 }
 
 // partitionCountersSize covers id + created_at + segments_count +

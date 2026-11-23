@@ -143,7 +143,8 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 4. The producer is acknowledged when the placed batch commits. The message is **committed**.
    Polls in this cluster read it at once. The shard that stored the object holds it in memory
    until the long-term segment below takes its messages, even with `read_cache_size` at 0, and
-   other polls read the bucket through the shard's read cache, `[tiered_storage] read_cache_size`.
+   other polls read the bucket through the shard's read cache, `[tiered_storage] read_cache_size`,
+   within the topic's own `read_cache_size` when it sets one.
 5. In the background, the partition's primary rewrites committed messages into **long-term
    segments** in the bucket, at most 64 MiB each, and commits each one to the partition's
    long-term log. It then stores the partition's **manifest**,
@@ -438,13 +439,14 @@ faster path.
 | `partition_resize_policy` other than `fixed` on a geo topic          | `InvalidOptionValue` (4042)   |
 | Any topic create in a shadow stream                                  | `ShadowStreamReadOnly` (1021) |
 
-After the create, the topic refuses changes, all but a change of its durations:
+After the create, the topic refuses changes, all but a change of its durations and of its
+`read_cache_size` and `read_ahead`:
 
-| Request on a geo topic                                | Answer                           |
-| ----------------------------------------------------- | -------------------------------- |
-| An update of its name or of any option but a duration | `OptionNotUpdatable` (4103)      |
-| A reset of a duration                                 | `OptionNotResettable` (4104)     |
-| Adding or deleting partitions                         | `PartitionResizeDisabled` (2023) |
+| Request on a geo topic                                                      | Answer                           |
+| --------------------------------------------------------------------------- | -------------------------------- |
+| An update of its name or of any option but a duration or a read cache key   | `OptionNotUpdatable` (4103)      |
+| A reset of a duration or of a read cache key                                | `OptionNotResettable` (4104)     |
+| Adding or deleting partitions                                               | `PartitionResizeDisabled` (2023) |
 
 A `FeatureUnavailable` from a cluster that is not ready is worth retrying while its nodes pass
 their store identity checks. `object_store_identity_verified` shows when each node does.
@@ -496,6 +498,15 @@ iggy topic update orders payments --set consumer_offset_upload_interval=200ms
 
 `iggy topic get` shows the durations that the topic sets. Every SDK has typed fields for them in
 its topic create options, its topic update and its topic read model.
+
+A geo topic can also set `read_cache_size` and `read_ahead`, as any topic can. They override the
+`[tiered_storage]` settings of the same name for the reads of the topic that go to the bucket:
+long-term segments, and fresh objects that the shard does not hold. `read_cache_size` is shared
+evenly between the topic's partitions, and each share is a limit within the read cache of the
+shard, not a reservation. `0` keeps nothing that those reads fetch, and turns readahead off. The
+fresh objects that a shard uploaded stay in memory for the polls at the tail whatever the topic
+sets. An update can change both and cannot reset them. See [tiered
+storage](../README.md#tiered-storage) in the server README.
 
 ### What happens after a create
 
@@ -1113,7 +1124,7 @@ Alert on these first:
 | `[geo] tombstone_grace`                          | `24 h`   | How long a deleted geo topic keeps its tombstone and its objects in this cluster's bucket, and how long this cluster keeps a detached shadow topic. Make it longer than any peer outage. A geo topic can set its own.                                                                                                                                                                                                                     |
 
 The keys that a geo topic can set for itself are in
-[Durations of a geo topic](#durations-of-a-geo-topic).
+[Durations of a geo topic](#durations-of-a-geo-topic), with `read_cache_size` and `read_ahead`.
 
 The two bounds of waiting sends protect the memory of a node when the bucket or a partition stops
 answering. A node holds at most `fresh_pending_bytes` times its shards for them. The share of one

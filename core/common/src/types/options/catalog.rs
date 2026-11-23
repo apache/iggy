@@ -24,7 +24,8 @@ use super::{
     DEFAULT_TIERED_STORAGE, Durability, GeoMode, MAX_MESSAGES_REQUIRED_TO_SAVE,
     MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
-    PartitionResizePolicy, ResourceOptions, TopicCreateOptions, TopicType, erase_options,
+    PartitionResizePolicy, READ_AHEAD_CACHE_SHARE, ResourceOptions, TOPIC_READ_AHEAD_MIN,
+    TOPIC_READ_CACHE_SIZE_MIN, TopicCreateOptions, TopicType, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -69,7 +70,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 33] = [
+pub static CATALOG: [OptionDescriptor; 35] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -603,6 +604,58 @@ pub static CATALOG: [OptionDescriptor; 33] = [
         },
     },
     OptionDescriptor {
+        key: OptionKey::ReadCacheSize,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        // Unset, each node applies its own server setting of the same name.
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        // It bounds what each node keeps in its own memory, so a node that
+        // ignored it would only apply its server setting.
+        critical: false,
+        description: || {
+            format!(
+                "The memory that each node keeps for what the reads of the topic fetch from the \
+                 object store, divided between the topic's partitions, in bytes or a byte-size \
+                 string (e.g. 16 MiB). 0 keeps nothing that they fetch, otherwise at least {} \
+                 KiB. The share of a partition is a limit within the read cache of its shard, \
+                 not a reservation, and a share below {} blocks of the node's \
+                 read_cache_block_size keeps nothing. Overrides [tiered_storage] \
+                 read_cache_size. An update can change it but not reset it. Unset, each node \
+                 applies its server setting of the same name, and only the read cache of the \
+                 shard bounds a partition",
+                TOPIC_READ_CACHE_SIZE_MIN / 1024,
+                READ_AHEAD_CACHE_SHARE
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::ReadAhead,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            format!(
+                "The most bytes that readahead fetches from the object store in front of a \
+                 sequential reader of the topic, in bytes or a byte-size string (e.g. 1 MiB). \
+                 0 turns readahead off, otherwise at least {} KiB, and at most one part in {} \
+                 of a read_cache_size that the topic sets. A partition reads ahead at most one \
+                 part in {} of its share of read_cache_size. Overrides [tiered_storage] \
+                 read_ahead. An update can change it but not reset it. Unset, each node \
+                 applies its server setting of the same name",
+                TOPIC_READ_AHEAD_MIN / 1024,
+                READ_AHEAD_CACHE_SHARE,
+                READ_AHEAD_CACHE_SHARE
+            )
+        },
+    },
+    OptionDescriptor {
         key: OptionKey::ShadowOrigin,
         scopes: STREAM_ONLY,
         kind: HeaderKind::String,
@@ -929,9 +982,9 @@ pub fn drop_options_fixed_by_type(explicit: &mut ResourceOptions) -> bool {
 /// 3. `ReadOnlyOption`: an internal or read-only key.
 /// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset, an
 ///    enable-only key that an update resets or sets to false, or any key of an
-///    update to a geo topic other than its durations, as it keeps its name and
-///    its other options. The geo rule runs only when `context` holds the
-///    topic's stored options.
+///    update to a geo topic other than its durations and its read cache
+///    settings, as it keeps its name and its other options. The geo rule runs
+///    only when `context` holds the topic's stored options.
 /// 5. `OptionNotResettable`: a reset of a column or of a key without default.
 /// 6. Value errors: a column inside a create block is `InvalidOptionValue`,
 ///    column values keep their own errors, other keys `InvalidOptionValue`,
@@ -1010,7 +1063,7 @@ pub fn admit(
         .flatten()
         .map(|current| TopicCreateOptions::from_resource_options(current).is_geo());
     if stored_geo == Some(true)
-        && let Some(key) = all_keys().find(|key| !key.is_geo_duration())
+        && let Some(key) = all_keys().find(|key| !key.is_geo_updatable())
     {
         return Err(IggyError::OptionNotUpdatable(key.to_string()));
     }
@@ -1164,6 +1217,10 @@ pub fn canonical_value(
         | OptionKey::TombstoneGrace
         | OptionKey::PositionsResumeTimeout
         | OptionKey::LongTermRewriteMaxInterval => IggyDuration::decode(key, entry)?.encode()?,
+        // Zero is a value here, the setting turned off, not a sentinel.
+        OptionKey::ReadCacheSize | OptionKey::ReadAhead => {
+            IggyByteSize::decode(key, entry)?.encode()?
+        }
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
@@ -1483,7 +1540,7 @@ fn key_preview(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{OptionsProvenance, topic_option_keys};
+    use super::super::{OptionsProvenance, TopicReadCache, topic_option_keys};
     use super::*;
     use crate::wire_conversions::resource_options_to_wire;
     use std::str::FromStr;
@@ -1587,6 +1644,32 @@ mod tests {
             ),
             (topic_option_keys::TOPIC_TYPE, OptionKey::TopicType),
             (topic_option_keys::GEO_MODE, OptionKey::GeoMode),
+            (
+                topic_option_keys::FRESH_UPLOAD_INTERVAL,
+                OptionKey::FreshUploadInterval,
+            ),
+            (
+                topic_option_keys::CONSUMER_OFFSET_UPLOAD_INTERVAL,
+                OptionKey::ConsumerOffsetUploadInterval,
+            ),
+            (
+                topic_option_keys::POSITIONS_PUBLISH_INTERVAL,
+                OptionKey::PositionsPublishInterval,
+            ),
+            (
+                topic_option_keys::TOMBSTONE_GRACE,
+                OptionKey::TombstoneGrace,
+            ),
+            (
+                topic_option_keys::POSITIONS_RESUME_TIMEOUT,
+                OptionKey::PositionsResumeTimeout,
+            ),
+            (
+                topic_option_keys::LONG_TERM_REWRITE_MAX_INTERVAL,
+                OptionKey::LongTermRewriteMaxInterval,
+            ),
+            (topic_option_keys::READ_CACHE_SIZE, OptionKey::ReadCacheSize),
+            (topic_option_keys::READ_AHEAD, OptionKey::ReadAhead),
         ] {
             assert_eq!(constant, key.to_string());
         }
@@ -1957,6 +2040,149 @@ mod tests {
             update(&expiry, &[], &OptionAdmissionContext::default()),
             Ok(())
         );
+    }
+
+    #[test]
+    fn given_a_stored_topic_when_admitting_an_update_should_take_the_read_cache_keys_of_any_type() {
+        let stored = |topic_type: &str| OptionAdmissionContext {
+            current: Some(
+                [(
+                    HeaderKey::from(OptionKey::TopicType),
+                    OptionValue::explicit(HeaderValue::try_from(topic_type).unwrap()),
+                )]
+                .into(),
+            ),
+            create_columns: OptionColumns::default(),
+        };
+        let update = |set: &WireOptions, context: &OptionAdmissionContext| {
+            admit(
+                OptionsScope::Topic,
+                OptionOperation::Update,
+                set,
+                &[],
+                context,
+            )
+            .map(|admitted| admitted.explicit)
+        };
+        let read_cache = block(&[
+            (OptionKey::ReadCacheSize, HeaderValue::from(0u64)),
+            (
+                OptionKey::ReadAhead,
+                HeaderValue::try_from("1 MiB").unwrap(),
+            ),
+        ]);
+        let duration = block(&[(OptionKey::TombstoneGrace, HeaderValue::from(9u64))]);
+
+        for context in [
+            stored("geo"),
+            stored("normal"),
+            OptionAdmissionContext::default(),
+        ] {
+            let explicit = update(&read_cache, &context).expect("read cache keys are taken");
+            assert_eq!(
+                explicit.get(&HeaderKey::from(OptionKey::ReadCacheSize)),
+                Some(&OptionValue::explicit(HeaderValue::from(0u64)))
+            );
+            assert_eq!(
+                explicit.get(&HeaderKey::from(OptionKey::ReadAhead)),
+                Some(&OptionValue::explicit(HeaderValue::from(1u64 << 20)))
+            );
+        }
+        assert!(update(&duration, &stored("geo")).is_ok());
+        assert_eq!(
+            update(&duration, &stored("normal")),
+            Err(IggyError::InvalidOptionValue(
+                OptionKey::TombstoneGrace.to_string()
+            )),
+            "a normal topic still has no durations"
+        );
+        let beside_expiry = block(&[
+            (OptionKey::ReadAhead, HeaderValue::from(1u64 << 20)),
+            (OptionKey::MessageExpiry, HeaderValue::from(9u64)),
+        ]);
+        assert_eq!(
+            update(&beside_expiry, &stored("geo")),
+            Err(IggyError::OptionNotUpdatable(
+                OptionKey::MessageExpiry.to_string()
+            ))
+        );
+        assert!(update(&beside_expiry, &stored("normal")).is_ok());
+    }
+
+    #[test]
+    fn given_read_cache_keys_when_described_should_be_updatable_topic_sizes_without_a_default() {
+        for key in TopicReadCache::KEYS {
+            let descriptor = key.descriptor();
+            assert_eq!(descriptor.scopes, TOPIC_ONLY, "{key}");
+            assert_eq!(descriptor.kind, HeaderKind::Uint64, "{key}");
+            assert_eq!(descriptor.storage, OptionStorage::Map, "{key}");
+            assert!(descriptor.is_updatable(), "{key}");
+            assert!(!descriptor.is_resettable(), "{key}");
+            assert_eq!(descriptor.flags(), OPTION_FLAG_UPDATABLE, "{key}");
+            assert_eq!(descriptor.default_value(), Ok(None), "{key}");
+            assert!(key.is_geo_updatable() && !key.is_geo_duration(), "{key}");
+            assert_eq!(
+                admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Update,
+                    &WireOptions::empty(),
+                    &[key.to_string()],
+                    &OptionAdmissionContext::default(),
+                )
+                .map(|_| ()),
+                Err(IggyError::OptionNotResettable(key.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn given_read_cache_values_when_canonicalizing_should_keep_zero_and_refuse_values_below_the_floor()
+     {
+        for (key, floor) in [
+            (OptionKey::ReadCacheSize, TOPIC_READ_CACHE_SIZE_MIN),
+            (OptionKey::ReadAhead, TOPIC_READ_AHEAD_MIN),
+        ] {
+            for kept in [0, floor, u64::MAX] {
+                assert_eq!(
+                    canonical_value(key, &entry(key, &HeaderValue::from(kept))),
+                    Ok(Some(HeaderValue::from(kept))),
+                    "{key} = {kept}"
+                );
+            }
+            for refused in [
+                HeaderValue::from(1u64),
+                HeaderValue::from(floor - 1),
+                HeaderValue::try_from("64 KiB").unwrap(),
+                HeaderValue::from(true),
+            ] {
+                assert_eq!(
+                    canonical_value(key, &entry(key, &refused)),
+                    Err(IggyError::InvalidOptionValue(key.to_string())),
+                    "{key} = {refused:?}"
+                );
+            }
+            assert_eq!(
+                canonical_value(key, &entry(key, &HeaderValue::try_from("16 MiB").unwrap())),
+                Ok(Some(HeaderValue::from(16u64 << 20)))
+            );
+            for operation in [OptionOperation::Create, OptionOperation::Update] {
+                let admitted = admit(
+                    OptionsScope::Topic,
+                    operation,
+                    &block(&[(key, HeaderValue::try_from("0").unwrap())]),
+                    &[],
+                    &OptionAdmissionContext::default(),
+                )
+                .expect("zero is a value");
+                assert_eq!(
+                    admitted.explicit.get(&HeaderKey::from(key)),
+                    Some(&OptionValue::explicit(HeaderValue::from(0u64))),
+                    "{operation:?} keeps {key} = 0"
+                );
+            }
+        }
+        assert_eq!(TOPIC_READ_CACHE_SIZE_MIN, 512 * 1024);
+        assert_eq!(TOPIC_READ_AHEAD_MIN, 128 * 1024);
     }
 
     #[test]

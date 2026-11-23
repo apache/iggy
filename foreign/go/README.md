@@ -92,7 +92,10 @@ if err := cli.UpdateTopic(ctx, streamId, topicId, iggcon.TopicUpdate{
 
 The sample is `Example_resourceOptions` in `client/example_resource_options_test.go`.
 
-A geo topic takes six durations of its own, in microseconds: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`, `PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and `LongTermRewriteMaxInterval`. Each overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent. `TopicUpdate` can set them, but not reset them, and they are the only keys an update may change on a geo topic. A normal topic refuses them.
+A geo topic takes six durations of its own, in microseconds: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`, `PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and `LongTermRewriteMaxInterval`. Each overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent. `TopicUpdate` can set them, but not reset them. A normal topic refuses them.
+
+Any topic takes two byte sizes for its reads from the object store. `ReadCacheSize` is the memory each node keeps for what the topic's reads fetch, divided between its partitions, and zero keeps nothing. `ReadAhead` is the most bytes that readahead fetches in front of a sequential reader, and zero turns readahead off.
+Nil leaves each node's `[tiered_storage]` setting of the same name, and `Topic` reports nil there too. `TopicUpdate` can change them on any topic, geo included, but not reset them. They and the six durations are the only keys an update may change on a geo topic.
 
 A stream encryption key is exactly 32 random bytes. Never derive it from a password: the fingerprint reads would then be an offline guessing oracle. The key travels inside the create request over the client's transport, so use TLS when the network between client and server is not trusted.
 

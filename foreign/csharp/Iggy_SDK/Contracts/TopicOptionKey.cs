@@ -21,8 +21,9 @@ namespace Apache.Iggy.Contracts;
 ///     The client-visible option keys of a topic, in catalog order. Names a key to reset in a
 ///     <see cref="TopicUpdate" />: only <see cref="MessageExpiry" />, <see cref="MaxTopicSize" />,
 ///     <see cref="LocalRetentionAge" /> and <see cref="LocalRetentionSize" /> reset to a default. The six durations
-///     of a geo topic, <see cref="FreshUploadInterval" /> to <see cref="LongTermRewriteMaxInterval" />, have no
-///     default, so the server refuses a reset of them.
+///     of a geo topic, <see cref="FreshUploadInterval" /> to <see cref="LongTermRewriteMaxInterval" />, and
+///     <see cref="ReadCacheSize" /> and <see cref="ReadAhead" /> have no default, so the server refuses a reset of
+///     them.
 /// </summary>
 public enum TopicOptionKey
 {
@@ -96,5 +97,11 @@ public enum TopicOptionKey
     PositionsResumeTimeout,
 
     /// <summary><c>long_term_rewrite_max_interval</c>, only on a geo topic, updatable and not resettable.</summary>
-    LongTermRewriteMaxInterval
+    LongTermRewriteMaxInterval,
+
+    /// <summary><c>read_cache_size</c>, updatable and not resettable.</summary>
+    ReadCacheSize,
+
+    /// <summary><c>read_ahead</c>, updatable and not resettable.</summary>
+    ReadAhead
 }

@@ -336,10 +336,10 @@ impl IggyClient {
     /// also become readable in the other datacenters through the object store. A geo topic needs
     /// an object store on every node of the cluster: while one is not ready, the server refuses
     /// `geo` with `Feature is unavailable`. A geo topic refuses tiered storage and an encrypted
-    /// stream, and keeps its name, its partition count and every option but the durations below.
-    /// `geo_mode` says how a geo topic writes its messages, `geo` or `geo_tiered`, and null
-    /// resolves to `geo` there. The server refuses `geo_tiered` with `Feature is unavailable` for
-    /// now, and any mode on a normal topic.
+    /// stream, and keeps its name, its partition count and every option but the durations and the
+    /// read cache settings below. `geo_mode` says how a geo topic writes its messages, `geo` or
+    /// `geo_tiered`, and null resolves to `geo` there. The server refuses `geo_tiered` with
+    /// `Feature is unavailable` for now, and any mode on a normal topic.
     ///
     /// The six durations after `geo_mode` override, for a geo topic, the server settings of the
     /// same name on each node: `[tiered_storage] fresh_upload_interval` (at most 10 s) and the
@@ -349,6 +349,17 @@ impl IggyClient {
     /// least 1 s). Each takes an int or a decimal string of microseconds. 0 is sent as a value,
     /// and null leaves the server setting in force. The server refuses any of them on a normal
     /// topic with `Invalid option value`.
+    ///
+    /// `read_cache_size` and `read_ahead`, after the durations, go on any topic and override the
+    /// `[tiered_storage]` settings of the same name on each node. `read_cache_size` is the memory
+    /// each node keeps for what the topic's reads fetch from the object store, divided between
+    /// its partitions: a limit within the read cache of each partition's shard, not a
+    /// reservation. 0 keeps nothing they fetch, otherwise it is at least 512 KiB. `read_ahead` is
+    /// the most bytes readahead fetches in front of a sequential reader of the topic. 0 turns
+    /// readahead off, otherwise it is at least 128 KiB and at most an eighth of a
+    /// `read_cache_size` above 0. Each takes an int or a decimal string of bytes. 0 is sent as a
+    /// value, and null leaves the server setting in force. The server refuses a value out of
+    /// range with `Invalid option value`.
     #[allow(clippy::too_many_arguments)]
     pub fn create_topic(
         &self,
@@ -379,6 +390,8 @@ impl IggyClient {
         tombstone_grace_micros: Option<&Zval>,
         positions_resume_timeout_micros: Option<&Zval>,
         long_term_rewrite_max_interval_micros: Option<&Zval>,
+        read_cache_size: Option<&Zval>,
+        read_ahead: Option<&Zval>,
     ) -> PhpResult {
         let options = topic_create_options(
             partitions_count,
@@ -406,6 +419,8 @@ impl IggyClient {
             tombstone_grace_micros,
             positions_resume_timeout_micros,
             long_term_rewrite_max_interval_micros,
+            read_cache_size,
+            read_ahead,
         )?;
         let stream: Identifier = stream.try_into()?;
         let inner = self.inner.clone();
@@ -434,10 +449,13 @@ impl IggyClient {
     /// tiered topic keeps on local disk after upload, with the same int or decimal string values
     /// and the same refusal of 0 as the expiry and the size cap.
     ///
-    /// The six durations of a geo topic take the values `createTopic()` takes, 0 included. They
-    /// are the only options an update can change on a geo topic, a normal topic refuses them with
-    /// `Invalid option value`, and they cannot be reset: a `reset` case or a `raw_reset` name of
-    /// one is refused with `Option cannot be reset`.
+    /// The six durations of a geo topic take the values `createTopic()` takes, 0 included. With
+    /// the read cache settings, they are the only options an update can change on a geo topic. A
+    /// normal topic refuses them with `Invalid option value`, and they cannot be reset: a `reset`
+    /// case or a `raw_reset` name of one is refused with `Option cannot be reset`.
+    ///
+    /// `read_cache_size` and `read_ahead` take the values `createTopic()` takes, 0 included, and
+    /// an update can change them on any topic. They cannot be reset either.
     #[allow(clippy::too_many_arguments)]
     #[php(defaults(reset = Vec::<TopicOptionKey>::new()))]
     pub fn update_topic(
@@ -459,6 +477,8 @@ impl IggyClient {
         tombstone_grace_micros: Option<&Zval>,
         positions_resume_timeout_micros: Option<&Zval>,
         long_term_rewrite_max_interval_micros: Option<&Zval>,
+        read_cache_size: Option<&Zval>,
+        read_ahead: Option<&Zval>,
     ) -> PhpResult {
         let options = topic_update_options(
             name,
@@ -476,6 +496,8 @@ impl IggyClient {
             tombstone_grace_micros,
             positions_resume_timeout_micros,
             long_term_rewrite_max_interval_micros,
+            read_cache_size,
+            read_ahead,
         )?;
         let stream: Identifier = stream.try_into()?;
         let topic: Identifier = topic.try_into()?;
@@ -1203,6 +1225,8 @@ fn topic_create_options(
     tombstone_grace_micros: Option<&Zval>,
     positions_resume_timeout_micros: Option<&Zval>,
     long_term_rewrite_max_interval_micros: Option<&Zval>,
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
 ) -> PhpResult<TopicCreateOptions> {
     let message_expiry_micros = optional_u64(message_expiry_micros, "message_expiry_micros")?;
     let max_topic_size = optional_u64(max_topic_size, "max_topic_size")?;
@@ -1245,6 +1269,7 @@ fn topic_create_options(
         positions_resume_timeout_micros,
         long_term_rewrite_max_interval_micros,
     )?;
+    let read_cache = read_cache(read_cache_size, read_ahead)?;
     let expiry = message_expiry_micros.map_or(IggyExpiry::ServerDefault, IggyExpiry::from);
     let max_size = max_topic_size.map_or(MaxTopicSize::ServerDefault, MaxTopicSize::from);
     let segment_max_age =
@@ -1280,6 +1305,7 @@ fn topic_create_options(
         topic_type,
         geo_mode,
         geo_durations,
+        read_cache,
         raw: raw.unwrap_or_default(),
     })
 }
@@ -1302,6 +1328,8 @@ fn topic_update_options(
     tombstone_grace_micros: Option<&Zval>,
     positions_resume_timeout_micros: Option<&Zval>,
     long_term_rewrite_max_interval_micros: Option<&Zval>,
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
 ) -> PhpResult<TopicUpdateOptions> {
     let message_expiry = optional_u64(message_expiry_micros, "message_expiry_micros")?
         .map(|micros| positive_update(micros, "message_expiry_micros").map(IggyExpiry::from))
@@ -1326,6 +1354,7 @@ fn topic_update_options(
         positions_resume_timeout_micros,
         long_term_rewrite_max_interval_micros,
     )?;
+    let read_cache = read_cache(read_cache_size, read_ahead)?;
     let (reset, raw_reset) = reset_names(reset, raw_reset)?;
     Ok(TopicUpdateOptions {
         name,
@@ -1335,6 +1364,7 @@ fn topic_update_options(
         local_retention_age,
         local_retention_size,
         geo_durations,
+        read_cache,
         reset,
         raw_reset,
         raw: raw.unwrap_or_default(),
@@ -1378,6 +1408,20 @@ fn geo_durations(
             long_term_rewrite_max_interval_micros,
             "long_term_rewrite_max_interval_micros",
         )?,
+    })
+}
+
+/// The read cache settings of a topic, each an int or a decimal string of bytes.
+///
+/// Zero turns a setting off, so like a zero duration it is sent, and only null leaves a setting
+/// to the server.
+fn read_cache(
+    read_cache_size: Option<&Zval>,
+    read_ahead: Option<&Zval>,
+) -> PhpResult<TopicReadCache> {
+    Ok(TopicReadCache {
+        size: optional_u64(read_cache_size, "read_cache_size")?.map(IggyByteSize::from),
+        read_ahead: optional_u64(read_ahead, "read_ahead")?.map(IggyByteSize::from),
     })
 }
 
@@ -1651,6 +1695,7 @@ mod tests {
             let max_topic_size = long_argument(&input["max_topic_size"]);
             let segment_size = long_argument(&input["segment_size"]);
             let [fresh, consumer_offset, publish, tombstone, resume, rewrite] = durations(input);
+            let [read_cache_size, read_ahead] = read_cache_settings(input);
             let options = topic_create_options(
                 number(&input["partitions_count"]),
                 input["compression_algorithm"].as_str().map(str::to_owned),
@@ -1677,6 +1722,8 @@ mod tests {
                 tombstone.as_ref(),
                 resume.as_ref(),
                 rewrite.as_ref(),
+                read_cache_size.as_ref(),
+                read_ahead.as_ref(),
             )
             .expect("typed arguments convert");
             let stream_id = identifier(&input["stream_id"]);
@@ -1724,6 +1771,7 @@ mod tests {
                 .as_array()
                 .map_or_else(Vec::new, |names| names.iter().map(reset_case).collect());
             let [fresh, consumer_offset, publish, tombstone, resume, rewrite] = durations(input);
+            let [read_cache_size, read_ahead] = read_cache_settings(input);
             let options = topic_update_options(
                 input["name"].as_str().map(str::to_owned),
                 message_expiry.as_ref(),
@@ -1740,6 +1788,8 @@ mod tests {
                 tombstone.as_ref(),
                 resume.as_ref(),
                 rewrite.as_ref(),
+                read_cache_size.as_ref(),
+                read_ahead.as_ref(),
             )
             .expect("typed arguments convert");
             let patch = options.to_patch().expect("patch encodes");
@@ -1803,6 +1853,8 @@ mod tests {
             None,
             Some(&zero),
             None,
+            None,
+            None,
         )
         .expect("zero converts")
         .to_wire()
@@ -1822,6 +1874,8 @@ mod tests {
             None,
             None,
             Some(&zero),
+            None,
+            None,
             None,
         )
         .expect("zero converts")
@@ -1871,6 +1925,8 @@ mod tests {
             Some(&negative),
             None,
             None,
+            None,
+            None,
         );
         let updated = topic_update_options(
             None,
@@ -1888,6 +1944,8 @@ mod tests {
             Some(&negative),
             None,
             None,
+            None,
+            None,
         );
 
         assert!(created.is_err());
@@ -1902,6 +1960,15 @@ mod tests {
     /// The durations of a fixture input as the ints a PHP caller passes, in catalog order.
     fn durations(input: &Value) -> [Option<Zval>; 6] {
         GeoTopicDurations::KEYS.map(|key| {
+            let name: &'static str = key.into();
+            long_argument(&input[name])
+        })
+    }
+
+    /// The read cache settings of a fixture input as the ints a PHP caller passes, in catalog
+    /// order.
+    fn read_cache_settings(input: &Value) -> [Option<Zval>; 2] {
+        TopicReadCache::KEYS.map(|key| {
             let name: &'static str = key.into();
             long_argument(&input[name])
         })

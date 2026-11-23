@@ -32,8 +32,10 @@ import static org.apache.iggy.system.OptionSpec.FLAG_UPDATABLE;
  * {@code local_retention_age} and {@code local_retention_size}, and reset the last four to their
  * defaults. It may also turn {@code tiered_storage} on, never off and never back to its default. On a geo
  * topic it may set the six durations from {@code fresh_upload_interval} to
- * {@code long_term_rewrite_max_interval}, the only keys an update changes there. They have no default, so
- * the server refuses a reset of them. Every other key is fixed at create.
+ * {@code long_term_rewrite_max_interval}. On any topic it may set {@code read_cache_size} and
+ * {@code read_ahead}, and with the durations they are the only keys an update changes on a geo topic.
+ * None of these eight has a default, so the server refuses a reset of them. Every other key is fixed at
+ * create.
  */
 public enum TopicOptionKey implements OptionKey {
     NAME("name", FLAG_UPDATABLE),
@@ -59,7 +61,9 @@ public enum TopicOptionKey implements OptionKey {
     POSITIONS_PUBLISH_INTERVAL("positions_publish_interval", FLAG_UPDATABLE),
     TOMBSTONE_GRACE("tombstone_grace", FLAG_UPDATABLE),
     POSITIONS_RESUME_TIMEOUT("positions_resume_timeout", FLAG_UPDATABLE),
-    LONG_TERM_REWRITE_MAX_INTERVAL("long_term_rewrite_max_interval", FLAG_UPDATABLE);
+    LONG_TERM_REWRITE_MAX_INTERVAL("long_term_rewrite_max_interval", FLAG_UPDATABLE),
+    READ_CACHE_SIZE("read_cache_size", FLAG_UPDATABLE),
+    READ_AHEAD("read_ahead", FLAG_UPDATABLE);
 
     private final String value;
     private final int flags;

@@ -77,6 +77,20 @@ detail::GeoTopicDurations GeoTopicDurationsFromFfi(const ffi::GeoTopicDurations 
     };
 }
 
+std::optional<std::uint64_t> TopicReadCacheBytesFromFfi(bool has_value, std::uint64_t bytes) {
+    if (!has_value) {
+        return std::nullopt;
+    }
+    return bytes;
+}
+
+detail::TopicReadCache TopicReadCacheFromFfi(const ffi::TopicReadCache &read_cache) {
+    return detail::TopicReadCache{
+        TopicReadCacheBytesFromFfi(read_cache.has_read_cache_size, read_cache.read_cache_size),
+        TopicReadCacheBytesFromFfi(read_cache.has_read_ahead, read_cache.read_ahead),
+    };
+}
+
 std::optional<std::string> TextFromFfi(bool has_text, const rust::String &text) {
     if (!has_text) {
         return std::nullopt;
@@ -330,8 +344,8 @@ Topic Topic::FromFfi(ffi::Topic topic) {
         topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
         topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
         topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
-        GeoTopicDurationsFromFfi(topic.geo_durations), topic.messages_count, topic.partitions_count,
-        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+        GeoTopicDurationsFromFfi(topic.geo_durations), TopicReadCacheFromFfi(topic.read_cache), topic.messages_count,
+        topic.partitions_count, ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 PartitionContext PartitionContext::FromFfi(ffi::PartitionContext context) {
@@ -356,8 +370,9 @@ TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {
         topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
         topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
         topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
-        GeoTopicDurationsFromFfi(topic.geo_durations), topic.messages_count, topic.partitions_count,
-        std::move(partitions), ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+        GeoTopicDurationsFromFfi(topic.geo_durations), TopicReadCacheFromFfi(topic.read_cache), topic.messages_count,
+        topic.partitions_count, std::move(partitions),
+        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {
