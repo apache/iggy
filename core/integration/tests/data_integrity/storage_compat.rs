@@ -47,8 +47,9 @@
 //!
 //! Three failure modes reach exit code 0 with a server that boots and serves:
 //!
-//! - A partition whose durable state cannot be read is TOMBSTONED and boot
-//!   continues. Only the log says so.
+//! - A partition whose durable state cannot be read is REFUSED and boot
+//!   continues. Only the log says so, in a line that starts with
+//!   [`PARTITION_REFUSED_MARKER`].
 //! - A topic loses a single storage option, per key, with no log line at
 //!   all: `TopicCreateOptions::parse_committed` deliberately discards
 //!   per-entry parse errors so one unreadable key cannot drop the rest.
@@ -56,7 +57,7 @@
 //!   happens to poll still read back fine, because segment batch headers
 //!   carry no magic and no version.
 //!
-//! So the test asserts the tombstone marker is absent, re-reads every seeded
+//! So the test asserts that marker is absent, re-reads every seeded
 //! option value AND its provenance flag, compares every stored message field
 //! against a read taken from the baseline, and byte-compares the segment
 //! files across the swap. It stops producing MID-segment on purpose: boot
@@ -78,7 +79,7 @@
 //! their independent replicated defaults. Production SDKs gain no fallback.
 //!
 //! `IGGY_TEST_VERBOSE` makes the harness inherit the server's stdout instead
-//! of capturing it, which would make the tombstone check vacuous. The
+//! of capturing it, which would make the marker check vacuous. The
 //! graceful-shutdown assertion below is taken on the same log and fails
 //! loudly in that case rather than passing on an empty file.
 
@@ -101,6 +102,7 @@ use integration::harness::{
 };
 use serde::{Deserialize, Serialize};
 use serial_test::parallel;
+use server_common::diagnostics::PARTITION_REFUSED_MARKER;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -262,40 +264,6 @@ const READBACK_COUNT: u32 = 16;
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Substring shared by all three tombstone log lines in
-/// `core/server/src/bootstrap.rs`. Matching the full sentence of any one of
-/// them would miss the others, and a segment layout change lands on the
-/// first arm, not the consensus-state one.
-///
-/// Being shorter than a whole word is what makes it match every arm, and also
-/// what makes it collide with [`TOMBSTONE_FIELD`]. Strip that before matching
-/// rather than lengthening this.
-const TOMBSTONE_MARKER: &str = "tombston";
-
-/// The one tracing FIELD in the server named for the tombstone state
-/// (`partition_reconciler.rs`, the parked-frame discard). Fields render as
-/// `key=value`, so a shard that is merely not the namespace's owner logs
-/// `tombstoned=false`, which contains [`TOMBSTONE_MARKER`] on a HEALTHY run.
-///
-/// Removed from the log before the absence check. Only this exact field form
-/// goes: every real arm reads `tombstoning it`, `tombstoned rather than` or
-/// `tombstoning the`, and none of them emits a `tombstoned` field, so their
-/// detection is untouched.
-///
-/// The collision is dormant at the default `info` level, but the line is
-/// `debug!`, and two independent variables reach the child: the harness
-/// forwards every `IGGY_*` name, and `RUST_LOG` is inherited by any process
-/// and OUTRANKS the configured level. Filtering the text keeps the check
-/// working under both instead of refusing to run.
-const TOMBSTONE_FIELD: &str = "tombstoned=";
-
-/// The geo setting that every boot prints with the rest of its configuration,
-/// as `tombstone_grace: 1day`. It names how long a deleted geo topic's
-/// tombstone stays in the object store, not a partition's state, and it
-/// contains [`TOMBSTONE_MARKER`] on every run. Removed like
-/// [`TOMBSTONE_FIELD`]: no arm that tombstones a partition writes this name.
-const TOMBSTONE_SETTING: &str = "tombstone_grace";
 
 /// Logged by `iggy-server`'s `main` once shutdown ran to completion. A stop
 /// that escalated to `SIGKILL` leaves crash-recovery state behind, which
@@ -1012,12 +980,10 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
     // whole run to drain, and after a positive marker so an uncaptured log
     // fails loudly instead of passing the absence check vacuously.
     assert_graceful_shutdown(&harness, "the server under test");
-    // `stdout_plain` returns the same ANSI-stripped text `stdout_contains`
-    // matches against, so filtering it costs no matching power.
     let stdout = harness.server().stdout_plain();
     assert!(
-        !reports_a_tombstoned_partition(&stdout),
-        "the server under test tombstoned a partition rather than reading the baseline's \
+        !stdout.contains(PARTITION_REFUSED_MARKER),
+        "the server under test refused a partition rather than reading the baseline's \
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
 
@@ -1025,32 +991,6 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
         &baseline_files,
         &disk::collect_comparable_files(&data_path, false),
     );
-}
-
-/// Whether a server log says that boot tombstoned a partition. The names that
-/// only share the marker's letters are taken out first.
-fn reports_a_tombstoned_partition(stdout: &str) -> bool {
-    stdout
-        .replace(TOMBSTONE_FIELD, "")
-        .replace(TOMBSTONE_SETTING, "")
-        .contains(TOMBSTONE_MARKER)
-}
-
-#[test]
-fn given_a_healthy_log_with_tombstone_names_when_checking_should_report_no_tombstoned_partition() {
-    let healthy = "geo: { origin: dc-a, tombstone_grace: 1day, manifest_poll_interval: 5s }\n\
-                   discarding a parked frame tombstoned=false\n";
-    assert!(!reports_a_tombstoned_partition(healthy));
-    for refusal in [
-        "tombstoning it",
-        "tombstoned rather than",
-        "tombstoning the",
-    ] {
-        assert!(
-            reports_a_tombstoned_partition(&format!("{healthy}{refusal}\n")),
-            "{refusal}"
-        );
-    }
 }
 
 /// A partition of a tiered topic keeps a chain file, and its older segments
@@ -1893,7 +1833,7 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
         "{who} did not log {GRACEFUL_SHUTDOWN_MARKER:?}. Either the stop escalated to SIGKILL, \
          leaving crash-recovery state that confounds the compatibility verdict, or stdout was \
          not captured at all (IGGY_TEST_VERBOSE makes the harness inherit it, which would also \
-         make the tombstone check vacuous). Server stdout:\n{}",
+         make the marker check vacuous). Server stdout:\n{}",
         harness.server().stdout_plain()
     );
 }
