@@ -19,6 +19,7 @@
 //! leaves out, as text built from the typed fields of the summary.
 
 use bench_dashboard_shared::omb::OMB_WINDOW_SECONDS;
+use bench_dashboard_shared::omb::chart::{PERCENTILE_LABELS, percentile_values};
 use bench_dashboard_shared::omb::result::OmbPercentiles;
 use bench_dashboard_shared::omb::setup::OmbSetup;
 use bench_dashboard_shared::omb::summary::{OmbRunSummary, OmbTimeSource};
@@ -29,9 +30,7 @@ use super::change::Kpi;
 use crate::components::ladder::log_bar_pcts;
 use crate::components::run_labels::{messages_text, milliseconds, nodes_text};
 use crate::format::group_digits;
-use crate::pages::omb::common::{
-    NOT_RECORDED, P99_INDEX, PERCENTILE_LABELS, length_text, percentile_values,
-};
+use crate::pages::omb::common::{NOT_RECORDED, P99_INDEX, length_text};
 use crate::pages::run::facts::AVERAGE_LABEL;
 
 /// What a run without a sidecar says in place of its Environment section.

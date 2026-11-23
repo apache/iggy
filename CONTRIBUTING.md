@@ -107,6 +107,30 @@ for review.
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
 
+### Docs
+
+The pages of [iggy.apache.org/docs](https://iggy.apache.org/docs/) live in `docs/` as MDX
+files. MDX is Markdown that can contain React components. If your change is visible to
+users, for example a new config key, CLI argument or SDK method, update `docs/` in the
+same PR. The connectors docs live in `docs/` of
+[apache/iggy-connectors](https://github.com/apache/iggy-connectors).
+
+[apache/iggy-website](https://github.com/apache/iggy-website) builds the site. It holds the
+components and the images that the pages use. To preview your pages, check it out next to
+this repository. Then run these commands in it, and the last two each in its own terminal:
+
+```bash
+npm ci
+IGGY_DOCS_DIR=../iggy/docs npm run docs:watch
+IGGY_DOCS_DIR=../iggy/docs npm run dev
+```
+
+The `docs:watch` command copies each saved page into the site. List each new page in the
+`meta.json` of its folder. Images live in `public/img/` of apache/iggy-website, so add a new
+image there in a website PR and wait until it merges. The `Docs` CI job builds the site with
+your pages. It fails on a broken link, on a missing image and on a page that its `meta.json`
+does not list.
+
 ### Review Comments
 
 Respond to every review comment, so that the reviewer knows you read it. Any one of these

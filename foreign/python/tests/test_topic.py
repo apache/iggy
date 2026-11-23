@@ -1303,6 +1303,7 @@ class TestTopicOptions:
             "encryption_key_source": (False, False, True, False),
             "encryption_key_fingerprint": (False, False, True, False),
             "encryption_kek_fingerprint": (False, False, True, False),
+            "shadow_origin": (False, False, True, False),
         }
         users = await iggy_client.describe_options("user")
         assert [(spec.key, spec.updatable) for spec in users] == [

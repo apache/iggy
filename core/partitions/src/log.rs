@@ -25,9 +25,9 @@ use journal::Journal;
 use server_common::SegmentStorage;
 use std::collections::VecDeque;
 use std::fmt::Debug;
+use std::ops::Range;
 use std::rc::Rc;
 
-const SEGMENTS_CAPACITY: usize = 1024;
 /// Max sealed segments per partition that keep a resident read handle (fd +
 /// sparse index). Without a cap every sealed segment a reader ever touched pins
 /// one fd for the partition's lifetime; the server-wide budget is this cap times
@@ -163,12 +163,12 @@ where
     fn default() -> Self {
         Self {
             journal: JournalState::default(),
-            segments: Vec::with_capacity(SEGMENTS_CAPACITY),
-            storage: Vec::with_capacity(SEGMENTS_CAPACITY),
-            indexes: Vec::with_capacity(SEGMENTS_CAPACITY),
-            messages_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
-            index_writers: Vec::with_capacity(SEGMENTS_CAPACITY),
-            sealed_read_state: Vec::with_capacity(SEGMENTS_CAPACITY),
+            segments: Vec::new(),
+            storage: Vec::new(),
+            indexes: Vec::new(),
+            messages_writers: Vec::new(),
+            index_writers: Vec::new(),
+            sealed_read_state: Vec::new(),
             sealed_lru: VecDeque::with_capacity(SEALED_READ_STATE_CAP + 1),
         }
     }
@@ -330,6 +330,36 @@ where
         self.sealed_lru
             .retain(|&offset| offset != segment.start_offset);
         Some((segment, storage))
+    }
+
+    /// Put `segment` in the place of the segments at `slots`, whose offsets
+    /// it holds, and return those. It starts with a read state of its own:
+    /// what a poll cached for one of the replaced segments describes other
+    /// files.
+    pub fn replace_segments(
+        &mut self,
+        slots: Range<usize>,
+        segment: Segment,
+        storage: SegmentStorage,
+    ) -> Vec<Segment> {
+        self.debug_assert_lockstep();
+        let replaced: Vec<Segment> = self.segments.splice(slots.clone(), [segment]).collect();
+        self.storage.splice(slots.clone(), [storage]);
+        self.indexes.splice(slots.clone(), [None]);
+        self.messages_writers.splice(slots.clone(), [None]);
+        self.index_writers.splice(slots.clone(), [None]);
+        for handle in &self.sealed_read_state[slots.clone()] {
+            handle.tracked.set(false);
+        }
+        self.sealed_read_state
+            .splice(slots, [SealedSegmentHandle::default()]);
+        self.sealed_lru.retain(|offset| {
+            replaced
+                .iter()
+                .all(|segment| segment.start_offset != *offset)
+        });
+        self.debug_assert_lockstep();
+        replaced
     }
 
     fn debug_assert_lockstep(&self) {
@@ -676,6 +706,53 @@ mod tests {
         assert!(
             log.retire_front().is_none(),
             "an empty log retires nothing instead of panicking",
+        );
+    }
+
+    #[test]
+    fn given_segments_in_the_middle_when_one_replaces_them_should_keep_the_vecs_in_lockstep_and_start_its_read_state_over()
+     {
+        let mut log = TestLog::default();
+        for start_offset in [0, 5, 10, 15] {
+            push_resident_sealed(&mut log, start_offset);
+        }
+        for slot in 0..4 {
+            log.touch_sealed_read_state(slot);
+        }
+        let replaced_handle = Rc::clone(&log.sealed_read_state[1]);
+
+        let replaced = log.replace_segments(
+            1..3,
+            Segment {
+                start_offset: 5,
+                end_offset: 14,
+                sealed: true,
+                ..Segment::default()
+            },
+            SegmentStorage::default(),
+        );
+
+        let starts = |segments: &[Segment]| -> Vec<u64> {
+            segments
+                .iter()
+                .map(|segment| segment.start_offset)
+                .collect()
+        };
+        assert_eq!(starts(&replaced), [5, 10]);
+        assert_eq!(starts(log.segments()), [0, 5, 15]);
+        assert_eq!(log.segments()[1].end_offset, 14);
+        assert_eq!(log.sealed_read_state().len(), 3);
+        assert_eq!(log.storages().len(), 3);
+        assert!(
+            log.sealed_read_state[1].index.borrow().is_none(),
+            "the index a poll cached for a replaced segment is not the new one's"
+        );
+        assert!(!Rc::ptr_eq(&log.sealed_read_state[1], &replaced_handle));
+        assert!(!replaced_handle.tracked.get());
+        assert_eq!(
+            log.sealed_lru.iter().copied().collect::<Vec<_>>(),
+            [15, 0],
+            "the entries of the replaced segments are gone"
         );
     }
 

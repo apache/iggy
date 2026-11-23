@@ -35,14 +35,15 @@ use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
 use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
-    AckLevel, CommitHeader, RepairRangeReplyHeader, ReplyHeader, RequestPreparesHeader,
-    RequestStateChunkHeader, RequestStateTransferHeader, RoutedRequestHeader,
-    StartViewChangeHeader, StateTransferTargetHeader, WireConsumer,
+    AckLevel, CommitEntry, CommitHeader, HeartbeatState, RepairRangeReplyHeader, ReplyHeader,
+    RequestPreparesHeader, RequestStateChunkHeader, RequestStateTransferHeader,
+    RoutedRequestHeader, StartViewChangeHeader, StateTransferTargetHeader, WireConsumer,
 };
 use iggy_binary_protocol::{
     Command, ConsensusHeader, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName,
     WireOptions,
 };
+use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
 use iggy_common::{IggyError, IggyTimestamp, PartitionStats, PollingStrategy, UserStatus};
 use journal::Journal;
 use journal::prepare_journal::PrepareJournal;
@@ -52,8 +53,8 @@ use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
-use metadata::stm::user::Users;
-use partitions::state_transfer::PartitionTransferSession;
+use metadata::stm::user::{ROOT_USER_CREATED_AT_MICROS, Users};
+use partitions::state_transfer::{PartitionTransferSession, TransferSlot};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer, RepairSession,
 };
@@ -68,21 +69,22 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 
 use super::test_support::{
     PollTestMetadata, delete_history, install_group_owner, partition_with_messages,
-    partition_with_messages_at_revision, partitions_config,
+    partition_with_messages_at_revision, partitions_config, primary_with_pending_view_write,
 };
+use crate::commit_batch::encode_commit_batch;
 use crate::metrics::ShardMetrics;
 use crate::shards_table::{PapayaShardsTable, ShardsTable};
 use crate::{
-    ConsumerAttachment, IggyShard, LifecycleFrame, NoopHost, PartitionConsensusConfig,
-    PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver, ReplicaTopology, ShardFrame,
-    ShardIdentity, TaggedSender, channel, shard_channel,
+    ConsumerAttachment, ExternalGroupRead, IggyShard, LifecycleFrame, NoopHost,
+    PartitionConsensusConfig, PartitionRead, PartitionReadReply, REPAIR_CHUNK_MAX, Receiver,
+    ReplicaTopology, ShardFrame, ShardIdentity, TaggedSender, channel, shard_channel,
 };
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::partitions::InstallConsumerGroupOwnerRequest;
 
 #[compio::test]
 async fn given_a_primary_with_a_deferred_view_change_when_reading_should_refuse_old_history() {
-    let (mut fixture, _) = BoundPoll::activated().await;
+    let (mut fixture, _) = Box::pin(BoundPoll::activated()).await;
     let partition = fixture.partition.as_mut().unwrap();
     let message = Message::<StartViewChangeHeader>::new(size_of::<StartViewChangeHeader>())
         .transmute_header(|_, header: &mut StartViewChangeHeader| {
@@ -149,17 +151,23 @@ async fn given_deleted_history_when_retirement_read_names_old_incarnation_should
         owner
             .on_partition_read(
                 namespace,
-                PartitionRead::SessionRetired {
-                    identity,
+                PartitionRead::SessionsRetired {
+                    ended: Arc::from([identity]),
+                    retired_through: identity.metadata_watermark,
                     created_revision: ORIGINAL_REVISION,
                 },
                 reply,
             )
             .await;
-        assert!(matches!(
-            replies.try_recv().unwrap(),
-            PartitionReadReply::SessionRetired(retired) if retired == (revision == ORIGINAL_REVISION)
-        ));
+        let reply = replies.try_recv().unwrap();
+        if revision == ORIGINAL_REVISION {
+            assert!(matches!(
+                reply,
+                PartitionReadReply::SessionsRetired(partitions::BatchRetirement::Retired)
+            ));
+        } else {
+            assert!(matches!(reply, PartitionReadReply::NotFound));
+        }
     }
 }
 
@@ -434,7 +442,7 @@ const BOUND_GROUP: u64 = 7;
 #[compio::test]
 async fn given_newer_installed_owner_when_stale_owner_polls_on_primary_should_refuse_without_progress()
  {
-    let (mut fixture, activated) = BoundPoll::activated().await;
+    let (mut fixture, activated) = Box::pin(BoundPoll::activated()).await;
     fixture
         .install(InstallConsumerGroupOwnerRequest {
             owner: ConsumerGroupOwner {
@@ -462,7 +470,7 @@ async fn given_newer_installed_owner_when_stale_owner_polls_on_primary_should_re
 #[compio::test]
 async fn given_unassigned_installed_owner_when_stale_owner_polls_on_primary_should_refuse_without_fatal_commit()
  {
-    let (mut fixture, activated) = BoundPoll::activated().await;
+    let (mut fixture, activated) = Box::pin(BoundPoll::activated()).await;
     fixture
         .install(InstallConsumerGroupOwnerRequest {
             owner: ConsumerGroupOwner {
@@ -485,7 +493,7 @@ async fn given_unassigned_installed_owner_when_stale_owner_polls_on_primary_shou
 /// replica can apply the install later. The owner retries until it does.
 #[compio::test]
 async fn given_unapplied_install_when_new_owner_polls_on_primary_should_retry_until_it_applies() {
-    let (mut fixture, _) = BoundPoll::activated().await;
+    let (mut fixture, _) = Box::pin(BoundPoll::activated()).await;
     let successor = fixture.reconnect_owner();
 
     let reply = fixture.poll().await;
@@ -508,7 +516,7 @@ async fn given_unapplied_install_when_new_owner_polls_on_primary_should_retry_un
 
 #[compio::test]
 async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generation() {
-    let (mut fixture, activated) = BoundPoll::activated().await;
+    let (mut fixture, activated) = Box::pin(BoundPoll::activated()).await;
 
     let reply = fixture.poll().await;
     fixture.commit().await;
@@ -519,7 +527,7 @@ async fn given_installed_owner_when_it_polls_on_primary_should_serve_its_generat
 #[compio::test]
 async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read_new_history() {
     const REPLACEMENT_REVISION: u64 = 2;
-    let (mut fixture, _) = BoundPoll::activated().await;
+    let (mut fixture, _) = Box::pin(BoundPoll::activated()).await;
     fixture.poll().await;
     fixture.commit().await;
     let (owner, ..) = fixture.served.as_ref().unwrap();
@@ -561,7 +569,7 @@ async fn given_a_captured_offset_read_when_partition_is_replaced_should_not_read
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: u32::try_from(BOUND_GROUP).unwrap(),
+                group: ExternalGroupRead::Group(u32::try_from(BOUND_GROUP).unwrap()),
                 metadata,
             },
         ] {
@@ -739,7 +747,7 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
                 metadata,
             },
             PartitionRead::ExternalGroupOffsetOnPrimary {
-                group_id: 1,
+                group: ExternalGroupRead::Group(1),
                 metadata,
             },
         ] {
@@ -766,6 +774,104 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
             owner.validate_partition_attachment(&consumer_offset_store(namespace), &attachment),
             Err(expected),
             "transferring {transferring}: an attached offset write"
+        );
+    }
+}
+
+#[compio::test]
+async fn given_a_pending_view_write_when_read_on_primary_should_refuse_until_it_lands() {
+    const CREATED_REVISION: u64 = 1;
+    let namespace = IggyNamespace::new(0, 0, 0);
+    let bus = Rc::new(IggyMessageBus::new(0));
+    let mut topic = Topic::default();
+    topic.partitions.push(Partition::new(
+        0,
+        namespace.inner(),
+        IggyTimestamp::default(),
+        CREATED_REVISION,
+        0,
+    ));
+    let mut stream = Stream::default();
+    stream.topics.insert(topic);
+    let mut inner = StreamsInner::default();
+    inner.items.insert(stream);
+    let users = Users::default();
+    users.ensure_root_user("iggy", "password-hash");
+    let metadata = PollTestMetadata::new((users, (inner.into(), ())));
+    let (owner, _inbox) = owner_with_metadata(&bus, partitions_config(), namespace, metadata);
+    owner.shards_table.insert(
+        namespace,
+        PartitionLocation::new(ShardId::new(0), CREATED_REVISION),
+    );
+    owner.plane.partitions().insert(
+        namespace,
+        primary_with_pending_view_write(Rc::clone(&bus), namespace, CREATED_REVISION),
+    );
+    let metadata = owner
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .poll_metadata(namespace, None, BOUND_CLIENT)
+        .expect("metadata names the partition");
+    let consumer = PollingConsumer::Consumer(1, 0);
+    let primary_reads = || {
+        [
+            PartitionRead::UnboundPollOnPrimary {
+                consumer,
+                args: PollingArgs::new(PollingStrategy::first(), 1, false),
+                user_id: DEFAULT_ROOT_USER_ID,
+                user_created_at: ROOT_USER_CREATED_AT_MICROS,
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: Some(consumer),
+                metadata,
+            },
+            PartitionRead::ConsumerOffsetOnPrimary {
+                consumer: None,
+                metadata,
+            },
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group: ExternalGroupRead::Group(1),
+                metadata,
+            },
+            PartitionRead::ResolveSegmentDeleteOffset { count: 1 },
+        ]
+    };
+
+    for landed in [false, true] {
+        if landed {
+            let partition = owner.plane.partitions().get_mut_by_ns(&namespace).unwrap();
+            assert!(partition.persist_superblock_if_needed().await);
+        }
+        for read in primary_reads() {
+            let (reply, replies) = channel(1);
+            owner.on_partition_read(namespace, read, reply).await;
+            let reply = replies.try_recv().expect("the owner answers the read");
+            if landed {
+                assert!(
+                    !matches!(reply, PartitionReadReply::Rejected(_)),
+                    "a persisted view serves the read, got {reply:?}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        reply,
+                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                    ),
+                    "a pending view write refuses the read, got {reply:?}"
+                );
+            }
+        }
+        let (reply, replies) = channel(1);
+        owner
+            .on_partition_read(namespace, PartitionRead::ConsumerOffset { consumer }, reply)
+            .await;
+        let reply = replies.try_recv().expect("the owner answers the read");
+        assert!(
+            !matches!(reply, PartitionReadReply::Rejected(_)),
+            "landed {landed}: a read that needs no primary is served, got {reply:?}"
         );
     }
 }
@@ -1153,7 +1259,7 @@ async fn given_deleted_history_when_metadata_still_lists_the_partition_should_re
                 (
                     "ExternalGroupOffsetOnPrimary",
                     PartitionRead::ExternalGroupOffsetOnPrimary {
-                        group_id: 1,
+                        group: ExternalGroupRead::Group(1),
                         metadata,
                     },
                 ),
@@ -1349,13 +1455,7 @@ async fn given_queued_offset_write_when_parent_or_history_changes_should_fence_a
             }
             Change::SessionReplacement => {
                 assert!(table.end_session(PARENT, USER, registration.op, registration.op + 1));
-                assert!(table.finalize_session(
-                    iggy_binary_protocol::requests::system::SessionIdentity {
-                        client_id: PARENT,
-                        session: registration.op,
-                        metadata_watermark: registration.op + 1,
-                    }
-                ));
+                assert_eq!(table.finalize_sessions_through(registration.op + 1), 1);
                 registration.op += 1;
                 table
                     .commit_register(
@@ -2157,16 +2257,21 @@ fn lagging_replica_in_cluster(namespace: IggyNamespace, replica_count: u8) -> Co
         consensus,
         config.segment_size,
     );
-    arm_lagging_transfer(&mut partition, GROUP_PRIMARY);
+    arm_lagging_transfer(
+        &mut partition,
+        GROUP_PRIMARY,
+        owner.plane.partitions().transfer_slot(),
+    );
     owner.plane.partitions().insert(namespace, partition);
     owner
 }
 
-fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8)
+fn arm_lagging_transfer<B, S>(partition: &mut IggyPartition<B, S>, peer: u8, slot: TransferSlot)
 where
     B: message_bus::MessageBus,
+    S: journal::superblock::SuperblockStore,
 {
-    partition.transfer = Some(PartitionTransferSession {
+    partition.set_transfer(Some(PartitionTransferSession {
         nonce: LAGGING_NONCE,
         peer,
         commit_op: 0,
@@ -2177,7 +2282,8 @@ where
         scan: None,
         seed: None,
         pulled_len: 0,
-    });
+        slot,
+    }));
 }
 
 /// A descriptor from `GROUP_PRIMARY` at `GROUP_VIEW`: an offer at
@@ -2242,18 +2348,26 @@ fn primary_commit(
     view: u32,
     commit: u64,
 ) -> Message<CommitHeader> {
-    Message::<CommitHeader>::new(size_of::<CommitHeader>()).transmute_header(
-        |_, header: &mut CommitHeader| {
-            header.command = Command::Commit;
-            header.cluster = 1;
-            header.replica = replica;
-            header.view = view;
-            header.commit = commit;
-            header.group = namespace.inner();
-            header.size = u32::try_from(size_of::<CommitHeader>()).unwrap();
-            header.seal();
-        },
-    )
+    primary_commit_at(namespace, 0, replica, view, commit)
+}
+
+fn primary_commit_at(
+    namespace: IggyNamespace,
+    incarnation: u64,
+    replica: u8,
+    view: u32,
+    commit: u64,
+) -> Message<CommitHeader> {
+    let entry = CommitEntry::new(
+        namespace.inner(),
+        incarnation,
+        view,
+        commit,
+        0,
+        HeartbeatState::Busy,
+        replica,
+    );
+    encode_commit_batch(1, replica, &[entry]).unwrap()
 }
 
 /// Restart the lagging replica's transfer against `peer` after a re-arm.
@@ -2263,7 +2377,7 @@ fn rearm_lagging_transfer_to(owner: &CompletionTestShard, namespace: IggyNamespa
         .get_mut_by_ns(&namespace)
         .expect("the partition stays registered");
     partition.transfer_rearm = None;
-    arm_lagging_transfer(partition, peer);
+    arm_lagging_transfer(partition, peer, partitions.transfer_slot());
 }
 
 /// The peer the lagging replica's next transfer attempt is scheduled against.
@@ -2295,8 +2409,7 @@ async fn given_the_primary_offer_when_this_replica_ratcheted_its_view_alone_shou
     let session = partitions
         .get_by_ns(&namespace)
         .expect("the partition stays registered")
-        .transfer
-        .as_ref();
+        .transfer();
     assert!(
         session.is_some_and(|session| session.target_accepted),
         "the group primary's offer holds more committed state than this replica \
@@ -2445,7 +2558,7 @@ async fn given_a_hard_refusal_from_a_backup_when_this_replica_ratcheted_its_view
             .get_mut_by_ns(&namespace)
             .expect("the partition stays registered");
         partition.transfer_rearm = None;
-        arm_lagging_transfer(partition, FAILED_BACKUP);
+        arm_lagging_transfer(partition, FAILED_BACKUP, partitions.transfer_slot());
     }
 
     owner
@@ -2642,7 +2755,7 @@ async fn tick_until_repair_peer_changes(
             .partitions()
             .get_by_ns(&namespace)
             .expect("the partition stays registered")
-            .repair
+            .repair()
             .map(|session| session.peer);
         if let Some(peer) = peer
             && Some(peer) != previous
@@ -2760,6 +2873,37 @@ async fn tick_until_metadata_repair_peer_changes(
     panic!("the metadata repair session never moved off {previous:?}");
 }
 
+/// The pump ages state-transfer offers once per tick on every shard, so the
+/// metadata tick must not age them a second time.
+#[compio::test]
+async fn given_a_served_offer_when_the_metadata_tick_runs_should_leave_its_age() {
+    const REQUESTER: u8 = 1;
+    let (owner, _dir) = gap_stopped_metadata_backup(5).await;
+    let key = (IggyNamespace::new(0, 0, 0).inner(), REQUESTER);
+    let offer = partitions::state_transfer::PartitionStateTransferOffer {
+        commit_op: 0,
+        segments: Vec::new(),
+        chain: None,
+        offsets: (
+            consensus::StateArtifact::for_bytes(consensus::artifact_kind::CONSUMER_OFFSETS, 0, &[]),
+            Rc::new(Vec::new()),
+        ),
+    };
+    owner.state_transfer_offers.borrow_mut().insert(
+        key,
+        crate::ServedStateTransfer {
+            nonce: 0,
+            offer: crate::ServedOffer::Partition(Rc::new(offer)),
+            idle_ticks: 0,
+            fully_served: false,
+        },
+    );
+
+    owner.tick_metadata().await;
+
+    assert_eq!(owner.state_transfer_offers.borrow()[&key].idle_ticks, 0);
+}
+
 /// The metadata plane aims its gap-repair arm and stall rotation at the
 /// primary it last heard from, as the partition plane does.
 #[compio::test]
@@ -2833,12 +2977,12 @@ async fn given_a_heartbeat_of_another_incarnation_when_it_names_a_newer_primary_
         )
     };
     assert_ne!(own_view_primary, heard_primary);
-    let stale = primary_commit(namespace, heard_primary, HEARD_VIEW, 5).transmute_header(
-        |heartbeat, header: &mut CommitHeader| {
-            *header = heartbeat;
-            header.partition_incarnation = hosted_incarnation + 1;
-            header.seal();
-        },
+    let stale = primary_commit_at(
+        namespace,
+        hosted_incarnation + 1,
+        heard_primary,
+        HEARD_VIEW,
+        5,
     );
 
     owner.on_commit(&stale).await;
@@ -2868,7 +3012,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
         let partition = partitions
             .get_mut_by_ns(&namespace)
             .expect("the fixture registers the partition");
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce: NONCE,
             view: partition.consensus().view(),
             from_op: partition.consensus().commit_min() + 1,
@@ -2879,7 +3023,7 @@ async fn given_a_floor_holding_the_walk_when_a_chunk_without_messages_lands_shou
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(partition.consensus().commit_min() + 1),
-        });
+        }));
         for op in FLOOR + 1..=FIRST_CHUNK_LAST {
             partition
                 .log
@@ -2964,7 +3108,7 @@ async fn resident_window_backup_with(
         let partition = partitions
             .get_mut_by_ns(&namespace)
             .expect("the fixture registers the partition");
-        partition.repair = Some(RepairSession {
+        partition.set_repair(Some(RepairSession {
             nonce,
             view: partition.consensus().view(),
             from_op: partition.consensus().commit_min() + 1,
@@ -2975,7 +3119,7 @@ async fn resident_window_backup_with(
             idle_ticks: 0,
             floor_pulled_from: 0,
             requested_from: Some(partition.consensus().commit_min() + 1),
-        });
+        }));
         for op in floor + 1..=to_op {
             partition
                 .log
@@ -3006,7 +3150,7 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
         .get_by_ns(&namespace)
         .expect("the partition stays registered");
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "the re-served RepairDone concludes the session"
     );
     assert_ne!(
@@ -3014,10 +3158,7 @@ async fn given_a_resident_window_when_the_last_repair_done_is_lost_should_re_req
         consensus::StateTransferStage::Idle,
         "an unanchored floor over a complete window converts to state transfer"
     );
-    assert_eq!(
-        partition.transfer.as_ref().map(|session| session.peer),
-        Some(PEER)
-    );
+    assert_eq!(partition.transfer().map(|session| session.peer), Some(PEER));
     assert_eq!(partition.consensus().commit_min(), 0);
 }
 
@@ -3049,7 +3190,7 @@ async fn given_a_connecting_resident_window_when_the_last_repair_done_is_lost_sh
         .expect("the partition stays registered");
     assert_eq!(partition.consensus().commit_min(), TO_OP);
     assert!(
-        partition.repair.is_none(),
+        partition.repair().is_none(),
         "the re-served RepairDone concludes the session"
     );
     assert_eq!(

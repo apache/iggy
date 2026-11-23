@@ -146,9 +146,6 @@ pub trait GatedApply:
     /// Propagates the underlying [`StateMachine::update`] error.
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError>;
 
-    /// Partition-set revision used to validate retirement coverage during WAL replay.
-    fn namespace_revision(&self) -> u64;
-
     /// Records the retirement debt a replayed `FinalizeSession` carried.
     fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64);
 
@@ -217,10 +214,6 @@ impl GatedApply for MuxStateMachine<variadic!(Users, Streams)> {
 
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         gated_apply(self, prepare)
-    }
-
-    fn namespace_revision(&self) -> u64 {
-        self.streams().read(|inner| inner.namespace_revision)
     }
 
     fn record_retirement_debt(&self, debts: &[RetirementDebt], metadata_op: u64) {
@@ -414,6 +407,7 @@ pub(crate) fn authorize(
         Operation::DeleteUser => check(users, |perm| perm.delete_user(user_id)),
         Operation::UpdateUserResolved => check(users, |perm| perm.update_user(user_id)),
         Operation::UpdatePermissions => check(users, |perm| perm.update_permissions(user_id)),
+        Operation::RetireGeoOrigin => check(users, |perm| perm.retire_geo_origin(user_id)),
         Operation::ChangePassword => {
             let Ok(request) = ChangePasswordRequest::decode_from(body) else {
                 return None;
@@ -450,6 +444,7 @@ pub(crate) fn authorize(
         | Operation::DeleteConsumerOffset
         | Operation::CompleteLifecycle
         | Operation::RewrapStreamKeys
+        | Operation::ShadowTopic
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
         | Operation::RetireConsumerGroupOwners
@@ -635,10 +630,6 @@ impl GatedApply for MuxStateMachine<()> {
 
     fn gated_update(&self, prepare: Message<PrepareHeader>) -> Result<ApplyReply, IggyError> {
         self.update(prepare)
-    }
-
-    fn namespace_revision(&self) -> u64 {
-        0
     }
 
     fn record_retirement_debt(&self, _debts: &[RetirementDebt], _metadata_op: u64) {}

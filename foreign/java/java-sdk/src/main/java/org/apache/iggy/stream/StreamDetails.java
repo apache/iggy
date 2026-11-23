@@ -73,4 +73,9 @@ public record StreamDetails(
     public List<String> encryptionKekFingerprints() {
         return EncryptionProjection.kekFingerprints(options, derivedOptions);
     }
+
+    /** The geo origin whose topics this shadow stream serves, empty for any other stream. */
+    public Optional<String> shadowOrigin() {
+        return ShadowProjection.origin(options, derivedOptions);
+    }
 }

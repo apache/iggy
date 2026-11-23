@@ -31,7 +31,8 @@
 
 use crate::shards_table::ShardsTable;
 use crate::{
-    COLD_POLL_BUDGET, ConsumerOffsetRead, IggyShard, PartitionRead, PartitionReadReply, Sender,
+    COLD_POLL_BUDGET, ConsumerOffsetRead, ExternalGroupRead, IggyShard, PartitionRead,
+    PartitionReadReply, Sender,
 };
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
@@ -181,7 +182,7 @@ where
             return;
         }
         let partitions = self.plane.partitions();
-        if matches!(read, PartitionRead::SessionRetired { .. }) {
+        if matches!(read, PartitionRead::SessionsRetired { .. }) {
             let failed_revision = partitions.failed_revision(&namespace).or_else(|| {
                 partitions
                     .with_partition(&namespace, |partition| {
@@ -195,7 +196,9 @@ where
                 return;
             }
         }
-        let rejection = self.partition_read_rejection(namespace, &read);
+        let rejection = self
+            .partition_read_rejection(namespace, &read)
+            .or_else(|| self.geo_read_refusal(namespace, &read));
         if let Some(error) = rejection {
             let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
@@ -234,16 +237,19 @@ where
             read => (read, None),
         };
         let result = match read {
-            PartitionRead::SessionRetired {
-                identity,
+            PartitionRead::SessionsRetired {
+                ended,
+                retired_through,
                 created_revision,
             } => partitions
                 .with_partition(&namespace, |partition| {
-                    PartitionReadReply::SessionRetired(
-                        partition.created_revision() == created_revision
-                            && partition.session_retired(identity),
-                    )
+                    (partition.created_revision() == created_revision).then(|| {
+                        PartitionReadReply::SessionsRetired(
+                            partition.sessions_retired(&ended, retired_through),
+                        )
+                    })
                 })
+                .flatten()
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::RetirementDebt {
                 created_revision,
@@ -364,14 +370,20 @@ where
                     current_offset: 0,
                 }
             }
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, .. } => partitions
-                .external_group_offset_read(&namespace, group_id)
-                .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
-                    PartitionReadReply::ConsumerOffset {
-                        stored,
-                        current_offset,
-                    }
-                }),
+            PartitionRead::ExternalGroupOffsetOnPrimary { group, .. } => match group {
+                ExternalGroupRead::Group(group_id) => {
+                    partitions.external_group_offset_read(&namespace, group_id)
+                }
+                ExternalGroupRead::Missing(name) => {
+                    partitions.external_position_read(&namespace, name)
+                }
+            }
+            .map_or(PartitionReadReply::NotFound, |(stored, current_offset)| {
+                PartitionReadReply::ConsumerOffset {
+                    stored,
+                    current_offset,
+                }
+            }),
             PartitionRead::GroupOffsetState { group_id } => partitions
                 .group_offset_state(&namespace, group_id)
                 .map_or(PartitionReadReply::NotFound, |(last_polled, committed)| {
@@ -412,9 +424,13 @@ where
                     if consensus.is_normal_backup() {
                         return Some(IggyError::NotPrimary);
                     }
+                    // The quorum check of a primary waits for its view write, so
+                    // until the write lands nothing bounds how long a primary cut
+                    // off from a newer view serves.
                     if !consensus.is_primary()
                         || !consensus.is_normal()
                         || consensus.is_transferring()
+                        || consensus.needs_superblock_persist()
                     {
                         return Some(IggyError::TransientNotAccepted);
                     }

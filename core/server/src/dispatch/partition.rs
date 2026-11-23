@@ -77,7 +77,7 @@ use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::shards_table::ShardsTable;
 use shard::{
-    ConsumerAttachment, DeferredPollContext, DeferredPollRequest, PartitionRead,
+    ConsumerAttachment, DeferredPollContext, DeferredPollRequest, ExternalGroupRead, PartitionRead,
     PartitionReadReply, PollQuotaIdentity,
 };
 use std::rc::Rc;
@@ -214,7 +214,7 @@ where
     // the op's frame with an empty body and a nonzero `status` the SDK peeks.
     //
     // Authorization uses this node's committed metadata. Admission requires
-    // quorum evidence younger than heartbeat_timeout + 3s, on a backup too,
+    // quorum evidence younger than commit_busy_heartbeat_timeout + 3s, on a backup too,
     // because it ages the evidence from its previous probe. This limits stale
     // grants while keeping partition traffic independent of metadata consensus.
     let scope = IggyNamespace::from_raw(namespace);
@@ -561,7 +561,7 @@ const fn progress_consumer(target: &ConsumerOffsetTarget) -> Option<(u8, usize)>
         ConsumerOffsetTarget::ExternalGroup(group_id) => {
             Some((KIND_EXTERNAL_GROUP, *group_id as usize))
         }
-        ConsumerOffsetTarget::MissingGroup => None,
+        ConsumerOffsetTarget::MissingGroup | ConsumerOffsetTarget::MissingExternalGroup(_) => None,
     }
 }
 
@@ -1379,7 +1379,16 @@ where
             metadata,
         },
         ConsumerOffsetTarget::ExternalGroup(group_id) => {
-            PartitionRead::ExternalGroupOffsetOnPrimary { group_id, metadata }
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group: ExternalGroupRead::Group(group_id),
+                metadata,
+            }
+        }
+        ConsumerOffsetTarget::MissingExternalGroup(name) => {
+            PartitionRead::ExternalGroupOffsetOnPrimary {
+                group: ExternalGroupRead::Missing(name),
+                metadata,
+            }
         }
         ConsumerOffsetTarget::MissingGroup => PartitionRead::ConsumerOffsetOnPrimary {
             consumer: None,
@@ -1397,6 +1406,10 @@ pub enum ConsumerOffsetTarget {
     ExternalGroup(u32),
     /// The named group does not exist, so no offset exists to report.
     MissingGroup,
+    /// The external offsets of a group that does not exist here, by its
+    /// name. On a geo or shadow topic, a position that another datacenter
+    /// published for them can answer the read.
+    MissingExternalGroup(String),
 }
 
 /// Resolve a decoded consumer-offset read into its namespace, partition, and
@@ -1434,7 +1447,7 @@ where
     }
     // A group offset is keyed by the group's monotonic id (any client may read
     // it, member or not), the same key the write path is rewritten to. An
-    // unresolved group (e.g. deleted) has no offset to report.
+    // unresolved group (e.g. deleted) has no offset of its own to report.
     let Some(group_id) = shard
         .plane
         .metadata()
@@ -1442,6 +1455,17 @@ where
         .streams()
         .resolve_consumer_group_id(&wire.stream_id, &wire.topic_id, &wire.consumer.id)
     else {
+        // The gateway creates a Kafka group's Iggy group at its first commit,
+        // so a group that moved from another datacenter reads by name first.
+        if wire.consumer.kind == KIND_EXTERNAL_GROUP
+            && let iggy_binary_protocol::WireIdentifier::String(name) = &wire.consumer.id
+        {
+            return Ok((
+                namespace,
+                partition_id,
+                ConsumerOffsetTarget::MissingExternalGroup(name.as_str().to_owned()),
+            ));
+        }
         return Ok((namespace, partition_id, ConsumerOffsetTarget::MissingGroup));
     };
     #[allow(clippy::cast_possible_truncation)]

@@ -15,23 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::commit_batch;
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
 use crate::shards_table::{
     ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
 };
-use crate::{IggyShard, LifecycleFrame, Receiver, RestorableMetadataStm, ShardFrame};
+use crate::{
+    IggyShard, LifecycleFrame, PARTITION_WALKS_PER_TICK_MAX, Receiver, RestorableMetadataStm,
+    ShardFrame,
+};
 use consensus::{MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use futures::FutureExt;
 use futures::future::poll_fn;
-use iggy_binary_protocol::{Command, ConsensusError, GenericHeader, Operation, PrepareHeader};
+use iggy_binary_protocol::{
+    Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader, ConsensusError,
+    GenericHeader, Operation, PrepareHeader,
+};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::{ConnectionInstaller, MessageBus, ReplicaHandshakeDoneFn, ReplicaLinkId};
 use partitions::{FatalCommit, PartitionIncarnation};
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
 use server_common::{Message, MessageBag};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,7 +152,104 @@ where
             }
         };
         let (operation, namespace) = bag.routing();
-        self.route_typed(operation, namespace, bag);
+        match bag {
+            MessageBag::Commit(message) => self.route_commit_batch(message, operation),
+            MessageBag::CommitReply(message) => self.route_commit_reply_batch(message, operation),
+            bag => self.route_typed(operation, namespace, bag),
+        }
+    }
+
+    /// Send each entry of a Commit batch to the shard that owns its group. A
+    /// body that does not match its checksum drops the whole frame.
+    fn route_commit_batch(&self, message: Message<CommitHeader>, operation: Operation) {
+        let header = *message.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitEntry>(&message, header.checksum_body)
+        else {
+            self.drop_corrupt_batch(header.command);
+            return;
+        };
+        self.metrics.record_commit_batch_received(entries.len());
+        if let Some(target) = self.single_target(&entries, |entry| entry.group) {
+            self.try_send_to_target(target, MessageBag::Commit(message), operation);
+            return;
+        }
+        for (target, entries) in self.entries_by_shard(entries, |entry| entry.group) {
+            if let Some(part) =
+                commit_batch::encode_commit_batch(header.cluster, header.replica, &entries)
+            {
+                self.try_send_to_target(target, MessageBag::Commit(part), operation);
+            }
+        }
+    }
+
+    /// Send each entry of a `CommitReply` batch to the shard that owns its
+    /// group. A body that does not match its checksum drops the whole frame.
+    fn route_commit_reply_batch(&self, message: Message<CommitReplyHeader>, operation: Operation) {
+        let header = *message.header();
+        let Some(entries) =
+            commit_batch::verified_entries::<_, CommitReplyEntry>(&message, header.checksum_body)
+        else {
+            self.drop_corrupt_batch(header.command);
+            return;
+        };
+        self.metrics
+            .record_commit_reply_batch_received(entries.len());
+        if let Some(target) = self.single_target(&entries, |entry| entry.group) {
+            self.try_send_to_target(target, MessageBag::CommitReply(message), operation);
+            return;
+        }
+        for (target, entries) in self.entries_by_shard(entries, |entry| entry.group) {
+            if let Some(part) =
+                commit_batch::encode_commit_reply_batch(header.cluster, header.replica, &entries)
+            {
+                self.try_send_to_target(target, MessageBag::CommitReply(part), operation);
+            }
+        }
+    }
+
+    /// The shard that owns every group of `entries`, or `None` when they span
+    /// shards. Nodes with equal shard counts hash a group to the same shard, so
+    /// a batch between them has one owner.
+    fn single_target<E>(&self, entries: &[E], group: impl Fn(&E) -> u64) -> Option<u16> {
+        let (first, rest) = entries.split_first()?;
+        let target = self.group_shard(group(first));
+        rest.iter()
+            .all(|entry| self.group_shard(group(entry)) == target)
+            .then_some(target)
+    }
+
+    fn entries_by_shard<E>(
+        &self,
+        entries: Vec<E>,
+        group: impl Fn(&E) -> u64,
+    ) -> BTreeMap<u16, Vec<E>> {
+        let mut targets: BTreeMap<u16, Vec<E>> = BTreeMap::new();
+        for entry in entries {
+            targets
+                .entry(self.group_shard(group(&entry)))
+                .or_default()
+                .push(entry);
+        }
+        targets
+    }
+
+    fn group_shard(&self, group: u64) -> u16 {
+        if group == METADATA_GROUP {
+            0
+        } else {
+            calculate_shard_from_consensus_ns(group, self.shard_count)
+        }
+    }
+
+    fn drop_corrupt_batch(&self, command: Command) {
+        self.metrics
+            .record_frame_drop(frame_drop_variant::CONSENSUS, frame_drop_reason::UNPARSABLE);
+        tracing::warn!(
+            shard = self.id,
+            ?command,
+            "dropping a batch frame whose body does not match its checksum"
+        );
     }
 
     /// Invoke the client-request handler directly, exactly as the client-fd
@@ -353,8 +457,8 @@ where
         // Consensus timer driver, folded into the pump: running the tick as a
         // select! arm (not a sibling task) serializes it with frame processing,
         // so `tick_partitions` can no longer hold a partition reference across
-        // an `.await` while `apply_reconcile_ops` reallocates the partitions
-        // vec on this same task. The timer is created once and pinned, then
+        // an `.await` while `apply_reconcile_ops` removes that partition on
+        // this same task. The timer is created once and pinned, then
         // re-armed only after it fires, so a busy inbox cannot drop-and-reset
         // it (which would stall heartbeats / prepare retransmit).
         // Single source for the timer, so the re-arm below cannot drift from the
@@ -395,6 +499,10 @@ where
         };
         let mut armed_deadline = None;
         let mut deferred_deadline = std::pin::pin!(deadline_timer(None));
+        // The uploads of fresh objects run on deadlines of their own, far
+        // shorter than a tick: producers wait for the open window to close.
+        let mut armed_fresh_deadline = None;
+        let mut fresh_deadline = std::pin::pin!(deadline_timer(None));
         loop {
             self.service_deferred_polls().await;
             // Here and not at the end of the turn: an idle owner would hold
@@ -404,6 +512,11 @@ where
             if next_deadline != armed_deadline {
                 armed_deadline = next_deadline;
                 deferred_deadline.set(deadline_timer(next_deadline));
+            }
+            let next_fresh_deadline = self.fresh_uploads_deadline();
+            if next_fresh_deadline != armed_fresh_deadline {
+                armed_fresh_deadline = next_fresh_deadline;
+                fresh_deadline.set(deadline_timer(next_fresh_deadline));
             }
             // `select_biased!`, not `select!`: the unbiased macro draws its
             // arm order from a process-random thread-local PRNG, which the
@@ -425,10 +538,16 @@ where
                     // decoupled from the pump again without reintroducing the
                     // partition-ref-across-`.await` UB this fold closed.
                     self.tick_metadata().await;
+                    self.tick_primary_handoff();
                     if let Some(fault) = self.tick_partitions(&mut namespace_scratch).await {
                         fatal = Some(fault);
                         break;
                     }
+                    self.tick_fresh_writes().await;
+                    self.tick_fresh_sweeps();
+                    self.tick_geo_positions();
+                    self.tick_long_term_rewrites().await;
+                    self.tick_long_term_merges().await;
                     // Runs here, not inside `tick_metadata`: that early-returns
                     // on shards without metadata consensus, and partition-plane
                     // offers live on every shard that hosts a serving group --
@@ -458,6 +577,11 @@ where
                 () = deferred_deadline.as_mut() => {
                     armed_deadline = None;
                     deferred_deadline.set(deadline_timer(None));
+                }
+                () = fresh_deadline.as_mut() => {
+                    armed_fresh_deadline = None;
+                    fresh_deadline.set(deadline_timer(None));
+                    self.drive_fresh_uploads();
                 }
                 frame = poll_fn(|_| {
                     self.pop_redispatched_frame().map_or(Poll::Pending, Poll::Ready)
@@ -562,6 +686,9 @@ where
             // After every event, as partition I/O, so a busy inbox cannot
             // starve the serves that wait for a disk read.
             self.serve_landed_read().await;
+            // After every event too: a commit frees the room that the sends
+            // of a stored fresh object wait for, and it can come in any arm.
+            self.feed_fresh_sends_awaiting_room().await;
         }
 
         self.poll_completions.close();
@@ -583,6 +710,7 @@ where
         // clients time out, which is what a node stopping on a durability
         // fault owes them.
         self.shutting_down.set(true);
+        let stop_began_micros = self.bus.monotonic_micros();
         if fatal.is_none() {
             fatal = self
                 .drain_queued_frames_for_shutdown(&mut loopback_buf)
@@ -603,7 +731,8 @@ where
         // graceful restart recovers consumer offsets ahead of the data. On a
         // fault, healthy partitions still flush. A fenced partition skips the
         // flush, leaving any resident committed data unpersisted at shutdown.
-        self.flush_partitions(&mut loopback_buf).await;
+        self.flush_partitions(&mut loopback_buf, stop_began_micros)
+            .await;
         self.partition_io.close();
 
         // A failed flush fences its partition: the data it could not write is
@@ -616,8 +745,12 @@ where
         fatal
     }
 
+    /// Drives every partition through its graceful stop. The partitions that
+    /// the stop can checkpoint hold before they drain their writers, until the
+    /// checkpoint starts or the stop checkpoint window, counted from
+    /// `stop_began_micros` on the bus clock, ends.
     #[allow(clippy::future_not_send)]
-    async fn flush_partitions(&self, loopback: &mut LoopbackRound)
+    async fn flush_partitions(&self, loopback: &mut LoopbackRound, stop_began_micros: u64)
     where
         B: MessageBus + 'static,
         MJ: JournalHandle,
@@ -628,6 +761,18 @@ where
     {
         self.shutting_down.set(true);
         let partitions = self.plane.partitions();
+        let window = self.stop_checkpoint_window.get();
+        let window_ticks = window.as_micros() / CONSENSUS_TICK_INTERVAL.as_micros().max(1);
+        // The free start slots of every tick until the deadline. Checkpoint
+        // starts share them with other walks, so the stop can reach fewer.
+        let reach = usize::try_from(window_ticks)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(PARTITION_WALKS_PER_TICK_MAX);
+        self.metrics
+            .record_stop_checkpoints_missed(partitions.plan_stop_checkpoints(reach));
+        let hold_deadline_micros =
+            stop_began_micros.saturating_add(u64::try_from(window.as_micros()).unwrap_or(u64::MAX));
+        let mut holding = true;
         let namespaces: Vec<_> = partitions.namespaces().copied().collect();
         for namespace in &namespaces {
             if let Some(partition) = partitions.get_io_owner(namespace) {
@@ -665,6 +810,18 @@ where
                     }
                     self.tick_metadata().await;
                     let _ = self.tick_partitions(&mut namespace_scratch).await;
+                    self.tick_fresh_writes().await;
+                    self.tick_long_term_rewrites().await;
+                    self.tick_long_term_merges().await;
+                    // After the tick: the first tick fires one interval after
+                    // the stop began, so the tick at the deadline must still
+                    // start its share of the reach.
+                    if holding && self.bus.monotonic_micros() >= hold_deadline_micros {
+                        holding = false;
+                        self.metrics.record_stop_checkpoints_missed(
+                            partitions.release_stop_checkpoints(),
+                        );
+                    }
                     tick.set(rearm());
                 }
                 completion = self.partition_io.recv().fuse() => {
@@ -803,12 +960,7 @@ where
     /// the pump-exit edges where a stop signal wins before that tick, or a
     /// queued frame fails while the pump is draining during shutdown.
     fn first_partition_commit_fault(&self) -> Option<FatalCommit> {
-        let partitions = self.plane.partitions();
-        partitions.namespaces().find_map(|namespace| {
-            partitions
-                .get_io_owner(namespace)
-                .and_then(|partition| partition.fatal().cloned())
-        })
+        self.plane.partitions().first_commit_fault()
     }
 
     /// `first_partition_commit_fault` for the simulator's lost-wakeup
@@ -1114,8 +1266,7 @@ where
             LifecycleFrame::PartitionPlacementViews(reports, statuses) => {
                 if self.id == 0 {
                     self.plane.metadata().observe_partition_views(&reports);
-                    self.partition_status_outbox
-                        .record(&statuses, self.bus.monotonic_now());
+                    self.partition_status_outbox.record(&statuses);
                     self.record_partition_statuses(&statuses);
                 } else {
                     self.metrics.record_frame_drop(
@@ -1242,6 +1393,121 @@ where
             LifecycleFrame::ObjectDeleteFinished(finished) => {
                 self.on_object_delete_finished(*finished);
             }
+            LifecycleFrame::PublishManifest {
+                namespace,
+                created_revision,
+                now,
+            } => {
+                self.on_publish_manifest(namespace, created_revision, now);
+            }
+            LifecycleFrame::ManifestPublishFinished(finished) => {
+                self.on_manifest_publish_finished(&finished);
+            }
+            LifecycleFrame::FreshUploadFinished(finished) => {
+                self.on_fresh_upload_finished(*finished).await;
+            }
+            LifecycleFrame::RewriteSegments {
+                namespace,
+                created_revision,
+            } => {
+                self.on_rewrite_segments(namespace, created_revision).await;
+            }
+            LifecycleFrame::SegmentRewriteFinished(finished) => {
+                self.on_segment_rewrite_finished(*finished).await;
+            }
+            LifecycleFrame::SweepFreshObjects { now } => {
+                self.on_sweep_fresh_objects(now);
+            }
+            LifecycleFrame::FreshObjectsListed(finished) => {
+                self.on_fresh_objects_listed(*finished);
+            }
+            LifecycleFrame::ReportFreshObjects { sweep } => {
+                self.on_report_fresh_objects(sweep);
+            }
+            LifecycleFrame::FreshObjectsReported(report) => {
+                self.on_fresh_objects_reported(*report);
+            }
+            LifecycleFrame::FreshObjectsDeleted(finished) => {
+                self.on_fresh_objects_deleted(*finished);
+            }
+            LifecycleFrame::CheckTopicObjects { now } => {
+                self.on_check_topic_objects(now);
+            }
+            LifecycleFrame::TopicObjectCheckFinished(finished) => {
+                self.on_topic_object_check_finished(&finished);
+            }
+            LifecycleFrame::PeerManifestsListed {
+                origin,
+                now,
+                manifests,
+            } => {
+                self.on_peer_manifests_listed(&origin, now, manifests).await;
+            }
+            LifecycleFrame::PeerManifestRead(finished) => {
+                self.on_peer_manifest_read(*finished).await;
+            }
+            LifecycleFrame::RetainRetiredPeer {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_retired_peer(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
+            }
+            LifecycleFrame::ReportGeoPositions { round, scope } => {
+                self.on_report_geo_positions(round, scope).await;
+            }
+            LifecycleFrame::ReportGeoPositionsFolded { round, scope } => {
+                self.on_report_geo_positions_folded(round, scope.as_deref());
+            }
+            LifecycleFrame::GeoPositionsReported(report) => {
+                self.on_geo_positions_reported(*report);
+            }
+            LifecycleFrame::GeoPositionsStored(finished) => {
+                self.on_positions_stored(*finished);
+            }
+            LifecycleFrame::PeerPositionsListed(positions) => {
+                self.on_peer_positions_listed(*positions).await;
+            }
+            LifecycleFrame::NoteGeoPositions { namespace } => {
+                self.on_note_geo_positions(namespace).await;
+            }
+            LifecycleFrame::GeoCommitHeld(commit) => {
+                self.on_geo_commit_held(*commit);
+            }
+            LifecycleFrame::GeoCommitsWaiting { topics } => {
+                self.on_geo_commits_waiting(topics);
+            }
+            LifecycleFrame::GeoPositionsPublished { round, stored } => {
+                self.on_geo_positions_published(round, stored);
+            }
+            LifecycleFrame::SegmentMergeFinished(finished) => {
+                self.on_segment_merge_finished(*finished).await;
+            }
+            LifecycleFrame::RetainLongTerm {
+                namespace,
+                created_revision,
+                now,
+                message_expiry,
+                max_bytes,
+            } => {
+                self.on_retain_long_term(
+                    namespace,
+                    created_revision,
+                    now,
+                    message_expiry,
+                    max_bytes,
+                )
+                .await;
+            }
             LifecycleFrame::TruncatePartition {
                 namespace,
                 up_to_offset,
@@ -1334,17 +1600,40 @@ enum ReplicaHandshakeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::partition_placement_tests::owner;
-    use crate::{build_deny_reply_from_request_header, shard_channel};
-    use iggy_binary_protocol::RoutedRequestHeader;
-    use iggy_binary_protocol::{
-        Command, ConsensusError, GenericHeader, HEADER_SIZE, PrepareHeader,
-        prepare_identity_checksum_bytes,
+    use crate::host::NoopHost;
+    use crate::metrics::ShardMetrics;
+    use crate::partition_placement_tests::{PlacementShard, owner};
+    use crate::shards_table::PapayaShardsTable;
+    use crate::{
+        PartitionConsensusConfig, ReplicaTopology, ShardIdentity, TaggedSender,
+        build_deny_reply_from_request_header, shard_channel, shard_mesh_channels,
     };
-    use iggy_common::IggyError;
+    use consensus::{LocalPipeline, VsrConsensus};
+    use iggy_binary_protocol::{
+        Command, ConsensusError, GenericHeader, HEADER_SIZE, HeartbeatState, PrepareHeader,
+        ReplyHeader, RoutedRequestHeader, prepare_identity_checksum_bytes,
+    };
+    use iggy_common::{IggyByteSize, IggyError, IggyTimestamp, PartitionStats, variadic};
+    use message_bus::IggyMessageBus;
+    use metadata::stm::stream::{
+        Partition as TopicPartition, Stream, Streams, StreamsInner, Topic,
+    };
+    use metadata::stm::user::Users;
+    use metadata::{IggyMetadata, MuxStateMachine};
+    use partitions::{
+        CheckpointDelays, IggyIndexWriter, IggyPartition, IggyPartitions, MessagesWriter,
+        PartitionPathLayout, PartitionPersistence, PartitionsConfig, Segment,
+    };
     use server_common::iobuf::Owned;
-    use server_common::{MESSAGE_ALIGN, Message, MessageBag};
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
+    use server_common::sharding::{PartitionLocation, ShardId};
+    use server_common::{MESSAGE_ALIGN, Message, MessageBag, SegmentStorage};
     use std::mem::offset_of;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
 
     /// An `Operation` discriminant this build does not know, arriving on an
     /// otherwise wire-valid consensus frame (correct command, size, checksum:
@@ -1583,5 +1872,546 @@ mod tests {
             matches!(reply.try_recv(), Ok(None)),
             "a staged denial without its owner must not fill an HTTP slot"
         );
+    }
+
+    #[test]
+    fn given_commit_batches_when_dispatched_should_send_each_owner_shard_one_frame_of_its_entries()
+    {
+        const SHARDS: u16 = 2;
+        const INBOX_CAPACITY: usize = 4;
+        const SENDER: u8 = 1;
+        let (mut shard, _) = owner(0);
+        let (senders, inboxes, _replies) = shard_mesh_channels(SHARDS, INBOX_CAPACITY, 1);
+        shard.attach_senders(senders);
+        let inboxes: Vec<_> = inboxes.into_iter().map(Option::unwrap).collect();
+        let groups_on = |target| {
+            (0..)
+                .map(|id| IggyNamespace::new(1, 1, id).inner())
+                .filter(move |group| {
+                    calculate_shard_from_consensus_ns(*group, u32::from(SHARDS)) == target
+                })
+        };
+        let on_zero = groups_on(0).next().unwrap();
+        let on_one: Vec<u64> = groups_on(1).take(2).collect();
+
+        let commit = |group| CommitEntry::new(group, 1, 2, 3, 4, HeartbeatState::Busy, 0);
+        let one_owner = [commit(METADATA_GROUP), commit(on_zero)];
+        let two_owners = [commit(on_zero), commit(on_one[0]), commit(METADATA_GROUP)];
+        for entries in [&one_owner[..], &two_owners] {
+            let batch = commit_batch::encode_commit_batch(1, SENDER, entries).unwrap();
+            shard.dispatch(batch.into_generic());
+        }
+        assert_eq!(
+            routed(&inboxes[0]),
+            [
+                (SENDER, one_owner.to_vec()),
+                (SENDER, vec![commit(on_zero), commit(METADATA_GROUP)]),
+            ]
+        );
+        assert_eq!(routed(&inboxes[1]), [(SENDER, vec![commit(on_one[0])])]);
+
+        let reply = |group| CommitReplyEntry::new(group, 1, 2, 3, 0);
+        let one_owner = [reply(on_one[0]), reply(on_one[1])];
+        let two_owners = [reply(on_one[1]), reply(METADATA_GROUP), reply(on_one[0])];
+        for entries in [&one_owner[..], &two_owners] {
+            let batch = commit_batch::encode_commit_reply_batch(1, SENDER, entries).unwrap();
+            shard.dispatch(batch.into_generic());
+        }
+        assert_eq!(routed(&inboxes[0]), [(SENDER, vec![reply(METADATA_GROUP)])]);
+        assert_eq!(
+            routed(&inboxes[1]),
+            [
+                (SENDER, one_owner.to_vec()),
+                (SENDER, vec![reply(on_one[1]), reply(on_one[0])]),
+            ]
+        );
+    }
+
+    /// The sender node and the entries of every batch frame in `inbox`.
+    fn routed<E: bytemuck::Pod>(inbox: &Receiver<ShardFrame>) -> Vec<(u8, Vec<E>)> {
+        std::iter::from_fn(|| inbox.try_recv().ok())
+            .map(|frame| {
+                let decoded = match frame {
+                    ShardFrame::Consensus {
+                        message: MessageBag::Commit(message),
+                        ..
+                    } => commit_batch::verified_entries(&message, message.header().checksum_body)
+                        .map(|entries| (message.header().replica, entries)),
+                    ShardFrame::Consensus {
+                        message: MessageBag::CommitReply(message),
+                        ..
+                    } => commit_batch::verified_entries(&message, message.header().checksum_body)
+                        .map(|entries| (message.header().replica, entries)),
+                    _ => None,
+                };
+                decoded.expect("only batch frames with a matching body checksum")
+            })
+            .collect()
+    }
+
+    /// Ops each partition commits before the stop.
+    const COMMITTED_OPS: u64 = 2;
+    /// One tick: the stop can start [`PARTITION_WALKS_PER_TICK_MAX`] checkpoints.
+    const ONE_TICK_STOP_WINDOW: Duration = CONSENSUS_TICK_INTERVAL;
+    /// More partitions than [`ONE_TICK_STOP_WINDOW`] reaches.
+    const STOP_PARTITIONS: usize = PARTITION_WALKS_PER_TICK_MAX + 2;
+    /// Holds every WAL completion and reply of a test without a drop.
+    const SHARD_INBOX_CAPACITY: usize = 1024;
+    /// The partition revision that the metadata and the routes agree on.
+    const ROUTED_REVISION: u64 = 1;
+    const STOP_BOUND: Duration = Duration::from_secs(10);
+    const TASK_POLL_INTERVAL: Duration = Duration::from_millis(1);
+    const STOP_STARTS_SERIES: &str = "partition_wal_checkpoint_starts_total{trigger=\"stop\"}";
+    const STOP_MISSED_SERIES: &str = "partition_stop_checkpoints_missed_total";
+    const IDLE_STARTS_SERIES: &str = "partition_wal_checkpoint_starts_total{trigger=\"idle\"}";
+    const QUEUED_IN_FLIGHT_SERIES: &str = "partition_checkpoints_queued_in_flight";
+    const TICK_VISITS_SERIES: &str = "partition_tick_visits_total";
+    const SEGMENT_SIZE_BYTES: u64 = 1024 * 1024;
+    /// Keeps the committed messages resident until the stop flushes them.
+    const MESSAGES_REQUIRED_TO_SAVE: u32 = 100;
+    /// Longer than the busy ticks after a commit, so a partition sleeps before
+    /// its deadline, and shorter than the consensus timer that wakes it.
+    const TEST_IDLE_DELAY: Duration = Duration::from_millis(150);
+    const TEST_MAX_DELAY: Duration = Duration::from_secs(1);
+    /// The pop runs in the tick after the enqueue at the deadline, and the
+    /// start counts in the tick of the pop.
+    const WAKE_SLACK_TICKS: u64 = 3;
+    /// Ticks in which the test counts the visits to sleeping partitions. Timers
+    /// still wake them a few times, but an awake partition takes a visit in
+    /// every tick.
+    const QUIET_TICKS: u32 = 50;
+
+    /// A single-replica shard whose own frames, such as WAL completions, come
+    /// back to its pump as they do in the server. Its metadata and routes hold
+    /// `partition_count` partitions of stream 0 and topic 0, so the shard
+    /// admits sends to them. Their files go under `root`. Without `delays`,
+    /// the checkpoint rule stays off.
+    fn wired_owner(
+        root: &Path,
+        partition_count: usize,
+        delays: Option<CheckpointDelays>,
+    ) -> (PlacementShard, TaggedSender) {
+        let bus = Rc::new(IggyMessageBus::new(0));
+        let routes = PapayaShardsTable::new();
+        let mut topic = Topic::default();
+        for id in 0..partition_count {
+            let namespace = IggyNamespace::new(0, 0, id);
+            routes.insert(
+                namespace,
+                PartitionLocation::new(ShardId::new(0), ROUTED_REVISION),
+            );
+            topic.partitions.push(TopicPartition::new(
+                id,
+                namespace.inner(),
+                IggyTimestamp::default(),
+                ROUTED_REVISION,
+                0,
+            ));
+        }
+        let mut stream = Stream::default();
+        stream.topics.insert(topic);
+        let mut streams = StreamsInner::default();
+        streams.items.insert(stream);
+        let segment_size = IggyByteSize::from(SEGMENT_SIZE_BYTES);
+        let config = PartitionsConfig {
+            messages_required_to_save: MESSAGES_REQUIRED_TO_SAVE,
+            size_of_messages_required_to_save: segment_size,
+            validate_checksum: true,
+            segment_size,
+            preallocate_segments: false,
+            key_context: Arc::default(),
+            path_layout: PartitionPathLayout {
+                streams_root: root.to_string_lossy().into_owned(),
+            },
+        };
+        let metadata = IggyMetadata::new(
+            None,
+            None,
+            None,
+            None,
+            MuxStateMachine::<variadic!(Users, Streams)>::new((
+                Users::default(),
+                (streams.into(), ()),
+            )),
+            None,
+        );
+        let (sender, inbox, replies) = shard_channel(0, SHARD_INBOX_CAPACITY, SHARD_INBOX_CAPACITY);
+        let shard = PlacementShard::new(
+            ShardIdentity::new(0, "stop-checkpoint-test".to_owned()),
+            bus.clone(),
+            Rc::new(NoopHost),
+            metadata,
+            delays.into_iter().fold(
+                IggyPartitions::new(ShardId::new(0), config),
+                IggyPartitions::with_checkpoint_delays,
+            ),
+            vec![sender.clone()],
+            inbox,
+            replies,
+            1,
+            None,
+            routes,
+            PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus),
+            None,
+            ShardMetrics::for_shard(),
+        )
+        .expect("valid shard wiring");
+        (shard, sender)
+    }
+
+    /// A single-replica partition with an empty WAL, in the directory that
+    /// the partitions config of `shard` names.
+    #[allow(clippy::future_not_send)]
+    async fn insert_wal_partition(shard: &PlacementShard, id: usize) -> IggyNamespace {
+        let namespace = IggyNamespace::new(0, 0, id);
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            namespace.inner(),
+            shard.bus.clone(),
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let partitions = shard.plane.partitions();
+        let mut partition = IggyPartition::with_in_memory_storage(
+            Arc::new(PartitionStats::default()),
+            consensus,
+            partitions.config().segment_size,
+        );
+        let directory = partition_dir(partitions.config(), namespace);
+        std::fs::create_dir_all(&directory).unwrap();
+        partition.set_partition_dir(directory.to_string_lossy().into_owned());
+        Box::pin(attach_segment_files(
+            &mut partition,
+            partitions.config(),
+            namespace,
+        ))
+        .await;
+        Box::pin(partition.open_persistence()).await.unwrap();
+        partitions.insert(namespace, partition);
+        namespace
+    }
+
+    /// Backs the first segment with files, so the stop can flush the
+    /// committed messages.
+    #[allow(clippy::future_not_send)]
+    async fn attach_segment_files(
+        partition: &mut IggyPartition<Rc<IggyMessageBus>>,
+        config: &PartitionsConfig,
+        namespace: IggyNamespace,
+    ) {
+        let (stream, topic, id) = (
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        );
+        let log_path = config.get_messages_path(stream, topic, id, 0);
+        let index_path = config.get_index_path(stream, topic, id, 0);
+        let messages =
+            MessagesWriter::new(&log_path, Rc::new(AtomicU64::new(0)), false, false, None)
+                .await
+                .unwrap();
+        let indexes = IggyIndexWriter::new(&index_path, Rc::new(AtomicU64::new(0)), false, false)
+            .await
+            .unwrap();
+        let storage = SegmentStorage::new(&log_path, &index_path, 0, 0, true)
+            .await
+            .unwrap();
+        let segment_size = partition.log.active_segment().max_size;
+        partition.log.retire_back();
+        partition.log.add_persisted_segment(
+            Segment::new(0, segment_size),
+            storage,
+            Some(Rc::new(messages)),
+            Some(Rc::new(indexes)),
+        );
+    }
+
+    fn partition_dir(config: &PartitionsConfig, namespace: IggyNamespace) -> PathBuf {
+        PathBuf::from(config.get_partition_path(
+            namespace.stream_id(),
+            namespace.topic_id(),
+            namespace.partition_id(),
+        ))
+    }
+
+    /// Commits [`COMMITTED_OPS`] sends on `namespace` through the running
+    /// pump, from a tick of its own, so each partition has its own first op
+    /// tick.
+    #[allow(clippy::future_not_send)]
+    async fn commit_sends(shard: &PlacementShard, sender: &TaggedSender, namespace: IggyNamespace) {
+        let clock = shard.plane.partitions().tick_clock();
+        let tick = clock.now();
+        while clock.now() == tick {
+            compio::time::sleep(TASK_POLL_INTERVAL).await;
+        }
+        let pending: Vec<_> = (1..=COMMITTED_OPS)
+            .map(|client| {
+                let (reply, receiver) = crate::channel(1);
+                sender
+                    .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionSubmit {
+                        request: send_request(namespace, client),
+                        reply,
+                        attachment: None,
+                    }))
+                    .expect("the request fits the inbox");
+                receiver
+            })
+            .collect();
+        for receiver in pending {
+            let reply: Message<ReplyHeader> = receiver
+                .recv()
+                .await
+                .unwrap()
+                .expect("a committed send")
+                .try_into_typed()
+                .unwrap();
+            assert_eq!(reply.header().status, 0);
+        }
+    }
+
+    /// One message from its own client, because a client has one request in
+    /// flight per partition.
+    fn send_request(namespace: IggyNamespace, client: u64) -> Message<RoutedRequestHeader> {
+        let mut messages = IggyMessages::with_capacity(1);
+        messages.push(IggyMessage {
+            header: IggyMessageHeader {
+                id: u128::from(client),
+                payload_length: 1,
+                ..Default::default()
+            },
+            payload: vec![1].into(),
+            user_headers: None,
+        });
+        SendMessagesOwned::from_messages(namespace, &messages)
+            .unwrap()
+            .encode_request(RoutedRequestHeader {
+                command: Command::Request,
+                operation: Operation::SendMessages,
+                client: u128::from(client),
+                session: 1,
+                request: 1,
+                group: namespace.inner(),
+                ..Default::default()
+            })
+            .unwrap()
+    }
+
+    /// Runs the pump and stops it once `exercise` ends. Panics when the stop
+    /// does not finish within [`STOP_BOUND`].
+    #[allow(clippy::future_not_send)]
+    async fn run_until_stopped(
+        shard: &PlacementShard,
+        exercise: impl std::future::Future<Output = ()>,
+    ) {
+        let (stop, stopped) = crate::channel(1);
+        let pump = shard.run_message_pump(stopped, Arc::new(AtomicBool::new(false)));
+        let exercise = async {
+            exercise.await;
+            stop.try_send(()).unwrap();
+        };
+        let complete = async { futures::join!(pump, exercise) }.fuse();
+        let bound = compio::time::sleep(STOP_BOUND).fuse();
+        futures::pin_mut!(complete, bound);
+        futures::select_biased! {
+            (fault, ()) = complete => assert!(fault.is_none(), "the stop fenced a partition: {fault:?}"),
+            () = bound => panic!("the stop did not finish within {STOP_BOUND:?}"),
+        }
+    }
+
+    fn series_value(scrape: &str, series: &str) -> u64 {
+        scrape
+            .lines()
+            .find_map(|line| line.strip_prefix(series)?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no {series} in the scrape:\n{scrape}"))
+    }
+
+    /// The checkpoint op and the ops of the WAL of `namespace` in its
+    /// partition directory `directory`, read back as a boot reads them.
+    #[allow(clippy::future_not_send)]
+    async fn reopened_wal(
+        directory: &Path,
+        namespace: IggyNamespace,
+        revision: u64,
+    ) -> (u64, Vec<u64>) {
+        let directory = directory.join(format!("prepares-{revision}"));
+        let (persistence, prepares) =
+            PartitionPersistence::open(&directory, namespace.inner(), revision)
+                .await
+                .unwrap();
+        (
+            persistence.checkpoint_op(),
+            prepares.iter().map(|prepare| prepare.header().op).collect(),
+        )
+    }
+
+    /// What a stop left behind.
+    struct StopOutcome {
+        stop_starts: u64,
+        missed: u64,
+        /// In first op order: the namespace, its commit point and its WAL as
+        /// a boot reads it, see [`reopened_wal`].
+        partitions: Vec<(IggyNamespace, u64, (u64, Vec<u64>))>,
+    }
+
+    /// Commits [`COMMITTED_OPS`] sends on each of `partition_count` WAL
+    /// partitions, against namespace order, then stops the pump with the stop
+    /// window `window`. Every partition must complete its stop.
+    #[allow(clippy::future_not_send)]
+    async fn stop_after_commits(partition_count: usize, window: Duration) -> StopOutcome {
+        let root = tempfile::tempdir().unwrap();
+        let (shard, sender) = wired_owner(root.path(), partition_count, None);
+        let mut namespaces = Vec::with_capacity(partition_count);
+        for id in (0..partition_count).rev() {
+            namespaces.push(Box::pin(insert_wal_partition(&shard, id)).await);
+        }
+        shard.set_stop_checkpoint_window(window);
+
+        Box::pin(run_until_stopped(&shard, async {
+            for namespace in &namespaces {
+                commit_sends(&shard, &sender, *namespace).await;
+            }
+        }))
+        .await;
+
+        let scrape = shard.metrics.scrape();
+        let partitions = shard.plane.partitions();
+        let stopped: Vec<_> = namespaces
+            .iter()
+            .map(|namespace| {
+                let partition = partitions.get_by_ns(namespace).unwrap();
+                assert!(partition.shutdown_io_complete());
+                (
+                    *namespace,
+                    partition_dir(partitions.config(), *namespace),
+                    partition.created_revision(),
+                    partition.consensus().commit_min(),
+                )
+            })
+            .collect();
+        drop(shard);
+        let mut outcome = StopOutcome {
+            stop_starts: series_value(&scrape, STOP_STARTS_SERIES),
+            missed: series_value(&scrape, STOP_MISSED_SERIES),
+            partitions: Vec::with_capacity(partition_count),
+        };
+        for (namespace, directory, revision, commit_min) in stopped {
+            let wal = Box::pin(reopened_wal(&directory, namespace, revision)).await;
+            outcome.partitions.push((namespace, commit_min, wal));
+        }
+        outcome
+    }
+
+    /// The stop serves the partitions with the oldest first op up to its
+    /// reach, counts the rest as missed, and every partition still completes.
+    /// A boot then loads no op of a served partition again.
+    #[compio::test]
+    async fn given_more_partitions_than_the_stop_reach_when_stopping_should_checkpoint_the_oldest_and_count_the_rest()
+     {
+        let outcome = Box::pin(stop_after_commits(STOP_PARTITIONS, ONE_TICK_STOP_WINDOW)).await;
+
+        let served = u64::try_from(PARTITION_WALKS_PER_TICK_MAX).unwrap();
+        let unserved = u64::try_from(STOP_PARTITIONS).unwrap() - served;
+        assert_eq!(
+            (outcome.stop_starts, outcome.missed),
+            (served, unserved),
+            "(stop checkpoint starts, missed partitions)"
+        );
+        for (index, (namespace, commit_min, wal)) in outcome.partitions.iter().enumerate() {
+            assert_eq!(*commit_min, COMMITTED_OPS);
+            let expected = if index < PARTITION_WALKS_PER_TICK_MAX {
+                (*commit_min, vec![*commit_min])
+            } else {
+                (0, (1..=*commit_min).collect())
+            };
+            assert_eq!(*wal, expected, "partition {}", namespace.partition_id());
+        }
+    }
+
+    /// Idle partitions come due one idle delay after their last op, although
+    /// they sleep: the deadline wakes them. Each gets one checkpoint through
+    /// the queue, and after it no partition stays awake.
+    #[compio::test]
+    async fn given_idle_partitions_when_the_idle_delay_passes_should_checkpoint_each_once_and_sleep()
+     {
+        const PARTITIONS: usize = 4;
+        let root = tempfile::tempdir().unwrap();
+        let delays = CheckpointDelays::new(TEST_IDLE_DELAY, TEST_MAX_DELAY);
+        let (shard, sender) = wired_owner(root.path(), PARTITIONS, Some(delays));
+        let mut namespaces = Vec::with_capacity(PARTITIONS);
+        for id in 0..PARTITIONS {
+            namespaces.push(Box::pin(insert_wal_partition(&shard, id)).await);
+        }
+        let due = u64::try_from(PARTITIONS).unwrap();
+        let idle_ticks =
+            u64::try_from(TEST_IDLE_DELAY.as_micros() / CONSENSUS_TICK_INTERVAL.as_micros())
+                .unwrap();
+        let clock = shard.plane.partitions().tick_clock();
+        let mut ticks_to_due = None;
+        let mut quiet_visits = None;
+        Box::pin(run_until_stopped(&shard, async {
+            for namespace in &namespaces {
+                commit_sends(&shard, &sender, *namespace).await;
+            }
+            let committed_at = clock.now();
+            while series_value(&shard.metrics.scrape(), IDLE_STARTS_SERIES) < due {
+                compio::time::sleep(TASK_POLL_INTERVAL).await;
+            }
+            ticks_to_due = Some(clock.now() - committed_at);
+            while series_value(&shard.metrics.scrape(), QUEUED_IN_FLIGHT_SERIES) > 0 {
+                compio::time::sleep(TASK_POLL_INTERVAL).await;
+            }
+            let partitions = shard.plane.partitions();
+            for namespace in &namespaces {
+                let partition = partitions.get_by_ns(namespace).unwrap();
+                assert_eq!(
+                    partition.checkpoint_deadline(delays),
+                    None,
+                    "a deadline that stays armed wakes partition {} again",
+                    namespace.partition_id()
+                );
+            }
+            let before = series_value(&shard.metrics.scrape(), TICK_VISITS_SERIES);
+            compio::time::sleep(CONSENSUS_TICK_INTERVAL * QUIET_TICKS).await;
+            quiet_visits = Some(series_value(&shard.metrics.scrape(), TICK_VISITS_SERIES) - before);
+        }))
+        .await;
+
+        let ticks_to_due = ticks_to_due.unwrap();
+        assert!(
+            ticks_to_due <= idle_ticks + WAKE_SLACK_TICKS,
+            "the last idle checkpoint started {ticks_to_due} ticks after the commits"
+        );
+        let quiet_visits = quiet_visits.unwrap();
+        assert!(
+            quiet_visits < u64::from(QUIET_TICKS),
+            "{quiet_visits} visits in {QUIET_TICKS} ticks: a partition stayed awake"
+        );
+        let scrape = shard.metrics.scrape();
+        assert_eq!(series_value(&scrape, IDLE_STARTS_SERIES), due);
+        assert_eq!(series_value(&scrape, STOP_STARTS_SERIES), 0);
+        let partitions = shard.plane.partitions();
+        let stopped: Vec<_> = namespaces
+            .iter()
+            .map(|namespace| {
+                let partition = partitions.get_by_ns(namespace).unwrap();
+                (
+                    *namespace,
+                    partition_dir(partitions.config(), *namespace),
+                    partition.created_revision(),
+                )
+            })
+            .collect();
+        drop(shard);
+        for (namespace, directory, revision) in stopped {
+            let wal = Box::pin(reopened_wal(&directory, namespace, revision)).await;
+            assert_eq!(
+                wal,
+                (COMMITTED_OPS, vec![COMMITTED_OPS]),
+                "partition {}",
+                namespace.partition_id()
+            );
+        }
     }
 }

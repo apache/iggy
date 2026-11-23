@@ -44,6 +44,7 @@ __all__ = [
     "ConsumerGroupsPage",
     "ConsumerOffsetInfo",
     "DirectProducerConfig",
+    "GeoMode",
     "GlobalPermissions",
     "HeaderKey",
     "HeaderValue",
@@ -132,6 +133,7 @@ __all__ = [
     "TopicDetails",
     "TopicOptions",
     "TopicPermissions",
+    "TopicType",
     "TopicsPage",
     "UserHeaders",
     "UserInfo",
@@ -670,6 +672,21 @@ class DirectProducerConfig:
         Constructs direct-producer batching and pacing configuration.
         """
     def __repr__(self) -> builtins.str: ...
+
+@typing.final
+class GeoMode:
+    r"""
+    How a geo topic writes its messages, fixed at creation.
+    """
+
+    Geo: typing.ClassVar[GeoMode]
+    r"""
+    A batch goes to the object store before it commits.
+    """
+    GeoTiered: typing.ClassVar[GeoMode]
+    r"""
+    A batch is replicated first, and sealed segments are uploaded later.
+    """
 
 @typing.final
 class GlobalPermissions:
@@ -1296,6 +1313,30 @@ class IggyClient:
                 combined with another snapshot type, the 30-second binary
                 operation deadline expires, or the request fails.
         """
+    def retire_geo_origin(
+        self, origin: builtins.str
+    ) -> collections.abc.Awaitable[None]:
+        r"""
+        Retire the geo origin of a datacenter that never returns.
+
+        The cluster then follows nothing more of the origin: its shadow topics
+        serve what they hold until their retention removes it, and a client
+        may delete them. Retiring an origin that is retired already changes
+        nothing. A datacenter that comes back needs another origin name.
+
+        Requires root or the global `manage_servers` permission.
+
+        Args:
+            origin: The origin name of the lost datacenter, such as `"dc-a"`.
+
+        Returns:
+            An awaitable that resolves to `None` once the cluster committed
+            the retirement.
+
+        Raises:
+            IggyError: If the user lacks the permission, the server refuses
+                the origin, or the request fails.
+        """
     def describe_options(
         self, scope: builtins.str
     ) -> collections.abc.Awaitable[list[OptionSpec]]:
@@ -1865,6 +1906,12 @@ class IggyClient:
         tiered_storage: builtins.bool | None = None,
         local_retention_age: IggyExpiry | None = None,
         local_retention_size: MaxTopicSize | None = None,
+        fresh_upload_interval: datetime.timedelta | None = None,
+        consumer_offset_upload_interval: datetime.timedelta | None = None,
+        positions_publish_interval: datetime.timedelta | None = None,
+        tombstone_grace: datetime.timedelta | None = None,
+        positions_resume_timeout: datetime.timedelta | None = None,
+        long_term_rewrite_max_interval: datetime.timedelta | None = None,
     ) -> collections.abc.Awaitable[None]:
         r"""
         Update an existing topic.
@@ -1906,13 +1953,26 @@ class IggyClient:
                 unchanged when `None`. `MaxTopicSize.ServerDefault()` changes
                 nothing either, reset `OptionKey.LocalRetentionSize` to return
                 to the default.
+            fresh_upload_interval: A duration of a geo topic as
+                `datetime.timedelta | None`, unchanged when `None`. This and
+                the five durations below have the meaning and bounds
+                `TopicOptions` gives them, zero is a value, and none of them
+                can be reset. They are the only options an update changes on a
+                geo topic, and the server refuses them on a normal topic.
+            consumer_offset_upload_interval: As `fresh_upload_interval`.
+            positions_publish_interval: As `fresh_upload_interval`.
+            tombstone_grace: As `fresh_upload_interval`.
+            positions_resume_timeout: As `fresh_upload_interval`.
+            long_term_rewrite_max_interval: As `fresh_upload_interval`.
 
         Returns:
             An awaitable that resolves to `None` when the topic is updated.
 
         Raises:
             ValueError: If `message_expiry`, `max_topic_size`,
-                `local_retention_age` or `local_retention_size` is out of range.
+                `local_retention_age` or `local_retention_size` is out of range,
+                or a duration is negative or longer than `2**64 - 1`
+                microseconds.
             OptionError: A `RuntimeError` carrying the error `code` and
                 `kind` when the client or the server refuses an option.
             RuntimeError: Before anything is sent, if the update changes
@@ -3991,6 +4051,48 @@ class OptionKey:
     Cap on the uploaded segments a tiered topic keeps on local disk,
     resettable to unlimited.
     """
+    TopicType: typing.ClassVar[OptionKey]
+    r"""
+    Topic type, normal or geo, fixed at creation.
+    """
+    GeoMode: typing.ClassVar[OptionKey]
+    r"""
+    How a geo topic writes its messages, fixed at creation.
+    """
+    FreshUploadInterval: typing.ClassVar[OptionKey]
+    r"""
+    Longest time a send to a geo topic waits for its upload to start.
+    An update can set it, not reset it.
+    """
+    ConsumerOffsetUploadInterval: typing.ClassVar[OptionKey]
+    r"""
+    Shortest time between two uploads of the positions a geo topic's
+    stored offsets wait for. An update can set it, not reset it.
+    """
+    PositionsPublishInterval: typing.ClassVar[OptionKey]
+    r"""
+    How often a node uploads a geo topic's changed positions. An update
+    can set it, not reset it.
+    """
+    TombstoneGrace: typing.ClassVar[OptionKey]
+    r"""
+    How long a deleted geo topic's tombstone and objects stay. An update
+    can set it, not reset it.
+    """
+    PositionsResumeTimeout: typing.ClassVar[OptionKey]
+    r"""
+    How long a geo topic's group polls wait for the peers' positions after
+    a node starts. An update can set it, not reset it.
+    """
+    LongTermRewriteMaxInterval: typing.ClassVar[OptionKey]
+    r"""
+    Longest wait between two long-term rewrites of a geo topic's
+    partition. An update can set it, not reset it.
+    """
+    ShadowOrigin: typing.ClassVar[OptionKey]
+    r"""
+    The geo origin a shadow stream serves, computed by the server.
+    """
     def __str__(self) -> builtins.str: ...
 
 @typing.final
@@ -5218,6 +5320,12 @@ class Stream:
         Fingerprints of the server keys that wrap the stream's key: one outside
         a key rotation, empty for a plaintext stream.
         """
+    @property
+    def shadow_origin(self) -> builtins.str | None:
+        r"""
+        The geo origin whose topics this shadow stream serves, such as
+        `"dc-a"`. `None` for any stream that is not a shadow stream.
+        """
 
 @typing.final
 class StreamDetails:
@@ -5280,6 +5388,12 @@ class StreamDetails:
         r"""
         Fingerprints of the server keys that wrap the stream's key: one outside
         a key rotation, empty for a plaintext stream.
+        """
+    @property
+    def shadow_origin(self) -> builtins.str | None:
+        r"""
+        The geo origin whose topics this shadow stream serves, such as
+        `"dc-a"`. `None` for any stream that is not a shadow stream.
         """
 
 @typing.final
@@ -5644,6 +5758,56 @@ class Topic:
         not set one.
         """
     @property
+    def topic_type(self) -> TopicType:
+        r"""
+        What the topic is, normal or geo, fixed at creation.
+        """
+    @property
+    def geo_mode(self) -> GeoMode | None:
+        r"""
+        How a geo topic writes its messages, fixed at creation. `None` on a
+        normal topic.
+        """
+    @property
+    def fresh_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest time a send to the geo topic waits for its upload to start, or
+        `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def consumer_offset_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Shortest time between two uploads of the positions the geo topic's
+        stored offsets wait for, or `None` when the topic leaves it to each
+        node's server setting.
+        """
+    @property
+    def positions_publish_interval(self) -> datetime.timedelta | None:
+        r"""
+        How often a node uploads the geo topic's changed positions, or `None`
+        when the topic leaves it to each node's server setting.
+        """
+    @property
+    def tombstone_grace(self) -> datetime.timedelta | None:
+        r"""
+        How long the tombstone and the objects of the deleted geo topic stay,
+        or `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def positions_resume_timeout(self) -> datetime.timedelta | None:
+        r"""
+        How long the geo topic's group polls wait for the peers' positions
+        after a node starts, or `None` when the topic leaves it to each node's
+        server setting.
+        """
+    @property
+    def long_term_rewrite_max_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest wait between two long-term rewrites of a partition of the geo
+        topic, or `None` when the topic leaves it to each node's server
+        setting.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -5711,6 +5875,56 @@ class TopicDetails:
         not set one.
         """
     @property
+    def topic_type(self) -> TopicType:
+        r"""
+        What the topic is, normal or geo, fixed at creation.
+        """
+    @property
+    def geo_mode(self) -> GeoMode | None:
+        r"""
+        How a geo topic writes its messages, fixed at creation. `None` on a
+        normal topic.
+        """
+    @property
+    def fresh_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest time a send to the geo topic waits for its upload to start, or
+        `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def consumer_offset_upload_interval(self) -> datetime.timedelta | None:
+        r"""
+        Shortest time between two uploads of the positions the geo topic's
+        stored offsets wait for, or `None` when the topic leaves it to each
+        node's server setting.
+        """
+    @property
+    def positions_publish_interval(self) -> datetime.timedelta | None:
+        r"""
+        How often a node uploads the geo topic's changed positions, or `None`
+        when the topic leaves it to each node's server setting.
+        """
+    @property
+    def tombstone_grace(self) -> datetime.timedelta | None:
+        r"""
+        How long the tombstone and the objects of the deleted geo topic stay,
+        or `None` when the topic leaves it to each node's server setting.
+        """
+    @property
+    def positions_resume_timeout(self) -> datetime.timedelta | None:
+        r"""
+        How long the geo topic's group polls wait for the peers' positions
+        after a node starts, or `None` when the topic leaves it to each node's
+        server setting.
+        """
+    @property
+    def long_term_rewrite_max_interval(self) -> datetime.timedelta | None:
+        r"""
+        Longest wait between two long-term rewrites of a partition of the geo
+        topic, or `None` when the topic leaves it to each node's server
+        setting.
+        """
+    @property
     def options(self) -> UserHeaders:
         r"""
         Options the creating client set explicitly.
@@ -5760,6 +5974,14 @@ class TopicOptions:
         tiered_storage: builtins.bool | None = None,
         local_retention_age: IggyExpiry | None = None,
         local_retention_size: MaxTopicSize | None = None,
+        topic_type: TopicType | None = None,
+        geo_mode: GeoMode | None = None,
+        fresh_upload_interval: datetime.timedelta | None = None,
+        consumer_offset_upload_interval: datetime.timedelta | None = None,
+        positions_publish_interval: datetime.timedelta | None = None,
+        tombstone_grace: datetime.timedelta | None = None,
+        positions_resume_timeout: datetime.timedelta | None = None,
+        long_term_rewrite_max_interval: datetime.timedelta | None = None,
         raw: builtins.dict[builtins.str, builtins.str] | None = None,
     ) -> TopicOptions:
         r"""
@@ -5767,8 +5989,17 @@ class TopicOptions:
 
         Every setting left as `None` resolves against the server default at
         admission. Only `message_expiry`, `max_topic_size`, `tiered_storage`,
-        `local_retention_age`, `local_retention_size` and the name can change
-        after creation, through `update_topic`.
+        `local_retention_age`, `local_retention_size`, the six durations of a
+        geo topic and the name can change after creation, through
+        `update_topic`.
+
+        The six durations, `fresh_upload_interval` to
+        `long_term_rewrite_max_interval`, are `datetime.timedelta | None` and
+        go only on a geo topic, where each overrides the server setting of the
+        same name on every node. `None` leaves a duration unset, so each node
+        applies its own setting, and zero is a value. The server refuses them
+        on a normal topic, and a value out of range, with an `OptionError` of
+        kind `invalid_option_value`.
 
         Args:
             partitions_count: Number of partitions as `int`, at most 1000.
@@ -5815,6 +6046,33 @@ class TopicOptions:
                 unlimited when `None`. `MaxTopicSize.ServerDefault()` is the
                 same as `None`. The server refuses a size above a finite
                 `max_topic_size`.
+            topic_type: `TopicType.Geo` also makes the topic's messages
+                readable in the other datacenters, through the object store.
+                `None` creates a normal topic. A geo topic needs an object
+                store on every node of the cluster: while one is not ready,
+                the server refuses `TopicType.Geo` with `FeatureUnavailable`.
+                A geo topic refuses tiered storage and an encrypted stream,
+                and keeps its name, options and partition count.
+            geo_mode: How a geo topic writes its messages, as `GeoMode | None`.
+                `None` resolves to `GeoMode.Geo` on a geo topic. The server
+                refuses `GeoMode.GeoTiered` with `FeatureUnavailable` for now,
+                and any mode on a normal topic.
+            fresh_upload_interval: Longest time a send waits for the upload of
+                its fresh object to start, at most 10 seconds. One object
+                carries the sends of every partition a shard leads.
+            consumer_offset_upload_interval: Shortest time between two uploads
+                of the positions that the offsets consumer groups store
+                themselves wait for, at most 1 second. Zero answers such a
+                store at its local commit.
+            positions_publish_interval: How often a node uploads the changed
+                positions of the topic's consumer groups, above zero.
+            tombstone_grace: How long the tombstone and the objects of the
+                deleted topic stay in the object store, above zero.
+            positions_resume_timeout: How long, after a node starts, the group
+                polls of the topic's partitions wait for the positions of the
+                geo peers. Zero does not wait.
+            long_term_rewrite_max_interval: Longest wait between two long-term
+                rewrites of a partition, at least 1 second.
             raw: Additional option keys as `dict[str, str]`, sent as string
                 values so a key newer than this build can be set. A typed field
                 wins on collision.
@@ -5822,7 +6080,8 @@ class TopicOptions:
         Raises:
             ValueError: If `message_expiry`, `max_topic_size`,
                 `segment_max_age`, `local_retention_age` or
-                `local_retention_size` is out of range.
+                `local_retention_size` is out of range, or a duration is
+                negative or longer than `2**64 - 1` microseconds.
             RuntimeError: If `compression_algorithm` names no known algorithm.
             TypeError: If a durability is not a `Durability`.
         """
@@ -5882,6 +6141,22 @@ class TopicPermissions:
                 its consumer offsets.
             send_messages: Allow sending messages to the topic.
         """
+
+@typing.final
+class TopicType:
+    r"""
+    What a topic is, fixed at creation.
+    """
+
+    Normal: typing.ClassVar[TopicType]
+    r"""
+    Its messages stay in this cluster.
+    """
+    Geo: typing.ClassVar[TopicType]
+    r"""
+    Its messages also become readable in the other datacenters, through
+    the object store.
+    """
 
 @typing.final
 class TopicsPage:

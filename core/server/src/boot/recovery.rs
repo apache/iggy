@@ -43,7 +43,7 @@ use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
-use partitions::{IggyPartitions, PartitionsConfig, StreamKeyIdentity};
+use partitions::{IggyPartitions, PartitionsConfig, RepairRingBudget, StreamKeyIdentity};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
@@ -67,6 +67,8 @@ struct OwnedPartition {
     stats: Arc<PartitionStats>,
     metadata: Partition,
     runtime: TopicRuntimeOptions,
+    /// The peer's log that a partition of a shadow topic follows.
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
     identity: StreamKeyIdentity,
     encryption: StreamEncryption,
 }
@@ -173,7 +175,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         refuse_partitionless_stream_keys(metadata.mux_stm.streams(), &key_context, solo)?;
     }
     refuse_unreadable_topics(metadata.mux_stm.streams())?;
-    let partitions = IggyPartitions::with_repair_memory(
+    let partitions = IggyPartitions::with_capacity(
         shard_local_id,
         PartitionsConfig {
             messages_required_to_save: iggy_common::DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
@@ -189,8 +191,22 @@ pub(in crate::boot) async fn build_shard_for_thread(
             },
         },
         owned_partitions_capacity,
-        repair_memory,
-    );
+    )
+    .with_repair_memory(repair_memory)
+    .with_repair_rings(Rc::new(RepairRingBudget::new(
+        // A share past the address space bounds nothing, as `usize::MAX` does.
+        usize::try_from(
+            config
+                .partition
+                .journal_memory_shard_bytes_max(total_shards),
+        )
+        .unwrap_or(usize::MAX),
+    )))
+    .with_checkpoint_delays(partitions::CheckpointDelays::new(
+        config.partition.checkpoint_idle_delay.get_duration(),
+        config.partition.checkpoint_max_delay.get_duration(),
+    ))
+    .with_wal_reload_budget(config.partition.wal_reload_shard_bytes_max(total_shards));
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by
@@ -233,6 +249,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                             stats,
                             metadata: partition.clone(),
                             runtime: TopicRuntimeOptions::from_resource_options(&topic.options),
+                            peer_log: crate::shadow_topics::peer_log_of(stream, topic, namespace),
                             identity,
                             encryption: encryption
                                 .get_or_insert_with(|| StreamEncryption::from(&stream.options))
@@ -265,6 +282,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         stats: partition_stats,
         metadata: partition_metadata,
         runtime: topic_runtime,
+        peer_log,
         identity,
         encryption,
     } in owned
@@ -320,6 +338,21 @@ pub(in crate::boot) async fn build_shard_for_thread(
         };
         let mut partition = partition;
         partition.set_encryptor(encryptor);
+        // A shadow partition holds none of its peer's messages on disk, so
+        // it follows the peer's log again after every start.
+        if let Some((origin, prefix)) = peer_log
+            && let Err(error) = partition.follow_peer_log(origin, prefix)
+        {
+            error!(
+                stream_id,
+                topic_id,
+                partition_id = partition_metadata.id,
+                %error,
+                "skipping this partition at boot; a partition of a shadow topic cannot follow its peer's log"
+            );
+            unbuilt.push(namespace);
+            continue;
+        }
         partitions.insert(namespace, partition);
         shards_table.insert(
             namespace,
@@ -386,6 +419,9 @@ pub(in crate::boot) async fn build_shard_for_thread(
             .superblock_wedged_fatal_timeout
             .get_duration(),
     );
+    // The other half of the drain budget is for the started checkpoints and
+    // the drain of the writers.
+    shard.set_stop_checkpoint_window(config.sharding.shutdown_drain_timeout.get_duration() / 2);
     shard.set_served_segment_cache_bytes_max(
         config
             .partition
@@ -697,7 +733,7 @@ const RECOVERY_BARRIER_MULTIPLIER: u32 = 3;
 
 /// How long the post-restart read path waits for the recovered WAL suffix to
 /// re-commit before failing loud (retryable 503): the largest of the fixed
-/// floor, a `[cluster] heartbeat_timeout`-scaled window, and a
+/// floor, a `[cluster] commit_busy_heartbeat_timeout`-scaled window, and a
 /// `[cluster] view_change_status_timeout`-scaled window. Both knobs feed it
 /// because either, raised far past its default, stretches worst-case recovery
 /// past the fixed floor; see `await_recovery_barrier` for the read-side wait.
@@ -748,7 +784,7 @@ pub(in crate::boot) fn restore_metadata_consensus(
     let commit_watermark = owner.last_applied_op.unwrap_or(snapshot_floor);
     let restored_op = owner.last_journaled_op.unwrap_or(snapshot_floor);
     let recovery_deadline = recovery_barrier_deadline(
-        config.cluster.heartbeat_timeout.get_duration(),
+        config.cluster.commit_busy_heartbeat_timeout.get_duration(),
         config.cluster.view_change_status_timeout.get_duration(),
     );
     let prepare_queue_depth = config.metadata.prepare_queue_depth;
@@ -1236,20 +1272,15 @@ mod tests {
     }
 
     #[test]
-    fn default_cluster_heartbeat_timeout_matches_consensus_constant() {
-        // The config default lives in core/server/config.toml (a string,
-        // so no static assert can pin it); keep it in lockstep with the
-        // built-in the simulator and un-configured replicas run on.
-        let config_default = configs::cluster::ClusterConfig::default()
-            .heartbeat_timeout
-            .get_duration()
-            .as_millis();
-        let built_in = u128::from(consensus::TimeoutManager::NORMAL_HEARTBEAT_TICKS)
-            * shard::CONSENSUS_TICK_INTERVAL.as_millis();
+    fn default_heartbeat_values_match_consensus_constants() {
+        // The config defaults are strings in core/server/config.toml, so no
+        // static assert can pin them. The simulator and replicas without a
+        // config run on the built-in schedule.
+        let config = configs::server::ServerConfig::default();
         assert_eq!(
-            config_default, built_in,
-            "[cluster] heartbeat_timeout default drifted from \
-             TimeoutManager::NORMAL_HEARTBEAT_TICKS"
+            crate::shell::heartbeat_schedule(&config),
+            consensus::HeartbeatSchedule::default(),
+            "a [cluster] heartbeat default drifted from the consensus constants"
         );
     }
 
@@ -1303,7 +1334,7 @@ mod tests {
         let cluster = configs::cluster::ClusterConfig::default();
         assert_eq!(
             recovery_barrier_deadline(
-                cluster.heartbeat_timeout.get_duration(),
+                cluster.commit_busy_heartbeat_timeout.get_duration(),
                 cluster.view_change_status_timeout.get_duration(),
             ),
             RECOVERY_BARRIER_DEADLINE_FLOOR
@@ -1325,19 +1356,19 @@ mod tests {
     }
 
     #[test]
-    fn default_commit_broadcast_interval_matches_consensus_constant() {
+    fn default_commit_busy_heartbeat_interval_matches_consensus_constant() {
         // The config default lives in core/server/config.toml (a string,
         // so no static assert can pin it); keep it in lockstep with the
         // built-in the simulator and un-configured replicas run on.
         let config_default = configs::cluster::ClusterConfig::default()
-            .commit_broadcast_interval
+            .commit_busy_heartbeat_interval
             .get_duration()
             .as_millis();
         let built_in = u128::from(consensus::TimeoutManager::COMMIT_MESSAGE_TICKS)
             * shard::CONSENSUS_TICK_INTERVAL.as_millis();
         assert_eq!(
             config_default, built_in,
-            "[cluster] commit_broadcast_interval default drifted from \
+            "[cluster] commit_busy_heartbeat_interval default drifted from \
              TimeoutManager::COMMIT_MESSAGE_TICKS"
         );
     }

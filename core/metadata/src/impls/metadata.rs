@@ -26,6 +26,7 @@ use crate::stm::authz::{
     PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
 };
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
+use crate::stm::shadow::ShadowTopicRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
 };
@@ -80,9 +81,10 @@ use iggy_common::{
     HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
     OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
-    TopicResolvedOptions, UserId, admit, admit_tiered_storage, critical_keys_marker,
-    derived_defaults, stream_wrap_set, topic_option_keys, validate_local_retention,
-    validate_segment_max_age, validate_topic_segment_size,
+    TopicResolvedOptions, UserId, admit, admit_geo_topic, admit_tiered_storage,
+    critical_keys_marker, derived_defaults, drop_options_fixed_by_type, stream_wrap_set,
+    topic_option_keys, validate_geo_topic, validate_local_retention, validate_segment_max_age,
+    validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -96,6 +98,7 @@ use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::io;
 #[cfg(feature = "simulator")]
 use std::io::Write;
@@ -1060,14 +1063,14 @@ where
                 "invalid session finalization",
             )
         });
-        if mux_stm.streams().read(|inner| inner.namespace_revision) == request.namespace_revision {
-            if table_mutations_allowed {
-                client_table.borrow_mut().finalize_session(request.identity);
-            }
-            mux_stm
-                .streams()
-                .record_retirement_debt(&request.debt, header.op);
+        if table_mutations_allowed {
+            client_table
+                .borrow_mut()
+                .finalize_sessions_through(request.retired_through);
         }
+        mux_stm
+            .streams()
+            .record_retirement_debt(&request.debt, header.op);
         return CommittedApply {
             reply: build_reply_message(&header, &bytes::Bytes::new()),
             changes: Vec::new(),
@@ -3335,17 +3338,17 @@ where
             .map_err(|Canceled| MetadataSubmitError::Canceled)
     }
 
-    /// Finalize once every currently allocated partition group either proved
-    /// this exact ended session retired on a quorum of its members or is
-    /// listed in `debt`, which its next primary pays before serving sessions.
+    /// Finalize every ended session whose end op is at or below
+    /// `retired_through`. Each partition incarnation must have proved all of
+    /// them retired on a quorum of its members, or be listed in `debt`, which
+    /// its next primary pays before serving sessions.
     ///
     /// # Errors
     /// Returns an admission or consensus error before finalization commits.
     #[allow(clippy::future_not_send)]
     pub async fn submit_session_finalization(
         &self,
-        identity: SessionIdentity,
-        namespace_revision: u64,
+        retired_through: u64,
         debt: Vec<RetirementDebt>,
     ) -> Result<Option<u64>, MetadataSubmitError> {
         let consensus = self
@@ -3355,19 +3358,11 @@ where
         if !self.is_caught_up_primary() {
             return Err(MetadataSubmitError::NotCaughtUp);
         }
-        if self
-            .mux_stm
-            .streams()
-            .read(|inner| inner.namespace_revision)
-            != namespace_revision
-        {
-            return Ok(None);
-        }
         if !self
             .client_table
             .borrow()
             .ended_sessions()
-            .any(|ended| ended == identity)
+            .any(|ended| ended.metadata_watermark <= retired_through)
         {
             return Ok(None);
         }
@@ -3378,7 +3373,7 @@ where
         let header = RoutedRequestHeader {
             client: message_bus::AUTO_COMMIT_CLIENT_ID,
             session: 1,
-            request: identity.metadata_watermark,
+            request: retired_through,
             group: server_common::sharding::METADATA_GROUP,
             ..RoutedRequestHeader::default()
         };
@@ -3388,8 +3383,7 @@ where
                 &header,
                 Operation::FinalizeSession,
                 &FinalizeSessionRequest {
-                    identity,
-                    namespace_revision,
+                    retired_through,
                     debt,
                 }
                 .to_bytes(),
@@ -3764,6 +3758,135 @@ where
             Ok(reply) => Ok(iggy_binary_protocol::result_code(reply.body()) == Some(0)),
             Err(Canceled) => Err(MetadataSubmitError::Canceled),
         }
+    }
+
+    /// Submit a replicated `ShadowTopic` originated by the server (the shadow
+    /// pass of the metadata primary), not by a client.
+    ///
+    /// Same in-process path as [`Self::submit_truncate_partition_in_process`].
+    /// An `AdoptTopic` names the count of its partitions and its explicit
+    /// options only: this fills in what the admission of a topic create
+    /// resolves, the derived options with the node's default replication
+    /// factor and a consensus group, members and an initial view for each
+    /// partition. Returns the committed result code, `0` when the op applied,
+    /// or the code of the error that kept an adoption out of the pipeline.
+    ///
+    /// # Errors
+    /// `NotPrimary` / `NotCaughtUp` when this node cannot replicate,
+    /// `PipelineFull` under pipeline pressure, `Canceled` if the prepare is
+    /// dropped before commit.
+    #[allow(clippy::future_not_send)]
+    pub async fn submit_shadow_topic_in_process(
+        &self,
+        mut request: ShadowTopicRequest,
+    ) -> Result<u32, MetadataSubmitError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(MetadataSubmitError::NotPrimary)?;
+        if !is_caught_up_primary(consensus) {
+            return Err(
+                if consensus.is_primary() && consensus.is_normal() && !consensus.is_transferring() {
+                    MetadataSubmitError::NotCaughtUp
+                } else {
+                    MetadataSubmitError::NotPrimary
+                },
+            );
+        }
+        if consensus.pipeline_is_full() {
+            return Err(MetadataSubmitError::PipelineFull);
+        }
+        if let ShadowTopicRequest::AdoptTopic { create, .. }
+        | ShadowTopicRequest::RestoreTopic { create, .. } = &mut request
+            && let Err(error) = self.assign_shadow_partitions(create)
+        {
+            return Ok(error.as_code());
+        }
+        let header = RoutedRequestHeader {
+            client: RESERVED_CLIENT_ID,
+            group: server_common::sharding::METADATA_GROUP,
+            ..RoutedRequestHeader::default()
+        };
+        let prepare = consensus::seal_prepare_capacity(
+            build_prepare_message(
+                consensus,
+                &header,
+                Operation::ShadowTopic,
+                &request.to_bytes(),
+            ),
+            consensus.retry_capacity(&self.client_table.borrow()),
+        );
+        // The partitions of an adoption count toward placement while the
+        // prepare waits in the pipeline, as those of a topic create do.
+        if let Err(error) = self
+            .placement
+            .borrow_mut()
+            .remember(&prepare, consensus.replica_count())
+        {
+            return Ok(error.as_code());
+        }
+        match self.dispatch_prepare_and_await(consensus, prepare).await {
+            Ok(reply) => Ok(iggy_binary_protocol::result_code(reply.body()).unwrap_or(0)),
+            Err(Canceled) => Err(MetadataSubmitError::Canceled),
+        }
+    }
+
+    /// Fill in the derived options and the partition assignments of an
+    /// adopted shadow topic or a restored geo topic, as the admission of a
+    /// topic create does, which drops the keys a geo topic's mode fixes. Its
+    /// partitions count toward `[metadata] partitions_max` like any other.
+    fn assign_shadow_partitions(
+        &self,
+        create: &mut PersistedCreateTopicRequest,
+    ) -> Result<(), IggyError> {
+        let consensus = self
+            .consensus
+            .as_ref()
+            .ok_or(IggyError::TransientNotAccepted)?;
+        let partitions_max = self.partitions_max.get();
+        if partitions_max != 0 {
+            let committed =
+                u64::try_from(self.mux_stm.streams().partition_count()).unwrap_or(u64::MAX);
+            validate_partitions_limit(
+                partitions_max,
+                create.request.partitions_count,
+                committed.saturating_add(self.pending_partitions()?),
+            )?;
+        }
+        let mut explicit = resource_options_from_wire(&create.request.options, true)?;
+        if drop_options_fixed_by_type(&mut explicit) {
+            create.request.options = resource_options_to_wire(&explicit, OptionsProvenance::All)?;
+        }
+        let mut derived = derived_defaults(OptionsScope::Topic, &explicit)?;
+        let replication_factor = resolve_replication_factor(
+            None,
+            self.default_replication_factor(consensus.replica_count()),
+            consensus.replica_count(),
+            &mut derived,
+        )?;
+        create.derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
+        let mut counts = self.placement_counts()?;
+        create.partitions = self
+            .allocator
+            .allocate_many(create.request.partitions_count as usize)
+            .into_iter()
+            .enumerate()
+            .map(|(partition_id, consensus_group_id)| {
+                let (members, initial_view) = self.placement.borrow().select(
+                    &mut counts,
+                    consensus.view(),
+                    Some(replication_factor),
+                )?;
+                Ok(CreatedPartitionAssignment {
+                    partition_id: u32::try_from(partition_id)
+                        .map_err(|_| IggyError::InvalidCommand)?,
+                    consensus_group_id,
+                    initial_view,
+                    members,
+                })
+            })
+            .collect::<Result<Vec<_>, IggyError>>()?;
+        Ok(())
     }
 
     /// Submit a replicated client request from in-process and await the
@@ -4781,16 +4904,20 @@ where
 
     /// Suggest one count-balancing move only after normal failover has settled.
     /// `after` rotates candidates so a recovering target cannot starve other groups.
+    /// Each move in `inflight` counts as done, so a caller plans a round of
+    /// moves by adding each suggestion to `inflight` before the next call.
     pub fn primary_rebalance_candidate(
         &self,
         eligible: &[bool],
         after: Option<IggyNamespace>,
+        inflight: &BTreeMap<IggyNamespace, PartitionPrimaryTransfer>,
     ) -> Option<PartitionPrimaryTransfer> {
         self.placement.borrow_mut().primary_rebalance_candidate(
             self.mux_stm.streams(),
             self.consensus.as_ref()?.replica_count(),
             eligible,
             after,
+            inflight,
         )
     }
 
@@ -5066,7 +5193,9 @@ where
         pending_headers(consensus, |header| {
             matches!(
                 header.operation,
-                Operation::CreateTopicWithAssignments | Operation::CreatePartitionsWithAssignments
+                Operation::CreateTopicWithAssignments
+                    | Operation::CreatePartitionsWithAssignments
+                    | Operation::ShadowTopic
             )
         })
     }
@@ -5160,12 +5289,16 @@ where
                     &OptionAdmissionContext::default(),
                 )?;
                 // A node that does not understand a critical key must refuse
-                // the topic rather than serve it without that key's effect.
+                // the topic rather than serve it without that key's effect. A
+                // geo topic writes in a mode even when the request names none,
+                // so its mode is critical either way.
+                let geo = TopicCreateOptions::from_resource_options(&admitted.explicit).is_geo();
                 let critical: Vec<OptionKey> = admitted
                     .explicit
                     .keys()
                     .filter_map(|key| OptionKey::try_from(key).ok())
                     .filter(|key| key.descriptor().critical)
+                    .chain(geo.then_some(OptionKey::GeoMode))
                     .collect();
                 if !critical.is_empty() {
                     admitted.explicit.insert(
@@ -5210,6 +5343,8 @@ where
                     ));
                 }
                 validate_segment_max_age(resolved.runtime)?;
+                validate_geo_topic(&admitted.explicit)?;
+                admit_geo_topic(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 admit_tiered_storage(&admitted.explicit, self.tiered_storage_cluster_ready())?;
                 validate_local_retention(&stored)?;
                 let derived_options = resource_options_to_wire(&derived, OptionsProvenance::All)?;
@@ -6164,10 +6299,10 @@ mod tests {
     };
     use iggy_common::MetadataChangeGroup;
     use iggy_common::{
-        HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage, OptionValueCodec,
-        ServerKeyContext, StreamEncryptionKey, StreamKeyOrigin, TopicUpdateOptions, UserStatus,
-        UserUpdateOptions, WrapSet, critical_keys_marker, descriptors_for, stream_wrap_set,
-        variadic,
+        Durability, GeoMode, HeaderValue, IggyExpiry, IggyTimestamp, OptionKey, OptionStorage,
+        OptionValueCodec, PartitionResizePolicy, ServerKeyContext, StreamEncryptionKey,
+        StreamKeyOrigin, TopicType, TopicUpdateOptions, UserStatus, UserUpdateOptions, WrapSet,
+        check_critical_options, critical_keys_marker, descriptors_for, stream_wrap_set, variadic,
     };
     use journal::prepare_journal::{DEFAULT_SLOT_COUNT, PrepareJournal};
     use journal::superblock::SuperblockContents;
@@ -7571,6 +7706,92 @@ mod tests {
     }
 
     #[test]
+    fn given_a_shadow_adoption_when_assigning_its_partitions_should_mint_each_within_the_cap() {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        let adoption = |partitions_count| PersistedCreateTopicRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count,
+                name: WireName::new("payments").unwrap(),
+                options: WireOptions::empty(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: Vec::new(),
+        };
+
+        let mut create = adoption(2);
+        metadata.assign_shadow_partitions(&mut create).unwrap();
+        let ids: Vec<u32> = create
+            .partitions
+            .iter()
+            .map(|partition| partition.partition_id)
+            .collect();
+        assert_eq!(ids, [0, 1]);
+        assert_ne!(
+            create.partitions[0].consensus_group_id,
+            create.partitions[1].consensus_group_id
+        );
+        assert!(
+            PersistedCreateTopicRequest::decode_from(&create.to_bytes()).is_ok(),
+            "the assigned create encodes as a topic create does"
+        );
+
+        metadata.set_partitions_max(2);
+        assert!(matches!(
+            metadata.assign_shadow_partitions(&mut adoption(2)),
+            Err(IggyError::PartitionsLimitReached)
+        ));
+    }
+
+    #[test]
+    fn given_a_restored_geo_topic_when_assigning_its_partitions_should_store_persisted_as_derived()
+    {
+        let mut metadata = placement_metadata();
+        metadata.mux_stm = Rc::new(TestMux::new((
+            users_with_topic_manager(),
+            (stream_with_one_partition().into(), ()),
+        )));
+        let create = |options: &TopicCreateOptions| PersistedCreateTopicRequest {
+            request: WireCreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("payments").unwrap(),
+                options: options.to_wire().unwrap(),
+            },
+            derived_options: WireOptions::empty(),
+            partitions: Vec::new(),
+        };
+        let durability = HeaderKey::from(OptionKey::Durability);
+        let replicated = OptionValue::explicit(Durability::Replicated.encode().unwrap());
+
+        let mut restored = create(&TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            geo_mode: Some(GeoMode::Geo),
+            ..TopicCreateOptions::default()
+        });
+        metadata.assign_shadow_partitions(&mut restored).unwrap();
+        let explicit = resource_options_from_wire(&restored.request.options, true).unwrap();
+        let derived = resource_options_from_wire(&restored.derived_options, false).unwrap();
+        assert!(!explicit.contains_key(&durability));
+        assert_eq!(
+            derived.get(&durability),
+            Some(&OptionValue::derived(
+                Durability::Persisted.encode().unwrap()
+            ))
+        );
+
+        // A shadow adoption is stored as a normal topic and keeps its block.
+        let mut adopted = create(&TopicCreateOptions::default());
+        metadata.assign_shadow_partitions(&mut adopted).unwrap();
+        let explicit = resource_options_from_wire(&adopted.request.options, true).unwrap();
+        assert_eq!(explicit.get(&durability), Some(&replicated));
+    }
+
+    #[test]
     fn given_unrelated_metadata_inflight_when_over_cap_create_is_invalid_should_defer_it() {
         let mut metadata = placement_metadata();
         metadata.mux_stm = Rc::new(TestMux::new((
@@ -8168,6 +8389,195 @@ mod tests {
             b"tiered_storage"
         );
         assert!(!TopicResolvedOptions::from(&explicit).tiered_storage);
+    }
+
+    #[test]
+    fn given_a_topic_type_when_preparing_create_topic_should_admit_geo_only_in_a_ready_cluster() {
+        let typed = |topic_type: Option<TopicType>, geo_mode: Option<GeoMode>| {
+            iggy_common::TopicCreateOptions {
+                topic_type,
+                geo_mode,
+                ..Default::default()
+            }
+        };
+        for cluster_ready in [false, true] {
+            let plane = metadata_plane();
+            plane.observe_tiered_storage_readiness(cluster_ready);
+            for geo_mode in [None, Some(GeoMode::Geo)] {
+                let admitted = prepare_topic_on(&plane, &typed(Some(TopicType::Geo), geo_mode));
+                if cluster_ready {
+                    assert!(admitted.is_ok(), "mode {geo_mode:?}: {admitted:?}");
+                } else {
+                    assert_eq!(
+                        admitted.err(),
+                        Some(IggyError::FeatureUnavailable),
+                        "mode {geo_mode:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                prepare_topic_on(
+                    &plane,
+                    &typed(Some(TopicType::Geo), Some(GeoMode::GeoTiered))
+                )
+                .err(),
+                Some(IggyError::FeatureUnavailable),
+                "geo_tiered, ready {cluster_ready}"
+            );
+            for (refused, key) in [
+                (
+                    iggy_common::TopicCreateOptions {
+                        tiered_storage: Some(true),
+                        ..typed(Some(TopicType::Geo), None)
+                    },
+                    "tiered_storage",
+                ),
+                (
+                    iggy_common::TopicCreateOptions {
+                        partition_resize_policy: Some(PartitionResizePolicy::Mutable),
+                        ..typed(Some(TopicType::Geo), None)
+                    },
+                    "partition_resize_policy",
+                ),
+            ] {
+                assert_eq!(
+                    prepare_topic_on(&plane, &refused).err(),
+                    Some(IggyError::InvalidOptionValue(key.to_owned())),
+                    "ready {cluster_ready}"
+                );
+            }
+        }
+        for topic_type in [None, Some(TopicType::Normal)] {
+            for geo_mode in [GeoMode::Geo, GeoMode::GeoTiered] {
+                assert_eq!(
+                    prepare_topic_with(&typed(topic_type, Some(geo_mode))).err(),
+                    Some(IggyError::InvalidOptionValue("geo_mode".to_owned())),
+                    "{topic_type:?} with {geo_mode}"
+                );
+            }
+        }
+
+        let persisted =
+            prepare_topic_with(&typed(None, None)).expect("a default topic is admitted");
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        let derived = resource_options_from_wire(&persisted.derived_options, false)
+            .expect("derived block decodes");
+        assert!(!explicit.contains_key(&HeaderKey::from(OptionKey::TopicType)));
+        assert!(!explicit.contains_key(&HeaderKey::from(OptionKey::CriticalKeys)));
+        assert_eq!(
+            derived[&HeaderKey::from(OptionKey::TopicType)]
+                .value
+                .as_bytes(),
+            b"normal"
+        );
+        assert!(!derived.contains_key(&HeaderKey::from(OptionKey::GeoMode)));
+        let mut stored = derived;
+        stored.extend(explicit);
+        let resolved = TopicResolvedOptions::from(&stored);
+        assert_eq!(resolved.topic_type, TopicType::Normal);
+        assert_eq!(resolved.geo_mode, None);
+
+        let stated = prepare_topic_with(&typed(Some(TopicType::Normal), None))
+            .expect("a topic that states it is normal is admitted");
+        assert_eq!(
+            resource_options_from_wire(&stated.request.options, true)
+                .expect("explicit block decodes")[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"topic_type"
+        );
+    }
+
+    #[test]
+    fn given_a_ready_cluster_when_preparing_a_geo_topic_should_store_its_mode_fixed_partitions_and_both_critical_keys()
+     {
+        let plane = metadata_plane();
+        plane.observe_tiered_storage_readiness(true);
+        let persisted = prepare_topic_on(
+            &plane,
+            &iggy_common::TopicCreateOptions {
+                topic_type: Some(TopicType::Geo),
+                ..Default::default()
+            },
+        )
+        .expect("a ready cluster admits a geo topic");
+        let explicit = resource_options_from_wire(&persisted.request.options, true)
+            .expect("explicit block decodes");
+        let derived = resource_options_from_wire(&persisted.derived_options, false)
+            .expect("derived block decodes");
+        assert_eq!(
+            explicit[&HeaderKey::from(OptionKey::CriticalKeys)]
+                .value
+                .as_bytes(),
+            b"geo_mode,topic_type"
+        );
+        assert!(!explicit.contains_key(&HeaderKey::from(OptionKey::GeoMode)));
+        assert_eq!(
+            derived[&HeaderKey::from(OptionKey::GeoMode)]
+                .value
+                .as_bytes(),
+            b"geo"
+        );
+        assert_eq!(
+            derived[&HeaderKey::from(OptionKey::PartitionResizePolicy)]
+                .value
+                .as_bytes(),
+            b"fixed"
+        );
+        let mut stored = derived;
+        stored.extend(explicit);
+        assert_eq!(check_critical_options(&stored), Ok(()));
+        let resolved = TopicResolvedOptions::from(&stored);
+        assert_eq!(resolved.geo_mode, Some(GeoMode::Geo));
+        assert_eq!(
+            resolved.partition_resize_policy,
+            PartitionResizePolicy::Fixed
+        );
+        assert!(resolved.runtime.places_batches);
+    }
+
+    #[test]
+    fn given_a_geo_topic_naming_a_durability_when_preparing_should_ignore_it_and_derive_persisted()
+    {
+        let durability = HeaderKey::from(OptionKey::Durability);
+        for named in [Durability::Replicated, Durability::Persisted] {
+            let plane = metadata_plane();
+            plane.observe_tiered_storage_readiness(true);
+            let persisted = prepare_topic_on(
+                &plane,
+                &iggy_common::TopicCreateOptions {
+                    topic_type: Some(TopicType::Geo),
+                    durability: named,
+                    ..Default::default()
+                },
+            )
+            .expect("a ready cluster admits a geo topic");
+            let explicit = resource_options_from_wire(&persisted.request.options, true)
+                .expect("explicit block decodes");
+            let derived = resource_options_from_wire(&persisted.derived_options, false)
+                .expect("derived block decodes");
+            assert!(!explicit.contains_key(&durability), "{named} is ignored");
+            assert_eq!(
+                derived.get(&durability),
+                Some(&OptionValue::derived(
+                    Durability::Persisted.encode().unwrap()
+                )),
+                "{named}"
+            );
+        }
+
+        let normal = prepare_topic_with(&iggy_common::TopicCreateOptions::default())
+            .expect("a normal topic is admitted");
+        let explicit = resource_options_from_wire(&normal.request.options, true)
+            .expect("explicit block decodes");
+        assert_eq!(
+            explicit.get(&durability),
+            Some(&OptionValue::explicit(
+                Durability::Replicated.encode().unwrap()
+            )),
+            "a normal topic keeps the durability it names"
+        );
     }
 
     #[test]
@@ -11472,10 +11882,9 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_group_logout_when_finalizing_session_should_preserve_retirement_coverage() {
+    async fn given_group_logout_when_finalizing_through_its_end_should_release_the_session() {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
-        let namespace_revision = metadata.mux_stm.namespace_revision();
         let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
         metadata
             .submit_logout_in_process(CLIENT, session, 1)
@@ -11487,19 +11896,21 @@ mod tests {
             .ended_sessions()
             .next()
             .unwrap();
-        assert_eq!(metadata.mux_stm.namespace_revision(), namespace_revision);
-        assert_ne!(
-            metadata.mux_stm.streams().read(|inner| inner.revision),
-            namespace_revision
-        );
 
+        assert_eq!(
+            metadata
+                .submit_session_finalization(identity.metadata_watermark - 1, Vec::new())
+                .await
+                .unwrap(),
+            None,
+            "a watermark below every session end has nothing to finalize"
+        );
         assert!(
             metadata
-                .submit_session_finalization(identity, namespace_revision, Vec::new())
+                .submit_session_finalization(identity.metadata_watermark, Vec::new())
                 .await
                 .unwrap()
-                .is_some(),
-            "membership changes must preserve retirement coverage"
+                .is_some()
         );
         assert_eq!(
             metadata.client_table.borrow().ended_sessions().next(),
@@ -11509,8 +11920,7 @@ mod tests {
     }
 
     #[compio::test]
-    async fn given_retirement_reports_when_namespace_changes_before_apply_should_keep_the_session()
-    {
+    async fn given_a_partition_created_after_a_session_ended_when_finalizing_should_release_it() {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = metadata_with_group_member(CLIENT).await;
         let session = metadata.client_table.borrow().get_epoch(CLIENT).unwrap();
@@ -11524,8 +11934,9 @@ mod tests {
             .ended_sessions()
             .next()
             .unwrap();
-        let revision = metadata.mux_stm.namespace_revision();
         let consensus = metadata.consensus.as_ref().unwrap();
+        // A partition created after the end starts its frontier above it, so
+        // the finalization does not depend on it.
         let create = build_prepare_message(
             consensus,
             &RoutedRequestHeader::default(),
@@ -11549,27 +11960,18 @@ mod tests {
             gated_apply(metadata.mux_stm.as_ref(), create).unwrap().code,
             0
         );
-        let current_revision = metadata.mux_stm.namespace_revision();
-        assert_ne!(current_revision, revision);
-        assert_eq!(
-            metadata
-                .submit_session_finalization(identity, revision, Vec::new())
-                .await
-                .unwrap(),
-            None
-        );
 
-        for (reported_revision, expected_session) in
-            [(revision, Some(identity)), (current_revision, None)]
-        {
+        for (retired_through, expected_session) in [
+            (identity.metadata_watermark - 1, Some(identity)),
+            (identity.metadata_watermark, None),
+        ] {
             let prepare = consensus::seal_prepare_capacity(
                 build_prepare_message(
                     consensus,
                     &RoutedRequestHeader::default(),
                     Operation::FinalizeSession,
                     &FinalizeSessionRequest {
-                        identity,
-                        namespace_revision: reported_revision,
+                        retired_through,
                         debt: Vec::new(),
                     }
                     .to_bytes(),
@@ -11586,7 +11988,7 @@ mod tests {
             assert_eq!(
                 metadata.client_table.borrow().ended_sessions().next(),
                 expected_session,
-                "finalization must use the namespace revision at ordered apply"
+                "finalization releases exactly the sessions that ended at or below its watermark"
             );
         }
     }
@@ -11620,8 +12022,7 @@ mod tests {
                 &RoutedRequestHeader::default(),
                 Operation::FinalizeSession,
                 &FinalizeSessionRequest {
-                    identity,
-                    namespace_revision: metadata.mux_stm.namespace_revision(),
+                    retired_through: identity.metadata_watermark,
                     debt: vec![
                         RetirementDebt {
                             namespace: namespace.inner(),
@@ -11899,7 +12300,10 @@ mod tests {
                     ClientTable::decode(&metadata.client_table.borrow().encode()).unwrap();
                 let ended = table.end_user_sessions(USER, tail[0].header().op);
                 if finalized {
-                    assert!(table.finalize_session(ended[0]));
+                    assert_eq!(
+                        table.finalize_sessions_through(ended[0].metadata_watermark),
+                        1
+                    );
                     consensus.sequencer().set_sequence(tail[0].header().op);
                     tail.push(consensus::seal_prepare_capacity(
                         build_prepare_message(
@@ -11907,8 +12311,7 @@ mod tests {
                             &request,
                             Operation::FinalizeSession,
                             &FinalizeSessionRequest {
-                                identity: ended[0],
-                                namespace_revision: metadata.mux_stm.namespace_revision(),
+                                retired_through: ended[0].metadata_watermark,
                                 debt: Vec::new(),
                             }
                             .to_bytes(),

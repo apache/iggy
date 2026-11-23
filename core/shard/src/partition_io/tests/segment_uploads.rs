@@ -135,18 +135,39 @@ pub(super) async fn tiered_owner(directory: &Path) -> IoTestShard {
     owner
 }
 
+/// How long the pump of [`pumped`] may take to stop once the body ended.
+const PUMP_STOP_DEADLINE: Duration = Duration::from_secs(30);
+
 /// Run `body` beside the owner's pump, and stop the pump when it ends. A
 /// shard runs its pump once, so everything that needs a commit goes in here.
 #[allow(clippy::future_not_send)]
 pub(super) async fn pumped<T>(owner: &IoTestShard, body: impl Future<Output = T>) -> T {
     let (stop, stopped) = channel(1);
+    let (ended, body_ended) = channel::<()>(1);
     let pump = owner.run_message_pump(stopped, Arc::new(AtomicBool::new(false)));
     let body = async {
         let output = body.await;
         stop.try_send(()).unwrap();
+        ended.try_send(()).unwrap();
         output
     };
-    futures::join!(pump, body).1
+    let stop_deadline = async {
+        if body_ended.recv().await.is_ok() {
+            compio::time::sleep(PUMP_STOP_DEADLINE).await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+    .fuse();
+    // Boxed, as the pump and the body together are a large future.
+    let mut ran = Box::pin(async { futures::join!(pump, body).1 }.fuse());
+    futures::pin_mut!(stop_deadline);
+    futures::select_biased! {
+        output = ran => output,
+        () = stop_deadline => panic!(
+            "the pump did not stop within {PUMP_STOP_DEADLINE:?} of the end of the test body"
+        ),
+    }
 }
 
 /// Wait for the pump to bring the owner to `done`.

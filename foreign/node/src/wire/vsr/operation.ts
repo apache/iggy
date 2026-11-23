@@ -40,6 +40,7 @@ export const Operation = {
   UpdateTopicResolved: 73,
   UpdateUserResolved: 74,
   RewrapStreamKeys: 75,
+  ShadowTopic: 76,
   CreateStream: 128,
   // 129 was UpdateStream. Never reuse it.
   DeleteStream: 130,
@@ -61,6 +62,7 @@ export const Operation = {
   JoinConsumerGroup: 148,
   LeaveConsumerGroup: 149,
   UpdateResource: 150,
+  RetireGeoOrigin: 151,
   SendMessages: 160,
   StoreConsumerOffset: 161,
   DeleteConsumerOffset: 162,
@@ -100,7 +102,8 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.DeleteGroup, Operation.DeleteConsumerGroup],
   [COMMAND_CODE.JoinGroup, Operation.JoinConsumerGroup],
   [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup],
-  [COMMAND_CODE.UpdateResource, Operation.UpdateResource]
+  [COMMAND_CODE.UpdateResource, Operation.UpdateResource],
+  [COMMAND_CODE.RetireGeoOrigin, Operation.RetireGeoOrigin]
 ]);
 
 const KNOWN_OPERATIONS: ReadonlySet<number> =
@@ -133,7 +136,7 @@ export const isMetadata = (operation: number): boolean => {
   if (isInternal(operation) && operation < Operation.SendMessages) return true;
   if (operation === Operation.DeleteSegments) return false;
   return operation >= METADATA_START &&
-    operation <= Operation.UpdateResource;
+    operation <= Operation.RetireGeoOrigin;
 };
 
 /**

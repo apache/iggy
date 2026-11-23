@@ -57,7 +57,9 @@ pub fn sample(
     _options: &WorkloadOptions,
 ) -> Option<Input> {
     match outcome {
-        Outcome::PartitionResizeDisabled => None,
+        Outcome::PartitionResizeDisabled
+        // The sim cluster has no geo peers, so it holds no shadow stream.
+        | Outcome::ShadowStreamReadOnly => None,
         Outcome::Ok => {
             let (stream, topic) = shadow.pick_topic_pair(prng)?;
             let live = *shadow

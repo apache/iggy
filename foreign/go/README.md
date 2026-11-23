@@ -92,6 +92,8 @@ if err := cli.UpdateTopic(ctx, streamId, topicId, iggcon.TopicUpdate{
 
 The sample is `Example_resourceOptions` in `client/example_resource_options_test.go`.
 
+A geo topic takes six durations of its own, in microseconds: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`, `PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and `LongTermRewriteMaxInterval`. Each overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent. `TopicUpdate` can set them, but not reset them, and they are the only keys an update may change on a geo topic. A normal topic refuses them.
+
 A stream encryption key is exactly 32 random bytes. Never derive it from a password: the fingerprint reads would then be an offline guessing oracle. The key travels inside the create request over the client's transport, so use TLS when the network between client and server is not trusted.
 
 The server stores the key wrapped under its own key and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream, and a server without it keeps the stream plaintext and refuses a client key.
@@ -214,7 +216,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 `SendMessages` returns any placements the server reports. Replicated mutations

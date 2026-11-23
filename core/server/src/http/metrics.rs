@@ -34,6 +34,7 @@ use prometheus_client::metrics::counter::{ConstCounter, Counter};
 use prometheus_client::metrics::gauge::{ConstGauge, Gauge};
 use prometheus_client::registry::Registry;
 use server_common::{DISK_USAGE, DiskUsage};
+use shard::metrics::{LongTermLag, ShardMetrics};
 use tracing::error;
 
 /// Exports the process-wide clamped-rollup count as a counter series, read at
@@ -208,6 +209,79 @@ fn encode_topic_gauge(
     Ok(())
 }
 
+/// What one partition has yet to rewrite into long-term segments, as the
+/// scrape handler named it from the streams STM.
+#[derive(Debug)]
+pub(in crate::http) struct LongTermLagSample {
+    pub(in crate::http) stream: Arc<str>,
+    pub(in crate::http) topic: Arc<str>,
+    pub(in crate::http) partition: usize,
+    pub(in crate::http) messages: u64,
+    /// `None` until the partition counted them, so the series is absent
+    /// rather than 0.
+    pub(in crate::http) bytes: Option<u64>,
+}
+
+/// Per-partition `{stream, topic, partition}` series of the partitions that
+/// place their batches and that this node leads, replaced wholesale on every
+/// scrape like [`TopicUsage`].
+#[derive(Debug, Clone, Default)]
+pub(in crate::http) struct LongTermLags {
+    samples: Arc<Mutex<Vec<LongTermLagSample>>>,
+}
+
+impl LongTermLags {
+    pub(in crate::http) fn replace(&self, samples: Vec<LongTermLagSample>) {
+        *self.samples.lock().unwrap_or_else(PoisonError::into_inner) = samples;
+    }
+}
+
+impl Collector for LongTermLags {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), std::fmt::Error> {
+        let samples = mem::take(&mut *self.samples.lock().unwrap_or_else(PoisonError::into_inner));
+        encode_long_term_lag_gauge(
+            &mut encoder,
+            "topic_partition_long_term_lag_messages",
+            "messages the partition committed that no long-term segment holds yet",
+            &samples,
+            |sample| Some(sample.messages),
+        )?;
+        encode_long_term_lag_gauge(
+            &mut encoder,
+            "topic_partition_long_term_lag_bytes",
+            concat!(
+                "bytes of the messages the partition committed that no long-term segment ",
+                "holds yet, absent until the partition counted them",
+            ),
+            &samples,
+            |sample| sample.bytes,
+        )
+    }
+}
+
+fn encode_long_term_lag_gauge(
+    encoder: &mut DescriptorEncoder,
+    name: &str,
+    help: &str,
+    samples: &[LongTermLagSample],
+    value: impl Fn(&LongTermLagSample) -> Option<u64>,
+) -> Result<(), std::fmt::Error> {
+    let mut metric_encoder = encoder.encode_descriptor(name, help, None, MetricType::Gauge)?;
+    for sample in samples {
+        let Some(value) = value(sample) else {
+            continue;
+        };
+        let partition = sample.partition.to_string();
+        let labels = [
+            ("stream", &*sample.stream),
+            ("topic", &*sample.topic),
+            ("partition", partition.as_str()),
+        ];
+        ConstGauge::new(value).encode(metric_encoder.encode_family(&labels)?)?;
+    }
+    Ok(())
+}
+
 /// Exports the disk usage of the volume holding the data directory, read at
 /// encode time like [`StatsRollupUnderflows`].
 ///
@@ -263,10 +337,11 @@ impl Collector for DiskUsageMetrics {
 /// The legacy server's metric set, registered under the same names and help
 /// texts so existing dashboards and alerts keep working unchanged.
 ///
-/// Unlike the legacy server, the entity gauges are not counted at mutation
-/// sites: the scrape handler (`http::handlers::get_metrics`) samples the live
-/// state on every scrape, so a gauge can never drift from the state it
-/// describes.
+/// The scrape handler (`http::handlers::get_metrics`) sets the entity gauges
+/// on every scrape, from the counts the metadata applies keep and from the
+/// node stats, so they walk no stream. Only the per-topic series walk every
+/// topic, and `[http.metrics] topic_gauges = false` turns them off, together
+/// with the per-partition series of [`LongTermLags`].
 pub(in crate::http) struct HttpMetrics {
     registry: Registry,
     /// The per-topic and disk series. They name every stream and topic and
@@ -282,6 +357,9 @@ pub(in crate::http) struct HttpMetrics {
     pub(in crate::http) users: Gauge,
     pub(in crate::http) clients: Gauge,
     pub(in crate::http) topic_usage: TopicUsage,
+    pub(in crate::http) long_term_lags: LongTermLags,
+    /// Where each shard leaves the lags its tick found.
+    shard_metrics: Vec<ShardMetrics>,
     /// Partition primary lookups on the owning shard for HTTP partition requests.
     pub(in crate::http) partition_primary_probes: Counter,
     /// Attempts to relay an HTTP partition request to another node.
@@ -294,7 +372,7 @@ pub(in crate::http) struct HttpMetrics {
 }
 
 impl HttpMetrics {
-    pub(in crate::http) fn init(shard_metrics_all: &[shard::metrics::ShardMetrics]) -> Self {
+    pub(in crate::http) fn init(shard_metrics_all: &[ShardMetrics]) -> Self {
         let mut registry = Registry::default();
         let http_requests = Counter::default();
         let streams = Gauge::default();
@@ -352,6 +430,8 @@ impl HttpMetrics {
         stats_registry.register_collector(Box::new(DataDiskFreeSpace));
         let topic_usage = TopicUsage::default();
         stats_registry.register_collector(Box::new(topic_usage.clone()));
+        let long_term_lags = LongTermLags::default();
+        stats_registry.register_collector(Box::new(long_term_lags.clone()));
         stats_registry.register_collector(Box::new(DiskUsageMetrics(&DISK_USAGE)));
         // Every shard's drop / reconcile / partition counters, one
         // `shard`-labelled sub-registry per shard so series stay per-shard
@@ -378,12 +458,23 @@ impl HttpMetrics {
             users,
             clients,
             topic_usage,
+            long_term_lags,
+            shard_metrics: shard_metrics_all.to_vec(),
             partition_primary_probes,
             partition_relays,
             metadata_floor_reads,
             session_registers,
             last_output_len: AtomicUsize::new(0),
         }
+    }
+
+    /// The lags the shards of this node found at their last ticks.
+    pub(in crate::http) fn shard_long_term_lags(&self) -> Vec<LongTermLag> {
+        let mut lags = Vec::new();
+        for shard_metrics in &self.shard_metrics {
+            lags.extend(shard_metrics.long_term_lags());
+        }
+        lags
     }
 
     /// Handle for the router's request-counting layer. The counter is
@@ -534,6 +625,7 @@ mod tests {
         HttpMetricsConfig {
             enabled,
             endpoint: endpoint.to_owned(),
+            topic_gauges: true,
         }
     }
 
@@ -748,6 +840,69 @@ mod tests {
             !output.contains(r#"topic_max_size_bytes{stream="orders",topic="us"}"#),
             "an uncapped topic must not export a max size:\n{output}"
         );
+    }
+
+    fn lag_sample(partition: usize, messages: u64, bytes: Option<u64>) -> LongTermLagSample {
+        LongTermLagSample {
+            stream: Arc::from("orders"),
+            topic: Arc::from("eu"),
+            partition,
+            messages,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn given_long_term_lag_samples_when_encoding_should_label_each_series_by_its_partition() {
+        let metrics = HttpMetrics::init(&[]);
+        let samples = || vec![lag_sample(0, 7, Some(4096)), lag_sample(3, 0, None)];
+        metrics.long_term_lags.replace(samples());
+        let output = metrics.formatted_output(true);
+        for line in [
+            "# TYPE topic_partition_long_term_lag_messages gauge",
+            "# TYPE topic_partition_long_term_lag_bytes gauge",
+            r#"topic_partition_long_term_lag_messages{stream="orders",topic="eu",partition="0"} 7"#,
+            r#"topic_partition_long_term_lag_messages{stream="orders",topic="eu",partition="3"} 0"#,
+            r#"topic_partition_long_term_lag_bytes{stream="orders",topic="eu",partition="0"} 4096"#,
+        ] {
+            assert!(
+                output.contains(&format!("\n{line}\n")),
+                "expected `{line}` in exposition:\n{output}"
+            );
+        }
+        assert!(
+            !output.contains(r#"lag_bytes{stream="orders",topic="eu",partition="3"}"#),
+            "a backlog that is not counted yet must not export bytes:\n{output}"
+        );
+        assert!(
+            !metrics.formatted_output(true).contains(r#"partition="0""#),
+            "a scrape that was handed no samples exports none"
+        );
+
+        metrics.long_term_lags.replace(samples());
+        assert!(
+            !metrics
+                .formatted_output(false)
+                .contains("topic_partition_long_term_lag"),
+            "the series name streams and topics, as the per-topic ones do"
+        );
+    }
+
+    #[test]
+    fn given_the_lags_of_two_shards_when_gathering_them_should_return_each_once() {
+        let lag = |partition, messages| LongTermLag {
+            namespace: server_common::sharding::IggyNamespace::new(1, 2, partition),
+            messages,
+            bytes: None,
+        };
+        let shards = [ShardMetrics::for_shard(), ShardMetrics::for_shard()];
+        shards[0].set_long_term_lags(vec![lag(0, 5)]);
+        shards[1].set_long_term_lags(vec![lag(1, 9)]);
+        let metrics = HttpMetrics::init(&shards);
+
+        assert_eq!(metrics.shard_long_term_lags(), [lag(0, 5), lag(1, 9)]);
+        shards[1].set_long_term_lags(Vec::new());
+        assert_eq!(metrics.shard_long_term_lags(), [lag(0, 5)]);
     }
 
     #[test]

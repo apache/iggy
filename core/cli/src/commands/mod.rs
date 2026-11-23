@@ -20,6 +20,7 @@ pub mod binary_cluster;
 pub mod binary_consumer_groups;
 pub mod binary_consumer_offsets;
 pub mod binary_context;
+pub mod binary_geo;
 pub mod binary_message;
 pub mod binary_partitions;
 pub mod binary_personal_access_tokens;

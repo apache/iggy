@@ -28,6 +28,8 @@ mod related;
 
 use std::rc::Rc;
 
+use bench_dashboard_shared::embed::OmbChartType;
+use bench_dashboard_shared::omb::chart::WindowMetric;
 use bench_dashboard_shared::omb::compare::OmbComparability;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
@@ -39,7 +41,7 @@ use yew_router::prelude::Link;
 
 use self::advanced::Advanced;
 use self::change::{Change, KPIS, Kpi};
-use self::chart::{DetailRef, WindowChart, WindowMetric};
+use self::chart::{DetailRef, WindowChart};
 use self::facts::{
     END_TO_END_TITLE, Fact, FactGroup, NO_SIDECAR_NOTE, UNRECORDED, end_to_end_side,
     environment_groups, estimated_start, ladder, property_groups, publish_side, workload_facts,
@@ -48,6 +50,7 @@ use self::history::{Baseline, History, Machines, history_view};
 use self::related::{related_runs, related_view};
 use crate::api::{fetch_omb_run, omb_result_url, omb_setup_url};
 use crate::components::chart::series_color;
+use crate::components::embed::{EmbedButton, EmbedCard, EmbedChart, EmbedProvider, EmbedRun};
 use crate::components::headline::kpi_card;
 use crate::components::ladder::{Rung, percentile_ladder};
 use crate::components::page::{breadcrumbs, loadable, page_shell, section_head};
@@ -357,7 +360,7 @@ fn found_view(
         &PLAIN_SECTIONS
     };
     html! {
-        <>
+        <EmbedProvider run={EmbedRun::Omb(run.id)} charts={embed_charts(run)}>
             { head(run) }
             { headline_strip(view) }
             <SectionNav {sections} scroll_ref={scroll_ref.clone()} />
@@ -426,7 +429,8 @@ fn found_view(
                 { section_head(
                     ARTIFACTS.label,
                     "Files of this run",
-                    "The result file as OMB wrote it, and the setup sidecar if the run has one.",
+                    "The result file as OMB wrote it, the setup sidecar if the run has one, and \
+                     the code to show this run's charts on another page.",
                 ) }
                 { artifacts(run) }
             </section>
@@ -440,8 +444,19 @@ fn found_view(
                 ) }
                 <Advanced detail={detail.clone()} reload={reload.clone()} />
             </section>
-        </>
+        </EmbedProvider>
     }
+}
+
+/// The charts of the run that an embed can draw, in the order of the page. A run without
+/// end-to-end numbers has no end-to-end chart, because the server answers 404 for it.
+fn embed_charts(run: &OmbRunSummary) -> Vec<EmbedChart> {
+    let end_to_end = matches!(EndToEnd::of(run), EndToEnd::Measured(_));
+    OmbChartType::ALL
+        .into_iter()
+        .filter(|chart| end_to_end || *chart != OmbChartType::EndToEndLatency)
+        .map(EmbedChart::Omb)
+        .collect()
 }
 
 fn head(run: &OmbRunSummary) -> Html {
@@ -546,6 +561,9 @@ fn window_card(detail: &DetailRef, metric: WindowMetric, note: Option<&'static s
     html! {
         <article class="card run-chart-card">
             <h3>{ metric.title() }</h3>
+            if let Some(chart) = OmbChartType::of_window(metric) {
+                <EmbedButton chart={EmbedChart::Omb(chart)} />
+            }
             <WindowChart detail={detail.clone()} {metric} />
             if let Some(note) = note {
                 <p class="card-note">{ note }</p>
@@ -604,6 +622,7 @@ fn ladder_card(title: &str, latency: &OmbPercentiles, side: &[Fact], note: &'sta
     html! {
         <article class="card run-ladder-card">
             <h3>{ title.to_owned() }</h3>
+            <EmbedButton chart={EmbedChart::Omb(OmbChartType::Ladder)} />
             { percentile_ladder(&rungs, false) }
             <div>
                 { fact_list(side) }
@@ -750,6 +769,7 @@ fn artifacts(run: &OmbRunSummary) -> Html {
                     </a>
                 </article>
             }
+            <EmbedCard />
         </div>
     }
 }

@@ -68,15 +68,23 @@ pub(crate) mod wire;
 pub(crate) mod http;
 
 // background: per-shard maintenance loops.
+pub(crate) mod geo_peers;
+pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
+pub(crate) mod origin_recovery;
 pub(crate) mod partition_reconciler;
+pub(crate) mod peer_manifests;
+pub(crate) mod peer_positions;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
     reconcile_partition_lifecycles, reconcile_pending_revocations,
 };
+pub(crate) mod credential_refresh;
+pub(crate) mod gcs_credentials;
 pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
+pub(crate) mod shadow_topics;
 pub(crate) mod snapshot;
 pub(crate) mod store_identity;
 pub(crate) mod sysinfo_printer;
@@ -88,3 +96,52 @@ pub(crate) mod external_auth;
 pub(crate) mod partition_helpers;
 pub mod server_error;
 pub(crate) mod sysinfo_probe;
+
+#[cfg(all(test, feature = "mimalloc", not(feature = "disable-mimalloc")))]
+mod tests {
+    use super::GLOBAL;
+    use iggy_binary_protocol::{Command, GenericHeader};
+    use message_bus::framing::read_message;
+    use server_common::iobuf::{Frozen, Owned};
+    use server_common::{MESSAGE_ALIGN, Message};
+
+    /// A small prepare, and a frame grown past one alignment unit.
+    const FRAME_LENS: [usize; 2] = [624, MESSAGE_ALIGN + 1000];
+
+    /// The journal and the repair ring charge `Frozen::allocation_size` of the
+    /// backing capacity. That counts the real block only while the backing
+    /// capacity is the block that mimalloc reserved.
+    #[compio::test]
+    #[allow(clippy::cast_possible_truncation)]
+    async fn given_journal_buffers_when_mimalloc_allocates_them_should_charge_the_whole_block() {
+        for frame_len in FRAME_LENS {
+            let frame = Message::<GenericHeader>::new(frame_len).transmute_header(
+                |_, h: &mut GenericHeader| {
+                    h.command = Command::Ping;
+                    h.size = frame_len as u32;
+                },
+            );
+            let mut wire = frame.as_slice();
+            let read = read_message(&mut wire, frame_len).await.unwrap();
+            let buffers = [
+                ("read off the wire", read.into_frozen()),
+                ("zeroed", Owned::<MESSAGE_ALIGN>::zeroed(frame_len).into()),
+                (
+                    "copied",
+                    Frozen::from(Owned::copy_from_slice(frame.as_slice())),
+                ),
+            ];
+            for (source, buffer) in buffers {
+                let charged = buffer.backing_capacity();
+                // SAFETY: mimalloc is the global allocator, and `buffer` keeps
+                // its block alive.
+                let block = unsafe { GLOBAL.usable_size(buffer.as_slice().as_ptr()) };
+                assert_eq!(
+                    block, charged,
+                    "a {frame_len} B frame {source}: the charge counts {charged} B, mimalloc \
+                     reserved {block} B"
+                );
+            }
+        }
+    }
+}

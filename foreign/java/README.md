@@ -371,6 +371,14 @@ The stream key is 32 random bytes. It travels inside the create request over the
 
 The typed builders refuse an update the server would refuse for its shape before anything is sent, with the server's error code. `raw(key, value)` and `rawReset(key)` reach keys this build has no field for, and the server decides whether they are allowed.
 
+A geo topic also takes six durations in microseconds: `freshUploadInterval`,
+`consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`,
+`positionsResumeTimeout` and `longTermRewriteMaxInterval`. Each one overrides the server setting of
+the same name on every node. Zero is a value for them, so the SDK sends it. On a geo topic, an
+update can set them, and they are the only options that it can change there. An update cannot reset
+them. The server refuses them on a normal topic. When the topic does not set a duration, a topic
+read returns an empty `Optional` for it.
+
 ### Metadata Changes
 
 `getMetadataChanges` reads the node's change log: one record per public result of a committed metadata operation, such as a stream created, a topic renamed, a user's permissions changed or a session closed. A mirror keeps a cursor, asks for the records after it, and stores the returned `next` cursor. The call needs root or the global `manageServers` permission and works on blocking TCP, async TCP and HTTP.
@@ -637,7 +645,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 Replicated mutations serialize within their metadata or partition lane. If a sent mutation's

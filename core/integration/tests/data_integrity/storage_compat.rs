@@ -82,6 +82,10 @@
 //! graceful-shutdown assertion below is taken on the same log and fails
 //! loudly in that case rather than passing on an empty file.
 
+use crate::server::tiered_storage_fs::{
+    STREAM as TIERED_STREAM, TOPIC as TIERED_TOPIC, create_tiered_topic, fs_store_envs,
+    send_every_message, wait_for_eviction,
+};
 use bytes::Bytes;
 use iggy::prelude::*;
 use iggy_binary_protocol::codec::WireEncode;
@@ -101,6 +105,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -125,6 +130,18 @@ const BASELINE_DATA_ENV: &str = "COMPAT_BASELINE_DATA";
 /// Selects the server's config file, ahead of the relative default path the
 /// module documentation warns about.
 const CONFIG_PATH_ENV: &str = "IGGY_CONFIG_PATH";
+
+/// The file under the data directory that names the storage format of the
+/// build that created it.
+const STORAGE_FORMAT_FILE: &str = "storage-format";
+
+/// What every build since the storage format gate says when it refuses a data
+/// directory.
+const UNSUPPORTED_STORAGE: &str = "startup refused without modifying data";
+
+/// How long the baseline may take to refuse a data directory. It refuses
+/// before it binds a port or opens a partition.
+const REFUSAL_DEADLINE: Duration = Duration::from_secs(60);
 
 const JOURNAL_SLOTS_KEY: &str = "metadata.journal_slots";
 
@@ -1005,6 +1022,148 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
     );
 }
 
+/// A partition of a tiered topic keeps a chain file, and its older segments
+/// live only in the object store. A build from before tiered storage would
+/// read it as a partition that lost data, so a baseline with another storage
+/// format must refuse the whole directory and leave it as it was.
+///
+/// Run it with a baseline from before the storage format of the build under
+/// test: `COMPAT_BASELINE_SERVER` and `COMPAT_BASELINE_CONFIG` as for the
+/// seed half. A baseline with the same format fails it.
+#[tokio::test]
+#[parallel]
+#[ignore = "needs a baseline iggy-server and its config, see the test's documentation"]
+async fn given_a_tiered_data_directory_when_a_baseline_with_another_storage_format_boots_on_it_should_refuse_it_unchanged()
+ {
+    let baseline = baseline_server_binary();
+    let baseline_config = baseline_server_config();
+    let fixture = tempfile::tempdir().unwrap();
+    let baseline_document: toml::Value =
+        toml::from_str(&fs::read_to_string(&baseline_config).unwrap()).unwrap();
+    let launcher = baseline_launcher(fixture.path(), &baseline, &baseline_document);
+
+    let baseline_format = {
+        let envs = HashMap::from([(CONFIG_PATH_ENV.to_string(), baseline_config.clone())]);
+        let mut harness = TestHarness::builder()
+            .cluster_nodes(1)
+            .server(
+                TestServerConfig::builder()
+                    .executable_path(launcher.to_string_lossy().into_owned())
+                    .extra_envs(envs)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        harness
+            .start()
+            .await
+            .expect("the baseline boots on an empty data directory");
+        let format = fs::read(harness.server().data_path().join(STORAGE_FORMAT_FILE)).unwrap();
+        harness.stop().await.unwrap();
+        format
+    };
+
+    let store = tempfile::tempdir().unwrap();
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store.path()))
+                .build(),
+        )
+        .build()
+        .unwrap();
+    harness.start().await.unwrap();
+    let data_path = harness.server().data_path();
+    let client = harness.tcp_root_client().await.unwrap();
+    let stream = Identifier::named(TIERED_STREAM).unwrap();
+    let topic = Identifier::named(TIERED_TOPIC).unwrap();
+    client
+        .create_stream(TIERED_STREAM, &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_for_eviction(store.path(), &data_path).await;
+    drop(client);
+    harness.stop().await.unwrap();
+
+    let format = fs::read(data_path.join(STORAGE_FORMAT_FILE)).unwrap();
+    assert_ne!(
+        String::from_utf8_lossy(&format),
+        String::from_utf8_lossy(&baseline_format),
+        "the baseline writes the storage format of the build under test, so it would read the \
+         tiered partitions as its own. Either the build under test kept a format it changed, or \
+         the baseline is not from before it"
+    );
+    let directory = fixture.path().join("data");
+    copy_directory(&data_path, &directory);
+    let before = every_file(&directory);
+    assert!(
+        before.keys().any(|path| path.ends_with("remote.chain")),
+        "the data directory holds no chain file: {:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    let mut baseline = Command::new(&launcher)
+        .env("IGGY_PATH", &directory)
+        .env(CONFIG_PATH_ENV, &baseline_config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + REFUSAL_DEADLINE;
+    let status = loop {
+        if let Some(status) = baseline.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = baseline.kill();
+            let _ = baseline.wait();
+            panic!(
+                "the baseline still runs {REFUSAL_DEADLINE:?} after it booted on a directory of \
+                 storage format {:?}",
+                String::from_utf8_lossy(&format)
+            );
+        }
+        sleep(Duration::from_millis(100)).await;
+    };
+    let output = baseline.wait_with_output().unwrap();
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(!status.success(), "the baseline exited with {status}");
+    assert!(
+        said.contains(UNSUPPORTED_STORAGE),
+        "the baseline exited with {status} for another reason than the storage format: {said}"
+    );
+    assert!(
+        every_file(&directory) == before,
+        "the baseline changed the data directory it refused"
+    );
+}
+
+/// Every file under `root`, by its path below `root`, with its bytes.
+fn every_file(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![root.to_owned()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(root).unwrap().display().to_string();
+                files.insert(relative, fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
 /// Resolve one of the baseline artefacts to an absolute, existing path.
 ///
 /// The absolute requirement is not cosmetic for the binary. `ServerHandle::start`
@@ -1547,6 +1706,10 @@ async fn assert_topic_recovered(
         local_retention_size: seed
             .local_retention_size
             .and(recovered.local_retention_size),
+        topic_type: seed.topic_type.and(recovered.topic_type),
+        geo_mode: seed.geo_mode.and(recovered.geo_mode),
+        // No default is derived for them, so they read back as sent.
+        geo_durations: recovered.geo_durations,
         raw: BTreeMap::new(),
     };
     assert_eq!(

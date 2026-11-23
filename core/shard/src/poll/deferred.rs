@@ -336,6 +336,8 @@ struct PartitionStatus {
     /// A fault, a read history that changes, a state transfer, or a status
     /// other than normal.
     unstable: bool,
+    /// The view start is applied and the view is persisted. The quorum check
+    /// that bounds the reads of a cut-off primary waits for that write.
     view_started: bool,
     primary: bool,
     /// The incarnation that the owner of the partition serves.
@@ -356,7 +358,7 @@ impl PartitionStatus {
                 || partition.requires_state_transfer()
                 || !consensus.is_normal()
                 || consensus.is_transferring(),
-            view_started: consensus.applied_view_start(),
+            view_started: consensus.applied_view_start() && !consensus.needs_superblock_persist(),
             primary: consensus.is_primary(),
             incarnation,
         }
@@ -1247,6 +1249,17 @@ where
         Ok(visibility)
     }
 
+    /// Whether the partition's peer log dropped or replaced a segment that
+    /// `result` walked, see [`partitions::IggyPartition::peer_log_moved_under_read`].
+    fn peer_log_moved_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.peer_log_moved_under_read(result)
+            })
+            .unwrap_or(false)
+    }
+
     fn offset_stored_since(
         &self,
         namespace: IggyNamespace,
@@ -1294,6 +1307,9 @@ where
         let admission = (|| {
             request.options.validate(request.args.count)?;
             let (history, _, view) = self.validate_deferred_context(namespace, &request)?;
+            if let Some(error) = self.geo_position_refusal(namespace, request.consumer) {
+                return Err(error);
+            }
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
@@ -1615,6 +1631,12 @@ where
                 return;
             }
         };
+        // Whatever the read found in the store, a trim or a merge in the
+        // peer log it covers makes the retry plan from the new log.
+        if self.peer_log_moved_under_read(waiter.namespace, &result) {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        }
         let result = match result.checked() {
             Ok(result) => result,
             Err(error) => {
