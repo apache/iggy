@@ -73,7 +73,7 @@ pub struct IggyBenchDashboardServerArgs {
     pub omb_results_dir: Option<PathBuf>,
 
     /// Address at which readers open the dashboard, for example
-    /// https://benchmarks.iggy.apache.org. robots.txt and sitemap.xml use it for absolute links.
+    /// `https://benchmarks.iggy.apache.org`. robots.txt and sitemap.xml use it for absolute links.
     /// Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
     #[arg(long, value_name = "URL")]
     pub public_url: Option<PublicUrl>,

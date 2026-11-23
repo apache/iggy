@@ -463,7 +463,7 @@ Options:
       --embed-cache-max-gib <GIB>    Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the files that readers used least recently [default: 10]
       --config <CONFIG>              Dashboard configuration file: official suites, headline workloads, and thresholds [default: dashboard.toml]
       --omb-results-dir <DIR>        Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
-      --public-url <URL>             Address at which readers open the dashboard, for example https://benchmarks.iggy.apache.org. robots.txt and sitemap.xml use it for absolute links. Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
+      --public-url <URL>             Address at which readers open the dashboard, for example `https://benchmarks.iggy.apache.org`. robots.txt and sitemap.xml use it for absolute links. Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
   -h, --help                         Print help
   -V, --version                      Print version
 ```
