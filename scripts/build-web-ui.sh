@@ -25,6 +25,16 @@ set -Eeuo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE_DIR="${REPO_ROOT}/core/web_ui"
 
+# Deno installs an unrelated dx, which can come first on PATH.
+if [[ "$(dx --version 2>/dev/null)" != dioxus* ]]; then
+    echo "No Dioxus dx on PATH, install it with scripts/ci/install-dx.sh" >&2
+    exit 1
+fi
+
+# rustup picks the toolchain from the working directory, so cargo and rustup
+# use the one rust-toolchain.toml pins only from inside the repo.
+cd "${CRATE_DIR}"
+
 # dx stages under the cargo target directory, which CARGO_TARGET_DIR or a
 # cargo config can move, so ask cargo the same way dx does. Plain bash parses
 # the JSON so the script needs no jq.
@@ -40,6 +50,4 @@ TARGET_DIR="${BASH_REMATCH[1]}"
 rm -rf "${TARGET_DIR}/dx/iggy-web-ui" "${CRATE_DIR}/dist"
 
 rustup target add wasm32-unknown-unknown
-
-cd "${CRATE_DIR}"
 dx bundle --platform web --release --out-dir dist

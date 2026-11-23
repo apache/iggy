@@ -6,12 +6,16 @@ built with the Dioxus CLI, `dx`.
 
 ## Prerequisites
 
-`dx` must match the `dioxus` version in `Cargo.lock`. On Linux,
-`scripts/ci/install-dx.sh` downloads the pinned build. Elsewhere:
+`dx` must match the `dioxus` version in `Cargo.lock`. `scripts/ci/install-dx.sh`
+pins it as `DX_VERSION` and checks it against `Cargo.lock`. On Linux (glibc)
+and macOS it downloads that build into `~/.cargo/bin`, or the directory passed
+as its argument. Elsewhere it prints the `cargo install` command to run.
+On Linux it also installs the wasm-bindgen, wasm-opt and esbuild that
+`dx bundle` would otherwise download, so CI can build with `NO_DOWNLOADS=1`.
 
 ```bash
+./scripts/ci/install-dx.sh
 rustup target add wasm32-unknown-unknown
-cargo install dioxus-cli --version 0.7.10 --locked
 ```
 
 ## Release bundle

@@ -57,9 +57,11 @@ runs:
         # Test and Miri jobs execute nextest.
         install-nextest: ${{ startsWith(inputs.task, 'miri') || inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
         coverage: ${{ inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' }}
-        # These tasks do not compile workspace crates and need no native
-        # libraries. All compiling tasks keep the existing dependency setup.
-        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' }}
+        # These tasks need no native libraries. fmt, sort and machete compile
+        # nothing, and build-web-ui compiles only the web UI and its
+        # dependencies, none of which link hwloc or udev. All other compiling
+        # tasks keep the existing dependency setup.
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' && inputs.task != 'build-web-ui' }}
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
@@ -98,7 +100,8 @@ runs:
         tool: cargo-machete
 
     # dx is not in taiki-e/install-action's manifests, so the script fetches
-    # the pinned Dioxus release, like the cargo-sort step above.
+    # the pinned Dioxus release, like the cargo-sort step above. It also pins
+    # the wasm-bindgen, wasm-opt and esbuild that dx bundle would download.
     - name: Install dx
       if: inputs.task == 'build-web-ui'
       run: ./scripts/ci/install-dx.sh
@@ -131,6 +134,9 @@ runs:
     # build gets its own lint pass before the bundle.
     - name: Build web UI
       if: inputs.task == 'build-web-ui'
+      env:
+        # Makes dx take the tools install-dx.sh pinned from PATH.
+        NO_DOWNLOADS: "1"
       run: |
         rustup target add wasm32-unknown-unknown
         cargo clippy --locked -p iggy-web-ui --target wasm32-unknown-unknown --all-features --all-targets -- -D warnings
