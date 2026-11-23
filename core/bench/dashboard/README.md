@@ -223,6 +223,32 @@ The OMB embed pages and PNG files send `Cache-Control: public, max-age=3600`, be
 can change. A sidecar change reaches a cached OMB page or PNG within that hour. Error answers send no
 `Cache-Control`.
 
+### Pages and Crawlers
+
+The server answers each page path of the frontend router with `frontend/dist/index.html`. The status tells
+crawlers whether the page exists:
+
+- 200: `/`, `/explore`, `/methodology`, `/omb`, the compare pages, and the page of each run that the server loaded
+- 301: `/benchmarks/{uuid}` to `/runs/{uuid}`, and `/compare/{left}/{right}` to `/compare?runs={left},{right}`.
+  A run id in uppercase or without hyphens moves to its lowercase form. A page path with a trailing slash moves to
+  the path without it
+- 404: every other path, an unknown run, and a run id that does not parse. The body is the app, which shows its
+  not-found page
+
+The page answers send `Cache-Control: no-cache`, because each frontend build changes the script names in
+`index.html`. The compare pages send `X-Robots-Tag: noindex, follow`, because their query picks the runs. Every
+answer under `/api` and `/embed` sends `X-Robots-Tag: noindex`.
+
+The page paths are in `shared/src/pages.rs`. When you add a page to the frontend router, add its path there and
+its route in `server/src/handlers/pages.rs`. A test on each side fails until the three match.
+
+- `GET /robots.txt`
+  - Allows every crawler. With `--public-url`, the file also names the sitemap
+- `GET /sitemap.xml`
+  - Lists `/`, `/explore`, `/methodology`, every run page, `/omb` and every OMB run page, with absolute links.
+    The `lastmod` of a run page is the time of the run
+  - Needs `--public-url`. Without it, the answer is 404
+
 `/health` and the `/api` endpoints return JSON, with three exceptions. `/api/artifacts/{uuid}` returns a ZIP file,
 and the two OMB downloads return the original files. The embed endpoints return HTML or PNG. All of them use
 standard HTTP status codes:
@@ -232,8 +258,8 @@ standard HTTP status codes:
 - 404: Resource not found
 - 500: Server error
 
-An unknown `/api` path returns 404 with a JSON error. Every other path serves the frontend from `frontend/dist`.
-A page path with no file there gets `index.html` with 200, so the frontend's page links work.
+An unknown `/api` path returns 404 with a JSON error. Every other path serves a file from `frontend/dist`, or a
+page as [Pages and Crawlers](#pages-and-crawlers) describes.
 
 ## Prerequisites
 
@@ -408,6 +434,7 @@ Using a named volume:
 | `CACHE_DIR`           | not set                     | Directory for cached embeds and artifact zips. See `--cache-dir` |
 | `EMBED_CACHE_MAX_GIB` | not set                     | Size limit of the embed cache. See `--embed-cache-max-gib`       |
 | `OMB_RESULTS_DIR`     | not set                     | Directory for OMB results. See `--omb-results-dir`               |
+| `PUBLIC_URL`          | not set                     | Address at which readers open the dashboard. See `--public-url`  |
 
 #### Volume Permissions
 
@@ -436,6 +463,7 @@ Options:
       --embed-cache-max-gib <GIB>    Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the files that readers used least recently [default: 10]
       --config <CONFIG>              Dashboard configuration file: official suites, headline workloads, and thresholds [default: dashboard.toml]
       --omb-results-dir <DIR>        Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
+      --public-url <URL>             Address at which readers open the dashboard, for example https://benchmarks.iggy.apache.org. robots.txt and sitemap.xml use it for absolute links. Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
   -h, --help                         Print help
   -V, --version                      Print version
 ```
@@ -451,6 +479,10 @@ embed files at once, delete `embed/`. The default is `iggy-bench-dashboard` in t
 The server reads `--config` at start. The default is `dashboard.toml` in the working directory, and this
 directory holds the file for the official AWS suites. If a run's `suite` label is in `[[suites]]`, the run is
 official. If the file is missing or invalid, the server does not start.
+
+On a public host, set `--public-url` to the address at which readers open the dashboard, without a path. The
+sitemap and `robots.txt` need absolute links, and the server does not build them from the `Host` header of a
+request. If the argument is not set, the server logs a warning at start.
 
 ### Environment Variables for Development
 

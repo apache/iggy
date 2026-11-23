@@ -98,7 +98,8 @@ RUN chmod +x /app/docker-entrypoint.sh && \
     chown iggy:iggy /app/docker-entrypoint.sh
 
 # Set default environment variables for configuration. OMB_RESULTS_DIR has no default: set it,
-# for example to /data/omb_results, to show OpenMessaging Benchmark (OMB) results.
+# for example to /data/omb_results, to show OpenMessaging Benchmark (OMB) results. PUBLIC_URL has
+# no default: set it on a public host, so that robots.txt and sitemap.xml have absolute links.
 ENV HOST=0.0.0.0 \
     PORT=80 \
     RESULTS_DIR=/data/performance_results \

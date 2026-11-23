@@ -17,6 +17,7 @@
 
 use crate::embed_cache::DEFAULT_MAX_GIB;
 use crate::error::IggyBenchDashboardServerError;
+use crate::public_url::PublicUrl;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use serde::Deserialize;
 use std::fs;
@@ -70,6 +71,12 @@ pub struct IggyBenchDashboardServerArgs {
     /// Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
     #[arg(long, value_name = "DIR")]
     pub omb_results_dir: Option<PathBuf>,
+
+    /// Address at which readers open the dashboard, for example
+    /// https://benchmarks.iggy.apache.org. robots.txt and sitemap.xml use it for absolute links.
+    /// Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
+    #[arg(long, value_name = "URL")]
+    pub public_url: Option<PublicUrl>,
 }
 
 /// An `--omb-results-dir` that the server can't use.
