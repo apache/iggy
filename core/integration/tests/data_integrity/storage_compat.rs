@@ -290,6 +290,13 @@ const TOMBSTONE_MARKER: &str = "tombston";
 /// working under both instead of refusing to run.
 const TOMBSTONE_FIELD: &str = "tombstoned=";
 
+/// The geo setting that every boot prints with the rest of its configuration,
+/// as `tombstone_grace: 1day`. It names how long a deleted geo topic's
+/// tombstone stays in the object store, not a partition's state, and it
+/// contains [`TOMBSTONE_MARKER`] on every run. Removed like
+/// [`TOMBSTONE_FIELD`]: no arm that tombstones a partition writes this name.
+const TOMBSTONE_SETTING: &str = "tombstone_grace";
+
 /// Logged by `iggy-server`'s `main` once shutdown ran to completion. A stop
 /// that escalated to `SIGKILL` leaves crash-recovery state behind, which
 /// would make the next boot exercise crash recovery and compatibility at the
@@ -1009,9 +1016,7 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
     // matches against, so filtering it costs no matching power.
     let stdout = harness.server().stdout_plain();
     assert!(
-        !stdout
-            .replace(TOMBSTONE_FIELD, "")
-            .contains(TOMBSTONE_MARKER),
+        !reports_a_tombstoned_partition(&stdout),
         "the server under test tombstoned a partition rather than reading the baseline's \
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
@@ -1020,6 +1025,32 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
         &baseline_files,
         &disk::collect_comparable_files(&data_path, false),
     );
+}
+
+/// Whether a server log says that boot tombstoned a partition. The names that
+/// only share the marker's letters are taken out first.
+fn reports_a_tombstoned_partition(stdout: &str) -> bool {
+    stdout
+        .replace(TOMBSTONE_FIELD, "")
+        .replace(TOMBSTONE_SETTING, "")
+        .contains(TOMBSTONE_MARKER)
+}
+
+#[test]
+fn given_a_healthy_log_with_tombstone_names_when_checking_should_report_no_tombstoned_partition() {
+    let healthy = "geo: { origin: dc-a, tombstone_grace: 1day, manifest_poll_interval: 5s }\n\
+                   discarding a parked frame tombstoned=false\n";
+    assert!(!reports_a_tombstoned_partition(healthy));
+    for refusal in [
+        "tombstoning it",
+        "tombstoned rather than",
+        "tombstoning the",
+    ] {
+        assert!(
+            reports_a_tombstoned_partition(&format!("{healthy}{refusal}\n")),
+            "{refusal}"
+        );
+    }
 }
 
 /// A partition of a tiered topic keeps a chain file, and its older segments
