@@ -528,11 +528,17 @@ upload rate wants 64 MiB or more. With `read_cache_size` at 0, each poll reads
 exactly its bytes from the store and nothing it fetches is kept, but the shard
 still holds what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes
 are served only while the node reads that peer, and never across a change of
-the cluster that owns its root. The counters `remote_read_block_hits`,
-`remote_read_block_misses`, `remote_read_ahead_hits`,
-`remote_read_blocks_fetched_ahead`, `remote_read_demand_bytes`,
-`remote_read_ahead_bytes`, `remote_read_fresh_releases` and
-`remote_read_carried_bytes`, and the gauges `remote_read_cache_bytes` and
+the cluster that owns its root. The budget is shared by every partition of the
+shard. A size of a topic's own, once a topic can set one, is a limit on what
+each of its partitions keeps, not a reservation: a partition over its limit
+evicts its own blocks, and what a quiet partition leaves unused is there for
+the others. The
+counters `remote_read_block_hits`, `remote_read_block_misses`,
+`remote_read_ahead_hits`, `remote_read_blocks_fetched_ahead`,
+`remote_read_demand_bytes`, `remote_read_ahead_bytes`,
+`remote_read_fresh_releases`, `remote_read_carried_bytes` and
+`remote_read_limit_evictions`, the blocks that left because their partition was
+over its limit, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
 
 Each partition of a tiered topic also has a manifest object,

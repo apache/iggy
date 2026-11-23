@@ -20,7 +20,10 @@ use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::poll_plan::{PollPlan, PollReadResult, PollTier};
-use crate::{RemoteObjects, RemoteSegments, SegmentLocation};
+use crate::{
+    LIMIT_BLOCKS_MIN, PartitionReadSettings, ReadCache, ReadCacheSettings, RemoteObjects,
+    RemoteSegments, SegmentLocation,
+};
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::LocalBoxFuture;
@@ -89,6 +92,29 @@ fn strategies() -> [PollingStrategy; 4] {
 fn plan(partition: &mut IggyPartition<IggyMessageBus>, strategy: PollingStrategy) -> PollPlan {
     let args = PollingArgs::new(strategy, 10, false);
     partition.build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+}
+
+/// [`polled_all`] with the read settings `settings` for the partition.
+pub(super) async fn polled_all_reading(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    settings: PartitionReadSettings,
+) -> Vec<(Option<u64>, Vec<u8>)> {
+    let mut polls = Vec::new();
+    for strategy in strategies() {
+        let args = PollingArgs::new(strategy, 10, false);
+        let result = partition
+            .build_poll_plan_reading(
+                PollingConsumer::Consumer(1, 0),
+                &args,
+                false,
+                usize::MAX,
+                settings,
+            )
+            .execute()
+            .await;
+        polls.push(accepted(partition, result));
+    }
+    polls
 }
 
 fn accepted(
@@ -186,6 +212,83 @@ async fn given_evicted_segments_when_polling_across_them_should_return_the_bytes
     Box::pin(evict_sealed(&mut partition, directory.path())).await;
 
     assert_eq!(Box::pin(polled_all(&mut partition)).await, local);
+}
+
+/// A store that counts the GETs that reach it.
+struct Counted {
+    store: Rc<MemoryStore>,
+    gets: Cell<usize>,
+}
+
+impl RemoteObjects for Counted {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        self.gets.set(self.gets.get() + 1);
+        ObjectStore::get_range(&*self.store, key, range).boxed_local()
+    }
+}
+
+/// Every poll of [`strategies`] with `settings`, and the GETs they sent.
+async fn fetched(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    counted: &Counted,
+    settings: PartitionReadSettings,
+) -> (Vec<(Option<u64>, Vec<u8>)>, usize) {
+    let before = counted.gets.get();
+    let polled = Box::pin(polled_all_reading(partition, settings)).await;
+    (polled, counted.gets.get() - before)
+}
+
+/// The plan carries the partition's read settings to its reads: through the
+/// shard's cache a second pass asks the store nothing, a limit below eight
+/// blocks keeps nothing and asks it each time, and the partition that leaves
+/// the shard leaves nothing in the cache.
+#[compio::test]
+async fn given_evicted_segments_polled_with_each_limit_when_polling_twice_should_keep_within_it() {
+    const BLOCK_BYTES: u64 = 4096;
+    let (directory, mut partition, store, local) = Box::pin(uploaded_partition()).await;
+    let counted = Rc::new(Counted {
+        store,
+        gets: Cell::new(0),
+    });
+    let cache = ReadCache::new(ReadCacheSettings {
+        cache_bytes: 64 * 1024 * 1024,
+        block_bytes: BLOCK_BYTES,
+        read_ahead: 0,
+    });
+    partition.set_remote_segments(Rc::new(
+        RemoteSegments::new(Rc::clone(&counted) as _, layout())
+            .with_cache(Rc::clone(&counted) as _, &cache),
+    ));
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    let under = PartitionReadSettings {
+        limit: Some(usize::try_from((LIMIT_BLOCKS_MIN - 1) * BLOCK_BYTES).unwrap()),
+        read_ahead: None,
+    };
+    let shard = PartitionReadSettings::SHARD;
+
+    let (cold, cold_gets) = Box::pin(fetched(&mut partition, &counted, shard)).await;
+    let (warm, warm_gets) = Box::pin(fetched(&mut partition, &counted, shard)).await;
+    assert!(cache.take_metrics().cached_bytes > 0);
+    let (limited, limited_gets) = Box::pin(fetched(&mut partition, &counted, under)).await;
+    assert_eq!(
+        cache.take_metrics().cached_bytes,
+        0,
+        "the limit evicted what it held"
+    );
+    let (again, again_gets) = Box::pin(fetched(&mut partition, &counted, under)).await;
+
+    assert_eq!([&cold, &warm, &limited, &again], [&local; 4]);
+    assert!(cold_gets > 0);
+    assert_eq!(warm_gets, 0, "a second pass reads the cache");
+    assert!(limited_gets > 0 && again_gets == limited_gets);
+    Box::pin(fetched(&mut partition, &counted, shard)).await;
+    assert!(cache.take_metrics().cached_bytes > 0);
+    partition.forget_reads();
+    assert_eq!(cache.take_metrics().cached_bytes, 0);
 }
 
 #[compio::test]

@@ -53,12 +53,12 @@ use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
 use server_common::yield_to_reactor;
 
-use crate::RemoteSegments;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::poll_plan::{DiskFault, PartitionDirResolution};
 use crate::remote_segments::RemoteRange;
 use crate::remote_segments::{FRESH_READ_BYTES_MAX, FRESH_READ_GAP_BYTES, FreshReads};
+use crate::{PartitionReadSettings, RemoteSegments};
 
 const PREPARE_HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
@@ -128,6 +128,8 @@ pub struct PlacedReadPlan {
     /// The long-term segment after the last of [`Self::long_term`], which the
     /// poll does not read and readahead may.
     pub(crate) long_term_next: Option<ManifestSegment>,
+    /// How the partition's reads of the store use the shard's cache.
+    pub(crate) read_settings: PartitionReadSettings,
 }
 
 /// What [`PlacedReadPlan::read`] returns.
@@ -336,7 +338,7 @@ impl PlacedReadPlan {
                 .or(self.long_term_next.as_ref())
                 .map(|next| self.long_term_log(next));
             let index = self
-                .wait(remote.read_long_term_index(&log, LONG_TERM_INDEX_BYTES))
+                .wait(remote.read_long_term_index(&log, LONG_TERM_INDEX_BYTES, self.read_settings))
                 .await?;
             let mut position = wanted.first_position(&index, segment.size);
             let mut len = LONG_TERM_READ_BYTES;
@@ -344,7 +346,7 @@ impl PlacedReadPlan {
                 let end = segment.size.min(position.saturating_add(len));
                 let read = usize::try_from(end - position).map_err(|_| DiskFault::Tiered)?;
                 let chunk = self
-                    .wait(remote.read(&log, position, read, next.as_ref()))
+                    .wait(remote.read(&log, position, read, next.as_ref(), self.read_settings))
                     .await?;
                 match take_whole_batches(chunk.as_slice(), wanted, batches)? {
                     Read::Batches(bytes) => {
@@ -608,8 +610,13 @@ impl PlacedReadPlan {
                 Some(placement.position..end)
             })
             .collect();
-        self.wait(remote.fetch_fresh(first.placement.object_id, &blobs))
-            .await
+        self.wait(remote.fetch_fresh(
+            first.placement.object_id,
+            &blobs,
+            self.prefix,
+            self.read_settings,
+        ))
+        .await
     }
 
     /// The whole batch of `placed`: its header with the batch checksum it
@@ -632,8 +639,13 @@ impl PlacedReadPlan {
         let blob = if let Some(blob) = fetched.get(placement.object_id, &range) {
             blob
         } else {
-            self.wait(remote.read_fresh(placement.object_id, range))
-                .await?
+            self.wait(remote.read_fresh(
+                placement.object_id,
+                range,
+                self.prefix,
+                self.read_settings,
+            ))
+            .await?
         };
         whole_prepare(&whole_header(placed, &blob)?, &blob)
     }
@@ -1246,6 +1258,7 @@ mod tests {
             long_term: Vec::new(),
             long_term_floor: None,
             long_term_next: None,
+            read_settings: PartitionReadSettings::SHARD,
         }
     }
 

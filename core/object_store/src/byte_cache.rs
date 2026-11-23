@@ -42,6 +42,16 @@
 //! Bytes this node stored itself can be kept apart from both queues until
 //! their owner releases them, see [`Admission::Held`]. They take at most all
 //! but an eighth of the budget, see [`UNHELD_SHARE`].
+//!
+//! An entry can name its owner, and an owner can have a limit: the most its
+//! entries hold of the budget, see [`ByteCache::set_limit`]. A limit reserves
+//! nothing. An owner over its limit evicts its own entries, by the rules
+//! above applied to its entries alone: what it fetched ahead takes an eighth
+//! of its limit, its small queue a tenth, and it remembers the keys of as
+//! many bytes as its main queue may hold. A full budget evicts as without
+//! limits, whoever owns what leaves, and an insert never evicts another
+//! owner's entry while the budget has room for it. Entries without an owner,
+//! and every held entry, count against the budget alone.
 
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -93,16 +103,30 @@ pub enum Lookup {
     Miss,
 }
 
-/// Bytes by key, with the most memory they may hold together.
+/// Bytes by key, with the most memory they may hold together, and the most
+/// that the entries of each owner `O` with a limit may hold.
 #[derive(Debug)]
-pub struct ByteCache<K> {
-    entries: BTreeMap<K, Entry>,
+pub struct ByteCache<K, O = ()> {
+    entries: BTreeMap<K, Entry<O>>,
     lines: [Line<K>; 5],
+    /// The entries of each owner with a limit, by where they are. An owner
+    /// without one has no row: its entries count against the budget alone.
+    limited: BTreeMap<O, Limited<K>>,
     budget: usize,
     entered: u64,
+    /// Entries whose bytes left because their owner was over its limit,
+    /// since the last [`ByteCache::take_limit_evictions`].
+    limit_evictions: u64,
 }
 
-impl<K: Ord + Clone> ByteCache<K> {
+/// The entries of one owner with a limit.
+#[derive(Debug)]
+struct Limited<K> {
+    limit: usize,
+    lines: [Line<K>; 5],
+}
+
+impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
     #[must_use]
     pub const fn new(budget: usize) -> Self {
         Self {
@@ -114,8 +138,10 @@ impl<K: Ord + Clone> ByteCache<K> {
                 Line::new(),
                 Line::new(),
             ],
+            limited: BTreeMap::new(),
             budget,
             entered: 0,
+            limit_evictions: 0,
         }
     }
 
@@ -170,9 +196,31 @@ impl<K: Ord + Clone> ByteCache<K> {
     /// can be more than its length. Bytes that do not fit the whole budget
     /// are not kept.
     pub fn insert(&mut self, key: K, bytes: Bytes, held: usize, admission: Admission) {
+        self.admit(key, bytes, held, admission, None);
+    }
+
+    /// [`Self::insert`] for `owner`. Bytes that do not fit the owner's limit
+    /// are not kept, and an owner over its limit makes room among its own
+    /// entries first. Held bytes belong to no owner.
+    pub fn insert_owned(
+        &mut self,
+        key: K,
+        bytes: Bytes,
+        held: usize,
+        admission: Admission,
+        owner: O,
+    ) {
+        self.admit(key, bytes, held, admission, Some(owner));
+    }
+
+    fn admit(&mut self, key: K, bytes: Bytes, held: usize, admission: Admission, owner: Option<O>) {
         // The store's objects never change, so bytes the cache holds already
         // are these bytes.
         if self.holds(&key) || held > self.budget {
+            return;
+        }
+        let owner = owner.filter(|_| admission != Admission::Held);
+        if owner.is_some_and(|owner| self.limit(&owner).is_some_and(|limit| held > limit)) {
             return;
         }
         let remembered = self.entries.contains_key(&key);
@@ -181,6 +229,9 @@ impl<K: Ord + Clone> ByteCache<K> {
             // Released before room is made, so that what it releases can be
             // what leaves.
             self.release_held_past(self.held_limit().saturating_sub(held));
+        }
+        if let Some(owner) = owner {
+            self.make_owner_room(owner, held, admission == Admission::Ahead);
         }
         self.make_room(held, admission == Admission::Ahead);
         let place = match admission {
@@ -200,11 +251,87 @@ impl<K: Ord + Clone> ByteCache<K> {
                 entered: 0,
                 returns: 0,
                 ahead: admission != Admission::Read,
+                owner,
             },
         );
         // Bytes held alone past the share are released as they enter.
         self.release_held_past(self.held_limit());
         self.forget_old_keys();
+        if let Some(owner) = owner {
+            self.forget_old_keys_of(owner);
+        }
+    }
+
+    /// The limit of `owner`, `None` for one without.
+    #[must_use]
+    pub fn limit(&self, owner: &O) -> Option<usize> {
+        self.limited.get(owner).map(|limited| limited.limit)
+    }
+
+    /// Give `owner` the limit `limit`, evicting its entries down to it, or
+    /// take its limit away with `None`.
+    ///
+    /// The first limit of an owner looks for its entries among all of them,
+    /// once.
+    pub fn set_limit(&mut self, owner: O, limit: Option<usize>) {
+        let Some(limit) = limit else {
+            self.limited.remove(&owner);
+            return;
+        };
+        if let Some(limited) = self.limited.get_mut(&owner) {
+            limited.limit = limit;
+        } else {
+            let mut lines = [
+                Line::new(),
+                Line::new(),
+                Line::new(),
+                Line::new(),
+                Line::new(),
+            ];
+            for (key, entry) in &self.entries {
+                if entry.owner == Some(owner) {
+                    lines[entry.place as usize].put(entry.entered, key.clone(), entry.held);
+                }
+            }
+            self.limited.insert(owner, Limited { limit, lines });
+        }
+        self.make_owner_room(owner, 0, false);
+        self.forget_old_keys();
+        self.forget_old_keys_of(owner);
+    }
+
+    /// Drop every entry of `owner`, the keys it remembers too, and its limit.
+    /// The entries of an owner without a limit are looked for among all of
+    /// them.
+    pub fn remove_owner(&mut self, owner: &O) {
+        let keys: Vec<K> = match self.limited.remove(owner) {
+            Some(limited) => limited
+                .lines
+                .into_iter()
+                .flat_map(|line| line.order.into_values())
+                .collect(),
+            None => self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.owner.as_ref() == Some(owner))
+                .map(|(key, _)| key.clone())
+                .collect(),
+        };
+        for key in keys {
+            self.unlink(&key);
+        }
+    }
+
+    /// Bytes of memory the buffers of `owner` hold, when it has a limit.
+    #[must_use]
+    pub fn held_by(&self, owner: &O) -> Option<usize> {
+        self.limited.get(owner).map(Limited::held)
+    }
+
+    /// Entries whose bytes left because their owner was over its limit,
+    /// since the last call.
+    pub const fn take_limit_evictions(&mut self) -> u64 {
+        std::mem::replace(&mut self.limit_evictions, 0)
     }
 
     /// Put bytes kept under [`Admission::Held`] in the small queue, as its
@@ -294,6 +421,46 @@ impl<K: Ord + Clone> ByteCache<K> {
         }
     }
 
+    /// Evict among the entries of `owner` until `incoming` more bytes of it
+    /// fit its limit, by the rules of [`Self::make_room`] applied to its
+    /// entries alone. `ahead` says that readahead fetched them.
+    fn make_owner_room(&mut self, owner: O, incoming: usize, ahead: bool) {
+        loop {
+            let Some(limited) = self.limited.get(&owner) else {
+                return;
+            };
+            let limit = limited.limit;
+            let held = limited.held();
+            if held + incoming <= limit {
+                return;
+            }
+            let small = limited.held_in(Place::Small);
+            let waiting = limited.held_in(Place::Ahead);
+            let main_is_empty = limited.held_in(Place::Main) == 0;
+            let oldest = |place: Place| limited.lines[place as usize].oldest();
+            let with_incoming = waiting + if ahead { incoming } else { 0 };
+            let passed = if waiting > 0 && with_incoming > limit / AHEAD_SHARE {
+                oldest(Place::Ahead).inspect(|key| self.unlink(key))
+            } else if small > 0 && (small >= limit / SMALL_SHARE || main_is_empty) {
+                oldest(Place::Small).inspect(|key| self.pass_small(key))
+            } else if !main_is_empty {
+                oldest(Place::Main).inspect(|key| self.pass_main(key))
+            } else {
+                oldest(Place::Ahead).inspect(|key| self.unlink(key))
+            };
+            if passed.is_none() {
+                return;
+            }
+            if self
+                .limited
+                .get(&owner)
+                .is_none_or(|limited| limited.held() < held)
+            {
+                self.limit_evictions += 1;
+            }
+        }
+    }
+
     /// Drop the oldest entry of `place` with nothing remembered. `false`
     /// when it has none.
     fn drop_oldest(&mut self, place: Place) -> bool {
@@ -326,53 +493,63 @@ impl<K: Ord + Clone> ByteCache<K> {
         self.held_in(Place::Main) == 0
     }
 
-    /// Take the oldest entry out of the small queue: into the main queue if
-    /// readers came back to it, and out of the cache otherwise, with its key
-    /// remembered. `false` when the queue is empty.
+    /// Take the oldest entry out of the small queue, see
+    /// [`Self::pass_small`]. `false` when the queue is empty.
     fn pass_oldest_small(&mut self) -> bool {
-        let Some(key) = self.lines[Place::Small as usize].oldest() else {
-            return false;
-        };
+        self.lines[Place::Small as usize]
+            .oldest()
+            .inspect(|key| self.pass_small(key))
+            .is_some()
+    }
+
+    /// Take `key` out of the small queue: into the main queue if readers
+    /// came back to it, and out of the cache otherwise, with its key
+    /// remembered.
+    fn pass_small(&mut self, key: &K) {
         let (returns, ahead) = self
             .entries
-            .get(&key)
+            .get(key)
             .map_or((0, false), |entry| (entry.returns, entry.ahead));
         if returns > RETURNS_TO_STAY {
-            self.relink(&key, Place::Main);
-            if let Some(entry) = self.entries.get_mut(&key) {
+            self.relink(key, Place::Main);
+            if let Some(entry) = self.entries.get_mut(key) {
                 entry.returns = 0;
             }
         } else if ahead {
             // Nobody read the bytes, so a reader that arrives late is a
             // first reader. Remembering the key would count it as one that
             // came back.
-            self.unlink(&key);
+            self.unlink(key);
         } else {
-            self.relink(&key, Place::Gone);
-            if let Some(entry) = self.entries.get_mut(&key) {
+            self.relink(key, Place::Gone);
+            if let Some(entry) = self.entries.get_mut(key) {
                 entry.bytes = None;
             }
         }
-        true
     }
 
-    /// Take the oldest entry of the main queue: back in as its newest, with
-    /// one return less, if readers came back to it, and out of the cache
-    /// otherwise. `false` when the queue is empty.
+    /// Take the oldest entry of the main queue, see [`Self::pass_main`].
+    /// `false` when the queue is empty.
     fn pass_oldest_main(&mut self) -> bool {
-        let Some(key) = self.lines[Place::Main as usize].oldest() else {
-            return false;
-        };
-        let returns = self.entries.get(&key).map_or(0, |entry| entry.returns);
+        self.lines[Place::Main as usize]
+            .oldest()
+            .inspect(|key| self.pass_main(key))
+            .is_some()
+    }
+
+    /// Take `key` out of the main queue: back in as its newest, with one
+    /// return less, if readers came back to it, and out of the cache
+    /// otherwise.
+    fn pass_main(&mut self, key: &K) {
+        let returns = self.entries.get(key).map_or(0, |entry| entry.returns);
         if returns == 0 {
-            self.unlink(&key);
+            self.unlink(key);
         } else {
-            self.relink(&key, Place::Main);
-            if let Some(entry) = self.entries.get_mut(&key) {
+            self.relink(key, Place::Main);
+            if let Some(entry) = self.entries.get_mut(key) {
                 entry.returns = returns - 1;
             }
         }
-        true
     }
 
     /// Remember keys for as many bytes as the main queue may hold, and no
@@ -387,15 +564,38 @@ impl<K: Ord + Clone> ByteCache<K> {
         }
     }
 
+    /// [`Self::forget_old_keys`] among the keys of `owner`, by its limit,
+    /// so that an owner that reads much once leaves room for the keys that
+    /// others remember.
+    fn forget_old_keys_of(&mut self, owner: O) {
+        loop {
+            let Some(limited) = self.limited.get(&owner) else {
+                return;
+            };
+            let most = limited.limit - limited.limit / SMALL_SHARE;
+            if limited.held_in(Place::Gone) <= most {
+                return;
+            }
+            let Some(key) = limited.lines[Place::Gone as usize].oldest() else {
+                return;
+            };
+            self.unlink(&key);
+        }
+    }
+
     /// Move the entry under `key` to `place`, where the time it entered
     /// puts it.
     fn move_keeping_age(&mut self, key: &K, place: Place) {
         let Some(entry) = self.entries.get_mut(key) else {
             return;
         };
-        self.lines[entry.place as usize].take(entry.entered, entry.held);
+        let (from, entered, held) = (entry.place, entry.entered, entry.held);
         entry.place = place;
-        self.lines[place as usize].put(entry.entered, key.clone(), entry.held);
+        let owner = entry.owner;
+        for lines in self.lines_of(owner) {
+            lines[from as usize].take(entered, held);
+            lines[place as usize].put(entered, key.clone(), held);
+        }
     }
 
     /// Move the entry under `key` to `place`, as its newest.
@@ -403,22 +603,49 @@ impl<K: Ord + Clone> ByteCache<K> {
         let Some(mut entry) = self.entries.remove(key) else {
             return;
         };
-        self.lines[entry.place as usize].take(entry.entered, entry.held);
+        for lines in self.lines_of(entry.owner) {
+            lines[entry.place as usize].take(entry.entered, entry.held);
+        }
         entry.place = place;
         self.link(key.clone(), entry);
     }
 
-    fn link(&mut self, key: K, mut entry: Entry) {
+    fn link(&mut self, key: K, mut entry: Entry<O>) {
         self.entered += 1;
         entry.entered = self.entered;
-        self.lines[entry.place as usize].put(self.entered, key.clone(), entry.held);
+        for lines in self.lines_of(entry.owner) {
+            lines[entry.place as usize].put(entry.entered, key.clone(), entry.held);
+        }
         self.entries.insert(key, entry);
     }
 
     fn unlink(&mut self, key: &K) {
         if let Some(entry) = self.entries.remove(key) {
-            self.lines[entry.place as usize].take(entry.entered, entry.held);
+            for lines in self.lines_of(entry.owner) {
+                lines[entry.place as usize].take(entry.entered, entry.held);
+            }
         }
+    }
+
+    /// The lines that an entry of `owner` is in: the cache's, and its
+    /// owner's when that has a limit.
+    fn lines_of(&mut self, owner: Option<O>) -> impl Iterator<Item = &mut [Line<K>; 5]> {
+        let limited = owner.and_then(|owner| self.limited.get_mut(&owner));
+        std::iter::once(&mut self.lines).chain(limited.map(|limited| &mut limited.lines))
+    }
+}
+
+impl<K> Limited<K> {
+    const fn held_in(&self, place: Place) -> usize {
+        self.lines[place as usize].held
+    }
+
+    /// Bytes of memory its buffers hold.
+    const fn held(&self) -> usize {
+        self.held_in(Place::Small)
+            + self.held_in(Place::Main)
+            + self.held_in(Place::Ahead)
+            + self.held_in(Place::Kept)
     }
 }
 
@@ -438,7 +665,7 @@ enum Place {
 }
 
 #[derive(Debug)]
-struct Entry {
+struct Entry<O> {
     /// `None` for a key the cache only remembers.
     bytes: Option<Bytes>,
     held: usize,
@@ -451,6 +678,7 @@ struct Entry {
     /// Nobody asked for the bytes when they entered, and no reader has read
     /// them.
     ahead: bool,
+    owner: Option<O>,
 }
 
 /// Keys in the order they entered, with the memory their buffers hold.
@@ -504,8 +732,16 @@ mod tests {
         }
     }
 
-    /// The keys whose bytes the cache holds in `place`, the oldest first.
     fn keys_in(cache: &ByteCache<u32>, place: Place) -> Vec<u32> {
+        owned_keys_in(cache, place)
+    }
+
+    fn assert_bounds(cache: &ByteCache<u32>) {
+        assert_owned_bounds(cache);
+    }
+
+    /// The keys whose bytes the cache holds in `place`, the oldest first.
+    fn owned_keys_in<O>(cache: &ByteCache<u32, O>, place: Place) -> Vec<u32> {
         cache.lines[place as usize]
             .order
             .values()
@@ -513,11 +749,12 @@ mod tests {
             .collect()
     }
 
-    fn assert_bounds(cache: &ByteCache<u32>) {
+    fn assert_owned_bounds<O: Copy + Ord + std::fmt::Debug>(cache: &ByteCache<u32, O>) {
         assert!(cache.held() <= cache.budget());
         assert!(cache.held_apart() <= cache.held_limit());
         assert!(cache.held_in(Place::Gone) <= cache.budget());
         let mut summed = [0; 5];
+        let mut by_owner: BTreeMap<O, [usize; 5]> = BTreeMap::new();
         for (key, entry) in &cache.entries {
             summed[entry.place as usize] += entry.held;
             assert_eq!(entry.bytes.is_none(), entry.place == Place::Gone);
@@ -525,12 +762,32 @@ mod tests {
                 cache.lines[entry.place as usize].order.get(&entry.entered),
                 Some(key)
             );
+            if entry.place == Place::Kept {
+                assert_eq!(entry.owner, None, "a held entry belongs to no owner");
+            }
+            if let Some(limited) = entry.owner.and_then(|owner| cache.limited.get(&owner)) {
+                assert_eq!(
+                    limited.lines[entry.place as usize]
+                        .order
+                        .get(&entry.entered),
+                    Some(key)
+                );
+                by_owner.entry(entry.owner.unwrap()).or_default()[entry.place as usize] +=
+                    entry.held;
+            }
         }
         for (line, held) in cache.lines.iter().zip(summed) {
             assert_eq!(line.held, held);
         }
         let linked: usize = cache.lines.iter().map(|line| line.order.len()).sum();
         assert_eq!(linked, cache.entries.len());
+        for (owner, limited) in &cache.limited {
+            let summed = by_owner.get(owner).copied().unwrap_or_default();
+            for (line, held) in limited.lines.iter().zip(summed) {
+                assert_eq!(line.held, held, "{owner:?}");
+            }
+            assert!(limited.held() <= limited.limit, "{owner:?}");
+        }
     }
 
     /// A cache whose main queue holds `shared`, each read by four readers.
@@ -939,6 +1196,206 @@ mod tests {
         assert_bounds(&cache);
     }
 
+    /// A cache of `budget` whose owner `B` holds `shared` in the main queue,
+    /// each read by four readers.
+    fn owned_cache_with_shared(budget: usize, shared: &[u32]) -> ByteCache<u32, char> {
+        let mut cache = ByteCache::new(budget);
+        for key in shared {
+            for _ in 0..4 {
+                read_as(&mut cache, 'B', *key, 10);
+            }
+        }
+        for key in 10_000..10_000 + u32::try_from(budget / 10).unwrap() {
+            read_as(&mut cache, 'B', key, 10);
+        }
+        assert_eq!(owned_keys_in(&cache, Place::Main), shared);
+        cache
+    }
+
+    fn read_as(cache: &mut ByteCache<u32, char>, owner: char, key: u32, len: usize) -> bool {
+        match cache.read(&key) {
+            Lookup::Miss => {
+                cache.insert_owned(key, buffer(len), len, Admission::Read, owner);
+                false
+            }
+            Lookup::Hit(_) | Lookup::AheadHit(_) => true,
+        }
+    }
+
+    /// The keys of `owner` whose bytes the cache holds.
+    fn held_keys_of(cache: &ByteCache<u32, char>, owner: char) -> Vec<u32> {
+        cache
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.owner == Some(owner) && entry.bytes.is_some())
+            .map(|(key, _)| *key)
+            .collect()
+    }
+
+    #[test]
+    fn given_an_owner_over_its_limit_when_it_inserts_should_evict_only_its_own_entries() {
+        let mut cache = ByteCache::new(100);
+        for key in [1, 2, 3] {
+            read_as(&mut cache, 'B', key, 10);
+        }
+        cache.set_limit('A', Some(30));
+
+        for key in 10..20 {
+            read_as(&mut cache, 'A', key, 10);
+            assert_owned_bounds(&cache);
+        }
+
+        assert_eq!(held_keys_of(&cache, 'A'), [17, 18, 19]);
+        assert_eq!(held_keys_of(&cache, 'B'), [1, 2, 3]);
+        assert_eq!(cache.held_by(&'A'), Some(30));
+        assert_eq!(cache.take_limit_evictions(), 7);
+        assert_eq!(cache.take_limit_evictions(), 0);
+    }
+
+    /// An owner over its limit turns over its own small queue, so what
+    /// others share stays in the main queue however much it reads once.
+    #[test]
+    fn given_entries_another_owner_shares_when_an_owner_over_its_limit_reads_a_long_history_should_keep_them()
+     {
+        let shared = [1, 2, 3, 4, 5];
+        let mut cache = owned_cache_with_shared(100, &shared);
+        cache.set_limit('A', Some(50));
+
+        for key in 100..5_000 {
+            read_as(&mut cache, 'A', key, 10);
+            assert_owned_bounds(&cache);
+        }
+
+        assert_eq!(owned_keys_in(&cache, Place::Main), shared);
+        assert!(cache.held_by(&'A').unwrap() <= 50);
+    }
+
+    #[test]
+    fn given_limits_that_add_up_to_more_than_the_budget_when_every_owner_inserts_should_keep_within_the_budget()
+     {
+        let mut cache = ByteCache::new(100);
+        for owner in ['A', 'B', 'C'] {
+            cache.set_limit(owner, Some(60));
+        }
+
+        for key in 0..300 {
+            let owner = ['A', 'B', 'C'][key as usize % 3];
+            read_as(&mut cache, owner, key, 10);
+            assert_owned_bounds(&cache);
+        }
+
+        assert_eq!(cache.held(), 100);
+        for owner in ['A', 'B', 'C'] {
+            assert!(cache.held_by(&owner).unwrap() <= 60);
+        }
+    }
+
+    #[test]
+    fn given_a_limit_below_the_entry_size_when_inserting_should_keep_nothing_for_that_owner() {
+        let mut cache = ByteCache::new(100);
+        cache.set_limit('A', Some(9));
+
+        read_as(&mut cache, 'A', 1, 10);
+        cache.insert_owned(2, buffer(10), 10, Admission::Ahead, 'A');
+        read_as(&mut cache, 'B', 3, 10);
+
+        assert!(!cache.holds(&1) && !cache.holds(&2));
+        assert!(cache.holds(&3));
+        assert_eq!(cache.held_by(&'A'), Some(0));
+        assert_owned_bounds(&cache);
+    }
+
+    #[test]
+    fn given_a_lower_limit_when_set_should_evict_the_owner_down_to_it() {
+        let mut cache = ByteCache::new(100);
+        for key in [1, 2, 3, 4] {
+            read_as(&mut cache, 'A', key, 10);
+        }
+        read_as(&mut cache, 'B', 5, 10);
+        cache.set_limit('A', Some(40));
+        assert_eq!(
+            cache.held_by(&'A'),
+            Some(40),
+            "the first limit finds its entries"
+        );
+
+        cache.set_limit('A', Some(20));
+
+        assert_eq!(held_keys_of(&cache, 'A'), [3, 4]);
+        assert_eq!(held_keys_of(&cache, 'B'), [5]);
+        assert_eq!(cache.take_limit_evictions(), 2);
+        cache.set_limit('A', None);
+        assert_eq!(cache.held_by(&'A'), None);
+        assert_eq!(cache.limit(&'A'), None);
+        assert_owned_bounds(&cache);
+    }
+
+    #[test]
+    fn given_an_owner_when_removed_should_drop_its_entries_its_keys_and_its_limit() {
+        let mut cache = ByteCache::new(40);
+        for key in [1, 2, 3, 4, 5] {
+            read_as(&mut cache, 'A', key, 10);
+        }
+        read_as(&mut cache, 'B', 6, 10);
+        assert_eq!(owned_keys_in(&cache, Place::Gone), [1, 2]);
+        let mut unlimited = ByteCache::<u32, char>::new(40);
+        for key in [1, 2, 3] {
+            read_as(&mut unlimited, 'A', key, 10);
+        }
+        cache.set_limit('A', Some(40));
+
+        cache.remove_owner(&'A');
+        unlimited.remove_owner(&'A');
+
+        assert_eq!(cache.held(), 10);
+        assert_eq!(owned_keys_in(&cache, Place::Gone), [0_u32; 0]);
+        assert_eq!(cache.limit(&'A'), None);
+        assert_eq!(unlimited.held(), 0);
+        assert_owned_bounds(&cache);
+        assert_owned_bounds(&unlimited);
+    }
+
+    /// What this node stored and holds belongs to no owner, so no limit
+    /// touches it.
+    #[test]
+    fn given_held_entries_when_owners_are_over_their_limits_should_keep_them() {
+        let mut cache = ByteCache::new(100);
+        cache.insert(1, buffer(10), 10, Admission::Held);
+        cache.insert_owned(2, buffer(10), 10, Admission::Held, 'A');
+        cache.set_limit('A', Some(20));
+
+        for key in 10..40 {
+            read_as(&mut cache, 'A', key, 10);
+        }
+
+        assert!(cache.is_held(&1) && cache.is_held(&2));
+        assert_eq!(cache.held_by(&'A'), Some(20));
+        assert_owned_bounds(&cache);
+    }
+
+    /// What readahead fetched for an owner counts towards its limit, and
+    /// an owner at its limit keeps at most an eighth of it waiting.
+    #[test]
+    fn given_bytes_fetched_ahead_for_an_owner_when_inserted_should_count_towards_its_limit_and_its_ahead_share()
+     {
+        let mut cache = ByteCache::new(1_000);
+        cache.set_limit('A', Some(80));
+        cache.insert_owned(1, buffer(10), 10, Admission::Ahead, 'A');
+        assert_eq!(cache.held_by(&'A'), Some(10));
+        for key in 10..17 {
+            read_as(&mut cache, 'A', key, 10);
+        }
+        assert_eq!(cache.held_by(&'A'), Some(80));
+
+        for key in [2, 3, 4] {
+            cache.insert_owned(key, buffer(10), 10, Admission::Ahead, 'A');
+            assert_owned_bounds(&cache);
+        }
+
+        assert_eq!(owned_keys_in(&cache, Place::Ahead), [4]);
+        assert_eq!(cache.held_by(&'A'), Some(80));
+    }
+
     #[test]
     fn given_random_reads_of_buffers_of_many_sizes_when_run_should_keep_every_bound() {
         let mut random = StdRng::seed_from_u64(0x1667);
@@ -963,7 +1420,78 @@ mod tests {
             if step % 5_000 == 0 {
                 cache.set_budget(random.random_range(300..2_000));
             }
-            assert_bounds(&cache);
+            assert_owned_bounds(&cache);
+        }
+    }
+
+    /// Owners with and without limits that come and go: every bound holds
+    /// after each step, and an owner's insert evicts no other owner's bytes
+    /// while the budget has room for it.
+    #[test]
+    fn given_random_reads_of_owners_with_limits_when_run_should_keep_every_bound_and_leave_others_alone()
+     {
+        let mut random = StdRng::seed_from_u64(0x0768);
+        let mut cache = ByteCache::<u32, u8>::new(1_000);
+        for step in 0..50_000_u32 {
+            let key = if random.random_bool(0.6) {
+                random.random_range(0..20)
+            } else {
+                random.random_range(0..400)
+            };
+            let len = 1 + (key as usize * 37) % 300;
+            // One owner per key, as for the blocks of a partition's objects.
+            let owner = u8::try_from(key % 5).unwrap();
+            let fits = cache.held() + len <= cache.budget()
+                && cache.limit(&owner).is_none_or(|limit| len <= limit);
+            let others: Vec<u32> = cache
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.bytes.is_some() && entry.owner != Some(owner))
+                .map(|(key, _)| *key)
+                .collect();
+            let owned_insert = match random.random_range(0..14) {
+                0 => {
+                    cache.insert_owned(key, buffer(len), len, Admission::Ahead, owner);
+                    true
+                }
+                1 => {
+                    cache.remove(&key);
+                    false
+                }
+                2 => {
+                    cache.insert(key, buffer(len), len, Admission::Held);
+                    false
+                }
+                3 => {
+                    cache.release(&key);
+                    false
+                }
+                4 => {
+                    let limit = random.random_bool(0.8).then(|| random.random_range(0..600));
+                    cache.set_limit(owner, limit);
+                    false
+                }
+                5 if random.random_bool(0.1) => {
+                    cache.remove_owner(&owner);
+                    false
+                }
+                _ => match cache.read(&key) {
+                    Lookup::Miss => {
+                        cache.insert_owned(key, buffer(len), len, Admission::Read, owner);
+                        true
+                    }
+                    Lookup::Hit(_) | Lookup::AheadHit(_) => false,
+                },
+            };
+            if owned_insert && fits {
+                for other in others {
+                    assert!(cache.holds(&other), "step {step}: {other} left for {key}");
+                }
+            }
+            if step % 5_000 == 0 {
+                cache.set_budget(random.random_range(300..2_000));
+            }
+            assert_owned_bounds(&cache);
         }
     }
 }

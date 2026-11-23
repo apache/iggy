@@ -67,6 +67,7 @@ async fn read_disk_faults_closed_when_earlier_segment_unreadable() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![
             DiskSegment {
@@ -151,6 +152,7 @@ async fn read_disk_serves_a_batch_wider_than_the_sized_chunk() {
         deadline: None,
         bytes_per_message: Some(1),
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,
@@ -246,6 +248,7 @@ async fn read_disk_faults_closed_when_earlier_segment_corrupt() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![
             DiskSegment {
@@ -332,6 +335,7 @@ async fn read_disk_faults_closed_on_batch_checksum_mismatch() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum,
         segments: vec![DiskSegment {
             start_offset: 0,
@@ -379,6 +383,7 @@ fn file_less_plan(persisted: u64) -> DiskReadPlan {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         segments: vec![DiskSegment {
             start_offset: 0,
             persisted,
@@ -447,6 +452,7 @@ async fn read_disk_faults_closed_when_partition_dir_unresolvable() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         segments: vec![DiskSegment {
             start_offset: 0,
             persisted: 512,
@@ -524,6 +530,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,
@@ -566,6 +573,7 @@ async fn read_disk_caches_and_reuses_sealed_segment_fd() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,
@@ -637,6 +645,7 @@ async fn read_disk_does_not_retain_fd_for_untracked_handle() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,
@@ -732,6 +741,7 @@ async fn read_disk_reloads_sealed_index_to_skip_scan() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,
@@ -842,6 +852,7 @@ async fn read_disk_resolves_oversized_index_without_materializing() {
         deadline: None,
         bytes_per_message: None,
         widest_batch_bytes: 0,
+        read_settings: crate::PartitionReadSettings::SHARD,
         validate_checksum: true,
         segments: vec![DiskSegment {
             start_offset: 0,

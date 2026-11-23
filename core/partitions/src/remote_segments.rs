@@ -41,8 +41,8 @@ use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, LongTermKey, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey,
-    SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
+    ErrorClass, KeyLayout, LongTermKey, ObjectPrefix, ObjectRange, ObjectStore, ObjectStoreError,
+    SegmentKey, SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
@@ -53,7 +53,9 @@ use tracing::{error, warn};
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
-use crate::remote_blocks::{ReadCache, ReadGate, RemoteBlocks, RemoteReadMetrics, StoreSlot};
+use crate::remote_blocks::{
+    PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks, RemoteReadMetrics, StoreSlot,
+};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -382,9 +384,32 @@ impl RemoteSegments {
         }
     }
 
+    /// The partition whose incarnation `prefix` names in this store left the
+    /// shard: what its reads keep goes, and what its GETs in flight fetch is
+    /// not kept.
+    pub(crate) fn forget_reader(&self, prefix: ObjectPrefix) {
+        if let Some(blocks) = &self.blocks {
+            blocks.forget_reader(prefix);
+        }
+    }
+
+    /// How the partition `prefix` names reads through the cache with
+    /// `settings`, `None` without a cache that keeps what it fetches for it.
+    fn reading(
+        &self,
+        prefix: ObjectPrefix,
+        settings: PartitionReadSettings,
+    ) -> Option<(&RemoteBlocks, Reading)> {
+        let blocks = self.fetched_into_cache()?;
+        Some((blocks, blocks.reading(prefix, settings)?))
+    }
+
     /// The bytes at `range` of the fresh object `object_id`: the blob of one
     /// batch, from memory when this shard holds them and from the store
     /// otherwise.
+    ///
+    /// The reader is the partition whose incarnation `prefix` names, reading
+    /// with `settings`.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the range.
@@ -392,18 +417,20 @@ impl RemoteSegments {
         &self,
         object_id: u128,
         range: Range<u64>,
+        prefix: ObjectPrefix,
+        settings: PartitionReadSettings,
     ) -> Result<Bytes, DiskFault> {
-        if let Some(blocks) = &self.blocks {
-            if let Some(blob) = blocks
-                .held_fresh(object_id)
-                .and_then(|object| slice_at(&object, 0, &range))
-            {
-                return Ok(blob);
-            }
-            if blocks.cache().keeps_fetched() {
-                let key = self.layout.fresh_key(object_id);
-                return blocks.read_fresh(object_id, &key, range).await;
-            }
+        if let Some(blob) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.held_fresh(object_id))
+            .and_then(|object| slice_at(&object, 0, &range))
+        {
+            return Ok(blob);
+        }
+        if let Some((blocks, reading)) = self.reading(prefix, settings) {
+            let key = self.layout.fresh_key(object_id);
+            return blocks.read_fresh(reading, object_id, &key, range).await;
         }
         self.read_fresh_from_store(object_id, range).await
     }
@@ -459,10 +486,11 @@ impl RemoteSegments {
         &self,
         log: &RemoteRange,
         cap: u64,
+        settings: PartitionReadSettings,
     ) -> Result<Bytes, DiskFault> {
         let key = self.object_key(log, SegmentObject::Index);
-        if let Some(blocks) = self.fetched_into_cache() {
-            return blocks.read_segment_index(log, &key, cap).await;
+        if let Some((blocks, reading)) = self.reading(log.key.prefix, settings) {
+            return blocks.read_segment_index(reading, log, &key, cap).await;
         }
         self.objects
             .get_range(&key, 0..cap)
@@ -478,7 +506,8 @@ impl RemoteSegments {
     /// blobs come in its blocks. Otherwise blobs that sit within
     /// [`FRESH_READ_GAP_BYTES`] of each other come in one read of at most
     /// [`FRESH_READ_BYTES_MAX`]. The poll takes its blobs from the returned
-    /// reads, which the cache may have had no room to keep.
+    /// reads, which the cache may have had no room to keep. The reader is as
+    /// in [`Self::read_fresh`].
     ///
     /// # Errors
     /// As [`Self::read_fresh`].
@@ -486,31 +515,37 @@ impl RemoteSegments {
         &self,
         object_id: u128,
         ranges: &[Range<u64>],
+        prefix: ObjectPrefix,
+        settings: PartitionReadSettings,
     ) -> Result<FreshReads, DiskFault> {
         let mut missing: Vec<Range<u64>> = ranges
             .iter()
             .filter(|range| range.start < range.end)
             .cloned()
             .collect();
-        if let Some(blocks) = &self.blocks {
-            if let Some(object) = blocks.held_fresh(object_id) {
-                return Ok(FreshReads {
-                    object_id,
-                    reads: vec![(0, object)],
-                });
-            }
-            let start = missing.iter().map(|range| range.start).min();
-            let end = missing.iter().map(|range| range.end).max();
-            if blocks.cache().keeps_fetched()
-                && let Some((start, end)) = start.zip(end)
-            {
-                let key = self.layout.fresh_key(object_id);
-                let bytes = blocks.read_fresh(object_id, &key, start..end).await?;
-                return Ok(FreshReads {
-                    object_id,
-                    reads: vec![(start, bytes)],
-                });
-            }
+        if let Some(object) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.held_fresh(object_id))
+        {
+            return Ok(FreshReads {
+                object_id,
+                reads: vec![(0, object)],
+            });
+        }
+        let start = missing.iter().map(|range| range.start).min();
+        let end = missing.iter().map(|range| range.end).max();
+        if let Some((start, end)) = start.zip(end)
+            && let Some((blocks, reading)) = self.reading(prefix, settings)
+        {
+            let key = self.layout.fresh_key(object_id);
+            let bytes = blocks
+                .read_fresh(reading, object_id, &key, start..end)
+                .await?;
+            return Ok(FreshReads {
+                object_id,
+                reads: vec![(start, bytes)],
+            });
         }
         missing.sort_unstable_by_key(|range| range.start);
         let mut reads: Vec<Range<u64>> = Vec::new();
@@ -565,8 +600,9 @@ impl RemoteSegments {
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
-    /// of the segment. `next` is the segment the reader goes on to, if it
-    /// is in the same store, which readahead may run on into.
+    /// of the segment, for the partition that reads it with `settings`.
+    /// `next` is the segment the reader goes on to, if it is in the same
+    /// store, which readahead may run on into.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the segment holds.
@@ -576,6 +612,7 @@ impl RemoteSegments {
         position: u64,
         len: usize,
         next: Option<&RemoteRange>,
+        settings: PartitionReadSettings,
     ) -> Result<Frozen<4096>, DiskFault> {
         let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
@@ -583,10 +620,12 @@ impl RemoteSegments {
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
-        if let Some(blocks) = self.fetched_into_cache() {
+        if let Some((blocks, reading)) = self.reading(source.key.prefix, settings) {
             let next_key = next.map(|next| self.object_key(next, next.key.object));
             let next = next.zip(next_key.as_deref());
-            return blocks.read_segment(source, &key, start..end, next).await;
+            return blocks
+                .read_segment(reading, source, &key, start..end, next)
+                .await;
         }
         let object = self
             .objects
@@ -1423,7 +1462,10 @@ mod tests {
         let remote = RemoteSegments::new(store.clone(), KeyLayout::new("iggy").unwrap());
         let blobs = [100..200, 200..300, 1000..1100];
 
-        let fetched = remote.fetch_fresh(7, &blobs).await.unwrap();
+        let fetched = remote
+            .fetch_fresh(7, &blobs, log().key.prefix, PartitionReadSettings::SHARD)
+            .await
+            .unwrap();
 
         assert_eq!(store.ranges.borrow().len(), 1);
         assert_eq!(store.ranges.borrow()[0], 100..1100);
@@ -1448,7 +1490,10 @@ mod tests {
         let third = far + FRESH_READ_BYTES_MAX;
         let blobs = [third..third + 100, 0..100, far..far + 100];
 
-        remote.fetch_fresh(7, &blobs).await.unwrap();
+        remote
+            .fetch_fresh(7, &blobs, log().key.prefix, PartitionReadSettings::SHARD)
+            .await
+            .unwrap();
 
         assert_eq!(
             *store.ranges.borrow(),
@@ -1462,7 +1507,15 @@ mod tests {
         let remote = RemoteSegments::new(store, KeyLayout::new("iggy").unwrap());
 
         assert_eq!(
-            remote.fetch_fresh(7, &[100..200, 200..300]).await.err(),
+            remote
+                .fetch_fresh(
+                    7,
+                    &[100..200, 200..300],
+                    log().key.prefix,
+                    PartitionReadSettings::SHARD
+                )
+                .await
+                .err(),
             Some(DiskFault::Tiered)
         );
     }
