@@ -855,7 +855,7 @@ pub const DISK_POLL_CHUNK_MAX: u64 = 1 << 20;
 /// Smallest first read of a disk poll. Below this the syscall and the segment
 /// walk cost more than the bytes the smaller read saves, and a poll for a
 /// handful of messages would issue a read per batch.
-const DISK_POLL_CHUNK_MIN: u64 = 64 << 10;
+pub const DISK_POLL_CHUNK_MIN: u64 = 64 << 10;
 
 /// How the chunk loop over one segment ended.
 enum SegmentWalk {

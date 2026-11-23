@@ -18,7 +18,8 @@
 //! Reads of segments whose `.log` left the disk.
 //!
 //! A poll plan names a remote segment by an object and a byte range in it,
-//! and the walk reads that range with ranged GETs straight from the store.
+//! and the walk reads that range with ranged GETs from the store, through a
+//! cache of the object's blocks on the shard's own store.
 //! The segment's sparse index is the local `.index` while one is usable, and
 //! otherwise the `.index` object, fetched once and kept on disk. The fetch
 //! runs in a task of its own (see [`IndexFetch`]), apart from the polls that
@@ -50,6 +51,7 @@ use tracing::{error, warn};
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
+use crate::remote_blocks::{ReadCacheSettings, RemoteBlocks, RemoteReadMetrics};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -460,6 +462,9 @@ pub struct RemoteSegments {
     /// See [`INDEX_GET_TIMEOUT`].
     pub(crate) index_get_timeout: Duration,
     fresh: RefCell<FreshCache>,
+    /// The blocks of `.log` objects, `None` for reads that go to the store
+    /// for exactly their range.
+    pub(crate) blocks: Option<Rc<RemoteBlocks>>,
 }
 
 impl RemoteSegments {
@@ -470,7 +475,43 @@ impl RemoteSegments {
             layout,
             index_get_timeout: INDEX_GET_TIMEOUT,
             fresh: RefCell::new(FreshCache::new(FRESH_CACHE_BYTES)),
+            blocks: None,
         }
+    }
+
+    /// Reads of the node's own store through the tier service `executor`,
+    /// which keep the `.log` objects they read in memory and fetch ahead of a
+    /// poll that reads a segment in order, as `settings` say. With no cache
+    /// bytes they read as [`Self::new`] does.
+    #[must_use]
+    pub fn cached<E>(executor: E, layout: KeyLayout, settings: ReadCacheSettings) -> Self
+    where
+        E: TierExecutor + Clone + 'static,
+    {
+        let ahead = Rc::new(ExecutorObjects::with_class(
+            executor.clone(),
+            TierJobClass::SpeculativeFetch,
+        ));
+        Self::new(Rc::new(ExecutorObjects::new(executor)), layout).with_blocks(ahead, settings)
+    }
+
+    /// Keep `.log` objects in blocks, and fetch ahead through `ahead`, as
+    /// `settings` say.
+    pub(crate) fn with_blocks(
+        mut self,
+        ahead: Rc<dyn RemoteObjects>,
+        settings: ReadCacheSettings,
+    ) -> Self {
+        self.blocks = (settings.cache_bytes > 0)
+            .then(|| Rc::new(RemoteBlocks::new(Rc::clone(&self.objects), ahead, settings)));
+        self
+    }
+
+    /// What the reads of `.log` objects did since the last take, `None`
+    /// when they keep no blocks.
+    #[must_use]
+    pub fn take_read_metrics(&self) -> Option<RemoteReadMetrics> {
+        self.blocks.as_ref().map(|blocks| blocks.take_metrics())
     }
 
     /// Keep at most `budget` bytes of fresh objects in memory.
@@ -660,6 +701,9 @@ impl RemoteSegments {
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
+        if let Some(blocks) = &self.blocks {
+            return blocks.read(source, &key, start..end).await;
+        }
         let object = self
             .objects
             .get_range(&key, start..end)
@@ -838,7 +882,9 @@ fn field(entry: &[u8; IGGY_INDEX_SIZE], slot: usize) -> u64 {
     u64::from_le_bytes(bytes)
 }
 
-fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
+/// What a store that failed a read of `key` with `error` means for the poll,
+/// logged: retryable for a transient error, tiered for any other.
+pub fn fault(key: &str, error: &ObjectStoreError) -> DiskFault {
     warn!(
         target: "iggy.partitions.diag",
         plane = "partitions",

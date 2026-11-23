@@ -546,6 +546,27 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn given_bare_byte_counts_for_the_read_cache_env_vars_when_loading_should_read_bytes() {
+        let cfg = load_with_env_vars(&[
+            ("IGGY_TIERED_STORAGE_READ_CACHE_SIZE", "33554432"),
+            ("IGGY_TIERED_STORAGE_READ_CACHE_BLOCK_SIZE", "65536"),
+            ("IGGY_TIERED_STORAGE_READ_AHEAD", "0"),
+        ])
+        .expect("config with bare byte counts for the read cache deserializes");
+
+        assert_eq!(cfg.tiered_storage.read_cache_size.as_bytes_u64(), 32 << 20);
+        assert_eq!(
+            cfg.tiered_storage.read_cache_block_size.as_bytes_u64(),
+            64 << 10
+        );
+        assert_eq!(cfg.tiered_storage.read_ahead.as_bytes_u64(), 0);
+        cfg.tiered_storage
+            .validate_tuning()
+            .expect("a read cache without readahead validates");
+    }
+
     /// The shipped file, like every file written before tiered storage, has
     /// no `[tiered_storage]` table.
     #[test]

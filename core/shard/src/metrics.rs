@@ -526,6 +526,19 @@ pub struct ShardMetrics {
     /// Fresh objects this shard stored that carry proof rows and no data,
     /// because no window closed soon enough after their batches committed.
     fresh_confirmations_total: Counter,
+    /// Blocks of `.log` objects that polls took from the read cache of the
+    /// node's own store, and the blocks they fetched or waited for.
+    remote_read_block_hits_total: Counter,
+    remote_read_block_misses_total: Counter,
+    /// First reads of blocks that readahead fetched, and the blocks it
+    /// fetched.
+    remote_read_ahead_hits_total: Counter,
+    remote_read_blocks_fetched_ahead_total: Counter,
+    /// Bytes of the GETs that polls waited for, and of the GETs of readahead.
+    remote_read_demand_bytes_total: Counter,
+    remote_read_ahead_bytes_total: Counter,
+    /// Bytes that the read cache holds.
+    remote_read_cache_bytes: Gauge,
     /// 1 while this node passes the store identity check of tiered storage.
     /// Both object store gauges hold for the whole node, so every shard
     /// exports the same ones, see [`Self::share_object_store_gauges`].
@@ -760,6 +773,13 @@ impl ShardMetrics {
             fresh_object_size: fresh_object_size_histogram(),
             fresh_proof_lag_seconds: Gauge::default(),
             fresh_confirmations_total: Counter::default(),
+            remote_read_block_hits_total: Counter::default(),
+            remote_read_block_misses_total: Counter::default(),
+            remote_read_ahead_hits_total: Counter::default(),
+            remote_read_blocks_fetched_ahead_total: Counter::default(),
+            remote_read_demand_bytes_total: Counter::default(),
+            remote_read_ahead_bytes_total: Counter::default(),
+            remote_read_cache_bytes: Gauge::default(),
             object_store_identity_verified: Gauge::default(),
             object_store_unreachable: Gauge::default(),
             geo_peer_identity_verified: Family::default(),
@@ -921,6 +941,23 @@ impl ShardMetrics {
     }
 
     /// Set `object_store_identity_verified`, for every shard that shares it.
+    /// What the read cache of the node's own store did since the last take,
+    /// see [`partitions::RemoteSegments::take_read_metrics`].
+    pub fn record_remote_reads(&self, reads: &partitions::RemoteReadMetrics) {
+        self.remote_read_block_hits_total.inc_by(reads.block_hits);
+        self.remote_read_block_misses_total
+            .inc_by(reads.block_misses);
+        self.remote_read_ahead_hits_total
+            .inc_by(reads.read_ahead_hits);
+        self.remote_read_blocks_fetched_ahead_total
+            .inc_by(reads.blocks_fetched_ahead);
+        self.remote_read_demand_bytes_total
+            .inc_by(reads.demand_bytes);
+        self.remote_read_ahead_bytes_total.inc_by(reads.ahead_bytes);
+        self.remote_read_cache_bytes
+            .set(i64::try_from(reads.cached_bytes).unwrap_or(i64::MAX));
+    }
+
     pub fn set_object_store_identity_verified(&self, verified: bool) {
         self.object_store_identity_verified.set(i64::from(verified));
     }
@@ -2835,6 +2872,42 @@ impl ShardMetrics {
             self.pump_tick_lateness.clone(),
         );
         registry.register(
+            "remote_read_block_hits",
+            "blocks of segments in the object store that polls took from the read cache",
+            self.remote_read_block_hits_total.clone(),
+        );
+        registry.register(
+            "remote_read_block_misses",
+            "blocks of segments in the object store that polls fetched, or waited for while \
+             another poll fetched them",
+            self.remote_read_block_misses_total.clone(),
+        );
+        registry.register(
+            "remote_read_ahead_hits",
+            "first reads of blocks that readahead fetched",
+            self.remote_read_ahead_hits_total.clone(),
+        );
+        registry.register(
+            "remote_read_blocks_fetched_ahead",
+            "blocks that readahead fetched before any poll asked for them",
+            self.remote_read_blocks_fetched_ahead_total.clone(),
+        );
+        registry.register(
+            "remote_read_demand_bytes",
+            "bytes of the object store reads that polls waited for",
+            self.remote_read_demand_bytes_total.clone(),
+        );
+        registry.register(
+            "remote_read_ahead_bytes",
+            "bytes of the object store reads of readahead",
+            self.remote_read_ahead_bytes_total.clone(),
+        );
+        registry.register(
+            "remote_read_cache_bytes",
+            "bytes of segments in the object store that the read cache holds",
+            self.remote_read_cache_bytes.clone(),
+        );
+        registry.register(
             "object_store_identity_verified",
             "1 while this node passes the store identity check of tiered storage, so it runs uploads and object deletes",
             self.object_store_identity_verified.clone(),
@@ -3487,6 +3560,42 @@ mod tests {
                 scrape.lines().any(|line| line == series),
                 "{series} is not in the scrape:\n{scrape}"
             );
+        }
+    }
+
+    #[test]
+    fn given_remote_reads_of_two_sweeps_when_scraping_should_add_the_counts_and_show_the_last_level()
+     {
+        let metrics = ShardMetrics::for_shard();
+        let reads = partitions::RemoteReadMetrics {
+            block_hits: 3,
+            block_misses: 2,
+            read_ahead_hits: 1,
+            blocks_fetched_ahead: 4,
+            demand_bytes: 512,
+            ahead_bytes: 1024,
+            cached_bytes: 2048,
+        };
+        metrics.record_remote_reads(&reads);
+        metrics.record_remote_reads(&partitions::RemoteReadMetrics {
+            cached_bytes: 1536,
+            ..reads
+        });
+
+        let mut registry = Registry::default();
+        metrics.register(&mut registry);
+        let mut buffer = String::new();
+        prometheus_client::encoding::text::encode(&mut buffer, &registry).unwrap();
+        for line in [
+            "remote_read_block_hits_total 6",
+            "remote_read_block_misses_total 4",
+            "remote_read_ahead_hits_total 2",
+            "remote_read_blocks_fetched_ahead_total 8",
+            "remote_read_demand_bytes_total 1024",
+            "remote_read_ahead_bytes_total 2048",
+            "remote_read_cache_bytes 1536",
+        ] {
+            assert!(buffer.lines().any(|scraped| scraped == line), "{line}");
         }
     }
 

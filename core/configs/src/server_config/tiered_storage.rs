@@ -61,6 +61,25 @@ pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
 /// each object would wait for the upload interval.
 pub const FRESH_PENDING_BYTES_MIN: u64 = 4 * 1024 * 1024;
 
+/// The smallest `read_cache_block_size`: the smallest piece a poll reads from
+/// the store. Mirrors `partitions::DISK_POLL_CHUNK_MIN`.
+pub const READ_CACHE_BLOCK_SIZE_MIN: u64 = 64 * 1024;
+
+/// The largest `read_cache_block_size`: the largest piece a poll reads from
+/// the store, above which most reads would fetch more than they ask for.
+/// Mirrors `partitions::DISK_POLL_CHUNK_MAX`.
+pub const READ_CACHE_BLOCK_SIZE_MAX: u64 = 1024 * 1024;
+
+/// What `read_ahead` is at most, as a part of `read_cache_size`: one in this
+/// many. Bytes that readahead fetched wait for their reader in that part of
+/// the cache. Mirrors `iggy_object_store::AHEAD_SHARE`.
+pub const READ_AHEAD_CACHE_SHARE: u64 = 8;
+
+/// The fewest blocks of `read_cache_block_size` that a `read_ahead` other
+/// than zero holds: the blocks of the first readahead in front of a reader.
+/// Mirrors `partitions::READ_AHEAD_START_BLOCKS`.
+pub const READ_AHEAD_BLOCKS_MIN: u64 = 2;
+
 /// The object store that tiered storage keeps segments in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -273,6 +292,27 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_max_retry_delay")]
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
+    /// The bytes of the segments read from the store that one shard keeps
+    /// in memory for the next polls of the same bytes. Zero turns the cache
+    /// and readahead off. Otherwise at least [`READ_AHEAD_CACHE_SHARE`]
+    /// blocks.
+    #[serde(default = "default_read_cache_size")]
+    #[config_env(leaf)]
+    pub read_cache_size: IggyByteSize,
+    /// The bytes of one block of the read cache, the piece it fetches and
+    /// keeps. From [`READ_CACHE_BLOCK_SIZE_MIN`] to
+    /// [`READ_CACHE_BLOCK_SIZE_MAX`].
+    #[serde(default = "default_read_cache_block_size")]
+    #[config_env(leaf)]
+    pub read_cache_block_size: IggyByteSize,
+    /// The most bytes past a poll that the shard fetches before any poll
+    /// asks for them, when polls read a segment in order. Zero turns
+    /// readahead off. Otherwise at least [`READ_AHEAD_BLOCKS_MIN`] blocks,
+    /// and at most one part in [`READ_AHEAD_CACHE_SHARE`] of
+    /// `read_cache_size`.
+    #[serde(default = "default_read_ahead")]
+    #[config_env(leaf)]
+    pub read_ahead: IggyByteSize,
     /// The shortest time between the starts of two uploads of fresh objects
     /// on one shard, unless an object fills first. A send that finds a free
     /// upload slot and the last upload started at least this long ago is
@@ -308,8 +348,7 @@ pub struct TieredStorageConfig {
 /// and how many bytes they hold.
 ///
 /// Segment uploads, fresh uploads, object deletes, cold reads that a poll
-/// waits for and housekeeping go through the tier service. Speculative
-/// fetches do not yet, so their caps take no effect.
+/// waits for, readahead and housekeeping go through the tier service.
 #[derive(Debug, Deserialize, Serialize, Clone, PartialEq, ConfigEnv)]
 #[serde(deny_unknown_fields)]
 pub struct TierJobsConfig {
@@ -394,6 +433,9 @@ impl Default for TieredStorageConfig {
             max_attempts: default_max_attempts(),
             retry_delay: default_retry_delay(),
             max_retry_delay: default_max_retry_delay(),
+            read_cache_size: default_read_cache_size(),
+            read_cache_block_size: default_read_cache_block_size(),
+            read_ahead: default_read_ahead(),
             fresh_upload_interval: default_fresh_upload_interval(),
             long_term_backlog_limit: default_long_term_backlog_limit(),
             fresh_pending_bytes: default_fresh_pending_bytes(),
@@ -444,7 +486,8 @@ impl Display for TieredStorageConfig {
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
              url_style: {}, credentials: {}, gcs: {}, jobs: {}, mock_s3: {}, \
              request_timeout: {}, progress_timeout: {}, max_attempts: {}, retry_delay: {}, \
-             max_retry_delay: {}, fresh_upload_interval: {}, long_term_backlog_limit: {}, \
+             max_retry_delay: {}, read_cache_size: {}, read_cache_block_size: {}, \
+             read_ahead: {}, fresh_upload_interval: {}, long_term_backlog_limit: {}, \
              fresh_pending_bytes: {}, fresh_partition_pending_bytes: {} }}",
             self.backend,
             self.prefix,
@@ -462,6 +505,9 @@ impl Display for TieredStorageConfig {
             self.max_attempts,
             self.retry_delay,
             self.max_retry_delay,
+            self.read_cache_size,
+            self.read_cache_block_size,
+            self.read_ahead,
             self.fresh_upload_interval,
             self.long_term_backlog_limit,
             self.fresh_pending_bytes,
@@ -545,8 +591,9 @@ impl TieredStorageConfig {
     ///
     /// # Errors
     /// [`ConfigurationError::InvalidConfigurationValue`] for a cap of zero, a
-    /// duration outside its bounds, no attempt, or a backoff cap below its
-    /// start.
+    /// duration outside its bounds, no attempt, a backoff cap below its
+    /// start, or a read cache whose block size, size and readahead do not
+    /// fit together.
     pub fn validate_tuning(&self) -> Result<(), ConfigurationError> {
         let jobs = &self.jobs;
         let counts = [
@@ -590,6 +637,7 @@ impl TieredStorageConfig {
         if self.max_retry_delay.get_duration() < self.retry_delay.get_duration() {
             return refuse("max_retry_delay must not be shorter than retry_delay");
         }
+        self.validate_read_cache()?;
         if self.fresh_upload_interval.get_duration() > FRESH_UPLOAD_INTERVAL_MAX {
             return refuse(&format!(
                 "fresh_upload_interval must be at most {}",
@@ -604,6 +652,48 @@ impl TieredStorageConfig {
             ));
         }
         self.validate_fresh_pending_bytes()
+    }
+
+    /// The block size always, and the size and readahead of a cache that is
+    /// on. The messages give exact bytes: rounded, a value one byte past a
+    /// bound prints as the bound.
+    fn validate_read_cache(&self) -> Result<(), ConfigurationError> {
+        let block = self.read_cache_block_size.as_bytes_u64();
+        if !(READ_CACHE_BLOCK_SIZE_MIN..=READ_CACHE_BLOCK_SIZE_MAX).contains(&block) {
+            return refuse(&format!(
+                "read_cache_block_size is {block} B and must be between \
+                 {READ_CACHE_BLOCK_SIZE_MIN} B and {READ_CACHE_BLOCK_SIZE_MAX} B"
+            ));
+        }
+        let cache_size = self.read_cache_size.as_bytes_u64();
+        if cache_size == 0 {
+            return Ok(());
+        }
+        if cache_size < READ_AHEAD_CACHE_SHARE * block {
+            return refuse(&format!(
+                "read_cache_size is {cache_size} B and must be 0 or at least \
+                 {READ_AHEAD_CACHE_SHARE} blocks of read_cache_block_size ({block} B), so the \
+                 part that holds readahead fits a block"
+            ));
+        }
+        let read_ahead = self.read_ahead.as_bytes_u64();
+        if read_ahead == 0 {
+            return Ok(());
+        }
+        if read_ahead < READ_AHEAD_BLOCKS_MIN * block {
+            return refuse(&format!(
+                "read_ahead is {read_ahead} B and must be 0 or at least {READ_AHEAD_BLOCKS_MIN} \
+                 blocks of read_cache_block_size ({block} B), what the first readahead fetches"
+            ));
+        }
+        if read_ahead > cache_size / READ_AHEAD_CACHE_SHARE {
+            return refuse(&format!(
+                "read_ahead is {read_ahead} B and must be 0 or at most one part in \
+                 {READ_AHEAD_CACHE_SHARE} of read_cache_size ({cache_size} B), the part of the \
+                 cache that holds what readahead fetched"
+            ));
+        }
+        Ok(())
     }
 
     fn validate_fresh_pending_bytes(&self) -> Result<(), ConfigurationError> {
@@ -689,6 +779,18 @@ fn default_retry_delay() -> IggyDuration {
 
 fn default_max_retry_delay() -> IggyDuration {
     IggyDuration::new_from_secs(5)
+}
+
+fn default_read_cache_size() -> IggyByteSize {
+    IggyByteSize::from(64 * 1024 * 1024)
+}
+
+fn default_read_cache_block_size() -> IggyByteSize {
+    IggyByteSize::from(256 * 1024)
+}
+
+fn default_read_ahead() -> IggyByteSize {
+    IggyByteSize::from(2 * 1024 * 1024)
 }
 
 fn default_fresh_upload_interval() -> IggyDuration {
@@ -984,6 +1086,118 @@ mod tests {
 
         assert!(shortest.validate().is_ok(), "{shortest}");
         assert!(longest.validate().is_ok(), "{longest}");
+    }
+
+    #[test]
+    fn given_no_read_cache_keys_when_reading_the_section_should_use_64_mib_256_kib_and_2_mib() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(config.read_cache_size.as_bytes_u64(), 64 << 20);
+        assert_eq!(config.read_cache_block_size.as_bytes_u64(), 256 << 10);
+        assert_eq!(config.read_ahead.as_bytes_u64(), 2 << 20);
+        let defaults = TieredStorageConfig::default();
+        assert_eq!(config.read_cache_size, defaults.read_cache_size);
+        assert_eq!(config.read_cache_block_size, defaults.read_cache_block_size);
+        assert_eq!(config.read_ahead, defaults.read_ahead);
+        assert!(config.validate().is_ok());
+        assert!(defaults.validate_tuning().is_ok());
+        let printed = format!(
+            "read_cache_size: {}, read_cache_block_size: {}, read_ahead: {},",
+            config.read_cache_size, config.read_cache_block_size, config.read_ahead
+        );
+        assert!(config.to_string().contains(&printed), "{config}");
+    }
+
+    fn read_cache(size: &str, block_size: &str, read_ahead: &str) -> TieredStorageConfig {
+        TieredStorageConfig {
+            read_cache_size: size.parse().unwrap(),
+            read_cache_block_size: block_size.parse().unwrap(),
+            read_ahead: read_ahead.parse().unwrap(),
+            ..fs_config()
+        }
+    }
+
+    #[test]
+    fn given_a_read_cache_block_size_outside_64_kib_to_1_mib_when_validating_should_refuse_even_with_the_cache_off()
+     {
+        assert!(read_cache("64 MiB", "64 KiB", "2 MiB").validate().is_ok());
+        assert!(read_cache("64 MiB", "1 MiB", "2 MiB").validate().is_ok());
+        for size in ["64 MiB", "0"] {
+            assert!(
+                read_cache(size, "65535 B", "0").validate().is_err(),
+                "{size}"
+            );
+            assert!(
+                read_cache(size, "1048577 B", "0").validate().is_err(),
+                "{size}"
+            );
+            assert!(read_cache(size, "0", "0").validate().is_err(), "{size}");
+        }
+        let no_backend = TieredStorageConfig {
+            read_cache_block_size: "2 MiB".parse().unwrap(),
+            ..TieredStorageConfig::default()
+        };
+        assert!(no_backend.validate_tuning().is_err());
+    }
+
+    /// An eighth of the cache holds what readahead fetched, and it has to
+    /// hold one block.
+    #[test]
+    fn given_a_read_cache_smaller_than_eight_blocks_when_validating_should_refuse() {
+        assert!(read_cache("2 MiB", "256 KiB", "0").validate().is_ok());
+        assert!(read_cache("2097151 B", "256 KiB", "0").validate().is_err());
+        assert!(read_cache("8 MiB", "1 MiB", "0").validate().is_ok());
+        assert!(read_cache("8388607 B", "1 MiB", "0").validate().is_err());
+        assert!(read_cache("1 B", "64 KiB", "0").validate().is_err());
+    }
+
+    #[test]
+    fn given_read_ahead_below_two_blocks_when_validating_should_refuse() {
+        assert!(
+            read_cache("64 MiB", "256 KiB", "512 KiB")
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            read_cache("64 MiB", "256 KiB", "524287 B")
+                .validate()
+                .is_err()
+        );
+        assert!(
+            read_cache("64 MiB", "256 KiB", "256 KiB")
+                .validate()
+                .is_err()
+        );
+        assert!(read_cache("64 MiB", "1 MiB", "1 MiB").validate().is_err());
+        assert!(
+            read_cache("64 MiB", "256 KiB", "0").validate().is_ok(),
+            "no readahead"
+        );
+    }
+
+    #[test]
+    fn given_read_ahead_past_an_eighth_of_the_read_cache_when_validating_should_refuse() {
+        assert!(read_cache("64 MiB", "256 KiB", "8 MiB").validate().is_ok());
+        assert!(
+            read_cache("64 MiB", "256 KiB", "8388609 B")
+                .validate()
+                .is_err()
+        );
+        assert!(read_cache("8 MiB", "256 KiB", "1 MiB").validate().is_ok());
+        assert!(read_cache("8 MiB", "256 KiB", "2 MiB").validate().is_err());
+        let no_backend = TieredStorageConfig {
+            read_ahead: "9 MiB".parse().unwrap(),
+            ..TieredStorageConfig::default()
+        };
+        assert!(no_backend.validate_tuning().is_err());
+    }
+
+    #[test]
+    fn given_the_read_cache_turned_off_when_validating_should_not_check_its_size_or_readahead() {
+        assert!(read_cache("0", "256 KiB", "1 B").validate().is_ok());
+        assert!(read_cache("0", "256 KiB", "1 GiB").validate().is_ok());
+        assert!(read_cache("0", "64 KiB", "0").validate().is_ok());
     }
 
     #[test]

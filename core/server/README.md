@@ -510,6 +510,21 @@ The cluster accepts `tiered_storage` on a topic only while every node has a
 backend and passes the store identity check described below. Until then the
 request fails with `FeatureUnavailable`.
 
+A poll reads a segment in the store in blocks of `read_cache_block_size`,
+256 KiB by default, and each shard keeps up to `read_cache_size` of them in
+memory. A smaller block wastes less on small or random reads, and a larger one
+suits consumers that read forward. A poll of bytes that another poll read a
+moment ago takes them from there, and polls that miss the same block at once
+share one read. When polls read a segment in order, the shard also fetches up
+to `read_ahead` bytes past the last poll before any poll asks for them. These
+fetches take the speculative fetch caps of `[tiered_storage.jobs]` and start
+only while no poll waits for the store. With `read_cache_size` at 0, each poll
+reads exactly its bytes from the store. Reads of the stores of geo peers are
+not kept. The counters `remote_read_block_hits`, `remote_read_block_misses`,
+`remote_read_ahead_hits`, `remote_read_blocks_fetched_ahead`,
+`remote_read_demand_bytes` and `remote_read_ahead_bytes`, and the gauge
+`remote_read_cache_bytes`, show what the cache of each shard does.
+
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
 It lists the segments that the store holds, with their offsets, timestamps,

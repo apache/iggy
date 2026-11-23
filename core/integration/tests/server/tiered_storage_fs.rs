@@ -26,6 +26,8 @@ use iggy_object_store::{FsStore, ObjectStore, PartitionManifest};
 use integration::harness::{TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
+use super::http_client::HttpClient;
+
 pub(crate) const STREAM: &str = "tiered-stream";
 pub(crate) const TOPIC: &str = "tiered-topic";
 pub(crate) const PARTITION_ID: u32 = 0;
@@ -39,6 +41,8 @@ const READY_DEADLINE: Duration = Duration::from_secs(60);
 /// take.
 pub(crate) const TIERING_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// How long the shards may take to report the reads of a pass on `/metrics`.
+const METRICS_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_back_from_the_store()
@@ -70,6 +74,49 @@ async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_
     assert!(
         segment_logs(store.path()).len() >= uploaded,
         "the store lost segments over the restart"
+    );
+}
+
+/// The test's messages fit the read cache of a shard at its defaults.
+#[tokio::test]
+async fn given_segments_read_once_from_the_store_when_reading_them_again_should_serve_them_from_the_read_cache()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = server_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let http = HttpClient::login_root(&harness).await;
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_until_only_the_open_segment_is_local(store.path(), &harness.server().data_path()).await;
+
+    // One message a poll, so that the polls of a segment read it in order.
+    if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
+        panic!("first pass: {error}");
+    }
+    let first = settled_read_cache_counts(&http, |counts| counts.demand_bytes > 0).await;
+    assert!(
+        first.blocks_fetched_ahead > 0,
+        "readahead fetched nothing in front of the first pass: {first:?}"
+    );
+    if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
+        panic!("second pass: {error}");
+    }
+    let second = settled_read_cache_counts(&http, |counts| *counts != first).await;
+
+    assert!(
+        second.block_hits > first.block_hits,
+        "the second pass took no block from the read cache: {first:?}, then {second:?}"
+    );
+    assert_eq!(
+        second.demand_bytes, first.demand_bytes,
+        "the second pass asked the store again: {first:?}, then {second:?}"
     );
 }
 
@@ -160,6 +207,97 @@ pub(crate) async fn wait_for_eviction(store: &Path, data_path: &Path) -> usize {
     }
 }
 
+/// Waits until the data directory holds the open segment alone, and the store
+/// every other one.
+async fn wait_until_only_the_open_segment_is_local(store: &Path, data_path: &Path) {
+    let deadline = Instant::now() + TIERING_DEADLINE;
+    loop {
+        let uploaded = segment_logs(store);
+        // The data directory holds other `.log` files, such as the server's
+        // own log.
+        let local: Vec<String> = segment_logs(data_path)
+            .into_iter()
+            .filter(|name| name.strip_suffix(".log").is_some_and(is_start_offset))
+            .collect();
+        if local.len() == 1 && !uploaded.is_empty() && !uploaded.contains(&local[0]) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "within {TIERING_DEADLINE:?} the sealed segments did not all leave the disk: the \
+             store holds {uploaded:?}, the data directory {local:?}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Whether `name` is a start offset as segment files spell it.
+fn is_start_offset(name: &str) -> bool {
+    name.len() == 20 && name.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// What the read caches of the server's shards did, summed over the shards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadCacheCounts {
+    block_hits: u64,
+    demand_bytes: u64,
+    blocks_fetched_ahead: u64,
+}
+
+/// The counts once two scrapes a poll interval apart agree and `ready`
+/// accepts them. A shard copies its counts out once a tick, so one scrape
+/// can miss the last reads.
+async fn settled_read_cache_counts(
+    http: &HttpClient,
+    ready: impl Fn(&ReadCacheCounts) -> bool,
+) -> ReadCacheCounts {
+    let deadline = Instant::now() + METRICS_DEADLINE;
+    let mut last = read_cache_counts(http).await;
+    loop {
+        sleep(POLL_INTERVAL).await;
+        let counts = read_cache_counts(http).await;
+        if counts == last && ready(&counts) {
+            return counts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "within {METRICS_DEADLINE:?} the read cache did not report the pass: {counts:?}"
+        );
+        last = counts;
+    }
+}
+
+async fn read_cache_counts(http: &HttpClient) -> ReadCacheCounts {
+    let exposition = http
+        .get("/metrics")
+        .await
+        .text()
+        .await
+        .expect("metrics text");
+    ReadCacheCounts {
+        block_hits: summed(&exposition, "remote_read_block_hits_total"),
+        demand_bytes: summed(&exposition, "remote_read_demand_bytes_total"),
+        blocks_fetched_ahead: summed(&exposition, "remote_read_blocks_fetched_ahead_total"),
+    }
+}
+
+/// The samples of `series` of every shard, summed.
+fn summed(exposition: &str, series: &str) -> u64 {
+    exposition
+        .lines()
+        .filter(|line| {
+            line.strip_prefix(series)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '))
+        })
+        .map(|line| {
+            line.rsplit(' ')
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or_else(|| panic!("unreadable sample: {line}"))
+        })
+        .sum()
+}
+
 pub(crate) async fn send_every_message(
     client: &IggyClient,
     stream: &Identifier,
@@ -200,6 +338,16 @@ pub(crate) async fn read_every_message(
     stream: &Identifier,
     topic: &Identifier,
 ) -> Result<(), String> {
+    read_every_message_in_polls_of(client, stream, topic, 10).await
+}
+
+/// [`read_every_message`] with `count` messages a poll.
+async fn read_every_message_in_polls_of(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    count: u32,
+) -> Result<(), String> {
     let mut offset = 0;
     while offset < MESSAGES {
         let polled = client
@@ -210,7 +358,7 @@ pub(crate) async fn read_every_message(
                 &Consumer::default(),
                 &PollingStrategy::offset(offset),
                 PollOptions {
-                    count: 10,
+                    count,
                     ..PollOptions::default()
                 },
             )

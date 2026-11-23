@@ -1524,6 +1524,24 @@ handshake_grace = "10 s"
 #max_attempts = 3
 #retry_delay = "200 ms"
 #max_retry_delay = "5 s"
+# The bytes of the segments read from the store that one shard keeps in
+# memory, so that a poll of bytes another poll read a moment ago does not ask
+# the store again. Each shard keeps its own, so a node spends this times its
+# shards. Reads of geo peers' stores are not kept. "0" turns the cache and
+# readahead off. Otherwise at least 8 blocks of 'read_cache_block_size'.
+#read_cache_size = "64 MiB"
+# The piece of a segment that the cache fetches and keeps. A smaller block
+# wastes less on a small or random read. A larger block means fewer entries
+# and suits consumers that read forward. Adjacent missing blocks are fetched
+# in one request either way. From 64 KiB to 1 MiB.
+#read_cache_block_size = "256 KiB"
+# When polls read a segment in order, the shard fetches up to this many bytes
+# past the last poll before a poll asks for them, in whole blocks. These
+# fetches take the speculative fetch caps of [tiered_storage.jobs] and start
+# only while no poll waits for the store. "0" turns readahead off. Otherwise
+# at least 2 blocks, and at most an eighth of 'read_cache_size', the part of
+# the cache where the fetched bytes wait for their poll.
+#read_ahead = "2 MiB"
 # The shortest time between the starts of two uploads of fresh objects on one
 # shard, so a shard creates at most one object per interval, plus the objects
 # that fill to 4 MiB before it passes. A send that finds a free upload slot
@@ -1569,11 +1587,11 @@ handshake_grace = "10 s"
 #fresh_partition_pending_bytes = "8 MiB"
 # Per shard: how many jobs of each class run at once, and the bytes that
 # fetches and uploads hold. A segment larger than 'upload_bytes' uploads
-# alone. Polls that read from the store are demand fetches. Nothing uses the
-# speculative fetch caps yet. 'fresh_uploads' are the uploads that producers
-# of geo topics wait for. They have slots of their own and never wait behind
-# 'uploads'. Housekeeping jobs, such as sweeps and the merges of long-term
-# segments, start only while no fetch or upload waits.
+# alone. Polls that read from the store are demand fetches, and readahead
+# ('read_ahead') takes the speculative fetch caps. 'fresh_uploads' are the
+# uploads that producers of geo topics wait for. They have slots of their own
+# and never wait behind 'uploads'. Housekeeping jobs, such as sweeps and the
+# merges of long-term segments, start only while no fetch or upload waits.
 #[tiered_storage.jobs]
 #demand_fetches = 16
 #demand_fetch_bytes = "64 MiB"

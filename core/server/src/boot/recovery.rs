@@ -536,6 +536,15 @@ const _: () = assert!(
         == shard::SERVED_SEGMENT_CACHE_BYTES_DEFAULT
 );
 const _: () = assert!(configs::cluster::DEFAULT_REPAIR_CHUNK_MAX as u64 == shard::REPAIR_CHUNK_MAX);
+const _: () =
+    assert!(configs::tiered_storage::READ_CACHE_BLOCK_SIZE_MIN == partitions::DISK_POLL_CHUNK_MIN);
+const _: () =
+    assert!(configs::tiered_storage::READ_CACHE_BLOCK_SIZE_MAX == partitions::DISK_POLL_CHUNK_MAX);
+const _: () = assert!(
+    configs::tiered_storage::READ_AHEAD_CACHE_SHARE == iggy_object_store::AHEAD_SHARE as u64
+);
+const _: () =
+    assert!(configs::tiered_storage::READ_AHEAD_BLOCKS_MIN == partitions::READ_AHEAD_START_BLOCKS);
 const _: () = assert!(
     configs::cluster::STATE_CHUNK_HEADER_LEN
         == size_of::<iggy_binary_protocol::consensus::StateChunkHeader>() as u64
