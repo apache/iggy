@@ -1324,7 +1324,7 @@ async fn reconcile_target(
                      took of it, so this node does not serve it; remove its directory and \
                      restart the node to build it again"
                 );
-                partitions.fence(ns, created_revision);
+                partitions.refuse(ns, created_revision);
                 return Convergence::Converged;
             }
             if let Some((origin, prefix)) = peer_log
@@ -1366,7 +1366,7 @@ async fn reconcile_target(
                 error = %err,
                 "refusing to rebuild a partition lost with this node's storage"
             );
-            partitions.fence(ns, created_revision);
+            partitions.refuse(ns, created_revision);
             Convergence::Converged
         }
         Err(err) => {
