@@ -416,7 +416,11 @@ where
 
     let incomplete = !clients.complete;
     let mut sessions = clients.clients;
-    sessions.extend(liveness.borrow_mut().local_activity(now, timeout));
+    sessions.extend(liveness.borrow_mut().local_activity(
+        now,
+        timeout,
+        shard.bus.realtime_micros(),
+    ));
 
     if primary_view.is_some() {
         let table = metadata.client_table.borrow();
@@ -2557,7 +2561,10 @@ mod tests {
                 CLIENT + 2,
                 0,
                 iggy_binary_protocol::requests::users::login_register::RegisterRequest {
-                    user_created_at: 1,
+                    credential:
+                        iggy_binary_protocol::requests::users::login_register::CredentialProof::account(
+                            1, 1,
+                        ),
                     bind_verifier: [0x6b; 32],
                 },
             ),

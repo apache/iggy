@@ -21,7 +21,7 @@
 
 use crate::client_table::{ClientTable, RequestStatus};
 use crate::{Consensus, Pipeline, PipelineEntry, VsrConsensus};
-use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
 use iggy_binary_protocol::{
     EvictionHeader, EvictionReason, HEADER_SIZE, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN,
     Operation, PrepareHeader, WireDecode,
@@ -251,7 +251,7 @@ pub fn register_preflight<B, P>(
     user_id: u32,
     verifier_body: &[u8],
     request_checksum: u128,
-    account_is_active: impl FnOnce(u64) -> bool,
+    accepts_credential: impl FnOnce(&CredentialProof) -> bool,
 ) -> PreflightOutcome
 where
     B: MessageBus,
@@ -266,11 +266,16 @@ where
     let Ok(registration) = RegisterRequest::decode_from(verifier_body) else {
         return PreflightOutcome::Reject(IggyError::InvalidCommand.as_code());
     };
-    if !account_is_active(registration.user_created_at) {
+    if !accepts_credential(&registration.credential) {
         return PreflightOutcome::Reject(IggyError::Unauthenticated.as_code());
     }
     let table = client_table.borrow();
-    match table.registered_session(client_id, user_id, registration.bind_verifier) {
+    match table.registered_session(
+        client_id,
+        user_id,
+        registration.bind_verifier,
+        registration.credential.token_id,
+    ) {
         Ok(Some(epoch)) => {
             let header = PrepareHeader {
                 cluster: consensus.cluster(),
@@ -574,7 +579,7 @@ mod tests {
                     client_id,
                     ACTING_USER_ID,
                     &RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32]
                     }
                     .to_bytes(),
@@ -595,13 +600,13 @@ mod tests {
                     client_id,
                     ACTING_USER_ID,
                     &RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     }
                     .to_bytes(),
                     0,
-                    |created_at| {
-                        assert_eq!(created_at, 1);
+                    |credential| {
+                        assert_eq!(*credential, CredentialProof::account(1, 1));
                         false
                     },
                 ),
@@ -987,7 +992,7 @@ mod tests {
                     client_id,
                     IMPOSTOR,
                     &RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32]
                     }
                     .to_bytes(),
@@ -1006,7 +1011,7 @@ mod tests {
                     client_id,
                     OWNER,
                     &RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32]
                     }
                     .to_bytes(),
@@ -1083,7 +1088,7 @@ mod tests {
             client_id,
             ACTING_USER_ID,
             &RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             }
             .to_bytes(),
@@ -1160,7 +1165,7 @@ mod tests {
         consensus.init();
         let client_table = fresh_client_table();
         let body = RegisterRequest {
-            user_created_at: 1,
+            credential: CredentialProof::account(1, 1),
             bind_verifier: [0x5a; 32],
         }
         .to_bytes();
@@ -1201,7 +1206,7 @@ mod tests {
             client_id,
             ACTING_USER_ID,
             &RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             }
             .to_bytes(),

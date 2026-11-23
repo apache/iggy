@@ -44,7 +44,7 @@ use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{classify_partition_reply, committed_payload, eviction_error};
 use crate::http::session::HttpSession;
-use crate::http::state::HttpInner;
+use crate::http::state::{HttpInner, ensure_active_user};
 use crate::http::wire::build_request_message;
 use crate::reply_frame::transient_code;
 use crate::rewrite::http_chain;
@@ -195,6 +195,8 @@ async fn submit_gated(
     body: &[u8],
 ) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
+    ensure_active_user(shard, session.user_id, &session.credential)
+        .map_err(WriteError::Rejected)?;
     // Burn the id at stamp time: every exit below (rewrite rejection,
     // unresolved delete-segments, unanswered submit, exhausted transient
     // budget, eviction) then leaves it spent rather than handing it to a
@@ -238,6 +240,13 @@ async fn submit_gated(
     let reply = loop {
         // Retry the same rewritten body: a newly minted PAT token could differ
         // from the token hash protected by the first receipt.
+        if let Err(error) = ensure_active_user(shard, session.user_id, &session.credential) {
+            return Err(WriteError::Rejected(if saw_not_committed {
+                IggyError::TransientNotCommitted
+            } else {
+                error
+            }));
+        }
         let retry_request = request.clone();
         // A missing verdict leaves the outcome unknown, as a canceled prepare does.
         let transient = match submit_client_request_on_owner(shard, request).await {
@@ -438,6 +447,8 @@ async fn partition_write(
     ensure_in_process_reply_target(state, session);
     let request_id = {
         let mut next_id = session.data_gate.lock().await;
+        ensure_active_user(&state.shard, session.user_id, &session.credential)
+            .map_err(PartitionWriteError::Rejected)?;
         let request_id = *next_id;
         *next_id = next_id
             .checked_add(1)

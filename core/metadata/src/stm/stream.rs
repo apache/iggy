@@ -684,6 +684,7 @@ pub struct Stream {
     pub stats: Arc<StreamStats>,
     pub topics: IdSlab<Topic>,
     pub(crate) topic_index: AHashMap<Arc<str>, usize>,
+    pub(crate) topics_by_creation: BTreeSet<(u64, usize)>,
 }
 
 impl Default for Stream {
@@ -698,6 +699,7 @@ impl Default for Stream {
             stats: Arc::new(StreamStats::default()),
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
+            topics_by_creation: BTreeSet::new(),
         }
     }
 }
@@ -714,6 +716,7 @@ impl Clone for Stream {
             stats: self.stats.clone(),
             topics: self.topics.clone(),
             topic_index: self.topic_index.clone(),
+            topics_by_creation: self.topics_by_creation.clone(),
         }
     }
 }
@@ -731,21 +734,21 @@ impl Stream {
             stats: Arc::new(StreamStats::default()),
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
+            topics_by_creation: BTreeSet::new(),
         }
     }
 
-    /// The topics in creation order, keyed by `(created_at micros, topic id)`.
-    /// A stream holds at most `MAX_TOPICS` topics, so a page sorts them for
-    /// each read in place of an index that every topic apply keeps.
-    #[must_use]
-    pub fn topics_by_created(&self) -> Vec<((u64, usize), &Topic)> {
-        let mut topics: Vec<_> = self
-            .topics
-            .iter()
-            .map(|(id, topic)| ((topic.created_at.as_micros(), id), topic))
-            .collect();
-        topics.sort_unstable_by_key(|(key, _)| *key);
-        topics
+    pub fn topics_by_created_after(
+        &self,
+        after: Option<(u64, usize)>,
+        descending: bool,
+    ) -> impl Iterator<Item = ((u64, usize), &Topic)> {
+        Directed::new(
+            self.topics_by_creation
+                .range(range_after(after.as_ref(), descending)),
+            descending,
+        )
+        .filter_map(|&key| Some((key, self.topics.get(key.1)?)))
     }
 
     #[must_use]
@@ -760,6 +763,7 @@ impl Stream {
             stats,
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
+            topics_by_creation: BTreeSet::new(),
         }
     }
 }
@@ -3537,6 +3541,7 @@ impl StateHandler for CreateStreamRequest {
             stats: stream_stats,
             topics: IdSlab::new(),
             topic_index: AHashMap::default(),
+            topics_by_creation: BTreeSet::new(),
         };
         let inserted = state.items.insert(stream);
         debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
@@ -3964,6 +3969,9 @@ pub(crate) fn create_topic(
     }
 
     stream.topic_index.insert(name_arc, topic_id);
+    stream
+        .topics_by_creation
+        .insert((timestamp.as_micros(), topic_id));
 
     let Some(topic) = stream.topics.get(topic_id) else {
         return ApplyReply::err(CreateTopicResult::StreamNotFound);
@@ -4363,6 +4371,9 @@ impl StateHandler for DeleteTopicRequest {
             .collect();
         let removed = stream.topics.remove(topic_id);
         stream.topic_index.remove(&name);
+        stream
+            .topics_by_creation
+            .remove(&(removed.created_at.as_micros(), topic_id));
         // Roll the topic and its partitions out of the stream total and evict
         // their entries, so a reused slab id starts from zero.
         state
@@ -4820,6 +4831,7 @@ impl StreamsInner {
 
             let mut topic_index: AHashMap<Arc<str>, usize> = AHashMap::new();
             let mut topic_entries: Vec<(usize, Topic)> = Vec::new();
+            let mut topics_by_creation = BTreeSet::new();
 
             for (topic_slab_key, topic_snap) in stream_snap.topics {
                 let topic_stats =
@@ -4867,6 +4879,7 @@ impl StreamsInner {
                         .collect(),
                 };
                 topic_index.insert(topic_name, topic_slab_key);
+                topics_by_creation.insert((topic.created_at.as_micros(), topic_slab_key));
                 topic_entries.push((topic_slab_key, topic));
             }
 
@@ -4883,6 +4896,7 @@ impl StreamsInner {
                 stats: stream_stats,
                 topics,
                 topic_index,
+                topics_by_creation,
             };
 
             index.insert(stream_name, slab_key);
@@ -4930,6 +4944,7 @@ impl StreamsInner {
             placement_index,
             catalog_counts,
             recent_partition_changes: RecentPartitionChanges::after(snapshot.revision),
+            installed_snapshot_op: 0,
             last_result: None,
             apply_context: ApplyContext::default(),
             stats_registry,
@@ -9474,14 +9489,19 @@ mod tests {
         assert_eq!(reply.code, 0);
         create_topic_at(&mut inner, "d", 50);
 
-        let stream = &inner.items[0];
-        assert_eq!(stream.topics[0].name.as_ref(), "d");
-        let order: Vec<usize> = stream
-            .topics_by_created()
-            .into_iter()
-            .map(|((_, id), _)| id)
-            .collect();
-        assert_eq!(order, [1, 2, 0]);
+        let snapshot = Streams::from(inner.clone()).to_snapshot();
+        let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+        for stream in [&inner.items[0], &restored.items[0]] {
+            assert_eq!(stream.topics[0].name.as_ref(), "d");
+            let ids = |after, descending| {
+                stream
+                    .topics_by_created_after(after, descending)
+                    .map(|((_, id), _)| id)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(ids(None, false), [1, 2, 0]);
+            assert_eq!(ids(Some((50, 0)), true), [2, 1]);
+        }
     }
 
     #[test]

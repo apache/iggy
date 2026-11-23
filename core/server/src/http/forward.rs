@@ -1035,7 +1035,7 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
             bearer,
             verified.jwt_id.as_deref(),
             verified.user_id,
-            verified.user_created_at,
+            &verified.credential,
         );
         let relay_targets = if deferred {
             &state.forward.deferred_relay_targets
@@ -1720,6 +1720,7 @@ mod tests {
     use hyper::service::Service as _;
     use hyper_util::service::TowerToHyperService;
     use iggy_binary_protocol::requests::users::UpdatePermissionsRequest;
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
     use iggy_binary_protocol::{Operation, WireEncode, WireIdentifier};
     use iggy_common::IggyDuration;
     use metadata::impls::metadata::StreamsFrontend;
@@ -1731,7 +1732,7 @@ mod tests {
     use crate::http::admission::MAX_IN_FLIGHT_RELAY_TARGETS;
     use crate::http::handlers::HTTP_UNREGISTERED_CLIENT_ID;
     use crate::http::reads::tests::{
-        READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
+        CLUSTER_UID, READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
         read_state_with_frontier,
     };
     use crate::http::router;
@@ -1856,7 +1857,12 @@ mod tests {
         );
         let token = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .unwrap();
         let route = HeaderValue::try_from(
             PartitionRoute {
@@ -2383,7 +2389,12 @@ mod tests {
             .expect("a proof is a header value");
         let token = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .expect("a token for the reader");
         let mut headers = marked(&route, Some(&proof));
         headers.insert(
@@ -2524,7 +2535,12 @@ mod tests {
             .expect("a proof is a header value");
         let bearer = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .expect("a token for the reader")
             .access_token;
         let mut headers = marked(&route, Some(&proof));
@@ -2541,7 +2557,7 @@ mod tests {
                     &bearer,
                     verified.jwt_id.as_deref(),
                     verified.user_id,
-                    verified.user_created_at,
+                    &verified.credential,
                 ))
             }
             RelayTargetRefusal::BudgetSaturated => None,

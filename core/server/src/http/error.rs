@@ -167,8 +167,9 @@ impl ErrorResponse {
 pub(in crate::http) enum AuthError {
     Unauthenticated(IggyError),
     /// The Register provably never entered the consensus pipeline (not
-    /// primary, not caught up, or the prepare queue was full), so the request
-    /// is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
+    /// primary, not caught up, or the prepare queue was full), or this node
+    /// has not applied the account revision the bearer was issued at, so the
+    /// request is safe to re-issue anywhere. Rendered with the `TransientNotAccepted`
     /// body so a forwarding follower recognizes it as retryable against a
     /// re-resolved primary; a plain client sees the same retryable 503 either
     /// way.

@@ -79,9 +79,7 @@ public `uncertain: usize` field, so struct literals and exhaustive patterns must
 name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
 `set_partition_context` methods.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 ## Mutation recovery
 

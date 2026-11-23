@@ -210,6 +210,14 @@ impl PermissionBoard {
         users.set(user, username, access, revision);
     }
 
+    /// Closes the connections signed in as `user` and keeps what it may do, as
+    /// a password change ends the user's sessions and leaves the account active.
+    fn end_sessions(&self, user: UserKey, username: &str) {
+        let mut users = lock(&self.users);
+        let revision = self.next_revision();
+        users.end_sessions(user, username, revision);
+    }
+
     /// Sets the permissions of `user` while it is active. The change has no status, so it neither
     /// re-activates a revoked user nor adds one the board does not hold.
     fn set_permissions(&self, user: UserKey, username: &str, grants: Grants) {
@@ -288,6 +296,13 @@ impl Users {
                     .or_else(|| (entry.changed > seen).then(|| entry.access.clone()))
             },
         )
+    }
+
+    fn end_sessions(&mut self, user: UserKey, username: &str, revision: u64) {
+        if let Some(entry) = self.by_key.get_mut(&user) {
+            entry.revoked = revision;
+        }
+        self.revoked_names.insert(username.to_owned(), revision);
     }
 
     fn set(&mut self, user: UserKey, username: &str, access: UserAccess, revision: u64) {
@@ -747,6 +762,10 @@ impl Mirror {
             }
             MetadataChange::UserDeleted(user) => {
                 permissions.set(user_key!(user), &user.username, UserAccess::Revoked);
+                Changed::default()
+            }
+            MetadataChange::UserPasswordChanged(user) => {
+                permissions.end_sessions(user_key!(user), &user.username);
                 Changed::default()
             }
             _ => Changed::default(),
@@ -1633,6 +1652,48 @@ mod tests {
         assert_eq!(board.access("bob"), Some(UserAccess::Revoked));
         assert_eq!(board.access("carol"), Some(UserAccess::Revoked));
         assert_eq!(board.access("dave"), None);
+    }
+
+    #[test]
+    fn given_a_password_change_should_close_the_connections_of_that_user_and_keep_its_access() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserCreated(user(ALICE, "alice", UserStatus::Active, false)),
+                MetadataChange::UserCreated(user(BOB, "bob", UserStatus::Active, false)),
+            ],
+        );
+        let before = board.revision();
+        let (mut alice_seen, mut bob_seen, mut unresolved_seen) = (before, before, before);
+
+        apply_users(
+            &board,
+            &[MetadataChange::UserPasswordChanged(MetadataUserIdentity {
+                user_id: ALICE.user_id,
+                user_created_at: ALICE.created_at,
+                username: "alice".to_owned(),
+            })],
+        );
+        let mut signed_in_after = board.revision();
+
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut alice_seen),
+            Some(UserAccess::Revoked)
+        );
+        assert_eq!(
+            board.changed_since(None, "alice", &mut unresolved_seen),
+            Some(UserAccess::Revoked),
+            "a connection that never resolved its user closes too"
+        );
+        assert_eq!(board.changed_since(Some(BOB), "bob", &mut bob_seen), None);
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut signed_in_after),
+            None,
+            "a sign-in after the change stays"
+        );
+        assert_eq!(board.access("alice"), Some(reads_nothing()));
+        assert!(board.active_user("alice").is_some());
     }
 
     #[test]
