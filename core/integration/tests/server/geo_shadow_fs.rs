@@ -31,6 +31,7 @@ use integration::harness::{TestBinary, TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
 use super::http_client::HttpClient;
+use super::tiered_storage_fs::{METRICS_DEADLINE, settled_read_cache_counts};
 
 const STREAM: &str = "orders";
 const SHADOW_STREAM: &str = "__shadow_dc-a_orders";
@@ -202,6 +203,45 @@ async fn given_a_three_node_follower_when_restarted_and_its_primary_stops_should
         .stop()
         .expect("stop the metadata primary of dc-b");
     assert_every_node_holds(&dc_b, &[1, 2], adopted.id, geo_topic_id).await;
+}
+
+/// The polls of a shadow topic keep what they read of the peer's segments,
+/// so a second pass over them asks the peer's bucket for nothing.
+#[tokio::test]
+async fn given_a_shadow_topic_read_once_when_read_again_should_not_ask_the_peer_s_bucket() {
+    let store = tempfile::tempdir().expect("a directory for the store of dc-a");
+    let mut dc_a = origin_cluster(store.path());
+    dc_a.start().await.expect("dc-a boots");
+    let origin = dc_a.tcp_root_client().await.expect("a client of dc-a");
+    let topic_id = create_geo_topic(&origin, 1).await;
+    send_to_origin(&origin, 0..FIRST_SENDS).await;
+    let mut dc_b = follower_cluster(store.path(), 1);
+    dc_b.start().await.expect("dc-b boots");
+    let follower = dc_b.tcp_root_client().await.expect("a client of dc-b");
+    wait_for_shadow_topic(&follower, topic_id).await;
+    let shadow_topic = Identifier::numeric(topic_id).expect("the topic id");
+    let expected: Vec<(u64, Vec<u8>)> = (0..FIRST_SENDS)
+        .map(|index| (index, payload(index)))
+        .collect();
+    let deadline = Instant::now() + FOLLOW_DEADLINE;
+    while read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await != expected {
+        assert!(Instant::now() < deadline, "dc-b never served every message");
+        sleep(POLL_INTERVAL).await;
+    }
+    let http = HttpClient::login_root(&dc_b).await;
+    let first =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.demand_bytes > 0).await;
+
+    let read = read_from_start(&follower, &named(SHADOW_STREAM), &shadow_topic).await;
+    let second =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != first).await;
+
+    assert_eq!(read, expected);
+    assert!(second.block_hits > first.block_hits, "{second:?}");
+    assert_eq!(
+        second.demand_bytes, first.demand_bytes,
+        "the second pass read the peer's bucket: {first:?}, then {second:?}"
+    );
 }
 
 #[tokio::test]

@@ -6397,7 +6397,6 @@ where
         self.remote_segments.is_some()
     }
 
-    #[cfg(test)]
     pub(crate) const fn remote_segments(&self) -> Option<&Rc<crate::RemoteSegments>> {
         self.remote_segments.as_ref()
     }
@@ -6562,6 +6561,18 @@ where
         }
         let keyed_by_both_offsets = self.reads_segments_keyed_by_both_offsets();
         let cut = start_segment + walked < self.log.segments().len();
+        let remote_range = |segment: &Segment| match object_prefix {
+            Some(prefix) if segment.location == SegmentLocation::Remote => Some(RemoteRange {
+                key: SegmentKey {
+                    prefix,
+                    start_offset: segment.start_offset,
+                    object: SegmentObject::Log,
+                },
+                keyed_end_offset: keyed_by_both_offsets.then_some(segment.end_offset),
+                range: 0..segment.size.as_bytes_u64(),
+            }),
+            _ => None,
+        };
         let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
             .zip(self.log.sealed_read_state()[start_segment..].iter())
@@ -6570,28 +6581,21 @@ where
                 persisted: segment.size.as_bytes_u64(),
                 read_state: Rc::clone(read_state),
                 sealed: segment.sealed,
-                source: match object_prefix {
-                    Some(prefix) if segment.location == SegmentLocation::Remote => {
-                        SegmentSource::Remote(RemoteRange {
-                            key: SegmentKey {
-                                prefix,
-                                start_offset: segment.start_offset,
-                                object: SegmentObject::Log,
-                            },
-                            keyed_end_offset: keyed_by_both_offsets.then_some(segment.end_offset),
-                            range: 0..segment.size.as_bytes_u64(),
-                        })
-                    }
-                    _ => SegmentSource::Local,
-                },
+                source: remote_range(segment).map_or(SegmentSource::Local, SegmentSource::Remote),
             })
             .collect();
+        let next_remote = self
+            .log
+            .segments()
+            .get(start_segment + walked)
+            .and_then(remote_range);
         let disk = DiskReadPlan {
             partition_dir: self.partition_dir_resolution(),
             remote: self.remote_segments.clone(),
             object_prefix,
             index_fetches: self.index_fetches.fence(),
             segments,
+            next_remote,
             cut,
             deadline: None,
             start_position,
@@ -6644,11 +6648,11 @@ where
             }
             None => long_term.len(),
         };
-        let long_term = long_term[first..]
-            .iter()
-            .take(crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL)
-            .copied()
-            .collect();
+        let carried = long_term[first..]
+            .len()
+            .min(crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL);
+        let long_term_next = long_term.get(first + carried).copied();
+        let long_term = long_term[first..first + carried].to_vec();
         let segments = self
             .log
             .segments()
@@ -6672,6 +6676,7 @@ where
             prefix: crate::object_prefix(self.namespace(), self.created_revision()),
             long_term,
             long_term_floor: self.long_term_floor(),
+            long_term_next,
         }
     }
 
@@ -13157,6 +13162,14 @@ where
         );
         if primary {
             proofs.want();
+        }
+        if let Some(remote) = &self.remote_segments {
+            let last = u64::from(batch_stats.message_count).saturating_sub(1);
+            remote.note_fresh_commit(
+                self.namespace(),
+                placement.object_id,
+                batch_stats.base_offset + last,
+            );
         }
     }
 

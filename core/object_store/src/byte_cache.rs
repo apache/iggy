@@ -40,7 +40,8 @@
 //! sequential reader would look like one that came back.
 //!
 //! Bytes this node stored itself can be kept apart from both queues until
-//! their owner releases them, see [`Admission::Held`].
+//! their owner releases them, see [`Admission::Held`]. They take at most all
+//! but an eighth of the budget, see [`UNHELD_SHARE`].
 
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -52,6 +53,13 @@ const SMALL_SHARE: usize = 10;
 /// readahead fetched and nobody has read. Past it, the oldest of that goes
 /// first.
 pub const AHEAD_SHARE: usize = 8;
+
+/// Of the budget, one part in this many is never held.
+///
+/// Past the rest, the oldest held entry is released into the small queue
+/// where its age puts it, so a node that stores more than its owner releases
+/// still keeps what readers fetched since.
+pub const UNHELD_SHARE: usize = 8;
 
 /// The most times the cache counts readers coming back to one entry. More
 /// would keep an entry that was popular once for too many rounds.
@@ -134,6 +142,15 @@ impl<K: Ord + Clone> ByteCache<K> {
         Lookup::Hit(bytes)
     }
 
+    /// Whether the bytes under `key` are still kept apart as
+    /// [`Admission::Held`], and not released.
+    #[must_use]
+    pub fn is_held(&self, key: &K) -> bool {
+        self.entries
+            .get(key)
+            .is_some_and(|entry| entry.place == Place::Kept)
+    }
+
     /// Whether the cache holds the bytes under `key`. Not a read of them.
     #[must_use]
     pub fn holds(&self, key: &K) -> bool {
@@ -160,6 +177,11 @@ impl<K: Ord + Clone> ByteCache<K> {
         }
         let remembered = self.entries.contains_key(&key);
         self.unlink(&key);
+        if admission == Admission::Held {
+            // Released before room is made, so that what it releases can be
+            // what leaves.
+            self.release_held_past(self.held_limit().saturating_sub(held));
+        }
         self.make_room(held, admission == Admission::Ahead);
         let place = match admission {
             Admission::Held => Place::Kept,
@@ -180,6 +202,8 @@ impl<K: Ord + Clone> ByteCache<K> {
                 ahead: admission != Admission::Read,
             },
         );
+        // Bytes held alone past the share are released as they enter.
+        self.release_held_past(self.held_limit());
         self.forget_old_keys();
     }
 
@@ -217,6 +241,7 @@ impl<K: Ord + Clone> ByteCache<K> {
     /// Change the budget, evicting down to it.
     pub fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
+        self.release_held_past(self.held_limit());
         self.make_room(0, false);
         self.forget_old_keys();
     }
@@ -224,6 +249,12 @@ impl<K: Ord + Clone> ByteCache<K> {
     #[must_use]
     pub const fn budget(&self) -> usize {
         self.budget
+    }
+
+    /// Bytes of memory the buffers kept as [`Admission::Held`] hold.
+    #[must_use]
+    pub const fn held_apart(&self) -> usize {
+        self.held_in(Place::Kept)
     }
 
     /// Bytes of memory the kept buffers hold.
@@ -270,6 +301,21 @@ impl<K: Ord + Clone> ByteCache<K> {
             .oldest()
             .inspect(|key| self.unlink(key))
             .is_some()
+    }
+
+    /// The most bytes that held entries take.
+    const fn held_limit(&self) -> usize {
+        self.budget - self.budget / UNHELD_SHARE
+    }
+
+    /// Release the oldest held entries until they take at most `limit`.
+    fn release_held_past(&mut self, limit: usize) {
+        while self.held_in(Place::Kept) > limit {
+            let Some(key) = self.lines[Place::Kept as usize].oldest() else {
+                return;
+            };
+            self.move_keeping_age(&key, Place::Small);
+        }
     }
 
     const fn small_target(&self) -> usize {
@@ -339,6 +385,17 @@ impl<K: Ord + Clone> ByteCache<K> {
             };
             self.unlink(&key);
         }
+    }
+
+    /// Move the entry under `key` to `place`, where the time it entered
+    /// puts it.
+    fn move_keeping_age(&mut self, key: &K, place: Place) {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        self.lines[entry.place as usize].take(entry.entered, entry.held);
+        entry.place = place;
+        self.lines[place as usize].put(entry.entered, key.clone(), entry.held);
     }
 
     /// Move the entry under `key` to `place`, as its newest.
@@ -458,6 +515,7 @@ mod tests {
 
     fn assert_bounds(cache: &ByteCache<u32>) {
         assert!(cache.held() <= cache.budget());
+        assert!(cache.held_apart() <= cache.held_limit());
         assert!(cache.held_in(Place::Gone) <= cache.budget());
         let mut summed = [0; 5];
         for (key, entry) in &cache.entries {
@@ -818,17 +876,39 @@ mod tests {
         );
     }
 
-    /// The budget is a bound on memory, so held bytes that fill it alone give
-    /// way to newer held bytes, the oldest first.
+    /// Held bytes take all but an eighth of the budget. Past it the oldest
+    /// is released, and then leaves as bytes nobody read do.
     #[test]
-    fn given_held_bytes_that_fill_the_budget_when_more_are_held_should_drop_the_oldest() {
+    fn given_held_bytes_past_their_share_when_more_are_held_should_release_the_oldest() {
         let mut cache = ByteCache::new(20);
         for key in [1, 2, 3] {
             cache.insert(key, buffer(10), 10, Admission::Held);
+            assert_bounds(&cache);
         }
 
-        assert_eq!(keys_in(&cache, Place::Kept), [2, 3]);
+        assert_eq!(keys_in(&cache, Place::Kept), [3]);
+        assert_eq!(keys_in(&cache, Place::Small), [2]);
         assert!(!cache.entries.contains_key(&1), "nothing is remembered");
+        assert_eq!(cache.held_apart(), 10);
+    }
+
+    /// A node that holds more than its share keeps what readers fetched
+    /// after it released an entry, which leaves first.
+    #[test]
+    fn given_held_bytes_past_their_share_when_a_reader_fetched_since_should_keep_what_it_fetched() {
+        let mut cache = ByteCache::new(80);
+        for key in 0..8 {
+            cache.insert(key, buffer(10), 10, Admission::Held);
+        }
+        assert_eq!(keys_in(&cache, Place::Small), [0]);
+        read_into(&mut cache, 100, 10);
+
+        cache.insert(8, buffer(10), 10, Admission::Held);
+
+        assert!(cache.holds(&100));
+        assert!(!cache.holds(&0));
+        assert!(cache.is_held(&8) && !cache.is_held(&1));
+        assert_eq!(cache.held_apart(), 70);
         assert_bounds(&cache);
     }
 

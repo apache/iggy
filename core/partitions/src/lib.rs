@@ -50,11 +50,12 @@ pub use persistence::{
 };
 pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
 mod remote_blocks;
-pub use remote_blocks::{READ_AHEAD_START_BLOCKS, ReadCacheSettings, RemoteReadMetrics};
-mod remote_segments;
-pub use remote_segments::{
-    ExecutorObjects, FRESH_CACHE_BYTES, RemoteObjects, RemoteRange, RemoteSegments,
+pub use remote_blocks::{
+    FRESH_CACHE_BYTES, OWN_STORE, READ_AHEAD_START_BLOCKS, ReadCache, ReadCacheSettings, ReadGate,
+    RemoteReadMetrics, StoreSlot,
 };
+mod remote_segments;
+pub use remote_segments::{ExecutorObjects, RemoteObjects, RemoteRange, RemoteSegments};
 mod object_delete;
 mod segment;
 pub mod segment_anchor;

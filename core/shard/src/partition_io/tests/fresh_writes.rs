@@ -427,7 +427,8 @@ async fn given_sends_in_two_windows_when_both_close_should_store_two_objects_and
 
 /// The shard holds the messages it has just stored, so a consumer at the
 /// tail is served without a read of the store. The store the polls would
-/// read here is empty, so only those kept bytes can answer.
+/// read here is empty, so only those kept bytes can answer. A cache that
+/// keeps nothing fetched holds them all the same.
 #[compio::test]
 async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_without_reading_the_store()
  {
@@ -435,13 +436,15 @@ async fn given_sends_this_shard_stored_when_polling_them_should_serve_them_witho
     let owner = Box::pin(placing_owner(directory.path())).await;
     let uploader = TestUploader::new();
     owner.set_fresh_uploader(Some(uploader.clone()));
-    owner
-        .plane
-        .partitions()
-        .set_remote_segments(Rc::new(partitions::RemoteSegments::new(
-            Rc::new(MemoryStore::new()),
-            layout(),
-        )));
+    let cache = partitions::ReadCache::new(partitions::ReadCacheSettings {
+        cache_bytes: 0,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+    });
+    owner.plane.partitions().set_remote_segments(Rc::new(
+        partitions::RemoteSegments::new(Rc::new(MemoryStore::new()), layout())
+            .with_cache(Rc::new(MemoryStore::new()), &cache),
+    ));
     pumped(&owner, async {
         let _answers = [submit_send(&owner, 1, 100), submit_send(&owner, 2, 300)];
         until(&owner, |owner| committed_sends(owner) == 2).await;

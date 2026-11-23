@@ -26,10 +26,16 @@ use super::*;
 use crate::long_term::{TRIM_SEGMENTS, TrimSegments};
 use crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL;
 use crate::state_machine::{Applied, MachineCommand};
+use crate::{ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments};
+use futures::FutureExt;
+use futures::future::LocalBoxFuture;
 use iggy_common::{IggyDuration, IggyExpiry, PollingStrategy};
 use iggy_object_store::{
-    ManifestSegment, MemoryStore, ObjectStore, PutBody, PutOptions, SEGMENT_HASH_LEN,
+    ManifestSegment, MemoryStore, ObjectRange, ObjectStore, ObjectStoreError, PutBody, PutOptions,
+    SEGMENT_HASH_LEN,
 };
+use std::cell::RefCell;
+use std::ops::Range;
 use std::time::Duration;
 
 const SECOND_OBJECT: u128 = 0x52;
@@ -501,4 +507,177 @@ async fn given_expired_long_term_segments_when_the_trim_retention_decides_commit
         None,
         "nothing is left to decide once the trim applied"
     );
+}
+
+/// A store that keeps the key of every GET that reaches it.
+struct CountedGets {
+    store: Rc<MemoryStore>,
+    keys: RefCell<Vec<String>>,
+}
+
+impl RemoteObjects for CountedGets {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        self.keys.borrow_mut().push(key.to_owned());
+        ObjectStore::get_range(&*self.store, key, range).boxed_local()
+    }
+}
+
+/// A partition whose first long-term segments the store holds, and whose
+/// fresh object below the floor is gone, reading through `cache_bytes` of
+/// cache, with the keys of the GETs it sends.
+async fn rewritten_partition_reading_through(
+    cache_bytes: usize,
+) -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    Rc<CountedGets>,
+) {
+    let (directory, mut partition, store, _whole) =
+        Box::pin(leader_with_two_fresh_objects(4, 1)).await;
+    Box::pin(rewrite_up_to(&mut partition, &store, &[1, 3])).await;
+    Box::pin(lose_first_fresh_object(&mut partition, &store)).await;
+    let counted = Rc::new(CountedGets {
+        store,
+        keys: RefCell::default(),
+    });
+    let cache = ReadCache::new(ReadCacheSettings {
+        cache_bytes,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+    });
+    partition.set_remote_segments(Rc::new(
+        RemoteSegments::new(Rc::clone(&counted) as _, layout())
+            .with_cache(Rc::clone(&counted) as _, &cache),
+    ));
+    (directory, partition, counted)
+}
+
+#[compio::test]
+async fn given_long_term_segments_polled_twice_when_the_shard_keeps_what_it_reads_should_ask_the_store_once_for_each_object()
+ {
+    let (_directory, mut partition, counted) =
+        Box::pin(rewritten_partition_reading_through(64 * 1024 * 1024)).await;
+
+    let first = Box::pin(polled_all(&mut partition)).await;
+    let asked = counted.keys.borrow().clone();
+    let second = Box::pin(polled_all(&mut partition)).await;
+
+    assert_eq!(first, second);
+    assert_eq!(*counted.keys.borrow(), asked);
+    let indexes = asked
+        .iter()
+        .filter(|key| {
+            std::path::Path::new(key)
+                .extension()
+                .is_some_and(|extension| extension == "index")
+        })
+        .count();
+    assert_eq!(indexes, 2, "{asked:?}");
+    let mut unique = asked.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), asked.len(), "{asked:?}");
+}
+
+/// With no bytes for the cache, a poll of long-term segments asks the store
+/// as it did before the cache: again for each poll.
+#[compio::test]
+async fn given_long_term_segments_polled_twice_when_the_cache_keeps_nothing_fetched_should_ask_the_store_again()
+ {
+    let (_directory, mut partition, counted) =
+        Box::pin(rewritten_partition_reading_through(0)).await;
+
+    let first = Box::pin(polled_all(&mut partition)).await;
+    let asked = counted.keys.borrow().len();
+    let second = Box::pin(polled_all(&mut partition)).await;
+
+    assert_eq!(first, second);
+    assert!(asked > 0);
+    assert_eq!(counted.keys.borrow().len(), 2 * asked);
+}
+
+/// The polls of a partition read what the shard uploaded until the rewrite
+/// of those batches commits, and its long-term segment after that.
+#[compio::test]
+async fn given_an_object_this_shard_uploaded_when_the_rewrite_of_its_batches_commits_should_release_it()
+ {
+    let (_first_whole, first_placed, first_object) = whole_and_placed(2);
+    let (_second_whole, second_placed, second_object) = whole_and_placed_in(SECOND_OBJECT, 2);
+    let store = Box::pin(store_with(first_object)).await;
+    store
+        .put(
+            &layout().fresh_key(SECOND_OBJECT),
+            PutBody::from_bytes(second_object.clone()),
+            &PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let (_directory, mut partition) =
+        Box::pin(placing_leader_of_three_with(&first_placed, &store)).await;
+    let cache = ReadCache::new(ReadCacheSettings {
+        cache_bytes: 64 * 1024 * 1024,
+        block_bytes: 256 * 1024,
+        read_ahead: 0,
+    });
+    let remote = Rc::new(
+        RemoteSegments::new(Rc::clone(&store) as _, layout())
+            .with_cache(Rc::clone(&store) as _, &cache),
+    );
+    partition.set_remote_segments(Rc::clone(&remote));
+    remote.cache_fresh_object(SECOND_OBJECT, second_object, [partition.namespace()]);
+    Box::pin(commit_records(&mut partition, 3, &second_placed)).await;
+    remote.settle_fresh_object(SECOND_OBJECT);
+    assert!(remote.holds_fresh_object(SECOND_OBJECT));
+
+    Box::pin(rewrite_up_to(&mut partition, &store, &[1, 3])).await;
+
+    assert_eq!(partition.long_term_floor(), Some(3));
+    assert!(!remote.holds_fresh_object(SECOND_OBJECT));
+}
+
+/// A rewrite hands the segment it stored to the cache, so a consumer just
+/// behind it reads it from memory. A cache that keeps nothing fetched takes
+/// nothing.
+#[compio::test]
+async fn given_a_rewrite_that_stored_a_segment_when_polling_it_should_read_it_from_memory_with_a_cache()
+ {
+    for cache_bytes in [64 * 1024 * 1024, 0] {
+        let (_directory, mut partition, store, _whole) =
+            Box::pin(leader_with_two_fresh_objects(4, 1)).await;
+        let counted = Rc::new(CountedGets {
+            store: Rc::clone(&store),
+            keys: RefCell::default(),
+        });
+        let cache = ReadCache::new(ReadCacheSettings {
+            cache_bytes,
+            block_bytes: 256 * 1024,
+            read_ahead: 0,
+        });
+        partition.set_remote_segments(Rc::new(
+            RemoteSegments::new(Rc::clone(&counted) as _, layout())
+                .with_cache(Rc::clone(&counted) as _, &cache),
+        ));
+        Box::pin(rewrite_up_to(&mut partition, &store, &[3])).await;
+        counted.keys.borrow_mut().clear();
+
+        Box::pin(polled_all(&mut partition)).await;
+
+        let long_term = counted
+            .keys
+            .borrow()
+            .iter()
+            .filter(|key| key.contains('-'))
+            .count();
+        if cache_bytes > 0 {
+            assert_eq!(long_term, 0, "{:?}", counted.keys.borrow());
+            assert!(cache.take_metrics().carried_bytes > 0);
+        } else {
+            assert!(long_term > 0);
+            assert_eq!(cache.take_metrics().carried_bytes, 0);
+        }
+    }
 }

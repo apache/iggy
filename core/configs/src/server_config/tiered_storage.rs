@@ -292,10 +292,11 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_max_retry_delay")]
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
-    /// The bytes of the segments read from the store that one shard keeps
-    /// in memory for the next polls of the same bytes. Zero turns the cache
-    /// and readahead off. Otherwise at least [`READ_AHEAD_CACHE_SHARE`]
-    /// blocks.
+    /// The bytes of what one shard reads from object stores that it keeps in
+    /// memory for the next polls of the same bytes, which also hold the
+    /// fresh objects it uploads. Zero keeps nothing that reads fetch and
+    /// turns readahead off, and the shard still holds what it uploads.
+    /// Otherwise at least [`READ_AHEAD_CACHE_SHARE`] blocks.
     #[serde(default = "default_read_cache_size")]
     #[config_env(leaf)]
     pub read_cache_size: IggyByteSize,

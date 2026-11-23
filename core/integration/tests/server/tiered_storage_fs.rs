@@ -42,7 +42,7 @@ const READY_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const TIERING_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long the shards may take to report the reads of a pass on `/metrics`.
-const METRICS_DEADLINE: Duration = Duration::from_secs(30);
+pub(crate) const METRICS_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_back_from_the_store()
@@ -100,7 +100,8 @@ async fn given_segments_read_once_from_the_store_when_reading_them_again_should_
     if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
         panic!("first pass: {error}");
     }
-    let first = settled_read_cache_counts(&http, |counts| counts.demand_bytes > 0).await;
+    let first =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| counts.demand_bytes > 0).await;
     assert!(
         first.blocks_fetched_ahead > 0,
         "readahead fetched nothing in front of the first pass: {first:?}"
@@ -108,7 +109,8 @@ async fn given_segments_read_once_from_the_store_when_reading_them_again_should_
     if let Err(error) = read_every_message_in_polls_of(&client, &stream, &topic, 1).await {
         panic!("second pass: {error}");
     }
-    let second = settled_read_cache_counts(&http, |counts| *counts != first).await;
+    let second =
+        settled_read_cache_counts(&http, METRICS_DEADLINE, |counts| *counts != first).await;
 
     assert!(
         second.block_hits > first.block_hits,
@@ -238,20 +240,24 @@ fn is_start_offset(name: &str) -> bool {
 
 /// What the read caches of the server's shards did, summed over the shards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ReadCacheCounts {
-    block_hits: u64,
-    demand_bytes: u64,
-    blocks_fetched_ahead: u64,
+pub(crate) struct ReadCacheCounts {
+    pub(crate) block_hits: u64,
+    pub(crate) demand_bytes: u64,
+    pub(crate) blocks_fetched_ahead: u64,
+    pub(crate) held_bytes: u64,
+    pub(crate) fresh_releases: u64,
+    pub(crate) carried_bytes: u64,
 }
 
 /// The counts once two scrapes a poll interval apart agree and `ready`
-/// accepts them. A shard copies its counts out once a tick, so one scrape
-/// can miss the last reads.
-async fn settled_read_cache_counts(
+/// accepts them, within `within`. A shard copies its counts out once a
+/// tick, so one scrape can miss the last reads.
+pub(crate) async fn settled_read_cache_counts(
     http: &HttpClient,
+    within: Duration,
     ready: impl Fn(&ReadCacheCounts) -> bool,
 ) -> ReadCacheCounts {
-    let deadline = Instant::now() + METRICS_DEADLINE;
+    let deadline = Instant::now() + within;
     let mut last = read_cache_counts(http).await;
     loop {
         sleep(POLL_INTERVAL).await;
@@ -261,7 +267,7 @@ async fn settled_read_cache_counts(
         }
         assert!(
             Instant::now() < deadline,
-            "within {METRICS_DEADLINE:?} the read cache did not report the pass: {counts:?}"
+            "within {within:?} the read cache did not report the pass: {counts:?}"
         );
         last = counts;
     }
@@ -278,6 +284,9 @@ async fn read_cache_counts(http: &HttpClient) -> ReadCacheCounts {
         block_hits: summed(&exposition, "remote_read_block_hits_total"),
         demand_bytes: summed(&exposition, "remote_read_demand_bytes_total"),
         blocks_fetched_ahead: summed(&exposition, "remote_read_blocks_fetched_ahead_total"),
+        held_bytes: summed(&exposition, "remote_read_held_bytes"),
+        fresh_releases: summed(&exposition, "remote_read_fresh_releases_total"),
+        carried_bytes: summed(&exposition, "remote_read_carried_bytes_total"),
     }
 }
 

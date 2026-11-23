@@ -179,6 +179,9 @@ pub struct DiskReadPlan {
     /// (see `build_poll_plan`); `start_position` is the byte offset into the
     /// first one.
     pub(crate) segments: Vec<DiskSegment>,
+    /// The segment after the last of [`Self::segments`] when its bytes are in
+    /// the store, which the walk does not read and readahead may.
+    pub(crate) next_remote: Option<RemoteRange>,
     /// The snapshot stops before the partition's last segment, because the
     /// segments it holds already cover what the poll can return. A walk that
     /// runs out of them anyway has more to read, never a tail to splice.
@@ -250,6 +253,8 @@ enum SegmentBytes<'a> {
         /// The plan named the local `.log`, which was gone by the time the
         /// walk opened it.
         replanned: bool,
+        /// The segment after this one, when its bytes are in the same store.
+        next: Option<&'a RemoteRange>,
     },
 }
 
@@ -1092,7 +1097,7 @@ impl DiskReadPlan {
         // gap at the faulted segment). Pre-fault matches are still served.
         let mut fault = None;
 
-        for segment in &self.segments {
+        for (at, segment) in self.segments.iter().enumerate() {
             if walk.matched >= count {
                 break;
             }
@@ -1103,7 +1108,14 @@ impl DiskReadPlan {
                 walk.position = 0;
                 continue;
             }
-            let bytes = match self.open_segment(segment, partition_dir).await {
+            let next = self
+                .segments
+                .get(at + 1)
+                .map_or(self.next_remote.as_ref(), |next| match &next.source {
+                    SegmentSource::Remote(range) => Some(range),
+                    SegmentSource::Local => None,
+                });
+            let bytes = match self.open_segment(segment, next, partition_dir).await {
                 Ok(bytes) => bytes,
                 Err(kind) => {
                     // The segment may hold present-but-unreadable data. Stop
@@ -1331,6 +1343,7 @@ impl DiskReadPlan {
     async fn open_segment<'a>(
         &'a self,
         segment: &'a DiskSegment,
+        next: Option<&'a RemoteRange>,
         partition_dir: &str,
     ) -> Result<SegmentBytes<'a>, DiskFault> {
         if let SegmentSource::Remote(range) = &segment.source {
@@ -1342,6 +1355,7 @@ impl DiskReadPlan {
                 range: range.clone(),
                 state: &segment.read_state,
                 replanned: false,
+                next,
             });
         }
         let path = format!("{partition_dir}/{:0>20}.log", segment.start_offset);
@@ -1354,6 +1368,7 @@ impl DiskReadPlan {
                     range,
                     state: &segment.read_state,
                     replanned: true,
+                    next,
                 })
             }
             Err(_) => Err(DiskFault::Retryable),
@@ -1406,6 +1421,7 @@ impl DiskReadPlan {
                 range,
                 state,
                 replanned,
+                next,
             } => {
                 #[cfg(feature = "poll-diagnostics")]
                 {
@@ -1414,7 +1430,7 @@ impl DiskReadPlan {
                 }
                 let read = async {
                     remote
-                        .read(range, walk.position, len)
+                        .read(range, walk.position, len, *next)
                         .await
                         .map_err(|fault| {
                             // A `.log` that was gone without an eviction was
@@ -2061,6 +2077,7 @@ mod tests {
             remote: None,
             object_prefix: None,
             index_fetches: IndexFetchFence::detached(),
+            next_remote: None,
             cut: false,
             deadline: None,
             bytes_per_message,
@@ -2156,6 +2173,7 @@ mod tests {
             remote: None,
             object_prefix: None,
             index_fetches: IndexFetchFence::detached(),
+            next_remote: None,
             cut: false,
             deadline: None,
             bytes_per_message: None,
@@ -2333,6 +2351,7 @@ mod tests {
             remote: None,
             object_prefix: None,
             index_fetches: IndexFetchFence::detached(),
+            next_remote: None,
             cut: false,
             deadline: None,
             bytes_per_message: None,
@@ -2484,6 +2503,7 @@ mod tests {
                         remote: None,
                         object_prefix: None,
                         index_fetches: IndexFetchFence::detached(),
+                        next_remote: None,
                         cut: false,
                         deadline: None,
                         bytes_per_message: None,
@@ -2620,6 +2640,7 @@ mod tests {
                     remote: None,
                     object_prefix: None,
                     index_fetches: IndexFetchFence::detached(),
+                    next_remote: None,
                     cut: false,
                     deadline: None,
                     bytes_per_message: None,
@@ -2847,6 +2868,7 @@ mod tests {
                     remote: None,
                     object_prefix: None,
                     index_fetches: IndexFetchFence::detached(),
+                    next_remote: None,
                     cut: false,
                     deadline: None,
                     bytes_per_message: None,

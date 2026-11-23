@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use configs::geo::{GeoConfig, GeoPeerConfig};
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, PartitionsHandle};
 use futures::future::{Either, join_all, select};
 use iggy_object_store::gcs::{GcsAuth, GcsStore};
 use iggy_object_store::s3::{Credentials, S3Store};
@@ -50,6 +50,7 @@ use iggy_object_store::{
 };
 use message_bus::{IggyMessageBus, MessageBus};
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::ReadCache;
 use shard::metrics::ShardMetrics;
 use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, SharedPeerStatus};
 use shard::{Receiver, Sender, channel};
@@ -147,6 +148,13 @@ pub fn start(
 ) -> Option<Sender<()>> {
     if config.peers.is_empty() {
         return None;
+    }
+    let settings = crate::tiered_storage::read_cache_settings(tiered);
+    let partitions = shard.plane.partitions();
+    // A node with a store of its own made the cache already. One without
+    // makes it only when it keeps what the peers' polls fetch.
+    if partitions.read_cache().is_none() && settings.cache_bytes > 0 {
+        partitions.set_read_cache(ReadCache::new(settings));
     }
     shard.set_peer_stores(stores(config, tiered, bus, statuses, auth));
     if shard.id != 0 {

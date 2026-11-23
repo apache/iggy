@@ -137,6 +137,9 @@ where
     /// Where the partitions here read their remote segments from. `None` on a
     /// shard without an object store.
     remote_segments: RefCell<Option<Rc<crate::RemoteSegments>>>,
+    /// What the shard keeps of what it reads from object stores, which the
+    /// reads of its own store and of its geo peers share.
+    read_cache: RefCell<Option<Rc<crate::ReadCache>>>,
     /// Where the partitions that follow another cluster's log read it from,
     /// by the peer's origin name.
     peer_remote_segments: RefCell<Vec<(String, Rc<crate::RemoteSegments>)>>,
@@ -370,6 +373,7 @@ where
             persistence_notifier: RefCell::new(None),
             io_notifier: RefCell::new(None),
             remote_segments: RefCell::new(None),
+            read_cache: RefCell::new(None),
             peer_remote_segments: RefCell::default(),
             repair_memory: None,
             repair_rings: None,
@@ -990,6 +994,18 @@ where
         *self.remote_segments.borrow_mut() = Some(remote);
     }
 
+    /// Give the shard the cache that its reads of object stores share.
+    pub fn set_read_cache(&self, cache: Rc<crate::ReadCache>) {
+        *self.read_cache.borrow_mut() = Some(cache);
+    }
+
+    /// The cache that the shard's reads of object stores share, `None` on a
+    /// shard that was given none.
+    #[must_use]
+    pub fn read_cache(&self) -> Option<Rc<crate::ReadCache>> {
+        self.read_cache.borrow().clone()
+    }
+
     /// Give the partitions here that follow another cluster's log the store
     /// of their peer, by origin name, in place of the stores they had. A
     /// partition here already takes its peer's store the next time the pump
@@ -1404,6 +1420,9 @@ where
             .partitions
             .borrow_mut()
             .remove(namespace);
+        if let Some(remote) = self.remote_segments.borrow().as_deref() {
+            remote.forget_partition(*namespace);
+        }
         Some(partition)
     }
 
@@ -1580,6 +1599,9 @@ where
             .borrow_mut()
             .entry(namespace)
             .or_insert(None);
+        if let Some(remote) = self.remote_segments.borrow().as_deref() {
+            remote.forget_partition(namespace);
+        }
         self.wake_namespace(namespace);
     }
 
@@ -1886,8 +1908,10 @@ where
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
         let namespace = IggyNamespace::from_raw(message.header().group);
+        // The partition takes its store before the batch commits, so the
+        // commit can tell the shard's cache where the batch ends.
         let partition = (!self.is_tombstoned(&namespace))
-            .then(|| self.get_mut_by_ns(&namespace))
+            .then(|| self.get_mut_with_remote(&namespace))
             .flatten();
         let Some(partition) = partition else {
             warn!(

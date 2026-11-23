@@ -69,7 +69,7 @@ mod tier;
 mod topic;
 
 pub use backend::Backend;
-pub use byte_cache::{AHEAD_SHARE, Admission, ByteCache, Lookup};
+pub use byte_cache::{AHEAD_SHARE, Admission, ByteCache, Lookup, UNHELD_SHARE};
 pub use error::{ErrorClass, ObjectStoreError};
 pub use fresh::{FreshObject, FreshObjectId, is_fresh_object};
 pub use fresh_index::{
