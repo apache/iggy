@@ -124,8 +124,8 @@ type MetadataSessionClosedReason uint8
 const (
 	MetadataSessionClosedReasonLogout  MetadataSessionClosedReason = 0
 	MetadataSessionClosedReasonExpired MetadataSessionClosedReason = 1
-	// MetadataSessionClosedReasonRevoked is a session ended because its user
-	// was deactivated or deleted.
+	// MetadataSessionClosedReasonRevoked is a session ended by a user delete,
+	// deactivation, password change, or delete of the session's token.
 	MetadataSessionClosedReasonRevoked MetadataSessionClosedReason = 2
 )
 

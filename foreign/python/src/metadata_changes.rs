@@ -260,7 +260,7 @@ pub enum MetadataTokenDeletedReason {
 pub enum MetadataSessionClosedReason {
     Logout,
     Expired,
-    /// The user was deactivated or deleted.
+    /// A user delete, deactivation, password change, or delete of the session's token.
     Revoked,
 }
 

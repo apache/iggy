@@ -49,7 +49,7 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-1` storage gate
+complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 A partition of a tiered topic keeps a chain file, and its older segments live
 only in the object store. A build from before tiered storage would read such a
@@ -76,12 +76,13 @@ release before the option, keep the old layout. Set `[cluster]
 default_replication_factor` to a number to give those topics fewer copies.
 Topic responses carry each partition's member list and in-sync members, a client
 wire change that SDKs from before this release cannot decode.
-Batched session retirement changes the body of the session finalization
-(op 70). It also raises the replica wire revision to 3, so a build from before
-it and a build after it refuse each other. An older body can be misread as a new
-one, so the storage gate moves to `IGGY-METADATA-CHANGE-LOG-2`. A node refuses an
-`IGGY-METADATA-CHANGE-LOG-1` data directory at boot without changing it, so start
-every replica from fresh storage.
+
+The preceding storage format, `IGGY-METADATA-CHANGE-LOG-2`, used replica wire revision 3. It introduced batched session finalization (op 70) and refused directories marked `IGGY-METADATA-CHANGE-LOG-1` before writing to them.
+
+Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Its replicated registration and password-change requests use replica wire revision 4. State transfer uses client table format `ICT6` and metadata snapshot format 21.
+
+Every replica needs fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. Sign in again over HTTP or in the web UI to obtain an access token carrying the account revision.
+
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -312,11 +313,17 @@ External group offsets belong to groups managed outside Iggy, such as a Kafka
 gateway. They require no Iggy group membership and can exceed the partition's
 message-offset range.
 
-The bind proof is an independent session credential. Password changes and PAT
-revocation or expiry do not end an established session. Binding checks that the
-owner still exists and is active; current permissions still govern each request.
-Explicit logout, lease expiry, user deactivation and user deletion end session
-access.
+The bind proof binds a connection to a session the owner opened with a credential. Binding checks that the owner still exists and is active, and that a session opened with a personal access token still has that token, unexpired. Current permissions still govern each request. Explicit logout, lease expiry, user deactivation and user deletion end session access.
+
+A successful password change ends every session of the account except the TCP, QUIC or WebSocket session that made the change. It invalidates all previously issued Iggy access tokens for that account, including tokens exchanged from personal access tokens. An HTTP self-change also closes its submitting session. A caller presenting a self-issued token must sign in again.
+
+Deleting a personal access token ends the sessions opened with it and the access tokens exchanged from it. Its expiry stops them at the expiry time, before the cleaner deletes it, and an access token exchanged from it never outlives it. Personal access tokens survive a password change, so a service that signs in with one opens a new session after the change.
+
+Deactivating an account ends every session and deletes all its personal access tokens. After reactivation, sign in again and issue new personal access tokens.
+
+Each node decides from the metadata it has applied. A node that has not applied a password change or a token delete yet still serves the old credential until it does. Over HTTP it answers an access token issued after a password change it has not applied with a retryable refusal.
+
+A registration proved against a superseded account revision or a deleted token is refused. The client can sign in again with a current credential. A session that ends during a send leaves that send uncertain, as described below.
 
 If a committed reply is lost and that session ends before the caller proves the
 outcome, the operation remains uncertain. Signing in again, including after
@@ -1049,7 +1056,11 @@ A page ends at its limit, before its items pass 1 MiB, or after the walk passes 
 
 Each page is a separate read of one node. An entity that exists during the whole walk and matches the filter appears exactly once. An entity that someone creates or deletes during the walk can appear or not appear, so a walk is not a snapshot. Use `GetMetadataChanges` for an exact copy. If the pages of one walk come from different nodes, a later page can come from an older state. Over HTTP, `consistency=linearizable` sends every page read to the primary.
 
-`GetTopics` for a stream that does not exist answers an empty last page if the request has no cursor. With a cursor, it answers `StreamIdNotFound` (1009), because the stream was deleted during the walk. `GetPartitions` and `GetConsumerGroups` answer the not-found error of the missing stream or topic.
+`GetStreams` and `GetTopics` need only an authenticated caller. They list the streams `GetStream` serves the caller and the topics `GetTopic` serves it, so a caller without a grant reads an empty last page. A stream or topic grant lists its stream or topic.
+
+A caller that reads a stream only through topic grants does not see the stream in `GetStreams`, because a stream entry carries totals over all its topics, and lists those topics with `GetTopics` under the stream id it knows. In either sort order, a scoped page counts only entries covered by the caller's read grants toward the 65536-entry scan limit. A name filter can still leave a page empty with a cursor.
+
+`GetTopics` for a stream that does not exist, or that no grant of the caller reaches, answers an empty last page without walking it. With a cursor, a caller with a global read grant gets `StreamIdNotFound` (1009) for a missing stream, because the stream was deleted during the walk. Every other caller gets the empty last page, so a missing and a hidden stream read the same. `GetPartitions` and `GetConsumerGroups` answer the not-found error of the missing stream or topic.
 
 Over HTTP, four routes take the page keys `order`, `descending`, `limit`, `cursor` and `name`, next to `consistency`. They are `GET /streams`, `GET /streams/{stream_id}/topics`, `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups` and `GET /users`. If the query has `limit` or `cursor`, the route returns one page as `{"items": [...], "next": "pg1_..."}`, and the last page has no `next`.
 
@@ -1090,11 +1101,11 @@ admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
-This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a breaking change: released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.0 clients before decoding their login, and this server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
+This checkout accepts client protocol 0.12.3 at login. Replica wire revision 4 is checked separately when servers connect.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 16 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The
@@ -1108,7 +1119,7 @@ Replacing the binary does not migrate old data. Use the offline re-ingestion
 procedure above for an upgrade. A recovery from a backup must use a separately
 verified, compatible backup; copying a format marker is not a migration.
 
-Within compatible `IGGY-TIERED-SEGMENT-CHAIN-1` storage, this release reads superblock
+Within compatible `IGGY-TIERED-SEGMENT-CHAIN-2` storage, this release reads superblock
 envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
 records remain readable. New records atomically retain an adopted view, its
 advertised head and exact prepare headers alongside the existing consensus state.
@@ -1181,8 +1192,8 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-TIERED-SEGMENT-CHAIN-1` requires this initialization contract;
-older data directories are refused before mutation.
+
+Storage format `IGGY-TIERED-SEGMENT-CHAIN-2` requires this initialization record. The server refuses older directories before writing to them.
 
 Retirement also writes `retirement.fence` in that external namespace directory
 before counting a permanently failed partition as retired. The fence names the

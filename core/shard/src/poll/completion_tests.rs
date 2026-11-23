@@ -33,6 +33,7 @@ use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WireP
 use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
 use iggy_binary_protocol::requests::system::SessionIdentity;
 use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdatePermissionsRequest};
 use iggy_binary_protocol::{
     AckLevel, CommitEntry, CommitHeader, HeartbeatState, RepairRangeReplyHeader, ReplyHeader,
@@ -53,7 +54,9 @@ use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine;
 use metadata::stm::consumer_group::{ConsumerGroup, ConsumerGroupMember, JoinConsumerGroupRequest};
 use metadata::stm::stream::{Partition, Stream, StreamsInner, Topic};
-use metadata::stm::user::{ROOT_USER_CREATED_AT_MICROS, Users};
+use metadata::stm::user::{
+    ChangePasswordRequest, ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS, Users,
+};
 use partitions::state_transfer::{PartitionTransferSession, TransferSlot};
 use partitions::{
     IggyPartition, IggyPartitions, PartitionsConfig, PollingArgs, PollingConsumer, RepairSession,
@@ -187,6 +190,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         Rejoin,
         Delete,
         RevokePermissions,
+        Rotation,
     }
     for (change, unbound) in [
         Change::Logout,
@@ -196,6 +200,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
         Change::Rejoin,
         Change::Delete,
         Change::RevokePermissions,
+        Change::Rotation,
     ]
     .into_iter()
     .flat_map(|change| [(change, false), (change, true)])
@@ -274,7 +279,7 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
             let attachment = if unbound {
                 super::PollAttachment::Unbound {
                     user_id: USER,
-                    user_created_at: 0,
+                    credential: CredentialProof::account(0, FIXTURE_OP),
                     metadata: attachment.metadata,
                 }
             } else {
@@ -351,10 +356,28 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 }
                 .to_bytes(),
             ),
+            Change::Rotation => {
+                apply_poll_metadata_at(
+                    &owner,
+                    FIXTURE_OP + 1,
+                    Operation::ChangePassword,
+                    ChangePasswordRequest {
+                        user_id: WireIdentifier::numeric(USER),
+                        access_revision: FIXTURE_OP,
+                        keep_session: true,
+                        password_hash: "new-hash".to_owned(),
+                    }
+                    .to_bytes(),
+                );
+                // The commit path ends the sessions of the account with it.
+                table.end_user_sessions(USER, FIXTURE_OP + 1);
+            }
         }
         for (group, completion, replies, result) in completions {
-            let stale = matches!(change, Change::Delete | Change::RevokePermissions)
-                || (matches!(change, Change::Logout) && !unbound)
+            let stale = matches!(
+                change,
+                Change::Delete | Change::RevokePermissions | Change::Rotation
+            ) || (matches!(change, Change::Logout) && !unbound)
                 || (matches!(change, Change::Leave) && group.is_some());
             completion.complete(result);
             assert!(futures::poll!(pump.as_mut()).is_pending());
@@ -362,10 +385,10 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
                 .try_recv()
                 .expect("the owner must validate the completion");
             if stale {
-                let expected = if matches!(change, Change::RevokePermissions) {
-                    IggyError::Unauthorized
-                } else {
-                    IggyError::TransientNotAccepted
+                let expected = match change {
+                    Change::RevokePermissions => IggyError::Unauthorized,
+                    Change::Rotation if unbound => IggyError::Unauthenticated,
+                    _ => IggyError::TransientNotAccepted,
                 };
                 assert!(
                     matches!(
@@ -412,12 +435,21 @@ async fn given_pending_attached_poll_when_metadata_changes_should_fence_only_aff
 }
 
 fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: impl AsRef<[u8]>) {
+    apply_poll_metadata_at(owner, FIXTURE_OP, operation, body);
+}
+
+fn apply_poll_metadata_at(
+    owner: &CompletionTestShard,
+    op: u64,
+    operation: Operation,
+    body: impl AsRef<[u8]>,
+) {
     let body = body.as_ref();
     let size = size_of::<PrepareHeader>() + body.len();
     let mut message = Message::<PrepareHeader>::new(size);
     let header = PrepareHeader {
         command: Command::Prepare,
-        op: 100,
+        op,
         operation,
         size: u32::try_from(size).unwrap(),
         ..Default::default()
@@ -430,6 +462,9 @@ fn apply_poll_metadata(owner: &CompletionTestShard, operation: Operation, body: 
     );
 }
 
+/// The op and access revision of every change [`apply_poll_metadata`] applies,
+/// at timestamp 0.
+const FIXTURE_OP: u64 = 100;
 // Wider than u64, so a refusal that truncated it would name another client.
 const BOUND_CLIENT: u128 = (1 << 64) + 41;
 const OTHER_CLIENT: u128 = 42;
@@ -735,7 +770,7 @@ async fn given_backup_when_polled_on_primary_should_name_the_primary_unless_tran
                 consumer: PollingConsumer::Consumer(1, 0),
                 args: PollingArgs::new(PollingStrategy::next(), 1, false),
                 user_id: BOUND_USER,
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 metadata,
             },
             PartitionRead::ConsumerOffsetOnPrimary {
@@ -821,7 +856,10 @@ async fn given_a_pending_view_write_when_read_on_primary_should_refuse_until_it_
                 consumer,
                 args: PollingArgs::new(PollingStrategy::first(), 1, false),
                 user_id: DEFAULT_ROOT_USER_ID,
-                user_created_at: ROOT_USER_CREATED_AT_MICROS,
+                credential: CredentialProof::account(
+                    ROOT_USER_CREATED_AT_MICROS,
+                    ROOT_USER_ACCESS_REVISION,
+                ),
                 metadata,
             },
             PartitionRead::ConsumerOffsetOnPrimary {
