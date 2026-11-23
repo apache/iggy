@@ -36,6 +36,9 @@
 //!   [`ABSENCE_CONFIRM`].
 //! - A shadow stream without topics whose peer stream has no live object is
 //!   removed, and one whose peer stream was renamed is renamed too.
+//! - An adopted topic takes the `read_cache_size` and `read_ahead` that the
+//!   live object of its incarnation sets, and loses each one that the object
+//!   no longer sets, so its partitions read with what the peer's topic sets.
 //!
 //! Only the caught-up metadata primary proposes, so every replica learns the
 //! shadow streams through consensus. A deposed primary that has not learned
@@ -44,8 +47,9 @@
 //!
 //! Whether a peer's store answers is this node's view alone. While the
 //! listing of a peer fails, or the node reads nothing from the peer, the
-//! shadow topics of the peer are stale: they serve what they hold, and the
-//! pass removes none of them but those whose grace ended.
+//! shadow topics of the peer are stale: they serve what they hold with the
+//! read cache settings they took last, and the pass removes none of them but
+//! those whose grace ended.
 //!
 //! A peer whose origin retired is read no more. Each of its shadow topics is
 //! removed once the topic's retention in the peer passed since the
@@ -69,7 +73,9 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest,
 };
 use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
-use iggy_common::{CompressionAlgorithm, GeoMode, IggyTimestamp, TopicCreateOptions};
+use iggy_common::{
+    CompressionAlgorithm, GeoMode, IggyByteSize, IggyTimestamp, TopicCreateOptions, TopicReadCache,
+};
 use iggy_object_store::{
     ObjectPrefix, TierJobCancelled, TierScope, TierScopeToken, TopicCompression, TopicGeoMode,
     TopicKey, TopicObject, TopicRead, TopicState,
@@ -77,8 +83,8 @@ use iggy_object_store::{
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::shadow::{
-    RetiredOrigin, ShadowRetention, ShadowStream, ShadowTopicRequest, ShadowTopicTarget,
-    shadow_stream_name,
+    RetiredOrigin, ShadowReadCache, ShadowRetention, ShadowStream, ShadowTopicRequest,
+    ShadowTopicTarget, shadow_stream_name,
 };
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::{ExecutorTopicObjects, TopicObjects};
@@ -639,7 +645,8 @@ struct Plan {
 
 /// The first operation that brings committed metadata closer to the peers.
 /// Removals and detaches come first, so a topic id or name an old
-/// incarnation holds frees up before an adoption needs it.
+/// incarnation holds frees up before an adoption needs it. The read cache
+/// settings of adopted topics come last.
 fn plan(
     inner: &StreamsInner,
     peers: &BTreeMap<String, PeerView>,
@@ -662,8 +669,14 @@ fn plan(
             return plan;
         }
     }
-    for (origin, view) in followed {
+    for (origin, view) in followed.clone() {
         if let Some(proposal) = adopt(inner, origin, view, &mut plan.reports) {
+            plan.proposal = Some(proposal);
+            return plan;
+        }
+    }
+    for (origin, view) in followed {
+        if let Some(proposal) = follow_read_cache(inner, origin, view) {
             plan.proposal = Some(proposal);
             return plan;
         }
@@ -961,6 +974,64 @@ fn adopt(
     None
 }
 
+/// A change of the read cache settings of a shadow topic of `origin` to
+/// what the live object of its incarnation publishes. Only a peer that is
+/// read now, from a store that the cluster the shadow stream came from still
+/// owns, changes them.
+fn follow_read_cache(
+    inner: &StreamsInner,
+    origin: &str,
+    view: &PeerView,
+) -> Option<ShadowTopicRequest> {
+    if view.stale {
+        return None;
+    }
+    for (stream_id, stream) in shadow_streams_of(inner, origin) {
+        let Some(source) = stream
+            .shadow
+            .as_ref()
+            .filter(|source| view.cluster_uid == Some(source.cluster_uid))
+        else {
+            continue;
+        };
+        for (topic_id, topic) in &stream.topics {
+            let Some(shadow) = topic.shadow.filter(|shadow| !shadow.is_detached()) else {
+                continue;
+            };
+            let key = TopicKey {
+                stream_id: source.stream_id,
+                topic_id: topic_id as u64,
+                created_revision: shadow.created_revision,
+            };
+            let Some(object) = view
+                .objects
+                .get(&key)
+                .and_then(|seen| seen.object.as_ref())
+                .filter(|object| {
+                    object.is_live()
+                        && object.origin == origin
+                        && object.cluster_uid == source.cluster_uid
+                })
+            else {
+                continue;
+            };
+            let published = read_cache_of(object);
+            if ShadowReadCache::stored(&topic.options) != published {
+                return Some(ShadowTopicRequest::SetReadCache {
+                    target: ShadowTopicTarget {
+                        stream_id: u32::try_from(stream_id).ok()?,
+                        source: source.clone(),
+                        topic_id: u32::try_from(topic_id).ok()?,
+                        created_revision: shadow.created_revision,
+                    },
+                    read_cache: published,
+                });
+            }
+        }
+    }
+    None
+}
+
 /// The create of the shadow topic of `object`, without the partition
 /// assignments that the metadata primary fills in.
 fn adoption(stream_id: usize, object: &TopicObject) -> Option<CreateTopicWithAssignmentsRequest> {
@@ -969,6 +1040,10 @@ fn adoption(stream_id: usize, object: &TopicObject) -> Option<CreateTopicWithAss
             TopicCompression::None => CompressionAlgorithm::None,
             TopicCompression::Gzip => CompressionAlgorithm::Gzip,
         }),
+        read_cache: TopicReadCache {
+            size: object.read_cache_size.map(IggyByteSize::from),
+            read_ahead: object.read_ahead.map(IggyByteSize::from),
+        },
         ..TopicCreateOptions::default()
     };
     Some(CreateTopicWithAssignmentsRequest {
@@ -988,6 +1063,14 @@ const fn retention_of(object: &TopicObject) -> ShadowRetention {
     ShadowRetention {
         message_expiry: object.message_expiry,
         max_topic_size: object.max_topic_size,
+    }
+}
+
+/// The read cache settings that the topic of `object` sets in the peer.
+const fn read_cache_of(object: &TopicObject) -> ShadowReadCache {
+    ShadowReadCache {
+        size: object.read_cache_size,
+        read_ahead: object.read_ahead,
     }
 }
 
@@ -1037,6 +1120,10 @@ fn describe(proposal: &ShadowTopicRequest) -> String {
             create.request.name.as_str(),
             describe_source(&target.source),
             target.created_revision
+        ),
+        ShadowTopicRequest::SetReadCache { target, read_cache } => format!(
+            "set read_cache_size {:?} and read_ahead {:?} of topic {} of stream {}",
+            read_cache.size, read_cache.read_ahead, target.topic_id, target.stream_id
         ),
     }
 }
@@ -1092,6 +1179,8 @@ mod tests {
             published_at,
             state: TopicState::Live,
             tombstone_grace: 0,
+            read_cache_size: None,
+            read_ahead: None,
         }
     }
 
@@ -1259,6 +1348,125 @@ mod tests {
                 message_expiry: 3_600_000_000,
                 max_topic_size: 1 << 30,
             }
+        );
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    /// The peer's object of a topic that sets `read_cache_size` to `size` and
+    /// `read_ahead` to `read_ahead`.
+    fn cached(size: Option<u64>, read_ahead: Option<u64>) -> TopicObject {
+        TopicObject {
+            read_cache_size: size,
+            read_ahead,
+            ..object(key(), "orders", 10)
+        }
+    }
+
+    /// The proposal that gives the adopted topic `size` and `read_ahead`.
+    fn set_read_cache(
+        stream_id: u32,
+        size: Option<u64>,
+        read_ahead: Option<u64>,
+    ) -> ShadowTopicRequest {
+        ShadowTopicRequest::SetReadCache {
+            target: target(stream_id),
+            read_cache: ShadowReadCache { size, read_ahead },
+        }
+    }
+
+    #[test]
+    fn given_an_object_with_a_read_cache_when_adopting_should_give_the_shadow_topic_the_same() {
+        let published = cached(Some(16 * MIB), Some(0));
+        let (inner, stream_id) = adopted_from(published.clone());
+
+        let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC_SLOT];
+        assert_eq!(
+            topic.resolved.read_cache,
+            iggy_common::TopicReadCache {
+                size: Some(IggyByteSize::from(16 * MIB)),
+                read_ahead: Some(IggyByteSize::from(0)),
+            }
+        );
+        assert_eq!(
+            plan(&inner, &view([published]), NOW, GRACE).proposal,
+            None,
+            "the shadow topic holds what the peer sets"
+        );
+    }
+
+    #[test]
+    fn given_a_peer_that_changes_its_read_cache_when_planning_should_set_each_change_on_the_shadow_topic()
+     {
+        let (mut inner, stream_id) = adopted();
+        let steps = [
+            (Some(16 * MIB), None),
+            (Some(16 * MIB), Some(MIB)),
+            (Some(0), Some(MIB)),
+            (None, Some(MIB)),
+            (None, None),
+        ];
+
+        for (size, read_ahead) in steps {
+            let peers = view([cached(size, read_ahead)]);
+            assert_eq!(
+                plan(&inner, &peers, NOW, GRACE).proposal,
+                Some(set_read_cache(stream_id, size, read_ahead)),
+                "{size:?}, {read_ahead:?}"
+            );
+            apply_plan(&mut inner, &peers);
+            assert_eq!(
+                plan(&inner, &peers, NOW, GRACE).proposal,
+                None,
+                "applied {size:?}, {read_ahead:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_peer_that_is_not_followed_when_its_read_cache_changes_should_propose_nothing() {
+        let (inner, stream_id) = adopted();
+        let changed = cached(Some(16 * MIB), Some(MIB));
+
+        let mut stale = view([changed.clone()]);
+        let peer = stale.get_mut(PEER).unwrap();
+        peer.stale = true;
+        peer.complete = false;
+        assert_eq!(plan(&inner, &stale, NOW, GRACE).proposal, None, "stale");
+
+        let mut taken = view([changed.clone()]);
+        taken.get_mut(PEER).unwrap().cluster_uid = Some(PEER_CLUSTER + 1);
+        assert_eq!(
+            plan(&inner, &taken, NOW, GRACE).proposal,
+            None,
+            "a store that another cluster owns now"
+        );
+
+        let recreated = TopicObject {
+            key: TopicKey {
+                created_revision: PEER_REVISION + 5,
+                ..key()
+            },
+            ..changed.clone()
+        };
+        assert_eq!(
+            plan(&inner, &view([recreated]), NOW, GRACE).proposal,
+            None,
+            "another incarnation"
+        );
+
+        let (mut retired, _) = adopted();
+        retire_origin(&mut retired, PEER, NOW);
+        assert_eq!(
+            plan(&retired, &view([changed.clone()]), NOW, GRACE).proposal,
+            None,
+            "a retired origin"
+        );
+
+        assert_eq!(
+            plan(&inner, &view([changed]), NOW, GRACE).proposal,
+            Some(set_read_cache(stream_id, Some(16 * MIB), Some(MIB))),
+            "the same change from the followed peer"
         );
     }
 

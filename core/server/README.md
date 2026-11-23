@@ -544,7 +544,9 @@ setting: only the cache of the shard bounds the topic's partitions, and they
 read ahead the node's `read_ahead`. Neither can be reset. The fresh objects a
 shard uploads are held for the polls at the tail whatever a topic sets. A
 topic without `tiered_storage` accepts both, and they apply once its reads go
-to the store. The
+to the store. A shadow topic reads with the values that the geo topic it
+shadows sets, see [Shadow streams](#shadow-streams), and no client can set
+them on it. The
 counters `remote_read_block_hits`, `remote_read_block_misses`,
 `remote_read_ahead_hits`, `remote_read_blocks_fetched_ahead`,
 `remote_read_demand_bytes`, `remote_read_ahead_bytes`,
@@ -812,11 +814,13 @@ these objects to find the geo topics of this cluster. One listing of
 `<prefix>/meta/topics/` finds all of them. An object holds the origin, the
 `cluster_uid`, the stream and topic names and ids, and the partition count. It
 also holds the compression algorithm, the largest message size, the retention
-limits and the geo mode.
+limits, the geo mode, and the `read_cache_size` and `read_ahead` that the topic
+sets.
 
 The caught-up metadata primary stores the object of a new geo topic within
 about a second of its creation. When the content of the object changes, for
-example after a stream rename, it stores the object again. The primary of each
+example after a stream rename or an update of the topic's read cache settings,
+it stores the object again. The primary of each
 partition of a geo topic reads the object before it takes messages, and again
 after each change of primary. Until then, the partition refuses messages with
 `TransientNotAccepted`, which the SDKs retry. A store that does not answer
@@ -856,6 +860,12 @@ cluster, one operation at a time, so every node holds the same shadow streams:
 - An object that the peer's store no longer lists for 2 minutes removes its
   shadow topic.
 - A shadow stream without topics and without live objects is removed.
+- A shadow topic takes the `read_cache_size` and `read_ahead` that its live
+  object sets, at its adoption and after each change, and a key that the
+  object does not set is unset on the shadow topic too. The values stay as the
+  peer set them: each node bounds them to its own cache as it does for any
+  topic. While the peer's store does not answer, and after its origin retired,
+  a shadow topic keeps the last values it took.
 
 A read of a shadow stream, alone or in a listing, reports the read-only key
 `shadow_origin` with the peer's origin, and no other stream carries it. Every

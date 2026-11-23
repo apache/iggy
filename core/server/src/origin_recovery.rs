@@ -56,7 +56,7 @@ use iggy_binary_protocol::requests::topics::{
 use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
 use iggy_common::{
     CompressionAlgorithm, GeoMode, GeoTopicDurations, IggyByteSize, IggyDuration, IggyExpiry,
-    IggyTimestamp, MaxTopicSize, TopicCreateOptions, TopicType,
+    IggyTimestamp, MaxTopicSize, TopicCreateOptions, TopicReadCache, TopicType,
 };
 use iggy_object_store::{
     KeyLayout, ManifestError, ObjectPrefix, ObjectStore, ObjectStoreError, PartitionManifest,
@@ -416,6 +416,10 @@ pub struct RetiredTopic {
     pub described_at: u64,
     /// The topic's own `tombstone_grace` in microseconds, zero for none.
     pub tombstone_grace: u64,
+    /// The topic's own `read_cache_size` and `read_ahead` in bytes, `None`
+    /// for one that it does not set.
+    pub read_cache_size: Option<u64>,
+    pub read_ahead: Option<u64>,
 }
 
 /// Every geo topic that the retired cluster `retired_cluster_uid` described
@@ -461,6 +465,8 @@ impl From<TopicObject> for RetiredTopic {
             },
             described_at: object.published_at,
             tombstone_grace: object.tombstone_grace,
+            read_cache_size: object.read_cache_size,
+            read_ahead: object.read_ahead,
         }
     }
 }
@@ -661,6 +667,10 @@ fn restored_topic(
                 .then(|| IggyDuration::from(object.tombstone_grace)),
             ..GeoTopicDurations::default()
         },
+        read_cache: TopicReadCache {
+            size: object.read_cache_size.map(IggyByteSize::from),
+            read_ahead: object.read_ahead.map(IggyByteSize::from),
+        },
         ..TopicCreateOptions::default()
     };
     Some(CreateTopicWithAssignmentsRequest {
@@ -800,6 +810,8 @@ mod tests {
             deleted_at: None,
             described_at,
             tombstone_grace: 0,
+            read_cache_size: None,
+            read_ahead: None,
         }
     }
 
@@ -828,6 +840,8 @@ mod tests {
             published_at: 2,
             state: TopicState::Live,
             tombstone_grace: 0,
+            read_cache_size: Some(4 * 1024 * 1024),
+            read_ahead: None,
         };
         for object in [
             described(1, RETIRED),
@@ -879,5 +893,25 @@ mod tests {
             Some(IggyExpiry::ExpireDuration(IggyDuration::from(60_000_000)))
         );
         assert_eq!(options.max_topic_size, Some(MaxTopicSize::Unlimited));
+        assert_eq!(options.read_cache, TopicReadCache::default());
+    }
+
+    #[test]
+    fn given_a_topic_object_with_a_read_cache_when_restoring_should_keep_what_the_topic_set() {
+        let object = RetiredTopic {
+            read_cache_size: Some(16 * 1024 * 1024),
+            read_ahead: Some(0),
+            ..object(3, "orders", 10)
+        };
+
+        let create = restored_topic(3, &object).unwrap();
+
+        assert_eq!(
+            TopicCreateOptions::parse_committed(&create.request.options).read_cache,
+            TopicReadCache {
+                size: Some(IggyByteSize::from(16 * 1024 * 1024)),
+                read_ahead: Some(IggyByteSize::from(0)),
+            }
+        );
     }
 }

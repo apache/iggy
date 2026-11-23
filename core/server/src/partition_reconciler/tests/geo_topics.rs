@@ -232,6 +232,8 @@ async fn given_a_committed_geo_topic_when_the_metadata_primary_reconciles_should
             published_at: now.as_micros(),
             state: TopicState::Live,
             tombstone_grace: 0,
+            read_cache_size: None,
+            read_ahead: None,
         }
     );
     // The normal topic has no object.
@@ -419,6 +421,84 @@ async fn given_a_renamed_stream_when_the_metadata_primary_reconciles_should_stor
     geo_topics_pass(&ctx, after(start, Duration::from_secs(2))).await;
 
     assert_eq!(stored_object(&objects, key).stream_name, "orders-eu");
+}
+
+/// Commit an update of the geo topic's read cache settings that sets each
+/// key of `entries` to its bytes.
+fn update_read_cache(shard: &TestShard, op: u64, entries: &[(OptionKey, u64)]) {
+    let options: ResourceOptions = entries
+        .iter()
+        .map(|(key, bytes)| {
+            (
+                HeaderKey::from(*key),
+                OptionValue::explicit(HeaderValue::from(*bytes)),
+            )
+        })
+        .collect();
+    let update = UpdateTopicResolvedRequest {
+        stream_id: WireIdentifier::numeric(0),
+        topic_id: WireIdentifier::numeric(0),
+        name: None,
+        explicit_options: resource_options_to_wire(&options, OptionsProvenance::All).unwrap(),
+        derived_options: WireOptions::empty(),
+    };
+    let reply = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .update(build_prepare(op, Operation::UpdateTopicResolved, &update))
+        .expect("UpdateTopicResolved apply succeeds");
+    assert_eq!(reply.code, 0);
+}
+
+/// The shadow topics in other datacenters take a geo topic's read cache
+/// settings from its object, so an update of either one stores the object
+/// again.
+#[compio::test]
+async fn given_an_update_of_the_read_cache_of_a_geo_topic_when_the_metadata_primary_reconciles_should_store_its_object_again()
+ {
+    const MIB: u64 = 1024 * 1024;
+    let tmp = TempDir::new().unwrap();
+    let config = geo_config(&tmp);
+    let (shard, objects, key) = geo_primary(&config);
+    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let start = IggyTimestamp::now();
+    geo_topics_pass(&ctx, start).await;
+    let first = stored_object(&objects, key);
+    assert_eq!((first.read_cache_size, first.read_ahead), (None, None));
+
+    update_read_cache(&shard, 4, &[(OptionKey::ReadCacheSize, 16 * MIB)]);
+    let sized = after(start, Duration::from_secs(2));
+    geo_topics_pass(&ctx, sized).await;
+    assert_eq!(
+        stored_object(&objects, key),
+        TopicObject {
+            published_at: sized.as_micros(),
+            read_cache_size: Some(16 * MIB),
+            ..first.clone()
+        }
+    );
+
+    update_read_cache(&shard, 5, &[(OptionKey::ReadAhead, 0)]);
+    let ahead = after(start, Duration::from_secs(4));
+    geo_topics_pass(&ctx, ahead).await;
+    let stored = stored_object(&objects, key);
+    assert_eq!(
+        stored,
+        TopicObject {
+            published_at: ahead.as_micros(),
+            read_cache_size: Some(16 * MIB),
+            read_ahead: Some(0),
+            ..first
+        }
+    );
+
+    geo_topics_pass(&ctx, after(start, Duration::from_secs(6))).await;
+    assert_eq!(
+        stored_object(&objects, key),
+        stored,
+        "a pass without a change stores nothing"
+    );
 }
 
 /// Partitions added to a geo topic come at another revision, so the node

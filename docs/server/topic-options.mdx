@@ -80,6 +80,8 @@ iggy topic create my-stream archive 4 none --set tiered_storage=true --set read_
 iggy topic update my-stream archive --set read_ahead=0
 ```
 
+A shadow topic inherits both keys from the geo topic that it shadows in another datacenter, and follows each update of them there, within about 35 seconds. A key that the geo topic does not set is unset on the shadow topic too, and each node that reads it applies its own setting. A client cannot set them on a shadow topic: an update of a shadow topic is refused with `ShadowStreamReadOnly`.
+
 ## Create-only vs updatable
 
 Updates use UpdateResource with a set/reset patch. SDKs retain resource-specific update methods, but these methods send the shared command. These keys can change on a topic:
