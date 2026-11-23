@@ -9,12 +9,11 @@
 //   http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// software distributed under the License is distributed on
+// an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { toDate } from './serialize.utils.js';
@@ -31,6 +30,13 @@ describe('toDate', () => {
     assert.equal(
       toDate(1_700_000_000_000_000n).toISOString(),
       '2023-11-14T22:13:20.000Z'
+    );
+  });
+
+  it('truncates microseconds to milliseconds', () => {
+    assert.equal(
+      toDate(1_999n).toISOString(),
+      '1970-01-01T00:00:00.001Z'
     );
   });
 });
