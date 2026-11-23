@@ -35,15 +35,13 @@ import (
 	"time"
 
 	"github.com/apache/iggy/examples/go/common"
-	"github.com/apache/iggy/foreign/go/client/tcp"
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
 	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 const (
-	defaultAddress = "127.0.0.1:8090"
-	defaultStream  = "qw"
-	defaultTopic   = "records"
+	defaultStream = "qw"
+	defaultTopic  = "records"
 )
 
 const (
@@ -68,13 +66,13 @@ func main() {
 
 func run() error {
 	ctx := context.Background()
-	address := envOrDefault("IGGY_ADDRESS", defaultAddress)
+	address, tcpOptions := common.ServerOptions()
 	username := envOrDefault("IGGY_USERNAME", common.DefaultRootUsername)
 	password := envOrDefault("IGGY_PASSWORD", common.DefaultRootPassword)
 	stream := envOrDefault("IGGY_STREAM", defaultStream)
 	topic := envOrDefault("IGGY_TOPIC", defaultTopic)
 
-	cli, err := common.Dial(ctx, address, []tcp.Option{tcp.WithServerAddress(address)}, username, password)
+	cli, err := common.Dial(ctx, address, tcpOptions, username, password)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

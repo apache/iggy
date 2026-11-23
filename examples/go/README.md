@@ -81,7 +81,7 @@ Both read the tenant count from `TENANTS_COUNT` (default `3`). Streams, topics a
 
 Populates an Iggy topic with JSON records so that a sink connector has data to read. The producer sends 100 batches of 100 to 499 records each, logs the total and exits.
 
-Each record contains: `user_id`, `user_type`, `email`, `source`, `state`, `created_at` and `message`. The fields match the Rust and Python sink data producers, so one connector configuration works for every SDK.
+Each record contains: `user_id`, `user_type`, `email`, `source`, `state`, `created_at` and `message`. The fields match the Rust and Python sink data producers, so one connector configuration works for the Rust, Python and Go producers.
 
 Default stream: `qw` | Default topic: `records`
 
@@ -89,9 +89,10 @@ Environment variables:
 
 - `IGGY_STREAM` - stream name (default: `qw`)
 - `IGGY_TOPIC` - topic name (default: `records`)
-- `IGGY_ADDRESS` - server address (default: `127.0.0.1:8090`)
 - `IGGY_USERNAME` - authentication username (default: `iggy`)
 - `IGGY_PASSWORD` - authentication password (default: `iggy`)
+
+The server address comes from `--tcp-server-address` (default: `127.0.0.1:8090`), like the other Go examples.
 
 The producer creates the stream and topic if they are missing and keeps them after it exits, so running it again against the same server succeeds. It addresses the stream and topic by name. On a fresh server, the first stream created takes ID `0`, which the getting-started examples expect, so run this producer after them or on a separate fresh server.
 
