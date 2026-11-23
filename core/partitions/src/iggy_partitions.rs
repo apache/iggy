@@ -3226,7 +3226,7 @@ mod tests {
             partitions.refuse(namespace, 7);
 
             assert_eq!(partitions.failed_revision(&namespace), Some(7));
-            let logged = messages.0.lock().unwrap();
+            let logged = messages.0.lock().unwrap().clone();
             if logged.is_empty() {
                 continue;
             }
