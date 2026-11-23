@@ -35,6 +35,12 @@
 //! housekeeping class, as the listings of its manifests do, with the same
 //! back-off for a peer whose listing failed. A peer whose origin retired is
 //! listed no more.
+//!
+//! A pass that reads an object, or finds one gone, reads the peer's identity
+//! object before those reads and after them, and hands out what it read only
+//! when both reads named the cluster that the node reads the peer as, see
+//! [`IdentityBracket`]. Otherwise it forgets every object of the peer, so the
+//! next pass reads them again.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
@@ -44,14 +50,17 @@ use configs::geo::GeoConfig;
 use consensus::MetadataHandle;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    GeoLog, GeoPosition, KeyLayout, MAX_POSITIONS_OBJECT_LEN, ObjectStore, PositionHolder,
-    PositionsObject, TierExecutor, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
+    GeoLog, GeoPosition, IdentityRead, KeyLayout, MAX_POSITIONS_OBJECT_LEN, ObjectStore,
+    ObjectStoreError, PositionHolder, PositionsObject, StoreIdentity, TierExecutor, TierJobClass,
+    TierJobRequest, TierScope, TierScopeToken,
 };
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::StreamsInner;
 use server_common::sharding::IggyNamespace;
 use shard::geo_positions::{GeoPositionSettings, PeerPositions, local_logs};
+use shard::metrics::ShardMetrics;
+use shard::peers::{IdentityBracket, SharedPeerStatus};
 use shard::shards_table::calculate_shard_assignment;
 use tracing::{debug, warn};
 
@@ -160,6 +169,7 @@ impl PeerPositionLister {
                 service: service.clone(),
                 token: scope.token(),
                 objects,
+                status: peer.shared_status().clone(),
             });
         }
         if reads.is_empty() {
@@ -178,9 +188,23 @@ impl PeerPositionLister {
             let mut read = Vec::new();
             for peer in reads {
                 let peer_origin = peer.origin.clone();
-                let (objects, listed) = peer.read(&shard).await;
-                failed.insert(peer_origin.clone(), !listed);
-                read.push((peer_origin, objects, listed));
+                let status = peer.status.clone();
+                let pass = peer.read(shard.metrics()).await;
+                failed.insert(peer_origin.clone(), !pass.listed);
+                let adopted = pass.adopted(&status);
+                let objects = if pass.listed && !adopted {
+                    debug!(
+                        origin = peer_origin,
+                        identity = ?pass.identity,
+                        "the identity object of the geo peer did not name the cluster this node \
+                         reads before and after the positions it read; the next pass reads them \
+                         again"
+                    );
+                    Objects::new()
+                } else {
+                    pass.objects
+                };
+                read.push((peer_origin, objects, adopted));
             }
             let logs = shard
                 .plane
@@ -190,8 +214,8 @@ impl PeerPositionLister {
                 .read(|inner| local_logs(inner, &origin));
             let mut state_ref = state.borrow_mut();
             state_ref.settle(failed, now, interval);
-            for (peer_origin, objects, listed) in read {
-                if listed {
+            for (peer_origin, objects, adopted) in read {
+                if adopted {
                     hand_out(&shard, &peer_origin, &objects, &logs, place.total_shards);
                 }
                 state_ref.objects.insert(peer_origin, objects);
@@ -212,28 +236,48 @@ struct PeerRead<E> {
     service: E,
     token: TierScopeToken,
     objects: Objects,
+    status: SharedPeerStatus,
+}
+
+/// What a pass read of one peer.
+struct PassRead {
+    /// The objects it holds after the pass.
+    objects: Objects,
+    /// Whether the listing succeeded.
+    listed: bool,
+    /// What the reads of the identity object around the reads of objects
+    /// found, `None` when the pass found every object as the last pass left
+    /// it, and read none.
+    identity: Option<IdentityBracket>,
+}
+
+impl PassRead {
+    /// Whether the pass may hand out what it holds: the listing succeeded,
+    /// and the identity object named the cluster that `status` reads the
+    /// peer as around whatever the pass read.
+    fn adopted(&self, status: &SharedPeerStatus) -> bool {
+        self.listed && self.identity.is_none_or(|identity| status.adopts(identity))
+    }
 }
 
 impl<E: TierExecutor + Clone> PeerRead<E> {
-    /// List the peer's positions and read the objects that changed. Returns
-    /// the objects it holds after the pass, and whether the listing
-    /// succeeded. An object whose read failed keeps its last copy.
+    /// List the peer's positions and read the objects that changed. An
+    /// object whose read failed keeps its last copy.
     #[allow(
         clippy::future_not_send,
         reason = "the task runs on shard 0, which owns the peer's tier service"
     )]
-    async fn read(self, shard: &ServerShard) -> (Objects, bool) {
+    async fn read(self, metrics: &ShardMetrics) -> PassRead {
         let Self {
             origin,
             layout,
             service,
             token,
             mut objects,
+            status: _,
         } = self;
         let listed = list_all(service.clone(), token.clone(), layout.positions_prefix()).await;
-        shard
-            .metrics()
-            .record_peer_position_request(&origin, "list", listed.is_ok());
+        metrics.record_peer_position_request(&origin, "list", listed.is_ok());
         let keys = match listed {
             Ok(keys) => keys,
             Err(error) => {
@@ -241,14 +285,31 @@ impl<E: TierExecutor + Clone> PeerRead<E> {
                     origin,
                     error, "listing the consumer group positions of a geo peer failed"
                 );
-                return (objects, false);
+                return PassRead {
+                    objects,
+                    listed: false,
+                    identity: None,
+                };
             }
         };
+        let keys: Vec<_> = keys
+            .into_iter()
+            .filter_map(|(key, etag)| {
+                let expected = layout.parse_positions_key(&key)?;
+                Some((key, etag, expected))
+            })
+            .collect();
+        let changed = keys.len() != objects.len()
+            || keys
+                .iter()
+                .any(|(key, etag, _)| objects.get(key).is_none_or(|(known, _)| known != etag));
+        let before = if changed {
+            Some(read_identity(&service, &token, &layout).await)
+        } else {
+            None
+        };
         let mut kept = Objects::new();
-        for (key, etag) in keys {
-            let Some(expected) = layout.parse_positions_key(&key) else {
-                continue;
-            };
+        for (key, etag, expected) in keys {
             if let Some((known, object)) = objects.remove(&key)
                 && known == etag
             {
@@ -274,9 +335,7 @@ impl<E: TierExecutor + Clone> PeerRead<E> {
                 Ok(Err(error)) => Err(error.to_string()),
                 Err(cancelled) => Err(cancelled.to_string()),
             };
-            shard
-                .metrics()
-                .record_peer_position_request(&origin, "get", decoded.is_ok());
+            metrics.record_peer_position_request(&origin, "get", decoded.is_ok());
             match decoded {
                 Ok((stored_etag, object)) => {
                     let etag = if stored_etag.is_empty() {
@@ -294,8 +353,40 @@ impl<E: TierExecutor + Clone> PeerRead<E> {
                 }
             }
         }
-        (kept, true)
+        let identity = match before {
+            Some(before) => {
+                let after = read_identity(&service, &token, &layout).await;
+                Some(IdentityBracket::of(&before, &after))
+            }
+            None => None,
+        };
+        PassRead {
+            objects: kept,
+            listed: true,
+            identity,
+        }
     }
+}
+
+/// One read of the peer's identity object, in the class of the pass's other
+/// reads.
+#[allow(
+    clippy::future_not_send,
+    reason = "the task runs on shard 0, which owns the peer's tier service"
+)]
+async fn read_identity<E: TierExecutor>(
+    service: &E,
+    token: &TierScopeToken,
+    layout: &KeyLayout,
+) -> Result<IdentityRead, ObjectStoreError> {
+    let request = TierJobRequest::new(TierJobClass::Housekeeping, token.clone());
+    let layout = layout.clone();
+    service
+        .submit(request, move |store| async move {
+            StoreIdentity::read(&*store, &layout).await
+        })
+        .await
+        .map_err(|cancelled| ObjectStoreError::Transport(cancelled.to_string()))?
 }
 
 impl State {
@@ -409,9 +500,187 @@ fn leads_geo_partition(inner: &StreamsInner, origin: &str, place: NodePlace) -> 
 
 #[cfg(test)]
 mod tests {
-    use iggy_object_store::{PositionValue, PositionsKey};
+    use std::ops::Range;
+
+    use iggy_object_store::{
+        DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, PositionValue,
+        PositionsKey, PutBody, PutOptions, ReadOnlyStore, RecordingStore, StoreCalls,
+    };
+    use shard::peers::{PeerIdentity, PeerStatus, PeerStore};
+    use shard::tier_service::TierServiceConfig;
 
     use super::*;
+    use crate::dispatch::test_support::SpyBus;
+
+    /// The cluster that the node reads the peer as.
+    const PEER_CLUSTER: u128 = 0x0a0a;
+    /// A cluster that claims the peer's root in its place.
+    const OTHER_CLUSTER: u128 = 0x0b0b;
+
+    fn layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    /// The peer's store, as a pass reads it: a read of a positions object
+    /// first hands the root to [`OTHER_CLUSTER`], or every read of the
+    /// identity object gets no answer.
+    struct Peer {
+        inner: MemoryStore,
+        fault: Option<Fault>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Fault {
+        ClaimedDuringThePass,
+        IdentityUnanswered,
+    }
+
+    impl ObjectStore for Peer {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            self.inner.put(key, body, options).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            let identity = key == layout().identity_key();
+            match self.fault {
+                Some(Fault::IdentityUnanswered) if identity => {
+                    return Err(ObjectStoreError::Transport("reset".to_owned()));
+                }
+                Some(Fault::ClaimedDuringThePass) if !identity => {
+                    StoreIdentity {
+                        cluster_uid: OTHER_CLUSTER,
+                    }
+                    .replace(&self.inner, &layout())
+                    .await?;
+                }
+                _ => {}
+            }
+            self.inner.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.inner.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.inner.list(request).await
+        }
+    }
+
+    /// The peer `dc-b`, whose root [`PEER_CLUSTER`] claimed and the node
+    /// reads, holding one positions object.
+    async fn peer(fault: Option<Fault>) -> (PeerStore<SpyBus>, StoreCalls) {
+        let inner = MemoryStore::new();
+        StoreIdentity {
+            cluster_uid: PEER_CLUSTER,
+        }
+        .claim(&inner, &layout())
+        .await
+        .unwrap();
+        let object = object(0, 40, 0);
+        inner
+            .put(
+                &layout().positions_key(&object.key),
+                PutBody::from_bytes(object.encode().unwrap()),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let store = RecordingStore::new(Peer { inner, fault });
+        let calls = store.calls();
+        let status = SharedPeerStatus::default();
+        status.set(PeerStatus {
+            identity: PeerIdentity::Verified {
+                cluster_uid: PEER_CLUSTER,
+            },
+            ..PeerStatus::default()
+        });
+        let peer = PeerStore::new(
+            "dc-b".to_owned(),
+            layout(),
+            ReadOnlyStore::new(store),
+            SpyBus::default(),
+            &TierServiceConfig::default(),
+            status,
+        );
+        (peer, calls)
+    }
+
+    /// One pass over `peer` that starts from `objects`.
+    async fn pass(peer: &PeerStore<SpyBus>, objects: Objects) -> PassRead {
+        let scope = TierScope::new();
+        PeerRead {
+            origin: peer.origin().to_owned(),
+            layout: peer.layout().clone(),
+            service: peer.service().unwrap().clone(),
+            token: scope.token(),
+            objects,
+            status: peer.shared_status().clone(),
+        }
+        .read(&ShardMetrics::for_shard())
+        .await
+    }
+
+    /// A pass under a claim that holds hands out what it read, and a pass
+    /// that finds every object as the last one left it reads no identity.
+    #[compio::test]
+    async fn given_a_claim_that_holds_when_reading_positions_should_hand_them_out() {
+        let (peer, calls) = peer(None).await;
+        let status = peer.shared_status();
+
+        let first = pass(&peer, Objects::new()).await;
+        assert_eq!(first.identity, Some(IdentityBracket::Held(PEER_CLUSTER)));
+        assert!(first.adopted(status));
+        assert_eq!(first.objects.len(), 1);
+        let reads = calls.all().len();
+
+        let second = pass(&peer, first.objects).await;
+        assert_eq!(second.identity, None);
+        assert!(second.adopted(status));
+        assert_eq!(calls.all().len(), reads + 1, "one listing");
+        assert!(!status.take_check_request());
+    }
+
+    /// Positions read while another cluster took the root are not handed
+    /// out, and shard 0 checks the peer at once.
+    #[compio::test]
+    async fn given_a_root_claimed_by_another_cluster_during_the_pass_when_reading_positions_should_hand_out_nothing_and_ask_for_a_check()
+     {
+        let (peer, _) = peer(Some(Fault::ClaimedDuringThePass)).await;
+
+        let read = pass(&peer, Objects::new()).await;
+
+        assert_eq!(read.identity, Some(IdentityBracket::Moved));
+        assert!(!read.adopted(peer.shared_status()));
+        assert!(peer.shared_status().take_check_request());
+    }
+
+    /// A read of the identity object that gets no answer hands out nothing
+    /// and asks for no check.
+    #[compio::test]
+    async fn given_an_identity_read_without_an_answer_when_reading_positions_should_hand_out_nothing_and_ask_for_no_check()
+     {
+        let (peer, _) = peer(Some(Fault::IdentityUnanswered)).await;
+
+        let read = pass(&peer, Objects::new()).await;
+
+        assert_eq!(read.identity, Some(IdentityBracket::Unread));
+        assert!(!read.adopted(peer.shared_status()));
+        assert!(!peer.shared_status().take_check_request());
+    }
 
     fn object(replica: u8, offset: u64, reset: u64) -> PositionsObject {
         led_object(replica, &[(0, offset, reset)])

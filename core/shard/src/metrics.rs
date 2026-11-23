@@ -1190,8 +1190,20 @@ impl ShardMetrics {
         (lists, gets, refused)
     }
 
+    /// The count of the manifest reads of the geo peer `origin` that failed
+    /// or that the pump did not take.
+    #[cfg(test)]
+    #[must_use]
+    pub fn peer_manifest_read_failures(&self, origin: &str) -> u64 {
+        self.geo_peer_manifest_failures_total
+            .get_or_create(&GeoPeerRequestLabel {
+                origin: origin.to_owned(),
+                request: "get",
+            })
+            .get()
+    }
+
     /// The count of stale shadow topics of the geo peer `origin`.
-    #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn geo_shadow_topics_stale_value(&self, origin: &str) -> i64 {
         let label = GeoPeerLabel {

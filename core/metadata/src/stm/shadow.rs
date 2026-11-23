@@ -497,6 +497,28 @@ pub struct RetiredOrigin {
     pub retired_at: u64,
 }
 
+impl StreamsInner {
+    /// The cluster lifetimes that committed metadata knows for the peer
+    /// `origin`: the ones its shadow streams came from, and for a retired
+    /// origin the ones its retirement recorded. Empty before this cluster
+    /// adopted a stream of the origin.
+    #[must_use]
+    pub fn recorded_cluster_uids(&self, origin: &str) -> BTreeSet<u128> {
+        let retired = self
+            .retired_origins
+            .get(origin)
+            .into_iter()
+            .flat_map(|retired| retired.cluster_uids.iter().copied());
+        self.items
+            .iter()
+            .filter_map(|(_, stream)| stream.shadow.as_ref())
+            .filter(|source| source.origin == origin)
+            .map(|source| source.cluster_uid)
+            .chain(retired)
+            .collect()
+    }
+}
+
 impl StateHandler for RetireGeoOriginRequest {
     type State = StreamsInner;
 
@@ -1497,6 +1519,35 @@ mod tests {
                 cluster_uids: vec![PEER_CLUSTER],
                 retired_at: 1_000,
             })
+        );
+    }
+
+    #[test]
+    fn given_shadow_streams_and_a_retirement_when_asking_for_an_origins_clusters_should_give_both()
+    {
+        let (mut inner, _) = shadowed();
+        assert_eq!(
+            inner.recorded_cluster_uids(PEER),
+            BTreeSet::from([PEER_CLUSTER])
+        );
+        assert_eq!(inner.recorded_cluster_uids("dc-c"), BTreeSet::new());
+
+        assert_eq!(apply(&mut inner, 4, &retirement(PEER)).code, 0);
+        inner
+            .retired_origins
+            .get_mut(PEER)
+            .unwrap()
+            .cluster_uids
+            .push(RETIRED_CLUSTER);
+        let removed = inner.items.iter().map(|(id, _)| id).collect::<Vec<_>>();
+        for id in removed {
+            inner.items[id].shadow = None;
+        }
+
+        assert_eq!(
+            inner.recorded_cluster_uids(PEER),
+            BTreeSet::from([PEER_CLUSTER, RETIRED_CLUSTER]),
+            "a retired origin keeps the clusters of the shadow streams it had"
         );
     }
 

@@ -53,7 +53,7 @@ pub mod shards_table;
 mod test_support;
 pub mod tier_service;
 mod topic_object_checks;
-pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest};
+pub use peer_manifest_follows::{FinishedPeerManifestRead, ListedPeerManifest, PeerManifestSource};
 mod upload_pacing;
 
 pub use config::CoordinatorConfig;

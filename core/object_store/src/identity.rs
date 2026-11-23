@@ -28,14 +28,14 @@ use std::str::FromStr;
 
 use crate::error::ObjectStoreError;
 use crate::layout::KeyLayout;
-use crate::store::{ObjectStore, PutBody, PutMode, PutOptions, UserMetadata};
+use crate::store::{ObjectRange, ObjectStore, PutBody, PutMode, PutOptions, UserMetadata};
 
 /// The first line of the object, which names its format.
 const HEADER: &str = "iggy-store-identity 1";
 
 /// The most bytes that a read of the object takes. [`StoreIdentity`] writes
 /// 67, so a larger object is not one that it wrote.
-const MAX_IDENTITY_LEN: u64 = 1024;
+pub const MAX_IDENTITY_LEN: u64 = 1024;
 
 /// What the store identity object holds: the id of the cluster lifetime that
 /// owns the root.
@@ -156,18 +156,32 @@ impl StoreIdentity {
         store: &S,
         layout: &KeyLayout,
     ) -> Result<IdentityRead, ObjectStoreError> {
-        match store
-            .get_range(&layout.identity_key(), 0..MAX_IDENTITY_LEN)
-            .await
-        {
-            Ok(range) if range.size > MAX_IDENTITY_LEN => Ok(IdentityRead::Invalid),
+        IdentityRead::of(
+            store
+                .get_range(&layout.identity_key(), 0..MAX_IDENTITY_LEN)
+                .await,
+        )
+    }
+}
+
+impl IdentityRead {
+    /// What the answer to a read of the first [`MAX_IDENTITY_LEN`] bytes of
+    /// the identity object found, for a reader that cannot take an
+    /// [`ObjectStore`].
+    ///
+    /// # Errors
+    /// Any error of the read but [`ObjectStoreError::NotFound`], which is
+    /// [`IdentityRead::Missing`].
+    pub fn of(answer: Result<ObjectRange, ObjectStoreError>) -> Result<Self, ObjectStoreError> {
+        match answer {
+            Ok(range) if range.size > MAX_IDENTITY_LEN => Ok(Self::Invalid),
             Ok(range) => Ok(std::str::from_utf8(&range.bytes)
                 .ok()
                 .and_then(|text| text.parse().ok())
-                .map_or(IdentityRead::Invalid, IdentityRead::Found)),
-            Err(ObjectStoreError::NotFound { .. }) => Ok(IdentityRead::Missing),
+                .map_or(Self::Invalid, Self::Found)),
+            Err(ObjectStoreError::NotFound { .. }) => Ok(Self::Missing),
             // An empty object has no readable range.
-            Err(ObjectStoreError::InvalidRange { .. }) => Ok(IdentityRead::Invalid),
+            Err(ObjectStoreError::InvalidRange { .. }) => Ok(Self::Invalid),
             Err(error) => Err(error),
         }
     }

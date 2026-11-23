@@ -27,13 +27,30 @@
 //! holds up local traffic: the checks run in a task of shard 0 after the
 //! shards start. Shard 0 reads each peer's store identity object at once,
 //! every 5 seconds while the node reads nothing from the peer or the store
-//! does not answer, and every minute after that. The first claim of another
-//! cluster that a check reads is the cluster that the node remembers for the
-//! peer, see [`PeerIdentity`]. The node remembers it in memory only.
+//! does not answer, and every minute after that. It checks a peer at once
+//! too when committed metadata changes the clusters it expects of the peer,
+//! or when a pass on any shard asks for it, see
+//! [`SharedPeerStatus::adopts`].
 //!
-//! A peer whose origin committed metadata retired is checked no more: shard
-//! 0 marks its status retired, and no read of its identity object goes out.
+//! Each check compares the claim it reads with what committed metadata
+//! recorded of the peer: the clusters that its shadow streams came from,
+//! and for a retired origin the ones its retirement kept, see
+//! [`StreamsInner::recorded_cluster_uids`]. A claim of one of them counts,
+//! and so does any claim while metadata holds none, so a new reader trusts
+//! the first claim it reads. A claim of another cluster counts only when the
+//! recovery records under the root lead to it from a recorded one, as the
+//! recovery of a cluster that lost every disk writes them. A check follows
+//! those records only then, since a record can be large, and keeps what it
+//! found for that claim. Any other claim leaves the peer mismatched, and the
+//! node reads nothing from it, see [`PeerIdentity`]. The node remembers what
+//! it read in memory only, so a restarted node judges the claim again.
+//!
+//! A peer whose origin committed metadata retired is marked so, and checked
+//! only until a check in this process accepts the claim on its root. Its
+//! polls wait for that one read, and no read of its identity object goes out
+//! after it.
 
+use std::collections::BTreeSet;
 use std::pin::pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -46,10 +63,12 @@ use iggy_object_store::gcs::{GcsAuth, GcsStore};
 use iggy_object_store::s3::{Credentials, S3Store};
 use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStore, ObjectStoreError,
-    ReadOnlyStore, StoreIdentity,
+    ReadOnlyStore, RecoveryRead, RecoveryRecord, StoreIdentity,
 };
 use message_bus::{IggyMessageBus, MessageBus};
 use metadata::impls::metadata::StreamsFrontend;
+#[cfg(doc)]
+use metadata::stm::stream::StreamsInner;
 use partitions::ReadCache;
 use shard::metrics::ShardMetrics;
 use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, SharedPeerStatus};
@@ -70,9 +89,14 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// How long shard 0 waits for this cluster's `cluster_uid`, which the first
 /// committed metadata operation sets.
 const CLUSTER_UID_WAIT: Duration = Duration::from_secs(1);
-/// The longest shard 0 waits before it looks for a retired origin again. A
-/// look sends no request.
-const RETIREMENT_WAIT: Duration = Duration::from_secs(5);
+/// The longest shard 0 waits before it looks again for a retired origin, a
+/// change of the clusters that metadata expects of a peer, or a check that a
+/// shard asked for. A look sends no request.
+const LOOK_WAIT: Duration = Duration::from_secs(1);
+/// The most recovery records a check follows from a recorded cluster to the
+/// claim it found. Each recovery of a cluster that lost every disk writes
+/// one.
+const RECOVERY_HOPS_MAX: usize = 8;
 
 /// How the stores of each peer authorize their requests, in the order of
 /// the configuration: the access token of a `gcs` peer, `None` for a peer
@@ -237,18 +261,22 @@ fn checkers(
 }
 
 /// Check each peer whenever its check is due, until `stop` fires. A peer
-/// whose origin retired is marked so and never checked again.
+/// whose origin retired is marked so, and checked no more once a check
+/// accepted the claim on its root.
 async fn run<S: ObjectStore>(
     shard: Rc<ServerShard>,
     mut checkers: Vec<PeerChecker<S>>,
     stop: Receiver<()>,
 ) {
     loop {
-        let retired = shard.plane.metadata().mux_stm.streams().retired_origins();
+        let streams = shard.plane.metadata().mux_stm.streams();
+        let retired = streams.retired_origins();
         for checker in &mut checkers {
             if retired.contains_key(&checker.origin) {
                 checker.retire(shard.metrics());
             }
+            let expected = streams.read(|inner| inner.recorded_cluster_uids(&checker.origin));
+            checker.look(expected, Instant::now());
         }
         let wait = match own_cluster_uid(&shard) {
             None => CLUSTER_UID_WAIT,
@@ -257,7 +285,7 @@ async fn run<S: ObjectStore>(
                 let metrics = shard.metrics();
                 let due = checkers
                     .iter_mut()
-                    .filter(|checker| !checker.retired() && checker.due <= now)
+                    .filter(|checker| checker.wants_check(now))
                     .map(|checker| checker.step(own_cluster_uid, metrics));
                 match select(pin!(join_all(due)), pin!(stop.recv())).await {
                     Either::Left(_) => {}
@@ -266,7 +294,7 @@ async fn run<S: ObjectStore>(
                 let now = Instant::now();
                 checkers
                     .iter()
-                    .filter(|checker| !checker.retired())
+                    .filter(|checker| checker.checks())
                     .map(|checker| checker.due.saturating_duration_since(now))
                     .min()
                     .unwrap_or(RECHECK_INTERVAL)
@@ -274,7 +302,7 @@ async fn run<S: ObjectStore>(
         };
         // `Ok`: the stop fired, or its sender is gone. `Err`: the wait ran
         // out.
-        if compio::time::timeout(wait.min(RETIREMENT_WAIT), stop.recv())
+        if compio::time::timeout(wait.min(LOOK_WAIT), stop.recv())
             .await
             .is_ok()
         {
@@ -288,13 +316,28 @@ struct PeerChecker<S> {
     origin: String,
     store: S,
     layout: KeyLayout,
-    /// The longest one check waits for the store.
+    /// The longest one read of a check waits for the store.
     timeout: Duration,
     status: SharedPeerStatus,
     /// When the next check is due.
     due: Instant,
     /// What the last check read, so that a log line marks each change.
     last: Option<PeerRead>,
+    /// The clusters that committed metadata expects of the peer, see
+    /// [`StreamsInner::recorded_cluster_uids`].
+    expected: BTreeSet<u128>,
+    /// What the recovery records under the root proved of the last claim
+    /// that the expected clusters lacked.
+    proof: Option<Proof>,
+}
+
+/// What the recovery records under a peer's root prove of the claim of
+/// `found`, from the clusters `expected`: `of`, the one they lead from, or
+/// `None` when they lead to `found` from none.
+struct Proof {
+    found: u128,
+    expected: BTreeSet<u128>,
+    of: Option<u128>,
 }
 
 /// What one check of a peer found: the read, and the error behind an outage
@@ -321,15 +364,49 @@ impl<S: ObjectStore> PeerChecker<S> {
             status,
             due: Instant::now(),
             last: None,
+            expected: BTreeSet::new(),
+            proof: None,
         }
     }
 
+    #[cfg(test)]
     fn retired(&self) -> bool {
         self.status.get().retired
     }
 
-    /// Mark the peer retired, once. The node checks it no more and runs no
-    /// job on its store.
+    /// Whether the checks of the peer go on: a peer whose origin retired is
+    /// checked only until a check accepts the claim on its root. A change
+    /// that only a restart ends stops them too.
+    fn checks(&self) -> bool {
+        let status = self.status.get();
+        !status.retired
+            || matches!(
+                status.identity,
+                PeerIdentity::Unverified
+                    | PeerIdentity::Mismatched { .. }
+                    | PeerIdentity::Unconfirmed { .. }
+            )
+    }
+
+    fn wants_check(&self, now: Instant) -> bool {
+        self.checks() && self.due <= now
+    }
+
+    /// Take the clusters that committed metadata now expects of the peer,
+    /// and any check that a shard asked for. Either makes the next check
+    /// due at `now`.
+    fn look(&mut self, expected: BTreeSet<u128>, now: Instant) {
+        if self.status.take_check_request() {
+            self.due = now;
+        }
+        if expected != self.expected {
+            self.expected = expected;
+            self.due = now;
+        }
+    }
+
+    /// Mark the peer retired, once. The node runs no job on its store, and
+    /// checks it no more once a check accepted the claim on its root.
     fn retire(&self, metrics: &ShardMetrics) {
         let mut status = self.status.get();
         if status.retired {
@@ -341,9 +418,9 @@ impl<S: ObjectStore> PeerChecker<S> {
         info!(
             origin = %self.origin,
             root = self.layout.root(),
-            "the origin of the geo peer retired, so this node checks its store no more and \
-             follows nothing of it. Polls of its shadow topics read what they committed until \
-             their retention removes it"
+            "the origin of the geo peer retired, so this node follows nothing of it, and checks \
+             its store only until a check accepts the claim on its root. Polls of its shadow \
+             topics read what they committed until their retention removes it"
         );
     }
 
@@ -354,19 +431,90 @@ impl<S: ObjectStore> PeerChecker<S> {
     }
 
     /// One read of the peer's identity object that waits at most the
-    /// timeout.
-    async fn check(&self, own_cluster_uid: u128) -> PeerCheck {
+    /// timeout, judged against the clusters that committed metadata expects
+    /// of the peer.
+    async fn check(&mut self, own_cluster_uid: u128) -> PeerCheck {
         let read = StoreIdentity::read(&self.store, &self.layout);
-        compio::time::timeout(self.timeout, read).await.map_or_else(
+        let check = compio::time::timeout(self.timeout, read).await.map_or_else(
             |_| PeerCheck {
                 read: PeerRead::Unreachable,
-                error: Some(ObjectStoreError::Transport(format!(
-                    "the identity check got no answer within {:?}",
-                    self.timeout
-                ))),
+                error: Some(self.no_answer("the identity check")),
             },
             |answer| PeerCheck::of(answer, own_cluster_uid),
-        )
+        );
+        match check.read {
+            PeerRead::Found(found) => self.judge(found).await,
+            _ => check,
+        }
+    }
+
+    /// What a claim of `found` means for the peer: one that committed
+    /// metadata expects, one that recovery records prove the successor of
+    /// one it expects, or one it does not know.
+    async fn judge(&mut self, found: u128) -> PeerCheck {
+        let Some(&recorded) = self.expected.first() else {
+            return PeerCheck::read(PeerRead::Found(found));
+        };
+        if self.expected.contains(&found) {
+            return PeerCheck::read(PeerRead::Found(found));
+        }
+        let known = self
+            .proof
+            .as_ref()
+            .filter(|proof| proof.found == found && proof.expected == self.expected)
+            .map(|proof| proof.of);
+        let of = match known {
+            Some(of) => of,
+            None => match self.successor_of(found).await {
+                Ok(of) => {
+                    self.proof = Some(Proof {
+                        found,
+                        expected: self.expected.clone(),
+                        of,
+                    });
+                    of
+                }
+                Err(error) => {
+                    return PeerCheck {
+                        read: PeerRead::Unreachable,
+                        error: Some(error),
+                    };
+                }
+            },
+        };
+        PeerCheck::read(of.map_or(PeerRead::Unknown { recorded, found }, |of| {
+            PeerRead::Successor {
+                of,
+                cluster_uid: found,
+            }
+        }))
+    }
+
+    /// The expected cluster from which the recovery records under the root
+    /// lead to `found`, in at most [`RECOVERY_HOPS_MAX`] records.
+    async fn successor_of(&self, found: u128) -> Result<Option<u128>, ObjectStoreError> {
+        for &start in &self.expected {
+            let mut retired = start;
+            let mut followed = BTreeSet::new();
+            while followed.len() < RECOVERY_HOPS_MAX && followed.insert(retired) {
+                let read = RecoveryRecord::read(&self.store, &self.layout, retired);
+                let RecoveryRead::Found(record) = compio::time::timeout(self.timeout, read)
+                    .await
+                    .map_err(|_| self.no_answer("a read of a recovery record"))??
+                else {
+                    break;
+                };
+                if record.successor_cluster_uid == found {
+                    return Ok(Some(start));
+                }
+                retired = record.successor_cluster_uid;
+            }
+        }
+        Ok(None)
+    }
+
+    fn no_answer(&self, what: &str) -> ObjectStoreError {
+        ObjectStoreError::Transport(format!("{what} got no answer within {:?}", self.timeout))
     }
 
     /// Move the peer's status by `check`, set its gauges, log a change, and
@@ -396,6 +544,16 @@ impl<S: ObjectStore> PeerChecker<S> {
         let root = self.layout.root();
         let error = check.error.as_ref().map(ToString::to_string);
         match (after.identity, check.read) {
+            (PeerIdentity::Mismatched { found, .. }, _) => self.log_mismatch(found),
+            (PeerIdentity::Verified { cluster_uid }, PeerRead::Successor { of, .. }) => info!(
+                origin,
+                root,
+                cluster_uid = uid(cluster_uid),
+                of = uid(of),
+                "the root of the geo peer belongs to this cluster_uid, which the recovery \
+                 records under the root name the successor of a cluster that the shadow streams \
+                 came from, so this node reads the peer"
+            ),
             (PeerIdentity::Changed { cluster_uid, found }, _)
                 if !matches!(before.identity, PeerIdentity::Changed { .. }) =>
             {
@@ -483,9 +641,30 @@ impl<S: ObjectStore> PeerChecker<S> {
     }
 }
 
+impl<S> PeerChecker<S> {
+    fn log_mismatch(&self, found: u128) {
+        error!(
+            origin = %self.origin,
+            root = self.layout.root(),
+            recorded = ?self.expected.iter().copied().map(uid).collect::<Vec<_>>(),
+            found = uid(found),
+            "the root of the geo peer is claimed by a cluster that its shadow streams did not \
+             come from, and no recovery record under the root leads to it, so this node reads \
+             nothing from the peer. Point the peer entry at the store and prefix of the cluster \
+             that the shadow streams follow, or retire the origin if that cluster is gone. The \
+             server README says more"
+        );
+    }
+}
+
 impl PeerCheck {
+    const fn read(read: PeerRead) -> Self {
+        Self { read, error: None }
+    }
+
     /// What an answer to the read of a peer's identity object means, for a
-    /// node of the cluster `own_cluster_uid`.
+    /// node of the cluster `own_cluster_uid`, before it is judged against
+    /// what committed metadata expects.
     fn of(answer: Result<IdentityRead, ObjectStoreError>, own_cluster_uid: u128) -> Self {
         let read = match answer {
             Ok(IdentityRead::Found(found)) if found.cluster_uid == own_cluster_uid => {
@@ -515,7 +694,7 @@ impl PeerCheck {
 const fn next_check(status: PeerStatus) -> Duration {
     match status.identity {
         PeerIdentity::Verified { .. } if !status.unreachable => RECHECK_INTERVAL,
-        PeerIdentity::Changed { .. } => RECHECK_INTERVAL,
+        PeerIdentity::Changed { .. } | PeerIdentity::Mismatched { .. } => RECHECK_INTERVAL,
         PeerIdentity::Verified { .. }
         | PeerIdentity::Unverified
         | PeerIdentity::Unconfirmed { .. } => RETRY_INTERVAL,
@@ -606,7 +785,8 @@ mod tests {
 
     use iggy_object_store::{
         DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, PutBody,
-        PutOptions, RecordingStore, TierExecutor, TierJobClass, TierJobRequest, TierScope,
+        PutOptions, RecordingStore, StoreCalls, TierExecutor, TierJobClass, TierJobRequest,
+        TierScope,
     };
     use message_bus::transports::tls::install_default_crypto_provider;
 
@@ -617,6 +797,8 @@ mod tests {
     const DC_B: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
     const DC_C: u128 = 0x0c;
     const OTHER: u128 = 0x07;
+    /// A cluster that a recovery rebuilt in the place of `DC_B`.
+    const DC_B_RECOVERED: u128 = 0x0b01;
 
     fn layout() -> KeyLayout {
         KeyLayout::new("iggy").unwrap()
@@ -760,7 +942,7 @@ mod tests {
 
     #[compio::test]
     async fn given_a_peer_that_never_answers_when_checking_should_give_up_at_the_timeout() {
-        let checker = PeerChecker::new(
+        let mut checker = PeerChecker::new(
             "dc-b".to_owned(),
             SilentStore,
             layout(),
@@ -1010,6 +1192,216 @@ mod tests {
             "a gcs peer without its token gets no store"
         );
         assert!(preflight(&config).is_ok());
+    }
+
+    /// The root of `dc-b` in a store of its own, claimed by `claim`, with
+    /// the recovery records `(retired, successor)`.
+    async fn root(claim: u128, recoveries: &[(u128, u128)]) -> RecordingStore<MemoryStore> {
+        let store = MemoryStore::new();
+        for &(retired, successor) in recoveries {
+            let record = RecoveryRecord {
+                retired_cluster_uid: retired,
+                successor_cluster_uid: successor,
+                recovered_at: 1,
+                adopted_unproven: false,
+                partitions: Vec::new(),
+            };
+            assert!(record.create(&store, &layout()).await.unwrap());
+        }
+        StoreIdentity { cluster_uid: claim }
+            .claim(&store, &layout())
+            .await
+            .unwrap();
+        RecordingStore::new(store)
+    }
+
+    /// A checker of `dc-b` as a node that just started runs it: it read
+    /// nothing yet, and committed metadata recorded `expected` of the peer.
+    fn restarted(
+        store: RecordingStore<MemoryStore>,
+        expected: &[u128],
+        retired: bool,
+    ) -> (PeerChecker<ReadOnlyStore>, SharedPeerStatus, StoreCalls) {
+        let calls = store.calls();
+        let status = SharedPeerStatus::default();
+        status.set(PeerStatus {
+            retired,
+            ..PeerStatus::default()
+        });
+        let mut checker = PeerChecker::new(
+            "dc-b".to_owned(),
+            ReadOnlyStore::new(store),
+            layout(),
+            Duration::from_secs(5),
+            status.clone(),
+        );
+        checker.look(expected.iter().copied().collect(), Instant::now());
+        (checker, status, calls)
+    }
+
+    /// A node that restarted after another cluster took the peer's root
+    /// under the same prefix finds a claim that its shadow streams did not
+    /// come from, and reads nothing from the peer: no poll, no job, no
+    /// cached block.
+    #[compio::test]
+    async fn given_shadows_of_one_cluster_when_a_restarted_node_finds_the_root_claimed_by_another_should_read_nothing_from_it()
+     {
+        let (mut checker, status, _) = restarted(root(OTHER, &[]).await, &[DC_B], false);
+        let metrics = ShardMetrics::for_shard();
+
+        checker.step(OWN, &metrics).await;
+
+        let after = status.get();
+        assert_eq!(
+            after.identity,
+            PeerIdentity::Mismatched {
+                recorded: DC_B,
+                found: OTHER,
+            }
+        );
+        assert!(!after.serves_polls() && !after.serves_jobs());
+        assert_eq!(metrics.geo_peer_status_value("dc-b"), (false, false));
+    }
+
+    /// A recovery of the cluster that the shadow streams came from replaces
+    /// the claim and keeps every key, and its records lead from that cluster
+    /// to the claim, through every recovery since. A check follows them once
+    /// for the claim.
+    #[compio::test]
+    async fn given_recovery_records_that_lead_to_the_claim_when_checking_should_read_the_peer_as_the_successor()
+     {
+        let recoveries = [(DC_B, OTHER), (OTHER, DC_B_RECOVERED)];
+        let (mut checker, status, calls) =
+            restarted(root(DC_B_RECOVERED, &recoveries).await, &[DC_B], false);
+        let metrics = ShardMetrics::for_shard();
+
+        checker.step(OWN, &metrics).await;
+        let first = calls.all().len();
+        checker.step(OWN, &metrics).await;
+
+        assert_eq!(
+            status.get().identity,
+            PeerIdentity::Verified {
+                cluster_uid: DC_B_RECOVERED
+            }
+        );
+        assert!(status.get().serves_polls());
+        assert_eq!(
+            calls.all().len(),
+            first + 1,
+            "the second check reads the identity object alone"
+        );
+    }
+
+    /// A recovery record of a recorded cluster that names another successor
+    /// than the claim proves nothing of it.
+    #[compio::test]
+    async fn given_a_recovery_record_that_leads_elsewhere_when_checking_should_leave_the_peer_mismatched()
+     {
+        let (mut checker, status, _) =
+            restarted(root(OTHER, &[(DC_B, DC_C)]).await, &[DC_B], false);
+
+        checker.step(OWN, &ShardMetrics::for_shard()).await;
+
+        assert_eq!(
+            status.get().identity,
+            PeerIdentity::Mismatched {
+                recorded: DC_B,
+                found: OTHER,
+            }
+        );
+    }
+
+    /// A node that holds no shadow stream of the peer yet takes the first
+    /// claim it reads.
+    #[compio::test]
+    async fn given_no_shadow_streams_when_checking_should_trust_the_first_claim() {
+        let (mut checker, status, _) = restarted(root(OTHER, &[]).await, &[], false);
+
+        checker.step(OWN, &ShardMetrics::for_shard()).await;
+
+        assert_eq!(
+            status.get().identity,
+            PeerIdentity::Verified { cluster_uid: OTHER }
+        );
+    }
+
+    /// A mismatch ends once committed metadata expects the claim, such as
+    /// when the shadow streams of the old cluster are gone, without a
+    /// restart.
+    #[compio::test]
+    async fn given_a_mismatched_peer_when_metadata_stops_expecting_the_old_cluster_should_check_at_once_and_read_the_peer()
+     {
+        let (mut checker, status, _) = restarted(root(OTHER, &[]).await, &[DC_B], false);
+        let metrics = ShardMetrics::for_shard();
+        checker.step(OWN, &metrics).await;
+        assert!(!checker.wants_check(Instant::now()), "the next check waits");
+
+        checker.look(BTreeSet::new(), Instant::now());
+        assert!(checker.wants_check(Instant::now()));
+        checker.step(OWN, &metrics).await;
+
+        assert_eq!(
+            status.get().identity,
+            PeerIdentity::Verified { cluster_uid: OTHER }
+        );
+    }
+
+    /// A pass on any shard that saw the root move asks for a check, which
+    /// shard 0 runs at its next look.
+    #[test]
+    fn given_a_check_that_a_shard_asked_for_when_looking_should_make_it_due() {
+        let (mut checker, status, _) =
+            restarted(RecordingStore::new(MemoryStore::new()), &[], false);
+        let later = Instant::now() + RECHECK_INTERVAL;
+        checker.due = later;
+
+        checker.look(BTreeSet::new(), Instant::now());
+        assert_eq!(checker.due, later);
+        status.request_check();
+        checker.look(BTreeSet::new(), Instant::now());
+
+        assert!(checker.wants_check(Instant::now()));
+        assert!(!status.take_check_request(), "the look took the request");
+    }
+
+    /// The root of a retired origin that another cluster took is not read
+    /// after a restart, and a poll of its shadow topics gets nothing.
+    #[compio::test]
+    async fn given_a_retired_origin_whose_root_another_cluster_took_when_a_restarted_node_checks_should_serve_no_poll()
+     {
+        let (mut checker, status, _) = restarted(root(OTHER, &[]).await, &[DC_B], true);
+
+        assert!(!status.get().serves_polls(), "no poll before the check");
+        checker.step(OWN, &ShardMetrics::for_shard()).await;
+
+        assert!(!status.get().serves_polls());
+        assert!(
+            checker.checks(),
+            "the checks go on until one accepts a claim"
+        );
+    }
+
+    /// A retired origin whose root its own cluster still claims serves the
+    /// polls of its shadow topics after one read of the identity object, and
+    /// gets no other read from the checks.
+    #[compio::test]
+    async fn given_a_retired_origin_with_its_own_claim_when_a_restarted_node_checks_should_serve_polls_after_one_read_and_then_check_no_more()
+     {
+        let (mut checker, status, calls) = restarted(root(DC_B, &[]).await, &[DC_B], true);
+        assert!(!status.get().serves_polls());
+        assert!(checker.wants_check(Instant::now()));
+
+        checker.step(OWN, &ShardMetrics::for_shard()).await;
+        checker.look(BTreeSet::from([DC_B, DC_C]), Instant::now());
+
+        assert!(status.get().serves_polls());
+        assert!(!status.get().serves_jobs());
+        assert!(
+            !checker.wants_check(Instant::now() + RECHECK_INTERVAL * 10),
+            "no check once the claim was accepted"
+        );
+        assert_eq!(calls.all().len(), 1, "one read of the identity object");
     }
 
     #[test]

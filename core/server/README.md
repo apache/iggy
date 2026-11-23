@@ -722,9 +722,26 @@ another peer.
 When the node starts, shard 0 reads each peer's store identity object,
 `<prefix>/meta/identity`. After that it reads the object every minute. While the node
 reads nothing from the peer, or the peer's store does not answer, it reads the
-object every 5 seconds. The node remembers the first cluster that the object
-names. It keeps that cluster in memory only, so after a restart it reads the
-object again.
+object every 5 seconds.
+
+Each check compares the cluster that the object names with the clusters that
+committed metadata recorded for the peer: the ones its shadow streams came
+from, and for a retired peer the ones its retirement kept. The node reads the
+peer when the object names one of them. While metadata holds no shadow stream
+of the peer, the node takes the first cluster that the object names. When the
+object names another cluster, the node follows the recovery records under the
+peer's root, `<prefix>/meta/recovery/<cluster_uid>/record`, from a recorded
+cluster. A cluster that a recovery rebuilt from the store of a recorded one
+writes such a record, so the node reads the peer as that successor. The node
+reads a record only in this case, and once for each cluster that it finds.
+The node keeps what it found in memory only, so after a restart it judges the
+object again against what metadata recorded.
+
+A pass that commits what it read of a peer, the manifests of its partitions or
+the positions of its groups, reads the identity object before its other reads
+and after them. It commits what it read only when both reads name the cluster
+that the node reads the peer as. Otherwise it commits nothing, and asks shard
+0 to check the peer within a second, so the polls of the peer stop too.
 
 Only a configuration that can never work stops the boot, for example a prefix
 that is not a usable key prefix. A peer whose store does not answer never stops
@@ -735,7 +752,7 @@ Each shard exports two gauges for its node per peer, labelled with the peer's
 
 - `geo_peer_identity_verified` is 1 while the node reads the peer. It is 0
   until a check reads the peer's identity object, and while the object is
-  missing, refused or changed.
+  missing, refused, changed or names a cluster that metadata did not record.
 - `geo_peer_unreachable` is 1 while the peer's store does not answer the check.
   A node that verified the peer keeps reading what the store returns.
 
@@ -752,7 +769,18 @@ restarts. This happens when:
   object back, as the tiered storage section describes.
 
 Before you restart the node, find out which cluster owns the peer's prefix now.
-After the restart, the node remembers the cluster that it finds then.
+After the restart, the node reads the peer only if the cluster that it finds
+then is one that its shadow streams of the peer came from, or a successor that
+recovery records prove.
+
+A node logs that the root of a geo peer is claimed by a cluster that its
+shadow streams did not come from when a check finds such a cluster and no
+recovery record leads to it. It names the recorded clusters and the one it
+found, and reads nothing from the peer. This happens when the peer's entry
+points at the store of another cluster, or when the peer's metadata was
+rebuilt without a recovery. Correct the entry, or retire the origin when the
+cluster that the shadow streams follow is gone. The next check after metadata
+changes what it records of the peer judges the object again.
 
 A node also reads nothing from a peer whose identity object names this cluster.
 Then the peer's store and prefix are this cluster's own.
@@ -846,7 +874,10 @@ An operator retires a peer whose datacenter never returns with
 `iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs
 root or the global `manage_servers` permission. The retirement commits through
 the metadata of this cluster and cannot be undone. From then on, the nodes send
-the peer's store only the reads of polls. Each shadow partition of the peer
+the peer's store only the reads of polls, and after each start one read of its
+identity object, which the polls wait for. A node serves no poll of a retired
+peer whose identity object names a cluster that the retirement did not record,
+unless a recovery record leads to it. Each shadow partition of the peer
 drops the segments that the retention of its topic in the peer removes, and the
 primary removes each shadow topic once that `message_expiry` passed since the
 retirement, then each empty shadow stream. A client may delete the shadow

@@ -28,9 +28,12 @@ use std::time::Duration;
 
 use iggy::prelude::*;
 use iggy_object_store::KeyLayout;
-use integration::harness::{Bucket, BucketEvent, GeoClusterPair, GeoClusterPairBuilder, GeoSide};
+use integration::harness::{
+    Bucket, BucketEvent, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide,
+};
 use tokio::time::{Instant, sleep};
 
+use super::geo_peers::gauge;
 use super::http_client::HttpClient;
 
 const STREAM: &str = "orders";
@@ -58,6 +61,18 @@ const DEFAULT_MANIFEST_POLL: Duration = Duration::from_secs(5);
 /// when it started, which the request test leaves out.
 const WATCH_SETTLE: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a restarted cluster may take to boot and answer a client.
+const BOOT_DEADLINE: Duration = Duration::from_secs(60);
+/// How long the first identity check of a restarted node may take.
+const CHECK_DEADLINE: Duration = Duration::from_secs(30);
+/// How long the test keeps polling a shadow whose root another cluster took.
+const REFUSED_POLLS_FOR: Duration = Duration::from_secs(5);
+/// The messages that each cluster sends in its one batch.
+const BATCH_MESSAGES: u64 = 20;
+/// What the node logs once it finds a claim that its shadow streams did not
+/// come from.
+const MISMATCH_LOG: &str = "the root of the geo peer is claimed by a cluster that its shadow \
+                            streams did not come from";
 
 #[tokio::test]
 async fn given_steady_sends_to_a_geo_topic_when_a_consumer_follows_its_shadow_should_read_each_message_only_once_a_manifest_lists_it()
@@ -191,6 +206,130 @@ async fn given_a_shadow_without_consumers_when_its_origin_produces_should_send_t
         opens.manifest_files > 0 && opens.manifest_files <= lists + gets + 2,
         "each listing and each read opens the manifest once: {opens:?}"
     );
+}
+
+/// `dc-a` loses every disk, and a new cluster in its place takes the same
+/// root under the same prefix, recovers nothing, creates the same stream and
+/// topic, and sends other messages in the same batch. Its objects take the
+/// keys of the old cluster's. `dc-b` restarts, so it forgets the cluster it
+/// read: it judges the claim it finds against the cluster that its shadow
+/// stream came from, serves nothing of the new cluster through the old
+/// shadow, reports the peer unverified, and reads nothing of the root but
+/// its identity object.
+#[tokio::test]
+async fn given_a_followed_root_that_a_new_cluster_took_when_the_follower_restarts_should_serve_nothing_of_it_and_read_only_its_identity()
+ {
+    let mut pair =
+        started_pair(GeoClusterPair::builder().peer_reads_through_mirror(GeoSide::B)).await;
+    let (client_a, shadow) = create_and_follow(&pair).await;
+    send_batch(&client_a, "old").await;
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    assert_eq!(
+        read_from_offset_zero(&client_b, shadow, 100, BATCH_MESSAGES as usize).await,
+        batch("old")
+    );
+    let old_cluster = pair.a().bucket().cluster_uid().await.expect("the claim");
+    let old_segments = long_term_segments(pair.a().bucket()).await;
+    drop((client_a, client_b));
+    pair.cluster_mut(GeoSide::B)
+        .stop()
+        .await
+        .expect("dc-b stops");
+
+    let cluster_a = pair.cluster_mut(GeoSide::A);
+    cluster_a
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a loses its nodes");
+    let bucket = cluster_a.bucket().path().to_owned();
+    std::fs::remove_dir_all(&bucket).expect("empty the bucket of dc-a");
+    std::fs::create_dir_all(&bucket).expect("the bucket of dc-a again");
+    cluster_a
+        .harness_mut()
+        .restart_node_from_clean_slate(0)
+        .expect("dc-a starts on an empty disk");
+    let client_a = booted_client(pair.a()).await;
+    let (recreated, _) = recreate(&pair, &client_a).await;
+    assert_eq!(recreated, shadow.topic_id, "the same topic id");
+    send_batch(&client_a, "new").await;
+    let deadline = Instant::now() + READ_DEADLINE;
+    while long_term_segments(pair.a().bucket()).await.is_empty() {
+        assert!(Instant::now() < deadline, "the new dc-a stored no segment");
+        sleep(POLL_INTERVAL).await;
+    }
+    assert_ne!(
+        pair.a().bucket().cluster_uid().await.expect("the claim"),
+        old_cluster,
+        "another cluster claims the root"
+    );
+    assert_eq!(
+        long_term_segments(pair.a().bucket()).await,
+        old_segments,
+        "the new cluster's segment takes the key of the old one's"
+    );
+
+    let mirror = pair
+        .b()
+        .peer_mirror()
+        .expect("dc-b reads dc-a through a mirror");
+    let watch = mirror.watch().expect("a watch on the mirror");
+    let mirror = mirror.path().to_owned();
+    sleep(WATCH_SETTLE).await;
+    let started = std::time::Instant::now();
+    pair.cluster_mut(GeoSide::B)
+        .start()
+        .await
+        .expect("dc-b starts again");
+    let client_b = booted_client(pair.b()).await;
+    let node_b = pair.b().harness().node(0);
+    let check_deadline = Instant::now() + CHECK_DEADLINE;
+    let mut polls_end = None;
+    while polls_end.is_none_or(|end| Instant::now() < end) {
+        assert_serves_no_new_message(&client_b, shadow).await;
+        if polls_end.is_none() && node_b.stdout_contains(MISMATCH_LOG) {
+            polls_end = Some(Instant::now() + REFUSED_POLLS_FOR);
+        }
+        assert!(
+            polls_end.is_some() || Instant::now() < check_deadline,
+            "dc-b never reported the claim of the new cluster"
+        );
+        sleep(Duration::from_millis(250)).await;
+    }
+    let http_b = HttpClient::login_root(pair.b().harness()).await;
+    assert_eq!(
+        gauge(&scrape(&http_b).await, "geo_peer_identity_verified", "dc-a"),
+        Some(0)
+    );
+
+    let layout = pair.a().bucket().layout();
+    let identity = layout.identity_key();
+    let read: Vec<String> = watch
+        .reads()
+        .into_iter()
+        .filter_map(|event| match event {
+            BucketEvent::Read { at, paths } if at >= started => Some(paths),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|path| {
+            path.strip_prefix(&mirror)
+                .ok()
+                .and_then(Path::to_str)
+                .map(str::to_owned)
+        })
+        .filter(|key| {
+            !key.rsplit('/')
+                .next()
+                .is_some_and(|name| name.starts_with('.'))
+        })
+        .collect();
+    let recovery = format!("{}/meta/recovery/", layout.root());
+    assert!(
+        read.iter()
+            .all(|key| *key == identity || key.starts_with(&recovery)),
+        "dc-b read more of the new cluster's root than its identity: {read:?}"
+    );
+    assert!(read.contains(&identity), "dc-b checked the claim: {read:?}");
 }
 
 /// The ids of the shadow topic in `dc-b` of the geo topic of `dc-a`.
@@ -465,6 +604,107 @@ async fn create_and_follow(pair: &GeoClusterPair) -> (IggyClient, Shadow) {
             topic_id: topic.id,
         },
     )
+}
+
+/// One poll of the shadow from offset 0, which serves none of the messages
+/// of the new cluster: an error, nothing, or the old cluster's.
+async fn assert_serves_no_new_message(client: &IggyClient, shadow: Shadow) {
+    let Ok(polled) = client
+        .poll_messages(
+            &numeric(shadow.stream_id),
+            &numeric(shadow.topic_id),
+            0,
+            &Consumer::default(),
+            &PollingStrategy::offset(0),
+            PollOptions {
+                count: 100,
+                ..PollOptions::default()
+            },
+        )
+        .await
+    else {
+        return;
+    };
+    let served: Vec<String> = polled.messages.iter().map(payload_of).collect();
+    assert!(
+        served.iter().all(|payload| !payload.starts_with("new")),
+        "dc-b served the new cluster's messages through the old shadow: {served:?}"
+    );
+}
+
+/// Wait until a client of `cluster` logs in, after a restart.
+async fn booted_client(cluster: &GeoCluster) -> IggyClient {
+    let deadline = Instant::now() + BOOT_DEADLINE;
+    loop {
+        match cluster.root_client().await {
+            Ok(client) => return client,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} never took a client: {error}",
+                    cluster.origin()
+                );
+                sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+}
+
+/// Create the stream and the geo topic of [`create_and_follow`] in `dc-a`
+/// again, and return the topic's id and its stream's.
+async fn recreate(pair: &GeoClusterPair, client: &IggyClient) -> (u32, u32) {
+    let stream = client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create the stream again");
+    let topic = pair
+        .a()
+        .create_geo_topic(client, &named(STREAM), TOPIC, 1)
+        .await
+        .expect("dc-a takes the geo topic again");
+    (topic.id, stream.id)
+}
+
+/// [`BATCH_MESSAGES`] messages of the cluster `cluster`, all of one length.
+fn batch(cluster: &str) -> Vec<String> {
+    (0..BATCH_MESSAGES)
+        .map(|index| format!("{cluster}-cluster-{index:05}"))
+        .collect()
+}
+
+/// Send [`batch`] of `cluster` to the geo topic of `dc-a` in one send.
+async fn send_batch(client: &IggyClient, cluster: &str) {
+    let mut messages: Vec<IggyMessage> = batch(cluster)
+        .into_iter()
+        .map(|payload| {
+            IggyMessage::builder()
+                .payload(payload.into_bytes().into())
+                .build()
+                .expect("a message")
+        })
+        .collect();
+    client
+        .send_messages(
+            &named(STREAM),
+            &named(TOPIC),
+            &Partitioning::partition_id(0),
+            &mut messages,
+        )
+        .await
+        .expect("dc-a takes the send");
+}
+
+/// The offsets of every long-term segment that a manifest in `bucket`
+/// lists, which name their objects.
+async fn long_term_segments(bucket: &Bucket) -> Vec<(u64, u64)> {
+    bucket
+        .manifests()
+        .await
+        .expect("read the manifests")
+        .iter()
+        .flat_map(|manifest| &manifest.segments)
+        .map(|segment| (segment.start_offset, segment.end_offset))
+        .collect()
 }
 
 /// Send to the geo topic of `dc-a`, one message at a time, until `producing`

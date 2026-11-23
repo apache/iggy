@@ -1475,6 +1475,32 @@ mod tests {
         );
     }
 
+    /// The shadow streams of a peer came from the cluster that owned its
+    /// store then. A store that another cluster owns now gets no adoption,
+    /// detach or removal of them, and the pass reports it once.
+    #[test]
+    fn given_shadow_streams_of_another_cluster_than_the_stores_owner_when_planning_should_report_it_and_change_nothing()
+     {
+        let (inner, _) = adopted();
+        let another_topic = TopicKey {
+            topic_id: PEER_TOPIC + 1,
+            ..key()
+        };
+        let mut peers = view([tombstone(NOW - GRACE), object(another_topic, "billing", 20)]);
+        peers.get_mut(PEER).unwrap().cluster_uid = Some(PEER_CLUSTER + 1);
+
+        let plan = plan(&inner, &peers, NOW, GRACE);
+
+        assert_eq!(plan.proposal, None);
+        assert_eq!(
+            plan.reports,
+            [Report::OtherCluster {
+                origin: PEER.to_owned(),
+                cluster_uid: PEER_CLUSTER,
+            }]
+        );
+    }
+
     #[test]
     fn given_a_new_incarnation_at_a_detached_topic_id_when_planning_should_wait_for_the_old_one() {
         let (mut inner, stream_id) = adopted();

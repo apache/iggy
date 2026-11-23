@@ -80,7 +80,7 @@ pub use fresh_index::{
     SealedFreshObject,
 };
 pub use fs::FsStore;
-pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
+pub use identity::{IdentityRead, InvalidStoreIdentity, MAX_IDENTITY_LEN, StoreIdentity};
 pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, LongTermKey, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
