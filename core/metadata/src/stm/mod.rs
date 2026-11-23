@@ -361,6 +361,7 @@ macro_rules! define_state {
                 $(
                     $field_vis $field_name: $field_type,
                 )*
+                pub(crate) installed_snapshot_op: u64,
                 pub(crate) last_result: Option<$crate::stm::result::ApplyReply>,
                 pub(crate) apply_context: $crate::stm::ApplyContext,
             }
@@ -479,7 +480,7 @@ macro_rules! collect_handlers {
                 /// `RestoreSnapshotInPlace`); absorbed on both left-right
                 /// buffers like any op, which is what makes an in-place
                 /// restore sound under the double-apply contract.
-                RestoreSnapshot([<$state Snapshot>]),
+                RestoreSnapshot([<$state Snapshot>], u64),
             }
 
             impl $crate::stm::Command for [<$state Inner>] {
@@ -532,8 +533,9 @@ macro_rules! collect_handlers {
                                 $crate::stm::StateHandler::apply(payload, self, *ts)
                             },
                         )*)?
-                        [<$state Command>]::RestoreSnapshot(snapshot) => {
+                        [<$state Command>]::RestoreSnapshot(snapshot, op) => {
                             self.restore_in_place(snapshot.clone());
+                            self.installed_snapshot_op = *op;
                             $crate::stm::result::ApplyReply::default()
                         },
                     });

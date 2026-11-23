@@ -817,7 +817,7 @@ mod tests {
     use iggy_binary_protocol::requests::consumer_offsets::StoreConsumerOffsetRequest;
     use iggy_binary_protocol::requests::streams::CreateStreamRequest;
     use iggy_binary_protocol::requests::users::CreateUserRequest;
-    use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+    use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
     use iggy_binary_protocol::{
         AckLevel, Command, CommitEntry, CommitHeader, CommitReplyEntry, CommitReplyHeader,
         ConsensusHeader, DoViewChangeHeader, GenericHeader, HEADER_SIZE, HeartbeatState, Operation,
@@ -6270,8 +6270,9 @@ mod tests {
         for pending in &frames {
             pending.borrow_mut().clear();
         }
+        let root_header = *journal(OLD_PRIMARY).header(root_slot).unwrap();
         let registration = RegisterRequest {
-            user_created_at: journal(OLD_PRIMARY).header(root_slot).unwrap().timestamp,
+            credential: CredentialProof::account(root_header.timestamp, root_header.op),
             bind_verifier: [0x5a; 32],
         };
         let mut abandoned =

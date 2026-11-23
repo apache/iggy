@@ -78,7 +78,7 @@ use iggy_binary_protocol::{
     EvictionReason, GenericHeader, HEADER_SIZE, MAX_RECORD_REPLY_SIZE, Operation, RequestHeader,
     RoutedRequestHeader, WireDecode,
 };
-use iggy_common::{IggyError, UserStatus};
+use iggy_common::{IggyError, IggyTimestamp, UserStatus};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
@@ -242,6 +242,7 @@ fn enqueue_client_request<B, MJ, S, SB>(
             cancel.header().client,
             cancel.header().session,
             cancel.header().request,
+            bus.realtime_micros(),
         )
     {
         // Cancellation bypasses admission limits. A poll still queued behind
@@ -928,6 +929,7 @@ async fn handle_client_request<B, MJ, S, SB>(
         transport_client_id,
         include_attachment,
         shard.bus.monotonic_now(),
+        shard.bus.realtime_micros(),
     );
     if touched.is_none() {
         // A transport's first frame: the peer address and transport kind live
@@ -937,6 +939,7 @@ async fn handle_client_request<B, MJ, S, SB>(
             transport_client_id,
             include_attachment,
             shard.bus.monotonic_now(),
+            shard.bus.realtime_micros(),
         );
     }
     let ConnectionContext {
@@ -1129,6 +1132,10 @@ async fn handle_client_request<B, MJ, S, SB>(
             // replica's reconciler trims to the committed watermark. `classify`
             // names it ahead of the partition and metadata classes.
             let in_flight = drain.admit(Admission::MetadataLane).await;
+            if !holds_binding(&shard.bus, sessions, transport_client_id, bound) {
+                evict_lapsed_binding(shard, origin, transport_client_id).await;
+                return;
+            }
             let task_shard = Rc::clone(shard);
             shard.bus.spawn(async move {
                 let _in_flight = in_flight;
@@ -1177,6 +1184,10 @@ async fn handle_client_request<B, MJ, S, SB>(
             // and a pre-consensus deny still has to echo what the client sent.
             let header = *header;
             let in_flight = drain.admit(Admission::MetadataLane).await;
+            if !holds_binding(&shard.bus, sessions, transport_client_id, bound) {
+                evict_lapsed_binding(shard, origin, transport_client_id).await;
+                return;
+            }
             let request =
                 request.transmute_header(|header, new_header: &mut RoutedRequestHeader| {
                     *new_header = header;
@@ -1295,6 +1306,48 @@ fn ensure_transport_connection<B, MJ, S, SB>(
     );
 }
 
+/// Whether the transport still holds the binding its frame arrived with. A wait
+/// for the metadata lane can outlast the token that opened the session.
+fn holds_binding<B: ShellBus>(
+    bus: &B,
+    sessions: &RefCell<SessionManager>,
+    transport_client_id: u128,
+    bound: Option<(u128, u64)>,
+) -> bool {
+    sessions
+        .borrow_mut()
+        .touch_connection(
+            transport_client_id,
+            false,
+            bus.monotonic_now(),
+            bus.realtime_micros(),
+        )
+        .is_some_and(|context| context.bound == bound)
+}
+
+/// Answers a write whose binding lapsed while it waited the way an unbound write is answered.
+#[allow(clippy::future_not_send)]
+async fn evict_lapsed_binding<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    origin: ClientOrigin,
+    transport_client_id: u128,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    send_eviction(
+        shard,
+        origin,
+        transport_client_id,
+        EvictionReason::NoSession,
+        "binding_lapsed_before_metadata_lane",
+    )
+    .await;
+}
+
 pub(in crate::dispatch) fn upgrade_shard_handle<B, MJ, S, SB>(
     shard_handle: &ShellShardHandle<B, MJ, S, SB>,
 ) -> Option<Rc<ShellShard<B, MJ, S, SB>>>
@@ -1331,7 +1384,7 @@ where
     }
     let watermark = identity.metadata_watermark.max(identity.session);
     reads::await_metadata_read_frontier(shard, watermark).await?;
-    let (user_id, session, attachment) = if shard.id == 0 {
+    let (user_id, session, attachment, token_id) = if shard.id == 0 {
         shard
             .plane
             .metadata()
@@ -1357,13 +1410,24 @@ where
             Either::Right(_) => return Err(IggyError::TransientNotAccepted),
         }
     };
-    let active_user = shard.plane.metadata().mux_stm.users().read(|users| {
-        users
+    let now = IggyTimestamp::from(shard.bus.realtime_micros());
+    // A session opened with a personal access token lasts no longer than the
+    // token, even while no committed delete has ended it yet.
+    let expires_at = shard.plane.metadata().mux_stm.users().read(|users| {
+        let active = users
             .items
             .get(user_id as usize)
-            .is_some_and(|user| user.status == UserStatus::Active)
+            .is_some_and(|user| user.status == UserStatus::Active);
+        if !active {
+            return None;
+        }
+        users.token_deadline_at(user_id, token_id, now)
     });
-    if !active_user || !attachment.is_valid() {
+    let Some(expires_at) = expires_at else {
+        return Err(IggyError::Unauthenticated);
+    };
+    let attachment = attachment.expiring_at(expires_at);
+    if !attachment.is_valid_at(now.as_micros()) {
         return Err(IggyError::Unauthenticated);
     }
     sessions.borrow_mut().bind_authenticated_connection(
@@ -1421,7 +1485,7 @@ mod tests {
     };
     use iggy_binary_protocol::requests::topics::{DeleteTopicRequest, UpdateTopicResolvedRequest};
     use iggy_binary_protocol::requests::users::login_register::{
-        LoginRegisterRequest, RegisterRequest,
+        CredentialProof, LoginRegisterRequest, RegisterRequest,
     };
     use iggy_binary_protocol::requests::users::login_register_with_pat::LoginRegisterWithPatRequest;
     use iggy_binary_protocol::requests::users::{
@@ -1439,7 +1503,10 @@ mod tests {
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine;
-    use metadata::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES};
+    use metadata::stm::user::{
+        CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES,
+        ROOT_USER_CREATED_AT_MICROS,
+    };
     use metadata::{IggyMetadata, MetadataSubmitError};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use prometheus_client::encoding::text::encode;
@@ -1524,16 +1591,20 @@ mod tests {
             assert_eq!(iggy_binary_protocol::result_code(created.body()), Some(0));
             let verified =
                 session_ops::verify_login_credentials(&shard, "original", PASSWORD).unwrap();
+            let (token_user, token_proof) =
+                session_ops::verify_pat_credentials(&shard, TOKEN).unwrap();
+            assert_eq!(verified.0, token_user);
+            assert_eq!(verified.1.user_created_at, token_proof.user_created_at);
             assert_eq!(
                 verified,
-                session_ops::verify_pat_credentials(&shard, TOKEN).unwrap()
+                (USER, CredentialProof::account(CREATED_AT, CREATED_AT))
             );
             assert_eq!(
-                verified,
-                (USER, iggy_common::IggyTimestamp::from(CREATED_AT))
+                token_proof,
+                CredentialProof::token(CREATED_AT, CREATED_AT + 1)
             );
             let registration = RegisterRequest {
-                user_created_at: verified.1.as_micros(),
+                credential: verified.1,
                 bind_verifier: bind_verifier(CLIENT, verified.0, &SECRET),
             };
             let deleted = apply(
@@ -1757,6 +1828,109 @@ mod tests {
         }
     }
 
+    #[compio::test]
+    async fn given_a_token_session_when_binding_should_last_only_while_the_token_is_live() {
+        const CLIENT: u128 = 1;
+        const TRANSPORT: u128 = 2;
+        const USER: u32 = 0;
+        const TOKEN_OP: u64 = 5;
+        const SESSION: u64 = TOKEN_OP + 1;
+        const LIFETIME: u64 = 1_000;
+        const EXPIRES_AT: u64 = TOKEN_OP + LIFETIME;
+        const SECRET: [u8; 32] = [0x5a; 32];
+        const TOKEN_NAME: &str = "service";
+        for (now, deleted, bound) in [
+            (EXPIRES_AT - 1, false, true),
+            (EXPIRES_AT, false, false),
+            (EXPIRES_AT - 1, true, false),
+        ] {
+            let bus = SpyBus::default();
+            let shard = Rc::new(test_shard(&bus, 0, 1, FIRST_BOOT));
+            let metadata = shard.plane.metadata();
+            metadata.mux_stm.users().ensure_root_user("iggy", "hash");
+            let commit = |op, operation, body: &[u8]| {
+                let prepare = prepare_message(operation, 0, 0, body).transmute_header(
+                    |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                        *header = old;
+                        header.op = op;
+                        header.timestamp = op;
+                    },
+                );
+                let reply = metadata.mux_stm.update(prepare).expect("the op applies");
+                assert_eq!(reply.code, 0);
+            };
+            commit(
+                TOKEN_OP,
+                Operation::CreatePersonalAccessToken,
+                &CreatePersonalAccessTokenRequest {
+                    user_id: USER,
+                    name: WireName::new(TOKEN_NAME).unwrap(),
+                    expiry: LIFETIME,
+                    token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+                }
+                .to_bytes(),
+            );
+            let registration = RegisterRequest {
+                credential: CredentialProof::token(ROOT_USER_CREATED_AT_MICROS, TOKEN_OP),
+                bind_verifier: bind_verifier(CLIENT, USER, &SECRET),
+            };
+            metadata
+                .client_table
+                .borrow_mut()
+                .commit_registration(CLIENT, USER, &registration, register_reply(CLIENT, SESSION))
+                .expect("the token session registers");
+            if deleted {
+                commit(
+                    SESSION + 1,
+                    Operation::DeletePersonalAccessToken,
+                    &DeletePersonalAccessTokenRequest {
+                        user_id: USER,
+                        name: WireName::new(TOKEN_NAME).unwrap(),
+                        only_if_expired: false,
+                    }
+                    .to_bytes(),
+                );
+            }
+            metadata.applied_frontier().advance(SESSION + 1);
+            bus.realtime.set(Some(now));
+            let sessions = Rc::new(RefCell::new(SessionManager::new()));
+            sessions.borrow_mut().ensure_connection(
+                TRANSPORT,
+                "127.0.0.1:34567".parse().unwrap(),
+                ClientTransportKind::Tcp,
+                std::time::Instant::now(),
+            );
+
+            let outcome = complete_session_binding(
+                &shard,
+                &sessions,
+                TRANSPORT,
+                SessionIdentity {
+                    client_id: CLIENT,
+                    session: SESSION,
+                    metadata_watermark: SESSION,
+                },
+                BindSecret::new(Box::new(SECRET)),
+            )
+            .await;
+
+            if bound {
+                assert_eq!(outcome.expect("a live token binds"), (USER, SESSION));
+                let at_expiry = sessions
+                    .borrow_mut()
+                    .touch_connection(TRANSPORT, false, std::time::Instant::now(), EXPIRES_AT)
+                    .expect("the connection is known");
+                assert_eq!(at_expiry.bound, None, "the binding ends with its token");
+            } else {
+                assert!(
+                    matches!(outcome, Err(IggyError::Unauthenticated)),
+                    "at {now}, deleted {deleted}: {outcome:?}"
+                );
+                assert!(sessions.borrow().get_session(TRANSPORT).is_none());
+            }
+        }
+    }
+
     /// A read carries the metadata op of the client's last write, and the
     /// connection floor can be older. The read must wait for that op, or a
     /// client could miss its own write.
@@ -1966,6 +2140,46 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_held_read_when_its_binding_expires_should_refuse_at_the_deadline() {
+        let (bus, shard, host) = root_host(ServerConfig::default());
+        connect_root(host.sessions());
+        let attachment = shard
+            .plane
+            .metadata()
+            .client_table
+            .borrow_mut()
+            .attach_session(ROOT_CLIENT, ROOT_SESSION, DEFAULT_ROOT_USER_ID)
+            .unwrap();
+        bus.realtime.set(Some(10));
+        host.sessions()
+            .borrow_mut()
+            .bind_authenticated_connection(
+                ROOT_TRANSPORT,
+                ROOT_CLIENT,
+                ROOT_SESSION,
+                DEFAULT_ROOT_USER_ID,
+                attachment.expiring_at(11),
+                ROOT_SESSION,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+        host.on_client_request(ROOT_TRANSPORT, held_get_me(1, UNAPPLIED_OP));
+        settle().await;
+        assert!(bus.client_replies.borrow().is_empty());
+        bus.realtime.set(Some(11));
+        shard
+            .plane
+            .metadata()
+            .applied_frontier()
+            .advance(UNAPPLIED_OP);
+        await_replies(&bus, 1).await;
+        assert_eq!(
+            reply_status(&bus.client_replies.borrow()[0].1),
+            IggyError::StaleClient.as_code()
+        );
+    }
+
+    #[compio::test]
     async fn given_a_read_waiting_on_a_shard_when_the_session_ends_should_refuse_stale_client() {
         for (code, body) in shard_waiting_reads() {
             assert_read_refused_after_shard_wait(code, &body, ReadRevocation::Session).await;
@@ -2065,7 +2279,7 @@ mod tests {
             for reply_cap in [HEADER_SIZE, MAX_RECORD_REPLY_SIZE] {
                 let context = sessions
                     .borrow_mut()
-                    .touch_connection(READER_TRANSPORT, true, std::time::Instant::now())
+                    .touch_connection(READER_TRANSPORT, true, std::time::Instant::now(), 0)
                     .unwrap();
                 let request = request_message(
                     Operation::NonReplicated,
@@ -5377,7 +5591,8 @@ mod tests {
                 .touch_connection(
                     HOME_TRANSPORT,
                     false,
-                    message_bus::MessageBus::monotonic_now(&bus)
+                    message_bus::MessageBus::monotonic_now(&bus),
+                    0
                 )
                 .unwrap()
                 .metadata_watermark,
@@ -5422,7 +5637,12 @@ mod tests {
         assert_eq!(
             host.sessions()
                 .borrow_mut()
-                .touch_connection(CALLER, false, message_bus::MessageBus::monotonic_now(&bus))
+                .touch_connection(
+                    CALLER,
+                    false,
+                    message_bus::MessageBus::monotonic_now(&bus),
+                    0
+                )
                 .unwrap()
                 .metadata_watermark,
             WRITE_OP
@@ -5433,7 +5653,8 @@ mod tests {
                 .touch_connection(
                     HOME_TRANSPORT,
                     false,
-                    message_bus::MessageBus::monotonic_now(&bus)
+                    message_bus::MessageBus::monotonic_now(&bus),
+                    0
                 )
                 .unwrap()
                 .metadata_watermark,
@@ -5467,7 +5688,8 @@ mod tests {
                 .touch_connection(
                     HOME_TRANSPORT,
                     false,
-                    message_bus::MessageBus::monotonic_now(&bus)
+                    message_bus::MessageBus::monotonic_now(&bus),
+                    0
                 )
                 .unwrap()
                 .metadata_watermark,
@@ -5513,6 +5735,65 @@ mod tests {
         settle().await;
 
         assert_no_reply_to(&bus, HOME_TRANSPORT);
+    }
+
+    #[compio::test]
+    async fn given_a_metadata_write_waiting_for_the_lane_when_its_binding_expires_should_evict_it_unsubmitted()
+     {
+        const USER: u32 = 0;
+        const EXPIRES_AT: u64 = 100;
+        let bus = SpyBus::default();
+        let (owner, owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let (shard, host) = home_host(&bus, owner);
+        let attachment = shard
+            .plane
+            .metadata()
+            .client_table
+            .borrow_mut()
+            .attach_session(HOME_CLIENT, HOME_SESSION, USER)
+            .expect("the home session is live");
+        bus.realtime.set(Some(EXPIRES_AT - 1));
+        host.sessions()
+            .borrow_mut()
+            .bind_authenticated_connection(
+                HOME_TRANSPORT,
+                HOME_CLIENT,
+                HOME_SESSION,
+                USER,
+                attachment.expiring_at(EXPIRES_AT),
+                HOME_SESSION,
+                std::time::Instant::now(),
+            )
+            .expect("rebind with a credential deadline");
+        let body = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(1),
+        }
+        .to_bytes();
+        for request in 1..=2 {
+            let write = wire_request(
+                Operation::DeleteUser,
+                HOME_CLIENT,
+                HOME_SESSION,
+                request,
+                &body,
+            );
+            host.on_client_request(HOME_TRANSPORT, write.into_generic());
+        }
+        let first = forwarded_metadata_submit(&owner_inbox).await;
+
+        bus.realtime.set(Some(EXPIRES_AT));
+        drop(first);
+        settle().await;
+
+        assert!(
+            owner_inbox.try_recv().is_err(),
+            "a write that waited past the expiry must not be submitted"
+        );
+        let replies = bus.client_replies.borrow();
+        let (client, frame) = replies.last().expect("the waiting write is answered");
+        assert_eq!(*client, HOME_TRANSPORT);
+        assert_eq!(frame_command(frame), Command::Eviction as u8);
+        assert_eq!(eviction_reason_byte(frame), EvictionReason::NoSession as u8);
     }
 
     /// A login waits for shard 0 to commit its register. A connection that

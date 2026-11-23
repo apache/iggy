@@ -116,7 +116,7 @@ where
     let caller = DeferredPollContext {
         session: Some(attachment.clone()),
         user_id,
-        user_created_at: None,
+        credential: None,
         quota: PollQuotaIdentity::Session(consumer_client_id),
         primary: true,
     };

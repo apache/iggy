@@ -95,7 +95,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-1\n";
+const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -1481,6 +1481,8 @@ mod tests {
             b"IGGY-RESOURCE-OPTIONS-1\n",
             b"IGGY-METADATA-CHANGE-LOG-1\n",
             b"IGGY-METADATA-CHANGE-LOG-2\n",
+            b"IGGY-METADATA-CHANGE-LOG-3\n",
+            b"IGGY-TIERED-SEGMENT-CHAIN-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();

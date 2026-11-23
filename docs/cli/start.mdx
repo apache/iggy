@@ -117,7 +117,9 @@ iggy session status
 iggy logout
 ```
 
-`iggy session status` only checks whether a token exists in the local keyring. An expired token **still reports as active**. On TCP, QUIC and WebSocket, run `iggy me` to verify the session against the server. HTTP does not support `me`. Use an authenticated command such as `iggy stream list` with the required permissions.
+`iggy session status` only checks whether a token exists in the local keyring. An expired token **still reports as active**. On TCP, QUIC and WebSocket, run `iggy me` to verify the session against the server. HTTP does not support `me`. Use an authenticated command the account is permitted to run.
+
+On server 0.10.1-edge.2, `iggy stream list` returns the streams the signed-in user may read. The personal access token in the keyring survives a password change. When `iggy logout` deletes that token on the server, sessions opened with it lose access.
 
 ### Personal access tokens
 
