@@ -409,16 +409,26 @@ async fn assert_page_refusals(
         .expect("login the user without permissions");
     let query = PageQuery::default();
     let named = NamedPageQuery::default();
-    assert_error_code(
-        reader.get_streams_page(&named).await,
-        IggyError::Unauthorized,
-        "a streams page without the permission to read streams",
-    );
-    assert_error_code(
-        reader.get_topics_page(stream_id, &named).await,
-        IggyError::Unauthorized,
-        "a topics page without the permission to read the stream",
-    );
+    // A list holds only what the caller may read, so without a grant it is an
+    // empty last page rather than a refusal.
+    for (page, what) in [
+        (
+            reader
+                .get_streams_page(&named)
+                .await
+                .map(|page| (page.items.len(), page.next.is_some())),
+            "a streams page without a grant",
+        ),
+        (
+            reader
+                .get_topics_page(stream_id, &named)
+                .await
+                .map(|page| (page.items.len(), page.next.is_some())),
+            "a topics page without a grant",
+        ),
+    ] {
+        assert_eq!(page.expect(what), (0, false), "{what}");
+    }
     assert_error_code(
         reader
             .get_partitions_page(stream_id, topic_id, &query)

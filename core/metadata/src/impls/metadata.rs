@@ -22,15 +22,17 @@ use crate::change_log::{
     change_actor, change_page, current_page, session_closed, session_registered, session_revoked,
 };
 use crate::impls::placement::{PlacementCounts, PlacementState};
+use crate::permissioner::GrantsByCreation;
 use crate::stm::authz::{
     PartitionsCreate, admits_partitions_create, gated_apply, reject_stale_session,
 };
 use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
+use crate::stm::result::RevokedToken;
 use crate::stm::shadow::ShadowTopicRequest;
 use crate::stm::snapshot::{
     FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
 };
-use crate::stm::stream::{Streams, TruncatePartitionRequest};
+use crate::stm::stream::{Streams, StreamsInner, TruncatePartitionRequest};
 use crate::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ApplyContext, ConsensusGroupAllocator, StateMachine};
 use bytes::Bytes;
@@ -66,7 +68,7 @@ use iggy_binary_protocol::requests::system::{
 use iggy_binary_protocol::requests::topics::CreateTopicRequest as WireCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::CreateTopicWithAssignmentsRequest as PersistedCreateTopicRequest;
 use iggy_binary_protocol::requests::topics::UpdateTopicResolvedRequest;
-use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
 use iggy_binary_protocol::requests::users::{CreateUserRequest, UpdateUserResolvedRequest};
 use iggy_binary_protocol::responses::system::GetMetadataChangesResponse;
 use iggy_binary_protocol::{
@@ -78,13 +80,13 @@ use iggy_common::calculate_checksum;
 use iggy_common::variadic;
 use iggy_common::wire_conversions::{resource_options_from_wire, resource_options_to_wire};
 use iggy_common::{
-    HeaderKey, HeaderValue, IggyError, MetadataChangeStart, MetadataChangesQuery,
+    HeaderKey, HeaderValue, IggyError, IggyTimestamp, MetadataChangeStart, MetadataChangesQuery,
     OptionAdmissionContext, OptionKey, OptionOperation, OptionValue, OptionVisibility,
-    OptionsProvenance, OptionsScope, ResourceOptions, ServerKeyContext, TopicCreateOptions,
-    TopicResolvedOptions, UserId, admit, admit_geo_topic, admit_tiered_storage,
-    critical_keys_marker, derived_defaults, drop_options_fixed_by_type, stream_wrap_set,
-    topic_option_keys, validate_geo_topic, validate_local_retention, validate_segment_max_age,
-    validate_topic_segment_size,
+    OptionsProvenance, OptionsScope, Permissions, ResourceOptions, ServerKeyContext,
+    TopicCreateOptions, TopicResolvedOptions, UserId, UserStatus, admit, admit_geo_topic,
+    admit_tiered_storage, critical_keys_marker, derived_defaults, drop_options_fixed_by_type,
+    stream_wrap_set, topic_option_keys, validate_geo_topic, validate_local_retention,
+    validate_segment_max_age, validate_topic_segment_size,
 };
 use journal::local_gate::{LocalGate, LocalGateAcquire};
 use journal::superblock::{
@@ -142,6 +144,44 @@ pub trait StreamsFrontend {
     fn users(&self) -> &Users;
     #[must_use]
     fn streams(&self) -> &Streams;
+
+    /// Read stream or topic rows with the permissions of the same installed checkpoint.
+    ///
+    /// # Errors
+    /// Returns a transient refusal between the two publications of a checkpoint.
+    fn read_scoped_page<T>(
+        &self,
+        user_id: u32,
+        project: impl FnOnce(
+            &StreamsInner,
+            Option<&Permissions>,
+            Option<&GrantsByCreation>,
+        ) -> Result<T, IggyError>,
+    ) -> Result<T, IggyError>
+    where
+        Self: Sized,
+    {
+        // A normal delete prunes grants before a second stream publication can reuse the id.
+        self.streams().read(|streams| {
+            let (permissions, ordered) = self.users().read(|users| {
+                if streams.installed_snapshot_op != users.installed_snapshot_op {
+                    return Err(IggyError::TransientNotAccepted);
+                }
+                users
+                    .items
+                    .get(user_id as usize)
+                    .filter(|user| user.status == UserStatus::Active)
+                    .map(|user| {
+                        (
+                            user.permissions.clone(),
+                            users.grants_by_creation.get(&user.id).cloned(),
+                        )
+                    })
+                    .ok_or(IggyError::Unauthenticated)
+            })?;
+            project(streams, permissions.as_deref(), ordered.as_deref())
+        })
+    }
 }
 
 impl StreamsFrontend for MuxStateMachine<variadic!(Users, Streams)> {
@@ -498,6 +538,7 @@ pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
 
 /// The encoded snapshot and the checksum over exactly those bytes.
 fn encode_with_checksum(snapshot: &IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
+    snapshot.snapshot.validate()?;
     let encoded = snapshot.encode()?;
     let checksum = checkpoint_checksum(&encoded);
     Ok((encoded, checksum))
@@ -959,10 +1000,13 @@ where
                 "invalid committed Register identity",
             )
         });
-        if !mux_stm
-            .users()
-            .is_active_account(header.user_id, registration.user_created_at)
-        {
+        if !mux_stm.users().read(|users| {
+            users.accepts_credential_at(
+                header.user_id,
+                &registration.credential,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+            )
+        }) {
             let denied = crate::stm::result::ApplyReply::err(IggyError::Unauthenticated.as_code());
             return CommittedApply {
                 reply: build_reply_message_with(&header, denied.reply_body_len(), |dst| {
@@ -978,12 +1022,7 @@ where
             let reply = build_reply_message(&header, &bytes::Bytes::new());
             client_table
                 .borrow_mut()
-                .commit_register(
-                    header.client,
-                    header.user_id,
-                    registration.bind_verifier,
-                    reply,
-                )
+                .commit_registration(header.client, header.user_id, &registration, reply)
                 .unwrap_or_else(|error| {
                     fatal(
                         FatalReason::UnreconcilableLogFrontier,
@@ -998,7 +1037,7 @@ where
         // The session record comes first, then the handovers its memberships
         // took from the session change.
         let mut changes: Vec<AppliedChange> = inserted
-            .then(|| session_registered(&header, registration.user_created_at, epoch))
+            .then(|| session_registered(&header, registration.credential.user_created_at, epoch))
             .into_iter()
             .collect();
         changes.extend(mux_stm.streams().refresh_consumer_group_session(
@@ -1079,20 +1118,35 @@ where
     // Normal op: apply, build the reply. `Err` is decode/corruption only; a
     // business rejection commits as a deterministic no-op whose code rides
     // the reply body, replayed on retry.
-    let mut apply = reject_stale_session(&header, &client_table.borrow())
-        .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
-        .unwrap_or_else(|err| {
-            panic!(
-                "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
-                header.op
-            );
-        });
+    let prepared_at = IggyTimestamp::from(header.timestamp);
+    let mut apply = reject_stale_session(&header, &client_table.borrow(), |user_id, token_id| {
+        mux_stm
+            .users()
+            .read(|users| users.holds_live_token(user_id, token_id, prepared_at))
+    })
+    .map_or_else(|| gated_apply(mux_stm, prepare), Ok)
+    .unwrap_or_else(|err| {
+        panic!(
+            "apply_committed_prepare: committed metadata op={} failed to apply: {err}",
+            header.op
+        );
+    });
     if let Some(user) = apply.revoked_user {
         let ended = apply_user_revocation(
             mux_stm,
             client_table,
             table_mutations_allowed,
-            user,
+            Revocation::of_user(user, apply.kept_session_client),
+            &header,
+        );
+        apply.changes.extend(ended);
+    }
+    if let Some(token) = apply.revoked_token {
+        let ended = apply_user_revocation(
+            mux_stm,
+            client_table,
+            table_mutations_allowed,
+            Revocation::Token(token),
             &header,
         );
         apply.changes.extend(ended);
@@ -1121,29 +1175,77 @@ where
     }
 }
 
-/// Ends the user's sessions and returns their close records, then the records
+/// The sessions a committed op ends: every session of a user, every session
+/// but the one that changed the user's password, or the sessions a user opened
+/// with one personal access token.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Revocation {
+    User(WireUserKey),
+    OtherSessions {
+        user: WireUserKey,
+        kept_client: u128,
+    },
+    Token(RevokedToken),
+}
+
+impl Revocation {
+    /// Only a binary self-rotation preserves its submitting session.
+    pub(crate) fn of_user(user: WireUserKey, kept_client: Option<u128>) -> Self {
+        kept_client.map_or(Self::User(user), |kept_client| Self::OtherSessions {
+            user,
+            kept_client,
+        })
+    }
+
+    pub(crate) const fn user(self) -> WireUserKey {
+        match self {
+            Self::User(user) | Self::OtherSessions { user, .. } => user,
+            Self::Token(token) => token.user,
+        }
+    }
+
+    /// Ends the sessions in `table` and returns them.
+    pub(crate) fn end_sessions(self, table: &mut ClientTable, op: u64) -> Vec<SessionIdentity> {
+        match self {
+            Self::User(user) => table.end_user_sessions(user.user_id, op),
+            Self::OtherSessions { user, kept_client } => {
+                table.end_user_sessions_except(user.user_id, kept_client, op)
+            }
+            Self::Token(token) => table.end_token_sessions(token.user.user_id, token.token_id, op),
+        }
+    }
+
+    fn covers(self, table: &ClientTable, client_id: u128) -> bool {
+        table.get_user_id(client_id) == Some(self.user().user_id)
+            && match self {
+                Self::User(_) => true,
+                Self::OtherSessions { kept_client, .. } => client_id != kept_client,
+                Self::Token(token) => table.token_id(client_id) == token.token_id,
+            }
+    }
+}
+
+/// Ends the revoked sessions and returns their close records, then the records
 /// of the memberships that ended with them.
 fn apply_user_revocation<M: StreamsFrontend>(
     mux_stm: &M,
     client_table: &RefCell<ClientTable>,
     table_mutations_allowed: bool,
-    user: WireUserKey,
+    revocation: Revocation,
     header: &PrepareHeader,
 ) -> Vec<AppliedChange> {
-    if table_mutations_allowed {
-        client_table
-            .borrow_mut()
-            .end_user_sessions(user.user_id, header.op);
-    }
-    // A transferred table may already contain this end marker while the
-    // streams snapshot still needs the matching membership release.
-    let mut sessions: Vec<SessionIdentity> = {
+    let user = revocation.user();
+    let mut sessions: Vec<SessionIdentity> = if table_mutations_allowed {
+        revocation.end_sessions(&mut client_table.borrow_mut(), header.op)
+    } else {
+        // A transferred table may already contain this end marker while the
+        // streams snapshot still needs the matching membership release.
         let table = client_table.borrow();
         table
             .ended_sessions()
             .filter(|identity| {
                 identity.metadata_watermark == header.op
-                    && table.get_user_id(identity.client_id) == Some(user.user_id)
+                    && revocation.covers(&table, identity.client_id)
             })
             .collect()
     };
@@ -1812,7 +1914,13 @@ where
                     user_id,
                     message.body(),
                     request_checksum,
-                    |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
+                    |credential| {
+                        self.accepts_registration_proof(
+                            user_id,
+                            credential,
+                            consensus.clock_realtime_micros(),
+                        )
+                    },
                 );
                 apply_preflight_consensus_plane(
                     consensus,
@@ -3008,15 +3116,20 @@ where
             return Err(MetadataSubmitError::NotPrimary);
         }
         if is_caught_up_primary(consensus) {
-            if !self
-                .mux_stm
-                .users()
-                .is_active_account(user_id, registration.user_created_at)
-            {
+            if !self.accepts_registration_proof(
+                user_id,
+                &registration.credential,
+                consensus.clock_realtime_micros(),
+            ) {
                 return Err(MetadataSubmitError::Unauthenticated);
             }
             let table = self.client_table.borrow();
-            match table.registered_session(client_id, user_id, registration.bind_verifier) {
+            match table.registered_session(
+                client_id,
+                user_id,
+                registration.bind_verifier,
+                registration.credential.token_id,
+            ) {
                 Ok(Some(epoch)) => {
                     return Ok(BoundSession {
                         epoch,
@@ -3034,19 +3147,45 @@ where
             return Err(MetadataSubmitError::InProgress);
         }
         let request = build_register_request_message(consensus, client_id, user_id, registration);
-        if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
+        let outcome = if !is_caught_up_primary(consensus) || consensus.pipeline_is_full() {
             let (entry, receiver) = consensus::RequestEntry::with_subscriber(request);
             if consensus.push_queued_request(entry).is_err() {
                 return Err(MetadataSubmitError::PipelineFull);
             }
-            let _ = receiver.await;
+            receiver.await
         } else {
             let prepare = self
                 .prepare_request(request)
                 .expect("Register is a client-allowed operation");
-            let _ = self.dispatch_prepare_and_await(consensus, prepare).await;
+            self.dispatch_prepare_and_await(consensus, prepare).await
+        };
+        if outcome.is_ok_and(|reply| {
+            iggy_binary_protocol::result_code(reply.body())
+                == Some(IggyError::Unauthenticated.as_code())
+        }) {
+            return Err(MetadataSubmitError::Unauthenticated);
         }
-        self.bound_session(client_id, user_id, registration)
+        self.bound_session(
+            client_id,
+            user_id,
+            registration,
+            consensus.clock_realtime_micros(),
+        )
+    }
+
+    fn accepts_registration_proof(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        now_micros: u64,
+    ) -> bool {
+        self.mux_stm.users().read(|users| {
+            users.accepts_credential_at(
+                user_id,
+                credential,
+                iggy_common::IggyTimestamp::from(now_micros),
+            )
+        })
     }
 
     fn bound_session(
@@ -3054,17 +3193,19 @@ where
         client_id: u128,
         user_id: u32,
         registration: RegisterRequest,
+        now_micros: u64,
     ) -> Result<BoundSession, MetadataSubmitError> {
-        if !self
-            .mux_stm
-            .users()
-            .is_active_account(user_id, registration.user_created_at)
-        {
+        if !self.accepts_registration_proof(user_id, &registration.credential, now_micros) {
             return Err(MetadataSubmitError::Unauthenticated);
         }
         let table = self.client_table.borrow();
         let epoch = table
-            .registered_session(client_id, user_id, registration.bind_verifier)
+            .registered_session(
+                client_id,
+                user_id,
+                registration.bind_verifier,
+                registration.credential.token_id,
+            )
             .map_err(|_| MetadataSubmitError::ClientIdOwnedByAnotherUser)?
             .ok_or(MetadataSubmitError::Canceled)?;
         Ok(BoundSession {
@@ -4448,7 +4589,13 @@ where
                         user_id,
                         req.message.body(),
                         request_checksum,
-                        |created_at| self.mux_stm.users().is_active_account(user_id, created_at),
+                        |credential| {
+                            self.accepts_registration_proof(
+                                user_id,
+                                credential,
+                                consensus.clock_realtime_micros(),
+                            )
+                        },
                     );
                     apply_preflight_consensus_plane(
                         consensus,
@@ -6908,6 +7055,7 @@ mod tests {
                         client_id: 1,
                         epoch: 10,
                         user_id: 1,
+                        token_id: 0,
                         watermark: 3,
                         reply: vec![1, 2, 3],
                     },
@@ -6920,6 +7068,7 @@ mod tests {
                         client_id: 2,
                         epoch: 20,
                         user_id: 2,
+                        token_id: 9,
                         watermark: 0,
                         reply: vec![4, 5],
                     },
@@ -6961,6 +7110,7 @@ mod tests {
                     client_id: 1,
                     epoch: 1,
                     user_id: 1,
+                    token_id: 0,
                     watermark: 0,
                     reply: vec![0xFF; REPLY_LEN],
                 },
@@ -7125,6 +7275,47 @@ mod tests {
         }
     }
 
+    #[compio::test]
+    async fn given_a_token_expired_at_the_prepare_timestamp_when_registering_should_return_unauthenticated()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let mut metadata = metadata_plane();
+        metadata.journal = Some(
+            PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+                .await
+                .unwrap(),
+        );
+        metadata.mux_stm = Rc::new(TestMux::new((session_users(), (Streams::default(), ()))));
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let now = consensus.clock_realtime_micros();
+        let lifetime = 60_000_000;
+        let token = CreatePersonalAccessTokenRequest {
+            expiry: lifetime,
+            ..token_create(TOKEN_NAME)
+        };
+        let create = build_prepare_message(
+            consensus,
+            &RoutedRequestHeader::default(),
+            Operation::CreatePersonalAccessToken,
+            &token.to_bytes(),
+        );
+        let id = create.header().op;
+        metadata.mux_stm.update(create).unwrap();
+        consensus.observe_prepare_timestamp(now + lifetime * 2);
+        let registration = RegisterRequest {
+            credential: CredentialProof::token(1, id),
+            bind_verifier: [0x5a; 32],
+        };
+        assert!(metadata.accepts_registration_proof(TOKEN_OWNER, &registration.credential, now));
+        assert_eq!(
+            metadata
+                .submit_register_in_process(77, TOKEN_OWNER, registration)
+                .await,
+            Err(MetadataSubmitError::Unauthenticated)
+        );
+        assert!(!metadata.client_table.borrow().contains(77));
+    }
+
     // The login frame's `client` field is caller-supplied and
     // `resolve_acting_user_id` resolves authority from the entry it names, so
     // the register ownership gate must refuse an entry owned by another user
@@ -7172,7 +7363,7 @@ mod tests {
                 CLIENT,
                 IMPOSTOR,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32]
                 }
             )
@@ -7195,7 +7386,7 @@ mod tests {
                 CLIENT,
                 OWNER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32]
                 }
             )
@@ -7225,7 +7416,7 @@ mod tests {
                         client,
                         0,
                         RegisterRequest {
-                            user_created_at: 1,
+                            credential: CredentialProof::account(1, 1),
                             bind_verifier: [0x5a; 32],
                         },
                     ),
@@ -10886,7 +11077,7 @@ mod tests {
                     CLIENT,
                     0,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     },
                 )
@@ -11715,7 +11906,7 @@ mod tests {
                 CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -11750,7 +11941,7 @@ mod tests {
                 CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -11863,7 +12054,7 @@ mod tests {
                     client,
                     7,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     },
                 )
@@ -12104,7 +12295,7 @@ mod tests {
                 CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -12220,7 +12411,7 @@ mod tests {
             &request,
             Operation::Register,
             &RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             }
             .to_bytes(),
@@ -12259,24 +12450,6 @@ mod tests {
             metadata.mux_stm.users().ensure_root_user("root", "hash");
             let consensus = metadata.consensus.as_ref().unwrap();
             let request = RoutedRequestHeader::default();
-            for user_id in 1..=USER {
-                let create = CreateUserRequest {
-                    username: WireName::new(format!("user-{user_id}")).unwrap(),
-                    password: "hash".to_owned(),
-                    status: UserStatus::Active.as_code(),
-                    permissions: None,
-                    options: WireOptions::empty(),
-                };
-                metadata
-                    .mux_stm
-                    .update(build_prepare_message(
-                        consensus,
-                        &request,
-                        Operation::CreateUser,
-                        &create.to_bytes(),
-                    ))
-                    .unwrap();
-            }
             let mut snapshot =
                 <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, consensus.commit_min(), 1)
                     .unwrap();
@@ -12398,7 +12571,7 @@ mod tests {
         const VICTIM_USER: u32 = 7;
         const REQUEST: u64 = 1;
         let registration = || RegisterRequest {
-            user_created_at: 1,
+            credential: CredentialProof::account(1, 1),
             bind_verifier: [0x5a; 32],
         };
         let with_session = |request: Message<RoutedRequestHeader>, session: u64| {
@@ -12632,10 +12805,10 @@ mod tests {
                 &*metadata.mux_stm,
                 &metadata.client_table,
                 true,
-                WireUserKey {
+                Revocation::User(WireUserKey {
                     user_id: GROUP_MEMBER_USER,
                     user_created_at: 0,
-                },
+                }),
                 &header,
             );
             let seen = observer.join().unwrap();
@@ -12725,6 +12898,8 @@ mod tests {
     fn session_users() -> Users {
         const LAST_USER: u32 = 9;
         let mut users = UsersInner::new();
+        // Created at op 1, the access revision the sessions below prove.
+        users.apply_context.metadata_op = 1;
         for user_id in 0..=LAST_USER {
             let created = StateHandler::apply(
                 &CreateUserRequest {
@@ -12815,7 +12990,7 @@ mod tests {
                 client_id,
                 GROUP_MEMBER_USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -12940,7 +13115,7 @@ mod tests {
             CLIENT_C,
             ACTING_USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         ));
@@ -13031,7 +13206,7 @@ mod tests {
                 CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -13106,7 +13281,7 @@ mod tests {
                 CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: BIND_VERIFIER,
                 },
             )
@@ -13134,7 +13309,7 @@ mod tests {
                 NEW_CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: BIND_VERIFIER,
                 },
             )
@@ -13179,9 +13354,10 @@ mod tests {
                     CLIENT,
                     USER,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: BIND_VERIFIER
-                    }
+                    },
+                    consensus.clock_realtime_micros()
                 )
                 .unwrap()
                 .epoch,
@@ -13193,9 +13369,10 @@ mod tests {
                     NEW_CLIENT,
                     USER,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: BIND_VERIFIER
-                    }
+                    },
+                    consensus.clock_realtime_micros()
                 )
                 .unwrap()
                 .epoch,
@@ -13404,6 +13581,38 @@ mod tests {
         assert_eq!(coordinator.last_checkpoint(), (0, 0));
         assert!(!coordinator.snapshot_path().exists());
         assert!(!coordinator.checkpoint_pending.get());
+    }
+
+    #[compio::test]
+    async fn given_state_recovery_would_refuse_when_persisting_a_checkpoint_should_write_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let metadata: IggyMetadata<(), (), (), TestMux> = IggyMetadata::new(
+            None,
+            None,
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        // Root carries the revision of op 1, which a checkpoint at op 0 cannot hold.
+        metadata.mux_stm.users().ensure_root_user("root", "hash");
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+
+        let persisted = coordinator
+            .persist_snapshot(
+                &*metadata.mux_stm,
+                0,
+                0,
+                None,
+                metadata.change_log.snapshot(),
+            )
+            .await;
+
+        assert!(matches!(persisted, Err(SnapshotError::InvalidState(_))));
+        assert!(!coordinator.snapshot_path().exists());
+        assert_eq!(coordinator.last_checkpoint(), (0, 0));
     }
 
     #[compio::test]
@@ -14598,7 +14807,7 @@ mod tests {
             CLIENT_C,
             ACTING_USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         ));

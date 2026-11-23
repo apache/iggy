@@ -193,17 +193,22 @@ impl SessionManager {
     /// `None` means the connection is not registered yet, which happens
     /// only on a transport's first frame; the caller installs it from the
     /// bus metadata ([`Self::ensure_connection`]) and asks again.
+    ///
+    /// A binding whose credential expired at `realtime_micros` reads as
+    /// unbound, so an expired personal access token stops serving requests
+    /// before a committed delete ends its session.
     pub(crate) fn touch_connection(
         &mut self,
         connection_id: u128,
         include_attachment: bool,
         now: Instant,
+        realtime_micros: u64,
     ) -> Option<ConnectionContext> {
         let conn = self.connections.get_mut(&connection_id)?;
         if conn
             .consumer_session
             .as_ref()
-            .is_some_and(|(_, attachment)| !attachment.is_valid())
+            .is_some_and(|(_, attachment)| !attachment.is_valid_at(realtime_micros))
         {
             conn.state = ConnectionState::Connected;
             conn.consumer_session = None;
@@ -338,6 +343,7 @@ impl SessionManager {
         client: u128,
         session: u64,
         wire_request_id: u64,
+        now_micros: u64,
     ) -> bool {
         let Some(connection) = self.connections.get(&connection_id) else {
             return false;
@@ -346,7 +352,7 @@ impl SessionManager {
             || connection
                 .consumer_session
                 .as_ref()
-                .is_none_or(|(_, attachment)| !attachment.is_valid())
+                .is_none_or(|(_, attachment)| !attachment.is_valid_at(now_micros))
         {
             return false;
         }
@@ -560,13 +566,14 @@ impl SessionManager {
         &self,
         timeout: std::time::Duration,
         now: Instant,
+        now_micros: u64,
     ) -> impl Iterator<Item = ConsumerSession> + '_ {
         self.connections.values().filter_map(move |connection| {
             if now.saturating_duration_since(connection.last_heartbeat) >= timeout
                 || connection
                     .consumer_session
                     .as_ref()
-                    .is_none_or(|(_, attachment)| !attachment.is_valid())
+                    .is_none_or(|(_, attachment)| !attachment.is_valid_at(now_micros))
             {
                 return None;
             }
@@ -779,7 +786,7 @@ mod tests {
         }
         assert_eq!(
             sessions
-                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now(), 0)
                 .count(),
             0
         );
@@ -848,7 +855,7 @@ mod tests {
         );
         assert_eq!(
             sessions
-                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now(), 0)
                 .count(),
             0
         );
@@ -859,7 +866,7 @@ mod tests {
             Instant::now().checked_sub(TIMEOUT).unwrap();
         assert_eq!(
             sessions
-                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now(), 0)
                 .collect::<Vec<_>>(),
             [ConsumerSession {
                 client_id: CLIENT,
@@ -867,25 +874,52 @@ mod tests {
             }]
         );
         sessions
-            .touch_connection(1, false, std::time::Instant::now())
+            .touch_connection(1, false, std::time::Instant::now(), 0)
             .unwrap();
         assert_eq!(
             sessions
-                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now(), 0)
                 .count(),
             2
         );
         sessions.remove_connection(2);
         assert_eq!(
             sessions
-                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now(), 0)
                 .count(),
             1
         );
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
         assert_eq!(
             sessions
-                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now())
+                .iter_consumer_sessions(TIMEOUT, std::time::Instant::now(), 0)
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn given_expired_binding_when_reporting_members_should_stop_renewing_its_lease() {
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        bind(&mut sessions, &mut table, 1);
+        let (_, attachment) = sessions
+            .connections
+            .get_mut(&1)
+            .unwrap()
+            .consumer_session
+            .as_mut()
+            .unwrap();
+        *attachment = attachment.clone().expiring_at(100);
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(Duration::MAX, Instant::now(), 99)
+                .count(),
+            1
+        );
+        assert_eq!(
+            sessions
+                .iter_consumer_sessions(Duration::MAX, Instant::now(), 100)
                 .count(),
             0
         );
@@ -923,7 +957,7 @@ mod tests {
         assert_eq!(sessions.get_session(1), Some((CLIENT, EPOCH)));
         assert_eq!(
             sessions
-                .touch_connection(1, false, Instant::now())
+                .touch_connection(1, false, Instant::now(), 0)
                 .map(|context| context.metadata_watermark),
             Some(EPOCH + 5)
         );
@@ -969,6 +1003,45 @@ mod tests {
     }
 
     #[test]
+    fn given_binding_whose_credential_expired_when_touched_should_read_as_unbound() {
+        const EXPIRES_AT: u64 = 1_000;
+        let mut table = registry(CLIENT, USER, EPOCH);
+        let mut sessions = SessionManager::new();
+        sessions.ensure_connection(
+            1,
+            addr(5000),
+            ClientTransportKind::Tcp,
+            std::time::Instant::now(),
+        );
+        let attachment = table
+            .attach_session(CLIENT, EPOCH, USER)
+            .unwrap()
+            .expiring_at(EXPIRES_AT);
+        sessions
+            .bind_authenticated_connection(
+                1,
+                CLIENT,
+                EPOCH,
+                USER,
+                attachment,
+                EPOCH,
+                std::time::Instant::now(),
+            )
+            .unwrap();
+
+        let before = sessions
+            .touch_connection(1, false, Instant::now(), EXPIRES_AT - 1)
+            .unwrap();
+        let at_expiry = sessions
+            .touch_connection(1, false, Instant::now(), EXPIRES_AT)
+            .unwrap();
+
+        assert_eq!(before.bound, Some((CLIENT, EPOCH)));
+        assert_eq!((at_expiry.bound, at_expiry.user_id), (None, None));
+        assert_eq!(sessions.get_session(1), None);
+    }
+
+    #[test]
     fn disconnect_is_idempotent_and_does_not_remove_other_bindings() {
         let mut table = registry(CLIENT, USER, EPOCH);
         let mut sessions = SessionManager::new();
@@ -987,7 +1060,7 @@ mod tests {
         bind(&mut sessions, &mut table, 1);
         assert_eq!(
             sessions
-                .touch_connection(1, false, Instant::now())
+                .touch_connection(1, false, Instant::now(), 0)
                 .map(|context| context.metadata_watermark),
             Some(EPOCH)
         );
@@ -996,7 +1069,7 @@ mod tests {
         bind(&mut sessions, &mut table, 1);
         assert_eq!(
             sessions
-                .touch_connection(1, false, Instant::now())
+                .touch_connection(1, false, Instant::now(), 0)
                 .map(|context| context.metadata_watermark),
             Some(50)
         );
@@ -1010,7 +1083,7 @@ mod tests {
         sessions.record_metadata_watermark(1, 50);
         table.end_session(CLIENT, USER, EPOCH, EPOCH + 1);
         let context = sessions
-            .touch_connection(1, true, std::time::Instant::now())
+            .touch_connection(1, true, std::time::Instant::now(), 0)
             .unwrap();
         assert_eq!(context.bound, None);
         assert_eq!(context.user_id, None);
@@ -1033,7 +1106,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             sessions
-                .touch_connection(1, false, Instant::now())
+                .touch_connection(1, false, Instant::now(), 0)
                 .map(|context| context.metadata_watermark),
             Some(EPOCH + 2)
         );
@@ -1045,7 +1118,7 @@ mod tests {
         sessions.record_metadata_watermark(9, 5);
         assert!(
             sessions
-                .touch_connection(9, false, Instant::now())
+                .touch_connection(9, false, Instant::now(), 0)
                 .is_none()
         );
         assert_eq!(sessions.client_count(), 0);
@@ -1096,18 +1169,18 @@ mod tests {
         assert!(
             !sessions
                 .borrow()
-                .cancel_deferred_request(1, CLIENT + 1, EPOCH, 10)
+                .cancel_deferred_request(1, CLIENT + 1, EPOCH, 10, 0)
         );
         assert!(
             !sessions
                 .borrow()
-                .cancel_deferred_request(1, CLIENT, EPOCH + 1, 10)
+                .cancel_deferred_request(1, CLIENT, EPOCH + 1, 10, 0)
         );
         assert!(first.as_mut().now_or_never().is_none());
         assert!(
             sessions
                 .borrow()
-                .cancel_deferred_request(1, CLIENT, EPOCH, 10)
+                .cancel_deferred_request(1, CLIENT, EPOCH, 10, 0)
         );
         assert!(first.as_mut().now_or_never().unwrap().is_err());
         assert!(other.as_mut().now_or_never().is_none());
@@ -1154,7 +1227,7 @@ mod tests {
             assert!(
                 sessions
                     .borrow()
-                    .cancel_deferred_request(1, CLIENT, EPOCH, request)
+                    .cancel_deferred_request(1, CLIENT, EPOCH, request, 0)
             );
         }
 

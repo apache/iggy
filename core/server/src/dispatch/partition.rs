@@ -156,7 +156,7 @@ where
     let metadata_watermark = shard.plane.metadata().applied_frontier().get();
     if consumer_session
         .as_ref()
-        .is_some_and(|(_, attachment)| !attachment.is_valid())
+        .is_some_and(|(_, attachment)| !attachment.is_valid_at(shard.bus.realtime_micros()))
     {
         send_deny_reply(shard, origin, &header, IggyError::StaleClient.as_code()).await;
         return PartitionAdmission::Denied;
@@ -671,7 +671,7 @@ pub(in crate::dispatch) async fn handle_poll_messages<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
         return;
     };
-    if !attachment.is_valid() {
+    if !attachment.is_valid_at(shard.bus.realtime_micros()) {
         send_non_replicated_deny(shard, request, origin, IggyError::StaleClient.as_code()).await;
         return;
     }
@@ -802,7 +802,7 @@ where
         DeferredPollContext {
             session: Some(session),
             user_id,
-            user_created_at: None,
+            credential: None,
             quota: PollQuotaIdentity::Session(consumer_client_id),
             primary: true,
         },
@@ -1099,7 +1099,7 @@ pub(in crate::dispatch) async fn handle_get_consumer_offset<B, MJ, S, SB>(
         send_non_replicated_deny(shard, request, origin, IggyError::InvalidCommand.as_code()).await;
         return;
     };
-    if let Err(error) = authorize_attached(attachment, || {
+    if let Err(error) = authorize_attached(attachment, shard.bus.realtime_micros(), || {
         authorize_partition_read(
             shard,
             &wire.stream_id,

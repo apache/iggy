@@ -59,8 +59,8 @@ export const GET_TOPICS = {
 export const getTopicsPage = wrapCommand<GetTopicsPage, Page<Topic>>(GET_TOPICS);
 
 /**
- * Executable get topics command function. Reads every topic of the stream page
- * by page.
+ * Executable get topics command function. Reads every topic of the stream that
+ * the caller may read, page by page.
  */
 export const getTopics = (c: ClientProvider) =>
   ({ streamId }: GetTopics): Promise<Topic[]> =>
