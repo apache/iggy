@@ -30,7 +30,8 @@ use crate::state_transfer::{PartitionInstallError, PartitionStateTransferOffer};
 /// Sealed segments of a partition with [`ORIGIN_OPS`] one-message ops.
 const ORIGIN_SEALED: [u64; 3] = [0, 2, 4];
 
-/// An origin whose first two sealed segments left the disk.
+/// An origin whose store holds every sealed segment, and whose first two
+/// left the disk.
 async fn tiered_origin() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
     let (directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
     let mut origin = Box::new(origin);
@@ -92,6 +93,15 @@ fn layout<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<(u64, u64, u64, Se
         .collect()
 }
 
+/// The segments without where their bytes are: a receiver holds none of the
+/// bytes of a segment the store has, while the sender may still hold them.
+fn extents<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<(u64, u64, u64)> {
+    layout(partition)
+        .into_iter()
+        .map(|(start_offset, end_offset, size, _)| (start_offset, end_offset, size))
+        .collect()
+}
+
 fn offered_chain(offer: &PartitionStateTransferOffer) -> Chain {
     decode_chain(&offer.chain.as_ref().unwrap().1).unwrap()
 }
@@ -123,7 +133,7 @@ async fn install_with_chain(
 }
 
 #[compio::test]
-async fn given_a_tiered_origin_when_offering_should_carry_its_chain_and_no_remote_bytes() {
+async fn given_a_tiered_origin_when_offering_should_carry_its_chain_and_no_stored_bytes() {
     let (_directory, mut origin) = Box::pin(tiered_origin()).await;
 
     let offer = Box::pin(serve_offer(&mut origin)).await;
@@ -133,19 +143,23 @@ async fn given_a_tiered_origin_when_offering_should_carry_its_chain_and_no_remot
         .iter()
         .map(|source| source.entry.frontier)
         .collect();
-    assert_eq!(offered, [4, 6], "remote segments send no bytes");
+    assert_eq!(
+        offered,
+        [6],
+        "a segment the store holds sends no bytes, on the sender's disk or not"
+    );
     let manifest = offer.manifest();
     assert_eq!(manifest.len(), offer.artifact_count());
     assert_eq!(
-        manifest[2].kind,
+        manifest[1].kind,
         consensus::state_manifest::artifact_kind::SEGMENT_CHAIN
     );
     assert!(matches!(
-        offer.artifact_at(2),
+        offer.artifact_at(1),
         Some(crate::state_transfer::PartitionArtifactSource::Chain(_))
     ));
     assert!(matches!(
-        offer.artifact_at(3),
+        offer.artifact_at(2),
         Some(crate::state_transfer::PartitionArtifactSource::Offsets(_))
     ));
     let chain = offered_chain(&offer);
@@ -156,36 +170,96 @@ async fn given_a_tiered_origin_when_offering_should_carry_its_chain_and_no_remot
         [
             ChainRecord::Remote(sealed[0]),
             ChainRecord::Remote(sealed[1]),
-            ChainRecord::Sealed(sealed[2]),
-            // The local segment that an advance confirmed carries its proof.
-            ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
-                start: sealed[2].start_offset,
-                up_to: sealed[2].end_offset,
-                hash: sealed[2].hash,
-            }),
+            // Still on the sender's disk, and remote for the receiver.
+            ChainRecord::Remote(sealed[2]),
         ]
     );
 }
 
-/// A replica rebuilt by a transfer never applies the advances below the floor
-/// it starts from, so the proof that a local segment is stored has to arrive
-/// with the chain, or that segment would stay on its disk for good.
+/// The store holds the segment, so the receiver needs none of its bytes: it
+/// starts with the segment remote and reads it from the store.
 #[compio::test]
-async fn given_a_confirmed_local_segment_when_its_chain_is_installed_should_let_the_receiver_evict_it()
+async fn given_a_stored_segment_on_the_senders_disk_when_installed_should_be_remote_on_the_receiver()
  {
+    let (_origin_directory, mut origin) = Box::pin(tiered_origin()).await;
+    assert_eq!(locations(&origin)[2], SegmentLocation::Local);
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+
+    let remote_front = [
+        SegmentLocation::Remote,
+        SegmentLocation::Remote,
+        SegmentLocation::Remote,
+        SegmentLocation::Local,
+    ];
+    assert_eq!(locations(&receiver), remote_front);
+    assert_eq!(extents(&receiver), extents(&origin));
+    let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
+    assert!(!directory.join(format!("{:020}.log", 4)).exists());
+    drop(receiver);
+
+    let rebooted = Box::pin(reboot(&config)).await;
+    assert_eq!(locations(&rebooted), remote_front);
+}
+
+/// A rebuilt replica that later leads the partition publishes its manifest.
+/// The records of the segments it received no bytes of are all it has to
+/// list them, so they have to count as stored without an advance of its own.
+#[compio::test]
+async fn given_a_tiered_offer_when_installed_should_list_every_stored_segment_in_its_manifest() {
     let (_origin_directory, mut origin) = Box::pin(tiered_origin()).await;
     let offer = Box::pin(serve_offer(&mut origin)).await;
     let root = tempfile::tempdir().unwrap();
     let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+    let now = IggyTimestamp::now();
+    let stored = origin.manifest(now).unwrap().segments;
+    assert_eq!(stored.len(), ORIGIN_SEALED.len());
+
     Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
-    assert_eq!(locations(&receiver)[2], SegmentLocation::Local);
+
+    assert_eq!(receiver.manifest(now).unwrap().segments, stored);
+    drop(receiver);
+    let rebooted = Box::pin(reboot(&config)).await;
+    assert_eq!(rebooted.manifest(now).unwrap().segments, stored);
+}
+
+/// A segment the store holds behind one it does not hold yet still travels as
+/// bytes. A replica rebuilt by a transfer never applies the advances below the
+/// floor it starts from, so the proof that the segment is stored has to arrive
+/// with the chain, or it would stay on the receiver's disk for good.
+#[compio::test]
+async fn given_a_stored_segment_behind_an_unstored_one_when_its_chain_is_installed_should_let_the_receiver_evict_it()
+ {
+    let (_origin_directory, origin) =
+        Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
+    let mut origin = Box::new(origin);
+    confirm(&mut origin, &[2, 4]);
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+    let offered: Vec<u64> = offer
+        .segments
+        .iter()
+        .map(|source| source.entry.frontier)
+        .collect();
+    assert_eq!(offered, [0, 2, 4, 6]);
+    let root = tempfile::tempdir().unwrap();
+    let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+    assert_eq!(locations(&receiver)[1], SegmentLocation::Local);
     drop(receiver);
 
     // The proof is in the chain file, so it also survives the restart.
     let mut rebooted = Box::pin(reboot(&config)).await;
+    confirm(&mut rebooted, &[0]);
     Box::pin(evict(&mut rebooted, u64::MAX, KEEP_NOTHING)).await;
 
-    assert_eq!(locations(&rebooted)[2], SegmentLocation::Remote);
+    assert_eq!(
+        locations(&rebooted)[..3],
+        [SegmentLocation::Remote; 3],
+        "only the first segment was confirmed after the install"
+    );
 }
 
 /// The plan is pinned in a turn that can come before the I/O lane records an
@@ -210,8 +284,8 @@ async fn given_an_advance_not_yet_in_the_chain_when_its_chain_is_installed_shoul
     assert_eq!(locations(&rebooted)[0], SegmentLocation::Remote);
 }
 
-/// A rebuilt replica holds the sender's records and front, keeps no tiered
-/// bytes, and boots back into the same layout.
+/// A rebuilt replica holds the sender's records and front, keeps no bytes of
+/// a segment the store holds, and boots back into the same layout.
 #[compio::test]
 async fn given_a_tiered_offer_when_installed_should_hold_the_senders_chain_and_boot_into_it() {
     let (_origin_directory, mut origin) = Box::pin(tiered_origin()).await;
@@ -222,7 +296,7 @@ async fn given_a_tiered_offer_when_installed_should_hold_the_senders_chain_and_b
     Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
 
     let directory = PathBuf::from(config.get_partition_path(1, 1, 0));
-    assert_eq!(layout(&receiver), layout(&origin));
+    assert_eq!(extents(&receiver), extents(&origin));
     assert_eq!(receiver.object_prefix(), Some(PREFIX));
     for start_offset in ORIGIN_SEALED {
         assert_eq!(
@@ -230,7 +304,7 @@ async fn given_a_tiered_offer_when_installed_should_hold_the_senders_chain_and_b
             origin.sealed_segment_record(start_offset)
         );
     }
-    for start_offset in [0, 2] {
+    for start_offset in ORIGIN_SEALED {
         for extension in ["log", "index"] {
             assert!(
                 !directory
@@ -250,14 +324,16 @@ async fn given_a_tiered_offer_when_installed_should_hold_the_senders_chain_and_b
     drop(receiver);
 
     let rebooted = Box::pin(reboot(&config)).await;
-    assert_eq!(layout(&rebooted)[..3], layout(&origin)[..3]);
+    assert_eq!(extents(&rebooted)[..3], extents(&origin)[..3]);
+    assert_eq!(locations(&rebooted)[..3], [SegmentLocation::Remote; 3]);
     assert_eq!(rebooted.object_prefix(), Some(PREFIX));
 }
 
 /// An eviction whose record is durable but whose `.log` stayed: the segment
-/// is still local, so its bytes travel and its record travels as sealed.
+/// is still local on the sender. The store holds it, so it travels as its
+/// record like any other stored segment.
 #[compio::test]
-async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send_the_segment_as_local()
+async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send_the_segment_as_remote()
  {
     let (directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
     let mut origin = Box::new(origin);
@@ -297,30 +373,20 @@ async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send
         .iter()
         .map(|source| source.entry.frontier)
         .collect();
-    assert_eq!(offered, [2, 4, 6]);
-    // The receiver gets the bytes of both sealed segments, so it also gets the
-    // advances that let it evict them, the interrupted one included.
-    let advanced = |segment: crate::segment_chain::SegmentRecord| {
-        ChainRecord::Advanced(crate::tiered_floor::AdvanceTieredFloor {
-            start: segment.start_offset,
-            up_to: segment.end_offset,
-            hash: segment.hash,
-        })
-    };
+    assert_eq!(offered, [6]);
     assert_eq!(
         offered_chain(&offer).records,
         [
             ChainRecord::Remote(sealed[0]),
-            ChainRecord::Sealed(sealed[1]),
-            ChainRecord::Sealed(sealed[2]),
-            advanced(sealed[1]),
-            advanced(sealed[2]),
+            ChainRecord::Remote(sealed[1]),
+            ChainRecord::Remote(sealed[2]),
         ]
     );
     let root = tempfile::tempdir().unwrap();
     let (_config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
     Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
-    assert_eq!(layout(&receiver), layout(&origin));
+    assert_eq!(extents(&receiver), extents(&origin));
+    assert_eq!(locations(&receiver)[..3], [SegmentLocation::Remote; 3]);
 }
 
 /// A chain as the file holds it, with a segment's sealed record ahead of its
@@ -343,6 +409,7 @@ async fn given_a_chain_with_superseded_records_when_installed_should_keep_the_la
         ChainRecord::Sealed(sealed[1]),
         ChainRecord::TrimPoint(first_end),
         ChainRecord::Remote(sealed[0]),
+        ChainRecord::Remote(sealed[1]),
     ];
     let root = tempfile::tempdir().unwrap();
     let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
@@ -352,7 +419,7 @@ async fn given_a_chain_with_superseded_records_when_installed_should_keep_the_la
         .unwrap();
     Box::pin(finish_install_io(&mut receiver)).await.unwrap();
 
-    assert_eq!(layout(&receiver), layout(&origin));
+    assert_eq!(extents(&receiver), extents(&origin));
     assert_eq!(receiver.chain_trim_point(), Some(first_end));
     assert!(receiver.sealed_segment_record(0).is_none());
     for record in sealed {

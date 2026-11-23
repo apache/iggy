@@ -28,10 +28,10 @@ use tokio::time::{Instant, sleep};
 
 pub(crate) const STREAM: &str = "tiered-stream";
 pub(crate) const TOPIC: &str = "tiered-topic";
-const PARTITION_ID: u32 = 0;
+pub(crate) const PARTITION_ID: u32 = 0;
 const SEGMENT_BYTES: u64 = 1024 * 1024;
 const MESSAGE_BYTES: usize = 100 * 1024;
-const MESSAGES: u64 = 50;
+pub(crate) const MESSAGES: u64 = 50;
 /// How long the cluster may take to accept a tiered topic: the node claims
 /// the store first, and the metadata primary then has to see it ready.
 const READY_DEADLINE: Duration = Duration::from_secs(60);
@@ -119,10 +119,18 @@ pub(crate) fn tiered_topic_options() -> TopicCreateOptions {
 
 /// Creates the topic once the cluster accepts `tiered_storage`.
 pub(crate) async fn create_tiered_topic(client: &IggyClient, stream: &Identifier) {
-    let options = tiered_topic_options();
+    create_tiered_topic_with(client, stream, &tiered_topic_options()).await;
+}
+
+/// [`create_tiered_topic`] with `options` in place of [`tiered_topic_options`].
+pub(crate) async fn create_tiered_topic_with(
+    client: &IggyClient,
+    stream: &Identifier,
+    options: &TopicCreateOptions,
+) {
     let deadline = Instant::now() + READY_DEADLINE;
     loop {
-        match client.create_topic(stream, TOPIC, &options).await {
+        match client.create_topic(stream, TOPIC, options).await {
             Ok(_) => return,
             Err(IggyError::FeatureUnavailable) if Instant::now() < deadline => {
                 sleep(POLL_INTERVAL).await;

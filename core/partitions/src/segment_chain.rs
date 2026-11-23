@@ -976,8 +976,11 @@ impl SegmentChain {
             prefix: chain.prefix,
             valid_len: chain.valid_len,
             sealed: chain.sealed,
+            // A segment leaves a disk only after an advance matched it, so a
+            // remote record is the proof on its own. A replica rebuilt by a
+            // state transfer holds such records without their advances.
+            confirmed: chain.remote.clone(),
             remote: chain.remote,
-            confirmed: BTreeSet::new(),
             advances: BTreeMap::new(),
             diverged: BTreeSet::new(),
             trim_point: chain.trim_point,

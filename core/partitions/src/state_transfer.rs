@@ -36,7 +36,7 @@ use crate::partition_storage::{read_revision_record, write_revision_record};
 use crate::producer_state::{
     PRODUCER_BATCHES_RETAINED, PRODUCERS_MAX, ProducerBatch, ProducerEntry,
 };
-use crate::segment::SegmentLocation;
+use crate::segment::{Segment, SegmentLocation};
 use crate::segment_anchor::ANCHOR_SUFFIX;
 use crate::segment_chain::{
     CHAIN_FILE, Chain, ChainRecord, LiveChain, ObjectPrefix, SegmentRecord, decode_chain,
@@ -1626,8 +1626,9 @@ pub struct PartitionStateTransferOffer {
     /// `commit_min` when the offer's `TransferPlan` was pinned: the segments
     /// hold every op through it and none after it.
     pub commit_op: u64,
-    /// Ascending base offset; one artifact per non-empty local segment. A
-    /// segment whose `.log` left the disk travels only as its chain record.
+    /// Ascending base offset; one artifact per non-empty segment the store
+    /// does not hold yet. A segment the store holds travels only as its chain
+    /// record, even while its `.log` is still on the sender's disk.
     pub segments: Vec<SegmentArtifactSource>,
     /// The tiered partition's chain, `None` for a partition without one.
     pub chain: Option<(consensus::StateArtifact, std::rc::Rc<Vec<u8>>)>,
@@ -2947,10 +2948,17 @@ where
         let memos = self.segment_checksum_cache.borrow();
         let mut segments = Vec::with_capacity(self.log.segments().len());
         let mut without_log = Vec::new();
+        // The receiver takes its remote segments as the front of its log, so
+        // only an unbroken run from the front may travel without bytes.
+        let mut in_stored_front = true;
         for (segment, storage) in self.log.segments().iter().zip(self.log.storages()) {
             let size = segment.size.as_bytes_u64();
-            // A segment whose `.log` left the disk travels as its chain record.
-            if segment.location == SegmentLocation::Remote {
+            // A segment the store holds travels as its chain record, whether or
+            // not its `.log` is still on this disk: the receiver reads it from
+            // the store, as it would after evicting it.
+            in_stored_front = in_stored_front
+                && (segment.location == SegmentLocation::Remote || self.stores_segment(segment));
+            if in_stored_front {
                 without_log.push(segment.start_offset);
                 continue;
             }
@@ -2983,6 +2991,16 @@ where
             chain: self.segment_chain_snapshot(&without_log),
             offsets: self.offsets_wire_snapshot()?,
         })
+    }
+
+    /// Whether the store holds `segment` exactly as this replica has it: it is
+    /// sealed, the chain records it and a floor advance matched its hash.
+    fn stores_segment(&self, segment: &Segment) -> bool {
+        segment.sealed
+            && self
+                .segment_chain
+                .as_ref()
+                .is_some_and(|chain| chain.evictable(segment.start_offset, segment.end_offset))
     }
 
     /// Bytes of `planned` already hashed, clamped per segment to the planned
