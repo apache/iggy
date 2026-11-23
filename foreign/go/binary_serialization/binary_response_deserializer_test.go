@@ -521,7 +521,7 @@ func TestDeserializeConsumerGroup_ValidAndTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if details.ConsumerGroup.Name != name || details.ConsumerGroup.MembersCount != 1 || len(details.Members) != 1 {
+	if details.Name != name || details.MembersCount != 1 || len(details.Members) != 1 {
 		t.Fatalf("got %+v", details)
 	}
 
@@ -603,7 +603,7 @@ func TestDeserializeUser_ValidAndTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if user.UserInfo.Id != 7 || user.UserInfo.Username != username || user.Permissions == nil {
+	if user.Id != 7 || user.Username != username || user.Permissions == nil {
 		t.Fatalf("got %+v", user)
 	}
 
@@ -630,7 +630,7 @@ func TestDeserializeUser_ValidAndTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if userNoPerm.UserInfo.Id != 8 || userNoPerm.Permissions != nil {
+	if userNoPerm.Id != 8 || userNoPerm.Permissions != nil {
 		t.Fatalf("got %+v", userNoPerm)
 	}
 
@@ -661,7 +661,7 @@ func TestClientInfo_ValidAndTruncated(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if clientDetails.ClientInfo.ID != 1 || clientDetails.ClientInfo.Address != addr || len(clientDetails.ConsumerGroups) != 1 {
+	if clientDetails.ID != 1 || clientDetails.Address != addr || len(clientDetails.ConsumerGroups) != 1 {
 		t.Fatalf("got %+v", clientDetails)
 	}
 
