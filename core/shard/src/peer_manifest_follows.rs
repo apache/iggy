@@ -37,7 +37,7 @@
 //! the topic's retention removes, through the same commands.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use consensus::PartitionsHandle;
@@ -172,7 +172,9 @@ where
         else {
             return;
         };
-        let listed: HashMap<IggyNamespace, ListedPeerManifest> = manifests
+        // In namespace order, so the reads start in the same order on every
+        // run of the same input, as the simulator's replay needs.
+        let listed: BTreeMap<IggyNamespace, ListedPeerManifest> = manifests
             .into_iter()
             .map(|manifest| (manifest.namespace, manifest))
             .collect();
