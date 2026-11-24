@@ -51,7 +51,7 @@ async fn sweeping_primary(
         .unwrap();
     // The store's clock must move past the claim before the test stores.
     compio::time::sleep(Duration::from_millis(2)).await;
-    let ctx = make_ctx(shard, 1, Rc::new(config.clone()));
+    let ctx = make_ctx(shard, Rc::new(config.clone()));
     (ctx, deleter)
 }
 
@@ -232,7 +232,7 @@ async fn given_objects_stored_before_the_claim_when_two_sweeps_find_them_should_
     let shard = build_metadata_primary_shard(&config, mux);
     seed_cluster_uid(&shard, OWN_CLUSTER_UID);
     let deleter = install_memory_deleter(&shard);
-    let ctx = make_ctx(shard, 1, Rc::new(config.clone()));
+    let ctx = make_ctx(shard, Rc::new(config.clone()));
     let store = deleter.executor().store();
     store_objects(store, absent(5, revision(&ctx))).await;
     compio::time::sleep(Duration::from_millis(2)).await;
