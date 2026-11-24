@@ -23,22 +23,39 @@
 //! peer. One world step steps every cluster once, in an order that the
 //! world's PRNG draws, so a run replays from its seed.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::time::Duration;
 
+use consensus::{Consensus, MetadataHandle, PartitionsHandle};
+use iggy_binary_protocol::{ReplyHeader, RoutedRequestHeader, WireIdentifier};
+use iggy_common::{IggyError, PollingStrategy};
+use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::shadow::shadow_stream_name;
+use partitions::{PollingArgs, PollingConsumer};
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
-
-use iggy_binary_protocol::ReplyHeader;
+use server_common::sharding::IggyNamespace;
 
 use crate::Simulator;
 use crate::bucket::{BucketFaults, ClusterId, SimBucket};
+use crate::client::SimClient;
 use crate::geo::SimGeo;
 use crate::packet::PacketSimulatorOptions;
 
 /// The origin names of the clusters, by cluster index.
 pub const ORIGINS: [&str; 2] = ["dc-a", "dc-b"];
+
+/// The most messages one poll of [`GeoWorld::start_poll`] returns.
+pub const POLL_COUNT: u32 = 1000;
+
+/// Steps one attempt of a metadata operation waits for its answer.
+const ANSWER_STEPS: usize = 300;
+/// Steps a cluster gets to report that every node can tier topics, or to
+/// apply a metadata operation everywhere.
+const SETTLE_STEPS: usize = 3_000;
 
 /// How a world is built.
 #[derive(Debug, Clone)]
@@ -61,6 +78,33 @@ pub struct GeoWorldOptions {
     /// `deleted_at` with its own clock, so a skew moves when it retires a
     /// shadow.
     pub clock_skews_micros: [i64; 2],
+    /// The network of each cluster, by cluster index. The world fills in the
+    /// node count, the client count and the seed.
+    pub networks: [PacketSimulatorOptions; 2],
+}
+
+impl GeoWorldOptions {
+    /// `clusters` clusters of `replicas` replicas and `clients` clients each,
+    /// on perfect networks, with buckets that never fail and clocks that agree.
+    #[must_use]
+    pub fn new(seed: u64, clusters: u8, replicas: u8, clients: &[u128]) -> Self {
+        Self {
+            seed,
+            clusters,
+            replicas,
+            clients: clients.to_vec(),
+            faults: BucketFaults::default(),
+            tombstone_grace: configs::server::ServerConfig::default()
+                .geo
+                .tombstone_grace
+                .get_duration(),
+            clock_skews_micros: [0, 0],
+            networks: [
+                PacketSimulatorOptions::default(),
+                PacketSimulatorOptions::default(),
+            ],
+        }
+    }
 }
 
 /// Per-stream seeds of a world, drawn from its seed. Each cluster keeps its
@@ -72,6 +116,13 @@ pub struct GeoSeeds {
     pub clusters: [u64; 2],
     /// The faults of each cluster's bucket.
     pub stores: [u64; 2],
+    /// The draw of a run's fault parameters, apart from the faults it then
+    /// injects, as [`crate::seeds::SimSeeds::swarm`] is.
+    pub swarm: u64,
+    /// The faults a run injects: crashes, DC stops, cut links and stalls.
+    pub faults: u64,
+    /// The sends of a run.
+    pub workload: u64,
 }
 
 impl GeoSeeds {
@@ -84,9 +135,16 @@ impl GeoSeeds {
             world: parent.random(),
             clusters: [parent.random(), parent.random()],
             stores: [parent.random(), parent.random()],
+            swarm: parent.random(),
+            faults: parent.random(),
+            workload: parent.random(),
         }
     }
 }
+
+/// Where a poll that [`GeoWorld::start_poll`] started puts what it read: every
+/// byte of the messages, or the error of the poll.
+pub type PollOutput = Rc<RefCell<Option<Result<Vec<u8>, IggyError>>>>;
 
 /// One or two clusters with geo topics.
 pub struct GeoWorld {
@@ -124,7 +182,7 @@ impl GeoWorld {
                         client_count: u8::try_from(options.clients.len())
                             .expect("client count fits u8"),
                         seed: seeds.clusters[index],
-                        ..PacketSimulatorOptions::default()
+                        ..options.networks[index].clone()
                     },
                 );
                 let mut geo =
@@ -185,6 +243,254 @@ impl GeoWorld {
         replies
     }
 
+    /// End every fault: start every replica that is down, heal every
+    /// network, and give every bucket back to every cluster, without faults.
+    pub fn heal(&mut self) {
+        for sim in &mut self.clusters {
+            for replica in 0..sim.replica_count {
+                if sim.is_crashed(replica) {
+                    sim.replica_restart(replica);
+                }
+            }
+            sim.network.heal();
+        }
+        for bucket in &self.buckets {
+            bucket.set_faults(BucketFaults::default());
+            bucket.set_down(false);
+            bucket.heal();
+            for cluster in 0..self.clusters.len() {
+                bucket.set_cut(cluster_id(cluster), false);
+            }
+        }
+    }
+
+    /// The namespace of `partition` of `topic` in `stream`, once `cluster`
+    /// committed it.
+    #[must_use]
+    pub fn namespace_of(
+        &self,
+        cluster: usize,
+        stream: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Option<IggyNamespace> {
+        let sim = self.sim(cluster);
+        let replica = (0..sim.replica_count).find(|replica| !sim.is_crashed(*replica))?;
+        sim.replicas[usize::from(replica)].shards[0]
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .namespace_from_partition(
+                &WireIdentifier::named(stream).ok()?,
+                &WireIdentifier::named(topic).ok()?,
+                partition,
+            )
+    }
+
+    /// The namespace of the shadow on `peer` of `partition` of the geo topic
+    /// `topic` in `stream` of `origin`, once `peer` committed it.
+    #[must_use]
+    pub fn shadow_of(
+        &self,
+        peer: usize,
+        origin: usize,
+        stream: &str,
+        topic: &str,
+        partition: u32,
+    ) -> Option<IggyNamespace> {
+        let shadow_stream = shadow_stream_name(ORIGINS[origin], stream)?;
+        self.namespace_of(peer, &shadow_stream, topic, partition)
+    }
+
+    /// The live replica of `cluster` that leads `namespace` in normal status,
+    /// if one does.
+    #[must_use]
+    pub fn primary(&self, cluster: usize, namespace: IggyNamespace) -> Option<u8> {
+        let sim = self.sim(cluster);
+        (0..sim.replica_count).find(|replica| {
+            !sim.is_crashed(*replica)
+                && sim.replicas[usize::from(*replica)]
+                    .partition_shard(namespace)
+                    .plane
+                    .partitions()
+                    .peek_by_ns(&namespace)
+                    .is_some_and(|partition| {
+                        let consensus = partition.consensus();
+                        consensus.is_primary() && consensus.is_normal()
+                    })
+        })
+    }
+
+    /// The offset that each live replica of `cluster` committed for
+    /// `namespace`.
+    #[must_use]
+    pub fn commits(&self, cluster: usize, namespace: IggyNamespace) -> Vec<(u8, u64)> {
+        let sim = self.sim(cluster);
+        (0..sim.replica_count)
+            .filter(|replica| !sim.is_crashed(*replica))
+            .filter_map(|replica| {
+                sim.offsets(usize::from(replica), namespace)
+                    .map(|offsets| (replica, offsets.commit_offset))
+            })
+            .collect()
+    }
+
+    /// Start a poll of up to [`POLL_COUNT`] messages of `namespace` from
+    /// `offset` on `replica` of `cluster`. Its output is there once a later
+    /// step ends it.
+    pub fn start_poll(
+        &mut self,
+        cluster: usize,
+        replica: u8,
+        namespace: IggyNamespace,
+        offset: u64,
+    ) -> PollOutput {
+        let args = PollingArgs::new(PollingStrategy::offset(offset), POLL_COUNT, false);
+        let poll = self.sim(cluster).poll_messages(
+            usize::from(replica),
+            namespace,
+            PollingConsumer::Consumer(7, 0),
+            &args,
+        );
+        let output = PollOutput::default();
+        let ready = Rc::clone(&output);
+        self.sim_mut(cluster).executor.spawn(async move {
+            let polled = poll.await.map(|fragments| {
+                fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.as_slice().to_vec())
+                    .collect()
+            });
+            *ready.borrow_mut() = Some(polled);
+        });
+        output
+    }
+
+    /// [`Self::start_poll`], stepping until it ends.
+    ///
+    /// # Errors
+    /// The error of the poll, such as a refusal of a replica that is not the
+    /// partition's primary.
+    ///
+    /// # Panics
+    /// When the poll does not end within `steps` steps.
+    pub fn poll(
+        &mut self,
+        cluster: usize,
+        replica: u8,
+        namespace: IggyNamespace,
+        offset: u64,
+        steps: usize,
+    ) -> Result<Vec<u8>, IggyError> {
+        let output = self.start_poll(cluster, replica, namespace, offset);
+        for _ in 0..steps {
+            if output.borrow().is_some() {
+                break;
+            }
+            self.step();
+        }
+        output.borrow_mut().take().expect("the poll ends")
+    }
+
+    /// Submit `request` to replica 0 of `cluster` until it is answered with
+    /// anything but a refusal to take it now, then step until every live
+    /// replica applied it.
+    ///
+    /// # Panics
+    /// When the operation fails or does not apply everywhere in time.
+    pub fn complete(
+        &mut self,
+        cluster: usize,
+        client: &SimClient,
+        request: &Message<RoutedRequestHeader>,
+    ) {
+        let request_id = request.header().request;
+        let mut answered: Option<Message<ReplyHeader>> = None;
+        for _ in 0..SETTLE_STEPS / ANSWER_STEPS {
+            self.sim_mut(cluster).submit_request(
+                client.client_id(),
+                0,
+                request.clone().into_generic(),
+            );
+            answered = None;
+            for _ in 0..ANSWER_STEPS {
+                answered = self.step()[cluster]
+                    .iter()
+                    .find(|reply| reply.header().request == request_id)
+                    .map(Message::deep_copy);
+                if answered.is_some() {
+                    break;
+                }
+            }
+            let code = answered
+                .as_ref()
+                .and_then(|reply| metadata::stm::result::result_code(reply.body()));
+            if answered.is_some() && code != Some(IggyError::TransientNotAccepted.as_code()) {
+                break;
+            }
+        }
+        let reply = answered.expect("the metadata operation is answered");
+        let code = metadata::stm::result::result_code(reply.body());
+        // A delete answers before the fences of its partitions install.
+        assert!(
+            code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
+            "the metadata operation succeeds: {code:?}"
+        );
+        let op = reply.header().op;
+        let applied = (0..SETTLE_STEPS).any(|_| {
+            self.step();
+            let sim = self.sim(cluster);
+            (0..sim.replica_count)
+                .filter(|replica| !sim.is_crashed(*replica))
+                .all(|replica| {
+                    let metadata = sim.replicas[usize::from(replica)].shards[0]
+                        .plane
+                        .metadata();
+                    metadata.applied_frontier().get() >= op
+                        && !metadata.mux_stm.streams().lifecycle_pending(op)
+                })
+        });
+        assert!(applied, "metadata op {op} applies on every live replica");
+    }
+
+    /// Create `stream` and the geo topic `topic` of `partitions` partitions
+    /// in it on `cluster`, once its metadata primary admits a geo topic, and
+    /// return the partitions. `client` then knows their contexts.
+    ///
+    /// # Panics
+    /// When the cluster does not get ready or refuses the topic.
+    pub fn create_geo_topic(
+        &mut self,
+        cluster: usize,
+        client: &SimClient,
+        stream: &str,
+        topic: &str,
+        partitions: u32,
+    ) -> Vec<IggyNamespace> {
+        self.complete(cluster, client, &client.create_stream(stream));
+        let ready = (0..SETTLE_STEPS).any(|_| {
+            self.step();
+            self.sim(cluster).replicas[0].shards[0]
+                .plane
+                .metadata()
+                .tiered_storage_cluster_ready()
+        });
+        assert!(ready, "every node reports that it can tier topics");
+        self.complete(
+            cluster,
+            client,
+            &client.create_geo_topic(stream, topic, partitions),
+        );
+        self.sim(cluster).discover_partition_contexts(client);
+        (0..partitions)
+            .map(|partition| {
+                self.namespace_of(cluster, stream, topic, partition)
+                    .expect("the geo topic is committed")
+            })
+            .collect()
+    }
+
     fn verify_peers(&mut self) {
         let owners: Vec<Option<u128>> = self.clusters.iter().map(Simulator::cluster_uid).collect();
         for cluster in &mut self.clusters {
@@ -217,6 +523,9 @@ mod tests {
             seeds.clusters[1],
             seeds.stores[0],
             seeds.stores[1],
+            seeds.swarm,
+            seeds.faults,
+            seeds.workload,
         ];
 
         assert_eq!(all.iter().copied().collect::<HashSet<_>>().len(), all.len());

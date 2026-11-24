@@ -23,23 +23,14 @@
 //! published log from the origin's bucket at the origin's offsets (G2), and
 //! no cluster writes to a bucket that it does not own (G3).
 
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use consensus::{Consensus, MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::{ReplyHeader, RoutedRequestHeader, WireIdentifier};
-use iggy_common::{IggyError, PollingStrategy};
-use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::shadow::shadow_stream_name;
-use partitions::{PollingArgs, PollingConsumer};
-use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
 use crate::bucket::BucketFaults;
 use crate::client::SimClient;
-use crate::geo_world::{GeoWorld, GeoWorldOptions, ORIGINS};
+use crate::geo_world::{GeoWorld, GeoWorldOptions};
 
 const REPLICAS: u8 = 3;
 const CLIENT_ID: u128 = 1;
@@ -52,12 +43,8 @@ const PEER: usize = 1;
 /// Steps one send gets: the wait for the topic object, its upload window,
 /// the upload and the commit.
 const SEND_STEPS: usize = 3_000;
-/// Steps one attempt of a send or of a metadata operation waits for its
-/// answer.
+/// Steps one attempt of a send waits for its answer.
 const ANSWER_STEPS: usize = 300;
-/// Steps the cluster gets to report that every node can tier topics, or to
-/// apply a metadata operation everywhere.
-const SETTLE_STEPS: usize = 3_000;
 /// Steps a peer gets to serve what the origin published: a rewrite, a
 /// manifest, the peer's listing of topic objects and of manifests.
 const FOLLOW_STEPS: usize = 12_000;
@@ -78,15 +65,11 @@ fn skewed_geo_world(
     faults: BucketFaults,
     skews_micros: [i64; 2],
 ) -> (GeoWorld, SimClient) {
-    let mut world = GeoWorld::new(&GeoWorldOptions {
-        seed,
-        clusters,
-        replicas: REPLICAS,
-        clients: vec![CLIENT_ID],
-        faults,
-        tombstone_grace: TOMBSTONE_GRACE,
-        clock_skews_micros: skews_micros,
-    });
+    let mut options = GeoWorldOptions::new(seed, clusters, REPLICAS, &[CLIENT_ID]);
+    options.faults = faults;
+    options.tombstone_grace = TOMBSTONE_GRACE;
+    options.clock_skews_micros = skews_micros;
+    let mut world = GeoWorld::new(&options);
     let client = SimClient::new(CLIENT_ID);
     for cluster in 0..world.cluster_count() {
         world.sim_mut(cluster).shell_login(&client);
@@ -94,122 +77,14 @@ fn skewed_geo_world(
     (world, client)
 }
 
-/// Submit `request` to replica 0 of `cluster` until it is answered with
-/// anything but a refusal to take it now, then step until every live replica
-/// applied it.
-fn complete(
-    world: &mut GeoWorld,
-    cluster: usize,
-    client: &SimClient,
-    request: &Message<RoutedRequestHeader>,
-) {
-    let request_id = request.header().request;
-    let mut answered: Option<Message<ReplyHeader>> = None;
-    for _ in 0..SETTLE_STEPS / ANSWER_STEPS {
-        world.sim_mut(cluster).submit_request(
-            client.client_id(),
-            0,
-            request.clone().into_generic(),
-        );
-        answered = None;
-        for _ in 0..ANSWER_STEPS {
-            answered = world.step()[cluster]
-                .iter()
-                .find(|reply| reply.header().request == request_id)
-                .map(Message::deep_copy);
-            if answered.is_some() {
-                break;
-            }
-        }
-        let code = answered
-            .as_ref()
-            .and_then(|reply| metadata::stm::result::result_code(reply.body()));
-        if answered.is_some() && code != Some(IggyError::TransientNotAccepted.as_code()) {
-            break;
-        }
-    }
-    let reply = answered.expect("the metadata operation is answered");
-    let code = metadata::stm::result::result_code(reply.body());
-    // A delete answers before the fences of its partitions install.
-    assert!(
-        code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
-        "the metadata operation succeeds: {code:?}"
-    );
-    let op = reply.header().op;
-    let applied = (0..SETTLE_STEPS).any(|_| {
-        world.step();
-        let sim = world.sim(cluster);
-        (0..REPLICAS)
-            .filter(|replica| !sim.is_crashed(*replica))
-            .all(|replica| {
-                let metadata = sim.replicas[usize::from(replica)].shards[0]
-                    .plane
-                    .metadata();
-                metadata.applied_frontier().get() >= op
-                    && !metadata.mux_stm.streams().lifecycle_pending(op)
-            })
-    });
-    assert!(applied, "metadata op {op} applies on every live replica");
+/// Create the geo topic on the origin and return its partition.
+fn create_geo_topic(world: &mut GeoWorld, client: &SimClient) -> IggyNamespace {
+    world.create_geo_topic(ORIGIN, client, STREAM, TOPIC, 1)[0]
 }
 
-/// The namespace of partition 0 of `topic` in `stream`, once `cluster`
-/// committed it.
-fn namespace_of(
-    world: &GeoWorld,
-    cluster: usize,
-    stream: &str,
-    topic: &str,
-) -> Option<IggyNamespace> {
-    world.sim(cluster).replicas[0].shards[0]
-        .plane
-        .metadata()
-        .mux_stm
-        .streams()
-        .namespace_from_partition(
-            &WireIdentifier::named(stream).ok()?,
-            &WireIdentifier::named(topic).ok()?,
-            0,
-        )
-}
-
-/// Create the geo topic on `cluster` once its metadata primary admits one,
-/// and return its partition.
-fn create_geo_topic(world: &mut GeoWorld, cluster: usize, client: &SimClient) -> IggyNamespace {
-    complete(world, cluster, client, &client.create_stream(STREAM));
-    let ready = (0..SETTLE_STEPS).any(|_| {
-        world.step();
-        world.sim(cluster).replicas[0].shards[0]
-            .plane
-            .metadata()
-            .tiered_storage_cluster_ready()
-    });
-    assert!(ready, "every node reports that it can tier topics");
-    complete(
-        world,
-        cluster,
-        client,
-        &client.create_geo_topic(STREAM, TOPIC, 1),
-    );
-    world.sim(cluster).discover_partition_contexts(client);
-    namespace_of(world, cluster, STREAM, TOPIC).expect("the geo topic is committed")
-}
-
-/// The live replica of `cluster` that leads `namespace` in normal status, if
-/// one does.
-fn primary(world: &GeoWorld, cluster: usize, namespace: IggyNamespace) -> Option<u8> {
-    let sim = world.sim(cluster);
-    (0..REPLICAS).find(|replica| {
-        !sim.is_crashed(*replica)
-            && sim.replicas[usize::from(*replica)]
-                .partition_shard(namespace)
-                .plane
-                .partitions()
-                .peek_by_ns(&namespace)
-                .is_some_and(|partition| {
-                    let consensus = partition.consensus();
-                    consensus.is_primary() && consensus.is_normal()
-                })
-    })
+/// The shadow of the geo topic on the peer, once the peer created it.
+fn shadow_of(world: &GeoWorld) -> Option<IggyNamespace> {
+    world.shadow_of(PEER, ORIGIN, STREAM, TOPIC, 0)
 }
 
 /// Send `payload` to the primary of `namespace` until the cluster commits it.
@@ -229,7 +104,7 @@ fn send(
     let mut request = new_request();
     let mut steps = 0;
     while steps < SEND_STEPS {
-        let Some(target) = primary(world, cluster, namespace) else {
+        let Some(target) = world.primary(cluster, namespace) else {
             world.step();
             steps += 1;
             continue;
@@ -267,41 +142,6 @@ fn send(
         "a send of {:?} was not committed in {SEND_STEPS} steps",
         String::from_utf8_lossy(payload)
     );
-}
-
-/// Every byte that `replica` of `cluster` returns from offset 0 on, or the
-/// error of the poll.
-fn polled(
-    world: &mut GeoWorld,
-    cluster: usize,
-    replica: u8,
-    namespace: IggyNamespace,
-) -> Result<Vec<u8>, IggyError> {
-    let args = PollingArgs::new(PollingStrategy::offset(0), 1000, false);
-    let poll = world.sim(cluster).poll_messages(
-        usize::from(replica),
-        namespace,
-        PollingConsumer::Consumer(7, 0),
-        &args,
-    );
-    let output = Rc::new(RefCell::new(None));
-    let ready = Rc::clone(&output);
-    world.sim_mut(cluster).executor.spawn(async move {
-        *ready.borrow_mut() = Some(poll.await);
-    });
-    for _ in 0..SEND_STEPS {
-        if output.borrow().is_some() {
-            break;
-        }
-        world.step();
-    }
-    let polled = output.borrow_mut().take().expect("the poll ends");
-    polled.map(|fragments| {
-        fragments
-            .iter()
-            .flat_map(|fragment| fragment.as_slice().to_vec())
-            .collect()
-    })
 }
 
 /// Where each of `payloads` starts in `bytes`, or `None` when one is missing
@@ -352,8 +192,12 @@ fn assert_read_once_in_order(
     namespace: IggyNamespace,
     payloads: &[Vec<u8>],
 ) {
-    let replica = primary(world, cluster, namespace).expect("the partition has a primary");
-    let bytes = polled(world, cluster, replica, namespace).expect("the poll is served");
+    let replica = world
+        .primary(cluster, namespace)
+        .expect("the partition has a primary");
+    let bytes = world
+        .poll(cluster, replica, namespace, 0, SEND_STEPS)
+        .expect("the poll is served");
     assert!(
         holds_once_in_order(&bytes, payloads),
         "the primary serves each payload once, in send order: {:?}",
@@ -386,7 +230,7 @@ fn given_a_geo_topic_when_sends_are_acknowledged_should_hold_them_in_the_bucket_
  {
     const SENDS: usize = 8;
     let (mut world, client) = geo_world(0x6745_4F31, 1, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
 
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads {
@@ -403,13 +247,15 @@ fn given_a_primary_that_stops_when_sends_go_on_should_keep_every_acknowledged_se
     const SENDS: usize = 12;
     const REJOIN_STEPS: usize = 1_000;
     let (mut world, client) = geo_world(0x6745_4F32, 1, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
 
     for payload in &payloads[..SENDS / 2] {
         send(&mut world, ORIGIN, &client, namespace, payload);
     }
-    let stopped = primary(&world, ORIGIN, namespace).expect("the partition has a primary");
+    let stopped = world
+        .primary(ORIGIN, namespace)
+        .expect("the partition has a primary");
     world.sim_mut(ORIGIN).replica_crash(stopped);
     for payload in &payloads[SENDS / 2..] {
         send(&mut world, ORIGIN, &client, namespace, payload);
@@ -428,7 +274,7 @@ fn given_a_primary_that_stops_when_sends_go_on_should_keep_every_acknowledged_se
 fn given_a_bucket_that_fails_and_loses_answers_when_sending_should_keep_every_acknowledged_send() {
     const SENDS: usize = 12;
     let (mut world, client) = geo_world(0x6745_4F33, 1, faulty_bucket());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
 
     for payload in &payloads {
@@ -444,7 +290,7 @@ fn given_one_seed_when_a_faulty_run_goes_twice_should_replay_the_schedule_and_th
     const SENDS: usize = 6;
     let run = || {
         let (mut world, client) = geo_world(0x6745_4F34, 1, faulty_bucket());
-        let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+        let namespace = create_geo_topic(&mut world, &client);
         for index in 0..SENDS {
             send(&mut world, ORIGIN, &client, namespace, &payload(index));
         }
@@ -456,13 +302,6 @@ fn given_one_seed_when_a_faulty_run_goes_twice_should_replay_the_schedule_and_th
     };
 
     assert_eq!(run(), run());
-}
-
-/// The shadow of the geo topic on the peer, once the peer created it.
-fn shadow_of(world: &GeoWorld) -> Option<IggyNamespace> {
-    let shadow_stream =
-        shadow_stream_name(ORIGINS[ORIGIN], STREAM).expect("the shadow stream's name fits");
-    namespace_of(world, PEER, &shadow_stream, TOPIC)
 }
 
 /// Step until the peer's shadow serves every one of `payloads` once, in
@@ -480,10 +319,11 @@ fn await_shadow_serving(
         let Some(shadow) = shadow_of(world) else {
             continue;
         };
-        let Some(replica) = primary(world, PEER, shadow) else {
+        let Some(replica) = world.primary(PEER, shadow) else {
             continue;
         };
-        if polled(world, PEER, replica, shadow)
+        if world
+            .poll(PEER, replica, shadow, 0, SEND_STEPS)
             .is_ok_and(|bytes| holds_once_in_order(&bytes, payloads))
         {
             return Some(shadow);
@@ -492,23 +332,11 @@ fn await_shadow_serving(
     None
 }
 
-/// The offset that each live replica of the peer committed for `shadow`.
-fn shadow_commits(world: &GeoWorld, shadow: IggyNamespace) -> Vec<(u8, u64)> {
-    let sim = world.sim(PEER);
-    (0..REPLICAS)
-        .filter(|replica| !sim.is_crashed(*replica))
-        .filter_map(|replica| {
-            sim.offsets(usize::from(replica), shadow)
-                .map(|offsets| (replica, offsets.commit_offset))
-        })
-        .collect()
-}
-
 #[test]
 fn given_two_clusters_when_the_origin_publishes_should_serve_its_log_on_the_peer() {
     const SENDS: usize = 8;
     let (mut world, client) = geo_world(0x6745_4F41, 2, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads {
         send(&mut world, ORIGIN, &client, namespace, payload);
@@ -527,7 +355,7 @@ fn given_two_clusters_when_the_origin_publishes_should_serve_its_log_on_the_peer
 fn given_a_shadow_when_a_client_sends_to_it_should_refuse_and_store_nothing() {
     const SENDS: usize = 4;
     let (mut world, client) = geo_world(0x6745_4F42, 2, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads {
         send(&mut world, ORIGIN, &client, namespace, payload);
@@ -537,7 +365,9 @@ fn given_a_shadow_when_a_client_sends_to_it_should_refuse_and_store_nothing() {
     world.sim(PEER).discover_partition_contexts(&client);
     let foreign = b"geo-write-to-a-shadow".to_vec();
 
-    let target = primary(&world, PEER, shadow).expect("the shadow has a primary");
+    let target = world
+        .primary(PEER, shadow)
+        .expect("the shadow has a primary");
     let request = client.send_messages(shadow, &[Bytes::copy_from_slice(&foreign)]);
     let request_id = request.header().request;
     world
@@ -560,7 +390,9 @@ fn given_a_shadow_when_a_client_sends_to_it_should_refuse_and_store_nothing() {
         Some(shadow),
         "the shadow still serves the origin's log"
     );
-    let bytes = polled(&mut world, PEER, target, shadow).expect("the poll is served");
+    let bytes = world
+        .poll(PEER, target, shadow, 0, SEND_STEPS)
+        .expect("the poll is served");
     assert_eq!(
         positions(&bytes, std::slice::from_ref(&foreign)),
         None,
@@ -587,14 +419,14 @@ fn given_a_shadow_when_a_client_sends_to_it_should_refuse_and_store_nothing() {
 fn given_a_cut_link_to_the_origin_when_it_heals_should_catch_up_and_never_move_back() {
     const SENDS: usize = 12;
     let (mut world, client) = geo_world(0x6745_4F43, 2, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads[..SENDS / 2] {
         send(&mut world, ORIGIN, &client, namespace, payload);
     }
     let shadow = await_shadow_serving(&mut world, &payloads[..SENDS / 2], FOLLOW_STEPS)
         .expect("the peer serves the first half");
-    let mut highest = shadow_commits(&world, shadow);
+    let mut highest = world.commits(PEER, shadow);
 
     world
         .bucket(ORIGIN)
@@ -605,7 +437,7 @@ fn given_a_cut_link_to_the_origin_when_it_heals_should_catch_up_and_never_move_b
     for _ in 0..FOLLOW_STEPS / 4 {
         world.step();
         // G5: a peer's floor never moves back.
-        for (replica, commit) in shadow_commits(&world, shadow) {
+        for (replica, commit) in world.commits(PEER, shadow) {
             if let Some((_, seen)) = highest.iter_mut().find(|(seen, _)| *seen == replica) {
                 assert!(
                     commit >= *seen,
@@ -615,7 +447,7 @@ fn given_a_cut_link_to_the_origin_when_it_heals_should_catch_up_and_never_move_b
             }
         }
     }
-    let cut_off = shadow_commits(&world, shadow);
+    let cut_off = world.commits(PEER, shadow);
     world
         .bucket(ORIGIN)
         .set_cut(crate::bucket::ClusterId(1), false);
@@ -639,7 +471,7 @@ fn given_a_cut_link_to_the_origin_when_it_heals_should_catch_up_and_never_move_b
 fn given_the_peer_dc_stops_when_it_starts_again_should_catch_up() {
     const SENDS: usize = 8;
     let (mut world, client) = geo_world(0x6745_4F44, 2, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads[..SENDS / 2] {
         send(&mut world, ORIGIN, &client, namespace, payload);
@@ -668,7 +500,7 @@ fn given_the_peer_dc_stops_when_it_starts_again_should_catch_up() {
 fn given_the_origin_dc_stops_when_it_starts_again_should_keep_serving_and_take_sends() {
     const SENDS: usize = 8;
     let (mut world, client) = geo_world(0x6745_4F45, 2, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads[..SENDS / 2] {
         send(&mut world, ORIGIN, &client, namespace, payload);
@@ -705,19 +537,14 @@ fn given_a_deleted_geo_topic_when_its_grace_passes_should_retire_the_shadow() {
     const SENDS: usize = 4;
     const RETIRE_STEPS: usize = 30_000;
     let (mut world, client) = geo_world(0x6745_4F46, 2, BucketFaults::default());
-    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let namespace = create_geo_topic(&mut world, &client);
     let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
     for payload in &payloads {
         send(&mut world, ORIGIN, &client, namespace, payload);
     }
     await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS).expect("the peer serves the log");
 
-    complete(
-        &mut world,
-        ORIGIN,
-        &client,
-        &client.delete_topic(STREAM, TOPIC),
-    );
+    world.complete(ORIGIN, &client, &client.delete_topic(STREAM, TOPIC));
     let retired = (0..RETIRE_STEPS).any(|_| {
         world.step();
         shadow_of(&world).is_none()
@@ -737,19 +564,14 @@ fn given_clusters_whose_clocks_disagree_when_the_origin_publishes_and_deletes_sh
     let skews = [-45_000_000, 45_000_000];
     for (seed, skews) in [(0x6745_4F47, skews), (0x6745_4F48, [skews[1], skews[0]])] {
         let (mut world, client) = skewed_geo_world(seed, 2, BucketFaults::default(), skews);
-        let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+        let namespace = create_geo_topic(&mut world, &client);
         let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
         for payload in &payloads {
             send(&mut world, ORIGIN, &client, namespace, payload);
         }
 
         let served = await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS);
-        complete(
-            &mut world,
-            ORIGIN,
-            &client,
-            &client.delete_topic(STREAM, TOPIC),
-        );
+        world.complete(ORIGIN, &client, &client.delete_topic(STREAM, TOPIC));
         let retired = (0..RETIRE_STEPS).any(|_| {
             world.step();
             shadow_of(&world).is_none()

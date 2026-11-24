@@ -21,6 +21,7 @@ pub mod client;
 pub mod deps;
 pub mod executor;
 pub mod geo;
+pub mod geo_fuzz;
 pub mod geo_world;
 pub mod network;
 pub mod packet;
@@ -2338,7 +2339,7 @@ fn materialise_partition(
                 .with_members(members)
                 .with_created_op(created_op),
         );
-        finish_build(replica, owner_shard, namespace, epoch, peer_log);
+        finish_build(replica, owner_shard, namespace, peer_log);
     }
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -2384,7 +2385,6 @@ fn finish_build(
     replica: &SimReplica,
     shard: &Replica,
     namespace: IggyNamespace,
-    epoch: u64,
     peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
 ) {
     let Some(partition) = shard.plane.partitions().get_mut_by_ns(&namespace) else {
@@ -2396,14 +2396,6 @@ fn finish_build(
     let Some((origin, prefix)) = peer_log else {
         return;
     };
-    // A server names the indexes that the partition's polls fetch after its
-    // directory. Here they go to the node's memory, under a directory of this
-    // incarnation that no other partition shares.
-    partition.set_partition_dir(format!(
-        "simulated/replica-{}/{}-{epoch}",
-        partition.consensus().replica(),
-        namespace.inner()
-    ));
     partition
         .follow_peer_log(origin, prefix)
         .expect("a shadow partition built from its committed state follows its peer's log");

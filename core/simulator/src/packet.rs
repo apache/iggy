@@ -957,6 +957,29 @@ impl PacketSimulator {
         self.current_tick
     }
 
+    /// Start the faults of `options` on a network that ran without them: its
+    /// delays, losses, replays, partitions and clogs. The process counts and
+    /// the seed stay, and so does what is in flight.
+    ///
+    /// # Panics
+    /// When the delays of `options` are invalid, as [`Self::new`] says.
+    pub fn set_faults(&mut self, options: &PacketSimulatorOptions) {
+        assert!(
+            options.one_way_delay_min >= 1
+                && options.one_way_delay_mean >= options.one_way_delay_min,
+            "invalid delays: min {} mean {}",
+            options.one_way_delay_min,
+            options.one_way_delay_mean
+        );
+        self.options = PacketSimulatorOptions {
+            node_count: self.options.node_count,
+            client_count: self.options.client_count,
+            seed: self.options.seed,
+            ..options.clone()
+        };
+        self.auto_partition_stability = self.options.unpartition_stability;
+    }
+
     /// End fault injection: heal what is broken and stop drawing new faults.
     ///
     /// A drain cannot prove convergence while the generator that broke connectivity
