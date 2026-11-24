@@ -42,21 +42,24 @@ use std::rc::Rc;
 
 use configs::geo::GeoConfig;
 use consensus::MetadataHandle;
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     GeoLog, GeoPosition, KeyLayout, MAX_POSITIONS_OBJECT_LEN, ObjectStore, PositionHolder,
     PositionsObject, TierExecutor, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
 };
-use message_bus::MessageBus;
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::StreamsInner;
+use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::geo_positions::{GeoPositionSettings, PeerPositions, local_logs};
 use shard::shards_table::PartitionShards;
 use tracing::{debug, warn};
 
 use crate::peer_manifests::{NodePlace, backoff, list_all, micros};
-use crate::shell::ServerShard;
+use crate::shell::{ShellBus, ShellShard};
 
 /// The listings of the geo peers' consumer group positions that shard 0
 /// runs.
@@ -116,7 +119,18 @@ impl PeerPositionLister {
 
     /// Start a pass of listings in a detached task, on shard 0, at most once
     /// an interval. A pass while that task runs starts nothing.
-    pub fn pass(&self, shard: &Rc<ServerShard>, now: IggyTimestamp, place: NodePlace) {
+    pub fn pass<B, MJ, S, SB>(
+        &self,
+        shard: &Rc<ShellShard<B, MJ, S, SB>>,
+        now: IggyTimestamp,
+        place: NodePlace,
+    ) where
+        B: ShellBus + Unpin,
+        MJ: JournalHandle + 'static,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        S: 'static,
+        SB: SuperblockStore + 'static,
+    {
         let Some(interval) = self.interval else {
             return;
         };
@@ -228,7 +242,14 @@ impl<E: TierExecutor + Clone> PeerRead<E> {
         clippy::future_not_send,
         reason = "the task runs on shard 0, which owns the peer's tier service"
     )]
-    async fn read(self, shard: &ServerShard) -> (Objects, bool) {
+    async fn read<B, MJ, S, SB>(self, shard: &ShellShard<B, MJ, S, SB>) -> (Objects, bool)
+    where
+        B: ShellBus + Unpin,
+        MJ: JournalHandle + 'static,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        S: 'static,
+        SB: SuperblockStore + 'static,
+    {
         let Self {
             origin,
             layout,
@@ -348,13 +369,19 @@ fn merged(objects: &Objects) -> HashMap<&GeoLog, BTreeMap<u32, PartitionPosition
 }
 
 /// Hand every shard the positions of `origin` for the partitions it owns.
-fn hand_out(
-    shard: &ServerShard,
+fn hand_out<B, MJ, S, SB>(
+    shard: &ShellShard<B, MJ, S, SB>,
     origin: &str,
     objects: &Objects,
     logs: &[shard::geo_positions::LocalLog],
     partition_shards: PartitionShards,
-) {
+) where
+    B: ShellBus + Unpin,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
     let merged = merged(objects);
     let mut by_shard: Vec<Vec<(IggyNamespace, u64, PartitionPositions)>> =
         vec![Vec::new(); usize::from(partition_shards.shard_count())];

@@ -43,20 +43,23 @@ use std::time::Duration;
 
 use configs::geo::GeoConfig;
 use consensus::MetadataHandle;
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
     KeyLayout, ListRequest, ObjectPrefix, ObjectStore, TierExecutor, TierJobClass, TierJobRequest,
     TierScope, TierScopeToken,
 };
-use message_bus::MessageBus;
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::StreamsInner;
+use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use shard::ListedPeerManifest;
 use shard::shards_table::PartitionShards;
 use tracing::{debug, warn};
 
-use crate::shell::ServerShard;
+use crate::shell::{ShellBus, ShellShard};
 
 /// The longest wait before a listing of a peer that failed is tried again.
 pub const LIST_BACKOFF_MAX: Duration = Duration::from_mins(1);
@@ -107,7 +110,18 @@ impl PeerManifestLister {
 
     /// Start a pass of listings in a detached task, on shard 0, at most once
     /// an interval. A pass while that task runs starts nothing.
-    pub fn pass(&self, shard: &Rc<ServerShard>, now: IggyTimestamp, place: NodePlace) {
+    pub fn pass<B, MJ, S, SB>(
+        &self,
+        shard: &Rc<ShellShard<B, MJ, S, SB>>,
+        now: IggyTimestamp,
+        place: NodePlace,
+    ) where
+        B: ShellBus + Unpin,
+        MJ: JournalHandle + 'static,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        S: 'static,
+        SB: SuperblockStore + 'static,
+    {
         let Some(interval) = self.interval else {
             return;
         };
@@ -297,13 +311,19 @@ fn listed(
 /// Hand every shard the manifests of `origin` of the shadow partitions it
 /// owns. A shard that owns none gets an empty list, which ends what it
 /// followed of partitions that are not wanted here any more.
-fn hand_out(
-    shard: &ServerShard,
+fn hand_out<B, MJ, S, SB>(
+    shard: &ShellShard<B, MJ, S, SB>,
     origin: &str,
     now: IggyTimestamp,
     manifests: Vec<ListedPeerManifest>,
     partition_shards: PartitionShards,
-) {
+) where
+    B: ShellBus + Unpin,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
     let mut by_shard: Vec<Vec<ListedPeerManifest>> =
         vec![Vec::new(); usize::from(partition_shards.shard_count())];
     for manifest in manifests {
