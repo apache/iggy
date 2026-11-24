@@ -55,6 +55,7 @@ pub struct AppliedFrontier {
     recovered_revision: AtomicU64,
     waiters: Mutex<Waiters>,
     read_budget: Duration,
+    partition_request_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
     tiered_storage_ready: AtomicBool,
     store_identity_verified: AtomicBool,
@@ -103,6 +104,11 @@ impl AppliedFrontier {
     /// config default; this is what the simulator and unit fixtures get.
     pub const DEFAULT_READ_BUDGET: Duration = Duration::from_millis(3_000);
 
+    /// The budget of a partition request ahead of this frontier when nothing
+    /// sizes it from config: two commit broadcasts at the built-in
+    /// `COMMIT_MESSAGE_TICKS` interval.
+    pub const DEFAULT_PARTITION_REQUEST_BUDGET: Duration = Duration::from_millis(1_000);
+
     /// A frontier at zero whose held reads get `read_budget` before they fail
     /// retryable.
     #[must_use]
@@ -115,6 +121,7 @@ impl AppliedFrontier {
                 entries: Vec::new(),
             }),
             read_budget,
+            partition_request_budget: Self::DEFAULT_PARTITION_REQUEST_BUDGET,
             partition_freshness: None,
             tiered_storage_ready: AtomicBool::new(false),
             store_identity_verified: AtomicBool::new(false),
@@ -187,6 +194,14 @@ impl AppliedFrontier {
         self
     }
 
+    /// Size the wait of a partition request ahead of this frontier from
+    /// config, as the server sizes `read_budget`.
+    #[must_use]
+    pub const fn with_partition_request_budget(mut self, budget: Duration) -> Self {
+        self.partition_request_budget = budget;
+        self
+    }
+
     /// Unarmed single-node frontiers never require network evidence.
     #[must_use]
     pub fn partition_requests_allowed(&self, now: Instant) -> bool {
@@ -223,6 +238,14 @@ impl AppliedFrontier {
     #[must_use]
     pub const fn read_budget(&self) -> Duration {
         self.read_budget
+    }
+
+    /// How long a partition request ahead of this frontier may wait for it.
+    /// Shorter than [`Self::read_budget`], because the wait holds back the
+    /// requests that its connection sent after it.
+    #[must_use]
+    pub const fn partition_request_budget(&self) -> Duration {
+        self.partition_request_budget
     }
 
     /// Highest metadata op this NODE has applied and published.

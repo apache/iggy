@@ -1496,7 +1496,7 @@ mod tests {
         workload.options.weights = ActionWeights::new(&[(Action::PollMessages, 100)]);
         sim.discover_partition_contexts(&clients[0]);
         let (target, poll) = workload
-            .build_request(&clients[0])
+            .build_request_on(&clients[0], &sim)
             .expect("an idle client polls");
         sim.submit_request(clients[0].client_id(), target, poll.into_generic());
 

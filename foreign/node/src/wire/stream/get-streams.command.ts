@@ -41,7 +41,8 @@ export const GET_STREAMS = {
 export const getStreamsPage = wrapCommand<NamedPageQuery, Page<Stream>>(GET_STREAMS);
 
 /**
- * Executable get streams command function. Reads every stream page by page.
+ * Executable get streams command function. Reads every stream the caller may
+ * read, page by page.
  */
 export const getStreams = (c: ClientProvider) =>
   (): Promise<Stream[]> => readWholeList(c, GET_STREAMS, (query) => query);

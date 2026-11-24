@@ -36,6 +36,7 @@ const STREAM_2: &str = "perm-stream-2";
 const TOPIC_1: &str = "perm-topic-1";
 const TOPIC_2: &str = "perm-topic-2";
 const PARTITIONS: u32 = 1;
+const NOTHING: [&str; 0] = [];
 
 pub async fn run(harness: &TestHarness) {
     let root_client = harness
@@ -184,9 +185,13 @@ async fn test_no_permissions(harness: &TestHarness, root_client: &IggyClient) {
     assert_unauthorized(client.get_stats().await, "get_stats");
     assert_unauthorized(client.get_clients().await, "get_clients");
     assert_unauthorized(client.get_users().await, "get_users");
-    assert_unauthorized(client.get_streams().await, "get_streams");
+    assert_eq!(listed_streams(&client).await, NOTHING, "get_streams");
     assert_unauthorized(client.get_stream(&stream_id).await, "get_stream");
-    assert_unauthorized(client.get_topics(&stream_id).await, "get_topics");
+    assert_eq!(
+        listed_topics(&client, &stream_id).await,
+        NOTHING,
+        "get_topics"
+    );
     assert_unauthorized(client.get_topic(&stream_id, &topic_id).await, "get_topic");
     assert_unauthorized(
         client
@@ -315,7 +320,11 @@ async fn test_system_permissions(harness: &TestHarness, root_client: &IggyClient
 
     // But cannot read users or streams
     assert_unauthorized(client.get_users().await, "read_servers: get_users");
-    assert_unauthorized(client.get_streams().await, "read_servers: get_streams");
+    assert_eq!(
+        listed_streams(&client).await,
+        NOTHING,
+        "read_servers: get_streams"
+    );
 
     delete_test_user(root_client, READ_USER).await;
 
@@ -761,7 +770,11 @@ async fn test_message_permissions(harness: &TestHarness, root_client: &IggyClien
     );
 
     // Cannot read streams/topics without those permissions
-    assert_unauthorized(client.get_streams().await, "poll_messages: get_streams");
+    assert_eq!(
+        listed_streams(&client).await,
+        NOTHING,
+        "poll_messages: get_streams"
+    );
 
     delete_test_user(root_client, POLL_USER).await;
 
@@ -952,9 +965,10 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
         client.get_stream(&stream2_id).await,
         "stream-specific: get_stream 2",
     );
-    assert_unauthorized(
-        client.get_topics(&stream2_id).await,
-        "stream-specific: get_topics 2",
+    assert_eq!(
+        listed_topics(&client, &stream2_id).await,
+        NOTHING,
+        "stream-specific: get_topics 2"
     );
     assert_unauthorized(
         client.get_topic(&stream2_id, &topic_id).await,
@@ -990,8 +1004,12 @@ async fn test_stream_specific_permissions(harness: &TestHarness, root_client: &I
         "stream-specific: poll_messages 2",
     );
 
-    // Cannot get all streams (no global read_streams)
-    assert_unauthorized(client.get_streams().await, "stream-specific: get_streams");
+    // The stream list holds only the stream it may read
+    assert_eq!(
+        listed_streams(&client).await,
+        [STREAM_1],
+        "stream-specific: get_streams"
+    );
 
     delete_test_user(root_client, USER).await;
 }
@@ -1119,10 +1137,11 @@ async fn test_topic_specific_permissions(harness: &TestHarness, root_client: &Ig
         "topic-specific: poll_messages 2",
     );
 
-    // Cannot list all topics (no stream-level read_topics)
-    assert_unauthorized(
-        client.get_topics(&stream_id).await,
-        "topic-specific: get_topics",
+    // The topic list holds only the topic it may read
+    assert_eq!(
+        listed_topics(&client, &stream_id).await,
+        [TOPIC_1],
+        "topic-specific: get_topics"
     );
 
     delete_test_user(root_client, USER).await;
@@ -1372,9 +1391,10 @@ async fn test_global_permission_inheritance(harness: &TestHarness, root_client: 
         .expect("manage_topics → CG ops");
 
     // read_streams NOT implied
-    assert_unauthorized(
-        client.get_streams().await,
-        "manage_topics does NOT imply read_streams",
+    assert_eq!(
+        listed_streams(&client).await,
+        NOTHING,
+        "manage_topics does NOT imply read_streams"
     );
 
     delete_test_user(root_client, MANAGE_TOPICS_USER).await;
@@ -2959,9 +2979,10 @@ async fn test_personal_access_token_lifecycle(harness: &TestHarness, root_client
         .login_with_personal_access_token(&raw.token)
         .await
         .expect("PAT login should succeed");
-    assert_unauthorized(
-        via_pat.get_streams().await,
-        "PAT-bound session inherits the owner's empty rules",
+    assert_eq!(
+        listed_streams(&via_pat).await,
+        NOTHING,
+        "PAT-bound session inherits the owner's empty rules"
     );
 
     // Listing is caller-scoped: OTHER never sees USER's tokens.
@@ -3036,11 +3057,23 @@ async fn test_change_password_reply_path(harness: &TestHarness, root_client: &Ig
         .await
         .expect("connection stays usable after a wrong-current rejection");
 
-    // Correct current password: succeeds, session stays live.
+    // Correct current password: succeeds. A binary session that made the change
+    // stays live. Every HTTP token issued before it is refused, the caller's too.
     client
         .change_password(&user_id, "password123", "password456")
         .await
         .expect("self change with the correct current password");
+    if harness.transport().expect("transport") == TransportProtocol::Http {
+        assert_error_code(
+            client.get_personal_access_tokens().await.map(|_| ()),
+            IggyError::Unauthenticated,
+            "an HTTP token issued before the change",
+        );
+        client
+            .login_user(USER, "password456")
+            .await
+            .expect("sign in again with the new password");
+    }
     client
         .create_personal_access_token(
             "change-password-probe-2",
@@ -3096,6 +3129,28 @@ fn test_messages() -> Vec<IggyMessage> {
             .build()
             .unwrap(),
     ]
+}
+
+/// The names in the stream list of `client`, which holds the streams it may read.
+async fn listed_streams(client: &IggyClient) -> Vec<String> {
+    client
+        .get_streams()
+        .await
+        .expect("an authenticated caller lists streams")
+        .into_iter()
+        .map(|stream| stream.name)
+        .collect()
+}
+
+/// The names in the topic list of `stream_id`, which holds the topics `client` may read.
+async fn listed_topics(client: &IggyClient, stream_id: &Identifier) -> Vec<String> {
+    client
+        .get_topics(stream_id)
+        .await
+        .expect("an authenticated caller lists topics")
+        .into_iter()
+        .map(|topic| topic.name)
+        .collect()
 }
 
 fn assert_unauthorized<T: std::fmt::Debug>(result: Result<T, IggyError>, context: &str) {

@@ -36,6 +36,8 @@ use super::http_client::HttpClient;
 const STREAM: &str = "orders";
 const TOPIC: &str = "payments";
 const PARTITIONS: u32 = 2;
+/// The consumer of a test where one cluster alone reads.
+const READER: &str = "reader";
 /// Messages that one round sends to each partition.
 const MESSAGES: u32 = 50;
 const BATCH: u32 = 10;
@@ -320,9 +322,13 @@ async fn given_the_same_geo_topic_in_both_clusters_when_both_produce_at_once_sho
     for (side, client) in [(GeoSide::A, &client_a), (GeoSide::B, &client_b)] {
         let cluster = pair.cluster(side);
         let peer_topic = created[side.peer().index()];
+        // A plain consumer's position moves to the peer, so each cluster
+        // reads with a consumer of its own.
+        let reader = format!("reader-{}", cluster.origin());
         wait_for_published(pair.cluster(side.peer()), peer_topic, MESSAGES).await;
         assert_consumes(
             client,
+            &reader,
             &named(STREAM),
             &named(TOPIC),
             cluster.origin(),
@@ -335,6 +341,7 @@ async fn given_the_same_geo_topic_in_both_clusters_when_both_produce_at_once_sho
             .expect("the peer's topic is adopted");
         assert_consumes(
             client,
+            &reader,
             &numeric(shadow.id),
             &numeric(peer_topic.topic_id),
             cluster.peer_origin(),
@@ -377,6 +384,7 @@ async fn given_a_cluster_that_published_its_messages_when_it_stops_should_let_th
     assert_reads_own(&client_b, pair.b().origin(), MESSAGES).await;
     assert_consumes(
         &client_b,
+        READER,
         &numeric(shadow.id),
         &numeric(topic_a.topic_id),
         pair.a().origin(),
@@ -422,6 +430,7 @@ async fn given_a_stopped_cluster_when_it_returns_should_bring_what_it_took_befor
         .expect("dc-b follows dc-a");
     assert_consumes(
         &client_b,
+        READER,
         &numeric(shadow.id),
         &numeric(topic_a.topic_id),
         pair.a().origin(),
@@ -527,17 +536,18 @@ async fn assert_reads_own(client: &IggyClient, origin: &str, count: u32) {
     }
 }
 
-/// A consumer reads each partition of `topic` from where it stopped and gets
-/// the messages `indexes` of `origin`, each once and in the order `origin`
-/// took them, and nothing after them.
+/// The consumer `reader` reads each partition of `topic` from where it
+/// stopped and gets the messages `indexes` of `origin`, each once and in the
+/// order `origin` took them, and nothing after them.
 async fn assert_consumes(
     client: &IggyClient,
+    reader: &str,
     stream: &Identifier,
     topic: &Identifier,
     origin: &str,
     indexes: Range<u32>,
 ) {
-    let consumer = Consumer::new(named("reader"));
+    let consumer = Consumer::new(named(reader));
     let options = PollOptions {
         count: BATCH,
         commit: CommitPolicy::OnRead,

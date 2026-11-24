@@ -41,6 +41,7 @@ use reqwest_retry::{
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -612,6 +613,39 @@ impl HttpClient {
     where
         F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
     {
+        self.execute_with(method, url, may_commit, decorate, Self::handle_response)
+            .await
+    }
+
+    /// DELETE the session at `path`. Only the server's own unauthenticated refusal is
+    /// [`IggyError::Unauthenticated`], so a proxy 401 never reads as an ended session.
+    pub(crate) async fn delete_session(&self, path: &str) -> Result<Response, IggyError> {
+        let url = self.get_url(path)?;
+        self.fail_if_not_authenticated(path).await?;
+        self.execute_with(
+            Method::DELETE,
+            url,
+            true,
+            |request| request,
+            Self::handle_session_response,
+        )
+        .await
+    }
+
+    /// [`Self::execute`] with `handle` mapping each response.
+    async fn execute_with<F, H, R>(
+        &self,
+        method: Method,
+        url: Url,
+        may_commit: bool,
+        decorate: F,
+        handle: H,
+    ) -> Result<Response, IggyError>
+    where
+        F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
+        H: Fn(Response) -> R + Send + Sync,
+        R: Future<Output = Result<Response, IggyError>> + Send,
+    {
         let outcome_unknown = Arc::new(AtomicBool::new(false));
         let client = self.retrying_client(may_commit, &outcome_unknown);
         let deadline = Instant::now() + LIFECYCLE_RETRY_DEADLINE;
@@ -632,7 +666,7 @@ impl HttpClient {
                 return Err(IggyError::TransientNotCommitted);
             }
             let response = response.map_err(|_| IggyError::InvalidHttpRequest)?;
-            match Self::handle_response(response).await {
+            match handle(response).await {
                 Ok(response) => return Ok(response),
                 Err(IggyError::LifecycleBusy) if Instant::now() + pause < deadline => {
                     sleep(pause).await;
@@ -671,6 +705,22 @@ impl HttpClient {
                 Err(Self::response_error(status, reason))
             }
         }
+    }
+
+    /// [`Self::handle_response`], except that a 401 is [`IggyError::Unauthenticated`] only
+    /// with the server's unauthenticated body.
+    async fn handle_session_response(response: Response) -> Result<Response, IggyError> {
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Self::handle_response(response).await;
+        }
+        let reason = response.text().await.unwrap_or("error".to_string());
+        if error_id(&reason) == Some(IggyError::Unauthenticated.as_code()) {
+            return Err(IggyError::Unauthenticated);
+        }
+        Err(IggyError::HttpResponseError(
+            StatusCode::UNAUTHORIZED.as_u16(),
+            reason,
+        ))
     }
 
     async fn fail_if_not_authenticated(&self, path: &str) -> Result<(), IggyError> {

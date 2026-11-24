@@ -1119,8 +1119,8 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
-        /// Reads one page of the streams. An invalid query fails with
-        /// InvalidCommand (3) before anything is sent, as on the other page calls.
+        /// Reads one page of the streams the caller may read. An invalid query fails
+        /// with InvalidCommand (3) before anything is sent, as on the other page calls.
         fn get_streams_page(
             self: &Client,
             query: NamedPageQuery,
