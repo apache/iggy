@@ -1743,7 +1743,7 @@ impl ShardMetrics {
         self.partitions_reconcile_failures_total.inc();
     }
 
-    /// Bumped when the periodic full reconcile changes a partition that no
+    /// Bumped when the reconciler's repair changes a partition that no
     /// committed change and no local record announced. The reconciler's
     /// change sources should make this unreachable, so a non-zero value is a
     /// caught correctness anomaly that only the repair fixed.
@@ -2542,7 +2542,7 @@ impl ShardMetrics {
         );
         registry.register(
             "partitions_reconcile_repairs",
-            "partitions the periodic full reconcile changed although no change announced them; non-zero is a caught anomaly",
+            "partitions the reconciler's repair changed although no change announced them; non-zero is a caught anomaly",
             self.partitions_reconcile_repairs_total.clone(),
         );
         registry.register(

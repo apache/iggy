@@ -28,7 +28,7 @@
 //! # Work set
 //!
 //! A commit costs work for its own partitions, not for every partition on the
-//! node. Three sources fill [`ReconcilerCtx::pending`]:
+//! node. Four sources fill [`ReconcilerCtx::pending`]:
 //!
 //! - the partition changes each commit records
 //!   (`StreamsInner::partition_changes_since`), except consumer group
@@ -39,10 +39,15 @@
 //!   install (`IggyShard::take_reconcile_needed`);
 //! - a full fill from committed metadata and every local structure: at boot,
 //!   when the change feed lost entries the last pass did not read (overflow
-//!   or a snapshot restore), and every `FULL_RECONCILE_INTERVAL` as a repair.
-//!   A repair that acts on a namespace that no change announced logs a
-//!   warning and counts `partitions_reconcile_repairs`, because one of the
-//!   sources above missed it.
+//!   or a snapshot restore), and when a repair cycle ends with a local trace
+//!   that no committed partition accounts for;
+//! - the repair, which walks every committed partition this node stores, one
+//!   slice of the tree per `REPAIR_SLICE_INTERVAL`, and starts again
+//!   `REPAIR_INTERVAL` after the walk ended. The work set holds one slice at
+//!   a time, so the repair costs a shard the same at any number of
+//!   partitions. A repair that acts on a namespace that no change announced
+//!   logs a warning and counts `partitions_reconcile_repairs`, because one
+//!   of the sources above missed it.
 //!
 //! A namespace leaves the work set only when its check finds it converged.
 //! Work the check cannot finish now (a staged build, a deferred rebuild, a
@@ -109,7 +114,7 @@
 //! Keeping the table a hint is what makes it repairable: a check re-derives
 //! the namespace's row from committed metadata, so a lost row is rewritten
 //! once something puts the namespace in the work set, at the latest by the
-//! periodic full reconcile. An earlier design made the owner the sole writer and pushed
+//! repair. An earlier design made the owner the sole writer and pushed
 //! rows to peers to promote presence into a materialisation proof; it bought
 //! nothing the owner-side fences above do not already guarantee, and it traded
 //! that level-triggered repair for cross-core delta propagation that has to be
@@ -236,7 +241,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
@@ -250,8 +255,14 @@ const VISITS_PER_YIELD: usize = 1_024;
 /// most this many builds.
 const DISK_VISITS_PER_PASS: usize = 64;
 
-/// Time from the end of one full reconcile to the start of the next repair.
-const FULL_RECONCILE_INTERVAL: Duration = Duration::from_mins(10);
+/// Time from the end of a full round or of a repair cycle to the start of
+/// the next repair cycle.
+const REPAIR_INTERVAL: Duration = Duration::from_mins(10);
+
+/// Time from the end of the round over one repair slice to the next slice. A
+/// pass starts at most one slice, so an idle shard starts one per periodic
+/// tick.
+const REPAIR_SLICE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
 /// escalates to an operator-visible error (the backoff is capped, so
@@ -316,6 +327,52 @@ enum Convergence {
     Pending,
 }
 
+/// What put a full fill in the work set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullRoundTrigger {
+    /// The first pass of the task.
+    Boot,
+    /// The change feed lost changes that the last pass did not read.
+    LostChangeFeed,
+    /// A repair cycle ended with a routing row or a mounted partition that no
+    /// committed partition accounts for.
+    Leftover,
+}
+
+/// The round over a full fill, kept for its log line. A fill during the round
+/// starts the round again from the first namespace, and this record with it.
+#[derive(Clone, Copy)]
+struct FullRound {
+    trigger: FullRoundTrigger,
+    /// The start of the fill.
+    started_at: Instant,
+    fill_time: Duration,
+    /// The size of the work set after the fill.
+    work_set: usize,
+    visits: usize,
+}
+
+/// A stream key and a topic id: where a read of the committed tree starts.
+type TreePosition = (usize, usize);
+
+/// One walk of the repair over every committed partition this node stores.
+/// Its counts tell at the end whether the shard holds a routing row or a
+/// mounted partition that the walk did not meet.
+#[derive(Clone, Copy)]
+struct RepairCycle {
+    started_at: Instant,
+    /// Where the next slice starts, `None` after the last slice.
+    cursor: Option<TreePosition>,
+    slices: usize,
+    /// The partitions the slices held. Each has at most one routing row here.
+    stored: usize,
+    /// Those of `stored` that are mounted here or that this shard builds.
+    owned: usize,
+    /// Partition changes the feed announced since the first slice. Each can
+    /// name a partition created behind the cursor, which the counts miss.
+    announced: usize,
+}
+
 pub struct ReconcilerCtx {
     pub shard: Rc<ServerShard>,
     /// The placement of `shard`. The shard holds a read of a partition that
@@ -347,12 +404,17 @@ pub struct ReconcilerCtx {
     /// `Streams::revision` through which committed partition changes are in
     /// `pending`. `None` makes the next pass fill it from the whole tree.
     synced_revision: Cell<Option<u64>>,
-    /// When the next repair round starts. `None` while a full fill is in
-    /// `pending` and its round has not ended.
-    next_full_reconcile_at: Cell<Option<Instant>>,
-    /// While a repair round runs: the namespaces that something other than
-    /// the repair put in `pending`.
+    /// When the next step of the repair is due. `None` while a full fill or
+    /// a repair slice is in `pending` and its round has not ended.
+    next_repair_at: Cell<Option<Instant>>,
+    /// While the round over a repair slice or over the full fill of a repair
+    /// runs: the namespaces that something other than the repair put in
+    /// `pending`.
     repair_scrub: RefCell<Option<BTreeSet<IggyNamespace>>>,
+    /// The repair cycle under way, `None` between two cycles.
+    repair_cycle: Cell<Option<RepairCycle>>,
+    /// The full round under way, `None` between two full rounds.
+    full_round: Cell<Option<FullRound>>,
     group_offset_cleanup: GroupOffsetCleanup,
     lifecycle_reports: LifecycleReports,
     /// The incarnations whose delete this node saw commit as the metadata
@@ -409,8 +471,10 @@ impl ReconcilerCtx {
             resume_after: Cell::new(None),
             round_last: Cell::new(None),
             synced_revision: Cell::new(None),
-            next_full_reconcile_at: Cell::new(Some(Instant::now() + FULL_RECONCILE_INTERVAL)),
+            next_repair_at: Cell::new(Some(Instant::now() + REPAIR_INTERVAL)),
             repair_scrub: RefCell::new(None),
+            repair_cycle: Cell::new(None),
+            full_round: Cell::new(None),
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
@@ -439,14 +503,43 @@ impl ReconcilerCtx {
         }
     }
 
-    /// Ends a round over the work set. The end of a full round restarts the
-    /// repair clock and ends the repair scrub.
+    /// Ends a round over the work set. The end of the round over a full fill
+    /// or a repair slice ends the repair scrub and sets the time of the next
+    /// repair step. The end of a full round also logs the round.
     fn finish_round(&self) {
-        if self.next_full_reconcile_at.get().is_none() {
-            self.next_full_reconcile_at
-                .set(Some(Instant::now() + FULL_RECONCILE_INTERVAL));
-            self.repair_scrub.take();
+        if self.next_repair_at.get().is_some() {
+            return;
         }
+        self.repair_scrub.take();
+        let wait = if self.repair_cycle.get().is_some() {
+            REPAIR_SLICE_INTERVAL
+        } else {
+            self.first_cycle_delay()
+        };
+        self.next_repair_at.set(Some(Instant::now() + wait));
+        if let Some(round) = self.full_round.take() {
+            info!(
+                shard = self.shard.id,
+                trigger = ?round.trigger,
+                fill_ms = round.fill_time.as_millis(),
+                round_ms = round.started_at.elapsed().as_millis(),
+                visits = round.visits,
+                work_set = round.work_set,
+                "full reconcile round complete"
+            );
+        }
+    }
+
+    /// The wait from the end of a full round to the first repair cycle after
+    /// it. The full rounds of a node's shards end together at boot, so each
+    /// shard waits a different share of the interval longer. The shards then
+    /// do not end a cycle, or start the full round it can ask for, in the
+    /// same second.
+    fn first_cycle_delay(&self) -> Duration {
+        let offset = (REPAIR_INTERVAL * u32::from(self.shard.id))
+            .checked_div(u32::from(self.partition_shards.shard_count()))
+            .unwrap_or_default();
+        REPAIR_INTERVAL + offset
     }
 
     /// Warns when the repair acted on `ns` although no change announced it,
@@ -476,7 +569,7 @@ impl ReconcilerCtx {
         warn!(
             shard = self.shard.id,
             ns_raw = ns.inner(),
-            "full reconcile repaired a partition that no change announced"
+            "the repair acted on a partition that no change announced"
         );
         self.shard.metrics().record_partition_reconcile_repair();
     }
@@ -766,31 +859,137 @@ async fn fold_changes(ctx: &ReconcilerCtx) -> bool {
             ctx.incarnation_deletes
                 .observe(&ctx.shard, &changes, IggyTimestamp::now());
         }
-        ctx.add_announced(
+        let checks = || {
             changes
                 .iter()
                 .filter(|change| needs_partition_check(change.kind))
-                .map(|change| change.namespace),
-        );
+        };
+        ctx.add_announced(checks().map(|change| change.namespace));
+        ctx.repair_cycle.update(|cycle| {
+            cycle.map(|cycle| RepairCycle {
+                announced: cycle.announced + checks().count(),
+                ..cycle
+            })
+        });
     } else {
         // The lost changes can name any namespace, so a repair round under way
         // can no longer tell what they announced.
         ctx.repair_scrub.take();
-        fill_pending(ctx).await;
+        let trigger = if ctx.synced_revision.get().is_some() {
+            FullRoundTrigger::LostChangeFeed
+        } else {
+            FullRoundTrigger::Boot
+        };
+        fill_pending(ctx, trigger).await;
     }
     ctx.synced_revision.set(Some(revision));
-    if ctx
-        .next_full_reconcile_at
-        .get()
-        .is_some_and(|at| Instant::now() >= at)
+    // A repair step starts a round, so it waits for the end of a round that
+    // a capped pass left open.
+    if ctx.resume_after.get().is_none()
+        && ctx
+            .next_repair_at
+            .get()
+            .is_some_and(|at| Instant::now() >= at)
     {
-        let announced = ctx.pending.borrow().clone();
-        *ctx.repair_scrub.borrow_mut() = Some(announced);
-        ctx.group_offset_cleanup.synced_revision.set(None);
-        fill_pending(ctx).await;
-        partition_may_be_gone = true;
+        partition_may_be_gone |= repair_step(ctx).await;
     }
     partition_may_be_gone
+}
+
+/// Runs the repair step that is due: the next slice of the cycle, or the end
+/// of the cycle once the round over its last slice ended. Returns whether a
+/// partition may have gone, which the end of a cycle reports once.
+async fn repair_step(ctx: &ReconcilerCtx) -> bool {
+    let cycle = ctx.repair_cycle.get().unwrap_or_else(|| RepairCycle {
+        started_at: Instant::now(),
+        cursor: Some((0, 0)),
+        slices: 0,
+        stored: 0,
+        owned: 0,
+        announced: 0,
+    });
+    if let Some(position) = cycle.cursor {
+        repair_slice(ctx, cycle, position);
+        false
+    } else {
+        end_repair_cycle(ctx, cycle).await;
+        true
+    }
+}
+
+/// Puts the next slice of the committed tree in the work set, for the round
+/// that the pass starts next. A mounted partition of the slice also gets its
+/// group offset sweep, which otherwise only a group delete or the partition
+/// itself asks for.
+fn repair_slice(ctx: &ReconcilerCtx, mut cycle: RepairCycle, position: TreePosition) {
+    let announced = ctx.pending.borrow().clone();
+    *ctx.repair_scrub.borrow_mut() = Some(announced);
+    let mut slice = Vec::new();
+    cycle.cursor = read_committed_targets(ctx, position, &mut slice);
+    let partitions = ctx.shard.plane.partitions();
+    for ns in &slice {
+        let mounted = partitions.contains(ns);
+        if mounted {
+            partitions.mark_consumer_group_offsets_dirty(*ns);
+        }
+        if mounted || ctx.partition_shards.shard_for(ns) == ctx.shard.id {
+            cycle.owned += 1;
+        }
+    }
+    cycle.stored += slice.len();
+    cycle.slices += 1;
+    if cycle.slices == 1 {
+        let rare = rare_traces(ctx);
+        ctx.pending.borrow_mut().extend(rare);
+    }
+    ctx.pending.borrow_mut().extend(slice);
+    ctx.repair_cycle.set(Some(cycle));
+    ctx.next_repair_at.set(None);
+}
+
+/// Ends a repair cycle. A shard that holds more routing rows or more mounted
+/// partitions than the cycle met has a trace of a partition that committed
+/// metadata no longer holds and that no change announced. Only then a full
+/// round checks every local trace.
+///
+/// A create or a delete during the cycle cannot start that round by itself.
+/// `announced` covers a partition created behind the cursor, and a namespace
+/// stays in the work set until its removal is complete. The caller folded
+/// the feed after the last slice read the tree, so no committed removal is
+/// missing from both.
+async fn end_repair_cycle(ctx: &ReconcilerCtx, cycle: RepairCycle) {
+    ctx.repair_cycle.set(None);
+    let pending = ctx.pending.borrow().len();
+    let rows = ctx.shard.shards_table().row_count();
+    let mounted = ctx.shard.plane.partitions().len();
+    let slack = cycle.announced + pending;
+    let leftover = rows > cycle.stored + slack || mounted > cycle.owned + slack;
+    info!(
+        shard = ctx.shard.id,
+        cycle_ms = cycle.started_at.elapsed().as_millis(),
+        slices = cycle.slices,
+        stored = cycle.stored,
+        rows,
+        owned = cycle.owned,
+        mounted,
+        announced = cycle.announced,
+        pending,
+        leftover,
+        "partition repair cycle complete"
+    );
+    if !leftover {
+        ctx.next_repair_at
+            .set(Some(Instant::now() + REPAIR_INTERVAL));
+        return;
+    }
+    warn!(
+        shard = ctx.shard.id,
+        "the shard holds a routing row or a partition that the repair cycle did not meet; \
+         starting a full reconcile round"
+    );
+    let announced = ctx.pending.borrow().clone();
+    *ctx.repair_scrub.borrow_mut() = Some(announced);
+    fill_pending(ctx, FullRoundTrigger::Leftover).await;
 }
 
 /// Whether a change can leave a partition's local state behind committed
@@ -804,73 +1003,106 @@ fn needs_partition_check(kind: PartitionChangeKind) -> bool {
 /// into the work set, and starts a round over it from the first namespace.
 /// Inserts in chunks with a yield between them, because at a million
 /// partitions the work set takes a million namespaces.
-async fn fill_pending(ctx: &ReconcilerCtx) {
+async fn fill_pending(ctx: &ReconcilerCtx, trigger: FullRoundTrigger) {
+    let started_at = Instant::now();
     add_committed_targets(ctx).await;
-    let partitions = ctx.shard.plane.partitions();
-    let local: Vec<IggyNamespace> = partitions
+    let local: Vec<IggyNamespace> = ctx
+        .shard
+        .plane
+        .partitions()
         .namespaces()
         .copied()
-        .chain(partitions.tombstoned_namespaces())
         .chain(ctx.shard.shards_table().namespaces())
-        .chain(ctx.unbuilt_owned.borrow().iter().copied())
-        .chain(ctx.failure_state.borrow().keys().map(|(ns, _)| *ns))
+        .chain(rare_traces(ctx))
         .collect();
     for chunk in local.chunks(VISITS_PER_YIELD) {
         ctx.pending.borrow_mut().extend(chunk);
         yield_now().await;
     }
     ctx.resume_after.set(None);
-    ctx.next_full_reconcile_at.set(None);
+    ctx.next_repair_at.set(None);
+    ctx.repair_cycle.set(None);
+    ctx.full_round.set(Some(FullRound {
+        trigger,
+        started_at,
+        fill_time: started_at.elapsed(),
+        work_set: ctx.pending.borrow().len(),
+        visits: 0,
+    }));
 }
 
-/// Puts every committed partition this node stores into the work set. Reads
-/// the tree in chunks with a yield between them, so no read holds the
-/// metadata writer back for a whole walk. A change between two chunks is in
+/// The namespaces of the local traces that a healthy shard holds few of:
+/// the tombstones, the namespaces boot left unbuilt and the failed checks.
+fn rare_traces(ctx: &ReconcilerCtx) -> Vec<IggyNamespace> {
+    ctx.shard
+        .plane
+        .partitions()
+        .tombstoned_namespaces()
+        .into_iter()
+        .chain(ctx.unbuilt_owned.borrow().iter().copied())
+        .chain(ctx.failure_state.borrow().keys().map(|(ns, _)| *ns))
+        .collect()
+}
+
+/// Puts every committed partition this node stores into the work set, with
+/// a yield between two reads of the tree. A change between two reads is in
 /// the feed after the revision the caller read first.
 async fn add_committed_targets(ctx: &ReconcilerCtx) {
-    let streams = ctx.shard.plane.metadata().mux_stm.streams();
-    let mut chunk = Vec::new();
+    let mut targets = Vec::new();
     let mut next = Some((0, 0));
-    while let Some((first_stream, first_topic)) = next {
-        next = streams.read(|inner| {
-            let mut visited = 0;
-            for (stream_key, stream) in inner.items.iter_from(first_stream) {
-                if visited >= VISITS_PER_YIELD {
-                    return Some((stream_key, 0));
-                }
-                let topic_from = if stream_key == first_stream {
-                    first_topic
-                } else {
-                    0
-                };
-                for (topic_id, topic) in stream.topics.iter_from(topic_from) {
-                    if visited >= VISITS_PER_YIELD {
-                        return Some((stream_key, topic_id));
-                    }
-                    visited += topic.partitions.len().max(1);
-                    chunk.extend(
-                        topic
-                            .partitions
-                            .iter()
-                            .filter(|partition| {
-                                partition
-                                    .replica_set(ctx.replica_count)
-                                    .member(ctx.self_replica_id)
-                                    .is_some()
-                            })
-                            .map(|partition| IggyNamespace::new(stream.id, topic_id, partition.id)),
-                    );
-                }
-                visited += 1;
-            }
-            None
-        });
-        ctx.pending.borrow_mut().extend(&chunk);
-        chunk.clear();
+    while let Some(position) = next {
+        next = read_committed_targets(ctx, position, &mut targets);
+        ctx.pending.borrow_mut().extend(&targets);
+        targets.clear();
         if next.is_some() {
             yield_now().await;
         }
     }
+}
+
+/// Adds to `targets` the committed partitions this node stores, from
+/// `position` on, and stops after about `VISITS_PER_YIELD` of them, so the
+/// read does not hold the metadata writer back for a whole walk. Returns
+/// where the next read starts, `None` at the end of the tree.
+fn read_committed_targets(
+    ctx: &ReconcilerCtx,
+    (first_stream, first_topic): TreePosition,
+    targets: &mut Vec<IggyNamespace>,
+) -> Option<TreePosition> {
+    let streams = ctx.shard.plane.metadata().mux_stm.streams();
+    streams.read(|inner| {
+        let mut visited = 0;
+        for (stream_key, stream) in inner.items.iter_from(first_stream) {
+            if visited >= VISITS_PER_YIELD {
+                return Some((stream_key, 0));
+            }
+            let topic_from = if stream_key == first_stream {
+                first_topic
+            } else {
+                0
+            };
+            for (topic_id, topic) in stream.topics.iter_from(topic_from) {
+                if visited >= VISITS_PER_YIELD {
+                    return Some((stream_key, topic_id));
+                }
+                visited += topic.partitions.len().max(1);
+                targets.extend(
+                    topic
+                        .partitions
+                        .iter()
+                        .filter(|partition| {
+                            partition
+                                .replica_set(ctx.replica_count)
+                                .member(ctx.self_replica_id)
+                                .is_some()
+                        })
+                        .map(|partition| IggyNamespace::new(stream.id, topic_id, partition.id)),
+                );
+            }
+            visited += 1;
+        }
+        None
+    })
 }
 
 /// Checks the work set in key order, from the namespace after the last one
@@ -898,6 +1130,12 @@ async fn visit_pending(ctx: &ReconcilerCtx, counters: &mut PassCounters) -> bool
             return false;
         };
         last = Some(ns);
+        ctx.full_round.update(|round| {
+            round.map(|round| FullRound {
+                visits: round.visits + 1,
+                ..round
+            })
+        });
         let actions = counters.actions();
         if reconcile_namespace(ctx, ns, counters).await == Convergence::Converged {
             ctx.pending.borrow_mut().remove(&ns);
@@ -2627,7 +2865,8 @@ mod tests {
 
     use super::{
         CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
-        GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
+        FullRoundTrigger, GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS,
+        PassCounters, REPAIR_INTERVAL, ReconcilerCtx, RepairCycle, VISITS_PER_YIELD,
         build_partition_fresh, delete_partitions_from_disk, fetch_partition_build_inputs,
         fill_pending, fold_changes, group_offset_delete_request, reconcile_group_offsets,
         reconcile_once, reconcile_partition_lifecycles, reconcile_pending_revocations,
@@ -2689,7 +2928,7 @@ mod tests {
         PartitionsConfig, RETIRED_OBJECT_GRACE, RepairSession, Segment, object_prefix,
     };
     use rand::prelude::{RngExt, SeedableRng, StdRng};
-    use server_common::sharding::{IggyNamespace, ShardId};
+    use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
     use server_common::{Message, MessageBag, SegmentStorage};
     use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
@@ -3439,6 +3678,78 @@ mod tests {
     async fn reconcile_pass(ctx: &ReconcilerCtx) {
         reconcile_once(ctx).await;
         ctx.shard.apply_reconcile_ops();
+    }
+
+    /// Makes the next repair step due and runs the pass that takes it.
+    async fn repair_pass(ctx: &ReconcilerCtx) {
+        ctx.next_repair_at.set(Some(Instant::now()));
+        reconcile_pass(ctx).await;
+    }
+
+    /// Runs the slices of one repair cycle and returns the cycle as its last
+    /// slice left it. The next repair pass ends the cycle.
+    async fn repair_slices(ctx: &ReconcilerCtx) -> RepairCycle {
+        loop {
+            repair_pass(ctx).await;
+            let cycle = ctx
+                .repair_cycle
+                .get()
+                .expect("a repair pass must start a cycle or go on with it");
+            if cycle.cursor.is_none() {
+                return cycle;
+            }
+        }
+    }
+
+    /// Makes the end of the repair cycle due and folds it. Returns what the
+    /// full round is for when the end of the cycle starts one. The round is
+    /// read before a pass can run and end it.
+    async fn fold_cycle_end(ctx: &ReconcilerCtx) -> Option<FullRoundTrigger> {
+        ctx.next_repair_at.set(Some(Instant::now()));
+        fold_changes(ctx).await;
+        assert!(
+            ctx.repair_cycle.get().is_none(),
+            "the fold after the last slice must end the cycle"
+        );
+        ctx.full_round.get().map(|round| round.trigger)
+    }
+
+    /// A stream with one topic of one partition costs the cursor two visits.
+    const STREAMS_PER_SLICE: usize = VISITS_PER_YIELD / 2;
+
+    /// Shard 0 of a node that stores `streams` streams of one partition each
+    /// and owns none of them, so a check writes a routing row and builds
+    /// nothing. Its boot round is over. The seed takes ops `1..=2 * streams`
+    /// and consensus groups `1..=streams`.
+    async fn build_routing_only_shard(
+        tmp: &TempDir,
+        streams: usize,
+    ) -> (Rc<TestShard>, ReconcilerCtx) {
+        const TOTAL_SHARDS: u16 = 2;
+        let config = test_config(tmp);
+        let mux = TestMux::default();
+        for stream in 0..u32::try_from(streams).unwrap() {
+            let op = u64::from(stream) * 2 + 1;
+            seed_stream(&mux, op, &format!("stream-{stream}"));
+            seed_topic(
+                &mux,
+                op + 1,
+                stream,
+                "topic",
+                vec![assignment(0, u64::from(stream) + 1)],
+            );
+        }
+        let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+        let mut ctx = ReconcilerCtx::new(Rc::clone(&shard), Rc::new(config), CLUSTER_ID, 0, 1);
+        // With shard 0 skipped, shard 1 owns every partition.
+        ctx.partition_shards = PartitionShards::new(TOTAL_SHARDS, true);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(
+            ctx.pending.borrow().is_empty(),
+            "the boot round must converge"
+        );
+        (shard, ctx)
     }
 
     /// Single-shard scenario: every committed partition is owned locally.
@@ -5003,6 +5314,10 @@ mod tests {
             BTreeSet::from([created]),
             "only the new partition needs a check"
         );
+        assert!(
+            ctx.full_round.get().is_none(),
+            "a commit must start no full round"
+        );
 
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -5079,12 +5394,25 @@ mod tests {
         let partitions = shard.plane.partitions();
 
         assert!(reconcile_once(&ctx).await, "the pass must stop at the cap");
+        let round = ctx
+            .full_round
+            .get()
+            .expect("a capped pass must leave the boot round open");
+        assert_eq!(round.trigger, FullRoundTrigger::Boot);
+        assert_eq!(
+            (round.work_set, round.visits),
+            (partitions_count, DISK_VISITS_PER_PASS)
+        );
         shard.apply_reconcile_ops();
         assert_eq!(partitions.namespaces().count(), DISK_VISITS_PER_PASS);
 
         assert!(
             !reconcile_once(&ctx).await,
             "the next pass must build the rest"
+        );
+        assert!(
+            ctx.full_round.get().is_none(),
+            "the end of the round must log it and drop its record"
         );
         shard.apply_reconcile_ops();
         assert_eq!(partitions.namespaces().count(), partitions_count);
@@ -5188,8 +5516,9 @@ mod tests {
 
     /// The change feed and the pump's records must leave nothing for a full
     /// reconcile. Random creates, deletes and recreates on two shards, with
-    /// passes and pump applies at random points, drain the work set, and a
-    /// full fill then finds no action.
+    /// passes and pump applies at random points, drain the work set. A repair
+    /// cycle then meets each routing row and each mounted partition, so it
+    /// starts no full round, and a full fill finds no action.
     #[compio::test]
     async fn given_random_partition_changes_when_the_work_set_drains_should_leave_a_full_reconcile_nothing()
      {
@@ -5252,7 +5581,27 @@ mod tests {
                 ctx.pending.borrow()
             );
 
-            fill_pending(&ctx).await;
+            let cycle = repair_slices(&ctx).await;
+            assert_eq!(
+                (cycle.announced, ctx.pending.borrow().len()),
+                (0, 0),
+                "seed {seed}: a cycle on a converged shard must end with no slack"
+            );
+            assert_eq!(
+                (
+                    shard.shards_table().row_count(),
+                    shard.plane.partitions().len()
+                ),
+                (cycle.stored, cycle.owned),
+                "seed {seed}: the cycle must meet each routing row and each mounted partition"
+            );
+            assert_eq!(
+                fold_cycle_end(&ctx).await,
+                None,
+                "seed {seed}: the end of the cycle must start no full round"
+            );
+
+            fill_pending(&ctx, FullRoundTrigger::Leftover).await;
             let mut counters = PassCounters::default();
             assert!(!visit_pending(&ctx, &mut counters).await);
             assert_eq!(
@@ -5367,8 +5716,8 @@ mod tests {
         assert_eq!(shard.plane.partitions().len(), 1);
     }
 
-    /// The periodic full reconcile repairs what no change announced and counts
-    /// it. A change announced in the same round is not counted.
+    /// The repair fixes what no change announced and counts it. A change
+    /// announced in the same round is not counted.
     #[compio::test]
     async fn given_unannounced_damage_when_the_repair_runs_should_fix_it_and_count_only_it() {
         let tmp = TempDir::new().unwrap();
@@ -5390,7 +5739,7 @@ mod tests {
             "announced-topic",
             vec![assignment(0, 2)],
         );
-        ctx.next_full_reconcile_at.set(Some(Instant::now()));
+        ctx.next_repair_at.set(Some(Instant::now()));
 
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -5410,9 +5759,10 @@ mod tests {
     }
 
     /// Changes an overflow pushed out of the feed can name any namespace, so
-    /// acting on them in a repair round under way is no repair.
+    /// acting on them in the round over a repair slice is no repair. The full
+    /// fill that the overflow starts also ends the repair cycle.
     #[compio::test]
-    async fn given_repair_round_when_the_feed_overflows_should_count_no_repair() {
+    async fn given_repair_slice_when_the_feed_overflows_should_count_no_repair() {
         const NODES: u8 = 3;
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -5435,10 +5785,16 @@ mod tests {
             Durability::Persisted,
             &[0],
         );
-        ctx.next_full_reconcile_at.set(Some(Instant::now()));
+        ctx.next_repair_at.set(Some(Instant::now()));
         assert!(
             reconcile_once(&ctx).await,
-            "the builds must hold the repair round open"
+            "the builds must hold the round over the slice open"
+        );
+        let cycle = ctx.repair_cycle.get().expect("the cycle is under way");
+        assert_eq!((cycle.slices, cycle.stored), (1, DISK_VISITS_PER_PASS + 1));
+        assert!(
+            ctx.next_repair_at.get().is_none(),
+            "no repair step is due before the round over the slice ends"
         );
 
         let lost = IggyNamespace::new(0, 1, 0);
@@ -5456,15 +5812,466 @@ mod tests {
             "the overflow must push the create of `lost` out of the feed"
         );
 
+        fold_changes(&ctx).await;
+        let round = ctx
+            .full_round
+            .get()
+            .expect("the fill must start a full round");
+        assert_eq!(
+            (round.trigger, round.visits),
+            (FullRoundTrigger::LostChangeFeed, 0)
+        );
+        assert!(
+            ctx.repair_cycle.get().is_none(),
+            "a full fill must end the repair cycle"
+        );
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
 
+        assert!(ctx.full_round.get().is_none());
         assert!(shard.plane.partitions().contains(&lost));
         assert_eq!(
             shard.metrics().partitions_reconcile_repairs_value(),
             0,
             "a change the feed lost is not one that no source announced"
         );
+    }
+
+    /// The repair checks the committed tree a slice at a time. The work set
+    /// holds one slice, and a lost routing row comes back with the slice that
+    /// holds its partition.
+    #[compio::test]
+    async fn given_more_partitions_than_one_slice_when_the_repair_runs_should_check_them_slice_by_slice()
+     {
+        const SLICES: usize = 3;
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, SLICES * STREAMS_PER_SLICE).await;
+        let rows = shard.shards_table();
+        let first = IggyNamespace::new(0, 0, 0);
+        let last = IggyNamespace::new(SLICES * STREAMS_PER_SLICE - 1, 0, 0);
+        rows.remove(&first);
+        rows.remove(&last);
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        fold_changes(&ctx).await;
+        assert_eq!(
+            ctx.pending.borrow().len(),
+            STREAMS_PER_SLICE,
+            "the work set must hold one slice"
+        );
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            (rows.shard_for(first), rows.shard_for(last)),
+            (Some(1), None),
+            "the first slice must rewrite only the row of its own partition"
+        );
+
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            (cycle.slices, cycle.stored),
+            (SLICES, SLICES * STREAMS_PER_SLICE)
+        );
+        assert_eq!(rows.shard_for(last), Some(1));
+        assert_eq!(
+            (
+                rows.row_count(),
+                cycle.announced,
+                ctx.pending.borrow().len()
+            ),
+            (cycle.stored, 0, 0),
+            "the cycle must meet each routing row, with no slack"
+        );
+
+        let before = Instant::now();
+        assert_eq!(
+            fold_cycle_end(&ctx).await,
+            None,
+            "a cycle that met each routing row must start no full round"
+        );
+        assert!(
+            ctx.next_repair_at
+                .get()
+                .is_some_and(|at| at >= before + REPAIR_INTERVAL),
+            "the next cycle must wait for the repair interval"
+        );
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 2);
+    }
+
+    /// A repair slice starts a round. While a capped pass holds a round open,
+    /// a due slice waits, so the round resumes where it stopped.
+    #[compio::test]
+    async fn given_a_round_that_a_capped_pass_left_open_when_a_slice_is_due_should_wait_for_its_end()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        let partitions_count = DISK_VISITS_PER_PASS + 1;
+        seed_stream(&mux, 1, "stream-capped");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            2,
+            0,
+            "topic-capped",
+            (0..u32::try_from(partitions_count).unwrap())
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        assert!(reconcile_once(&ctx).await, "the builds must cap the pass");
+        shard.apply_reconcile_ops();
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        assert!(
+            !reconcile_once(&ctx).await,
+            "the next pass must end the round"
+        );
+        assert!(
+            ctx.repair_cycle.get().is_none(),
+            "no slice may start while a round is open"
+        );
+        assert_eq!(shard.plane.partitions().len(), DISK_VISITS_PER_PASS);
+        shard.apply_reconcile_ops();
+
+        reconcile_pass(&ctx).await;
+        let cycle = ctx
+            .repair_cycle
+            .get()
+            .expect("the pass after the round must start the slice");
+        assert_eq!(cycle.stored, partitions_count);
+    }
+
+    /// A partition created behind the cursor gets a routing row that the
+    /// cycle did not count. The end of the cycle must not take that row for
+    /// one that no committed partition accounts for.
+    #[compio::test]
+    async fn given_a_partition_created_behind_the_cursor_when_the_cycle_ends_should_start_no_full_round()
+     {
+        const STREAMS: usize = 2 * STREAMS_PER_SLICE;
+        let tmp = TempDir::new().unwrap();
+        let (shard, ctx) = build_routing_only_shard(&tmp, STREAMS).await;
+        repair_pass(&ctx).await;
+        let streams = u64::try_from(STREAMS).unwrap();
+        seed_topic(
+            &shard.plane.metadata().mux_stm,
+            2 * streams + 1,
+            0,
+            "late-topic",
+            vec![assignment(0, streams + 1)],
+        );
+
+        let cycle = repair_slices(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert_eq!(cycle.announced, 1);
+        assert_eq!(
+            shard.shards_table().row_count(),
+            cycle.stored + 1,
+            "the late partition must have a row that the cycle did not count"
+        );
+
+        assert_eq!(
+            fold_cycle_end(&ctx).await,
+            None,
+            "an announced create is no leftover"
+        );
+    }
+
+    /// A deleted partition keeps its routing row until the pump applies the
+    /// removal, and the work set holds its namespace until then. The end of
+    /// a cycle must not take the row for one that no change announced. The
+    /// same holds for a delete that commits after the last slice.
+    #[compio::test]
+    async fn given_a_removal_under_way_when_the_cycle_ends_should_start_no_full_round() {
+        for late_delete in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let (shard, ctx) = build_routing_only_shard(&tmp, 2).await;
+            let mux = &shard.plane.metadata().mux_stm;
+            seed_delete_topic(mux, 5, 0, 0);
+            reconcile_once(&ctx).await;
+
+            ctx.next_repair_at.set(Some(Instant::now()));
+            reconcile_once(&ctx).await;
+            let cycle = ctx.repair_cycle.get().expect("the cycle is under way");
+            assert_eq!(
+                (cycle.cursor, cycle.stored, cycle.announced),
+                (None, 1, 0),
+                "late delete {late_delete}"
+            );
+            assert_eq!(
+                shard.shards_table().row_count(),
+                2,
+                "late delete {late_delete}: the row of the deleted partition must still be there"
+            );
+            if late_delete {
+                seed_delete_topic(mux, 6, 1, 0);
+            }
+
+            assert_eq!(
+                fold_cycle_end(&ctx).await,
+                None,
+                "late delete {late_delete}: a removal under way is no leftover"
+            );
+        }
+    }
+
+    /// A partition that this node does not store gets no routing row here,
+    /// and a cycle does not count it.
+    #[compio::test]
+    async fn given_a_partition_this_node_does_not_store_when_the_cycle_ends_should_start_no_full_round()
+     {
+        const NODES: u8 = 3;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placed-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = Rc::new(ReconcilerCtx::new(
+            Rc::clone(&shard),
+            Rc::new(config),
+            CLUSTER_ID,
+            0,
+            NODES,
+        ));
+        let streams = shard.plane.metadata().mux_stm.streams();
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 0, 0),
+            1,
+            0,
+            Durability::Persisted,
+            &[0],
+        );
+        streams.seed_namespace_on(
+            IggyNamespace::new(0, 1, 0),
+            2,
+            0,
+            Durability::Persisted,
+            &[1, 2],
+        );
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        let cycle = repair_slices(&ctx).await;
+        assert_eq!((cycle.stored, cycle.owned, cycle.announced), (1, 1, 0));
+        assert_eq!(shard.shards_table().row_count(), 1);
+        assert_eq!(fold_cycle_end(&ctx).await, None);
+    }
+
+    /// A partition that the pump mounts after its slice is one that the cycle
+    /// met. The end of the cycle must not take it for a partition that no
+    /// committed partition accounts for.
+    #[compio::test]
+    async fn given_partitions_mounted_after_their_slice_when_the_cycle_ends_should_start_no_full_round()
+     {
+        const PARTITIONS: u32 = 4;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "staged-stream");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "staged-topic",
+            (0..PARTITIONS)
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        let partitions = shard.plane.partitions();
+        reconcile_once(&ctx).await;
+        assert!(
+            partitions.is_empty(),
+            "the builds must wait for the pump to mount them"
+        );
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        reconcile_once(&ctx).await;
+        let cycle = ctx.repair_cycle.get().expect("the cycle is under way");
+        assert_eq!((cycle.cursor, cycle.owned), (None, PARTITIONS as usize));
+        shard.apply_reconcile_ops();
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            (partitions.len(), ctx.pending.borrow().len()),
+            (PARTITIONS as usize, 0)
+        );
+
+        assert_eq!(fold_cycle_end(&ctx).await, None);
+    }
+
+    /// A routing row that no committed partition accounts for, and that no
+    /// change announced, is one row more than a cycle meets. The cycle then
+    /// ends with a full round, which removes the row and counts the repair.
+    #[compio::test]
+    async fn given_a_leftover_routing_row_when_the_cycle_ends_should_remove_it_in_a_full_round() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "leftover-stream");
+        seed_topic(&mux, 2, 0, "leftover-topic", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let rows = shard.shards_table();
+        let leftover = IggyNamespace::new(7, 0, 0);
+        rows.insert(leftover, PartitionLocation::new(ShardId::new(0), 1));
+
+        let cycle = repair_slices(&ctx).await;
+        assert_eq!((cycle.stored, rows.row_count()), (1, 2));
+        assert_eq!(
+            rows.shard_for(leftover),
+            Some(0),
+            "no slice holds the namespace of the leftover row"
+        );
+
+        assert_eq!(fold_cycle_end(&ctx).await, Some(FullRoundTrigger::Leftover));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+
+        assert_eq!(rows.shard_for(leftover), None);
+        assert_eq!(rows.row_count(), 1);
+        assert!(ctx.full_round.get().is_none());
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// A mounted partition that committed metadata no longer holds, with no
+    /// routing row and no announced delete, is one partition more than a
+    /// cycle meets. The full round at the end of the cycle removes it.
+    #[compio::test]
+    async fn given_a_mounted_partition_that_no_row_and_no_change_names_when_the_cycle_ends_should_remove_it()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "ghost-stream");
+        seed_topic(&mux, 2, 0, "ghost-topic", vec![assignment(0, 1)]);
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        let partitions = shard.plane.partitions();
+        let ns = IggyNamespace::new(0, 0, 0);
+        let partition_dir = ctx.config.get_partition_path(0, 0, 0);
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(partitions.contains(&ns));
+
+        // A delete that the feed does not hand to the reconciler.
+        let mux = &shard.plane.metadata().mux_stm;
+        seed_delete_topic(mux, 3, 0, 0);
+        let (revision, _) = mux.streams().revision_and_partition_changes(None);
+        ctx.synced_revision.set(Some(revision));
+        shard.shards_table().remove(&ns);
+
+        let cycle = repair_slices(&ctx).await;
+        assert_eq!((cycle.stored, cycle.owned), (0, 0));
+        assert!(
+            partitions.contains(&ns),
+            "no slice holds the namespace of the partition"
+        );
+
+        assert_eq!(fold_cycle_end(&ctx).await, Some(FullRoundTrigger::Leftover));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        assert!(!partitions.contains(&ns));
+        assert!(!Path::new(&partition_dir).exists());
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// The first slice of a cycle also checks the few traces that no slice of
+    /// the tree names: here the files of a namespace boot left unbuilt, whose
+    /// delete no change announced.
+    #[compio::test]
+    async fn given_an_unbuilt_namespace_that_no_change_names_when_a_cycle_starts_should_remove_its_files()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let partition_dir = config.get_partition_path(3, 0, 0);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "unbuilt-stream");
+        let shard = build_test_shard(0, &config, mux);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        let ns = IggyNamespace::new(3, 0, 0);
+        std::fs::create_dir_all(&partition_dir).expect("files of a prior life");
+        ctx.mark_unbuilt([ns]);
+
+        repair_pass(&ctx).await;
+
+        assert!(!Path::new(&partition_dir).exists());
+        assert!(!shard.plane.partitions().is_tombstoned(&ns));
+        assert_eq!(shard.metrics().partitions_reconcile_repairs_value(), 1);
+    }
+
+    /// A repair slice asks for the group offset sweep of the partitions it
+    /// holds that are mounted here, and of no other.
+    #[compio::test]
+    async fn given_a_repair_slice_when_it_holds_mounted_partitions_should_mark_their_group_offsets()
+    {
+        const TOTAL_SHARDS: u16 = 2;
+        const PARTITIONS: u32 = 8;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "sweep-stream");
+        seed_topic(
+            &mux,
+            2,
+            0,
+            "sweep-topic",
+            (0..PARTITIONS)
+                .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
+                .collect(),
+        );
+        let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let partitions = shard.plane.partitions();
+        let mounted: BTreeSet<IggyNamespace> = partitions.namespaces().copied().collect();
+        assert!(
+            !mounted.is_empty() && mounted.len() < PARTITIONS as usize,
+            "the topic must straddle both shards"
+        );
+        assert!(partitions.take_consumer_group_offsets_dirty().is_empty());
+
+        ctx.next_repair_at.set(Some(Instant::now()));
+        fold_changes(&ctx).await;
+
+        assert_eq!(partitions.take_consumer_group_offsets_dirty(), mounted);
+    }
+
+    /// The shards of a node end their boot rounds together. Each then waits a
+    /// different share of the repair interval longer, so their cycles do not
+    /// end in the same second.
+    #[compio::test]
+    async fn given_the_shards_of_a_node_when_their_boot_rounds_end_should_start_their_repairs_apart()
+     {
+        const TOTAL_SHARDS: u16 = 4;
+        for shard_id in 0..TOTAL_SHARDS {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+            let mux = TestMux::default();
+            seed_stream(&mux, 1, "offset-stream");
+            let shard = build_test_shard_in_mesh(shard_id, &config, mux, TOTAL_SHARDS);
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+
+            let before = Instant::now();
+            reconcile_pass(&ctx).await;
+            let after = Instant::now();
+
+            let wait =
+                REPAIR_INTERVAL + REPAIR_INTERVAL * u32::from(shard_id) / u32::from(TOTAL_SHARDS);
+            let first_cycle = ctx
+                .next_repair_at
+                .get()
+                .expect("the end of the boot round must set the first cycle");
+            assert!(
+                before + wait <= first_cycle && first_cycle <= after + wait,
+                "shard {shard_id}"
+            );
+        }
     }
 
     /// A committed truncate reaches its partition through the change feed. The

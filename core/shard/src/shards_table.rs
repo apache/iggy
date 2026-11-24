@@ -41,6 +41,8 @@ pub trait ShardsTable {
     fn remove(&self, namespace: &IggyNamespace) -> Option<PartitionLocation>;
 
     fn namespaces(&self) -> Vec<IggyNamespace>;
+
+    fn row_count(&self) -> usize;
 }
 
 /// Always-`None` impl. Satisfies the trait for test / simulator paths
@@ -65,6 +67,10 @@ impl ShardsTable for () {
 
     fn namespaces(&self) -> Vec<IggyNamespace> {
         Vec::new()
+    }
+
+    fn row_count(&self) -> usize {
+        0
     }
 }
 
@@ -119,6 +125,10 @@ impl ShardsTable for PapayaShardsTable {
     fn namespaces(&self) -> Vec<IggyNamespace> {
         let guard = self.inner.guard();
         self.inner.iter(&guard).map(|(ns, _)| *ns).collect()
+    }
+
+    fn row_count(&self) -> usize {
+        self.inner.len()
     }
 }
 
