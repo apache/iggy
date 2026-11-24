@@ -628,6 +628,68 @@ provider computes a CRC32C again on a HEAD, so the check compares what the
 store recorded when it took the object, not the bytes it holds now: a byte that
 flips inside an object file of the `fs` backend is not found.
 
+A committed delete of a partition, or of the topic or stream that holds it,
+queues the delete of the partition's objects in the memory of the metadata
+primary. A restart, a change of the metadata primary, a full queue, or a change
+feed that overflowed each leave those objects in the store, and nothing else
+deletes them. So shard 0 of the caught-up metadata primary sweeps
+the root of the store, while its node passes the store identity check
+described below:
+
+- It reads the revision that committed metadata reached, then the store
+  identity object, then lists every key under the prefix, in housekeeping
+  jobs of at most 16 pages of 1,000 keys.
+- It sorts the keys by partition incarnation: stream, topic, partition and
+  the revision the partition was created at. An incarnation is an orphan when
+  committed metadata holds no partition of it and its revision is not above
+  the one the sweep read before the listing.
+- It deletes an orphan only once two full sweeps in a row of the same primary
+  process found it, and the newest of its objects is older than
+  `[tiered_storage] orphan_grace`, 6 hours by default, by the time the store
+  gives each object. The delete goes through the same queue as a committed
+  delete: it checks committed metadata again, reads the store identity object
+  again and deletes nothing when it changed, lists the incarnation again, and
+  deletes each `.index` before its `.log` and the manifest last.
+- The primary sweeps every hour, or every `orphan_grace` when that is shorter.
+  `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
+  the whole root, a store identity object that names another cluster, and a
+  change of the metadata primary or of its view each drop what the sweeps
+  found, so the next two sweeps start the count again.
+
+The sweep never deletes:
+
+- A partition incarnation that committed metadata holds, or one created after
+  the sweep read the revision of metadata.
+- The data of geo topics: an incarnation with a long-term segment, or whose
+  topic incarnation has a geo topic object, live or a tombstone, and any fresh
+  object. The sweep of geo topics owns those.
+- Anything under `<prefix>/meta/`, except the manifest of an incarnation it
+  deletes, which goes last.
+- The data of another cluster. The sweep runs only while the node passes the
+  store identity check, and stops when the identity object it reads names
+  another cluster.
+- An incarnation with an object that is no newer than this cluster's claim of
+  the prefix, the time the store gives the identity object, as what a retired
+  cluster left before a recovery. The node logs such incarnations as a warning
+  and leaves them to an operator.
+- A key that is not the key of a segment object or a manifest.
+
+Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
+root, the gauge `orphan_incarnations`, the orphans the last sweep found,
+`orphan_incarnations_deleted_total`, the gauge `orphan_objects_before_claim`,
+and `orphan_identity_skips_total`, the sweeps and deletes that stopped at a
+store identity object other than the one they expected. Only shard 0 of the
+metadata primary moves them. A sweep costs a HEAD and a read of the identity
+object and one listing request per 1,000 keys under the prefix, fresh objects
+and the keys of other prefixes nested in it included. The delete of an orphan
+costs a read of the identity object, the listing of the incarnation, a HEAD of
+its manifest and of its geo topic object, and the deletes.
+
+Restoring metadata while tiered storage is in use is not supported. If
+metadata is rolled back or restored under the same cluster id, the
+incarnations of the history that was lost become orphans once the revision of
+metadata passes theirs, and the sweep deletes them.
+
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
 an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the

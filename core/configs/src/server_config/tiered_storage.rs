@@ -64,6 +64,11 @@ pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
 /// each object would wait for the upload interval.
 pub const FRESH_PENDING_BYTES_MIN: u64 = 4 * 1024 * 1024;
 
+/// The shortest `orphan_grace` other than zero. A store gives the moment of
+/// an object to the second, so a shorter grace cannot tell an object from
+/// one written in the same second.
+pub const ORPHAN_GRACE_MIN: Duration = Duration::from_secs(1);
+
 /// The largest `read_cache_block_size`: the largest piece a poll reads from
 /// the store, above which most reads would fetch more than they ask for.
 /// Mirrors `partitions::DISK_POLL_CHUNK_MAX`.
@@ -334,6 +339,16 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_fresh_partition_pending_bytes")]
     #[config_env(leaf)]
     pub fresh_partition_pending_bytes: IggyByteSize,
+    /// How long the newest object of a partition incarnation that committed
+    /// metadata no longer holds must be in the store before the sweep of the
+    /// root deletes the incarnation. The sweep lists the root every hour, or
+    /// every `orphan_grace` when that is shorter, and deletes an incarnation
+    /// that two sweeps in a row found. Zero or `disabled` turns the sweep
+    /// off. Otherwise at least [`ORPHAN_GRACE_MIN`].
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_orphan_grace")]
+    #[config_env(leaf)]
+    pub orphan_grace: IggyDuration,
 }
 
 /// How many jobs of each class the tier service of one shard runs at once,
@@ -432,6 +447,7 @@ impl Default for TieredStorageConfig {
             long_term_backlog_limit: default_long_term_backlog_limit(),
             fresh_pending_bytes: default_fresh_pending_bytes(),
             fresh_partition_pending_bytes: default_fresh_partition_pending_bytes(),
+            orphan_grace: default_orphan_grace(),
         }
     }
 }
@@ -480,7 +496,7 @@ impl Display for TieredStorageConfig {
              request_timeout: {}, progress_timeout: {}, max_attempts: {}, retry_delay: {}, \
              max_retry_delay: {}, read_cache_size: {}, read_cache_block_size: {}, \
              read_ahead: {}, fresh_upload_interval: {}, long_term_backlog_limit: {}, \
-             fresh_pending_bytes: {}, fresh_partition_pending_bytes: {} }}",
+             fresh_pending_bytes: {}, fresh_partition_pending_bytes: {}, orphan_grace: {} }}",
             self.backend,
             self.prefix,
             self.path,
@@ -504,6 +520,7 @@ impl Display for TieredStorageConfig {
             self.long_term_backlog_limit,
             self.fresh_pending_bytes,
             self.fresh_partition_pending_bytes,
+            self.orphan_grace,
         )
     }
 }
@@ -569,6 +586,13 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
             return refuse("prefix must not be empty");
         }
         self.validate_tuning()?;
+        let orphan_grace = self.orphan_grace.get_duration();
+        if !orphan_grace.is_zero() && orphan_grace < ORPHAN_GRACE_MIN {
+            return refuse(&format!(
+                "orphan_grace must be 0 (disabled) or at least {}",
+                IggyDuration::new(ORPHAN_GRACE_MIN)
+            ));
+        }
         if self.backend == TieredStorageBackend::MockS3 {
             self.validate_mock_s3()?;
         }
@@ -799,6 +823,10 @@ fn default_fresh_pending_bytes() -> IggyByteSize {
 
 fn default_fresh_partition_pending_bytes() -> IggyByteSize {
     IggyByteSize::from(8 * 1024 * 1024)
+}
+
+fn default_orphan_grace() -> IggyDuration {
+    IggyDuration::new(Duration::from_hours(6))
 }
 
 const fn default_demand_fetches() -> u32 {
@@ -1282,8 +1310,8 @@ mod tests {
         );
         assert!(config.validate().is_ok());
         let printed = format!(
-            "fresh_pending_bytes: {}, fresh_partition_pending_bytes: {} }}",
-            config.fresh_pending_bytes, config.fresh_partition_pending_bytes
+            "fresh_pending_bytes: {}, fresh_partition_pending_bytes: {}, orphan_grace: {} }}",
+            config.fresh_pending_bytes, config.fresh_partition_pending_bytes, config.orphan_grace
         );
         assert!(config.to_string().ends_with(&printed), "{config}");
     }
@@ -1334,6 +1362,55 @@ mod tests {
         assert!(bounds("16 MiB", "16 MiB").validate().is_ok());
         assert!(bounds("16 MiB", "16777217 B").validate().is_err());
         assert!(bounds("8 MiB", "32 MiB").validate().is_err());
+    }
+
+    #[test]
+    fn given_no_orphan_grace_when_reading_the_section_should_wait_six_hours() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(config.orphan_grace.get_duration(), Duration::from_hours(6));
+        assert_eq!(
+            config.orphan_grace,
+            TieredStorageConfig::default().orphan_grace
+        );
+        assert!(config.validate().is_ok());
+        assert!(config.to_string().contains("orphan_grace: 6h"), "{config}");
+    }
+
+    #[test]
+    fn given_orphan_grace_disabled_when_reading_the_section_should_turn_the_sweep_off() {
+        for text in ["disabled", "0", "none"] {
+            let config: TieredStorageConfig = serde_json::from_str(&format!(
+                r#"{{"backend": "fs", "path": "/var/lib/iggy-tiered", "orphan_grace": "{text}"}}"#
+            ))
+            .unwrap();
+
+            assert!(config.orphan_grace.is_zero(), "{text}");
+            assert!(config.validate().is_ok(), "{text}");
+        }
+        let unreadable = serde_json::from_str::<TieredStorageConfig>(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered", "orphan_grace": "soon"}"#,
+        );
+        assert!(unreadable.is_err());
+    }
+
+    #[test]
+    fn given_orphan_grace_below_a_second_when_validating_should_refuse() {
+        let grace = |text: &str| TieredStorageConfig {
+            orphan_grace: duration(text),
+            ..fs_config()
+        };
+
+        assert!(grace("1s").validate().is_ok());
+        assert!(grace("30 days").validate().is_ok());
+        assert!(grace("999ms").validate().is_err());
+        assert!(grace("1us").validate().is_err());
+        let ignored_without_a_backend = TieredStorageConfig {
+            orphan_grace: duration("1ms"),
+            ..TieredStorageConfig::default()
+        };
+        assert!(ignored_without_a_backend.validate().is_ok());
     }
 
     #[test]

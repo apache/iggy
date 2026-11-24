@@ -459,6 +459,11 @@ pub struct ShardMetrics {
     fresh_listings_truncated: Gauge,
     fresh_sweeps_held: Gauge,
     fresh_objects_deleted_total: Counter,
+    orphan_sweeps_total: Counter,
+    orphan_incarnations: Gauge,
+    orphan_incarnations_deleted_total: Counter,
+    orphan_objects_before_claim: Gauge,
+    orphan_identity_skips_total: Counter,
     partition_long_term_backlog_bytes: Gauge,
     partition_long_term_lags: Arc<Mutex<LongTermLags>>,
     partition_long_term_delayed_sends_total: Counter,
@@ -750,6 +755,11 @@ impl ShardMetrics {
             fresh_listings_truncated: Gauge::default(),
             fresh_sweeps_held: Gauge::default(),
             fresh_objects_deleted_total: Counter::default(),
+            orphan_sweeps_total: Counter::default(),
+            orphan_incarnations: Gauge::default(),
+            orphan_incarnations_deleted_total: Counter::default(),
+            orphan_objects_before_claim: Gauge::default(),
+            orphan_identity_skips_total: Counter::default(),
             partition_long_term_backlog_bytes: Gauge::default(),
             partition_long_term_lags: Arc::default(),
             partition_long_term_delayed_sends_total: Counter::default(),
@@ -2054,6 +2064,50 @@ impl ShardMetrics {
         self.fresh_objects_deleted_total.get()
     }
 
+    /// Bumped by every sweep of the root for orphan incarnations that listed
+    /// the whole root.
+    pub fn record_orphan_sweep(&self) {
+        self.orphan_sweeps_total.inc();
+    }
+
+    /// Republished by every sweep of the root that listed all of it, and
+    /// zeroed when its findings are dropped: the orphans it found, and the
+    /// objects of the incarnations left from before this cluster's claim of
+    /// the root.
+    pub fn set_orphan_findings(&self, orphans: usize, objects_before_claim: usize) {
+        self.orphan_incarnations
+            .set(i64::try_from(orphans).unwrap_or(i64::MAX));
+        self.orphan_objects_before_claim
+            .set(i64::try_from(objects_before_claim).unwrap_or(i64::MAX));
+    }
+
+    /// Bumped when the delete of an orphan incarnation left nothing of it.
+    pub fn record_orphan_incarnation_deleted(&self) {
+        self.orphan_incarnations_deleted_total.inc();
+    }
+
+    /// Bumped when a sweep of the root, or the delete of an orphan, found
+    /// the store identity object other than the claim it expected, and
+    /// deleted nothing.
+    pub fn record_orphan_identity_skip(&self) {
+        self.orphan_identity_skips_total.inc();
+    }
+
+    /// Test-only read, mirroring the siblings: the full sweeps, the orphans
+    /// of the last one, the orphans deleted, the objects from before the
+    /// claim, and the identity skips.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn orphan_sweep_values(&self) -> (u64, i64, u64, i64, u64) {
+        (
+            self.orphan_sweeps_total.get(),
+            self.orphan_incarnations.get(),
+            self.orphan_incarnations_deleted_total.get(),
+            self.orphan_objects_before_claim.get(),
+            self.orphan_identity_skips_total.get(),
+        )
+    }
+
     /// Republished by the pump's tick: the most messages one partition this
     /// shard leads committed that no long-term segment holds yet, as the
     /// partition's last rewrite pass found. Zero when none waits.
@@ -2719,6 +2773,36 @@ impl ShardMetrics {
             "fresh_objects_deleted",
             "fresh objects this replica deleted",
             self.fresh_objects_deleted_total.clone(),
+        );
+        registry.register(
+            "orphan_sweeps",
+            "sweeps of the object store root that listed every key of it for the objects of \
+             partition incarnations that committed metadata no longer holds",
+            self.orphan_sweeps_total.clone(),
+        );
+        registry.register(
+            "orphan_incarnations",
+            "partition incarnations the last sweep of the object store root found with objects \
+             and without a partition in committed metadata, which a second sweep deletes",
+            self.orphan_incarnations.clone(),
+        );
+        registry.register(
+            "orphan_incarnations_deleted",
+            "orphan partition incarnations whose objects were deleted from the object store",
+            self.orphan_incarnations_deleted_total.clone(),
+        );
+        registry.register(
+            "orphan_objects_before_claim",
+            "objects of partition incarnations without a partition in committed metadata that \
+             are no newer than this cluster's claim of the object store root, which the last \
+             sweep left for an operator",
+            self.orphan_objects_before_claim.clone(),
+        );
+        registry.register(
+            "orphan_identity_skips",
+            "sweeps of the object store root and orphan deletes that deleted nothing because \
+             the store identity object was not the claim they expected",
+            self.orphan_identity_skips_total.clone(),
         );
         registry.register(
             "partition_long_term_rewrite_lag_messages",

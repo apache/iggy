@@ -69,12 +69,20 @@ pub mod segment_anchor;
 pub mod segment_chain;
 mod segment_upload;
 pub use object_delete::{
-    DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, ListedSegment,
-    MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome,
-    ObjectDeleteStart, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects,
-    delete_incarnation, delete_long_term_segments, delete_objects, delete_segments,
-    list_segment_starts, sweep_long_term, sweep_segments, sweepable,
+    ClaimReadOutcome, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY,
+    IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteJob,
+    ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE,
+    RootListOutcome, SweptObjects, delete_incarnation, delete_long_term_segments, delete_objects,
+    delete_segments, list_segment_starts, sweep_long_term, sweep_segments, sweepable,
 };
+mod orphan_sweep;
+pub use orphan_sweep::{
+    ClaimStamp, ListedIncarnation, ORPHAN_LIST_PAGES_PER_JOB, ORPHAN_SWEEP_INTERVAL,
+    OrphanCandidates, OrphanDelete, OrphanGuard, OrphanRefusal, RootKey, RootListing, RootPages,
+    SweepFindings, SweepStamp, Verdict, quiet_since, sweep_interval, verdict,
+};
+mod orphan_sweep_job;
+pub use orphan_sweep_job::{delete_orphan, list_root, read_claim};
 mod fresh_proofs;
 pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
 mod fresh_upload;

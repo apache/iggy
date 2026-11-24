@@ -601,6 +601,7 @@ mod tests {
                 "IGGY_TIERED_STORAGE_FRESH_PARTITION_PENDING_BYTES",
                 "24 MiB",
             ),
+            ("IGGY_TIERED_STORAGE_ORPHAN_GRACE", "disabled"),
         ];
         let known = ServerConfig::all_env_var_names();
         for (name, value) in vars {
@@ -638,6 +639,7 @@ mod tests {
             tiered.fresh_partition_pending_bytes.as_bytes_u64(),
             24 * 1024 * 1024
         );
+        assert!(tiered.orphan_grace.is_zero());
         assert_eq!(
             tiered.jobs.upload_bytes.as_bytes_u64(),
             4 * 1024 * 1024 * 1024

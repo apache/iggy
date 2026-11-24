@@ -36,22 +36,27 @@
 //!
 //! The queue is memory only and holds what this node saw commit while it was
 //! the metadata primary. A restart, a primary change, a change feed that
-//! overflowed and a full queue each leave objects in the store, for a sweep
-//! of unowned prefixes to find. Nothing is queued on a shard without an
-//! object deleter, and a shard holds one only while its node passes the
-//! store identity check of [`crate::store_identity`].
+//! overflowed and a full queue each leave objects in the store, for the
+//! sweep of [`crate::orphan_sweep`] to find, and the orphans it finds go
+//! through the same queue. Nothing is queued on a shard without an object
+//! deleter, and a shard holds one only while its node passes the store
+//! identity check of [`crate::store_identity`].
 
 use crate::shell::ServerShard;
 use consensus::MetadataHandle;
 use iggy_common::IggyTimestamp;
+use iggy_object_store::ObjectPrefix;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::{PartitionChange, PartitionChangeKind};
-use partitions::{DeletedIncarnations, ObjectDeleteStart, ObjectDeleter, object_prefix};
+use metadata::stm::stream::{PartitionChange, PartitionChangeKind, Streams};
+use partitions::{
+    DeletedIncarnations, IncarnationSettled, ObjectDeleteStart, ObjectDeleter, OrphanGuard,
+    OrphanRefusal, object_prefix,
+};
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
 use std::rc::Rc;
-use tracing::warn;
+use tracing::{info, warn};
 
 /// The deleted incarnations of one shard and the task that deletes them.
 #[derive(Default)]
@@ -90,6 +95,35 @@ impl IncarnationDeletes {
         }
     }
 
+    /// Queue the orphans that the sweep of the store found, each due at
+    /// `now` and deleted only once the store still holds what its guard
+    /// records. Returns how many were queued.
+    pub fn queue_orphans(
+        &self,
+        shard: &ServerShard,
+        orphans: Vec<(ObjectPrefix, OrphanGuard)>,
+        now: IggyTimestamp,
+    ) -> usize {
+        if !shard.plane.metadata().is_settled_primary() || shard.object_deleter().is_none() {
+            return 0;
+        }
+        let mut queue = self.queue.borrow_mut();
+        let offered = orphans.len();
+        let queued = orphans
+            .into_iter()
+            .filter(|(prefix, guard)| queue.queue_orphan(*prefix, guard.clone(), now))
+            .count();
+        if queued < offered {
+            warn!(
+                shard = shard.id,
+                left_out = offered - queued,
+                queued = queue.len(),
+                "too many incarnations wait for the delete of their objects; the next sweep finds the orphans left out again"
+            );
+        }
+        queued
+    }
+
     /// Delete the objects of every incarnation that waited long enough by
     /// `now`, one job at a time in a detached task. A pass while that task
     /// runs starts nothing.
@@ -104,9 +138,10 @@ impl IncarnationDeletes {
         shard.bus.spawn(async move {
             let mut next = Some(first);
             while let Some((deleter, (job, scope))) = next {
-                let id = job.id;
+                let (id, prefix) = (job.id, job.prefix);
                 let outcome = deleter.run(job, scope).await;
-                queue.borrow_mut().finish(id, outcome, now);
+                let settled = queue.borrow_mut().finish(id, outcome, now);
+                record_settled(&owner, prefix, settled);
                 // A job that did not finish waits past `now`, so the task
                 // ends once it tried everything that was due.
                 next = next_job(&owner, &queue, now);
@@ -133,6 +168,50 @@ impl IncarnationDeletes {
             .borrow()
             .contains(&object_prefix(namespace, created_revision))
     }
+
+    /// Whether the orphan sweep queued `prefix`.
+    #[cfg(test)]
+    pub fn is_queued_orphan(&self, prefix: &ObjectPrefix) -> bool {
+        self.queue.borrow().is_orphan(prefix)
+    }
+}
+
+/// Whether committed metadata holds a partition of exactly the incarnation
+/// `prefix`. An id that names no namespace cannot be checked, so it counts
+/// as held, and nothing deletes it.
+pub fn holds_incarnation(streams: &Streams, prefix: &ObjectPrefix) -> bool {
+    let (Ok(stream_id), Ok(topic_id), Ok(partition_id)) = (
+        usize::try_from(prefix.stream_id),
+        usize::try_from(prefix.topic_id),
+        usize::try_from(prefix.partition_id),
+    ) else {
+        return true;
+    };
+    IggyNamespace::try_new(stream_id, topic_id, partition_id).is_none_or(|namespace| {
+        streams.created_revision_for_namespace(namespace) == Some(prefix.created_revision)
+    })
+}
+
+/// Count and log what a delete job of an orphan settled.
+fn record_settled(shard: &ServerShard, prefix: ObjectPrefix, settled: Option<IncarnationSettled>) {
+    match settled {
+        Some(IncarnationSettled::Deleted { orphan: true }) => {
+            shard.metrics().record_orphan_incarnation_deleted();
+            info!(
+                ?prefix,
+                "deleted the objects of a partition incarnation that committed metadata no longer holds"
+            );
+        }
+        Some(IncarnationSettled::Refused(OrphanRefusal::IdentityChanged)) => {
+            shard.metrics().record_orphan_identity_skip();
+        }
+        Some(
+            IncarnationSettled::Deleted { orphan: false }
+            | IncarnationSettled::Retried
+            | IncarnationSettled::Refused(_),
+        )
+        | None => {}
+    }
 }
 
 /// The next due job and the deleter to run it on. A node that is not the
@@ -150,19 +229,6 @@ fn next_job(
     }
     let deleter = shard.object_deleter()?;
     let streams = shard.plane.metadata().mux_stm.streams();
-    let start = queue.begin(now, |prefix| {
-        // An id that names no namespace cannot be checked, so it counts as
-        // live and is never deleted.
-        let (Ok(stream_id), Ok(topic_id), Ok(partition_id)) = (
-            usize::try_from(prefix.stream_id),
-            usize::try_from(prefix.topic_id),
-            usize::try_from(prefix.partition_id),
-        ) else {
-            return true;
-        };
-        IggyNamespace::try_new(stream_id, topic_id, partition_id).is_none_or(|namespace| {
-            streams.created_revision_for_namespace(namespace) == Some(prefix.created_revision)
-        })
-    })?;
+    let start = queue.begin(now, |prefix| holds_incarnation(streams, prefix))?;
     Some((deleter, start))
 }

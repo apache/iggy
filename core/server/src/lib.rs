@@ -72,6 +72,7 @@ pub(crate) mod geo_peers;
 pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
 pub(crate) mod origin_recovery;
+pub(crate) mod orphan_sweep;
 pub(crate) mod partition_reconciler;
 pub(crate) mod peer_manifests;
 pub(crate) mod peer_positions;
