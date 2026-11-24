@@ -36,6 +36,7 @@ use crate::dispatch::failure::{
     ClientOrigin, FrameChannel, send_eviction, send_host_frame, send_result_rejection,
 };
 use crate::dispatch::login_error::LoginRegisterError;
+use crate::external_auth::AccountRejection;
 use crate::reply_frame::{
     build_deny_reply, build_empty_reply, build_login_register_reply, current_metadata_commit,
 };
@@ -46,7 +47,9 @@ use consensus::client_table::bind_verifier;
 use consensus::{Consensus, MetadataHandle};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_binary_protocol::requests::system::SessionIdentity;
-use iggy_binary_protocol::requests::users::login_register::{BindSecret, RegisterRequest};
+use iggy_binary_protocol::requests::users::login_register::{
+    BindSecret, CredentialProof, RegisterRequest,
+};
 use iggy_binary_protocol::requests::users::{LoginRegisterRequest, LoginRegisterWithPatRequest};
 use iggy_binary_protocol::{
     ClientVersionInfo, Command, ConsensusHeader, EvictionReason, ForwardLogoutHeader,
@@ -90,11 +93,14 @@ pub fn warm_dummy_password_hash() {
     LazyLock::force(&DUMMY_PASSWORD_HASH);
 }
 
+/// The id of the account `username` names and what its password proved, read
+/// in the same read as the verified hash. A password change or a revocation
+/// committed after this read refuses the proof.
 pub fn verify_login_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     username: &str,
     password: &str,
-) -> Result<(u32, IggyTimestamp), LoginRegisterError>
+) -> Result<(u32, CredentialProof), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -136,14 +142,17 @@ where
         {
             return Err(LoginRegisterError::InvalidCredentials);
         }
-        Ok((user.id, user.created_at))
+        Ok((
+            user.id,
+            CredentialProof::account(user.created_at.as_micros(), user.access_revision),
+        ))
     })
 }
 
 pub fn verify_pat_credentials<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<(u32, IggyTimestamp), LoginRegisterError>
+) -> Result<(u32, CredentialProof), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -152,19 +161,19 @@ where
     SB: SuperblockStore + 'static,
 {
     verify_pat_credentials_with_expiry(shard, token)
-        .map(|(user_id, created_at, _)| (user_id, created_at))
+        .map(|(user_id, credential, _)| (user_id, credential))
 }
 
-/// Like [`verify_pat_credentials`] but also surfaces the owner's `created_at`,
-/// from the same read so it names the token's owner, and the token's expiry
-/// (unix seconds, `u64::MAX` when the PAT never expires). The HTTP extractor
-/// keys a per-token VSR session table on this expiry for lazy eviction; the
-/// wire and login paths need the account identity and go through
+/// Like [`verify_pat_credentials`] but also surfaces the token's expiry (Unix
+/// microseconds, `u64::MAX` when the PAT never expires). The proof names the token
+/// by the op that created it and its owner by `created_at`, both from the same
+/// read. The HTTP extractor keys a per-token VSR session table on this expiry
+/// for lazy eviction. The wire and login paths go through
 /// [`verify_pat_credentials`].
 pub fn verify_pat_credentials_with_expiry<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     token: &str,
-) -> Result<(u32, IggyTimestamp, u64), LoginRegisterError>
+) -> Result<(u32, CredentialProof, u64), LoginRegisterError>
 where
     B: ShellBus,
     MJ: JournalHandle + 'static,
@@ -187,7 +196,7 @@ where
                 MetadataSubmitError::NotCaughtUp,
             ));
         }
-        let Some((user_id, token_name)) =
+        let Some((user_id, token_name, token_id)) =
             users.personal_access_token_index.get(token_hash.as_str())
         else {
             return Err(LoginRegisterError::InvalidToken);
@@ -212,8 +221,12 @@ where
         // the HTTP session table never expiry-evicts its entry.
         let expiry = pat
             .expiry_at
-            .map_or(u64::MAX, |expiry_at| expiry_at.to_secs());
-        Ok((user.id, user.created_at, expiry))
+            .map_or(u64::MAX, |expiry_at| expiry_at.as_micros());
+        Ok((
+            user.id,
+            CredentialProof::token(user.created_at.as_micros(), *token_id),
+            expiry,
+        ))
     })
 }
 
@@ -224,7 +237,7 @@ async fn complete_login_register<B, MJ, S, SB>(
     origin: ClientOrigin,
     vsr_client_id: u128,
     request_header: &RoutedRequestHeader,
-    (user_id, user_created_at): (u32, IggyTimestamp),
+    (user_id, credential): (u32, CredentialProof),
     client_version: &ClientVersionInfo,
     secret: &BindSecret,
 ) -> Result<(), LoginRegisterError>
@@ -247,7 +260,7 @@ where
     // needs no rollback -- the connection stays Connected and the SDK
     // read-timeout replays.
     let registration = RegisterRequest {
-        user_created_at: user_created_at.as_micros(),
+        credential,
         bind_verifier: bind_verifier(vsr_client_id, user_id, secret.expose_secret()),
     };
     let session = match submit_register_on_owner(shard, vsr_client_id, user_id, registration).await
@@ -561,16 +574,8 @@ const FORWARD_SUBMIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// - `ClientIdOwnedByAnotherUser` stays a decision of the caught-up primary
 ///   and round-trips as a terminal refusal.
 ///
-/// Verification is point-in-time on the backup. A password change, PAT
-/// revocation, or user deactivation committed on the primary but not yet
-/// applied on the backup can therefore admit a login during the backup's apply
-/// lag. The forward cannot complete while the backup is partitioned from the
-/// primary, which bounds this to a connected replica's replication lag. This
-/// is the same stale-read window as the existing HTTP forward.
-///
-/// The session binds here before this node applies the commit locally. That
-/// is the window a primary-side login already has against every other node's
-/// apply lag, not a new one.
+/// The primary checks the proof against its applied state. After a successful
+/// Register the backup waits for that epoch before binding the connection.
 #[allow(clippy::future_not_send)]
 pub(in crate::dispatch) async fn submit_register_local_or_forward<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
@@ -1363,6 +1368,7 @@ async fn try_external_auth_login<B, MJ, S, SB>(
         },
     };
 
+    let started_at_op = shard.plane.metadata().applied_frontier().get();
     let decision = match callout_external_auth(ext_auth, ext_request).await {
         Ok(decision) => decision,
         Err(error) => {
@@ -1379,12 +1385,9 @@ async fn try_external_auth_login<B, MJ, S, SB>(
 
     let login_error = match decision {
         ValidatedDecision::Allow { username } => {
-            let resolve = shard
-                .plane
-                .metadata()
-                .mux_stm
-                .users()
-                .read(|users| crate::external_auth::resolve_username(users, &username));
+            let resolve = shard.plane.metadata().mux_stm.users().read(|users| {
+                crate::external_auth::resolve_username(users, &username, started_at_op)
+            });
             match resolve {
                 Ok(account) => {
                     match complete_login_register(
@@ -1406,19 +1409,12 @@ async fn try_external_auth_login<B, MJ, S, SB>(
                                 error = %error,
                                 "ext-auth login/register failed"
                             );
-                            error
+                            error.after_external_verification()
                         }
                     }
                 }
-                Err(iggy_error) => {
-                    warn!(
-                        transport_client_id,
-                        ext_username = %username,
-                        error = %iggy_error,
-                        "ext-auth user resolution failed"
-                    );
-                    LoginRegisterError::InvalidCredentials
-                }
+                Err(AccountRejection::CredentialChanged) => LoginRegisterError::CredentialChanged,
+                Err(_) => LoginRegisterError::InvalidCredentials,
             }
         }
         ValidatedDecision::Deny { reason } => {
@@ -1456,7 +1452,7 @@ mod tests {
     use metadata::IggyMetadata;
     use metadata::impls::metadata::IggySnapshot;
     use metadata::stm::StateMachine as _;
-    use metadata::stm::user::CreatePersonalAccessTokenRequest;
+    use metadata::stm::user::{ChangePasswordRequest, CreatePersonalAccessTokenRequest};
     use partitions::{IggyPartitions, PartitionPathLayout, PartitionsConfig};
     use server_common::MessageBag;
     use server_common::sharding::ShardId;
@@ -1556,10 +1552,39 @@ mod tests {
     fn terminal_vs_transient() {
         assert!(LoginRegisterError::InvalidCredentials.is_terminal());
         assert!(LoginRegisterError::InvalidToken.is_terminal());
+        assert!(!LoginRegisterError::CredentialChanged.is_terminal());
+        assert_eq!(
+            transient_login_code(&LoginRegisterError::CredentialChanged),
+            IggyError::TransientNotAccepted
+        );
         assert!(LoginRegisterError::UserInactive.is_terminal());
         assert!(LoginRegisterError::Binding(IggyError::Unauthenticated).is_terminal());
         // Transient is the only recoverable variant: never terminal.
         assert!(!LoginRegisterError::Transient(MetadataSubmitError::PipelineFull).is_terminal());
+    }
+
+    #[test]
+    fn given_refused_register_or_bind_when_externally_verified_should_retry_at_the_right_stage() {
+        for (error, expected) in [
+            (
+                LoginRegisterError::Transient(MetadataSubmitError::Unauthenticated),
+                IggyError::TransientNotAccepted,
+            ),
+            (
+                LoginRegisterError::Binding(IggyError::Unauthenticated),
+                IggyError::TransientNotCommitted,
+            ),
+        ] {
+            assert!(error.is_terminal());
+            let external = error.after_external_verification();
+            assert!(!external.is_terminal());
+            assert_eq!(transient_login_code(&external), expected);
+        }
+        assert!(
+            LoginRegisterError::Transient(MetadataSubmitError::ClientIdOwnedByAnotherUser)
+                .after_external_verification()
+                .is_terminal()
+        );
     }
 
     /// The reasons this module emits must map back to the credential
@@ -1812,6 +1837,88 @@ mod tests {
         );
     }
 
+    #[compio::test]
+    async fn given_a_lagging_backup_when_the_primary_checks_its_password_proof_should_refuse_the_old_revision()
+     {
+        const CLIENT: u128 = 7;
+        const EPOCH: u64 = 2;
+        const ROTATION: u64 = EPOCH + 1;
+        const VERIFIER: [u8; 32] = [0x5a; 32];
+        let primary_bus = SpyBus::default();
+        let primary = Rc::new(test_shard(&primary_bus, 0, 3, FIRST_BOOT));
+        let backup = Rc::new(test_shard(&SpyBus::default(), 1, 3, FIRST_BOOT));
+        let original_hash = server_common::crypto::hash_password("original");
+        for shard in [&primary, &backup] {
+            shard
+                .plane
+                .metadata()
+                .mux_stm
+                .users()
+                .ensure_root_user("root", &original_hash);
+        }
+        let metadata = primary.plane.metadata();
+        metadata
+            .client_table
+            .borrow_mut()
+            .commit_register(CLIENT, 0, VERIFIER, register_reply(CLIENT, EPOCH))
+            .expect("existing registration");
+        let change = ChangePasswordRequest {
+            keep_session: true,
+            user_id: iggy_binary_protocol::WireIdentifier::numeric(0),
+            access_revision: 1,
+            password_hash: server_common::crypto::hash_password("rotated"),
+        };
+        let prepare = prepare_message(Operation::ChangePassword, CLIENT, 1, &change.to_bytes())
+            .transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.op = ROTATION;
+                header.session = EPOCH;
+            });
+        let changed = metadata::apply_committed_prepare(
+            &*metadata.mux_stm,
+            &metadata.client_table,
+            true,
+            |_| {},
+            prepare,
+        );
+        assert_eq!(
+            iggy_binary_protocol::result_code(changed.reply.body()),
+            Some(0)
+        );
+
+        for (shard, password, expected) in [
+            (&backup, "original", ForwardRegisterOutcome::Unauthenticated),
+            (&primary, "rotated", ForwardRegisterOutcome::Ok),
+        ] {
+            let (user_id, credential) = verify_login_credentials(shard, "root", password)
+                .expect("current password on the verifying replica");
+            primary_bus.replica_sends.borrow_mut().clear();
+            answer_forwarded_register(
+                &primary,
+                CLIENT,
+                user_id,
+                RegisterRequest {
+                    credential,
+                    bind_verifier: VERIFIER,
+                },
+                1,
+                1,
+            )
+            .await;
+            let (target, reply) = primary_bus.sole_replica_send::<ForwardRegisterResultHeader>();
+            assert_eq!(target, 1);
+            assert_eq!(reply.outcome, expected);
+            assert_eq!(
+                reply.epoch,
+                if expected == ForwardRegisterOutcome::Ok {
+                    EPOCH
+                } else {
+                    0
+                }
+            );
+        }
+    }
+
     /// A backup's login: it forwards the register it authenticated to the
     /// view's primary and completes on the primary's verdict, with the whole
     /// round trip going through the real shard ingest arm.
@@ -1833,7 +1940,7 @@ mod tests {
                     CLIENT,
                     USER,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     },
                 )
@@ -1954,7 +2061,7 @@ mod tests {
                     0xCAFE,
                     7,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     },
                 )
@@ -1992,7 +2099,7 @@ mod tests {
             0xCAFE,
             7,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )
@@ -2106,7 +2213,7 @@ mod tests {
                     CLIENT,
                     7,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     },
                 )
@@ -2162,7 +2269,7 @@ mod tests {
                 0xCAFE,
                 7,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             ),
@@ -2186,7 +2293,7 @@ mod tests {
             0xCAFE,
             7,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )

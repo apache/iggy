@@ -128,7 +128,7 @@ export type MetadataTokenDeletedReason =
 export const MetadataSessionClosedReason = {
   Logout: 'logout',
   Expired: 'expired',
-  /** The user was deactivated or deleted */
+  /** A user delete, deactivation, password change, or delete of the session's token. */
   Revoked: 'revoked'
 } as const;
 

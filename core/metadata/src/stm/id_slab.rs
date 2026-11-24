@@ -33,6 +33,7 @@
 use crate::stm::walk::Directed;
 use std::collections::BTreeSet;
 use std::ops::{Index, IndexMut};
+use std::sync::Arc;
 
 /// Arena addressed by stable `usize` keys, allocating the lowest free key.
 #[derive(Debug, Clone)]
@@ -182,6 +183,15 @@ impl<T> IdSlab<T> {
         IterMut {
             inner: self.entries.iter_mut().enumerate(),
         }
+    }
+}
+
+impl<T: Clone> IdSlab<Arc<T>> {
+    /// The value at `key` for writing, copied first when another holder, such
+    /// as a checkpoint capture, shares it. Call it only once the write is
+    /// certain: a write that changes nothing still pays the copy.
+    pub fn make_mut(&mut self, key: usize) -> Option<&mut T> {
+        self.get_mut(key).map(Arc::make_mut)
     }
 }
 
