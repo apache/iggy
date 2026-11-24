@@ -18,6 +18,86 @@
 use super::*;
 
 #[test]
+fn given_partitions_of_two_creates_when_listing_those_of_one_op_should_keep_what_the_node_stores() {
+    const TOPIC_OP: u64 = 5;
+    const UNUSED_OP: u64 = 7;
+    const GROW_OP: u64 = 9;
+    let streams = Streams::default();
+    let timestamp = IggyTimestamp::from(1);
+    let stream = WireIdentifier::String(WireName::new("orders").unwrap());
+    let topic = WireIdentifier::String(WireName::new("events").unwrap());
+    let at = |metadata_op| ApplyContext {
+        metadata_op,
+        ..ApplyContext::default()
+    };
+    let assignment =
+        |partition_id, consensus_group_id, members: [u8; 2]| CreatedPartitionAssignment {
+            initial_view: 0,
+            partition_id,
+            consensus_group_id,
+            members: members.to_vec(),
+        };
+    let commands = [
+        StreamsCommand::CreateStream(
+            CreateStreamRequest {
+                name: WireName::new("orders").unwrap(),
+                options: WireOptions::empty(),
+            },
+            timestamp,
+            at(1),
+        ),
+        StreamsCommand::CreateTopicWithAssignments(
+            CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: stream.clone(),
+                    partitions_count: 2,
+                    name: WireName::new("events").unwrap(),
+                    options: TopicCreateOptions {
+                        replication_factor: Some(2),
+                        ..Default::default()
+                    }
+                    .to_wire()
+                    .unwrap(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![assignment(0, 1, [0, 1]), assignment(1, 2, [1, 2])],
+            },
+            timestamp,
+            at(TOPIC_OP),
+        ),
+        // Partition ids of this command count from the highest id of the topic.
+        StreamsCommand::CreatePartitionsWithAssignments(
+            CreatePartitionsWithAssignmentsRequest {
+                request: CreatePartitionsRequest {
+                    stream_id: stream.clone(),
+                    topic_id: topic.clone(),
+                    partitions_count: 1,
+                },
+                partitions: vec![assignment(0, 3, [0, 2])],
+            },
+            timestamp,
+            at(GROW_OP),
+        ),
+    ];
+    for command in commands {
+        streams.inner.try_apply(command).unwrap();
+    }
+    let created = |op, node| streams.partitions_created_at(&stream, &topic, op, node);
+    let partition = |id| IggyNamespace::new(0, 0, id);
+
+    assert_eq!(created(TOPIC_OP, 0), [partition(0)]);
+    assert_eq!(created(TOPIC_OP, 2), [partition(1)]);
+    assert_eq!(created(GROW_OP, 0), [partition(2)]);
+    assert_eq!(created(GROW_OP, 1), []);
+    assert_eq!(created(UNUSED_OP, 0), []);
+    let missing = WireIdentifier::String(WireName::new("missing").unwrap());
+    assert_eq!(
+        streams.partitions_created_at(&stream, &missing, TOPIC_OP, 0),
+        []
+    );
+}
+
+#[test]
 fn current_partition_count_scans_existing_topic_state() {
     let mut inner = StreamsInner::new();
     create_stream(&mut inner, "stream");

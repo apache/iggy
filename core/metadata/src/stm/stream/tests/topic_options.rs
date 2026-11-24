@@ -87,7 +87,10 @@ fn given_stored_critical_marker_when_patch_declares_more_keys_should_store_the_b
     };
     let mut inner = StreamsInner::new();
     create_stream(&mut inner, "stream");
-    inner.items[0]
+    inner
+        .items
+        .make_mut(0)
+        .unwrap()
         .options
         .insert(marker_key.clone(), marker("encryption_key_wrapped"));
 

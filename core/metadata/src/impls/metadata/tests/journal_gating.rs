@@ -22,7 +22,7 @@ use super::*;
 /// `checkpoint_if_needed` runs inside `on_replicate`, once per submit.
 /// Under a concurrent login/create burst, several `on_replicate` futures
 /// cross the forced-checkpoint boundary (journal `remaining_capacity <=
-/// CHECKPOINT_MARGIN`, i.e. op `SLOT_COUNT - MARGIN = 960`) together, and
+/// CHECKPOINT_MARGIN`, i.e. op `SLOTS - MARGIN = 960`) together, and
 /// every one of them runs a full checkpoint concurrently. The concurrent
 /// `journal.drain()` calls race on the one fixed `wal.tmp`: the losers
 /// surface `snapshot I/O error: No such file or directory` (or a short
@@ -42,18 +42,23 @@ async fn concurrent_checkpoint_boundary_must_not_drop_prepares() {
     const CLIENT: u128 = 1;
     const SESSION: u64 = 1;
     const ACTING_USER: u32 = 7;
+    /// Few enough that the fill below stays short.
+    const SLOTS: usize = 1024;
     /// One op below the forced-checkpoint trigger: the journal holds
-    /// 1024 slots and forces a checkpoint when 64 or fewer remain.
+    /// `SLOTS` slots and forces a checkpoint when 64 or fewer remain.
     const FILL: u64 = 960;
 
     let dir = tempfile::tempdir().unwrap();
     // Bootstrap creates the metadata dir; the coordinator's snapshot
     // persist expects it to exist.
     std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
-    let journal =
-        journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
-            .await
-            .unwrap();
+    let journal = journal::prepare_journal::PrepareJournal::open_with_slots(
+        &dir.path().join("journal.wal"),
+        0,
+        SLOTS,
+    )
+    .await
+    .unwrap();
     let consensus = VsrConsensus::new(
         1,
         0,
@@ -230,16 +235,21 @@ async fn given_a_submit_waiting_on_the_journal_gate_when_a_view_is_adopted_meanw
     const CLIENT: u128 = 1;
     let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
     let consensus = metadata.consensus.as_ref().unwrap();
+    commit_on_spy_bus_primary(&metadata, create_stream_request(CLIENT, 1, "committed")).await;
+    assert_eq!(
+        consensus.commit_min(),
+        1,
+        "op 1 gives a checkpoint a subject"
+    );
+    // Each prepare from here on finds the journal at the margin.
     metadata.set_checkpoint_margin(usize::MAX);
-    let coordinator = metadata.coordinator.as_ref().unwrap();
-    coordinator.checkpoint_pending.set(true);
 
     let held = metadata.journal_gate.try_acquire().unwrap();
     let waiting = compio::runtime::spawn({
         let metadata = Rc::clone(&metadata);
         async move {
             metadata
-                .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                .submit_request_in_process(create_stream_request(CLIENT, 2, "stale"))
                 .await
         }
     });
@@ -247,9 +257,9 @@ async fn given_a_submit_waiting_on_the_journal_gate_when_a_view_is_adopted_meanw
     assert_eq!(
         consensus.pipeline_len(),
         1,
-        "the submit claims op 1 and waits on the gate"
+        "the submit claims op 2 and waits on the gate"
     );
-    adopt_view(consensus, 1);
+    adopt_view(consensus, 1, 1);
     drop(held);
     let reply = waiting.await.unwrap().unwrap();
 
@@ -264,17 +274,19 @@ async fn given_a_submit_waiting_on_the_journal_gate_when_a_view_is_adopted_meanw
             .as_ref()
             .unwrap()
             .handle()
-            .header(1)
+            .header(2)
             .is_none(),
         "a prepare of view 0 must not enter the journal of view 1"
     );
-    assert!(
-        coordinator.checkpoint_pending.get(),
+    assert_eq!(
+        metadata.coordinator.as_ref().unwrap().last_checkpoint().0,
+        0,
         "a prepare of view 0 must not run a checkpoint in view 1"
     );
     for backup in 1..=2 {
-        assert!(
-            sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+        assert_eq!(
+            sent_prepare_ops(consensus.message_bus(), backup),
+            [1],
             "backup {backup} must not be sent a prepare of the view that ended"
         );
     }
@@ -289,20 +301,20 @@ async fn given_a_submit_inside_its_checkpoint_when_a_view_is_adopted_meanwhile_s
     const CLIENT: u128 = 1;
     let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
     let consensus = metadata.consensus.as_ref().unwrap();
-    // An interrupted checkpoint stays pending, and the next prepare retries it.
+    commit_on_spy_bus_primary(&metadata, create_stream_request(CLIENT, 1, "committed")).await;
+    assert_eq!(
+        consensus.commit_min(),
+        1,
+        "op 1 gives the checkpoint a subject"
+    );
+    // Each prepare from here on finds the journal at the margin.
     metadata.set_checkpoint_margin(usize::MAX);
-    metadata
-        .coordinator
-        .as_ref()
-        .unwrap()
-        .checkpoint_pending
-        .set(true);
 
     let checkpointing = compio::runtime::spawn({
         let metadata = Rc::clone(&metadata);
         async move {
             metadata
-                .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                .submit_request_in_process(create_stream_request(CLIENT, 2, "stale"))
                 .await
         }
     });
@@ -311,7 +323,7 @@ async fn given_a_submit_inside_its_checkpoint_when_a_view_is_adopted_meanwhile_s
         metadata.checkpoint_lock.try_acquire().is_none(),
         "the submit must be inside its checkpoint"
     );
-    adopt_view(consensus, 1);
+    adopt_view(consensus, 1, 1);
     let reply = checkpointing.await.unwrap().unwrap();
 
     assert_eq!(
@@ -325,18 +337,19 @@ async fn given_a_submit_inside_its_checkpoint_when_a_view_is_adopted_meanwhile_s
             .as_ref()
             .unwrap()
             .handle()
-            .header(1)
+            .header(2)
             .is_none(),
         "a prepare of view 0 must not enter the journal of view 1"
     );
     assert_eq!(
         consensus.sequencer().current_sequence(),
-        0,
+        1,
         "a prepare of view 0 must not move the sequencer of view 1"
     );
     for backup in 1..=2 {
-        assert!(
-            sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+        assert_eq!(
+            sent_prepare_ops(consensus.message_bus(), backup),
+            [1],
             "backup {backup} must not be sent a prepare of the view that ended"
         );
     }
@@ -396,7 +409,7 @@ async fn given_a_submit_inside_its_append_when_a_view_is_adopted_meanwhile_shoul
         journal.handle().header(1).is_none(),
         "the write must still be in flight"
     );
-    adopt_view(consensus, NEXT_VIEW);
+    adopt_view(consensus, NEXT_VIEW, 0);
     appending.await.unwrap().unwrap();
 
     assert!(

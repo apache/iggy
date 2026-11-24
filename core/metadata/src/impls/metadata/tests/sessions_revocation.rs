@@ -191,7 +191,7 @@ async fn expired_logout_waits_for_catchup_and_preserves_registered_members() {
             CLIENT,
             USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )
@@ -226,7 +226,7 @@ async fn expired_logout_removes_only_the_observed_session() {
             CLIENT,
             USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )
@@ -339,7 +339,7 @@ async fn recovery_frontier_records_partition_revisions_separately_from_metadata_
                 client,
                 7,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -580,7 +580,7 @@ async fn stale_logout_preserves_a_newer_session_and_its_membership() {
             CLIENT,
             USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )
@@ -696,7 +696,7 @@ async fn replayed_register_preserves_the_original_epoch_below_the_table_frontier
         &request,
         Operation::Register,
         &RegisterRequest {
-            user_created_at: 1,
+            credential: CredentialProof::account(1, 1),
             bind_verifier: [0x5a; 32],
         }
         .to_bytes(),
@@ -735,24 +735,6 @@ async fn given_user_revocation_when_committed_should_release_group_memberships()
         metadata.mux_stm.users().ensure_root_user("root", "hash");
         let consensus = metadata.consensus.as_ref().unwrap();
         let request = RoutedRequestHeader::default();
-        for user_id in 1..=USER {
-            let create = CreateUserRequest {
-                username: WireName::new(format!("user-{user_id}")).unwrap(),
-                password: "hash".to_owned(),
-                status: UserStatus::Active.as_code(),
-                permissions: None,
-                options: WireOptions::empty(),
-            };
-            metadata
-                .mux_stm
-                .update(build_prepare_message(
-                    consensus,
-                    &request,
-                    Operation::CreateUser,
-                    &create.to_bytes(),
-                ))
-                .unwrap();
-        }
         let mut snapshot =
             <IggySnapshot as Snapshot>::create(&*metadata.mux_stm, consensus.commit_min(), 1)
                 .unwrap();
@@ -872,7 +854,7 @@ async fn given_request_pipelined_behind_user_revocation_when_checkpointed_should
     const VICTIM_USER: u32 = 7;
     const REQUEST: u64 = 1;
     let registration = || RegisterRequest {
-        user_created_at: 1,
+        credential: CredentialProof::account(1, 1),
         bind_verifier: [0x5a; 32],
     };
     let with_session = |request: Message<RoutedRequestHeader>, session: u64| {
@@ -1105,10 +1087,10 @@ async fn given_two_sessions_of_one_user_when_revoked_should_publish_both_removal
             &*metadata.mux_stm,
             &metadata.client_table,
             true,
-            WireUserKey {
+            Revocation::User(WireUserKey {
                 user_id: GROUP_MEMBER_USER,
                 user_created_at: 0,
-            },
+            }),
             &header,
         );
         let seen = observer.join().unwrap();
@@ -1274,7 +1256,7 @@ async fn register_in_mid_commit_window_is_queued_then_committed() {
         CLIENT_C,
         ACTING_USER,
         RegisterRequest {
-            user_created_at: 1,
+            credential: CredentialProof::account(1, 1),
             bind_verifier: [0x5a; 32],
         },
     ));

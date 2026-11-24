@@ -119,14 +119,19 @@ fn given_a_reused_topic_id_when_sorting_by_creation_should_list_the_new_topic_la
     assert_eq!(reply.code, 0);
     create_topic_at(&mut inner, "d", 50);
 
-    let stream = &inner.items[0];
-    assert_eq!(stream.topics[0].name.as_ref(), "d");
-    let order: Vec<usize> = stream
-        .topics_by_created()
-        .into_iter()
-        .map(|((_, id), _)| id)
-        .collect();
-    assert_eq!(order, [1, 2, 0]);
+    let snapshot = Streams::from(inner.clone()).to_snapshot();
+    let restored = StreamsInner::inner_from_snapshot(snapshot, Arc::default());
+    for stream in [&inner.items[0], &restored.items[0]] {
+        assert_eq!(stream.topics[0].name.as_ref(), "d");
+        let ids = |after, descending| {
+            stream
+                .topics_by_created_after(after, descending)
+                .map(|((_, id), _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(None, false), [1, 2, 0]);
+        assert_eq!(ids(Some((50, 0)), true), [2, 1]);
+    }
 }
 
 #[test]

@@ -19,9 +19,9 @@ use iggy_binary_protocol::IGGY_PROTOCOL_VERSION;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::fmt;
 
-use crate::change_log::{ChangeLogSnapshot, RingSnapshot};
-use crate::stm::stream::StreamsSnapshot;
-use crate::stm::user::UsersSnapshot;
+use crate::change_log::{ChangeLogEncoder, ChangeLogSnapshot, RingSnapshot};
+use crate::stm::stream::{StreamsCapture, StreamsEncoder, StreamsSnapshot};
+use crate::stm::user::{UsersEncoder, UsersSnapshot};
 
 /// The snapshot format version written by this build.
 ///
@@ -29,10 +29,8 @@ use crate::stm::user::UsersSnapshot;
 /// fields change, including nested fields: `MessagePack` encodes structs
 /// positionally, so a layout change can reinterpret bytes without an error.
 ///
-/// [`MetadataSnapshot::decode`] accepts versions from
-/// [`MIN_READABLE_SNAPSHOT_FORMAT_VERSION`] through this version. Older accepted
-/// formats rely on defaulted trailing fields; incompatible versions outside
-/// that range are refused before payload deserialization.
+/// [`MetadataSnapshot::decode`] accepts only version 21. It checks the version
+/// before deserializing the payload.
 ///
 /// Version 2: `status` sits at reply-header offset 216 (version 1 carried a
 /// `namespace` word before it), which the client table's cached replies embed as raw
@@ -89,15 +87,20 @@ use crate::stm::user::UsersSnapshot;
 ///
 /// Version 20: the shadow record of a topic gained the peer's `geo_mode`, as a
 /// trailing, defaulted field.
-pub const SNAPSHOT_FORMAT_VERSION: u32 = 20;
+///
+/// Version 21: `UserSnapshot` gained `access_revision`, each
+/// `PersonalAccessTokenSnapshot` the `id` of the op that created it, and each
+/// `ClientEntrySnapshot` the `token_id` of the token it was opened with. None
+/// has a default that could stand in for the real value.
+pub const SNAPSHOT_FORMAT_VERSION: u32 = 21;
 
 /// Oldest format version [`MetadataSnapshot::decode`] still reads.
 ///
-/// Session protection is mandatory and its nested layout changed in version
-/// 14, so older snapshots cannot prove the current retry contract and are
-/// refused. Version 14 reads with every partition on every node and no
-/// retirement debt.
-pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 14;
+/// Version 21 carries the access revision every credential check compares and
+/// the token each session was opened with. An older snapshot has neither, so
+/// it could only restore accounts and sessions that no credential proves, and
+/// is refused.
+pub const MIN_READABLE_SNAPSHOT_FORMAT_VERSION: u32 = 21;
 
 /// The release that wrote a snapshot: the packed `iggy_binary_protocol` semver of
 /// this build. [`iggy_binary_protocol::ProtocolVersion`] documents the packing and
@@ -174,6 +177,13 @@ pub enum SnapshotError {
     HistoryBindingNotDurable {
         snapshot_seq: u64,
     },
+    /// A state transfer leaves `tail` ops between the journal floor and the
+    /// frontier of its client table, more than the WAL has slots. No checkpoint
+    /// runs below that frontier, so the replica could never journal the tail.
+    TransferTailExceedsJournal {
+        tail: u64,
+        journal_slots: usize,
+    },
 }
 
 /// Stage at which snapshot persistence failed.
@@ -243,6 +253,16 @@ impl fmt::Display for SnapshotError {
                      binding; the WAL suffix above it was kept"
                 )
             }
+            Self::TransferTailExceedsJournal {
+                tail,
+                journal_slots,
+            } => {
+                write!(
+                    f,
+                    "state transfer tail of {tail} ops does not fit the WAL: \
+                     `metadata.journal_slots` is {journal_slots}"
+                )
+            }
         }
     }
 }
@@ -261,7 +281,8 @@ impl std::error::Error for SnapshotError {
             | Self::Truncated { .. }
             | Self::UnsupportedFormatVersion { .. }
             | Self::IncoherentManifest { .. }
-            | Self::HistoryBindingNotDurable { .. } => None,
+            | Self::HistoryBindingNotDurable { .. }
+            | Self::TransferTailExceedsJournal { .. } => None,
         }
     }
 }
@@ -379,13 +400,8 @@ impl MetadataSnapshot {
     pub fn decode(bytes: &[u8]) -> Result<Self, SnapshotError> {
         // Bytes carrying no readable version are not a snapshot at all, so they fall
         // through to the deserializer, whose error names what actually went wrong.
-        if let Some(version) = peek_format_version(bytes)
-            && !(MIN_READABLE_SNAPSHOT_FORMAT_VERSION..=SNAPSHOT_FORMAT_VERSION).contains(&version)
-        {
-            return Err(SnapshotError::UnsupportedFormatVersion {
-                found: version,
-                expected: SNAPSHOT_FORMAT_VERSION,
-            });
+        if let Some(version) = peek_format_version(bytes) {
+            ensure_readable_format_version(version)?;
         }
         let snapshot: Self = rmp_serde::from_slice(bytes).map_err(SnapshotError::Deserialize)?;
         snapshot.validate()?;
@@ -393,11 +409,270 @@ impl MetadataSnapshot {
     }
 
     pub(crate) fn validate(&self) -> Result<(), SnapshotError> {
+        validate_credentials(
+            self.users.as_ref(),
+            self.client_table.as_ref(),
+            self.sequence_number,
+        )?;
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
             streams.validate_partition_members()?;
         }
         self.change_log.validate(self.sequence_number)
+    }
+}
+
+/// The credential rules of [`MetadataSnapshot::validate`]. They read only the
+/// sections that a [`MetadataCapture`] owns, so a capture checks them too.
+fn validate_credentials(
+    users: Option<&UsersSnapshot>,
+    client_table: Option<&consensus::ClientTableSnapshot>,
+    sequence_number: u64,
+) -> Result<(), SnapshotError> {
+    if let Some(users) = users {
+        users.validate_credential_ids(sequence_number)?;
+    }
+    // A session's token was created before the session registered.
+    if client_table.is_some_and(|table| {
+        table
+            .slots
+            .iter()
+            .any(|(_, entry)| entry.token_id >= entry.epoch)
+    }) {
+        return Err(SnapshotError::InvalidState(
+            "client entry token outside its session history",
+        ));
+    }
+    Ok(())
+}
+
+/// The state of one commit in the shape of [`MetadataSnapshot`], with the streams
+/// section held by pointer.
+///
+/// Taking it copies no stream (see [`StreamsCapture`]), so it can be encoded
+/// while the state machines move on. `CaptureEncoder` writes the bytes
+/// [`MetadataSnapshot::encode`] writes for the same state: the fields keep the
+/// order and types of [`MetadataSnapshot`], and the streams section encodes as a
+/// [`StreamsSnapshot`].
+#[derive(Debug)]
+pub struct MetadataCapture {
+    pub(crate) version: u32,
+    pub(crate) created_at: u64,
+    pub(crate) sequence_number: u64,
+    pub(crate) users: Option<UsersSnapshot>,
+    pub(crate) streams: Option<StreamsCapture>,
+    pub(crate) client_table: Option<consensus::ClientTableSnapshot>,
+    pub(crate) change_log: ChangeLogSnapshot,
+    pub(crate) writer_release: u32,
+}
+
+impl MetadataCapture {
+    /// Capture the state machines of `stm`. The client table and the change log
+    /// are not state machines, so the caller folds them in.
+    ///
+    /// # Errors
+    /// Whatever a state machine's [`FillSnapshot`] returns.
+    pub fn create<T>(stm: &T, sequence_number: u64, created_at: u64) -> Result<Self, SnapshotError>
+    where
+        T: FillSnapshot<Self>,
+    {
+        let mut capture = Self {
+            version: SNAPSHOT_FORMAT_VERSION,
+            created_at,
+            sequence_number,
+            users: None,
+            streams: None,
+            client_table: None,
+            change_log: ChangeLogSnapshot::default(),
+            writer_release: SNAPSHOT_WRITER_RELEASE,
+        };
+        stm.fill_snapshot(&mut capture)?;
+        Ok(capture)
+    }
+
+    /// Refuse credentials that recovery would refuse to restore, before a
+    /// checkpoint replaces the last snapshot that boots.
+    ///
+    /// # Errors
+    /// [`SnapshotError::InvalidState`] naming the rule that the capture breaks.
+    pub(crate) fn validate_credentials(&self) -> Result<(), SnapshotError> {
+        validate_credentials(
+            self.users.as_ref(),
+            self.client_table.as_ref(),
+            self.sequence_number,
+        )
+    }
+
+    pub(crate) const fn into_encoder(self) -> CaptureEncoder {
+        CaptureEncoder {
+            capture: self,
+            next: CaptureStep::Head,
+        }
+    }
+}
+
+/// The length of the msgpack array a [`MetadataSnapshot`] encodes as.
+const METADATA_SNAPSHOT_FIELDS: usize = 8;
+
+/// The length of the msgpack array a [`consensus::ClientTableSnapshot`]
+/// encodes as.
+const CLIENT_TABLE_SNAPSHOT_FIELDS: usize = 2;
+
+/// Encodes a [`MetadataCapture`] one step at a time, so a writer can stop
+/// between steps: the fields before the users, each step of [`UsersEncoder`]
+/// and of [`StreamsEncoder`], the client table one slot a step, each step of
+/// [`ChangeLogEncoder`], then the writer release.
+#[derive(Debug)]
+pub(crate) struct CaptureEncoder {
+    capture: MetadataCapture,
+    next: CaptureStep,
+}
+
+#[derive(Debug)]
+enum CaptureStep {
+    Head,
+    Users(UsersEncoder),
+    Streams(StreamsEncoder),
+    ClientTable,
+    ClientSlots(ArraySteps<(u32, consensus::ClientEntrySnapshot)>),
+    ChangeLog(ChangeLogEncoder),
+    Done,
+}
+
+impl CaptureEncoder {
+    /// Append the next step to `out` and return whether steps remain.
+    pub(crate) fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        match &mut self.next {
+            CaptureStep::Head => {
+                encode_array_len(out, METADATA_SNAPSHOT_FIELDS)?;
+                encode_value(out, &self.capture.version)?;
+                encode_value(out, &self.capture.created_at)?;
+                encode_value(out, &self.capture.sequence_number)?;
+                self.next = if let Some(users) = self.capture.users.take() {
+                    CaptureStep::Users(UsersEncoder::from(users))
+                } else {
+                    encode_value(out, &None::<UsersSnapshot>)?;
+                    self.streams_step(out)?
+                };
+            }
+            CaptureStep::Users(encoder) => {
+                if !encoder.encode_next(out)? {
+                    self.next = self.streams_step(out)?;
+                }
+            }
+            CaptureStep::Streams(encoder) => {
+                if !encoder.encode_next(out)? {
+                    self.next = CaptureStep::ClientTable;
+                }
+            }
+            CaptureStep::ClientTable => {
+                self.next = if let Some(table) = self.capture.client_table.take() {
+                    encode_array_len(out, CLIENT_TABLE_SNAPSHOT_FIELDS)?;
+                    encode_value(out, &table.capacity)?;
+                    CaptureStep::ClientSlots(ArraySteps::from(table.slots))
+                } else {
+                    encode_value(out, &None::<consensus::ClientTableSnapshot>)?;
+                    self.change_log_step()
+                };
+            }
+            CaptureStep::ClientSlots(slots) => {
+                if !slots.encode_next(out)? {
+                    self.next = self.change_log_step();
+                }
+            }
+            CaptureStep::ChangeLog(encoder) => {
+                if !encoder.encode_next(out)? {
+                    encode_value(out, &self.capture.writer_release)?;
+                    self.next = CaptureStep::Done;
+                }
+            }
+            CaptureStep::Done => {}
+        }
+        Ok(!matches!(self.next, CaptureStep::Done))
+    }
+
+    fn streams_step(&mut self, out: &mut Vec<u8>) -> Result<CaptureStep, SnapshotError> {
+        Ok(if let Some(streams) = self.capture.streams.take() {
+            CaptureStep::Streams(StreamsEncoder::from(streams))
+        } else {
+            encode_value(out, &None::<StreamsSnapshot>)?;
+            CaptureStep::ClientTable
+        })
+    }
+
+    fn change_log_step(&mut self) -> CaptureStep {
+        CaptureStep::ChangeLog(std::mem::take(&mut self.capture.change_log).into())
+    }
+}
+
+/// Append `value` to `out` as `rmp_serde::to_vec` encodes it.
+pub(crate) fn encode_value<T: Serialize + ?Sized>(
+    out: &mut Vec<u8>,
+    value: &T,
+) -> Result<(), SnapshotError> {
+    rmp_serde::encode::write(out, value).map_err(SnapshotError::Serialize)
+}
+
+/// Append the msgpack array header that serde writes ahead of `len` elements.
+pub(crate) fn encode_array_len(out: &mut Vec<u8>, len: usize) -> Result<(), SnapshotError> {
+    let len = u32::try_from(len)
+        .map_err(|_| SnapshotError::InvalidState("a snapshot array outgrows msgpack"))?;
+    rmp::encode::write_array_len(out, len)
+        .map_err(|error| SnapshotError::Serialize(error.into()))?;
+    Ok(())
+}
+
+/// Append the msgpack map header that serde writes ahead of `len` entries.
+pub(crate) fn encode_map_len(out: &mut Vec<u8>, len: usize) -> Result<(), SnapshotError> {
+    let len = u32::try_from(len)
+        .map_err(|_| SnapshotError::InvalidState("a snapshot map outgrows msgpack"))?;
+    rmp::encode::write_map_len(out, len).map_err(|error| SnapshotError::Serialize(error.into()))?;
+    Ok(())
+}
+
+/// Writes what the derived `Serialize` of a `Vec<T>` writes, one step at a
+/// time: the array header, then one element per step. A list that grows with
+/// the catalog is too much to encode between two yields of the snapshot
+/// writer.
+#[derive(Debug)]
+pub(crate) struct ArraySteps<T> {
+    items: std::vec::IntoIter<T>,
+    header_written: bool,
+}
+
+impl<T> From<Vec<T>> for ArraySteps<T> {
+    fn from(items: Vec<T>) -> Self {
+        Self {
+            items: items.into_iter(),
+            header_written: false,
+        }
+    }
+}
+
+/// The steps of a list that is already written.
+impl<T> Default for ArraySteps<T> {
+    fn default() -> Self {
+        Self {
+            items: Vec::new().into_iter(),
+            header_written: true,
+        }
+    }
+}
+
+impl<T: Serialize> ArraySteps<T> {
+    /// Append the next step to `out` and return whether steps remain.
+    pub(crate) fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        if !self.header_written {
+            encode_array_len(out, self.items.len())?;
+            self.header_written = true;
+        } else if let Some(item) = self.items.next() {
+            encode_value(out, &item)?;
+        }
+        Ok(!self.is_done())
+    }
+
+    pub(crate) fn is_done(&self) -> bool {
+        self.header_written && self.items.len() == 0
     }
 }
 
@@ -418,6 +693,48 @@ pub fn peek_format_version(encoded: &[u8]) -> Option<u32> {
     let mut cursor = encoded;
     rmp::decode::read_array_len(&mut cursor).ok()?;
     rmp::decode::read_int(&mut cursor).ok()
+}
+
+/// The sequence number stamped in encoded snapshot bytes, read from the leading
+/// elements without decoding the state sections behind them.
+///
+/// Unlike [`MetadataSnapshot::decode`] this does not validate the state: it
+/// answers which op a file covers, not whether its state restores.
+///
+/// # Errors
+/// [`SnapshotError::UnsupportedFormatVersion`] for a version this build does not
+/// read, since the position of the field depends on the layout, or
+/// [`SnapshotError::Deserialize`] when the leading elements are missing or are not
+/// unsigned integers.
+pub fn peek_sequence_number(encoded: &[u8]) -> Result<u64, SnapshotError> {
+    // `version`, `created_at`, `sequence_number`.
+    const LEADING_FIELDS: u32 = 3;
+
+    let deserialize =
+        |error: rmp::decode::NumValueReadError| SnapshotError::Deserialize(error.into());
+    let mut cursor = encoded;
+    let fields = rmp::decode::read_array_len(&mut cursor)
+        .map_err(|error| SnapshotError::Deserialize(error.into()))?;
+    if fields < LEADING_FIELDS {
+        return Err(SnapshotError::Deserialize(
+            rmp_serde::decode::Error::LengthMismatch(LEADING_FIELDS),
+        ));
+    }
+    let version: u32 = rmp::decode::read_int(&mut cursor).map_err(deserialize)?;
+    ensure_readable_format_version(version)?;
+    let _created_at: u64 = rmp::decode::read_int(&mut cursor).map_err(deserialize)?;
+    rmp::decode::read_int(&mut cursor).map_err(deserialize)
+}
+
+fn ensure_readable_format_version(version: u32) -> Result<(), SnapshotError> {
+    if (MIN_READABLE_SNAPSHOT_FORMAT_VERSION..=SNAPSHOT_FORMAT_VERSION).contains(&version) {
+        Ok(())
+    } else {
+        Err(SnapshotError::UnsupportedFormatVersion {
+            found: version,
+            expected: SNAPSHOT_FORMAT_VERSION,
+        })
+    }
 }
 
 /// Trait for metadata snapshot implementations.
@@ -562,7 +879,7 @@ impl<S> RestoreSnapshot<S> for () {
 /// ```
 #[macro_export]
 macro_rules! impl_fill_restore {
-    ($wrapper:ident, $field:ident) => {
+    ($wrapper:ident, $field:ident $(, $index:ident)?) => {
         impl $crate::stm::snapshot::FillSnapshot<$crate::stm::snapshot::MetadataSnapshot>
             for $wrapper
         {
@@ -591,6 +908,7 @@ macro_rules! impl_fill_restore {
                         stringify!($field)
                     )))
                 })?;
+                $(let snap = snap.$index(snapshot);)?
                 Self::from_snapshot(snap)
             }
         }
@@ -611,8 +929,9 @@ macro_rules! impl_fill_restore {
                             format_args!("Snapshot Restore Error: {}", stringify!($field)),
                         ))
                     })?;
+                    $(let snap = snap.$index(snapshot);)?
                     self.inner
-                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap))
+                        .try_apply([<$wrapper Command>]::RestoreSnapshot(snap, snapshot.sequence_number))
                         .map_err(|err| {
                             SnapshotError::Io(std::io::Error::other(format!(
                                 "in-place restore on a reader-only state machine: {err}"
@@ -649,7 +968,7 @@ mod tests {
     use crate::stm::stream::{
         PartitionSnapshot, StatsSnapshot, StreamSnapshot, StreamsSnapshot, TopicSnapshot,
     };
-    use crate::stm::user::UserSnapshot;
+    use crate::stm::user::{PersonalAccessTokenSnapshot, UserSnapshot, Users};
     use iggy_common::{
         HeaderKey, HeaderValue, IggyTimestamp, OptionKey, OptionValue, ResourceOptions,
     };
@@ -669,6 +988,140 @@ mod tests {
         assert!(decoded.client_table.is_none());
     }
 
+    /// The checkpoint goldens always hold a streams section, so this pins the
+    /// encoding of a capture without one.
+    #[test]
+    fn given_a_capture_without_state_machines_when_encoding_should_write_the_snapshot_bytes() {
+        const CREATED_AT: u64 = 1_700_000_000_000_000;
+        let mut expected = MetadataSnapshot::new(7);
+        expected.created_at = CREATED_AT;
+        let mut encoder = MetadataCapture::create(&(), 7, CREATED_AT)
+            .unwrap()
+            .into_encoder();
+
+        let mut bytes = Vec::new();
+        while encoder.encode_next(&mut bytes).unwrap() {}
+
+        assert_eq!(bytes, expected.encode().unwrap());
+    }
+
+    /// A client table encodes one slot a step, with the bytes of the derived
+    /// encoding, so a full table does not land in one chunk of the writer.
+    #[test]
+    fn given_a_capture_with_client_slots_when_encoding_should_write_the_snapshot_bytes_a_slot_a_step()
+     {
+        const CREATED_AT: u64 = 1_700_000_000_000_000;
+        const SLOTS: u32 = 3;
+        let slots: Vec<_> = (0..SLOTS)
+            .map(|slot| {
+                let entry = consensus::ClientEntrySnapshot {
+                    bind_verifier: [u8::try_from(slot).unwrap(); 32],
+                    ended_op: (slot == 1).then_some(9),
+                    client_id: u128::from(slot) + 1,
+                    epoch: 2,
+                    user_id: slot,
+                    token_id: 1,
+                    watermark: 5,
+                    reply: vec![0x80; 300],
+                };
+                (slot * 2, entry)
+            })
+            .collect();
+        let slots_bytes = rmp_serde::to_vec(&slots).unwrap().len();
+        let client_table = consensus::ClientTableSnapshot { capacity: 8, slots };
+        let mut expected = MetadataSnapshot::new(7);
+        expected.created_at = CREATED_AT;
+        expected.client_table = Some(client_table.clone());
+        let mut capture = MetadataCapture::create(&(), 7, CREATED_AT).unwrap();
+        capture.client_table = Some(client_table);
+        let mut encoder = capture.into_encoder();
+
+        let mut bytes = Vec::new();
+        let mut largest_step = 0;
+        loop {
+            let before = bytes.len();
+            let more = encoder.encode_next(&mut bytes).unwrap();
+            largest_step = largest_step.max(bytes.len() - before);
+            if !more {
+                break;
+            }
+        }
+
+        assert_eq!(bytes, expected.encode().unwrap());
+        assert!(
+            largest_step < slots_bytes / 2,
+            "a step of {largest_step} bytes holds more than one of the {SLOTS} slots"
+        );
+    }
+
+    /// The users section encodes one entry a step, with the bytes of the
+    /// derived encoding, so the user list does not land in one chunk of the
+    /// writer.
+    #[test]
+    fn given_a_capture_with_users_when_encoding_should_write_the_snapshot_bytes_an_entry_a_step() {
+        use crate::stm::user::{PermissionerSnapshot, PersonalAccessTokenSnapshot, UsersSnapshot};
+
+        const CREATED_AT: u64 = 1_700_000_000_000_000;
+        // Above 15 entries a msgpack array takes the long form of its header.
+        const USERS: u32 = 20;
+        let ids = || 0..USERS;
+        let users = UsersSnapshot {
+            items: ids()
+                .map(|id| {
+                    let user = user_snapshot_fixture(id, &format!("user-{id}"), "hash");
+                    (id as usize, user)
+                })
+                .collect(),
+            personal_access_tokens: ids()
+                .map(|id| {
+                    let token = PersonalAccessTokenSnapshot {
+                        user_id: id,
+                        name: format!("token-{id}"),
+                        token: format!("secret-{id}"),
+                        expiry_at: (id % 2 == 0).then(|| IggyTimestamp::from(u64::from(id))),
+                        id: u64::from(id) + 1,
+                    };
+                    (id, vec![(token.name.clone(), token)])
+                })
+                .collect(),
+            // As `Users::to_snapshot` writes it, apart from one list that pins
+            // the place of the section.
+            permissioner: PermissionerSnapshot {
+                users_permissions: Vec::new(),
+                users_streams_permissions: Vec::new(),
+                users_that_can_poll_messages_from_all_streams: vec![7],
+                users_that_can_send_messages_to_all_streams: Vec::new(),
+                users_that_can_poll_messages_from_specific_streams: Vec::new(),
+                users_that_can_send_messages_to_specific_streams: Vec::new(),
+            },
+            grants_by_creation: ahash::AHashMap::new(),
+        };
+        let users_bytes = rmp_serde::to_vec(&users.items).unwrap().len();
+        let mut expected = MetadataSnapshot::new(7);
+        expected.created_at = CREATED_AT;
+        expected.users = Some(users.clone());
+        let mut capture = MetadataCapture::create(&(), 7, CREATED_AT).unwrap();
+        capture.users = Some(users);
+        let mut encoder = capture.into_encoder();
+
+        let mut bytes = Vec::new();
+        let mut largest_step = 0;
+        loop {
+            let before = bytes.len();
+            let more = encoder.encode_next(&mut bytes).unwrap();
+            largest_step = largest_step.max(bytes.len() - before);
+            if !more {
+                break;
+            }
+        }
+
+        assert_eq!(bytes, expected.encode().unwrap());
+        assert!(
+            largest_step < users_bytes / 4,
+            "a step of {largest_step} bytes holds more than one of the {USERS} users"
+        );
+    }
+
     #[test]
     fn encoded_shape_is_pinned_to_the_format_version() {
         // The gate is only as good as the discipline that bumps it, and nothing else
@@ -678,7 +1131,7 @@ mod tests {
         // operator's boot reading one field's bytes as another's. Changing either
         // number is the reminder to change the other.
         const FIELD_COUNT: u32 = 8;
-        const PINNED_VERSION: u32 = 20;
+        const PINNED_VERSION: u32 = 21;
 
         let encoded = MetadataSnapshot::new(0).encode().unwrap();
         let mut cursor = encoded.as_slice();
@@ -704,7 +1157,9 @@ mod tests {
         const TOPIC_FIELD_COUNT: u32 = 12;
         const STREAM_FIELD_COUNT: u32 = 8;
         const STREAMS_FIELD_COUNT: u32 = 5;
-        const USER_FIELD_COUNT: u32 = 7;
+        const USER_FIELD_COUNT: u32 = 8;
+        const PERSONAL_ACCESS_TOKEN_FIELD_COUNT: u32 = 5;
+        const CLIENT_ENTRY_FIELD_COUNT: u32 = 8;
         // Version 4 appended `fences`; it is defaulted on read, which is what
         // keeps version 3 readable, so a further append here needs the same
         // treatment or a bump.
@@ -726,6 +1181,23 @@ mod tests {
             "ClientTableSnapshot's field count changed; default the new field or bump the version"
         );
         cursor.clear();
+
+        let client_entry = consensus::ClientEntrySnapshot {
+            bind_verifier: [0; 32],
+            ended_op: None,
+            client_id: 0,
+            epoch: 0,
+            user_id: 0,
+            token_id: 0,
+            watermark: 0,
+            reply: Vec::new(),
+        };
+        let encoded = rmp_serde::to_vec(&client_entry).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            CLIENT_ENTRY_FIELD_COUNT,
+            "ClientEntrySnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
 
         let topic = TopicSnapshot {
             id: 0,
@@ -811,6 +1283,7 @@ mod tests {
             password_hash: String::new(),
             status: iggy_common::UserStatus::Active,
             created_at: IggyTimestamp::default(),
+            access_revision: 0,
             permissions: None,
             options: ResourceOptions::new(),
         };
@@ -820,6 +1293,68 @@ mod tests {
             USER_FIELD_COUNT,
             "UserSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
         );
+
+        let token = PersonalAccessTokenSnapshot {
+            user_id: 0,
+            name: String::new(),
+            token: String::new(),
+            expiry_at: None,
+            id: 0,
+        };
+        let encoded = rmp_serde::to_vec(&token).unwrap();
+        assert_eq!(
+            rmp::decode::read_array_len(&mut encoded.as_slice()).unwrap(),
+            PERSONAL_ACCESS_TOKEN_FIELD_COUNT,
+            "PersonalAccessTokenSnapshot's field count changed; bump SNAPSHOT_FORMAT_VERSION with it"
+        );
+    }
+
+    #[test]
+    fn given_invalid_access_revision_when_decoding_a_checkpoint_should_refuse() {
+        let users = Users::default();
+        users.ensure_root_user("root", "hash");
+        for revision in [0, 6] {
+            let mut snapshot = MetadataSnapshot::new(5);
+            let mut section = users.to_snapshot();
+            section.items[0].1.access_revision = revision;
+            snapshot.users = Some(section);
+            assert!(matches!(
+                MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+                Err(SnapshotError::InvalidState(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn given_conflicting_token_names_when_restoring_a_checkpoint_should_refuse() {
+        let users = Users::default();
+        users.ensure_root_user("root", "hash");
+        let entry = |id| {
+            let name = "build".to_owned();
+            (
+                name.clone(),
+                PersonalAccessTokenSnapshot {
+                    user_id: 0,
+                    name,
+                    token: format!("{id:064x}"),
+                    expiry_at: None,
+                    id,
+                },
+            )
+        };
+        for buckets in [
+            vec![(0, vec![entry(2), entry(3)])],
+            vec![(0, vec![entry(2)]), (0, vec![entry(3)])],
+        ] {
+            let mut section = users.to_snapshot();
+            section.personal_access_tokens = buckets;
+            let mut snapshot = MetadataSnapshot::new(5);
+            snapshot.users = Some(section);
+            assert!(matches!(
+                MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+                Err(SnapshotError::InvalidState(_))
+            ));
+        }
     }
 
     #[test]
@@ -858,6 +1393,53 @@ mod tests {
             Some(SNAPSHOT_FORMAT_VERSION),
             "the first array element must be the format version"
         );
+    }
+
+    #[test]
+    fn given_encoded_snapshot_when_peeking_sequence_number_should_read_only_the_leading_fields() {
+        let mut snapshot = MetadataSnapshot::new(u64::from(u32::MAX) + 7);
+        snapshot.created_at = 1_700_000_000_000_000;
+        let encoded = snapshot.encode().unwrap();
+        let decoded = MetadataSnapshot::decode(&encoded).unwrap().sequence_number;
+        assert_eq!(peek_sequence_number(&encoded).unwrap(), decoded);
+
+        let leading_len = (0..=encoded.len())
+            .find(|&len| peek_sequence_number(&encoded[..len]).is_ok())
+            .unwrap();
+        assert!(leading_len < encoded.len(), "the sections must not be read");
+        assert_eq!(
+            peek_sequence_number(&encoded[..leading_len]).unwrap(),
+            decoded
+        );
+        for len in 0..leading_len {
+            assert!(
+                matches!(
+                    peek_sequence_number(&encoded[..len]),
+                    Err(SnapshotError::Deserialize(_))
+                ),
+                "a payload truncated to {len} bytes must not yield a sequence number"
+            );
+        }
+    }
+
+    #[test]
+    fn given_unreadable_layout_when_peeking_sequence_number_should_refuse_it() {
+        let mut foreign = MetadataSnapshot::new(3);
+        foreign.version = SNAPSHOT_FORMAT_VERSION + 1;
+        assert!(matches!(
+            peek_sequence_number(&foreign.encode().unwrap()),
+            Err(SnapshotError::UnsupportedFormatVersion { found, .. })
+                if found == SNAPSHOT_FORMAT_VERSION + 1
+        ));
+
+        // Two elements, then a value that a reader ignoring the length would take
+        // for the sequence number.
+        let mut short = rmp_serde::to_vec(&(SNAPSHOT_FORMAT_VERSION, 0u64)).unwrap();
+        short.push(5);
+        assert!(matches!(
+            peek_sequence_number(&short),
+            Err(SnapshotError::Deserialize(_))
+        ));
     }
 
     #[test]
@@ -1205,6 +1787,7 @@ mod tests {
             password_hash: password_hash.to_string(),
             status: UserStatus::Active,
             created_at: IggyTimestamp::from(1_694_968_446_131_680_u64),
+            access_revision: 1,
             permissions: None,
             options: ResourceOptions::default(),
         }
@@ -1229,6 +1812,7 @@ mod tests {
         use crate::stm::user::{PermissionerSnapshot, UsersSnapshot};
 
         let users_snap = UsersSnapshot {
+            grants_by_creation: ahash::AHashMap::new(),
             items: vec![
                 (0, user_snapshot_fixture(0, "alice", "hash_a")),
                 (2, user_snapshot_fixture(2, "charlie", "hash_c")),

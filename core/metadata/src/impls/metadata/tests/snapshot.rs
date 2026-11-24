@@ -47,7 +47,7 @@ async fn given_cached_offer_when_installing_snapshot_should_invalidate_without_r
     let mut metadata = metadata_plane();
     metadata.coordinator = Some(SnapshotCoordinator::new(
         directory.path().to_path_buf(),
-        IggySnapshot::create,
+        MetadataCapture::create,
     ));
     let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
     IggySnapshot::create(&TestMux::default(), 0, 1)
@@ -56,17 +56,17 @@ async fn given_cached_offer_when_installing_snapshot_should_invalidate_without_r
         .await
         .unwrap();
     let checkpoint = metadata.checkpoint_lock.acquire().await;
-    {
-        let mut blocked_offer = std::pin::pin!(metadata.state_transfer_offer());
-        assert!(matches!(
-            futures::poll!(&mut blocked_offer),
-            std::task::Poll::Ready(Err(StateTransferUnavailable::CheckpointInProgress))
-        ));
-    }
+    assert!(
+        matches!(
+            metadata.state_transfer_offer().await,
+            Err(StateTransferUnavailable::SnapshotReplaced)
+        ),
+        "a running checkpoint must refuse an offer of the file it replaces"
+    );
     drop(checkpoint);
-    let first = settled_transfer_offer(&metadata).await.unwrap();
+    let first = metadata.state_transfer_offer().await.unwrap();
     std::fs::remove_file(&path).unwrap();
-    let cached = settled_transfer_offer(&metadata).await.unwrap();
+    let cached = metadata.state_transfer_offer().await.unwrap();
     assert!(
         Rc::ptr_eq(&first, &cached),
         "a cache hit must need no disk read"
@@ -79,7 +79,7 @@ async fn given_cached_offer_when_installing_snapshot_should_invalidate_without_r
         .install_state_transfer(&incoming, ClientTable::new(CLIENTS_TABLE_MAX), 1, 1)
         .await
         .unwrap();
-    let replaced = settled_transfer_offer(&metadata).await.unwrap();
+    let replaced = metadata.state_transfer_offer().await.unwrap();
     assert_eq!(replaced.snapshot_seq, 1);
     assert!(!Rc::ptr_eq(&first, &replaced));
 
@@ -88,9 +88,82 @@ async fn given_cached_offer_when_installing_snapshot_should_invalidate_without_r
     damaged[0] ^= 1;
     std::fs::write(&path, damaged).unwrap();
     assert!(matches!(
-        settled_transfer_offer(&metadata).await,
+        metadata.state_transfer_offer().await,
         Err(StateTransferUnavailable::SnapshotUnreadable(_))
     ));
+}
+
+#[compio::test]
+async fn given_a_snapshot_replacement_when_offering_should_never_serve_the_replaced_file_after_it()
+{
+    const OLD_SEQ: u64 = 1;
+    const NEW_SEQ: u64 = 2;
+    const NEWER_SEQ: u64 = 3;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+    let mut metadata = metadata_plane();
+    metadata.coordinator = Some(SnapshotCoordinator::new(
+        directory.path().to_path_buf(),
+        MetadataCapture::create,
+    ));
+    let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
+    IggySnapshot::create(&TestMux::default(), OLD_SEQ, 1)
+        .unwrap()
+        .persist(&path)
+        .await
+        .unwrap();
+    let transferred = |seq| {
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), seq, seq).unwrap();
+        snapshot.snapshot_mut().client_table = Some(metadata.client_table.borrow().to_snapshot());
+        snapshot.encode().unwrap()
+    };
+    let table = || ClientTable::new(CLIENTS_TABLE_MAX);
+
+    // An offer cached before the install is refused while the install writes
+    // and dropped at its rename.
+    let before = metadata.state_transfer_offer().await.unwrap();
+    assert_eq!(before.snapshot_seq, OLD_SEQ);
+    let new_bytes = transferred(NEW_SEQ);
+    let held = SNAPSHOT_IO.lock().await;
+    let mut installing =
+        Box::pin(metadata.install_state_transfer(&new_bytes, table(), NEW_SEQ, NEW_SEQ));
+    assert!(futures::poll!(&mut installing).is_pending());
+    assert!(matches!(
+        metadata.state_transfer_offer().await,
+        Err(StateTransferUnavailable::SnapshotReplaced)
+    ));
+    drop(held);
+    installing.await.unwrap();
+    assert_eq!(
+        metadata.state_transfer_offer().await.unwrap().snapshot_seq,
+        NEW_SEQ,
+        "the cache must not outlive the file it was read from"
+    );
+
+    // A read that spans a rename is refused and leaves the cache empty.
+    metadata.clear_state_transfer_offer_cache();
+    let newer_bytes = transferred(NEWER_SEQ);
+    let mut offer = Box::pin(metadata.state_transfer_offer());
+    assert!(
+        futures::poll!(&mut offer).is_pending(),
+        "the read must suspend"
+    );
+    metadata
+        .install_state_transfer(&newer_bytes, table(), NEWER_SEQ, NEWER_SEQ)
+        .await
+        .unwrap();
+    assert!(matches!(
+        offer.await,
+        Err(StateTransferUnavailable::SnapshotReplaced)
+    ));
+    assert!(
+        metadata.transfer_offer_cache.borrow().is_none(),
+        "a refused offer must not reach the cache"
+    );
+    assert_eq!(
+        metadata.state_transfer_offer().await.unwrap().snapshot_seq,
+        NEWER_SEQ
+    );
 }
 
 #[test]
@@ -253,7 +326,7 @@ async fn given_a_primary_below_its_recovery_barrier_when_a_peer_asks_for_state_s
     let mut metadata = metadata_plane();
     metadata.coordinator = Some(SnapshotCoordinator::new(
         directory.path().to_path_buf(),
-        IggySnapshot::create,
+        MetadataCapture::create,
     ));
     let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
     IggySnapshot::create(&TestMux::default(), SNAPSHOT_OP, 1)
@@ -265,7 +338,8 @@ async fn given_a_primary_below_its_recovery_barrier_when_a_peer_asks_for_state_s
     consensus.restore_commit_state(COMMITTED, COMMITTED);
     consensus.set_recovery_barrier(COMMITTED + 1);
 
-    let offer = settled_transfer_offer(&metadata)
+    let offer = metadata
+        .state_transfer_offer()
         .await
         .expect("a primary below its recovery barrier must still serve committed state");
     assert_eq!(offer.snapshot_seq, SNAPSHOT_OP);
@@ -289,7 +363,7 @@ async fn given_commits_during_snapshot_io_when_installing_should_preserve_the_ne
         let mut metadata = metadata_plane();
         metadata.coordinator = Some(SnapshotCoordinator::new(
             directory.path().to_path_buf(),
-            IggySnapshot::create,
+            MetadataCapture::create,
         ));
         let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
         table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();

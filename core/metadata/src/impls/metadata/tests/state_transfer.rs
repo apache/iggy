@@ -38,7 +38,7 @@ async fn given_retried_keyless_create_when_committed_should_store_one_envelope()
             CLIENT,
             USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )
@@ -113,7 +113,7 @@ async fn given_newer_local_state_when_installing_stale_transfer_should_preserve_
             CLIENT,
             USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: BIND_VERIFIER,
             },
         )
@@ -140,7 +140,7 @@ async fn given_newer_local_state_when_installing_stale_transfer_should_preserve_
             NEW_CLIENT,
             USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: BIND_VERIFIER,
             },
         )
@@ -184,9 +184,10 @@ async fn given_newer_local_state_when_installing_stale_transfer_should_preserve_
                 CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: BIND_VERIFIER
-                }
+                },
+                consensus.clock_realtime_micros()
             )
             .unwrap()
             .epoch,
@@ -198,9 +199,10 @@ async fn given_newer_local_state_when_installing_stale_transfer_should_preserve_
                 NEW_CLIENT,
                 USER,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: BIND_VERIFIER
-                }
+                },
+                consensus.clock_realtime_micros()
             )
             .unwrap()
             .epoch,
@@ -300,6 +302,47 @@ async fn given_ahead_client_table_when_installing_older_transfer_should_preserve
 }
 
 #[compio::test]
+async fn given_a_durable_pairing_and_a_failed_trim_when_retrying_at_the_same_op_should_keep_the_paired_snapshot()
+ {
+    const COMMITTED: u64 = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let superblock = Rc::new(CheckpointSuperblock::default());
+    let (md, _jobs) = job_metadata(dir.path(), 0, 1, Some(Rc::clone(&superblock))).await;
+    commit_on_primary(&md, 1..=COMMITTED).await;
+    let consensus = md.consensus.as_ref().unwrap();
+    let journal = md.journal.as_ref().unwrap();
+    let coordinator = md.coordinator.as_ref().unwrap();
+    // The journal refuses a trim while another drain is in flight.
+    let mut other_drain = std::pin::pin!(journal.handle().drain(1..=1));
+    assert!(futures::poll!(other_drain.as_mut()).is_pending());
+    md.set_checkpoint_margin(usize::MAX);
+    md.checkpoint_if_needed(consensus, journal).await;
+    assert_eq!(coordinator.superblock_checkpoint_op.get(), COMMITTED);
+    assert!(coordinator.checkpoint_pending.get(), "the trim failed");
+    assert_eq!(journal_floor(&md), 0);
+    let paired = std::fs::read(coordinator.snapshot_path()).unwrap();
+
+    md.checkpoint_if_needed(consensus, journal).await;
+
+    assert_eq!(
+        superblock.writes.get(),
+        1,
+        "a second capture of the paired op must not start"
+    );
+    assert_eq!(
+        std::fs::read(coordinator.snapshot_path()).unwrap(),
+        paired,
+        "the superblock pairs the checksum of the first snapshot of this op"
+    );
+
+    other_drain.await.unwrap();
+    md.checkpoint_if_needed(consensus, journal).await;
+    assert!(!coordinator.checkpoint_pending.get());
+    assert_eq!(journal_floor(&md), COMMITTED - 1);
+    assert_eq!(superblock.writes.get(), 1);
+}
+
+#[compio::test]
 async fn given_a_saved_snapshot_and_failed_superblock_when_retrying_should_finish_the_same_checkpoint()
  {
     let directory = tempfile::tempdir().unwrap();
@@ -364,12 +407,28 @@ async fn given_a_saved_snapshot_and_failed_superblock_when_retrying_should_finis
     assert!(coordinator.snapshot_path().exists());
     assert!(coordinator.checkpoint_pending.get());
     assert_eq!(superblock.writes.get(), 1);
+    // A failed write may have reached the disk, so each retry must keep
+    // the snapshot that it paired: a capture here would trip the boundary.
+    STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::TableCaptured));
+    metadata.checkpoint_if_needed(consensus, journal).await;
+    assert_eq!(
+        superblock.writes.get(),
+        2,
+        "the retry writes the superblock"
+    );
+    assert!(coordinator.checkpoint_pending.get());
     superblock.fail.set(false);
     metadata.checkpoint_if_needed(consensus, journal).await;
+    assert_eq!(
+        STOP_CHECKPOINT_AFTER.take(),
+        Some(CheckpointBoundary::TableCaptured),
+        "no retry may capture the op again"
+    );
     assert!(!coordinator.checkpoint_pending.get());
-    assert_eq!(superblock.writes.get(), 2);
+    assert_eq!(coordinator.superblock_checkpoint_op.get(), 1);
+    assert_eq!(superblock.writes.get(), 3);
     metadata.checkpoint_if_needed(consensus, journal).await;
-    assert_eq!(superblock.writes.get(), 2);
+    assert_eq!(superblock.writes.get(), 3);
 }
 
 #[compio::test]
@@ -528,6 +587,138 @@ async fn transferred_client_table_waits_for_applied_frontier_before_checkpoint()
         recovered.client_table.get_watermark(CLIENT),
         Some(TABLE_FRONTIER - 1)
     );
+}
+
+/// No checkpoint runs below the frontier of a transferred client table, so
+/// the journal must hold every op from the floor of the install up to it.
+#[compio::test]
+#[allow(clippy::too_many_lines)]
+async fn given_a_transfer_tail_when_it_exceeds_the_journal_slots_should_refuse_the_install() {
+    const SLOTS: usize = 4;
+    const SNAPSHOT_OP: u64 = 1;
+    const FRONTIER: u64 = SNAPSHOT_OP + SLOTS as u64;
+    const NEXT_SNAPSHOT_OP: u64 = FRONTIER + 2;
+    let directory = tempfile::tempdir().unwrap();
+    let metadata_directory = directory.path().join(crate::impls::METADATA_DIR);
+    std::fs::create_dir_all(&metadata_directory).unwrap();
+    let journal =
+        PrepareJournal::open_with_slots(&metadata_directory.join("journal.wal"), 0, SLOTS)
+            .await
+            .unwrap();
+    let consensus = VsrConsensus::new(
+        1,
+        0,
+        1,
+        server_common::sharding::METADATA_GROUP,
+        NoopBus,
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+        Some(consensus),
+        Some(journal),
+        None,
+        None,
+        TestMux::default(),
+        Some(directory.path().to_path_buf()),
+    );
+    let consensus = metadata.consensus.as_ref().unwrap();
+    let journal = metadata.journal.as_ref().unwrap();
+    let coordinator = metadata.coordinator.as_ref().unwrap();
+    metadata.set_checkpoint_margin(usize::MAX);
+
+    // One op per slot is the largest tail that fits.
+    let (snapshot, table) = transfer_with_tail(SNAPSHOT_OP, SLOTS as u64);
+    metadata
+        .install_state_transfer(&snapshot, table, FRONTIER, FRONTIER)
+        .await
+        .unwrap();
+    for request in 1..=SLOTS as u64 {
+        let prepare = metadata
+            .prepare_request(create_stream_request(
+                TAIL_CLIENT,
+                request,
+                &format!("s{request}"),
+            ))
+            .unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        journal.handle().append(prepare).await.unwrap();
+    }
+    metadata.resume_stranded_commits().await;
+    assert_eq!(consensus.commit_min(), FRONTIER);
+    let above = metadata
+        .prepare_request(create_stream_request(
+            TAIL_CLIENT,
+            SLOTS as u64 + 1,
+            "above",
+        ))
+        .unwrap();
+    assert!(
+        journal.handle().append(above.clone()).await.is_err(),
+        "the tail fills the journal, so one more op needs a checkpoint"
+    );
+    metadata.checkpoint_if_needed(consensus, journal).await;
+    assert_eq!(coordinator.last_checkpoint().0, FRONTIER);
+    journal.handle().append(above).await.unwrap();
+
+    let durable_state = || {
+        (
+            std::fs::read(coordinator.snapshot_path()).unwrap(),
+            coordinator.last_checkpoint(),
+            coordinator.superblock_checkpoint_op.get(),
+            journal.handle().snapshot_op(),
+            journal.handle().last_op(),
+            metadata.client_table_frontier.get(),
+            consensus.commit_min(),
+            consensus.commit_max(),
+        )
+    };
+    let before = durable_state();
+
+    // One more op than slots above a snapshot that is ahead.
+    let tail = SLOTS as u64 + 1;
+    let frontier = NEXT_SNAPSHOT_OP + tail;
+    let (snapshot, table) = transfer_with_tail(NEXT_SNAPSHOT_OP, tail);
+    let error = metadata
+        .install_state_transfer(&snapshot, table, frontier, frontier)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            SnapshotError::TransferTailExceedsJournal {
+                tail: refused,
+                journal_slots: SLOTS,
+            } if refused == tail
+        ),
+        "{error}"
+    );
+    assert!(error.to_string().contains("`metadata.journal_slots`"));
+    assert_eq!(
+        durable_state(),
+        before,
+        "a refused install must leave the replica as it was"
+    );
+
+    // A snapshot at the commit point is not ahead and installs its table
+    // only, so the floor stays below the entry of the last checkpoint.
+    let floor = journal.handle().snapshot_op();
+    assert_eq!(floor, FRONTIER - 1);
+    let fitting = floor + SLOTS as u64;
+    let (snapshot, table) = transfer_with_tail(FRONTIER, fitting + 1 - FRONTIER);
+    assert!(matches!(
+        metadata
+            .install_state_transfer(&snapshot, table, fitting + 1, fitting + 1)
+            .await,
+        Err(SnapshotError::TransferTailExceedsJournal { .. })
+    ));
+    assert_eq!(durable_state(), before);
+    let (snapshot, table) = transfer_with_tail(FRONTIER, fitting - FRONTIER);
+    metadata
+        .install_state_transfer(&snapshot, table, fitting, fitting)
+        .await
+        .unwrap();
+    assert_eq!(metadata.client_table_frontier.get(), fitting);
 }
 
 /// The commit loop and the promotion of queued requests run at the tail
@@ -1254,8 +1445,79 @@ async fn given_a_failed_install_when_an_older_offer_arrives_should_keep_the_dura
 }
 
 #[compio::test]
+async fn given_a_failed_install_when_an_offer_of_the_same_op_arrives_should_keep_the_durable_snapshot()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let md = transfer_receiver(directory.path(), true).await;
+    let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+    let wal_path = metadata_dir.join("journal.wal");
+    let saved_wal = metadata_dir.join("journal.saved");
+    let incoming_state = TestMux::default();
+    incoming_state.users().ensure_root_user("restored", "hash");
+    let offer = |created_at| {
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut snapshot =
+            IggySnapshot::create(&incoming_state, TRANSFER_FLOOR, created_at).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        (snapshot.encode().unwrap(), table)
+    };
+
+    // Keep the open WAL readable but make the truncate's rename fail, after
+    // the snapshot and its superblock pairing have reached disk.
+    let (first, table) = offer(1);
+    std::fs::rename(&wal_path, &saved_wal).unwrap();
+    std::fs::create_dir(&wal_path).unwrap();
+    let failed = md
+        .install_state_transfer(&first, table, TRANSFER_FLOOR, TRANSFER_FLOOR)
+        .await;
+    std::fs::remove_dir(&wal_path).unwrap();
+    std::fs::rename(&saved_wal, &wal_path).unwrap();
+    assert!(matches!(failed, Err(SnapshotError::Io(_))), "{failed:?}");
+    let durable = std::fs::read(metadata_dir.join("snapshot.bin")).unwrap();
+
+    // The checkpoint of another primary at the same op, stamped at another time.
+    let (second, table) = offer(2);
+    assert_ne!(first, second);
+    // A crash once a rewritten snapshot is durable, before its superblock write.
+    STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::DirectorySynced));
+    let installed = md
+        .install_state_transfer(&second, table, TRANSFER_FLOOR, TRANSFER_FLOOR)
+        .await;
+    let image = crash_image(directory.path());
+    let boundary = STOP_CHECKPOINT_AFTER.take();
+    let recovered = recover::<TestMux>(
+        image.path(),
+        TRANSFER_RECEIVER,
+        DEFAULT_SLOT_COUNT,
+        CLIENTS_TABLE_MAX,
+        |_| {},
+        ChangeLogCapacities::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read(metadata_dir.join("snapshot.bin")).unwrap(),
+        durable
+    );
+    assert_eq!(
+        recovered.snapshot_checkpoint,
+        md.coordinator.as_ref().unwrap().last_checkpoint()
+    );
+    assert_eq!(
+        boundary,
+        Some(CheckpointBoundary::DirectorySynced),
+        "an offer of the durable op must not rewrite its snapshot"
+    );
+    assert!(installed.is_ok(), "{installed:?}");
+    assert_eq!(md.consensus.as_ref().unwrap().commit_min(), TRANSFER_FLOOR);
+}
+
+#[compio::test]
 async fn given_a_pending_checkpoint_after_failed_transfer_when_retried_should_keep_the_newer_snapshot()
  {
+    /// Two ops above the commit point, so a trim to it would drain an op
+    /// above that point too.
+    const INSTALLED: u64 = TRANSFER_FLOOR + 1;
     let directory = tempfile::tempdir().unwrap();
     let md = transfer_receiver(directory.path(), true).await;
     let consensus = md.consensus.as_ref().unwrap();
@@ -1275,27 +1537,33 @@ async fn given_a_pending_checkpoint_after_failed_transfer_when_retried_should_ke
     let wal_path = metadata_dir.join("journal.wal");
     let saved_wal = metadata_dir.join("journal.saved");
     let table = ClientTable::new(CLIENTS_TABLE_MAX);
-    let mut snapshot = IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+    let mut snapshot = IggySnapshot::create(&TestMux::default(), INSTALLED, 1).unwrap();
     snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
     std::fs::rename(&wal_path, &saved_wal).unwrap();
     std::fs::create_dir(&wal_path).unwrap();
     let failed = md
-        .install_state_transfer(
-            &snapshot.encode().unwrap(),
-            table,
-            TRANSFER_FLOOR,
-            TRANSFER_FLOOR,
-        )
+        .install_state_transfer(&snapshot.encode().unwrap(), table, INSTALLED, INSTALLED)
         .await;
     std::fs::remove_dir(&wal_path).unwrap();
     std::fs::rename(&saved_wal, &wal_path).unwrap();
     assert!(matches!(failed, Err(SnapshotError::Io(_))), "{failed:?}");
     assert_eq!(consensus.commit_min(), TRANSFER_FLOOR - 1);
-    assert_eq!(coordinator.last_checkpoint().0, TRANSFER_FLOOR);
+    assert_eq!(coordinator.last_checkpoint().0, INSTALLED);
     assert!(coordinator.checkpoint_pending.get());
     let before = std::fs::read(coordinator.snapshot_path()).unwrap();
 
     md.checkpoint_if_needed(consensus, journal).await;
+    for op in consensus.commit_min()..INSTALLED {
+        assert!(
+            journal
+                .handle()
+                .header(usize::try_from(op).unwrap())
+                .is_some(),
+            "op {op}: the pairing is ahead of the commit point, so no trim may reach it"
+        );
+    }
+    assert_eq!(journal.handle().snapshot_op(), 0);
+    assert!(coordinator.checkpoint_pending.get());
     assert_eq!(std::fs::read(coordinator.snapshot_path()).unwrap(), before);
     let recovered = recover::<TestMux>(
         crash_image(directory.path()).path(),
@@ -1307,19 +1575,14 @@ async fn given_a_pending_checkpoint_after_failed_transfer_when_retried_should_ke
     )
     .await
     .unwrap();
-    assert_eq!(recovered.snapshot_checkpoint.0, TRANSFER_FLOOR);
+    assert_eq!(recovered.snapshot_checkpoint.0, INSTALLED);
 
     let table = ClientTable::new(CLIENTS_TABLE_MAX);
-    md.install_state_transfer(
-        &snapshot.encode().unwrap(),
-        table,
-        TRANSFER_FLOOR,
-        TRANSFER_FLOOR,
-    )
-    .await
-    .unwrap();
+    md.install_state_transfer(&snapshot.encode().unwrap(), table, INSTALLED, INSTALLED)
+        .await
+        .unwrap();
     md.checkpoint_if_needed(consensus, journal).await;
-    assert_eq!(consensus.commit_min(), TRANSFER_FLOOR);
+    assert_eq!(consensus.commit_min(), INSTALLED);
     assert!(!coordinator.checkpoint_pending.get());
 }
 
@@ -1456,7 +1719,7 @@ async fn tick_backstop_must_resume_stranded_commits_and_promotions() {
         CLIENT_C,
         ACTING_USER,
         RegisterRequest {
-            user_created_at: 1,
+            credential: CredentialProof::account(1, 1),
             bind_verifier: [0x5a; 32],
         },
     ));

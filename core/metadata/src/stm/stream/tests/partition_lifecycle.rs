@@ -24,7 +24,8 @@ fn given_topic_that_places_batches_when_checking_should_report_store_data() {
     create_topic_with_partitions(&mut inner, 1);
     assert!(!Streams::from(inner.clone()).has_topic_with_store_data());
 
-    inner.items[0].topics[0].resolved.runtime.places_batches = true;
+    let topic = &mut inner.items.make_mut(0).unwrap().topics[0];
+    topic.resolved.runtime.places_batches = true;
 
     assert!(!inner.items[0].topics[0].resolved.tiered_storage);
     assert!(Streams::from(inner).has_topic_with_store_data());
@@ -836,7 +837,7 @@ fn given_a_group_poll_of_many_partitions_when_resolving_once_should_match_one_po
             .collect(),
     };
     let _ = StateHandler::apply(&create_topic, &mut inner, IggyTimestamp::now());
-    let topic = &mut inner.items[0].topics[0];
+    let topic = &mut inner.items.make_mut(0).unwrap().topics[0];
     let incarnation = topic.partitions[0].created_revision;
     let owner = |client_id, incarnation| ConsumerGroupAssignment {
         incarnation,

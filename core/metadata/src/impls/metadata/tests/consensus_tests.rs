@@ -747,7 +747,7 @@ async fn given_committed_receipts_when_checkpoint_stops_at_each_boundary_should_
                 CLIENT,
                 0,
                 RegisterRequest {
-                    user_created_at: 1,
+                    credential: CredentialProof::account(1, 1),
                     bind_verifier: [0x5a; 32],
                 },
             )
@@ -782,7 +782,27 @@ async fn given_committed_receipts_when_checkpoint_stops_at_each_boundary_should_
         let committed = consensus.commit_min();
         metadata.set_checkpoint_margin(usize::MAX);
         STOP_CHECKPOINT_AFTER.set(Some(boundary));
-        metadata.checkpoint_if_needed(consensus, journal).await;
+        if boundary == CheckpointBoundary::TableCaptured {
+            metadata.checkpoint_if_needed(consensus, journal).await;
+        } else {
+            metadata.state_transfer_offer().await.unwrap();
+            let held = SNAPSHOT_IO.lock().await;
+            let mut checkpoint = Box::pin(metadata.checkpoint_if_needed(consensus, journal));
+            assert!(futures::poll!(&mut checkpoint).is_pending());
+            assert!(
+                matches!(
+                    metadata.state_transfer_offer().await,
+                    Err(StateTransferUnavailable::SnapshotReplaced)
+                ),
+                "{boundary:?}: the snapshot write must refuse an offer"
+            );
+            drop(held);
+            checkpoint.await;
+            assert!(
+                metadata.transfer_offer_cache.borrow().is_none(),
+                "{boundary:?}: an offer cached before the snapshot write must not outlive it"
+            );
+        }
         assert!(
             STOP_CHECKPOINT_AFTER.get().is_none(),
             "{boundary:?} must be reached"

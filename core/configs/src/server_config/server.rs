@@ -546,6 +546,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn given_a_config_file_without_the_partition_skip_key_when_loading_should_place_partitions_on_every_shard()
+     {
+        const KEY_LINE: &str = "skip_shard_zero_for_partitions = false\n";
+        let shipped = include_str!("../../../server/config.toml");
+        assert!(shipped.contains(KEY_LINE), "the shipped file sets the key");
+
+        let cfg: ServerConfig = Figment::new()
+            .merge(Toml::string(&shipped.replace(KEY_LINE, "")))
+            .extract()
+            .expect("TOML without the key deserializes");
+
+        assert!(!cfg.cluster.coordinator.skip_shard_zero_for_partitions);
+        assert!(
+            !ServerConfig::default()
+                .cluster
+                .coordinator
+                .skip_shard_zero_for_partitions
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn given_partition_skip_env_var_when_loading_should_override_the_file() {
+        const NAME: &str = "IGGY_CLUSTER_COORDINATOR_SKIP_SHARD_ZERO_FOR_PARTITIONS";
+        let cfg = load_with_env_vars(&[(NAME, "true")])
+            .expect("config with the env override deserializes");
+
+        assert!(cfg.cluster.coordinator.skip_shard_zero_for_partitions);
+    }
+
     /// The shipped file, like every file written before tiered storage, has
     /// no `[tiered_storage]` table.
     #[test]

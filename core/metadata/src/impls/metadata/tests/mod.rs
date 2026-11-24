@@ -57,6 +57,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod checkpoint_jobs;
 mod commit_log;
 mod consensus_tests;
 mod journal_gating;
@@ -69,23 +70,102 @@ mod snapshot;
 mod state_transfer;
 mod topic_admission;
 
-#[allow(clippy::future_not_send)]
-async fn settled_transfer_offer(
-    metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
-) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
-    const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-    compio::time::timeout(TEST_TIMEOUT, async {
-        loop {
-            match metadata.state_transfer_offer().await {
-                Err(StateTransferUnavailable::CheckpointInProgress) => {
-                    compio::time::sleep(std::time::Duration::from_millis(1)).await;
-                }
-                result => return result,
-            }
-        }
-    })
-    .await
-    .expect("concurrent snapshot writers settle")
+fn two_session_client_table() -> consensus::ClientTableSnapshot {
+    consensus::ClientTableSnapshot {
+        capacity: 4,
+        slots: vec![
+            (
+                0,
+                consensus::ClientEntrySnapshot {
+                    bind_verifier: [0x5a; 32],
+                    ended_op: None,
+                    client_id: 1,
+                    epoch: 10,
+                    user_id: 1,
+                    token_id: 0,
+                    watermark: 3,
+                    reply: vec![1, 2, 3],
+                },
+            ),
+            (
+                2,
+                consensus::ClientEntrySnapshot {
+                    bind_verifier: [0x5a; 32],
+                    ended_op: None,
+                    client_id: 2,
+                    epoch: 20,
+                    user_id: 2,
+                    token_id: 9,
+                    watermark: 0,
+                    reply: vec![4, 5],
+                },
+            ),
+        ],
+    }
+}
+
+/// One user holding one token (more tokens encode in hash order), the
+/// populated stream catalog, two sessions and change log records in both
+/// rings.
+fn populated_checkpoint_state() -> (TestMux, ClientTableSnapshot, ChangeLogSnapshot) {
+    let mut users = UsersInner::new();
+    let timestamp = IggyTimestamp::from(1);
+    // The op of an apply is the access revision of its user and the id of
+    // its token, and a checkpoint refuses either at zero.
+    users.apply_context.metadata_op = 1;
+    let created = StateHandler::apply(
+        &CreateUserRequest {
+            username: WireName::new("token-owner").unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        },
+        &mut users,
+        timestamp,
+    );
+    assert_eq!(created.code, 0);
+    let token = CreatePersonalAccessTokenRequest {
+        user_id: 0,
+        ..token_create(TOKEN_NAME)
+    };
+    users.apply_context.metadata_op = 3;
+    assert_eq!(StateHandler::apply(&token, &mut users, timestamp).code, 0);
+    let streams = Streams::from(crate::stm::stream::tests::populated_catalog());
+
+    let change_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+    let header = |op| PrepareHeader {
+        op,
+        checksum: 0x5eed + u128::from(op),
+        timestamp: op,
+        ..PrepareHeader::default()
+    };
+    let change = |kind, body: &'static [u8]| AppliedChange {
+        kind,
+        actor_user_id: Some(0),
+        body: Bytes::from_static(body),
+    };
+    change_log
+        .append(
+            &header(1),
+            vec![change(WireMetadataChangeKind::UserCreated, b"user")],
+        )
+        .unwrap();
+    change_log
+        .append(
+            &header(2),
+            vec![
+                change(WireMetadataChangeKind::StreamCreated, b"stream"),
+                change(WireMetadataChangeKind::SessionRegistered, b"session"),
+            ],
+        )
+        .unwrap();
+
+    (
+        TestMux::new((users.into(), (streams, ()))),
+        two_session_client_table(),
+        change_log.snapshot(),
+    )
 }
 
 type TestMux = MuxStateMachine<variadic!(Users, Streams)>;
@@ -736,18 +816,170 @@ fn sent_prepare_ops(bus: &ReplicaSendSpyBus, replica: u8) -> Vec<u64> {
         .collect()
 }
 
-/// Lets the spawned tasks run once.
-async fn yield_now() {
-    let mut yielded = false;
-    std::future::poll_fn(|context| {
-        if yielded {
-            return std::task::Poll::Ready(());
-        }
-        yielded = true;
-        context.waker().wake_by_ref();
-        std::task::Poll::Pending
-    })
-    .await;
+type JobMetadata =
+    IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux, CheckpointSuperblock>;
+type JobHandles = Rc<RefCell<Vec<compio::runtime::JoinHandle<()>>>>;
+
+/// Journal slots of the checkpoint job tests: a job starts at
+/// [`JOB_TRIGGER_OP`] committed ops, the margin path at [`JOB_MARGIN_OP`]
+/// journaled ones.
+const JOB_SLOTS: usize = 256;
+const JOB_TRIGGER_OP: u64 = JOB_SLOTS as u64 / CHECKPOINT_JOB_TRIGGER_DIVISOR;
+const JOB_MARGIN_OP: u64 = (JOB_SLOTS - SnapshotCoordinator::<()>::CHECKPOINT_MARGIN) as u64;
+const JOB_RETRY_OPS: u64 = JOB_SLOTS as u64 / CHECKPOINT_JOB_RETRY_DIVISOR;
+const JOB_CLIENT: u128 = 1;
+/// Polls before a parked job counts as hung. Each one waits a millisecond.
+const JOB_POLL_BUDGET: usize = 10_000;
+
+/// Replica `replica` of `replica_count` on a [`JOB_SLOTS`] journal, with a
+/// session for [`JOB_CLIENT`] and a spawner that keeps each job's task so the
+/// test can await it.
+#[allow(clippy::future_not_send)]
+async fn job_metadata(
+    dir: &Path,
+    replica: u8,
+    replica_count: u8,
+    superblock: Option<Rc<CheckpointSuperblock>>,
+) -> (Rc<JobMetadata>, JobHandles) {
+    let metadata_dir = dir.join(crate::impls::METADATA_DIR);
+    std::fs::create_dir_all(&metadata_dir).unwrap();
+    let journal = PrepareJournal::open_with_slots(&metadata_dir.join("journal.wal"), 0, JOB_SLOTS)
+        .await
+        .unwrap();
+    let consensus = VsrConsensus::new(
+        1,
+        replica,
+        replica_count,
+        server_common::sharding::METADATA_GROUP,
+        NoopBus,
+        LocalPipeline::new(),
+    );
+    consensus.init();
+    let md = Rc::new(IggyMetadata::new(
+        Some(consensus),
+        Some(journal),
+        None,
+        superblock,
+        TestMux::default(),
+        Some(dir.to_path_buf()),
+    ));
+    md.client_table
+        .borrow_mut()
+        .commit_register(JOB_CLIENT, 0, [0x5a; 32], register_reply(JOB_CLIENT, 1))
+        .unwrap();
+    let jobs = JobHandles::default();
+    let spawned = Rc::clone(&jobs);
+    let weak = Rc::downgrade(&md);
+    md.set_checkpoint_spawner(Some(Rc::new(move |job| {
+        let weak = weak.clone();
+        spawned
+            .borrow_mut()
+            .push(compio::runtime::spawn(async move {
+                if let Some(md) = weak.upgrade() {
+                    md.run_checkpoint_job(job).await;
+                }
+            }));
+    })));
+    COMPLETED_CHECKPOINTS.set(0);
+    LAST_COMPLETED_CHECKPOINT.set(None);
+    (md, jobs)
+}
+
+/// Await every job started so far and return how many there were.
+#[allow(clippy::future_not_send)]
+async fn await_jobs(jobs: &JobHandles) -> usize {
+    let started: Vec<_> = jobs.borrow_mut().drain(..).collect();
+    let count = started.len();
+    for job in started {
+        job.await.unwrap();
+    }
+    count
+}
+
+fn job_prepare(md: &JobMetadata, op: u64) -> Message<PrepareHeader> {
+    md.prepare_request(create_stream_request(JOB_CLIENT, op, &format!("s{op}")))
+        .unwrap()
+}
+
+fn primary_prepare(md: &JobMetadata, op: u64) -> Message<PrepareHeader> {
+    let prepare = job_prepare(md, op);
+    md.consensus
+        .as_ref()
+        .unwrap()
+        .pipeline_message(PlaneKind::Metadata, &prepare);
+    prepare
+}
+
+#[allow(clippy::future_not_send)]
+async fn ack_self(md: &JobMetadata) {
+    let mut loopback = Vec::new();
+    md.consensus
+        .as_ref()
+        .unwrap()
+        .drain_loopback_into(&mut loopback);
+    for message in loopback {
+        md.on_ack(message.try_into_typed::<PrepareOkHeader>().unwrap())
+            .await;
+    }
+}
+
+/// Replicate and commit `ops` one by one on a single-replica primary.
+#[allow(clippy::future_not_send)]
+async fn commit_on_primary(md: &JobMetadata, ops: std::ops::RangeInclusive<u64>) {
+    for op in ops {
+        md.on_replicate(primary_prepare(md, op)).await;
+        ack_self(md).await;
+    }
+}
+
+fn spawn_replicate(md: &Rc<JobMetadata>, op: u64) -> compio::runtime::JoinHandle<()> {
+    let prepare = primary_prepare(md, op);
+    let md = Rc::clone(md);
+    compio::runtime::spawn(async move { md.on_replicate(prepare).await })
+}
+
+fn journal_floor(md: &JobMetadata) -> u64 {
+    md.journal.as_ref().unwrap().handle().snapshot_op()
+}
+
+fn journaled(md: &JobMetadata, op: u64) -> bool {
+    md.journal
+        .as_ref()
+        .unwrap()
+        .handle()
+        .header(usize::try_from(op).unwrap())
+        .is_some()
+}
+
+#[allow(clippy::future_not_send)]
+async fn persist_initial_snapshot(md: &JobMetadata) {
+    IggySnapshot::create(&TestMux::default(), 0, 1)
+        .unwrap()
+        .persist(&md.coordinator.as_ref().unwrap().snapshot_path())
+        .await
+        .unwrap();
+}
+
+/// The snapshot file holds the live state at its op, with the client table and
+/// change log of that commit. Call it before anything commits past the op.
+fn assert_snapshot_holds_live_state(md: &JobMetadata) {
+    let path = md.coordinator.as_ref().unwrap().snapshot_path();
+    let file = std::fs::read(&path).unwrap();
+    let (payload, _) = file.split_at(file.len() - SNAPSHOT_TRAILER_LEN);
+    let (loaded, _) = IggySnapshot::load(&path).unwrap();
+    assert_eq!(
+        loaded.sequence_number(),
+        md.consensus.as_ref().unwrap().commit_min()
+    );
+    let mut expected =
+        IggySnapshot::create(&*md.mux_stm, loaded.sequence_number(), loaded.created_at()).unwrap();
+    expected.snapshot.client_table = Some(md.client_table.borrow().to_snapshot());
+    expected.snapshot.change_log = md.change_log.snapshot();
+    assert_eq!(
+        payload,
+        expected.encode().unwrap(),
+        "the job captured a state other than its commit's"
+    );
 }
 
 /// The primary of a three-replica group at view 0, on a bus that records its
@@ -791,9 +1023,39 @@ async fn primary_on_spy_bus(
     (dir, metadata)
 }
 
-/// Adopts `view` from its primary with an empty log, as the shard does on a
-/// `StartView`.
-fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32) {
+/// Commits `request` as the next op of that primary: its own ack and the
+/// ack of backup 1 make the quorum.
+#[allow(clippy::future_not_send)]
+async fn commit_on_spy_bus_primary(
+    metadata: &IggyMetadata<VsrConsensus<ReplicaSendSpyBus>, PrepareJournal, (), TestMux>,
+    request: Message<RoutedRequestHeader>,
+) {
+    const BACKUP: u8 = 1;
+    let consensus = metadata.consensus.as_ref().unwrap();
+    let prepare = metadata.prepare_request(request).unwrap();
+    consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+    metadata.on_replicate(prepare).await;
+    let mut loopback = Vec::new();
+    consensus.drain_loopback_into(&mut loopback);
+    let own_ack = loopback
+        .pop()
+        .unwrap()
+        .try_into_typed::<PrepareOkHeader>()
+        .unwrap();
+    let backup_ack: Message<PrepareOkHeader> =
+        Message::<PrepareOkHeader>::new(size_of::<PrepareOkHeader>()).transmute_header(|_, ack| {
+            *ack = PrepareOkHeader {
+                replica: BACKUP,
+                ..*own_ack.header()
+            };
+        });
+    metadata.on_ack(own_ack).await;
+    metadata.on_ack(backup_ack).await;
+}
+
+/// Adopts `view` from its primary with a log that ends at the committed
+/// `head`, as the shard does on a `StartView`.
+fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32, head: u64) {
     let start_view = StartViewHeader {
         checksum: 0,
         checksum_body: 0,
@@ -804,8 +1066,8 @@ fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32) {
         command: Command::StartView,
         replica: consensus.primary_index(view),
         reserved_frame: [0; 66],
-        op: 0,
-        commit: 0,
+        op: head,
+        commit: head,
         group: server_common::sharding::METADATA_GROUP,
         partition_incarnation: 0,
         reserved: [0; 80],
@@ -818,6 +1080,8 @@ fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32) {
 fn session_users() -> Users {
     const LAST_USER: u32 = 9;
     let mut users = UsersInner::new();
+    // Created at op 1, the access revision the sessions below prove.
+    users.apply_context.metadata_op = 1;
     for user_id in 0..=LAST_USER {
         let created = StateHandler::apply(
             &CreateUserRequest {
@@ -908,7 +1172,7 @@ async fn join_group_member(
             client_id,
             GROUP_MEMBER_USER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32],
             },
         )
@@ -952,6 +1216,46 @@ async fn join_group_member(
             .len(),
         1
     );
+}
+
+const TAIL_CLIENT: u128 = 9;
+const TAIL_USER: u32 = 7;
+
+/// The snapshot at `snapshot_op` and the client table of a primary that
+/// committed `tail` requests of [`TAIL_CLIENT`] above it.
+fn transfer_with_tail(snapshot_op: u64, tail: u64) -> (Vec<u8>, ClientTable) {
+    let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+    table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+    table
+        .commit_register(
+            TAIL_CLIENT,
+            TAIL_USER,
+            [0x5a; 32],
+            register_reply(TAIL_CLIENT, snapshot_op),
+        )
+        .unwrap();
+    let mut snapshot =
+        <IggySnapshot as Snapshot>::create(&TestMux::default(), snapshot_op, 1).unwrap();
+    snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+    for request in 1..=tail {
+        let reply = build_reply_message(
+            &PrepareHeader {
+                client: TAIL_CLIENT,
+                user_id: TAIL_USER,
+                session: snapshot_op,
+                request,
+                op: snapshot_op + request,
+                operation: Operation::CreateStream,
+                ..Default::default()
+            },
+            &bytes::Bytes::new(),
+        );
+        assert_eq!(
+            table.commit_reply(TAIL_CLIENT, TAIL_USER, reply),
+            CommitReply::Cached
+        );
+    }
+    (snapshot.encode().unwrap(), table)
 }
 
 /// The replica [`transfer_receiver`] builds: replica 0 of a 3-node cluster.

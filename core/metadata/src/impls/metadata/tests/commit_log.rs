@@ -41,35 +41,7 @@ fn populated_snapshot_reencode_and_checksum_are_stable() {
     // covered by
     // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
     let mut snapshot = IggySnapshot::new(7);
-    snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
-        capacity: 4,
-        slots: vec![
-            (
-                0,
-                consensus::ClientEntrySnapshot {
-                    bind_verifier: [0x5a; 32],
-                    ended_op: None,
-                    client_id: 1,
-                    epoch: 10,
-                    user_id: 1,
-                    watermark: 3,
-                    reply: vec![1, 2, 3],
-                },
-            ),
-            (
-                2,
-                consensus::ClientEntrySnapshot {
-                    bind_verifier: [0x5a; 32],
-                    ended_op: None,
-                    client_id: 2,
-                    epoch: 20,
-                    user_id: 2,
-                    watermark: 0,
-                    reply: vec![4, 5],
-                },
-            ),
-        ],
-    });
+    snapshot.snapshot.client_table = Some(two_session_client_table());
 
     let encoded = snapshot.encode().unwrap();
     let decoded = IggySnapshot::decode(&encoded).unwrap();
@@ -105,6 +77,7 @@ fn client_table_reply_bytes_encode_as_a_msgpack_blob() {
                 client_id: 1,
                 epoch: 1,
                 user_id: 1,
+                token_id: 0,
                 watermark: 0,
                 reply: vec![0xFF; REPLY_LEN],
             },

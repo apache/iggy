@@ -34,6 +34,47 @@ fn resolve_acting_user_id_skips_register_and_logout() {
     }
 }
 
+#[compio::test]
+async fn given_a_token_expired_at_the_prepare_timestamp_when_registering_should_return_unauthenticated()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let mut metadata = metadata_plane();
+    metadata.journal = Some(
+        PrepareJournal::open(&directory.path().join("journal.wal"), 0)
+            .await
+            .unwrap(),
+    );
+    metadata.mux_stm = Rc::new(TestMux::new((session_users(), (Streams::default(), ()))));
+    let consensus = metadata.consensus.as_ref().unwrap();
+    let now = consensus.clock_realtime_micros();
+    let lifetime = 60_000_000;
+    let token = CreatePersonalAccessTokenRequest {
+        expiry: lifetime,
+        ..token_create(TOKEN_NAME)
+    };
+    let create = build_prepare_message(
+        consensus,
+        &RoutedRequestHeader::default(),
+        Operation::CreatePersonalAccessToken,
+        &token.to_bytes(),
+    );
+    let id = create.header().op;
+    metadata.mux_stm.update(create).unwrap();
+    consensus.observe_prepare_timestamp(now + lifetime * 2);
+    let registration = RegisterRequest {
+        credential: CredentialProof::token(1, id),
+        bind_verifier: [0x5a; 32],
+    };
+    assert!(metadata.accepts_registration_proof(TOKEN_OWNER, &registration.credential, now));
+    assert_eq!(
+        metadata
+            .submit_register_in_process(77, TOKEN_OWNER, registration)
+            .await,
+        Err(MetadataSubmitError::Unauthenticated)
+    );
+    assert!(!metadata.client_table.borrow().contains(77));
+}
+
 // The login frame's `client` field is caller-supplied and
 // `resolve_acting_user_id` resolves authority from the entry it names, so
 // the register ownership gate must refuse an entry owned by another user
@@ -81,7 +122,7 @@ async fn register_gate_refuses_an_entry_owned_by_another_user() {
             CLIENT,
             IMPOSTOR,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32]
             }
         )
@@ -104,7 +145,7 @@ async fn register_gate_refuses_an_entry_owned_by_another_user() {
             CLIENT,
             OWNER,
             RegisterRequest {
-                user_created_at: 1,
+                credential: CredentialProof::account(1, 1),
                 bind_verifier: [0x5a; 32]
             }
         )
@@ -134,7 +175,7 @@ async fn given_reserved_client_id_when_registering_in_process_should_reject_befo
                     client,
                     0,
                     RegisterRequest {
-                        user_created_at: 1,
+                        credential: CredentialProof::account(1, 1),
                         bind_verifier: [0x5a; 32],
                     },
                 ),
