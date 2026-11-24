@@ -22,7 +22,7 @@ use bench_report::{
     options::{
         BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability,
         BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions, BenchmarkTcpOptions,
-        BenchmarkTopicOptions,
+        BenchmarkTopicOptions, BenchmarkTopicStorage,
     },
     params::{BenchmarkDataVolume, BenchmarkParams},
     transport::BenchmarkTransport,
@@ -57,6 +57,7 @@ pub mod command_line;
 pub mod cpu_name;
 pub mod finish_condition;
 pub mod rate_limiter;
+pub mod readiness;
 pub mod warmup;
 
 /// Runs of one command that start within the same second get the suffixes `_2` up to this.
@@ -244,6 +245,7 @@ pub fn options_from_args(args: &IggyBenchArgs) -> BenchmarkOptions {
             messages_required_to_save: args.messages_required_to_save().map(NonZeroU32::get),
             max_topic_size: benchmark_max_topic_size(args.new_topic_max_size()),
             message_expiry: benchmark_message_expiry(args.message_expiry()),
+            storage: benchmark_topic_storage(args),
         },
         consumer: args.polls().then(|| BenchmarkConsumerOptions {
             consumer_offset_durability: benchmark_durability(args.consumer_offset_durability()),
@@ -257,6 +259,14 @@ pub fn options_from_args(args: &IggyBenchArgs) -> BenchmarkOptions {
             reuse_streams: args.reuse_streams(),
         },
         tcp,
+    }
+}
+
+fn benchmark_topic_storage(args: &IggyBenchArgs) -> BenchmarkTopicStorage {
+    match (args.topic_type(), args.tiered_storage()) {
+        (Some(TopicType::Geo), _) => BenchmarkTopicStorage::Geo,
+        (_, Some(true)) => BenchmarkTopicStorage::Tiered,
+        _ => BenchmarkTopicStorage::Local,
     }
 }
 
@@ -333,6 +343,12 @@ fn add_basic_arguments(parts: &mut Vec<String>, args: &IggyBenchArgs) {
     ));
     if let Some(threshold) = args.messages_required_to_save() {
         parts.push(format!("--messages-required-to-save {threshold}"));
+    }
+    if let Some(topic_type) = args.topic_type() {
+        parts.push(format!("--topic-type {topic_type}"));
+    }
+    if args.tiered_storage().is_some() {
+        parts.push("--tiered-storage".to_owned());
     }
 
     let messages_per_batch = args.messages_per_batch();
@@ -506,7 +522,7 @@ mod tests {
     use bench_report::options::{
         BenchmarkClientOptions, BenchmarkConsumerOptions, BenchmarkDurability,
         BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions, BenchmarkTcpOptions,
-        BenchmarkTopicOptions,
+        BenchmarkTopicOptions, BenchmarkTopicStorage,
     };
     use clap::{Command, CommandFactory, Parser};
     use std::io;
@@ -532,6 +548,8 @@ mod tests {
         "messages_required_to_save",
         "max_topic_size",
         "message_expiry",
+        "topic_type",
+        "tiered_storage",
         "consumer_offset_durability",
         "max_wait",
         "min_count",
@@ -690,6 +708,34 @@ mod tests {
     }
 
     #[test]
+    fn given_topic_storage_flags_when_reproducing_the_command_should_record_the_same_storage() {
+        for (flags, storage) in [
+            (&[][..], BenchmarkTopicStorage::Local),
+            (&["--tiered-storage"][..], BenchmarkTopicStorage::Tiered),
+            (&["--topic-type", "geo"][..], BenchmarkTopicStorage::Geo),
+        ] {
+            let mut arguments = vec!["iggy-bench"];
+            arguments.extend_from_slice(flags);
+            arguments.extend_from_slice(&["pinned-producer", "tcp"]);
+            let original = IggyBenchArgs::try_parse_from(arguments).unwrap();
+            assert_eq!(options_from_args(&original).topic.storage, storage);
+
+            let command = recreate_bench_command(&original);
+            let reproduced = IggyBenchArgs::try_parse_from(
+                command
+                    .split_ascii_whitespace()
+                    .skip_while(|argument| *argument != "iggy-bench"),
+            )
+            .unwrap();
+            assert_eq!(
+                options_from_args(&reproduced).topic.storage,
+                storage,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn every_bench_arg_should_be_a_typed_param_a_recorded_option_or_neutral() {
         let mut args = Vec::new();
         collect_arg_ids(&IggyBenchArgs::command(), "iggy-bench", &mut args);
@@ -749,6 +795,8 @@ mod tests {
             "5s",
             "--high-level-api",
             "--reuse-streams",
+            "--topic-type",
+            "geo",
             "pinned-producer-and-consumer",
             "--max-topic-size",
             "1GiB",
@@ -768,6 +816,7 @@ mod tests {
                     messages_required_to_save: Some(128),
                     max_topic_size: BenchmarkMaxTopicSize::Bytes(1_073_741_824),
                     message_expiry: BenchmarkMessageExpiry::AfterUs(3_600_000_000),
+                    storage: BenchmarkTopicStorage::Geo,
                 },
                 consumer: Some(BenchmarkConsumerOptions {
                     consumer_offset_durability: BenchmarkDurability::Persisted,

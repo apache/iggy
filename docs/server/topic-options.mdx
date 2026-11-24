@@ -1,0 +1,114 @@
+---
+title: Topic Options
+description: "Per-topic retention, durability and segment layout options, set when the topic is created."
+---
+
+Retention, durability, and segment layout are per-topic decisions, made when the topic is created. They used to be server-wide `[system.*]` keys, which gave every knob two homes. The server now [refuses to boot](/docs/server/configuration#relocated-configuration-keys) on the old keys, and each topic carries its own values instead.
+
+Options are key-value pairs sent with `CreateTopic`. Unknown keys are **rejected at the edge, never skipped**: a silently ignored knob would leave the client on server defaults with no way to find out. Streams and users have their own catalogs. See [Stream options](/docs/server/stream-options) for stream keys and names. User updates accept `username` and `status`.
+
+## The catalog
+
+| Option | Default | Constraints | Description |
+|--------|---------|-------------|-------------|
+| `max_topic_size` | unlimited | finite values at least `segment_size` | Topic-wide limit on sealed segment bytes, divided across partitions. The cleaner deletes eligible oldest sealed segments when a partition exceeds its share. |
+| `message_expiry` | none | | Delete the oldest sealed segments whose newest message timestamp is older than this duration. |
+| `partition_resize_policy` | `mutable` | `mutable` or `fixed`, create only | `fixed` rejects partition additions and deletions. `mutable` permits layout changes without a bounded cutover or per-key ordering across layouts. |
+| `replication_factor` | Server default, initially `all` | 1 through 32 and no greater than cluster membership, create only | Number of nodes that store each partition. |
+| `compression_algorithm` | `none` | `none` or `gzip` | Placeholder: stored and reported, no compression applied yet. |
+| `segment_size` | 1 GiB | 0 selects the default. Otherwise a 512-byte multiple from 1 MiB through 1 GiB | Soft size limit per segment: a segment may close one whole batch past it. |
+| `durability` | `replicated` | `replicated` or `persisted` | Message completion policy. `persisted` requires recoverable stable-storage copies at the replication quorum before success. |
+| `consumer_offset_durability` | `replicated` | `replicated` or `persisted` | Completion policy for explicit consumer-offset stores and deletes, independent of message durability. |
+| `messages_required_to_save` | 1024 | non-zero, at most 16777216 | Flush the journal once it holds this many messages. |
+| `size_of_messages_required_to_save` | 1 MiB | 0 selects the default. At most 1 GiB | Flush the journal once it holds this many bytes. Paired with the message count. Whichever threshold trips first flushes. |
+| `preallocate_segments` | `false` | `segment_size` x partitions at most 64 GiB per create | Reserve each segment's bytes up front where the filesystem supports it. |
+
+Both retention policies can be active at once. The active segment is **never touched**, and its bytes are excluded from the size limit. A segment whose end offset exceeds the lowest stored consumer or consumer-group offset is retained. With no stored offsets, this barrier is absent. Deletion is done by the server's segment cleaner (`[data_maintenance.messages]`, enabled by default).
+
+Both durability policies write data to disk and default independently to `replicated`. Neither inherits the other. Flush thresholds schedule ordinary segment writes. Required persistence, capacity pressure, or lifecycle operations can flush earlier. They do not weaken the `persisted` completion guarantee.
+
+Value forms are forgiving: byte sizes accept a raw number of bytes or a string like `"128 MiB"`, expiry accepts microseconds or a humantime string like `"7 days"`, booleans accept `true`/`false`. Create admission re-parses and re-encodes what you send, so a string `segment_size=128MiB` is stored as the number it names.
+
+`preallocate_segments` requests a `segment_size` reservation for each partition's segment file when it is opened, including during topic creation and rotation. On Linux this reserves disk space without changing the file's logical length. Unsupported or failed reservations log a warning and fall back to ordinary allocation. With the default 1 GiB segment size, the request is 1 GiB per partition up front, which is why it's opt-in and why one create is **capped at 64 GiB** of requested reservation.
+
+## Setting options
+
+At creation, every interface takes the same keys:
+
+```bash
+# CLI: --set is repeatable. Positional arguments: stream, name,
+# partitions count, compression algorithm.
+iggy topic create my-stream my-topic 1 none \
+  --set segment_size=128MiB \
+  --durability persisted \
+  --consumer-offset-durability persisted
+```
+
+In the CLI, both durability policies have named flags. `--set` is repeatable and covers other storage options, such as `segment_size`. `compression_algorithm`, `message_expiry`, and `max_topic_size` also have first-class parameters. Run `iggy options topic` to discover what the server accepts.
+
+SDKs expose typed durability values in their topic creation options. In Rust, set `TopicCreateOptions::durability` and `TopicCreateOptions::consumer_offset_durability` to `Durability::Replicated` or `Durability::Persisted`. The HTTP API takes `"durability"` and `"consumer_offset_durability"` as string values in the create body's `options` map.
+
+Keys absent from the wire request are resolved by the admitting server and stored as **derived** entries. Typed SDKs can send their default durability values explicitly. Binary `GetTopic` responses carry explicit and derived blocks. HTTP reports an `explicit` flag per option. Both report option values and the provenance of the request. Updates preserve the values and provenance of keys outside the patch.
+
+## Create-only vs updatable
+
+Updates use UpdateResource with a set/reset patch. SDKs retain resource-specific update methods, but these methods send the shared command. Only `name`, `message_expiry` and `max_topic_size` can change on a topic.
+
+An absent key keeps its value. In HTTP, `null` also leaves a value unchanged. A name in `reset` returns that option to the server default and marks it as derived. Do not send the same key in both sets. Unknown keys, read-only keys and create-only changes are rejected. An empty patch, including a patch with only null values or zero sentinels, is rejected.
+
+```bash
+iggy topic update my-stream my-topic --message-expiry 7days
+iggy topic update my-stream my-topic --reset message_expiry --reset max_topic_size
+iggy topic update my-stream my-topic --name archived-events
+```
+
+HTTP updates use a flat JSON object, not a nested `options` object:
+
+```json
+{
+  "message_expiry": "7 days",
+  "reset": ["max_topic_size"]
+}
+```
+
+`compression_algorithm`, `segment_size`, both durability policies, flush thresholds, `preallocate_segments`, `partition_resize_policy` and `replication_factor` are create-only. Select them before creating the topic. A finite size limit must still be at least the segment size.
+
+## Replication factor
+
+When `replication_factor` is absent, the server resolves `cluster.default_replication_factor` and stores the result with the topic. The default `all` uses every cluster node. A later server configuration change does not change existing topics.
+
+A factor of one stores one copy. Replicated durability can acknowledge it before stable storage. A factor of two requires both replicas to make progress. Three copies tolerate one unavailable replica. See [Cluster durability](/docs/clustering/durability) for larger quorum rules.
+
+```bash
+iggy topic create my-stream replicated-events 6 none --set replication_factor=3
+```
+
+The example needs a cluster with at least three nodes. The metadata group still spans the full cluster, independent of each topic's factor.
+
+## Discovering the catalog
+
+Ask the server which keys it accepts, with their types, defaults, and descriptions:
+
+```bash
+iggy options topic
+```
+
+For HTTP, set `IGGY_TOKEN` to a valid JWT or personal access token:
+
+```bash
+curl --fail-with-body \
+  -H "Authorization: Bearer $IGGY_TOKEN" \
+  http://localhost:3000/options/topic
+```
+
+The Rust SDK exposes the same call as `describe_options`. The scope is `topic`, `stream`, or `user`.
+
+Discovery matters most on the binary transports: TCP, QUIC, and WebSocket carry **only an error code** for a rejected key, not its name, so the catalog is how a client finds out what this server supports. Over HTTP the error message names the offending key directly.
+
+## Durability
+
+`replicated` waits for quorum commit and application without an additional stable-storage barrier. `persisted` also requires recoverable stable-storage copies at the required quorum. On a single node that means recoverable local persistence before success. In a cluster it uses durable prepare history. Setting `messages_required_to_save=1` is not required for `persisted`.
+
+The former `enforce_fsync` option is rejected. Use `durability` for messages and `consumer_offset_durability` for explicit offset changes. Poll auto-commit remains asynchronous, and HTTP `ack=none` confirms dispatch only, regardless of these policies.
+
+See [Durability](/docs/server/durability) for single-node failure behavior and [Cluster Durability](/docs/clustering/durability) for the quorum and WAL guarantees.

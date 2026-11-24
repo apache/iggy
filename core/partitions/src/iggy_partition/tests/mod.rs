@@ -461,6 +461,8 @@ fn poll_read_result<B: MessageBus>(
                 PollingConsumer::Consumer(..) => None,
             },
             _group_poll: None,
+            peer_first_segment: None,
+            peer_segments: None,
         },
         fragments,
         commit_offset: partition.offsets().commit_offset,
@@ -2034,8 +2036,15 @@ mod empty_offsets;
 mod eviction;
 mod floor_eviction;
 mod free_space;
+mod fresh_proofs;
+mod geo_positions;
 mod history;
 mod journal_budget;
+mod long_term_delete;
+mod long_term_merge;
+mod long_term_retention;
+mod manifest_history;
+mod manifest_publish;
 mod materialization;
 mod materialization_io;
 mod materialization_tail;
@@ -2047,7 +2056,13 @@ mod offset_replication;
 mod offset_reservations;
 mod offset_storage;
 mod offsets;
+mod origin_recovery;
+mod peer_log;
+mod peer_log_merges;
+mod peer_log_skips;
+mod peer_manifests;
 mod persistence_checkpoint;
+mod placed_batches;
 mod quiet;
 mod reload_budget;
 mod remote_poll;
@@ -2063,6 +2078,7 @@ mod state_transfer_offer;
 mod state_transfer_segments;
 mod superblock;
 mod tiering;
+mod topic_object;
 mod total_retention;
 mod transfer_ownership;
 mod wal;

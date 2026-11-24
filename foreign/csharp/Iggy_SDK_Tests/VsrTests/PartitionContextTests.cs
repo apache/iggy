@@ -177,6 +177,32 @@ public sealed class PartitionContextTests
         Assert.Equal(2, node.Requests(CommandCodes.GET_PARTITION_ROUTE_CODE));
     }
 
+    /// <summary>A shadow stream takes no send, and a retry would only be refused again.</summary>
+    [Fact]
+    public async Task given_a_shadow_stream_refusal_when_sending_should_return_it_without_retry()
+    {
+        using var node = new MockNode();
+        var sends = 0;
+        node.Serve(request =>
+        {
+            if (request.Operation == (byte)VsrOperation.SendMessages)
+            {
+                Interlocked.Increment(ref sends);
+                return Reply(request.Operation, [], VsrError.SHADOW_STREAM_READ_ONLY);
+            }
+
+            return Standalone(node, request);
+        });
+        using var client = new TcpMessageStream(Configuration(node), NullLoggerFactory.Instance);
+        await SignInAsync(client);
+
+        var refusal = await Assert.ThrowsAsync<IggyInvalidStatusCodeException>(() => SendAsync(client));
+
+        Assert.Equal(VsrError.SHADOW_STREAM_READ_ONLY, refusal.StatusCode);
+        Assert.True(refusal.FromServer);
+        Assert.Equal(1, Volatile.Read(ref sends));
+    }
+
     /// <summary>
     ///     A first history refusal is the server's verdict: it refuses the request before admission. Only a
     ///     refusal that follows an uncertain replay leaves the outcome unknown.

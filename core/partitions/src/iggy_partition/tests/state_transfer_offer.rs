@@ -878,6 +878,7 @@ fn batch_stats(base_offset: u64, message_count: u32) -> CommittedBatchStats {
         base_offset,
         message_count,
         size_bytes: 128,
+        placed: None,
     }
 }
 

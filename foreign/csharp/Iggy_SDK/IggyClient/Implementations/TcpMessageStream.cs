@@ -742,6 +742,13 @@ public sealed partial class TcpMessageStream : IIggyClient, IPartitionFetchClien
     }
 
     /// <inheritdoc />
+    public async Task RetireGeoOriginAsync(string origin, CancellationToken token = default)
+    {
+        var message = TcpContracts.RetireGeoOrigin(origin);
+        await SendAckAsync(CommandCodes.RETIRE_GEO_ORIGIN_CODE, message, token);
+    }
+
+    /// <inheritdoc />
     public async Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query,
         CancellationToken token = default)
     {

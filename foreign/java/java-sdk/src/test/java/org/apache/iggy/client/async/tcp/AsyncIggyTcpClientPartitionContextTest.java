@@ -95,6 +95,7 @@ class AsyncIggyTcpClientPartitionContextTest {
     private static final int HISTORY_UNAVAILABLE = 87;
     private static final int LIFECYCLE_BUSY = IggyErrorCode.LIFECYCLE_BUSY.getCode();
     private static final int PARTITION_NOT_OWNED = 5009;
+    private static final int SHADOW_STREAM_READ_ONLY = IggyErrorCode.SHADOW_STREAM_READ_ONLY.getCode();
     private static final int ASSIGNED_PARTITION = 7;
     private static final int DEFERRED_PARAMETERS_BYTES = 2 * Long.BYTES + 2 * Integer.BYTES;
     // An offset write status of the fake primary: the write is stored.
@@ -563,6 +564,42 @@ class AsyncIggyTcpClientPartitionContextTest {
                 assertThat(stamped)
                         .containsExactly(
                                 CALLER_CONTEXT, routeContext(ROUTE_INCARNATION), routeContext(ROUTE_INCARNATION));
+            } finally {
+                client.close().get(5, TimeUnit.SECONDS);
+            }
+            coordinator.get(5, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void shouldReturnShadowStreamReadOnlyWithoutRetryingASend() throws Exception {
+        InetAddress loopback = InetAddress.getLoopbackAddress();
+        try (ServerSocket coordinatorSocket = new ServerSocket(0, 4, loopback)) {
+            AtomicInteger sends = new AtomicInteger();
+            CompletableFuture<Void> coordinator = serve(coordinatorSocket, request -> {
+                if (request.operation() == OPERATION_REGISTER) {
+                    return Response.success(OPERATION_REGISTER, registerBody(1));
+                }
+                if (request.is(GET_CLUSTER_METADATA_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, singleNodeMetadata(coordinatorSocket.getLocalPort()));
+                }
+                if (request.is(GET_PARTITION_ROUTE_CODE, OPERATION_NON_REPLICATED)) {
+                    return Response.success(
+                            OPERATION_NON_REPLICATED, partitionRoute(Unpooled.buffer(), ROUTE_INCARNATION));
+                }
+                if (request.operation() == OPERATION_SEND_MESSAGES) {
+                    sends.incrementAndGet();
+                    return Response.error(OPERATION_SEND_MESSAGES, SHADOW_STREAM_READ_ONLY);
+                }
+                throw new IllegalStateException("Unexpected coordinator request: " + request);
+            });
+            AsyncIggyTcpClient client = client(coordinatorSocket);
+            try {
+                client.connect().get(5, TimeUnit.SECONDS);
+                client.login().get(5, TimeUnit.SECONDS);
+                assertServerError(send(client), SHADOW_STREAM_READ_ONLY);
+                assertThat(sends).hasValue(1);
             } finally {
                 client.close().get(5, TimeUnit.SECONDS);
             }

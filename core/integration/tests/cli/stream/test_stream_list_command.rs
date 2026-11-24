@@ -72,7 +72,7 @@ impl IggyCmdTestCase for TestStreamListCmd {
             )))
             .stdout(contains(self.name.clone()))
             .stdout(contains(match self.output {
-                OutputFormat::List => format!("{}|0 B|0|0|none\n", self.name),
+                OutputFormat::List => format!("{}|0 B|0|0|none|-\n", self.name),
                 OutputFormat::Default | OutputFormat::Table => "| Encryption |".to_owned(),
             }));
     }

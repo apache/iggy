@@ -348,6 +348,7 @@ public sealed class VsrMultiplexingTests
                  {
                      (CommandCodes.CREATE_STREAM_CODE, resolved),
                      (CommandCodes.UPDATE_RESOURCE_CODE, (byte)VsrOperation.RewrapStreamKeys),
+                     (CommandCodes.UPDATE_RESOURCE_CODE, (byte)VsrOperation.ShadowTopic),
                      (CommandCodes.UPDATE_RESOURCE_CODE, (byte)VsrOperation.CreateTopicWithAssignments)
                  })
         {

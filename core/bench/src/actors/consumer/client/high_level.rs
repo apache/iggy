@@ -24,6 +24,7 @@ use crate::actors::{
 };
 
 use crate::utils::ClientFactory;
+use crate::utils::readiness::is_probe;
 use futures_util::StreamExt;
 use iggy::prelude::*;
 use std::sync::Arc;
@@ -112,6 +113,7 @@ impl ConsumerClient for HighLevelConsumerClient {
 
             match timeout_result {
                 Ok(Some(message_result)) => match message_result {
+                    Ok(received_message) if is_probe(&received_message.message) => {}
                     Ok(received_message) => {
                         batch_messages += 1;
                         batch_user_bytes += received_message.message.payload.len() as u64;

@@ -210,6 +210,102 @@ async fn given_runtime_knobs_when_creating_topic_should_persist_them_per_topic(
     assert_eq!(polled.messages.len(), 1);
 }
 
+/// The harness server has no object store, so it refuses every geo topic. A
+/// setting a geo topic cannot have is refused before the store matters.
+#[iggy_harness(test_client_transport = [Tcp, Http])]
+async fn given_a_topic_type_when_creating_topic_should_refuse_geo_and_report_normal(
+    harness: &TestHarness,
+) {
+    let client = harness.root_client().await.unwrap();
+    client
+        .create_stream("typed-stream", &StreamCreateOptions::default())
+        .await
+        .unwrap();
+    let stream = Identifier::named("typed-stream").unwrap();
+    let typed = |topic_type: Option<TopicType>, geo_mode: Option<GeoMode>| TopicCreateOptions {
+        partitions_count: Some(1),
+        topic_type,
+        geo_mode,
+        ..TopicCreateOptions::default()
+    };
+
+    let refused = [
+        (
+            "geo",
+            typed(Some(TopicType::Geo), None),
+            IggyError::FeatureUnavailable,
+        ),
+        (
+            "geo-tiered",
+            typed(Some(TopicType::Geo), Some(GeoMode::GeoTiered)),
+            IggyError::FeatureUnavailable,
+        ),
+        (
+            "normal-with-mode",
+            typed(None, Some(GeoMode::Geo)),
+            IggyError::InvalidOptionValue(topic_option_keys::GEO_MODE.to_owned()),
+        ),
+        (
+            "geo-tiered-storage",
+            TopicCreateOptions {
+                tiered_storage: Some(true),
+                ..typed(Some(TopicType::Geo), None)
+            },
+            IggyError::InvalidOptionValue(topic_option_keys::TIERED_STORAGE.to_owned()),
+        ),
+        (
+            "geo-mutable",
+            TopicCreateOptions {
+                partition_resize_policy: Some(PartitionResizePolicy::Mutable),
+                ..typed(Some(TopicType::Geo), None)
+            },
+            IggyError::InvalidOptionValue(topic_option_keys::PARTITION_RESIZE_POLICY.to_owned()),
+        ),
+    ];
+    for (name, options, expected) in &refused {
+        let error = client
+            .create_topic(&stream, name, options)
+            .await
+            .expect_err("the server refuses this topic type");
+        assert_policy_error(error, expected.clone());
+    }
+
+    client
+        .create_topic(&stream, "normal", &typed(None, None))
+        .await
+        .unwrap();
+    let details = client
+        .get_topic(&stream, &Identifier::named("normal").unwrap())
+        .await
+        .unwrap()
+        .expect("topic exists");
+    let topic_type = details
+        .options
+        .get(&HeaderKey::from(OptionKey::TopicType))
+        .expect("topic_type echoes back");
+    assert!(!topic_type.explicit, "admission derived the type");
+    assert_eq!(topic_type.value.as_bytes(), b"normal");
+    assert!(
+        !details
+            .options
+            .contains_key(&HeaderKey::from(OptionKey::GeoMode))
+    );
+    let resolved = details.resolved_options();
+    assert_eq!(resolved.topic_type, TopicType::Normal);
+    assert_eq!(resolved.geo_mode, None);
+
+    for (name, _, _) in &refused {
+        assert!(
+            client
+                .get_topic(&stream, &Identifier::named(name).unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused create leaves no {name} topic"
+        );
+    }
+}
+
 #[iggy_harness]
 async fn given_stream_and_user_scopes_when_describing_options_should_report_mutability(
     harness: &TestHarness,

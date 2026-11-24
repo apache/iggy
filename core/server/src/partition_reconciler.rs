@@ -56,20 +56,23 @@
 //! so without that bound a create burst would hold a round open and leave
 //! the namespaces behind the cursor unchecked.
 //!
-//! # Materialisation race: the reply ships before the partition exists
+//! # Materialisation race: the commit lands before the partition exists
 //!
 //! `metadata::on_ack` fires the commit notifier and emits the wire reply
 //! immediately after STM apply, but the owning shard's reconciler wakes
 //! asynchronously and only enqueues `ReconcileOp::InsertOwned` once
 //! `build_partition_fresh` finishes (mkdir + segment open + fallocate,
-//! multi-millisecond). A client that produces the instant `create_topic`
-//! returns therefore races the partition into existence, on every shard at
-//! once.
+//! multi-millisecond). The metadata primary that serves the create holds the
+//! reply until its own shards have built the partitions it stores, for a
+//! bounded time (`dispatch::submit::await_created_partitions`). No other
+//! node waits, so a client that produces the instant `create_topic` returns
+//! can still race the partition into existence there, and on that primary
+//! once the bound has passed.
 //!
 //! The race is closed at the **owning shard**, not by the routing table:
 //!
 //! - `router::route_typed` treats a missing row as "not seeded yet", not
-//!   "unroutable", and falls back to `calculate_shard_assignment`. The frame
+//!   "unroutable", and falls back to `PartitionShards::shard_for`. The frame
 //!   always reaches the shard that will own the partition.
 //! - `IggyShard::park_if_unmaterialised` holds it there until the matching
 //!   `InsertOwned` lands, then hands it back to the pump -- but not to a
@@ -100,8 +103,8 @@
 //! readiness proof: every shard derives the same rows from the same committed
 //! metadata, and a row may exist before its partition does. Nothing may treat
 //! presence as "the owner is ready" - `dispatch::partition::wait_for_partition_routable`
-//! documents why the owner-readiness probe that used to live there was both
-//! unnecessary and ineffective.
+//! takes a row only as a reason not to wait, asks the owner itself when the row
+//! is missing, and documents why neither makes it a readiness gate.
 //!
 //! Keeping the table a hint is what makes it repairable: a check re-derives
 //! the namespace's row from committed metadata, so a lost row is rewritten
@@ -181,10 +184,14 @@
 //! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
+use crate::geo_topics::GeoTopics;
 use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
+use crate::peer_manifests::{NodePlace, PeerManifestLister};
+use crate::peer_positions::PeerPositionLister;
+use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -200,6 +207,7 @@ use iggy_binary_protocol::{
 use iggy_common::{
     ConsumerKind, IggyError, IggyTimestamp, StreamEncryption, check_critical_options,
 };
+use iggy_object_store::{TierJobCancelled, TierScope};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
@@ -211,13 +219,14 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, Segment, StreamKeyIdentity, delete_partitions_from_disk, read_created_revision,
+    IggyPartition, RecoveryPlan, Segment, StreamKeyIdentity, TOPIC_OBJECT_RETRY,
+    delete_partitions_from_disk, object_prefix, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
 use shard::MetadataSubmit;
 use shard::ReconcileOp;
-use shard::shards_table::{ShardsTable, calculate_shard_assignment};
+use shard::shards_table::{PartitionShards, ShardsTable};
 use shard::{Receiver, Sender};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -309,7 +318,9 @@ enum Convergence {
 
 pub struct ReconcilerCtx {
     pub shard: Rc<ServerShard>,
-    pub total_shards: u16,
+    /// The placement of `shard`. The shard holds a read of a partition that
+    /// this value places on it until the reconciler builds the partition.
+    pub partition_shards: PartitionShards,
     pub config: Rc<ServerConfig>,
     pub cluster_id: u128,
     pub self_replica_id: u8,
@@ -347,13 +358,27 @@ pub struct ReconcilerCtx {
     /// The incarnations whose delete this node saw commit as the metadata
     /// primary, and whose objects wait for their delete.
     incarnation_deletes: IncarnationDeletes,
+    /// The objects of this cluster's geo topics in its store, which the
+    /// metadata primary keeps in step with committed metadata.
+    geo_topics: GeoTopics,
+    /// The shadow streams of the geo peers' topics, which the metadata
+    /// primary keeps in step with the peers' stores.
+    shadow_topics: ShadowTopics,
+    /// The listings of the geo peers' manifests, which keep the shadow
+    /// partitions whose primary this node is up to date. Shard 0 only.
+    peer_manifests: PeerManifestLister,
+    /// The listings of the geo peers' consumer group positions, which the
+    /// primaries here adopt when they win. Shard 0 only.
+    peer_positions: PeerPositionLister,
+    /// When the next pass over the partitions of geo topics may be staged,
+    /// in microseconds since the Unix epoch.
+    next_topic_object_check_at: Cell<u64>,
 }
 
 impl ReconcilerCtx {
     #[must_use]
     pub fn new(
         shard: Rc<ServerShard>,
-        total_shards: u16,
         config: Rc<ServerConfig>,
         cluster_id: u128,
         self_replica_id: u8,
@@ -365,9 +390,14 @@ impl ReconcilerCtx {
             .mux_stm
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
+        let geo_topics = GeoTopics::new(&config.geo);
+        let shadow_topics = ShadowTopics::new(&config.geo);
+        let peer_manifests = PeerManifestLister::new(&config.geo);
+        let peer_positions = PeerPositionLister::new(&config.geo);
+        let partition_shards = shard.partition_shards();
         Self {
             shard,
-            total_shards,
+            partition_shards,
             config,
             cluster_id,
             self_replica_id,
@@ -384,6 +414,11 @@ impl ReconcilerCtx {
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
+            geo_topics,
+            shadow_topics,
+            peer_manifests,
+            peer_positions,
+            next_topic_object_check_at: Cell::new(0),
         }
     }
 
@@ -529,7 +564,7 @@ pub async fn run_reconciler(
 ) {
     debug!(
         shard = ctx.shard.id,
-        total_shards = ctx.total_shards,
+        total_shards = ctx.partition_shards.shard_count(),
         periodic_ms = periodic.as_millis(),
         "partition reconciler starting"
     );
@@ -563,6 +598,11 @@ pub async fn run_reconciler(
     }
 
     ctx.incarnation_deletes.stop();
+    ctx.geo_topics.stop();
+    ctx.shadow_topics.stop(&ctx.shard);
+    ctx.peer_manifests.stop();
+    ctx.peer_positions.stop();
+    ctx.shard.stop_geo_positions();
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -649,8 +689,18 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         reconcile_stream_keys(ctx);
     }
     report_lifecycles(ctx).await;
-    ctx.incarnation_deletes
-        .pass(&ctx.shard, IggyTimestamp::now());
+    let now = IggyTimestamp::now();
+    ctx.incarnation_deletes.pass(&ctx.shard, now);
+    ctx.geo_topics.pass(&ctx.shard, now);
+    ctx.shadow_topics.pass(&ctx.shard, now);
+    let place = NodePlace {
+        self_replica_id: ctx.self_replica_id,
+        replica_count: ctx.replica_count,
+        partition_shards: ctx.partition_shards,
+    };
+    ctx.peer_manifests.pass(&ctx.shard, now, place);
+    ctx.peer_positions.pass(&ctx.shard, now, place);
+    stage_topic_object_checks(ctx, now);
 
     if counters.total() > 0 {
         debug!(
@@ -678,6 +728,20 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         );
     }
     capped
+}
+
+/// Stage a pass over the partitions of geo topics on this shard's pump, at
+/// most once per [`TOPIC_OBJECT_RETRY`]. The pump starts the read of the
+/// topic's object for each partition whose primary does not take messages
+/// yet, so a new primary reads without waiting for a produce.
+fn stage_topic_object_checks(ctx: &ReconcilerCtx, now: IggyTimestamp) {
+    if now.as_micros() < ctx.next_topic_object_check_at.get() {
+        return;
+    }
+    let wait = u64::try_from(TOPIC_OBJECT_RETRY.as_micros()).unwrap_or(u64::MAX);
+    ctx.next_topic_object_check_at
+        .set(now.as_micros().saturating_add(wait));
+    ctx.shard.request_check_topic_objects(now);
 }
 
 /// Folds into the work set what changed since the last pass. Returns whether
@@ -1048,7 +1112,7 @@ async fn reconcile_target(
         return Convergence::Converged;
     }
 
-    let owning_shard = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    let owning_shard = ctx.partition_shards.shard_for(&ns);
     if owning_shard != shard_id {
         // Compare the epoch, not just presence: a delete + recreate
         // recycles the slab keys, so the row survives with the DEAD
@@ -1096,6 +1160,8 @@ async fn reconcile_target(
         metadata: partition_metadata,
         stream_key,
         encryption,
+        peer_log,
+        recovered_from,
     }) = fetch_partition_build_inputs(ctx, ns)
     else {
         return Convergence::Pending;
@@ -1182,6 +1248,34 @@ async fn reconcile_target(
         return Convergence::Pending;
     }
 
+    // A partition of a geo topic that a recovery restored starts from what
+    // the recovery took of it, which every replica installs before it serves
+    // a frame, so the group starts from one state. Committed metadata says
+    // which partitions those are, so no replica depends on its own config.
+    let plan = match recovered_from.filter(|_| !prior_life_on_disk) {
+        None => None,
+        Some(retired_cluster_uid) => match Box::pin(recovery_plan_of(
+            ctx,
+            ns,
+            created_revision,
+            retired_cluster_uid,
+        ))
+        .await
+        {
+            Ok(plan) => plan,
+            Err(reason) => {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                debug!(
+                    shard = shard_id,
+                    ns_raw = ns.inner(),
+                    reason,
+                    "the recovery plan of a partition is not read yet; building it later"
+                );
+                return Convergence::Pending;
+            }
+        },
+    };
+
     let built = if prior_life_on_disk {
         load_partition_or_fence(
             ctx.config.as_ref(),
@@ -1196,6 +1290,7 @@ async fn reconcile_target(
             partitions,
         )
         .await
+        .map(|partition| partition.map(Box::new))
     } else {
         build_partition_fresh(
             ctx.config.as_ref(),
@@ -1212,15 +1307,49 @@ async fn reconcile_target(
             Rc::clone(&ctx.shard.bus),
         )
         .await
-        .map(Some)
+        .map(|partition| Some(Box::new(partition)))
     };
+    // Boxed, so that the install's await below holds no whole partition in
+    // this future.
     match built {
         Ok(Some(mut partition)) => {
             partition.set_encryptor(encryptor);
             partition.start_at_create_op(partition_metadata.created_op);
+            if let Some(plan) = &plan
+                && let Err(error) =
+                    Box::pin(partition.install_recovery_plan(partitions.config(), plan)).await
+            {
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "a partition of a restored geo topic could not install what the recovery \
+                     took of it, so this node does not serve it; remove its directory and \
+                     restart the node to build it again"
+                );
+                partitions.refuse(ns, created_revision);
+                return Convergence::Converged;
+            }
+            if let Some((origin, prefix)) = peer_log
+                && let Err(error) = partition.follow_peer_log(origin, prefix)
+            {
+                ctx.record_failure(ns, FailureCause::Add, now);
+                ctx.shard.metrics().record_partition_reconcile_failure();
+                error!(
+                    shard = shard_id,
+                    stream_id = ns.stream_id(),
+                    topic_id = ns.topic_id(),
+                    partition_id = ns.partition_id(),
+                    %error,
+                    "a partition of a shadow topic cannot follow its peer's log"
+                );
+                return Convergence::Pending;
+            }
             ctx.shard.enqueue_reconcile_op(ReconcileOp::InsertOwned {
                 namespace: ns,
-                partition: Box::new(partition),
+                partition,
                 epoch: created_revision,
             });
             ctx.record_success(ns, FailureCause::Add);
@@ -1242,7 +1371,7 @@ async fn reconcile_target(
                 error = %err,
                 "refusing to rebuild a partition lost with this node's storage"
             );
-            partitions.fence(ns, created_revision);
+            partitions.refuse(ns, created_revision);
             Convergence::Converged
         }
         Err(err) => {
@@ -1258,6 +1387,34 @@ async fn reconcile_target(
             );
             Convergence::Pending
         }
+    }
+}
+
+/// What the recovery of `retired_cluster_uid` took of the partition `ns` of
+/// revision `created_revision`, `None` when it took nothing of the
+/// partition. `Err` with the reason while the plan cannot be read, as before
+/// the node passes its store identity check.
+async fn recovery_plan_of(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    created_revision: u64,
+    retired_cluster_uid: u128,
+) -> Result<Option<RecoveryPlan>, String> {
+    let Some(objects) = ctx.shard.topic_objects() else {
+        return Err("the node does not pass its store identity check yet".to_owned());
+    };
+    let scope = TierScope::new();
+    match objects
+        .read_recovery_plan(
+            retired_cluster_uid,
+            object_prefix(ns, created_revision),
+            scope.token(),
+        )
+        .await
+    {
+        Ok(Ok(plan)) => Ok(plan),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(TierJobCancelled) => Err("the read of the plan was cancelled".to_owned()),
     }
 }
 
@@ -1314,14 +1471,13 @@ fn reconcile_parked_frames(ctx: &ReconcilerCtx, round_ended: bool, counters: &mu
         return;
     }
     let partitions = ctx.shard.plane.partitions();
-    let total_shards = u32::from(ctx.total_shards);
     for ns in parked {
         if ctx.shard.has_staged_insert_owned(ns) {
             continue;
         }
         // Tombstoned namespaces are still in the map, so `contains` below reads
         // them as materialised.
-        let not_ours = calculate_shard_assignment(&ns, total_shards) != ctx.shard.id;
+        let not_ours = ctx.partition_shards.shard_for(&ns) != ctx.shard.id;
         let tombstoned = partitions.is_tombstoned(&ns);
         if tombstoned || not_ours {
             debug!(
@@ -1420,7 +1576,7 @@ async fn tear_down_owned_partition(
     // upgrade), refuse the delete and surface the inconsistency instead of
     // panicking the pump; the partition stays addressable via its existing
     // local entry until an operator resolves the conflict.
-    let hash_owner = calculate_shard_assignment(&ns, u32::from(ctx.total_shards));
+    let hash_owner = ctx.partition_shards.shard_for(&ns);
     if hash_owner != shard_id {
         ctx.shard.metrics().record_partition_reconcile_failure();
         error!(
@@ -1956,6 +2112,11 @@ struct PartitionBuildInputs {
     metadata: Partition,
     stream_key: StreamKeyIdentity,
     encryption: StreamEncryption,
+    /// The peer's log that a partition of a shadow topic follows.
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
+    /// The cluster that lost every disk, for a partition of a geo topic that
+    /// a recovery restored from its store.
+    recovered_from: Option<u128>,
 }
 
 /// Everything one namespace's build needs out of committed metadata: the shared
@@ -2002,6 +2163,8 @@ fn fetch_partition_build_inputs(
                 created_op: stream.created_op,
             },
             encryption: StreamEncryption::from(&stream.options),
+            peer_log: peer_log_of(stream, topic, ns),
+            recovered_from: topic.recovered_from,
         })
     })
 }
@@ -2460,6 +2623,8 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 
 #[cfg(test)]
 mod tests {
+    mod geo_topics;
+
     use super::{
         CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
         GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS, PassCounters, ReconcilerCtx,
@@ -2526,7 +2691,7 @@ mod tests {
     use rand::prelude::{RngExt, SeedableRng, StdRng};
     use server_common::sharding::{IggyNamespace, ShardId};
     use server_common::{Message, MessageBag, SegmentStorage};
-    use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
+    use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
     use shard::{IggyShard, PartitionConsensusConfig, ReconcileOp, Sender, ShardIdentity};
     use std::cell::Cell;
     use std::collections::{BTreeSet, HashSet};
@@ -3153,6 +3318,24 @@ mod tests {
         )
     }
 
+    /// [`build_test_shard`] on a node of `total_shards` shards, so the shard
+    /// places partitions over all of them. No test reads these lanes: the
+    /// receivers are dropped, and a send to them fails as `Disconnected`.
+    fn build_test_shard_in_mesh(
+        shard_id: u16,
+        config: &ServerConfig,
+        mux: TestMux,
+        total_shards: u16,
+    ) -> Rc<TestShard> {
+        const UNREAD_LANE_CAPACITY: usize = 1;
+        let (senders, ..) =
+            shard::shard_mesh_channels(total_shards, UNREAD_LANE_CAPACITY, UNREAD_LANE_CAPACITY);
+        let mut shard = Rc::into_inner(build_test_shard(shard_id, config, mux))
+            .expect("freshly built shard is uniquely owned");
+        shard.attach_senders(senders);
+        Rc::new(shard)
+    }
+
     /// Drain a test shard's lanes into `(consensus frames, staged client
     /// sends)`: work headed for the pump vs answers headed for a client.
     fn drain_inbox(lanes: &TestLanes) -> (usize, usize) {
@@ -3236,19 +3419,8 @@ mod tests {
         (fences, batches)
     }
 
-    fn make_ctx(
-        shard: Rc<TestShard>,
-        total_shards: u16,
-        config: Rc<ServerConfig>,
-    ) -> Rc<ReconcilerCtx> {
-        Rc::new(ReconcilerCtx::new(
-            shard,
-            total_shards,
-            config,
-            CLUSTER_ID,
-            0,
-            1,
-        ))
+    fn make_ctx(shard: Rc<TestShard>, config: Rc<ServerConfig>) -> Rc<ReconcilerCtx> {
+        Rc::new(ReconcilerCtx::new(shard, config, CLUSTER_ID, 0, 1))
     }
 
     /// The committed `created_view` of `ns`, what a reconcile pass would seed
@@ -3289,7 +3461,7 @@ mod tests {
         );
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
 
@@ -3331,7 +3503,7 @@ mod tests {
         seed_stream(&mux, 1, "stream-a");
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -3402,7 +3574,7 @@ mod tests {
         ))
         .expect("CreateTopicWithAssignments apply succeeds");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_pass(&ctx).await;
@@ -3452,7 +3624,7 @@ mod tests {
         ))
         .expect("CreateTopicWithAssignments apply succeeds");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
 
@@ -3480,7 +3652,7 @@ mod tests {
             seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
             seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
             let shard = build_test_shard_with_keys(0, &config, mux, node_context);
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
             reconcile_pass(&ctx).await;
 
@@ -3509,7 +3681,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, node_context);
-        let ctx = make_ctx(shard, 1, Rc::new(config));
+        let ctx = make_ctx(shard, Rc::new(config));
         let attempts = || {
             ctx.failure_state
                 .borrow()
@@ -3542,7 +3714,7 @@ mod tests {
             seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&stream_context, 1));
             seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
             let shard = build_test_shard_with_keys(0, &config, mux, key_context(OTHER_CONFIG_KEY));
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             let ns = IggyNamespace::new(0, 0, 0);
             std::fs::create_dir_all(&partition_dir).expect("prior partition files");
             if boot_deferred {
@@ -3579,7 +3751,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &stored);
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, Arc::clone(&new_context));
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_pass(&ctx).await;
@@ -3620,7 +3792,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, context);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         assert!(shard.plane.partitions().has_stream_keys());
@@ -3642,7 +3814,7 @@ mod tests {
         seed_encrypted_stream(&mux, 1, "stream-a", &wrap_stream_key(&context, 1));
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
         let shard = build_test_shard_with_keys(0, &config, mux, context);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         assert!(shard.plane.partitions().has_stream_keys());
 
@@ -3669,7 +3841,7 @@ mod tests {
             seed_stream(&mux, 1, "stream-a");
             seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
             let shard = build_test_shard(0, &config, mux);
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             let ns = IggyNamespace::new(0, 0, 0);
             let partition = fetch_partition_build_inputs(&ctx, ns)
                 .expect("committed namespace resolves")
@@ -3723,7 +3895,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         let listed = IggyNamespace::new(0, 0, 0);
         assert!(
@@ -3762,7 +3934,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_once(&ctx).await;
@@ -3804,7 +3976,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_once(&ctx).await;
@@ -3874,7 +4046,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_once(&ctx).await;
@@ -3935,7 +4107,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-a", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config.clone()));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config.clone()));
         let ns = IggyNamespace::new(0, 0, 0);
 
         let stats = fetch_partition_build_inputs(&ctx, ns)
@@ -4023,6 +4195,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir for system path");
         let config = test_config(&tmp);
         let total_shards: u16 = 4;
+        let placement = PartitionShards::new(total_shards, false);
 
         // Pick a partition count where the murmur3 distribution lands
         // entries on at least two distinct shards out of four, then
@@ -4034,9 +4207,7 @@ mod tests {
         let mut counts: std::collections::HashMap<u16, usize> = std::collections::HashMap::new();
         for partition_id in 0..partition_count {
             let ns = IggyNamespace::new(0, 0, partition_id as usize);
-            *counts
-                .entry(calculate_shard_assignment(&ns, u32::from(total_shards)))
-                .or_insert(0) += 1;
+            *counts.entry(placement.shard_for(&ns)).or_insert(0) += 1;
         }
         let (shard_id, _) = counts
             .iter()
@@ -4055,8 +4226,8 @@ mod tests {
             .collect();
         seed_topic(&mux, 2, 0, "topic-shard-aware", assignments);
 
-        let shard = build_test_shard(shard_id, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), total_shards, Rc::new(config));
+        let shard = build_test_shard_in_mesh(shard_id, &config, mux, total_shards);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
 
@@ -4066,7 +4237,7 @@ mod tests {
         let mut routed_only = 0usize;
         for partition_id in 0..partition_count {
             let ns = IggyNamespace::new(0, 0, partition_id as usize);
-            let expected_owner = calculate_shard_assignment(&ns, u32::from(total_shards));
+            let expected_owner = placement.shard_for(&ns);
             if expected_owner == shard_id {
                 assert!(
                     partitions.contains(&ns),
@@ -4120,7 +4291,7 @@ mod tests {
         );
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         assert_eq!(shard.plane.partitions().len(), 2);
@@ -4181,7 +4352,7 @@ mod tests {
         );
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         // Verify disk hierarchy exists before the delete commits.
@@ -4238,7 +4409,7 @@ mod tests {
         seed_topic(&mux, 3, 0, "topic-d2", vec![assignment(0, 3)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         assert_eq!(
@@ -4294,6 +4465,12 @@ mod tests {
     /// Store both objects of one segment and the manifest of `prefix`, and
     /// return their keys.
     async fn store_incarnation(deleter: &MemoryDeleter, prefix: ObjectPrefix) -> Vec<String> {
+        store_objects(deleter.executor().store(), prefix).await
+    }
+
+    /// Store both objects of one segment and the manifest of `prefix` in
+    /// `store`, and return their keys.
+    async fn store_objects(store: &MemoryStore, prefix: ObjectPrefix) -> Vec<String> {
         let layout = object_layout();
         let mut keys: Vec<String> = SegmentObject::ALL
             .into_iter()
@@ -4307,9 +4484,7 @@ mod tests {
             .collect();
         keys.push(layout.manifest_key(&prefix));
         for key in &keys {
-            deleter
-                .executor()
-                .store()
+            store
                 .put(key, PutBody::from_bytes(vec![1]), &PutOptions::default())
                 .await
                 .unwrap();
@@ -4356,7 +4531,7 @@ mod tests {
         seed_topic(&mux, 3, 0, "kept", vec![assignment(0, 3)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let deleted = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)]
             .map(|ns| committed_prefix(&shard, ns));
@@ -4408,7 +4583,7 @@ mod tests {
         seed_topic(&mux, 5, 1, "third", vec![assignment(0, 4)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let deleted = [
             IggyNamespace::new(0, 0, 0),
@@ -4449,7 +4624,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-reuse", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let old = committed_prefix(&shard, ns);
@@ -4484,7 +4659,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-live", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let live = committed_prefix(&shard, ns);
@@ -4498,6 +4673,7 @@ mod tests {
                 namespace: ns,
                 created_revision: live.created_revision,
                 kind: PartitionChangeKind::Removed,
+                skips_object_deletes: false,
             }],
             IggyTimestamp::now(),
         );
@@ -4526,7 +4702,7 @@ mod tests {
                 metadata_replica,
             );
             let deleter = install_memory_deleter(&shard);
-            let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             reconcile_pass(&ctx).await;
             let ns = IggyNamespace::new(0, 0, 0);
             let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
@@ -4543,6 +4719,7 @@ mod tests {
                     namespace: ns,
                     created_revision: 1,
                     kind: PartitionChangeKind::Removed,
+                    skips_object_deletes: false,
                 }],
                 IggyTimestamp::now(),
             );
@@ -4562,7 +4739,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-unannounced", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
@@ -4588,7 +4765,7 @@ mod tests {
         seed_stream(&mux, 1, "stream-no-deleter");
         seed_topic(&mux, 2, 0, "topic-no-deleter", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
 
         seed_delete_topic(&shard.plane.metadata().mux_stm, 3, 0, 0);
@@ -4607,7 +4784,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-demoted", vec![assignment(0, 1)]);
         let shard = build_metadata_primary_shard(&config, mux);
         let deleter = install_memory_deleter(&shard);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
         let stored = store_incarnation(&deleter, committed_prefix(&shard, ns)).await;
@@ -4644,7 +4821,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-reuse", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -4706,7 +4883,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         reconcile_pass(&ctx).await;
@@ -4761,7 +4938,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-unverifiable", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Committed, but no reconcile pass has run: no row to prove against.
@@ -4803,7 +4980,7 @@ mod tests {
         seed_stream(&mux, 1, "stream-delta");
         seed_topic(&mux, 2, 0, "topic-delta", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
@@ -4850,7 +5027,7 @@ mod tests {
         );
         seed_create_consumer_group(&mux, 3, 0, 0, "group");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         assert!(ctx.pending.borrow().is_empty());
@@ -4898,7 +5075,7 @@ mod tests {
                 .collect(),
         );
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let partitions = shard.plane.partitions();
 
         assert!(reconcile_once(&ctx).await, "the pass must stop at the cap");
@@ -4935,7 +5112,7 @@ mod tests {
                 .collect(),
         );
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let partitions = shard.plane.partitions();
         while reconcile_once(&ctx).await {
             shard.apply_reconcile_ops();
@@ -4970,7 +5147,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-early", vec![assignment(0, 1)]);
         seed_stream(&mux, 3, "stream-burst");
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let partitions = shard.plane.partitions();
         let mux = &shard.plane.metadata().mux_stm;
         let early = IggyNamespace::new(0, 0, 0);
@@ -5027,8 +5204,8 @@ mod tests {
             let config = test_config(&tmp);
             let mux = TestMux::default();
             seed_stream(&mux, 1, "oracle-stream");
-            let shard = build_test_shard(0, &config, mux);
-            let ctx = make_ctx(Rc::clone(&shard), TOTAL_SHARDS, Rc::new(config));
+            let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+            let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
             let stm = &shard.plane.metadata().mux_stm;
             let topic_ids = || {
                 stm.streams().read(|inner| {
@@ -5108,14 +5285,14 @@ mod tests {
                 .map(|partition_id| assignment(partition_id, u64::from(partition_id) + 1))
                 .collect(),
         );
-        let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), TOTAL_SHARDS, Rc::new(config));
+        let shard = build_test_shard_in_mesh(0, &config, mux, TOTAL_SHARDS);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let namespaces: Vec<_> = (0..PARTITIONS as usize)
             .map(|partition_id| IggyNamespace::new(0, 0, partition_id))
             .collect();
         let owners: BTreeSet<_> = namespaces
             .iter()
-            .map(|ns| calculate_shard_assignment(ns, u32::from(TOTAL_SHARDS)))
+            .map(|ns| ctx.partition_shards.shard_for(ns))
             .collect();
         assert_eq!(owners.len(), 2, "the topic must straddle both shards");
 
@@ -5160,7 +5337,6 @@ mod tests {
         let shard = build_test_shard(0, &config, mux);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -5201,7 +5377,7 @@ mod tests {
         seed_stream(&mux, 1, "repair-stream");
         seed_topic(&mux, 2, 0, "repair-topic", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         let damaged = IggyNamespace::new(0, 0, 0);
@@ -5245,7 +5421,6 @@ mod tests {
         let shard = build_test_shard(0, &config, mux);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -5305,7 +5480,7 @@ mod tests {
         seed_stream(&mux, 1, "trim-stream");
         seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let trims = || {
             let mut trims = Vec::new();
             while let Ok(frame) = lanes.main.try_recv() {
@@ -5361,7 +5536,7 @@ mod tests {
         seed_stream(&mux, 1, "trim-stream");
         seed_topic(&mux, 2, 0, "trim-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let trims = || {
             let mut trims = Vec::new();
             while let Ok(frame) = lanes.main.try_recv() {
@@ -5449,7 +5624,7 @@ mod tests {
         seed_stream(&mux, 1, "retained-stream");
         seed_topic(&mux, 2, 0, "retained-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -5601,6 +5776,157 @@ mod tests {
         ));
     }
 
+    /// Nothing else asks a partition that places its batches to delete the
+    /// objects its long-term log stopped listing. The pass carries no
+    /// truncation watermark, which does not bound those deletes.
+    #[compio::test]
+    async fn given_a_topic_that_places_its_batches_when_the_cleaner_passes_should_stage_a_delete_pass()
+     {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        seed_topic(&mux, 2, 0, "placing-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let deletes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut deletes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                if let shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                    namespace,
+                    created_revision,
+                    committed_up_to,
+                    ..
+                }) = frame
+                {
+                    deletes.push((namespace, created_revision, committed_up_to));
+                }
+            }
+            deletes
+        };
+        assert_eq!(deletes(), []);
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        assert_eq!(deletes(), [(namespace, created_revision, 0)]);
+    }
+
+    /// The segments of a partition that places its batches hold where the
+    /// messages are, so the per-replica expiry of those is not its retention:
+    /// the cleaner stages the pass over its long-term segments in its place,
+    /// with a byte budget of at least one such segment. Any other partition
+    /// keeps the per-replica pass and the budget of its own segments.
+    #[compio::test]
+    async fn given_a_retention_policy_when_the_cleaner_passes_should_stage_long_term_retention_only_for_a_topic_that_places_its_batches()
+     {
+        const EXPIRY_MICROS: u64 = 60_000_000;
+        // The smallest cap a topic takes is one of its segments. Shared
+        // between this many partitions it is below a long-term segment.
+        const TOPIC_BYTES: u64 = iggy_common::DEFAULT_SEGMENT_SIZE;
+        const PARTITIONS: u32 = 32;
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "placing-stream");
+        let assignments = (0..PARTITIONS)
+            .map(|partition| assignment(partition, u64::from(partition) + 1))
+            .collect();
+        seed_topic(&mux, 2, 0, "placing-topic", assignments);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 1024);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        let explicit: ResourceOptions = [
+            (OptionKey::MessageExpiry, HeaderValue::from(EXPIRY_MICROS)),
+            (OptionKey::MaxTopicSize, HeaderValue::from(TOPIC_BYTES)),
+        ]
+        .into_iter()
+        .map(|(key, value)| (HeaderKey::from(key), OptionValue::explicit(value)))
+        .collect();
+        let update = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &update))
+            .expect("UpdateTopic apply succeeds");
+        // The long-term retention passes the cleaner staged, and the byte
+        // budgets of the per-replica expiry passes that went with them.
+        let staged = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut long_term = Vec::new();
+            let mut expiry_budgets = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::RetainLongTerm {
+                        namespace,
+                        created_revision,
+                        message_expiry,
+                        max_bytes,
+                        ..
+                    }) => long_term.push((namespace, created_revision, message_expiry, max_bytes)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::CleanPartition {
+                        max_bytes,
+                        ..
+                    }) => expiry_budgets.push(max_bytes),
+                    _ => {}
+                }
+            }
+            (long_term, expiry_budgets)
+        };
+        let expiry = IggyExpiry::ExpireDuration(IggyDuration::from(EXPIRY_MICROS));
+        let long_term_segment = partitions::LONG_TERM_SEGMENT_BYTES as u64;
+
+        let (long_term, expiry_budgets) = staged();
+        assert_eq!(long_term, []);
+        assert_eq!(expiry_budgets.len(), PARTITIONS as usize);
+        assert!(
+            expiry_budgets
+                .iter()
+                .all(|budget| budget.is_some_and(|budget| budget >= TOPIC_BYTES)),
+            "a partition of whole batches keeps at least one of its own segments: \
+             {expiry_budgets:?}"
+        );
+
+        let partition = shard
+            .plane
+            .partitions()
+            .get_mut_by_ns(&namespace)
+            .expect("the reconciler materialized the partition");
+        let created_revision = partition.created_revision();
+        partition.set_runtime_options(iggy_common::TopicRuntimeOptions {
+            places_batches: true,
+            ..Default::default()
+        });
+
+        let (long_term, expiry_budgets) = staged();
+        assert_eq!(
+            long_term,
+            [(namespace, created_revision, expiry, Some(long_term_segment))]
+        );
+        assert_eq!(expiry_budgets.len(), PARTITIONS as usize - 1);
+    }
+
     /// An evicted segment is read back from the store, so the cleaner stages
     /// an eviction only while the node reads remote segments and passes the
     /// store identity check.
@@ -5612,7 +5938,7 @@ mod tests {
         seed_stream(&mux, 1, "evicted-stream");
         seed_topic(&mux, 2, 0, "evicted-topic", vec![assignment(0, 1)]);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -5659,6 +5985,96 @@ mod tests {
         assert_eq!(evictions(), [namespace]);
         frontier.set_store_identity_verified(false);
         assert_eq!(evictions(), Vec::<IggyNamespace>::new());
+    }
+
+    /// The delete pass of a tiered partition waits for a manifest that no
+    /// longer lists what it removes, so the cleaner stages the manifest pass
+    /// first. A shard without a publisher drops the pass, so it is staged
+    /// whether or not the node can tier topics.
+    #[compio::test]
+    async fn given_a_tiered_topic_when_the_cleaner_stages_its_passes_should_stage_the_manifest_ahead_of_the_object_deletes()
+     {
+        #[derive(Debug, PartialEq, Eq)]
+        enum Pass {
+            Manifest(IggyNamespace, u64),
+            Deletes(IggyNamespace, u64),
+        }
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mux = TestMux::default();
+        seed_stream(&mux, 1, "manifest-stream");
+        seed_topic(&mux, 2, 0, "manifest-topic", vec![assignment(0, 1)]);
+        let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
+        reconcile_pass(&ctx).await;
+        reconcile_pass(&ctx).await;
+        let namespace = IggyNamespace::new(0, 0, 0);
+        assert!(shard.plane.partitions().contains(&namespace));
+        let passes = || {
+            crate::segment_cleaner::stage_owned_partitions(&shard, &mut HashSet::new());
+            let mut passes = Vec::new();
+            while let Ok(frame) = lanes.main.try_recv() {
+                match frame {
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::PublishManifest {
+                        namespace,
+                        created_revision,
+                        ..
+                    }) => passes.push(Pass::Manifest(namespace, created_revision)),
+                    shard::ShardFrame::Lifecycle(shard::LifecycleFrame::DeleteObjects {
+                        namespace,
+                        created_revision,
+                        ..
+                    }) => passes.push(Pass::Deletes(namespace, created_revision)),
+                    _ => {}
+                }
+            }
+            passes
+        };
+        assert_eq!(passes(), [], "a topic that is not tiered has no manifest");
+
+        let explicit: ResourceOptions = std::iter::once((
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(HeaderValue::from(true)),
+        ))
+        .collect();
+        let enable = UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: None,
+            explicit_options: resource_options_to_wire(&explicit, OptionsProvenance::All)
+                .expect("options fit the wire"),
+            derived_options: WireOptions::empty(),
+        };
+        shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(build_prepare(3, Operation::UpdateTopicResolved, &enable))
+            .expect("UpdateTopic apply succeeds");
+        let created_revision = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .streams()
+            .created_revision_for_namespace(namespace)
+            .expect("the partition has an incarnation");
+
+        let expected = [
+            Pass::Manifest(namespace, created_revision),
+            Pass::Deletes(namespace, created_revision),
+        ];
+        assert!(
+            !shard
+                .plane
+                .metadata()
+                .applied_frontier()
+                .tiered_storage_ready()
+        );
+        assert_eq!(passes(), expected);
+        let frontier = shard.plane.metadata().applied_frontier();
+        frontier.set_store_identity_verified(true);
+        frontier.set_tiered_storage_ready(true);
+        assert_eq!(passes(), expected);
     }
 
     /// The mixed-version upgrade hole from IGGY-250, at the router seam this
@@ -5803,7 +6219,6 @@ mod tests {
         // The repair peer must be a member of the group it repairs from.
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -5945,7 +6360,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-wedge", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -6033,7 +6448,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-defer", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -6081,7 +6496,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         // Boot-fence shape: the verdict lands during partition load, before
@@ -6126,7 +6541,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence-exit", vec![assignment(0, 1)]);
 
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         let mux = &shard.plane.metadata().mux_stm;
@@ -6227,7 +6642,6 @@ mod tests {
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -6293,7 +6707,6 @@ mod tests {
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -6403,7 +6816,6 @@ mod tests {
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -6455,7 +6867,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, TOPIC_OP, 0, "topic", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
 
@@ -6490,7 +6902,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, 2, 0, "old", vec![assignment(0, 1)]);
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let namespace = IggyNamespace::new(0, 0, 0);
         let old_revision = shard
             .plane
@@ -6551,7 +6963,7 @@ mod tests {
             );
         }
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let stm = &shard.plane.metadata().mux_stm;
         let namespaces: Vec<_> = (0..TOPICS)
             .flat_map(|topic_id| {
@@ -6625,7 +7037,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-fence-hold", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         partitions.tombstone(ns);
@@ -6660,7 +7072,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-race", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
 
@@ -6710,7 +7122,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-defer-skip", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         reconcile_pass(&ctx).await;
         let ns = IggyNamespace::new(0, 0, 0);
@@ -6781,7 +7193,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-quarantine", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
 
@@ -6821,7 +7233,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-lost-row", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
         let partitions = shard.plane.partitions();
         let partition_dir = ctx.config.get_partition_path(0, 0, 0);
@@ -6864,7 +7276,7 @@ mod tests {
         seed_create_consumer_group(&mux, 3, 0, 0, "deleted");
         seed_delete_consumer_group(&mux, 4, 0, 0, 0);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, 0, 4).await;
@@ -6944,7 +7356,7 @@ mod tests {
         .expect("JoinConsumerGroup apply succeeds");
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let now = iggy_common::IggyTimestamp::now().as_micros();
@@ -6978,7 +7390,7 @@ mod tests {
         seed_pending_join(&mux, 4, 0, 0, 0, 100);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let now = iggy_common::IggyTimestamp::now().as_micros();
@@ -7019,7 +7431,7 @@ mod tests {
         seed_join_consumer_group(&mux, 4, 0, 0, 0, CLIENT_ID);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let rebalancing_timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let stm = &shard.plane.metadata().mux_stm;
@@ -7073,7 +7485,7 @@ mod tests {
         seed_join_consumer_group(&mux, 4, 0, 0, GROUP_ID, FIRST_CLIENT);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
         let timeout = config.consumer_group.rebalancing_timeout.as_micros();
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let stm = &shard.plane.metadata().mux_stm;
@@ -7127,7 +7539,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, 0, 4).await;
@@ -7178,7 +7590,7 @@ mod tests {
             .collect();
         seed_topic(&mux, 2, 0, "batch-topic", assignments);
         let (shard, lanes) = build_test_shard_with_inbox(0, &config, mux, 64);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let wakes = Rc::new(Cell::new(0));
         let counter = Rc::clone(&wakes);
@@ -7266,7 +7678,7 @@ mod tests {
         seed_delete_consumer_group(&mux, DELETED_REMOVAL_OP, 0, 0, DELETED_GROUP);
         seed_consumer_group_deletion_intent(&mux, DELETING_INTENT_OP, 0, 0, DELETING_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, DELETED_GROUP, DELETED_REMOVAL_OP).await;
@@ -7352,7 +7764,7 @@ mod tests {
         seed_delete_consumer_group(&mux, FIRST_REMOVAL_OP, 0, 0, GROUP_WITH_OFFSET);
         seed_delete_consumer_group(&mux, SECOND_REMOVAL_OP, 0, 0, GROUP_WITHOUT_OFFSET);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, GROUP_WITH_OFFSET, FIRST_REMOVAL_OP).await;
@@ -7412,7 +7824,6 @@ mod tests {
         let shard = build_test_shard(0, &config, mux);
         let ctx = Rc::new(ReconcilerCtx::new(
             Rc::clone(&shard),
-            1,
             Rc::new(config),
             CLUSTER_ID,
             0,
@@ -7487,7 +7898,7 @@ mod tests {
         seed_delete_consumer_group(&mux, STRANDED_REMOVAL_OP, 0, 0, STRANDED_GROUP);
         seed_delete_consumer_group(&mux, FREE_REMOVAL_OP, 0, 0, FREE_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, STRANDED_GROUP, STRANDED_REMOVAL_OP).await;
@@ -7535,7 +7946,7 @@ mod tests {
         seed_create_consumer_group(&mux, 3, 0, 0, "retired");
         seed_delete_consumer_group(&mux, REMOVAL_OP, 0, 0, RETIRED_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         install_deleted_group_owner(&shard, namespace, RETIRED_GROUP, REMOVAL_OP).await;
@@ -7590,7 +8001,7 @@ mod tests {
         }
         let (shard, inbox) =
             build_test_shard_with_inbox(0, &config, mux, GROUP_OFFSET_DELETES_PER_PASS + 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespace = IggyNamespace::new(0, 0, 0);
         for group in 0..groups {
@@ -7670,7 +8081,7 @@ mod tests {
         }
         seed_delete_consumer_group(&mux, delete_op, 0, 0, DELETED_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         let namespaces = [IggyNamespace::new(0, 0, 0), IggyNamespace::new(0, 0, 1)];
         for namespace in namespaces {
@@ -7716,7 +8127,7 @@ mod tests {
         seed_create_consumer_group(&mux, 3, 0, 0, "deleted");
         seed_delete_consumer_group(&mux, REMOVAL_OP, 0, 0, DELETED_GROUP);
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, INBOX_CAPACITY);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         drain_partition_submits(&inbox);
         let namespace = IggyNamespace::new(0, 0, 0);
@@ -7761,7 +8172,7 @@ mod tests {
         seed_stream(&mux, 1, "stream");
         seed_topic(&mux, 2, 0, "topic", vec![assignment(0, 1)]);
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 32);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         shard
             .plane
@@ -7795,7 +8206,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-cg", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
 
         let ns = IggyNamespace::new(0, 0, 0);
@@ -8010,7 +8421,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-reclaim", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // No pass yet, so the namespace is committed but unmaterialised.
@@ -8063,7 +8474,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-known", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         // Topic slab 1 does not exist yet, so there is no committed
         // `created_revision` to stamp: the frame parks with `epoch: None`.
@@ -8127,7 +8538,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-bytes", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         // Drain path 1: materialisation re-dispatches.
         let late = IggyNamespace::new(0, 1, 0);
@@ -8188,7 +8599,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-known", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
 
         // The primary replicates ahead of this node's metadata: topic slab 1 is
         // not committed here yet, so the prepare parks with `epoch: None`.
@@ -8241,7 +8652,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-first", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Parked against the FIRST incarnation, so it carries that revision.
@@ -8294,7 +8705,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-restamp-first", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Parked against the FIRST incarnation, so it carries that revision.
@@ -8382,7 +8793,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-order", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_prepare(&shard, ns, 5).await;
@@ -8436,7 +8847,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-park", vec![assignment(0, 1)]);
 
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         reconcile_pass(&ctx).await;
         reconcile_pass(&ctx).await;
         assert!(
@@ -8480,7 +8891,7 @@ mod tests {
                 .collect(),
         );
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let parked = IggyNamespace::new(0, 0, last_partition);
         park_one_request(&shard, parked).await;
         assert_eq!(shard.parked_frame_count(parked), 1);
@@ -8522,7 +8933,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-backoff", vec![assignment(0, 1)]);
 
         let (shard, inbox) = build_test_shard_with_inbox(0, &config, mux, 16);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_request(&shard, ns).await;
@@ -8590,7 +9001,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-epoch", vec![assignment(0, 1)]);
 
         let shard = build_test_shard(0, &config, mux);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         // Parked against the first incarnation, before any pass builds it.
@@ -9082,7 +9493,7 @@ mod tests {
         seed_topic(&mux, 2, 0, "topic-tombstone-park", vec![assignment(0, 1)]);
 
         let (shard, _inbox) = build_test_shard_with_inbox(0, &config, mux, 8);
-        let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+        let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
         let ns = IggyNamespace::new(0, 0, 0);
 
         park_one_request(&shard, ns).await;
@@ -9139,20 +9550,30 @@ mod tests {
     /// cross-core path, which only happens for namespaces the connection's shard
     /// does not own. That property is a murmur3 outcome, invisible from the
     /// integration test itself: it would stay green while silently degrading to
-    /// single-shard if the hash or the shard count changed. Pin it here, where
-    /// the assignment is a pure function, over the namespaces that test creates
-    /// (stream 0, topics 0..8, partition 0 - the slab keys the STM hands out).
+    /// single-shard if the hash, the shard count or the partition placement
+    /// changed. Pin it here, where the assignment is a pure function, over the
+    /// namespaces that test creates on its three shards (stream 0, topics 0..8,
+    /// partition 0 - the slab keys the STM hands out), for each placement it
+    /// runs: with shard 0 as a partition owner, and with partitions kept off it.
     #[test]
-    fn integration_topic_set_straddles_both_shards() {
-        let owners: Vec<u16> = (0..8)
-            .map(|topic_id| calculate_shard_assignment(&IggyNamespace::new(0, topic_id, 0), 2))
-            .collect();
-        let on_shard_one = owners.iter().filter(|owner| **owner == 1).count();
-        assert!(
-            on_shard_one > 0 && on_shard_one < owners.len(),
-            "the integration test's topics must land on both shards, else it \
-             silently stops covering the cross-core path; got {owners:?}"
-        );
+    fn given_the_integration_topics_when_placed_on_three_shards_should_straddle_shards() {
+        const SHARDS: u16 = 3;
+        const TOPICS: usize = 8;
+        for (skip_shard_zero, expected_owners) in [
+            (false, BTreeSet::from([0, 1, 2])),
+            (true, BTreeSet::from([1, 2])),
+        ] {
+            let placement = PartitionShards::new(SHARDS, skip_shard_zero);
+            let owners: BTreeSet<u16> = (0..TOPICS)
+                .map(|topic_id| placement.shard_for(&IggyNamespace::new(0, topic_id, 0)))
+                .collect();
+            assert_eq!(
+                owners, expected_owners,
+                "skip_shard_zero = {skip_shard_zero}: the integration test's topics must land \
+                 on more than one partition shard, else it silently stops covering the \
+                 cross-core path"
+            );
+        }
     }
 
     fn park_overflow_count(shard: &TestShard) -> u64 {

@@ -18,7 +18,7 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-<html>
+<html lang="en">
     <head>
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -34,10 +34,12 @@ under the License.
         />
         <base href="/" />
         <title>Apache Iggy Benchmarks Dashboard</title>
+        <!-- Deferred, so the splash paints before the script loads. It stays above the app
+             script, because deferred scripts run in document order and the charts need it. -->
+        <script defer src="/vendor/echarts-5.5.1.min.js"></script>
         <link data-trunk rel="copy-dir" href="assets" />
         <link data-trunk rel="rust" data-wasm-opt="z" />
         <link data-trunk rel="css" href="assets/style.css" />
-        <script src="/vendor/echarts-5.5.1.min.js"></script>
     </head>
 
     <body>

@@ -387,4 +387,17 @@ extension IggyClient {
     public func getClusterMetadata() async throws -> ClusterMetadata {
         try Responses.clusterMetadata(try await send(.getClusterMetadata)[...])
     }
+
+    /// Retires the geo peer `origin`, a datacenter that never returns. The
+    /// cluster then follows nothing of it again: its shadow topics serve
+    /// what they hold until their retention removes it, and a client may
+    /// delete them. A datacenter that comes back needs another origin name.
+    /// Needs root or the global `manageServers` permission. An origin that
+    /// is not 1 to 255 bytes fails with ``IggyErrorCode/invalidFormat``
+    /// before anything is sent.
+    public func retireGeoOrigin(origin: String) async throws {
+        let payload = try Requests.retireGeoOrigin(origin: origin)
+        let lineage = try await requireAuthenticated()
+        _ = try await send(.retireGeoOrigin, payload, lineage: lineage)
+    }
 }

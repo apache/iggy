@@ -55,9 +55,11 @@ pub struct AppliedFrontier {
     recovered_revision: AtomicU64,
     waiters: Mutex<Waiters>,
     read_budget: Duration,
+    partition_request_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
     tiered_storage_ready: AtomicBool,
     store_identity_verified: AtomicBool,
+    store_claimed_by_another: AtomicBool,
 }
 
 /// Volatile quorum evidence. Recovery restores metadata, never freshness.
@@ -102,6 +104,11 @@ impl AppliedFrontier {
     /// config default; this is what the simulator and unit fixtures get.
     pub const DEFAULT_READ_BUDGET: Duration = Duration::from_millis(3_000);
 
+    /// The budget of a partition request ahead of this frontier when nothing
+    /// sizes it from config: two commit broadcasts at the built-in
+    /// `COMMIT_MESSAGE_TICKS` interval.
+    pub const DEFAULT_PARTITION_REQUEST_BUDGET: Duration = Duration::from_millis(1_000);
+
     /// A frontier at zero whose held reads get `read_budget` before they fail
     /// retryable.
     #[must_use]
@@ -114,16 +121,17 @@ impl AppliedFrontier {
                 entries: Vec::new(),
             }),
             read_budget,
+            partition_request_budget: Self::DEFAULT_PARTITION_REQUEST_BUDGET,
             partition_freshness: None,
             tiered_storage_ready: AtomicBool::new(false),
             store_identity_verified: AtomicBool::new(false),
+            store_claimed_by_another: AtomicBool::new(false),
         }
     }
 
     /// Record whether the partitions of this node can read their remote
-    /// segments back. False until set. No boot path hands a partition those
-    /// reads yet (`IggyPartition::set_remote_segments`), so no boot path sets
-    /// this.
+    /// segments back. False until set, which the server does once it gave
+    /// them a store to read from.
     pub fn set_tiered_storage_ready(&self, ready: bool) {
         self.tiered_storage_ready.store(ready, Ordering::Release);
     }
@@ -155,6 +163,21 @@ impl AppliedFrontier {
         self.store_identity_verified.load(Ordering::Acquire)
     }
 
+    /// Record whether the last check that read this node's store identity
+    /// object found it naming another cluster, or holding bytes no cluster
+    /// wrote. False until the server's identity check sets it.
+    pub fn set_store_claimed_by_another(&self, claimed: bool) {
+        self.store_claimed_by_another
+            .store(claimed, Ordering::Release);
+    }
+
+    /// Whether this node's store names another cluster, as
+    /// [`Self::set_store_claimed_by_another`] last recorded it.
+    #[must_use]
+    pub fn store_claimed_by_another(&self) -> bool {
+        self.store_claimed_by_another.load(Ordering::Acquire)
+    }
+
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;
     /// a newly constructed frontier has no credit, including after recovery.
     #[must_use]
@@ -168,6 +191,14 @@ impl AppliedFrontier {
             window: heartbeat_timeout.saturating_add(Self::PARTITION_FRESHNESS_MARGIN),
             until_ns: AtomicU64::new(0),
         });
+        self
+    }
+
+    /// Size the wait of a partition request ahead of this frontier from
+    /// config, as the server sizes `read_budget`.
+    #[must_use]
+    pub const fn with_partition_request_budget(mut self, budget: Duration) -> Self {
+        self.partition_request_budget = budget;
         self
     }
 
@@ -207,6 +238,14 @@ impl AppliedFrontier {
     #[must_use]
     pub const fn read_budget(&self) -> Duration {
         self.read_budget
+    }
+
+    /// How long a partition request ahead of this frontier may wait for it.
+    /// Shorter than [`Self::read_budget`], because the wait holds back the
+    /// requests that its connection sent after it.
+    #[must_use]
+    pub const fn partition_request_budget(&self) -> Duration {
+        self.partition_request_budget
     }
 
     /// Highest metadata op this NODE has applied and published.

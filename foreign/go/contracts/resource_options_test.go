@@ -357,6 +357,7 @@ type streamResponseVector struct {
 		EncryptionKeySource       string                `json:"encryption_key_source"`
 		EncryptionKeyFingerprint  *string               `json:"encryption_key_fingerprint"`
 		EncryptionKekFingerprints []string              `json:"encryption_kek_fingerprints"`
+		ShadowOrigin              *string               `json:"shadow_origin"`
 	} `json:"expected"`
 }
 
@@ -374,6 +375,13 @@ type topicResponseVector struct {
 		CompressionAlgorithm string                `json:"compression_algorithm"`
 		MessageExpiry        string                `json:"message_expiry"`
 		MaxTopicSize         string                `json:"max_topic_size"`
+		// The durations of a geo topic, absent when unset.
+		FreshUploadInterval          *string `json:"fresh_upload_interval"`
+		ConsumerOffsetUploadInterval *string `json:"consumer_offset_upload_interval"`
+		PositionsPublishInterval     *string `json:"positions_publish_interval"`
+		TombstoneGrace               *string `json:"tombstone_grace"`
+		PositionsResumeTimeout       *string `json:"positions_resume_timeout"`
+		LongTermRewriteMaxInterval   *string `json:"long_term_rewrite_max_interval"`
 	} `json:"expected"`
 }
 
@@ -473,6 +481,7 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.StreamOptionEncryptionKeySource),
 			string(iggcon.StreamOptionEncryptionKeyFingerprint),
 			string(iggcon.StreamOptionEncryptionKekFingerprint),
+			string(iggcon.StreamOptionShadowOrigin),
 		},
 		"topic": {
 			string(iggcon.TopicOptionName),
@@ -491,6 +500,14 @@ func checkCatalog(t *testing.T, catalog []catalogRow) {
 			string(iggcon.TopicOptionTieredStorage),
 			string(iggcon.TopicOptionLocalRetentionAge),
 			string(iggcon.TopicOptionLocalRetentionSize),
+			string(iggcon.TopicOptionTopicType),
+			string(iggcon.TopicOptionGeoMode),
+			string(iggcon.TopicOptionFreshUploadInterval),
+			string(iggcon.TopicOptionConsumerOffsetUploadInterval),
+			string(iggcon.TopicOptionPositionsPublishInterval),
+			string(iggcon.TopicOptionTombstoneGrace),
+			string(iggcon.TopicOptionPositionsResumeTimeout),
+			string(iggcon.TopicOptionLongTermRewriteMaxInterval),
 		},
 		"user": {
 			string(iggcon.UserOptionUsername),
@@ -553,6 +570,7 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"encryption_key_source":      {accessor: "EncryptionKeySource"},
 			"encryption_key_fingerprint": {accessor: "EncryptionKeyFingerprint"},
 			"encryption_kek_fingerprint": {accessor: "EncryptionKekFingerprints"},
+			"shadow_origin":              {accessor: "ShadowOrigin"},
 		},
 		"topic": {
 			"name":                              {update: "Name"},
@@ -571,6 +589,14 @@ func checkTypedSurface(t *testing.T, catalog []catalogRow) {
 			"tiered_storage":                    {create: "TieredStorage", update: "TieredStorage"},
 			"local_retention_age":               {create: "LocalRetentionAge", update: "LocalRetentionAge", reset: string(iggcon.TopicOptionLocalRetentionAge)},
 			"local_retention_size":              {create: "LocalRetentionSize", update: "LocalRetentionSize", reset: string(iggcon.TopicOptionLocalRetentionSize)},
+			"topic_type":                        {create: "TopicType"},
+			"geo_mode":                          {create: "GeoMode"},
+			"fresh_upload_interval":             {create: "FreshUploadInterval", update: "FreshUploadInterval"},
+			"consumer_offset_upload_interval":   {create: "ConsumerOffsetUploadInterval", update: "ConsumerOffsetUploadInterval"},
+			"positions_publish_interval":        {create: "PositionsPublishInterval", update: "PositionsPublishInterval"},
+			"tombstone_grace":                   {create: "TombstoneGrace", update: "TombstoneGrace"},
+			"positions_resume_timeout":          {create: "PositionsResumeTimeout", update: "PositionsResumeTimeout"},
+			"long_term_rewrite_max_interval":    {create: "LongTermRewriteMaxInterval", update: "LongTermRewriteMaxInterval"},
 		},
 		"user": {
 			"username": {update: "Username"},
@@ -711,6 +737,13 @@ func checkStreamResponse(t *testing.T, constants fixtureConstants, vector stream
 	} else {
 		assert.Equal(t, expected.EncryptionKekFingerprints, stream.EncryptionKekFingerprints())
 	}
+	origin, ok := details.ShadowOrigin()
+	if expected.ShadowOrigin == nil {
+		assert.False(t, ok)
+	} else {
+		assert.True(t, ok)
+		assert.Equal(t, *expected.ShadowOrigin, origin)
+	}
 }
 
 func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicResponseVector) {
@@ -743,6 +776,34 @@ func checkTopicResponse(t *testing.T, constants fixtureConstants, vector topicRe
 	if localRetentionSize, ok := expected.Options[string(iggcon.TopicOptionLocalRetentionSize)]; ok {
 		assert.Equal(t, parseUint64(t, localRetentionSize.Value), topic.LocalRetentionSize)
 	}
+	if topicType, ok := expected.Options[string(iggcon.TopicOptionTopicType)]; ok {
+		assert.Equal(t, iggcon.TopicType(topicType.Value), topic.TopicType)
+	}
+	if geoMode, ok := expected.Options[string(iggcon.TopicOptionGeoMode)]; ok && topic.TopicType == iggcon.TopicTypeGeo {
+		require.NotNil(t, topic.GeoMode)
+		assert.Equal(t, iggcon.GeoMode(geoMode.Value), *topic.GeoMode)
+	} else if topic.TopicType == iggcon.TopicTypeNormal {
+		assert.Nil(t, topic.GeoMode)
+	}
+	checkDuration(t, iggcon.TopicOptionFreshUploadInterval, expected.FreshUploadInterval, topic.FreshUploadInterval)
+	checkDuration(t, iggcon.TopicOptionConsumerOffsetUploadInterval, expected.ConsumerOffsetUploadInterval, topic.ConsumerOffsetUploadInterval)
+	checkDuration(t, iggcon.TopicOptionPositionsPublishInterval, expected.PositionsPublishInterval, topic.PositionsPublishInterval)
+	checkDuration(t, iggcon.TopicOptionTombstoneGrace, expected.TombstoneGrace, topic.TombstoneGrace)
+	checkDuration(t, iggcon.TopicOptionPositionsResumeTimeout, expected.PositionsResumeTimeout, topic.PositionsResumeTimeout)
+	checkDuration(t, iggcon.TopicOptionLongTermRewriteMaxInterval, expected.LongTermRewriteMaxInterval, topic.LongTermRewriteMaxInterval)
+}
+
+// checkDuration compares a typed duration with the decimal microseconds of
+// the projection, where nil on both sides means unset.
+func checkDuration(t *testing.T, key iggcon.TopicOptionKey, expected *string, got *iggcon.Duration) {
+	t.Helper()
+	if expected == nil {
+		assert.Nil(t, got, key)
+		return
+	}
+	if assert.NotNil(t, got, key) {
+		assert.Equal(t, parseUint64(t, *expected), uint64(*got), key)
+	}
 }
 
 func checkUserResponse(t *testing.T, constants fixtureConstants, vector userResponseVector) {
@@ -768,9 +829,15 @@ func updateCommand(t *testing.T, scope string, target, input map[string]json.Raw
 	switch scope {
 	case "topic":
 		update := &command.UpdateTopic{
-			StreamId: identifier(t, target["stream_id"]),
-			TopicId:  identifier(t, target["topic_id"]),
-			Name:     optionalText(t, input["name"]),
+			StreamId:                     identifier(t, target["stream_id"]),
+			TopicId:                      identifier(t, target["topic_id"]),
+			Name:                         optionalText(t, input["name"]),
+			FreshUploadInterval:          optionalDuration(t, input["fresh_upload_interval"]),
+			ConsumerOffsetUploadInterval: optionalDuration(t, input["consumer_offset_upload_interval"]),
+			PositionsPublishInterval:     optionalDuration(t, input["positions_publish_interval"]),
+			TombstoneGrace:               optionalDuration(t, input["tombstone_grace"]),
+			PositionsResumeTimeout:       optionalDuration(t, input["positions_resume_timeout"]),
+			LongTermRewriteMaxInterval:   optionalDuration(t, input["long_term_rewrite_max_interval"]),
 		}
 		if raw, ok := input["message_expiry"]; ok {
 			expiry := iggcon.Duration(parseUint64(t, text(t, raw)))
@@ -831,24 +898,34 @@ func createStreamCommand(t *testing.T, input map[string]json.RawMessage) *comman
 func createTopicCommand(t *testing.T, input map[string]json.RawMessage) *command.CreateTopic {
 	t.Helper()
 	partitions := uint32(parseUint64(t, string(input["partitions_count"])))
-	compression := map[string]iggcon.CompressionAlgorithm{"none": iggcon.CompressionAlgorithmNone, "gzip": iggcon.CompressionAlgorithmGzip}[text(t, input["compression_algorithm"])]
-	expiry := iggcon.Duration(parseUint64(t, text(t, input["message_expiry"])))
-	maxTopicSize := parseUint64(t, text(t, input["max_topic_size"]))
-	segmentSize := parseUint64(t, text(t, input["segment_size"]))
 	durability := iggcon.Durability(text(t, input["durability"]))
 	consumerOffsetDurability := iggcon.Durability(text(t, input["consumer_offset_durability"]))
+	options := iggcon.TopicOptions{
+		PartitionsCount:              &partitions,
+		MessageExpiry:                optionalDuration(t, input["message_expiry"]),
+		MaxTopicSize:                 optionalUint64(t, input["max_topic_size"]),
+		SegmentSize:                  optionalUint64(t, input["segment_size"]),
+		Durability:                   &durability,
+		ConsumerOffsetDurability:     &consumerOffsetDurability,
+		FreshUploadInterval:          optionalDuration(t, input["fresh_upload_interval"]),
+		ConsumerOffsetUploadInterval: optionalDuration(t, input["consumer_offset_upload_interval"]),
+		PositionsPublishInterval:     optionalDuration(t, input["positions_publish_interval"]),
+		TombstoneGrace:               optionalDuration(t, input["tombstone_grace"]),
+		PositionsResumeTimeout:       optionalDuration(t, input["positions_resume_timeout"]),
+		LongTermRewriteMaxInterval:   optionalDuration(t, input["long_term_rewrite_max_interval"]),
+	}
+	if raw, ok := input["compression_algorithm"]; ok {
+		compression := map[string]iggcon.CompressionAlgorithm{"none": iggcon.CompressionAlgorithmNone, "gzip": iggcon.CompressionAlgorithmGzip}[text(t, raw)]
+		options.CompressionAlgorithm = &compression
+	}
+	if raw, ok := input["topic_type"]; ok {
+		topicType := iggcon.TopicType(text(t, raw))
+		options.TopicType = &topicType
+	}
 	return &command.CreateTopic{
 		StreamId: identifier(t, input["stream_id"]),
 		Name:     text(t, input["name"]),
-		Options: iggcon.TopicOptions{
-			PartitionsCount:          &partitions,
-			CompressionAlgorithm:     &compression,
-			MessageExpiry:            &expiry,
-			MaxTopicSize:             &maxTopicSize,
-			SegmentSize:              &segmentSize,
-			Durability:               &durability,
-			ConsumerOffsetDurability: &consumerOffsetDurability,
-		},
+		Options:  options,
 	}
 }
 
@@ -979,6 +1056,27 @@ func optionalText(t *testing.T, raw json.RawMessage) *string {
 	}
 	value := text(t, raw)
 	return &value
+}
+
+// optionalUint64 reads a decimal string input, nil when the input has none.
+func optionalUint64(t *testing.T, raw json.RawMessage) *uint64 {
+	t.Helper()
+	if raw == nil {
+		return nil
+	}
+	value := parseUint64(t, text(t, raw))
+	return &value
+}
+
+// optionalDuration reads decimal microseconds, nil when the input has none.
+func optionalDuration(t *testing.T, raw json.RawMessage) *iggcon.Duration {
+	t.Helper()
+	value := optionalUint64(t, raw)
+	if value == nil {
+		return nil
+	}
+	duration := iggcon.Duration(*value)
+	return &duration
 }
 
 func text(t *testing.T, raw json.RawMessage) string {

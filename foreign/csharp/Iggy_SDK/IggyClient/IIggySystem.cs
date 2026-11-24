@@ -121,6 +121,23 @@ public interface IIggySystem
     Task<MetadataChanges> GetMetadataChangesAsync(MetadataChangesQuery query, CancellationToken token = default);
 
     /// <summary>
+    ///     Retires the geo peer <paramref name="origin" />, a datacenter that never returns.
+    /// </summary>
+    /// <remarks>
+    ///     The cluster then follows nothing of it again: its shadow topics serve what they hold until their retention
+    ///     removes it, and a client may delete them. A datacenter that comes back needs another origin name. Requires
+    ///     root or the global manage servers permission. Available over TCP and HTTP.
+    /// </remarks>
+    /// <param name="origin">The origin name of the geo peer, 1 to 255 UTF-8 bytes.</param>
+    /// <param name="token">The cancellation token to cancel the operation.</param>
+    /// <returns>A task that completes when the cluster has retired the origin.</returns>
+    /// <exception cref="ArgumentException">An origin the request cannot carry, before anything is sent.</exception>
+    /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
+    ///     Unauthorized (code 41) without the manage servers permission.
+    /// </exception>
+    Task RetireGeoOriginAsync(string origin, CancellationToken token = default);
+
+    /// <summary>
     ///     Sends a ping request to the server to verify connectivity.
     /// </summary>
     /// <remarks>

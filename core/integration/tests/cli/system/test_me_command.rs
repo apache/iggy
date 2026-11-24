@@ -84,10 +84,10 @@ impl IggyCmdTestCase for TestMeCmd {
                     .stderr(diff("Error: Iggy sdk or command error\nCaused by: Iggy command line tool error\nCaused by: Missing iggy server credentials\n"));
             }
             Scenario::FailureDueToSessionTimeout => {
-                // An expired or invalid stored session surfaces as a generic
-                // login-with-token failure.
-                command_state.failure().stderr(diff(
-                    "Error: Iggy sdk or command error\nCaused by: Problem with server login with token\n",
+                // An expired stored session token is refused as an invalid token, so the CLI
+                // drops the stored session and asks for a new login.
+                command_state.failure().stderr(starts_with(
+                    "Error: Iggy sdk or command error\nCaused by: Login session expired for Iggy server: ",
                 ));
             }
         }

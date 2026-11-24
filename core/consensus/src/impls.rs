@@ -8660,6 +8660,13 @@ mod vsr_consensus_tests {
         })
     }
 
+    /// Parking a request stamps it from the clock, and Miri isolation rejects
+    /// the system clock.
+    fn frozen_clock() -> ConsensusClock {
+        const NOW_US: u64 = 4_242;
+        ConsensusClock::new(Rc::new(FrozenClock(NOW_US)))
+    }
+
     /// One committed write that passed through both queues.
     fn commit_queued_write(consensus: &VsrConsensus<StageNoopBus>, op: u64) {
         assert!(
@@ -8677,7 +8684,15 @@ mod vsr_consensus_tests {
      {
         const HEARTBEAT_TICKS: u64 = 2;
         const BUSY_INTERVALS: u64 = 3;
-        let consensus = VsrConsensus::new(1, 0, 3, 0, StageNoopBus, LocalPipeline::new());
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            0,
+            StageNoopBus,
+            LocalPipeline::new(),
+            frozen_clock(),
+        );
         consensus.set_commit_message_ticks(HEARTBEAT_TICKS);
         consensus.init();
         let pass_heartbeat_interval = || {
@@ -8702,8 +8717,15 @@ mod vsr_consensus_tests {
 
     #[test]
     fn given_a_primary_that_took_writes_when_it_adopts_the_next_view_should_free_its_queues() {
-        let consensus =
-            VsrConsensus::new(1, 0, 3, METADATA_GROUP, StageNoopBus, LocalPipeline::new());
+        let consensus = VsrConsensus::with_clock(
+            1,
+            0,
+            3,
+            METADATA_GROUP,
+            StageNoopBus,
+            LocalPipeline::new(),
+            frozen_clock(),
+        );
         consensus.init();
         commit_queued_write(&consensus, 1);
 

@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release, with a minimum binary protocol version of 0.12.1. Older builds are incompatible. This release requires fresh server storage (`IGGY-METADATA-CHANGE-LOG-2`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+This SDK uses binary client protocol 0.12.3. Server 0.10.1-edge.2 accepts that protocol and requires fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -555,9 +555,7 @@ sign-in succeeds. This also discards a session whose Register succeeded when a
 later step of the explicit sign-in fails. Earlier calls keep their original
 lineage. Only SDK recovery continues them under a replacement session.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.
@@ -718,6 +716,9 @@ console.log(stream.encryptionKeyFingerprint === key.fingerprint()); // true
 `stream.update`, `topic.update` and `user.update` change only the keys they name and leave every other setting as it is, so an update without `name` keeps the name. `reset` returns a key to the server default. Use the `StreamOptionKey`, `TopicOptionKey` and `UserOptionKey` constants to name keys.
 
 Only the topic keys `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` can be reset. The topic key `tiered_storage` is enable-only: an update can set it to `true`, and setting it to `false` or resetting it is refused with 4103. Settings fixed at create, such as the topic compression algorithm, the partition resize policy or the stream key, have no update field.
+
+A geo topic takes six durations of its own, in microseconds: `freshUploadInterval`, `consumerOffsetUploadInterval`, `positionsPublishInterval`, `tombstoneGrace`, `positionsResumeTimeout` and `longTermRewriteMaxInterval` (`GeoTopicDurations`). Each overrides the server setting of the same name, and one left out leaves that setting. `0n` is a value and is sent.
+`topic.update` can set them, and they are the only keys it may change on a geo topic, but a reset of one is refused with 4104. A normal topic refuses them with 4042. Reads report them as `bigint`, `null` when unset.
 
 The SDK checks the typed fields and `reset` before sending, in the server's order and with its error codes (4041 for an unknown key, 4105 for a read-only key, 4103 for a create-only key, 4104 for a key without a default, then the name, username or status error). For a key this build has no field or constant for, pass `options` entries and `rawReset` names. The SDK sends those as they are and the server decides, so a refusal comes back from the server.
 

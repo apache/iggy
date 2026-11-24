@@ -44,13 +44,17 @@ use crate::stream_keys::{
 };
 use crate::users::maybe_rewrite_user_password_request;
 use crate::wire::{request_body, rewrite_request_body};
+use configs::geo::check_origin;
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::requests::partitions::{
     CreatePartitionsRequest, DeletePartitionsRequest,
 };
-use iggy_binary_protocol::requests::streams::CreateStreamRequest;
-use iggy_binary_protocol::requests::system::{ResourceTarget, UpdateResourceRequest};
-use iggy_binary_protocol::requests::topics::CreateTopicRequest;
+use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
+use iggy_binary_protocol::requests::streams::{CreateStreamRequest, DeleteStreamRequest};
+use iggy_binary_protocol::requests::system::{
+    ResourceTarget, RetireGeoOriginRequest, UpdateResourceRequest,
+};
+use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
 use iggy_binary_protocol::requests::users::CreateUserRequest;
 use iggy_binary_protocol::{
     MAX_PARTITIONS_PER_REQUEST, Operation, PrepareHeader, RoutedRequestHeader, WireDecode,
@@ -61,12 +65,14 @@ use iggy_common::wire_conversions::resource_options_to_wire;
 use iggy_common::{
     AdmittedOptions, IggyByteSize, IggyError, MaxTopicSize, OptionAdmissionContext, OptionColumns,
     OptionOperation, OptionsProvenance, OptionsScope, ResourceOptions, TopicCreateOptions,
-    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_local_retention,
-    validate_preallocated_topic_bytes, validate_segment_max_age, validate_topic_segment_size,
+    TopicResolvedOptions, UserStatus, admit, derived_defaults, validate_geo_topic,
+    validate_local_retention, validate_preallocated_topic_bytes, validate_segment_max_age,
+    validate_topic_segment_size,
 };
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::shadow::is_shadow_stream_name;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use server_common::Message;
@@ -143,7 +149,7 @@ where
     // consensus and applies as a committed InvalidCredentials no-op, so the only
     // Err returned is a malformed body.
     let request =
-        maybe_rewrite_user_password_request(shard, request).map_err(|error| RewriteDeny {
+        maybe_rewrite_user_password_request(shard, request, true).map_err(|error| RewriteDeny {
             stage: RewriteStage::UserPassword,
             error,
         })?;
@@ -195,7 +201,7 @@ where
     SB: SuperblockStore + 'static,
 {
     let (request, raw_token) = rewrite_pat_request_for_user(user_id, request)?;
-    let request = maybe_rewrite_user_password_request(shard, request)?;
+    let request = maybe_rewrite_user_password_request(shard, request, false)?;
     let bounded = static_bounds(shard, Some(user_id), request)?;
     let key_context = shard.plane.partitions().key_context();
     let request = maybe_rewrite_secret_options_request(&key_context, bounded, || {
@@ -373,6 +379,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
+    refuse_shadow_write(shard.plane.metadata().mux_stm.streams(), &request)?;
     match request.header().operation {
         Operation::CreateTopic => CreateTopicRequest::decode_from(request_body(&request))
             .map_err(|_| IggyError::InvalidCommand)
@@ -403,9 +410,11 @@ where
                     );
                     return Err(IggyError::InvalidReplicationFactor);
                 }
-                // No ruling on `tiered_storage` here: whether the cluster can
-                // tier is known to the metadata primary alone, and it checks
-                // every request it prepares.
+                validate_geo_topic(&admitted.explicit)?;
+                // No ruling on `tiered_storage` or a geo `topic_type` here:
+                // whether the cluster can tier or hold a geo topic is known to
+                // the metadata primary alone, and it checks every request it
+                // prepares.
                 let mut stored = derived_defaults(OptionsScope::Topic, &admitted.explicit)?;
                 stored.extend(admitted.explicit);
                 validate_local_retention(&stored)?;
@@ -448,6 +457,7 @@ where
             .map_err(|_| IggyError::InvalidCommand)
             .and_then(|patch| patch_bounds(shard, user_id, &patch))?,
         Operation::CreateStream => return bound_stream_create(request),
+        Operation::RetireGeoOrigin => bound_geo_retirement(&request)?,
         Operation::CreateUser => {
             let mut create_user = CreateUserRequest::decode_from(request_body(&request))
                 .map_err(|_| IggyError::InvalidCommand)?;
@@ -471,6 +481,89 @@ where
     Ok(Bounded::Request(request))
 }
 
+/// Refuse a client write to a shadow stream before it takes a replicated
+/// log entry. Apply refuses the same, for a request that reached the primary
+/// before this node learned of the stream. A body that does not decode passes,
+/// for the stage that decodes it to refuse. A delete of a shadow stream or
+/// topic passes once the stream's origin retired.
+fn refuse_shadow_write(
+    streams: &Streams,
+    request: &Message<RoutedRequestHeader>,
+) -> Result<(), IggyError> {
+    let body = request_body(request);
+    let stream_id = match request.header().operation {
+        Operation::CreateTopic => CreateTopicRequest::decode_from(body)
+            .ok()
+            .map(|create| create.stream_id),
+        Operation::CreatePartitions => CreatePartitionsRequest::decode_from(body)
+            .ok()
+            .map(|create| create.stream_id),
+        Operation::DeletePartitions => DeletePartitionsRequest::decode_from(body)
+            .ok()
+            .map(|delete| delete.stream_id),
+        Operation::DeleteTopic => {
+            return refuse_shadow_delete(
+                streams,
+                DeleteTopicRequest::decode_from(body)
+                    .ok()
+                    .map(|delete| delete.stream_id),
+            );
+        }
+        Operation::DeleteStream => {
+            return refuse_shadow_delete(
+                streams,
+                DeleteStreamRequest::decode_from(body)
+                    .ok()
+                    .map(|delete| delete.stream_id),
+            );
+        }
+        Operation::DeleteSegments => DeleteSegmentsRequest::decode_from(body)
+            .ok()
+            .map(|delete| delete.stream_id),
+        Operation::UpdateResource => {
+            UpdateResourceRequest::decode_from(body)
+                .ok()
+                .and_then(|patch| match patch.target {
+                    ResourceTarget::Stream { stream_id }
+                    | ResourceTarget::Topic { stream_id, .. } => Some(stream_id),
+                    ResourceTarget::User { .. } => None,
+                })
+        }
+        _ => None,
+    };
+    if stream_id.is_some_and(|stream_id| streams.is_shadow_stream(&stream_id)) {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
+}
+
+/// Refuse the retirement of an origin whose name no cluster can take.
+fn bound_geo_retirement(request: &Message<RoutedRequestHeader>) -> Result<(), IggyError> {
+    let retire = RetireGeoOriginRequest::decode_from(request_body(request))
+        .map_err(|_| IggyError::InvalidCommand)?;
+    check_origin(retire.origin.as_str()).map_err(|reason| {
+        debug!(
+            origin = retire.origin.as_str(),
+            reason, "refusing to retire a geo origin whose name no cluster can take"
+        );
+        IggyError::InvalidFormat
+    })
+}
+
+/// Refuse a client delete of a shadow stream, or of a topic in one, whose
+/// origin has not retired.
+fn refuse_shadow_delete(
+    streams: &Streams,
+    stream_id: Option<WireIdentifier>,
+) -> Result<(), IggyError> {
+    if stream_id.is_some_and(|stream_id| {
+        streams.is_shadow_stream(&stream_id) && !streams.is_retired_shadow_stream(&stream_id)
+    }) {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
+}
+
 /// Decode and admit a stream create, handed on decoded with its admitted
 /// options. A refused one has its copies of a client key erased.
 fn bound_stream_create(request: Message<RoutedRequestHeader>) -> Result<Bounded, IggyError> {
@@ -478,6 +571,10 @@ fn bound_stream_create(request: Message<RoutedRequestHeader>) -> Result<Bounded,
         erase_stream_create(request, None);
         return Err(IggyError::InvalidCommand);
     };
+    if is_shadow_stream_name(create.name.as_str()) {
+        erase_stream_create(request, Some(create));
+        return Err(IggyError::InvalidStreamName);
+    }
     let admitted = admit_create(
         OptionsScope::Stream,
         &create.options,
@@ -541,6 +638,15 @@ where
         // A rule between two keys reads the one this patch leaves alone from
         // the stored map, so a patch of either key meets it.
         validate_local_retention(&admitted.patched(&current)?)?;
+    }
+    if matches!(patch.target, ResourceTarget::Stream { .. })
+        && admitted
+            .columns
+            .name
+            .as_deref()
+            .is_some_and(is_shadow_stream_name)
+    {
+        return Err(IggyError::InvalidStreamName);
     }
     if let (Some(actor_id), ResourceTarget::User { user_id: target_id }) =
         (authorized_user_id, &patch.target)
@@ -693,6 +799,7 @@ mod tests {
         register_reply, request_message, test_shard, test_shard_with_key_context,
     };
     use bytes::Bytes;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::system::WireResetKeys;
     use iggy_binary_protocol::requests::topics::{
         CreateTopicWithAssignmentsRequest, UpdateTopicResolvedRequest,
@@ -701,9 +808,10 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::wire_conversions::resource_options_from_wire;
     use iggy_common::{
-        HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey, OptionValue, OptionsUpdate,
-        ServerKeyContext, StreamCreateOptions, StreamEncryptionKey, StreamKeyOrigin,
-        TopicUpdateOptions, UserUpdateOptions, stream_wrap_set, text,
+        GeoMode, GeoTopicDurations, HeaderKey, HeaderValue, IggyDuration, IggyExpiry, OptionKey,
+        OptionValue, OptionsUpdate, PartitionResizePolicy, ServerKeyContext, StreamCreateOptions,
+        StreamEncryptionKey, StreamKeyOrigin, TopicType, TopicUpdateOptions, UserUpdateOptions,
+        stream_wrap_set, text,
     };
     use message_bus::installer::conn_info::ClientTransportKind;
     use metadata::stm::StateMachine as _;
@@ -960,6 +1068,333 @@ mod tests {
         .map(|_| ());
         assert_eq!(tcp, Err(expected.clone()), "binary chain");
         assert_eq!(http, Err(expected), "HTTP chain");
+    }
+
+    fn create_topic_body(name: &str, options: &TopicCreateOptions) -> Bytes {
+        CreateTopicRequest {
+            stream_id: WireIdentifier::numeric(0),
+            partitions_count: 1,
+            name: WireName::new(name).unwrap(),
+            options: options.to_wire().unwrap(),
+        }
+        .to_bytes()
+    }
+
+    /// The edge cannot tell whether the cluster can hold a geo topic, so a
+    /// geo create passes both chains. A primary whose cluster cannot tier
+    /// refuses it, as a reply that leaves the session in place.
+    #[compio::test]
+    async fn given_a_geo_topic_when_created_should_pass_either_chain_and_be_refused_by_the_primary()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = root_sessions(&shard, 1);
+
+        for geo_mode in [None, Some(GeoMode::Geo), Some(GeoMode::GeoTiered)] {
+            let body = create_topic_body(
+                "geo",
+                &TopicCreateOptions {
+                    topic_type: Some(TopicType::Geo),
+                    geo_mode,
+                    ..TopicCreateOptions::default()
+                },
+            );
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            );
+            assert!(tcp.is_ok(), "binary chain, {geo_mode:?}");
+            let (admitted, _) = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            )
+            .unwrap_or_else(|error| panic!("HTTP chain, {geo_mode:?}: {error}"));
+
+            let reply = shard
+                .plane
+                .metadata()
+                .submit_request_in_process(admitted)
+                .await
+                .expect("the primary answers");
+            assert_eq!(reply.header().command, Command::Reply, "{geo_mode:?}");
+            assert_eq!(
+                iggy_binary_protocol::result_code(reply.body()),
+                Some(IggyError::FeatureUnavailable.as_code()),
+                "{geo_mode:?}"
+            );
+        }
+    }
+
+    /// The primary would evict a client over these refusals, so the edge must
+    /// answer them.
+    #[test]
+    fn given_a_setting_its_type_cannot_have_when_creating_a_topic_should_refuse_it_on_either_chain()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        let sessions = root_sessions(&shard, 1);
+        let geo = |options: TopicCreateOptions| TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            ..options
+        };
+        let cases = [
+            (
+                TopicCreateOptions {
+                    geo_mode: Some(GeoMode::Geo),
+                    ..TopicCreateOptions::default()
+                },
+                OptionKey::GeoMode,
+            ),
+            (
+                TopicCreateOptions {
+                    topic_type: Some(TopicType::Normal),
+                    geo_mode: Some(GeoMode::GeoTiered),
+                    ..TopicCreateOptions::default()
+                },
+                OptionKey::GeoMode,
+            ),
+            (
+                geo(TopicCreateOptions {
+                    tiered_storage: Some(true),
+                    ..TopicCreateOptions::default()
+                }),
+                OptionKey::TieredStorage,
+            ),
+            (
+                geo(TopicCreateOptions {
+                    partition_resize_policy: Some(PartitionResizePolicy::Mutable),
+                    ..TopicCreateOptions::default()
+                }),
+                OptionKey::PartitionResizePolicy,
+            ),
+        ];
+
+        for (options, key) in cases {
+            let body = create_topic_body("topic", &options);
+            let expected = IggyError::InvalidOptionValue(key.to_string());
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::CreateTopic, 1, 1, 1, &body),
+            )
+            .map(|_| ());
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {key}");
+            assert_eq!(http, Err(expected), "HTTP chain, {key}");
+        }
+    }
+
+    /// An edge that reads a geo topic refuses a patch of it by key, so the
+    /// client learns which key it may not change. Only its durations change.
+    #[test]
+    fn given_a_geo_topic_when_patching_it_should_refuse_any_key_but_its_durations_on_either_chain()
+    {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        commit_geo_topic(&shard, 3);
+        let sessions = root_sessions(&shard, 1);
+        let patch_geo = |update: TopicUpdateOptions| {
+            let patch = update.to_patch().expect("the patch encodes");
+            UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(1),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let cases = [
+            (
+                patch_geo(TopicUpdateOptions {
+                    message_expiry: Some(IggyExpiry::ExpireDuration(
+                        IggyDuration::from_str("1h").unwrap(),
+                    )),
+                    ..TopicUpdateOptions::default()
+                }),
+                OptionKey::MessageExpiry,
+            ),
+            (
+                patch_geo(TopicUpdateOptions {
+                    raw_reset: [OptionKey::MessageExpiry.to_string()].into(),
+                    ..TopicUpdateOptions::default()
+                }),
+                OptionKey::MessageExpiry,
+            ),
+            (
+                patch_geo(TopicUpdateOptions {
+                    name: Some("renamed".to_owned()),
+                    ..TopicUpdateOptions::default()
+                }),
+                OptionKey::Name,
+            ),
+        ];
+
+        for (body, key) in cases {
+            let expected = IggyError::OptionNotUpdatable(key.to_string());
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, &body),
+            )
+            .map(|_| ());
+            assert_eq!(tcp, Err(expected.clone()), "binary chain, {key}");
+            assert_eq!(http, Err(expected), "HTTP chain, {key}");
+        }
+        // The normal topic beside it takes a patch.
+        assert_eq!(
+            http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(
+                    Operation::UpdateResource,
+                    1,
+                    1,
+                    1,
+                    &topic_patch(&[(OptionKey::MessageExpiry, "1h")], &[])
+                ),
+            )
+            .map(|_| ()),
+            Ok(())
+        );
+    }
+
+    /// A geo topic takes a change of its durations, and refuses their reset
+    /// as no default exists. The normal topic beside it takes none.
+    #[test]
+    fn given_a_geo_topic_when_patching_its_durations_should_take_them_and_refuse_a_reset_on_either_chain()
+     {
+        let bus = SpyBus::default();
+        let shard = Rc::new(test_shard(&bus, 0, 1, 1));
+        create_one_partition(&shard);
+        commit_geo_topic(&shard, 3);
+        let sessions = root_sessions(&shard, 1);
+        let patch_geo = |update: TopicUpdateOptions| {
+            let patch = update.to_patch().expect("the patch encodes");
+            UpdateResourceRequest {
+                target: ResourceTarget::Topic {
+                    stream_id: WireIdentifier::numeric(0),
+                    topic_id: WireIdentifier::numeric(1),
+                },
+                reset: patch.reset,
+                options: patch.set,
+            }
+            .to_bytes()
+        };
+        let both_chains = |body: &Bytes| {
+            let tcp = tcp_chain(
+                &shard,
+                &sessions,
+                1,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|_| ())
+            .map_err(|deny| deny.error);
+            let http = http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(Operation::UpdateResource, 1, 1, 1, body),
+            )
+            .map(|_| ());
+            (tcp, http)
+        };
+        let durations = patch_geo(TopicUpdateOptions {
+            geo_durations: GeoTopicDurations {
+                tombstone_grace: Some(IggyDuration::from_str("6h").unwrap()),
+                consumer_offset_upload_interval: Some(IggyDuration::from_str("0").unwrap()),
+                ..GeoTopicDurations::default()
+            },
+            ..TopicUpdateOptions::default()
+        });
+        assert_eq!(both_chains(&durations), (Ok(()), Ok(())));
+        let reset = patch_geo(TopicUpdateOptions {
+            raw_reset: [OptionKey::TombstoneGrace.to_string()].into(),
+            ..TopicUpdateOptions::default()
+        });
+        let not_resettable = IggyError::OptionNotResettable(OptionKey::TombstoneGrace.to_string());
+        assert_eq!(
+            both_chains(&reset),
+            (Err(not_resettable.clone()), Err(not_resettable))
+        );
+        // The normal topic beside it has no durations.
+        assert_eq!(
+            http_chain(
+                &shard,
+                DEFAULT_ROOT_USER_ID,
+                request_message(
+                    Operation::UpdateResource,
+                    1,
+                    1,
+                    1,
+                    &topic_patch(&[(OptionKey::TombstoneGrace, "6h")], &[])
+                ),
+            )
+            .map(|_| ()),
+            Err(IggyError::InvalidOptionValue(
+                OptionKey::TombstoneGrace.to_string()
+            ))
+        );
+    }
+
+    /// Commits a one-partition geo topic as topic 1 of stream 0, with the
+    /// defaults a primary that can tier derives for it.
+    fn commit_geo_topic(shard: &Rc<TestShard>, op: u64) {
+        let explicit = TopicCreateOptions {
+            topic_type: Some(TopicType::Geo),
+            ..TopicCreateOptions::default()
+        };
+        let derived = derived_defaults(OptionsScope::Topic, &explicit.to_option_map().unwrap())
+            .expect("the defaults derive");
+        let body = CreateTopicWithAssignmentsRequest {
+            request: CreateTopicRequest {
+                stream_id: WireIdentifier::numeric(0),
+                partitions_count: 1,
+                name: WireName::new("geo").unwrap(),
+                options: explicit.to_wire().unwrap(),
+            },
+            derived_options: resource_options_to_wire(&derived, OptionsProvenance::All).unwrap(),
+            partitions: vec![CreatedPartitionAssignment {
+                initial_view: 0,
+                partition_id: 0,
+                consensus_group_id: 1 << 20,
+                members: Vec::new(),
+            }],
+        }
+        .to_bytes();
+        let applied = shard
+            .plane
+            .metadata()
+            .mux_stm
+            .update(prepare_message(
+                Operation::CreateTopicWithAssignments,
+                1,
+                op,
+                &body,
+            ))
+            .expect("the create applies");
+        assert_eq!(applied.code, 0);
     }
 
     /// The edge rules on the request alone, so a patch that turns tiered
