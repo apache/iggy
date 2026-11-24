@@ -17,9 +17,7 @@
 
 use crate::commit_batch;
 use crate::metrics::{frame_drop_reason, frame_drop_variant};
-use crate::shards_table::{
-    ShardsTable, calculate_shard_assignment, calculate_shard_from_consensus_ns,
-};
+use crate::shards_table::ShardsTable;
 use crate::{
     IggyShard, LifecycleFrame, PARTITION_WALKS_PER_TICK_MAX, Receiver, RestorableMetadataStm,
     ShardFrame,
@@ -53,6 +51,12 @@ use std::task::Poll;
 pub use consensus::TICK_INTERVAL as CONSENSUS_TICK_INTERVAL;
 
 pub const COOPERATIVE_EVENT_BUDGET: usize = 64;
+
+/// How many kept metadata frames the pump hands back per main-lane frame.
+/// More than one: a metadata frame that arrives behind kept ones is kept too,
+/// so one per frame never shortens the queue under a steady stream of them,
+/// and the repair of a gap waits behind it.
+const GATED_METADATA_FRAMES_PER_MAIN_FRAME: usize = 2;
 
 #[derive(Default)]
 pub struct LoopbackRound {
@@ -209,8 +213,8 @@ where
     }
 
     /// The shard that owns every group of `entries`, or `None` when they span
-    /// shards. Nodes with equal shard counts hash a group to the same shard, so
-    /// a batch between them has one owner.
+    /// shards. Nodes with equal shard counts and partition placement hash a
+    /// group to the same shard, so a batch between them has one owner.
     fn single_target<E>(&self, entries: &[E], group: impl Fn(&E) -> u64) -> Option<u16> {
         let (first, rest) = entries.split_first()?;
         let target = self.group_shard(group(first));
@@ -238,7 +242,7 @@ where
         if group == METADATA_GROUP {
             0
         } else {
-            calculate_shard_from_consensus_ns(group, self.shard_count)
+            self.partition_shards.shard_for_consensus_ns(group)
         }
     }
 
@@ -265,16 +269,16 @@ where
     }
 
     /// Route a consensus-control message (`StartViewChange`, `DoViewChange`,
-    /// `StartView`, `Commit`) by hashing its raw `u64` consensus namespace.
-    /// Every node uses the same hash so the shard owning the consensus
-    /// group is deterministic across the cluster.
+    /// `StartView`, `Commit`) by hashing its raw `u64` consensus namespace
+    /// with this node's partition placement, the one the group's partition
+    /// lives under.
     pub(crate) fn route_consensus_control(
         &self,
         message: MessageBag,
         namespace_u64: u64,
         operation: Operation,
     ) {
-        let target = calculate_shard_from_consensus_ns(namespace_u64, self.shard_count);
+        let target = self.partition_shards.shard_for_consensus_ns(namespace_u64);
         self.try_send_to_target(target, message, operation);
     }
 
@@ -301,7 +305,7 @@ where
             let partition_namespace = IggyNamespace::from_raw(namespace_u64);
             // The shards table is a cache of the deterministic hash
             // assignment (every `InsertOwned`/`InsertRouted` row stores
-            // `calculate_shard_assignment`'s result), seeded asynchronously
+            // `PartitionShards::shard_for`'s result), seeded asynchronously
             // by each shard's reconciler. A miss therefore means "not seeded
             // yet", not "unroutable": fall back to the hash so frames arriving
             // during the post-commit convergence window still reach the shard
@@ -321,7 +325,7 @@ where
                         partition = partition_namespace.partition_id(),
                         "namespace not in shards_table; routing by hash assignment"
                     );
-                    calculate_shard_assignment(&partition_namespace, self.shard_count)
+                    self.partition_shards.shard_for(&partition_namespace)
                 });
             self.try_send_to_target(target, generic, operation);
             return;
@@ -568,6 +572,9 @@ where
                     // a quiet shard until the next inbound frame's tail
                     // drain; parked partition frames then never re-dispatch.
                     self.apply_reconcile_ops();
+                    // After the apply: a build that lands on this tick releases
+                    // the held reads whose hold has not ended.
+                    self.expire_held_reads();
                     self.tick_deferred_polls();
                     self.sweep_readiness_watches();
                     consensus_tick.set(rearm_tick());
@@ -631,9 +638,35 @@ where
                                 self.process_frame(reply).await;
                             }
                             self.process_one_poll_completion(&mut loopback_buf).await;
+                            // A bounded turn per main frame, as the reply lane
+                            // above: the arm below never runs while the main
+                            // lane is busy.
+                            for _ in 0..GATED_METADATA_FRAMES_PER_MAIN_FRAME {
+                                let Some(frame) = self.pop_gated_metadata_frame() else {
+                                    break;
+                                };
+                                self.replay_gated_metadata_frame(frame, &mut loopback_buf).await;
+                            }
                         }
                         Err(_) => break,
                     }
+                }
+                frame = poll_fn(|_| {
+                    self.pop_gated_metadata_frame().map_or(Poll::Pending, Poll::Ready)
+                }).fuse() => {
+                    // Below the main lane, not with the redispatch arm above
+                    // it: a trim can leave a deep queue, and the frames that
+                    // arrive meanwhile, such as the replies to this replica's
+                    // heartbeats, must not wait for all of it.
+                    self.replay_gated_metadata_frame(frame, &mut loopback_buf).await;
+                    // As the redispatch arm does: this arm outranks the reply
+                    // lane and the poll completions too.
+                    if let Ok(reply) = self.reply_inbox.try_recv()
+                        && self.accept_frame_for_self(&reply)
+                    {
+                        self.process_frame(reply).await;
+                    }
+                    self.process_one_poll_completion(&mut loopback_buf).await;
                 }
                 frame = self.reply_inbox.recv().fuse() => {
                     // Reached only while the main lane is quiet (biased order):
@@ -710,6 +743,7 @@ where
         // clients time out, which is what a node stopping on a durability
         // fault owes them.
         self.shutting_down.set(true);
+        self.reject_held_reads();
         let stop_began_micros = self.bus.monotonic_micros();
         if fatal.is_none() {
             fatal = self
@@ -871,6 +905,23 @@ where
             self.process_loopback(loopback_buf).await;
             self.apply_reconcile_ops();
         }
+    }
+
+    /// Hand the plane one metadata frame that waited for the end of a WAL
+    /// trim, see `Self::defer_gated_metadata_frame`.
+    #[allow(clippy::future_not_send)]
+    async fn replay_gated_metadata_frame(&self, frame: MessageBag, loopback_buf: &mut LoopbackRound)
+    where
+        B: MessageBus + 'static,
+        MJ: JournalHandle,
+        <MJ as JournalHandle>::Target:
+            Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        M: RestorableMetadataStm,
+    {
+        self.deliver_message(frame, None).await;
+        self.cooperate().await;
+        self.process_loopback(loopback_buf).await;
+        self.apply_reconcile_ops();
     }
 
     /// Process queued work after the select loop has stopped. Redispatch keeps
@@ -1211,8 +1262,9 @@ where
                 namespace,
                 read,
                 reply,
+                hold,
             } => {
-                self.on_partition_read(namespace, read, reply).await;
+                self.on_partition_read(namespace, read, reply, hold).await;
             }
             LifecycleFrame::ReadinessWait { wait, reply, watch } => {
                 self.admit_readiness_wait(*wait, &reply, watch);
@@ -1605,8 +1657,9 @@ mod tests {
     use crate::partition_placement_tests::{PlacementShard, owner};
     use crate::shards_table::PapayaShardsTable;
     use crate::{
-        PartitionConsensusConfig, ReplicaTopology, ShardIdentity, TaggedSender,
-        build_deny_reply_from_request_header, shard_channel, shard_mesh_channels,
+        PartitionConsensusConfig, PartitionRead, PartitionReadReply, ReplicaTopology,
+        ShardIdentity, TaggedSender, build_deny_reply_from_request_header, shard_channel,
+        shard_mesh_channels,
     };
     use consensus::{LocalPipeline, VsrConsensus};
     use iggy_binary_protocol::{
@@ -1884,12 +1937,11 @@ mod tests {
         let (senders, inboxes, _replies) = shard_mesh_channels(SHARDS, INBOX_CAPACITY, 1);
         shard.attach_senders(senders);
         let inboxes: Vec<_> = inboxes.into_iter().map(Option::unwrap).collect();
+        let placement = shard.partition_shards();
         let groups_on = |target| {
             (0..)
                 .map(|id| IggyNamespace::new(1, 1, id).inner())
-                .filter(move |group| {
-                    calculate_shard_from_consensus_ns(*group, u32::from(SHARDS)) == target
-                })
+                .filter(move |group| placement.shard_for_consensus_ns(*group) == target)
         };
         let on_zero = groups_on(0).next().unwrap();
         let on_one: Vec<u64> = groups_on(1).take(2).collect();
@@ -2011,7 +2063,7 @@ mod tests {
         let mut stream = Stream::default();
         stream.topics.insert(topic);
         let mut streams = StreamsInner::default();
-        streams.items.insert(stream);
+        streams.items.insert(Arc::new(stream));
         let segment_size = IggyByteSize::from(SEGMENT_SIZE_BYTES);
         let config = PartitionsConfig {
             messages_required_to_save: MESSAGES_REQUIRED_TO_SAVE,
@@ -2053,6 +2105,7 @@ mod tests {
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus),
             None,
+            true,
             ShardMetrics::for_shard(),
         )
         .expect("valid shard wiring");
@@ -2301,6 +2354,60 @@ mod tests {
             outcome.partitions.push((namespace, commit_min, wal));
         }
         outcome
+    }
+
+    /// No build lands after a stop, so the pump answers the reads that wait
+    /// for one. Committed partitions that the shard never built stand for the
+    /// gap after a create.
+    #[compio::test]
+    async fn given_shutdown_when_reads_are_held_should_answer_all() {
+        const HELD_READS: usize = 2;
+        let root = tempfile::tempdir().unwrap();
+        let (shard, sender) = wired_owner(root.path(), HELD_READS, None);
+        let held: Vec<_> = (0..HELD_READS)
+            .map(|id| {
+                let (reply, replies) = crate::channel(1);
+                sender
+                    .try_send(ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
+                        namespace: IggyNamespace::new(0, 0, id),
+                        read: PartitionRead::Primary,
+                        reply,
+                        hold: None,
+                    }))
+                    .unwrap();
+                replies
+            })
+            .collect();
+
+        Box::pin(run_until_stopped(&shard, async {
+            while shard.held_read_count() < HELD_READS {
+                compio::time::sleep(TASK_POLL_INTERVAL).await;
+            }
+        }))
+        .await;
+
+        for replies in &held {
+            assert!(matches!(
+                replies.try_recv(),
+                Ok(PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted
+                ))
+            ));
+        }
+        assert_eq!(shard.held_read_count(), 0);
+        let (reply, replies) = crate::channel(1);
+        shard
+            .on_partition_read(
+                IggyNamespace::new(0, 0, 0),
+                PartitionRead::Primary,
+                reply,
+                None,
+            )
+            .await;
+        assert!(
+            matches!(replies.try_recv(), Ok(PartitionReadReply::NotFound)),
+            "a stopped shard holds no new read"
+        );
     }
 
     /// The stop serves the partitions with the oldest first op up to its

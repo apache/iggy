@@ -2087,7 +2087,12 @@ impl Harness {
     fn stream(&self, stream_id: usize) -> Stream {
         self.mux
             .streams()
-            .read(|streams| streams.items.get(stream_id).cloned())
+            .read(|streams| {
+                streams
+                    .items
+                    .get(stream_id)
+                    .map(|stream| stream.as_ref().clone())
+            })
             .expect("stream exists")
     }
 
