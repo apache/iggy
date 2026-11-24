@@ -1817,6 +1817,8 @@ pub struct TopicCreateOptions {
     /// A geo topic in the `geo` mode has no choice: the server ignores this
     /// and stores [`Durability::Persisted`].
     pub durability: Durability,
+    /// Completion policy of explicit consumer offset stores and deletes. A
+    /// geo topic in the `geo` mode has no choice here either.
     pub consumer_offset_durability: Durability,
     /// Immutable after creation. `None` resolves to
     /// [`PartitionResizePolicy::Mutable`], or to `Fixed` on a geo topic.
@@ -1875,8 +1877,9 @@ impl TopicCreateOptions {
         matches!(self.topic_type, Some(TopicType::Geo))
     }
 
-    /// The durability the topic's type and mode fix, or `None` when the
-    /// topic's own `durability` decides. See [`GeoMode::fixed_durability`].
+    /// The durability the topic's type and mode fix for its messages and its
+    /// consumer offsets, or `None` when the topic's own options decide. See
+    /// [`GeoMode::fixed_durability`].
     #[must_use]
     pub fn fixed_durability(&self) -> Option<Durability> {
         if !self.is_geo() {

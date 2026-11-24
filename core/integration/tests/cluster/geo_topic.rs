@@ -31,6 +31,8 @@ const STREAM: &str = "geo-cluster-stream";
 const TOPIC: &str = "geo-cluster-topic";
 const PARTITION_ID: u32 = 0;
 const MESSAGES: u64 = 20;
+const CONSUMER_ID: u32 = 7;
+const STORED_OFFSET: u64 = 12;
 /// More sends than `EVICTED_RING_CAPACITY` keeps for repair, so a node that
 /// lost them all cannot take them from another replica's journal.
 const MESSAGES_PAST_REPAIR: u64 = 200;
@@ -111,6 +113,59 @@ async fn given_a_geo_topic_past_the_repair_window_when_a_node_returns_without_it
     harness.stop_node(1).expect("stop node 1");
 
     send_and_read_through(&harness, &[0, 2], MESSAGES_PAST_REPAIR).await;
+}
+
+/// A replica that answered a send or an offset store before writing it can
+/// return from a crash without it, so after every node dies the partition
+/// trusts no such replica's log and elects only once all are back. A geo
+/// topic writes both first, so the two nodes that return elect without the
+/// third and serve every acknowledged send and the stored offset.
+#[tokio::test]
+async fn given_a_geo_topic_on_three_nodes_when_every_node_dies_and_two_return_should_serve_the_sends_and_the_stored_offset()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = cluster_with_fs_store(store.path(), &[]);
+    harness.start().await.expect("the cluster boots");
+    seed_geo_topic(&harness, MESSAGES, None).await;
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    let consumer = Consumer::new(Identifier::numeric(CONSUMER_ID).expect("consumer identifier"));
+    harness
+        .root_client_for_node(0)
+        .await
+        .expect("connect a root client")
+        .store_consumer_offset(
+            &consumer,
+            &stream,
+            &topic,
+            Some(PARTITION_ID),
+            STORED_OFFSET,
+        )
+        .await
+        .expect("store the consumer offset");
+
+    harness.kill_cluster().expect("kill every node");
+    for node in [0, 1] {
+        harness.restart_node(node).expect("restart the node");
+    }
+
+    let deadline = Instant::now() + SETTLE_DEADLINE;
+    loop {
+        if let Some(client) = connect_any(&harness, &[0, 1]).await
+            && let Ok(Some(offset)) = client
+                .get_consumer_offset(&consumer, &stream, &topic, Some(PARTITION_ID))
+                .await
+        {
+            assert_eq!(offset.stored_offset, STORED_OFFSET);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "nodes 0 and 1 never served the stored consumer offset"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+    send_and_read_through(&harness, &[0, 1], MESSAGES).await;
 }
 
 fn cluster_with_fs_store(store: &Path, extra: &[(&str, &str)]) -> TestHarness {

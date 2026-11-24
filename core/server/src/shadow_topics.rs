@@ -964,10 +964,7 @@ fn adopt(
                 },
                 create: Box::new(adoption(stream_id, object)?),
                 retention: retention_of(object),
-                geo_mode: match object.geo_mode {
-                    TopicGeoMode::Geo => GeoMode::Geo,
-                    TopicGeoMode::GeoTiered => GeoMode::GeoTiered,
-                },
+                geo_mode: geo_mode_of(object),
             });
         }
     }
@@ -1034,12 +1031,20 @@ fn follow_read_cache(
 
 /// The create of the shadow topic of `object`, without the partition
 /// assignments that the metadata primary fills in.
+///
+/// Its partitions run with the durability that the origin's `geo_mode`
+/// fixes, as a read of the shadow topic reports. With replicated offsets, a
+/// crash of every node would leave a shadow partition waiting for its last
+/// replica before it elects.
 fn adoption(stream_id: usize, object: &TopicObject) -> Option<CreateTopicWithAssignmentsRequest> {
+    let durability = geo_mode_of(object).fixed_durability().unwrap_or_default();
     let options = TopicCreateOptions {
         compression_algorithm: Some(match object.compression {
             TopicCompression::None => CompressionAlgorithm::None,
             TopicCompression::Gzip => CompressionAlgorithm::Gzip,
         }),
+        durability,
+        consumer_offset_durability: durability,
         read_cache: TopicReadCache {
             size: object.read_cache_size.map(IggyByteSize::from),
             read_ahead: object.read_ahead.map(IggyByteSize::from),
@@ -1063,6 +1068,14 @@ const fn retention_of(object: &TopicObject) -> ShadowRetention {
     ShadowRetention {
         message_expiry: object.message_expiry,
         max_topic_size: object.max_topic_size,
+    }
+}
+
+/// The mode of the topic of `object` in the peer.
+const fn geo_mode_of(object: &TopicObject) -> GeoMode {
+    match object.geo_mode {
+        TopicGeoMode::Geo => GeoMode::Geo,
+        TopicGeoMode::GeoTiered => GeoMode::GeoTiered,
     }
 }
 
@@ -1740,6 +1753,26 @@ mod tests {
 
         assert!(!runtime.places_batches);
         assert!(!runtime.geo_topic);
+    }
+
+    #[test]
+    fn given_the_shadow_of_a_topic_in_each_mode_when_deriving_its_runtime_options_should_run_the_durability_the_mode_fixes()
+     {
+        for (geo_mode, expected) in [
+            (TopicGeoMode::Geo, iggy_common::Durability::Persisted),
+            (TopicGeoMode::GeoTiered, iggy_common::Durability::Replicated),
+        ] {
+            let (inner, stream_id) = adopted_from(TopicObject {
+                geo_mode,
+                ..object(key(), "orders", 10)
+            });
+            let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC_SLOT];
+
+            let runtime = iggy_common::TopicRuntimeOptions::from_resource_options(&topic.options);
+
+            assert_eq!(runtime.durability, expected, "{geo_mode:?}");
+            assert_eq!(runtime.consumer_offset_durability, expected, "{geo_mode:?}");
+        }
     }
 
     #[test]

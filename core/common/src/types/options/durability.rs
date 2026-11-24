@@ -19,6 +19,8 @@ use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumString, IntoStaticStr};
 
+use super::OptionKey;
+
 /// Storage guarantee required at explicit operation completion. Both policies persist data.
 #[derive(
     Debug,
@@ -46,6 +48,10 @@ pub enum Durability {
 }
 
 impl Durability {
+    /// The topic options that take a durability: one for messages, one for
+    /// explicit consumer offset stores and deletes.
+    pub const KEYS: [OptionKey; 2] = [OptionKey::Durability, OptionKey::ConsumerOffsetDurability];
+
     #[must_use]
     pub const fn is_persisted(self) -> bool {
         matches!(self, Self::Persisted)

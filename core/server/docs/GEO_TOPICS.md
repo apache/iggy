@@ -416,15 +416,20 @@ every topic option the server takes.
 `geo_mode` defaults to `geo` on a geo topic, the only mode clients can pick in this version. The
 server stores `partition_resize_policy` as `fixed` on a geo topic.
 
-A geo topic in the `geo` mode has no durability choice: it is always `persisted`. The server
-ignores the `durability` option on create, which the CLI and every SDK send as `replicated`
-unless told otherwise, and `GetTopic` reports `persisted` as derived. A send to a geo topic
-already waits for its upload to the bucket. With `persisted` it also waits until the record that
-places its batch is on disk on a quorum of the cluster's nodes. Without that record no
-datacenter can read the batch. On GCP, a power loss of every node of a cluster lost 70 of 10,500
-acknowledged messages with `replicated` and none with `persisted`. The flush cost about 4 ms on
-a 65 ms send. The `geo_tiered` mode, not available in this version, is the one meant for a
-faster path.
+A geo topic in the `geo` mode has no durability choice: its messages and its consumer offsets
+are always `persisted`. The server ignores the `durability` and `consumer_offset_durability`
+options on create, which the CLI and every SDK send as `replicated` unless told otherwise, and
+`GetTopic` reports both as `persisted`, derived. A send to a geo topic already waits for its
+upload to the bucket. With `persisted` it also waits until the record that places its batch is
+on disk on a quorum of the cluster's nodes. Without that record no datacenter can read the
+batch. On GCP, a power loss of every node of a cluster lost 70 of 10,500 acknowledged messages
+with `replicated` and none with `persisted`. The flush cost about 4 ms on a 65 ms send.
+
+An offset store waits in the same way. A node that answers a store before it is on disk can
+come back without it, and after every node of a cluster stops at once the partition then
+trusts no node's log: it elects a primary only once all of its nodes are back. With both
+`persisted`, any quorum of them elects. The `geo_tiered` mode, not available in this version,
+is the one meant for a faster path.
 
 ### What a create refuses
 
@@ -561,9 +566,10 @@ A consumer connects to the cluster of its own datacenter, and reads:
 A client recognizes a shadow stream by the read-only key `shadow_origin`, which names the origin.
 A stream read reports it, alone or in a listing, and no other stream carries it. Every SDK has a
 typed getter for it, and for the `topic_type` and `geo_mode` of a topic. A shadow topic reads as a
-geo topic with the `geo_mode` of its origin, and in the `geo` mode as `persisted`, although this
-cluster stores it as a normal topic and runs none of a geo topic's write path for it. The CLI
-shows the origin in `iggy stream list`, and the type, the mode and the origin in `iggy topic get`.
+geo topic with the `geo_mode` of its origin, although this cluster stores it as a normal topic and
+runs none of a geo topic's write path for it. In the `geo` mode it reads as `persisted` for its
+messages and its consumer offsets, and its partitions run with both. The CLI shows the origin in
+`iggy stream list`, and the type, the mode and the origin in `iggy topic get`.
 
 A shadow topic is read like any other topic, by stream name and topic name or id. It has the
 topic id and the partition ids of its origin's topic, and it is built to serve the origin's
@@ -713,7 +719,7 @@ acknowledged it. At that load each partition rewrites every 10 s, the default lo
 | ------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | One node of a cluster fails                             | The partitions elect another primary as for any topic. Nothing is lost.                                                                                                                                                                                                                                                          |
 | A cluster's bucket does not answer                      | Its geo topics refuse sends with 58. Polls that need bytes from the bucket get 58, which the SDKs retry. A group's own offset store on a geo or shadow topic commits, and is answered with `TransientNotCommitted` (57) after 10 s, which the SDKs send again. Rewrites wait. Peers mark the shadow topics of that origin stale. |
-| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. A geo topic in the `geo` mode is always `persisted`, so it keeps every acknowledged message: see [above](#create-a-geo-topic).                                                                          |
+| A cluster fails and returns, its bucket stays           | On restart the cluster replays its consensus log, and the rewrite publishes the committed messages it had not published. A geo topic in the `geo` mode is always `persisted`, so it keeps every acknowledged message and offset, and a quorum of its nodes serves it: see [above](#create-a-geo-topic).                          |
 | A cluster is destroyed with its disks, its bucket stays | A cluster rebuilt on empty disks takes back its geo topics when an operator asks for it: see [Recover an origin that lost its disks](#recover-an-origin-that-lost-its-disks). The published messages come back, and so do the committed ones that self-describing fresh objects prove. The other committed messages are lost.    |
 | A cluster is destroyed and never returns                | Its shadow topics in the other clusters stop growing. Retire its origin in each of them: see [Retire an origin](#retire-an-origin). Its shadow topics then expire by their own retention.                                                                                                                                        |
 | A bucket is lost                                        | Every message of the geo topics of that cluster is lost, committed or published. This is the reason for the deployment rule.                                                                                                                                                                                                     |

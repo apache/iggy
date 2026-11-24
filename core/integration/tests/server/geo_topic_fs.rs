@@ -153,9 +153,10 @@ async fn given_a_geo_topic_when_producing_should_store_the_sends_and_read_them_b
     assert_reads_every_message(&client, &stream, &topic, MESSAGES).await;
 }
 
-/// A geo topic in the `geo` mode has no durability choice: whatever a create
-/// names, or with no `durability` at all, every transport reports `persisted`
-/// as derived. A normal topic keeps the durability it names.
+/// A geo topic in the `geo` mode has no durability choice, for its messages
+/// or its consumer offsets: whatever a create names, or with neither key at
+/// all, every transport reports both `persisted` as derived. A normal topic
+/// keeps the durabilities it names.
 #[tokio::test]
 async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_report_persisted() {
     let store = tempfile::tempdir().expect("a directory for the object store");
@@ -182,6 +183,7 @@ async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_rep
         "http-replicated",
         &TopicCreateOptions {
             durability: Durability::Replicated,
+            consumer_offset_durability: Durability::Replicated,
             ..geo.clone()
         },
     )
@@ -227,16 +229,24 @@ async fn given_a_geo_topic_when_created_naming_any_durability_or_none_should_rep
                 .await
                 .expect("get topic")
                 .expect("the topic exists");
-            let durability = details
-                .options
-                .get(&HeaderKey::from(OptionKey::Durability))
-                .expect("the durability is stored");
-            assert_eq!(
-                details.resolved_options().runtime.durability,
-                expected,
-                "{name} over {transport}"
-            );
-            assert_eq!(durability.explicit, explicit, "{name} over {transport}");
+            let runtime = details.resolved_options().runtime;
+            for (key, resolved) in [
+                (OptionKey::Durability, runtime.durability),
+                (
+                    OptionKey::ConsumerOffsetDurability,
+                    runtime.consumer_offset_durability,
+                ),
+            ] {
+                let stored = details
+                    .options
+                    .get(&HeaderKey::from(key))
+                    .expect("the durability is stored");
+                assert_eq!(resolved, expected, "{key} of {name} over {transport}");
+                assert_eq!(
+                    stored.explicit, explicit,
+                    "{key} of {name} over {transport}"
+                );
+            }
         }
     }
 }

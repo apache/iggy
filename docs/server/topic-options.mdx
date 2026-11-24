@@ -39,7 +39,7 @@ Options are key-value pairs sent with `CreateTopic`, and some of them can change
 
 Both retention policies can be active at once. The active segment is **never touched**, and its bytes are excluded from the size limit. A segment whose end offset exceeds the lowest stored consumer or consumer-group offset is retained. With no stored offsets, this barrier is absent. Deletion is done by the server's segment cleaner (`[data_maintenance.messages]`, enabled by default).
 
-Both durability policies write data to disk and default independently to `replicated`. Neither inherits the other. Flush thresholds schedule ordinary segment writes. Required persistence, capacity pressure, or lifecycle operations can flush earlier. They do not weaken the `persisted` completion guarantee.
+Both durability policies write data to disk and default independently to `replicated`. Neither inherits the other. A geo topic in the `geo` mode is always `persisted` for both: the server ignores what its create sends for them. Flush thresholds schedule ordinary segment writes. Required persistence, capacity pressure, or lifecycle operations can flush earlier. They do not weaken the `persisted` completion guarantee.
 
 Value forms are forgiving: byte sizes accept a raw number of bytes or a string like `"128 MiB"`, expiry accepts microseconds or a humantime string like `"7 days"`, booleans accept `true`/`false`. Create admission re-parses and re-encodes what you send, so a string `segment_size=128MiB` is stored as the number it names.
 

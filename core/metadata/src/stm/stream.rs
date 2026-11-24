@@ -5892,24 +5892,37 @@ mod tests {
         block
     }
 
-    /// The durability `topic_id` in stream 0 runs with, and its stored entry.
-    fn stored_durability(inner: &StreamsInner, topic_id: usize) -> (Durability, OptionValue) {
+    /// The durability `topic_id` in stream 0 runs with and its stored entry,
+    /// for its messages and for its consumer offsets.
+    fn stored_durability(inner: &StreamsInner, topic_id: usize) -> [(Durability, OptionValue); 2] {
         let topic = &inner.items[0].topics[topic_id];
-        let stored = topic
-            .options
-            .get(&HeaderKey::from(OptionKey::Durability))
-            .expect("a create stores the durability")
-            .clone();
-        (topic.resolved.runtime.durability, stored)
+        let runtime = topic.resolved.runtime;
+        let stored = |key: OptionKey| {
+            topic
+                .options
+                .get(&HeaderKey::from(key))
+                .expect("a create stores both durabilities")
+                .clone()
+        };
+        [
+            (runtime.durability, stored(OptionKey::Durability)),
+            (
+                runtime.consumer_offset_durability,
+                stored(OptionKey::ConsumerOffsetDurability),
+            ),
+        ]
     }
 
-    fn durability_entry(durability: Durability, explicit: bool) -> OptionValue {
+    /// What [`stored_durability`] returns for a topic that runs with
+    /// `durability` for its messages and its consumer offsets.
+    fn stored_entries(durability: Durability, explicit: bool) -> [(Durability, OptionValue); 2] {
         let value = durability.encode().unwrap();
-        if explicit {
+        let entry = if explicit {
             OptionValue::explicit(value)
         } else {
             OptionValue::derived(value)
-        }
+        };
+        [(durability, entry.clone()), (durability, entry)]
     }
 
     #[test]
@@ -5930,26 +5943,12 @@ mod tests {
 
         assert_eq!(
             stored_durability(&inner, 0),
-            (
-                Durability::Persisted,
-                durability_entry(Durability::Persisted, false)
-            )
+            stored_entries(Durability::Persisted, false)
         );
         assert_eq!(
             stored_durability(&inner, 1),
-            (
-                Durability::Replicated,
-                durability_entry(Durability::Replicated, false)
-            )
+            stored_entries(Durability::Replicated, false)
         );
-        let offsets = HeaderKey::from(OptionKey::ConsumerOffsetDurability);
-        for topic in [0, 1] {
-            assert_eq!(
-                inner.items[0].topics[topic].options.get(&offsets),
-                Some(&durability_entry(Durability::Replicated, false)),
-                "only message durability depends on the topic type"
-            );
-        }
     }
 
     /// Apply stores what the primary committed and recomputes nothing, so a
@@ -5966,6 +5965,7 @@ mod tests {
         ] {
             let explicit = TopicCreateOptions {
                 durability,
+                consumer_offset_durability: durability,
                 ..geo_topic()
             };
             let name = format!("geo-{durability}");
@@ -5975,7 +5975,7 @@ mod tests {
             );
             assert_eq!(
                 stored_durability(&inner, topic_id),
-                (durability, durability_entry(durability, true))
+                stored_entries(durability, true)
             );
         }
     }
@@ -6008,10 +6008,6 @@ mod tests {
             OptionKey::MessageExpiry,
             IggyExpiry::from(9_000_000u64).encode().unwrap(),
         );
-        let replicated = explicit(
-            OptionKey::Durability,
-            Durability::Replicated.encode().unwrap(),
-        );
         // A geo topic's durations are the only options an update can change.
         let grace = explicit(
             OptionKey::TombstoneGrace,
@@ -6019,7 +6015,10 @@ mod tests {
         );
 
         assert_eq!(apply(&mut inner, &expiry), not_updatable);
-        assert_eq!(apply(&mut inner, &replicated), not_updatable);
+        for key in Durability::KEYS {
+            let replicated = explicit(key, Durability::Replicated.encode().unwrap());
+            assert_eq!(apply(&mut inner, &replicated), not_updatable, "{key}");
+        }
         assert_eq!(apply(&mut inner, &grace), 0);
         assert!(
             inner.items[0].topics[0]
@@ -6030,10 +6029,7 @@ mod tests {
         );
         assert_eq!(
             stored_durability(&inner, 0),
-            (
-                Durability::Persisted,
-                durability_entry(Durability::Persisted, false)
-            )
+            stored_entries(Durability::Persisted, false)
         );
     }
 
