@@ -17,7 +17,7 @@ Deferred polling lets the server wait for messages before answering a read. The 
 | `max_bytes` | 1 MiB | Reply budget, including binary metadata and batch framing |
 | `commit` | Manual | When to store the returned position |
 
-These are the shared poll defaults. High-level consumers can select a positive wait by default. The SDK derives a request timeout from the wait plus 10 seconds. The wire protocol permits waits up to 600 seconds, but the server caps them at `sharding.deferred_poll_max_wait`, 30 seconds by default.
+These are the shared poll defaults. A read of a partition that the server is still building is held until the partition can serve, for up to 3 seconds, also with a zero `max_wait`. Over HTTP the read can wait longer, see [HTTP reads](#http-reads). High-level consumers can select a positive wait by default. The SDK derives a request timeout from the wait plus 10 seconds. The wire protocol permits waits up to 600 seconds, but the server caps them at `sharding.deferred_poll_max_wait`, 30 seconds by default.
 
 A reply can contain fewer than `min_count` messages when the wait ends. The first message can exceed `max_bytes` and return alone, so a large message does not prevent progress. Treat the byte budget as a batching limit, not an absolute allocation guarantee.
 
@@ -51,6 +51,10 @@ Raw HTTP defaults differ from `PollOptions`: count is 10, wait is one second, an
 
 The query uses `wait_us`, `min_count`, `max_bytes` and `request_timeout_us` alongside the normal consumer, partition, strategy and count fields. A positive wait needs at least one second between the wait and request timeout. Configure a proxy timeout long enough to receive the reply.
 
+The node that receives an HTTP read looks for the primary of the partition. The 3 second hold can end before a node can serve the partition. The node then keeps looking until a primary can serve the read, or until the request deadline passes. The deadline is `request_timeout_us` for a deferred read and 10 seconds for an immediate read. If no primary can serve the read before the deadline, the node refuses the read with a retryable error, and the read stored no offset. A read that reached a primary and got no answer in time fails with HTTP 504. A read without `auto_commit` that a node relays fails with a retryable HTTP 503 when the primary node does not answer the relay. A committing read fails with HTTP 502 when the relay connection breaks after the send. A committing read that fails with 502 or 504 can have stored its offset, see [Cancellation and uncertain results](#cancellation-and-uncertain-results).
+
 ## Server capacity
 
 The [sharding configuration](/docs/server/configuration#sharding) bounds parked requests, per-session requests, disk reads and completion delivery. HTTP requests without a binary session count against their user. Capacity exhaustion can return a retryable error. Keep retries within a bounded application deadline.
+
+A read that waits for a partition that the server is still building does not count against the limits of parked requests, per shard or per session. A FetchMessages read keeps the per-session read slot and the bytes that it reserved before the wait. That wait has limits of its own: 4,096 held reads per shard and 128 per partition. A read over one of them gets a retryable error at once. After the wait ends, the server admits the poll under the limits of parked requests.

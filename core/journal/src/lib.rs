@@ -49,6 +49,12 @@ pub trait Journal {
         None
     }
 
+    /// Number of slots the journal holds, the bound of
+    /// [`Self::remaining_capacity`]. `None` for journals without one.
+    fn slot_count(&self) -> Option<usize> {
+        None
+    }
+
     /// Remove every entry at or above `from_op`, returning how many went, and
     /// leave the snapshot watermark where it is.
     ///
@@ -73,8 +79,8 @@ pub trait Journal {
     /// looking for a suffix ABOVE some op has no bound to probe up to.
     fn last_op(&self) -> Option<u64>;
 
-    /// Remove entries with ops in `ops` from the journal,
-    /// returning the removed entries sorted by op.
+    /// Remove entries with ops in `ops` from the journal without reading
+    /// them, returning how many were removed.
     ///
     /// Implementations that persist to disk should rewrite the underlying
     /// storage to reclaim space. The default is a no-op for journals that
@@ -82,11 +88,8 @@ pub trait Journal {
     ///
     /// # Errors
     /// Returns an I/O error if the drain fails.
-    fn drain(
-        &self,
-        _ops: RangeInclusive<u64>,
-    ) -> impl Future<Output = io::Result<Vec<Self::Entry>>> {
-        async { Ok(Vec::new()) }
+    fn drain(&self, _ops: RangeInclusive<u64>) -> impl Future<Output = io::Result<usize>> {
+        async { Ok(0) }
     }
 
     /// Snapshot watermark: entries at or below it are evictable. `0` for

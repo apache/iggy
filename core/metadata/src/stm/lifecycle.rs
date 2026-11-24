@@ -38,7 +38,9 @@ use iggy_common::{IggyError, IggyTimestamp};
 use serde::{Deserialize, Serialize};
 
 use crate::stm::result::ApplyReply;
-use crate::stm::snapshot::SnapshotError;
+use crate::stm::snapshot::{
+    ArraySteps, SnapshotError, encode_array_len, encode_map_len, encode_value,
+};
 use crate::stm::stream::{
     PartitionSnapshot, Streams, StreamsInner, StreamsSnapshot, TopicSnapshot,
 };
@@ -86,6 +88,54 @@ pub struct LifecycleIntent {
     partition_index: BTreeMap<(u32, u32), usize>,
     #[serde(skip)]
     remaining_partitions: usize,
+}
+
+/// The length of the msgpack array a [`LifecycleIntent`] encodes as.
+const LIFECYCLE_INTENT_FIELDS: usize = 5;
+
+/// Writes what the derived `Serialize` of the intent map writes, one step at
+/// a time: the fields of an intent ahead of its partitions, then one
+/// [`LifecyclePartition`] per step. The intent of a large topic or stream
+/// holds one row for each of its partitions.
+#[derive(Debug)]
+pub(crate) struct LifecycleIntentsEncoder {
+    /// The count of intents, until the first step wrote it.
+    len: Option<usize>,
+    intents: std::collections::btree_map::IntoIter<u64, LifecycleIntent>,
+    /// The rows of the intent that the steps are inside.
+    partitions: ArraySteps<LifecyclePartition>,
+}
+
+impl From<BTreeMap<u64, LifecycleIntent>> for LifecycleIntentsEncoder {
+    fn from(intents: BTreeMap<u64, LifecycleIntent>) -> Self {
+        Self {
+            len: Some(intents.len()),
+            intents: intents.into_iter(),
+            partitions: ArraySteps::default(),
+        }
+    }
+}
+
+impl LifecycleIntentsEncoder {
+    /// Append the next step to `out` and return whether steps remain.
+    pub(crate) fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        if let Some(len) = self.len.take() {
+            encode_map_len(out, len)?;
+        }
+        if !self.partitions.is_done() {
+            self.partitions.encode_next(out)?;
+        } else if let Some((op, intent)) = self.intents.next() {
+            encode_value(out, &op)?;
+            encode_array_len(out, LIFECYCLE_INTENT_FIELDS)?;
+            encode_value(out, &intent.context)?;
+            encode_value(out, &intent.stream_id)?;
+            encode_value(out, &intent.topic_id)?;
+            encode_value(out, &intent.action)?;
+            self.partitions = intent.partitions.into();
+            self.partitions.encode_next(out)?;
+        }
+        Ok(!self.partitions.is_done() || self.intents.len() > 0)
+    }
 }
 
 /// The stream, the topic (`None` for a stream-wide intent) and the metadata op
@@ -2044,7 +2094,9 @@ mod tests {
         let reply = apply(&streams, Operation::DeleteConsumerGroup, &delete, context());
         assert_eq!(reply.code, 0);
         let mut inner = StreamsInner::inner_from_snapshot(streams.to_snapshot(), Arc::default());
-        inner.items[0].topics[0].consumer_groups.remove(&0);
+        inner.items.make_mut(0).unwrap().topics[0]
+            .consumer_groups
+            .remove(&0);
 
         let batch =
             CompleteLifecycleRequest::new(INTENT_OP, 0, vec![completion(0, 12), completion(1, 23)])
@@ -2119,7 +2171,9 @@ mod tests {
 
         // The group cannot vanish while its deletion is pending, so the test
         // removes it directly to make the finalization fail and reopen.
-        restored.items[0].topics[0].consumer_groups.remove(&0);
+        restored.items.make_mut(0).unwrap().topics[0]
+            .consumer_groups
+            .remove(&0);
         let last = CompleteLifecycleRequest::new(INTENT_OP, 0, vec![completion(1, 23)]).unwrap();
         assert_ne!(last.apply(&mut restored, IggyTimestamp::now()).code, 0);
         assert_eq!(restored.lifecycle_scopes, both, "reopen");

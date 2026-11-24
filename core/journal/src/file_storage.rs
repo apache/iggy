@@ -21,13 +21,19 @@ use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use server_common::DISK_USAGE;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::truncate_file;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::io;
 use std::path::{Path, PathBuf};
 
 /// File-backed storage implementing the `Storage` trait.
+///
+/// Every call works on its own handle of the file (a clone shares the
+/// descriptor), so a call suspended across [`Self::reopen`] finishes on the
+/// descriptor it started on. A read then returns the bytes its offset named in
+/// the replaced file. A write still must not overlap a reopen: its bytes would
+/// land in the replaced file. The metadata `journal_gate` keeps the two apart.
 pub struct FileStorage {
-    file: UnsafeCell<compio::fs::File>,
+    file: RefCell<compio::fs::File>,
     write_offset: Cell<u64>,
     path: PathBuf,
 }
@@ -50,7 +56,7 @@ impl FileStorage {
             .note_descriptor_exhaustion(|| format!("opening {}", path.display()))?;
         let len = file.metadata().await?.len();
         Ok(Self {
-            file: UnsafeCell::new(file),
+            file: RefCell::new(file),
             write_offset: Cell::new(len),
             path: path.to_path_buf(),
         })
@@ -69,9 +75,8 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if the descriptor cannot be cloned, truncated, or synced.
     pub(crate) async fn truncate(&self, len: u64) -> io::Result<()> {
-        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
-        let file = unsafe { &*self.file.get() };
-        truncate_file(file, len).await?;
+        let file = self.file();
+        truncate_file(&file, len).await?;
         self.write_offset.set(len);
         file.sync_all().await
     }
@@ -81,8 +86,7 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if sync fails.
     pub async fn fsync(&self) -> io::Result<()> {
-        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
-        unsafe { &*self.file.get() }.sync_data().await
+        self.file().sync_data().await
     }
 
     /// Positional read into `buf`. Returns the buffer with data filled in.
@@ -90,9 +94,7 @@ impl FileStorage {
     /// # Errors
     /// Returns an I/O error if the read fails.
     pub async fn read_at(&self, offset: u64, buf: Vec<u8>) -> io::Result<Vec<u8>> {
-        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
-        let file = unsafe { &*self.file.get() };
-        let (result, buf) = file.read_exact_at(buf, offset).await.into();
+        let (result, buf) = self.file().read_exact_at(buf, offset).await.into();
         result?;
         Ok(buf)
     }
@@ -125,10 +127,8 @@ impl FileStorage {
         let len = buf.buf_len() as u64;
         let offset = self.write_offset.get();
         self.write_offset.set(offset + len);
-        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
-        let file = unsafe { &mut *self.file.get() };
         let _charge = DISK_USAGE.charge(len);
-        let (result, _buf) = file.write_all_at(buf, offset).await.into();
+        let (result, _buf) = self.file().write_all_at(buf, offset).await.into();
         if let Err(error) = result {
             if self.write_offset.get() == offset + len {
                 self.write_offset.set(offset);
@@ -157,10 +157,13 @@ impl FileStorage {
             .await
             .note_descriptor_exhaustion(|| format!("reopening {}", self.path.display()))?;
         let len = file.metadata().await?.len();
-        // SAFETY: single-threaded compio runtime, no concurrent access to the file.
-        unsafe { *self.file.get() = file };
+        *self.file.borrow_mut() = file;
         self.write_offset.set(len);
         Ok(())
+    }
+
+    fn file(&self) -> compio::fs::File {
+        self.file.borrow().clone()
     }
 }
 
@@ -170,15 +173,17 @@ impl Storage for FileStorage {
 
     async fn write_at(&self, offset: usize, buf: Self::Buffer) -> io::Result<usize> {
         let len = buf.buf_len();
-        let file = unsafe { &mut *self.file.get() };
-        let (result, _buf) = file.write_all_at(buf, offset as u64).await.into();
+        let (result, _buf) = self.file().write_all_at(buf, offset as u64).await.into();
         result?;
         Ok(len)
     }
 
     async fn read_at(&self, offset: usize, buffer: Self::Buffer) -> io::Result<Self::Buffer> {
-        let file = unsafe { &*self.file.get() };
-        let (result, buffer) = file.read_exact_at(buffer, offset as u64).await.into();
+        let (result, buffer) = self
+            .file()
+            .read_exact_at(buffer, offset as u64)
+            .await
+            .into();
         result?;
         Ok(buffer)
     }
@@ -187,7 +192,9 @@ impl Storage for FileStorage {
 #[cfg(test)]
 mod tests {
     use super::FileStorage;
+    use futures::poll;
     use server_common::executor::create_shard_executor;
+    use std::pin::pin;
     use tempfile::tempdir;
 
     #[test]
@@ -223,6 +230,33 @@ mod tests {
             assert_eq!(storage.file_len(), 64);
             assert_eq!(std::fs::metadata(&renamed_path).unwrap().len(), 64);
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
+        });
+    }
+
+    #[test]
+    fn given_a_read_in_flight_when_reopening_should_return_the_replaced_file_bytes() {
+        let runtime = create_shard_executor().unwrap();
+        runtime.block_on(async {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("journal.wal");
+            let replacement_path = dir.path().join("journal.wal.tmp");
+            let storage = FileStorage::open(&path).await.unwrap();
+            storage.write_append(vec![0xAB_u8; 128]).await.unwrap();
+            std::fs::write(&replacement_path, vec![0xCD_u8; 128]).unwrap();
+
+            let mut read = pin!(storage.read_at(0, vec![0_u8; 128]));
+            assert!(
+                poll!(&mut read).is_pending(),
+                "the read must be in flight when the file is replaced"
+            );
+            std::fs::rename(&replacement_path, &path).unwrap();
+            storage.reopen().await.unwrap();
+
+            assert_eq!(read.await.unwrap(), vec![0xAB_u8; 128]);
+            assert_eq!(
+                storage.read_at(0, vec![0_u8; 128]).await.unwrap(),
+                vec![0xCD_u8; 128]
+            );
         });
     }
 }

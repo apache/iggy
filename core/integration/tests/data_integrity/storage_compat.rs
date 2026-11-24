@@ -47,8 +47,9 @@
 //!
 //! Three failure modes reach exit code 0 with a server that boots and serves:
 //!
-//! - A partition whose durable state cannot be read is TOMBSTONED and boot
-//!   continues. Only the log says so.
+//! - A partition whose durable state cannot be read is REFUSED and boot
+//!   continues. Only the log says so, in a line that starts with
+//!   [`PARTITION_REFUSED_MARKER`].
 //! - A topic loses a single storage option, per key, with no log line at
 //!   all: `TopicCreateOptions::parse_committed` deliberately discards
 //!   per-entry parse errors so one unreadable key cannot drop the rest.
@@ -56,7 +57,7 @@
 //!   happens to poll still read back fine, because segment batch headers
 //!   carry no magic and no version.
 //!
-//! So the test asserts the tombstone marker is absent, re-reads every seeded
+//! So the test asserts that marker is absent, re-reads every seeded
 //! option value AND its provenance flag, compares every stored message field
 //! against a read taken from the baseline, and byte-compares the segment
 //! files across the swap. It stops producing MID-segment on purpose: boot
@@ -78,7 +79,7 @@
 //! their independent replicated defaults. Production SDKs gain no fallback.
 //!
 //! `IGGY_TEST_VERBOSE` makes the harness inherit the server's stdout instead
-//! of capturing it, which would make the tombstone check vacuous. The
+//! of capturing it, which would make the marker check vacuous. The
 //! graceful-shutdown assertion below is taken on the same log and fails
 //! loudly in that case rather than passing on an empty file.
 
@@ -101,6 +102,7 @@ use integration::harness::{
 };
 use serde::{Deserialize, Serialize};
 use serial_test::parallel;
+use server_common::diagnostics::PARTITION_REFUSED_MARKER;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -146,16 +148,18 @@ const REFUSAL_DEADLINE: Duration = Duration::from_secs(60);
 const JOURNAL_SLOTS_KEY: &str = "metadata.journal_slots";
 
 /// `metadata.journal_slots` floor for `prepare_queue_depth = 32`
-/// (`4 * max(64, 32)`). With the 64-op checkpoint margin a checkpoint fires
-/// once the journal holds 192 committed ops.
+/// (`4 * max(64, 32)`). A checkpoint starts once half of it, 128 ops,
+/// committed past the last one.
 const JOURNAL_SLOTS: &str = "256";
 
-/// Committed metadata ops between forced checkpoints at [`JOURNAL_SLOTS`].
-const CHECKPOINT_EVERY: u32 = 192;
+/// Committed metadata ops between checkpoints at [`JOURNAL_SLOTS`].
+const CHECKPOINT_EVERY: u32 = 128;
 
 /// Stream creates that drive the metadata plane past its first checkpoint.
-/// Everything seeded before them lands in the snapshot.
-const SEED_STREAMS: u32 = 250;
+/// Everything seeded before them lands in the snapshot. The seed and the WAL
+/// tail end far from the second checkpoint, so no tail record lands in a
+/// snapshot.
+const SEED_STREAMS: u32 = 180;
 
 /// Stream creates issued after the checkpoint, so recovery must fold a
 /// snapshot AND replay a WAL suffix on top of it.
@@ -262,33 +266,6 @@ const READBACK_COUNT: u32 = 16;
 /// [`POLL_INTERVAL`] this is still ~50 probes per wait.
 const SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
-
-/// Substring shared by all three tombstone log lines in
-/// `core/server/src/bootstrap.rs`. Matching the full sentence of any one of
-/// them would miss the others, and a segment layout change lands on the
-/// first arm, not the consensus-state one.
-///
-/// Being shorter than a whole word is what makes it match every arm, and also
-/// what makes it collide with [`TOMBSTONE_FIELD`]. Strip that before matching
-/// rather than lengthening this.
-const TOMBSTONE_MARKER: &str = "tombston";
-
-/// The one tracing FIELD in the server named for the tombstone state
-/// (`partition_reconciler.rs`, the parked-frame discard). Fields render as
-/// `key=value`, so a shard that is merely not the namespace's owner logs
-/// `tombstoned=false`, which contains [`TOMBSTONE_MARKER`] on a HEALTHY run.
-///
-/// Removed from the log before the absence check. Only this exact field form
-/// goes: every real arm reads `tombstoning it`, `tombstoned rather than` or
-/// `tombstoning the`, and none of them emits a `tombstoned` field, so their
-/// detection is untouched.
-///
-/// The collision is dormant at the default `info` level, but the line is
-/// `debug!`, and two independent variables reach the child: the harness
-/// forwards every `IGGY_*` name, and `RUST_LOG` is inherited by any process
-/// and OUTRANKS the configured level. Filtering the text keeps the check
-/// working under both instead of refusing to run.
-const TOMBSTONE_FIELD: &str = "tombstoned=";
 
 /// Logged by `iggy-server`'s `main` once shutdown ran to completion. A stop
 /// that escalated to `SIGKILL` leaves crash-recovery state behind, which
@@ -1005,14 +982,10 @@ async fn given_baseline_data_directory_when_booted_by_build_under_test_should_re
     // whole run to drain, and after a positive marker so an uncaptured log
     // fails loudly instead of passing the absence check vacuously.
     assert_graceful_shutdown(&harness, "the server under test");
-    // `stdout_plain` returns the same ANSI-stripped text `stdout_contains`
-    // matches against, so filtering it costs no matching power.
     let stdout = harness.server().stdout_plain();
     assert!(
-        !stdout
-            .replace(TOMBSTONE_FIELD, "")
-            .contains(TOMBSTONE_MARKER),
-        "the server under test tombstoned a partition rather than reading the baseline's \
+        !stdout.contains(PARTITION_REFUSED_MARKER),
+        "the server under test refused a partition rather than reading the baseline's \
          durable state; boot still exits 0, so only the log says so. Server stdout:\n{stdout}"
     );
 
@@ -1863,7 +1836,7 @@ fn assert_graceful_shutdown(harness: &TestHarness, who: &str) {
         "{who} did not log {GRACEFUL_SHUTDOWN_MARKER:?}. Either the stop escalated to SIGKILL, \
          leaving crash-recovery state that confounds the compatibility verdict, or stdout was \
          not captured at all (IGGY_TEST_VERBOSE makes the harness inherit it, which would also \
-         make the tombstone check vacuous). Server stdout:\n{}",
+         make the marker check vacuous). Server stdout:\n{}",
         harness.server().stdout_plain()
     );
 }

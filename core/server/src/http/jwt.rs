@@ -23,12 +23,15 @@
 //! also verifies external RS256/EC tokens against the issuer's JWKS
 //! ([`super::jwks`]) and maps them onto the configured iggy username.
 //! The refresh-token route re-issues by composing `decode_for_refresh` (verify
-//! plus a refusal of trusted-issuer tokens) with `generate` at the handler;
-//! without a revocation list that refresh is stateless, so the token it was
-//! minted from stays valid until its own `exp`. The claim set (`JwtClaims`) is
+//! plus a refusal of trusted-issuer tokens) with `generate` at the handler.
+//! Refresh leaves the original token usable until it expires, the account
+//! revision changes, or its source personal access token is revoked or expires.
+//! The claim set (`JwtClaims`) is
 //! the legacy one plus `user_created_at`, which names the account a
-//! self-issued token was issued to. The `IggyError -> HTTP` grading is reused
-//! verbatim so error bodies stay identical to the legacy server.
+//! self-issued token was issued to, `access_revision`, which a password change
+//! or a revocation moves past, and `token_id` for a token exchanged from a
+//! personal access token. The `IggyError -> HTTP` grading is reused verbatim so
+//! error bodies stay identical to the legacy server.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -36,6 +39,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use configs::http::{HttpJwtConfig, TrustedIssuerConfig};
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_common::{IggyDuration, IggyError, IggyExpiry, IggyTimestamp, UserId};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -187,9 +191,11 @@ impl JwtManager {
         })
     }
 
-    /// Issue a signed access token for the account `user_id` created at
-    /// `user_created_at`, carrying a unique `jti` plus issued-at / not-before /
-    /// expiry stamps derived from the config.
+    /// Issue a signed access token for the account `user_id` carrying what
+    /// `credential` proved, a unique `jti` plus issued-at / not-before / expiry
+    /// stamps derived from the config. The expiry never passes
+    /// `expires_at_secs`, the expiry of the personal access token the token was
+    /// exchanged from.
     ///
     /// # Errors
     ///
@@ -197,7 +203,9 @@ impl JwtManager {
     pub fn generate(
         &self,
         user_id: UserId,
-        user_created_at: IggyTimestamp,
+        credential: CredentialProof,
+        cluster_uid: u128,
+        expires_at_secs: u64,
     ) -> Result<GeneratedToken, IggyError> {
         let header = Header::new(self.algorithm);
         let iat = IggyTimestamp::now().to_secs();
@@ -206,7 +214,7 @@ impl JwtManager {
             IggyExpiry::ServerDefault => 0,
             IggyExpiry::ExpireDuration(duration) => duration.as_secs(),
         };
-        let exp = iat + u64::from(expiry_secs);
+        let exp = (iat + u64::from(expiry_secs)).min(expires_at_secs);
         let nbf = iat + u64::from(self.not_before.as_secs());
         let claims = JwtClaims {
             jti: Uuid::now_v7().to_string(),
@@ -216,9 +224,15 @@ impl JwtManager {
             iat,
             exp,
             nbf,
-            user_created_at: Some(user_created_at.as_micros()),
+            user_created_at: Some(credential.user_created_at),
+            access_revision: Some(credential.access_revision),
+            token_id: (credential.token_id != 0).then_some(credential.token_id),
         };
-        let access_token = encode::<JwtClaims>(&header, &claims, &self.encoding_key)
+        let claims = SelfIssuedClaims {
+            claims,
+            cluster_uid: Uuid::from_u128(cluster_uid),
+        };
+        let access_token = encode(&header, &claims, &self.encoding_key)
             .map_err(|_| IggyError::CannotGenerateJwt)?;
         Ok(GeneratedToken {
             user_id,
@@ -342,12 +356,13 @@ impl JwtManager {
     pub async fn decode_for_refresh(
         &self,
         token: &str,
-    ) -> Result<(UserId, IggyTimestamp), IggyError> {
+    ) -> Result<(UserId, CredentialProof, u128), IggyError> {
         match self.decode(token).await?.subject {
             TokenSubject::Account {
                 user_id,
-                created_at,
-            } => Ok((user_id, created_at)),
+                credential,
+                cluster_uid,
+            } => Ok((user_id, credential, cluster_uid)),
             TokenSubject::TrustedIssuer(issuer) => {
                 debug!(username = %issuer.config.username, "refusing to refresh a trusted-issuer token");
                 Err(IggyError::InvalidAccessToken)
@@ -359,18 +374,30 @@ impl JwtManager {
     /// The synchronous common path shared by the fast path and by every
     /// trusted-issuer classification miss.
     fn decode_self_issued(&self, token: &str) -> Result<VerifiedToken, IggyError> {
-        let claims = decode::<JwtClaims>(token, &self.decoding_key, &self.validation)
+        let SelfIssuedClaims {
+            claims,
+            cluster_uid,
+        } = decode::<SelfIssuedClaims>(token, &self.decoding_key, &self.validation)
             .map(|data| data.claims)
             .map_err(|_| IggyError::Unauthenticated)?;
         let user_id = claims.sub.parse().map_err(|_| IggyError::Unauthenticated)?;
-        // Missing only on a token from a server that did not stamp it yet.
-        let created_at = claims.user_created_at.ok_or(IggyError::Unauthenticated)?;
+        // Missing only on a token from a server that did not stamp them yet.
+        let user_created_at = claims.user_created_at.ok_or(IggyError::Unauthenticated)?;
+        let access_revision = claims
+            .access_revision
+            .filter(|&revision| revision != 0)
+            .ok_or(IggyError::Unauthenticated)?;
         Ok(VerifiedToken {
             jti: claims.jti,
             exp: claims.exp,
             subject: TokenSubject::Account {
                 user_id,
-                created_at: IggyTimestamp::from(created_at),
+                cluster_uid: cluster_uid.as_u128(),
+                credential: CredentialProof {
+                    user_created_at,
+                    access_revision,
+                    token_id: claims.token_id.unwrap_or_default(),
+                },
             },
         })
     }
@@ -514,6 +541,13 @@ impl<'de> Deserialize<'de> for Audience {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct SelfIssuedClaims {
+    #[serde(flatten)]
+    claims: JwtClaims,
+    cluster_uid: Uuid,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct JwtClaims {
     pub jti: String,
@@ -530,6 +564,15 @@ struct JwtClaims {
     /// that token onto the configured username instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_created_at: Option<u64>,
+    /// The account's access revision when the token was issued. A password
+    /// change or a revocation moves the account past it, which refuses every
+    /// token issued before. Every self-issued token sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_revision: Option<u64>,
+    /// The op that created the personal access token this token was exchanged
+    /// from, which must stay live and unexpired for the token to work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_id: Option<u64>,
 }
 
 /// A token that passed [`JwtManager::decode`].
@@ -543,10 +586,12 @@ pub(in crate::http) struct VerifiedToken {
 /// The account a verified token acts as.
 #[derive(Debug)]
 pub(in crate::http) enum TokenSubject {
-    /// A self-issued token names the account it was issued to.
+    /// A self-issued token names the account it was issued to and what the
+    /// credential it was issued for proved.
     Account {
         user_id: UserId,
-        created_at: IggyTimestamp,
+        credential: CredentialProof,
+        cluster_uid: u128,
     },
     /// A trusted-issuer token acts as the user its issuer config names, looked
     /// up per request, so a later account that takes a deleted user's id does
@@ -576,13 +621,27 @@ mod tests {
         }
     }
 
+    const CLUSTER_UID: u128 = u128::MAX - 1;
     const USER_ID: UserId = 7;
     const USER_CREATED_AT_MICROS: u64 = 1_700_000_000_000_000;
+    const ACCESS_REVISION: u64 = 12;
+    const TOKEN_ID: u64 = 34;
 
     fn issue(manager: &JwtManager) -> GeneratedToken {
         manager
-            .generate(USER_ID, IggyTimestamp::from(USER_CREATED_AT_MICROS))
+            .generate(
+                USER_ID,
+                CredentialProof::account(USER_CREATED_AT_MICROS, ACCESS_REVISION),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .expect("issues")
+    }
+
+    fn claims_of(manager: &JwtManager, token: &str) -> SelfIssuedClaims {
+        decode::<SelfIssuedClaims>(token, &manager.decoding_key, &manager.validation)
+            .expect("valid now")
+            .claims
     }
 
     // The default config has no trusted issuers, so `decode` takes the
@@ -621,8 +680,8 @@ mod tests {
         assert!(
             matches!(
                 verified.subject,
-                TokenSubject::Account { user_id: USER_ID, created_at }
-                    if created_at.as_micros() == USER_CREATED_AT_MICROS
+                TokenSubject::Account { user_id: USER_ID, credential, cluster_uid: CLUSTER_UID }
+                    if credential == CredentialProof::account(USER_CREATED_AT_MICROS, ACCESS_REVISION)
             ),
             "unexpected subject {:?}",
             verified.subject
@@ -630,17 +689,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn given_token_exchanged_from_personal_access_token_when_decoded_should_name_both_proofs()
+    {
+        let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
+        let credential = CredentialProof {
+            user_created_at: USER_CREATED_AT_MICROS,
+            access_revision: ACCESS_REVISION,
+            token_id: TOKEN_ID,
+        };
+        let token = manager
+            .generate(USER_ID, credential, CLUSTER_UID, u64::MAX)
+            .expect("issues");
+
+        let verified = manager
+            .decode(&token.access_token)
+            .await
+            .expect("valid now");
+
+        assert!(
+            matches!(
+                verified.subject,
+                TokenSubject::Account { user_id: USER_ID, credential: decoded, cluster_uid: CLUSTER_UID } if decoded == credential
+            ),
+            "unexpected subject {:?}",
+            verified.subject
+        );
+    }
+
+    #[test]
+    fn given_source_token_expiring_first_when_issuing_should_cap_the_expiry() {
+        let manager = JwtManager::build(
+            &HttpJwtConfig {
+                access_token_expiry: IggyExpiry::NeverExpire,
+                ..config("0 s", "5 s")
+            },
+            None,
+        )
+        .expect("builds");
+        let source_expiry = IggyTimestamp::now().to_secs() + 60;
+
+        let token = manager
+            .generate(
+                USER_ID,
+                CredentialProof::token(USER_CREATED_AT_MICROS, TOKEN_ID),
+                CLUSTER_UID,
+                source_expiry,
+            )
+            .expect("issues");
+
+        assert_eq!(token.access_token_expiry, source_expiry);
+        assert_eq!(
+            claims_of(&manager, &token.access_token).claims.exp,
+            source_expiry
+        );
+    }
+
+    #[tokio::test]
+    async fn given_self_issued_token_without_cluster_uid_when_decoded_should_reject() {
+        let manager = JwtManager::build(&config("0 s", "5 s"), None).unwrap();
+        let claims = claims_of(&manager, &issue(&manager).access_token).claims;
+        let token = encode(
+            &Header::new(manager.algorithm),
+            &claims,
+            &manager.encoding_key,
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.decode(&token).await,
+            Err(IggyError::Unauthenticated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn given_self_issued_token_without_access_revision_when_decoded_should_reject() {
+        let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
+        for revision in [None, Some(0)] {
+            let mut claims = claims_of(&manager, &issue(&manager).access_token);
+            // A token from before tokens named a revision, signed with the live key.
+            claims.claims.access_revision = revision;
+            let token = encode(
+                &Header::new(manager.algorithm),
+                &claims,
+                &manager.encoding_key,
+            )
+            .expect("signs");
+            assert!(
+                manager.decode(&token).await.is_err(),
+                "a validly signed token with revision {revision:?} must be refused"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn given_self_issued_token_without_account_stamp_when_decoded_should_reject() {
         let manager = JwtManager::build(&config("0 s", "5 s"), None).expect("builds");
-        let mut claims = decode::<JwtClaims>(
-            &issue(&manager).access_token,
-            &manager.decoding_key,
-            &manager.validation,
-        )
-        .expect("valid now")
-        .claims;
+        let mut claims = claims_of(&manager, &issue(&manager).access_token);
         // A token from before tokens named their account, signed with the live key.
-        claims.user_created_at = None;
+        claims.claims.user_created_at = None;
         let token = encode(
             &Header::new(manager.algorithm),
             &claims,

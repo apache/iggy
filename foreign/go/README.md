@@ -325,9 +325,7 @@ roster discovery failure after Register succeeds, discards its tentative session
 and requires another explicit sign-in. The sign-in does not wait for a pending
 automatic registration, and late completion cannot replace a newer session.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 Crash durability follows the topic's `durability` policy: `replicated`
 confirms replication, while `persisted` also waits for the required replicas
