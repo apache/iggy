@@ -24,7 +24,9 @@ use consensus::client_table::SessionAttachment;
 use consensus::{LocalPipeline, MetadataHandle, VsrConsensus};
 use futures::channel::oneshot;
 use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
-use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
+use iggy_binary_protocol::requests::consumer_groups::{
+    CreateConsumerGroupRequest, DeleteConsumerGroupRequest,
+};
 use iggy_binary_protocol::requests::streams::CreateStreamRequest;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
@@ -50,6 +52,7 @@ use message_bus::{
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::StateMachine as _;
 use metadata::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+use metadata::stm::result::ApplyReply;
 use metadata::stm::stream::Streams;
 use metadata::stm::user::Users;
 use metadata::{IggyMetadata, MuxStateMachine};
@@ -626,18 +629,26 @@ pub fn attach_root_session(shard: &TestShard, client_id: u128, session: u64) -> 
         .unwrap()
 }
 
+/// Applies `body` as committed metadata op `op`.
+pub fn apply_metadata_op(
+    mux_stm: &TestMux,
+    op: u64,
+    operation: Operation,
+    body: &[u8],
+) -> ApplyReply {
+    mux_stm
+        .update(prepare_message(operation, 0, op, body).transmute_header(
+            |old, header: &mut iggy_binary_protocol::PrepareHeader| {
+                *header = old;
+                header.op = op;
+            },
+        ))
+        .unwrap()
+}
+
 /// Delete and recreate the topic at the same slab ids through committed metadata operations.
 pub fn recreate_topic_in(mux_stm: &TestMux, namespace: IggyNamespace) {
-    let apply = |op, operation, body: Bytes| {
-        mux_stm
-            .update(prepare_message(operation, 0, op, &body).transmute_header(
-                |old, header: &mut iggy_binary_protocol::PrepareHeader| {
-                    *header = old;
-                    header.op = op;
-                },
-            ))
-            .unwrap()
-    };
+    let apply = |op, operation, body: Bytes| apply_metadata_op(mux_stm, op, operation, &body);
     let deleted = apply(
         4,
         Operation::DeleteTopic,
@@ -702,6 +713,56 @@ pub fn create_consumer_group(shard: &TestShard) {
             .to_bytes(),
         ))
         .unwrap();
+}
+
+/// Deletes the group of [`create_consumer_group`] and creates it again under
+/// its name, so that it gets a new id.
+pub fn recreate_consumer_group(shard: &TestShard) {
+    const DELETE_OP: u64 = 4;
+    const COMPLETE_OP: u64 = 5;
+    const CREATE_OP: u64 = 6;
+    let mux_stm = &shard.plane.metadata().mux_stm;
+    let deleted = apply_metadata_op(
+        mux_stm,
+        DELETE_OP,
+        Operation::DeleteConsumerGroup,
+        &DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::named("group").unwrap(),
+        }
+        .to_bytes(),
+    );
+    assert_eq!(deleted.code, 0);
+    let completion = CompleteLifecycleRequest::new(
+        DELETE_OP,
+        0,
+        vec![LifecycleCompletion {
+            topic_id: 0,
+            partition_id: 0,
+            partition_op: 1,
+        }],
+    )
+    .unwrap();
+    let completed = apply_metadata_op(
+        mux_stm,
+        COMPLETE_OP,
+        Operation::CompleteLifecycle,
+        &completion.to_bytes(),
+    );
+    assert_eq!(completed.code, 0);
+    let created = apply_metadata_op(
+        mux_stm,
+        CREATE_OP,
+        Operation::CreateConsumerGroup,
+        &CreateConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            name: WireName::new("group").unwrap(),
+        }
+        .to_bytes(),
+    );
+    assert_eq!(created.code, 0);
 }
 
 /// A `CreateUser` request for a user that may read server state and poll

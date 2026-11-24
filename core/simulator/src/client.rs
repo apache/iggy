@@ -50,6 +50,7 @@ use iggy_binary_protocol::requests::system::{
 };
 use iggy_binary_protocol::requests::topics::{CreateTopicRequest, DeleteTopicRequest};
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
+use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
 use iggy_binary_protocol::requests::users::{
     ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, LoginRegisterRequest,
     UpdatePermissionsRequest,
@@ -66,7 +67,8 @@ use iggy_common::{
     critical_keys_marker,
 };
 use metadata::stm::user::{
-    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, ROOT_USER_CREATED_AT_MICROS,
+    ChangePasswordRequest as ResolvedChangePasswordRequest, CreatePersonalAccessTokenRequest,
+    DeletePersonalAccessTokenRequest, ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS, User,
 };
 use secrecy::SecretString;
 use server_common::sharding::{IggyNamespace, METADATA_GROUP};
@@ -279,8 +281,11 @@ impl SimClient {
     #[allow(clippy::cast_possible_truncation)]
     pub fn register(&self) -> Message<RoutedRequestHeader> {
         let header_size = std::mem::size_of::<RoutedRequestHeader>();
-        let registration = iggy_binary_protocol::requests::users::login_register::RegisterRequest {
-            user_created_at: ROOT_USER_CREATED_AT_MICROS,
+        let registration = RegisterRequest {
+            credential: CredentialProof::account(
+                ROOT_USER_CREATED_AT_MICROS,
+                ROOT_USER_ACCESS_REVISION,
+            ),
             bind_verifier: consensus::client_table::bind_verifier(
                 self.client_id,
                 0,
@@ -708,10 +713,46 @@ impl SimClient {
         current_password: &str,
         new_password: &str,
     ) -> Message<RoutedRequestHeader> {
-        let wire = ChangePasswordRequest {
-            user_id: WireIdentifier::named(user).expect("username must be valid"),
-            current_password: current_password.to_string(),
-            new_password: new_password.to_string(),
+        let user_id = WireIdentifier::named(user).expect("username must be valid");
+        // See `create_personal_access_token` for why the shape depends on the path.
+        if self.shell_wire.get() {
+            let wire = ChangePasswordRequest {
+                user_id,
+                current_password: current_password.to_string(),
+                new_password: new_password.to_string(),
+            };
+            return self.build_request(Operation::ChangePassword, &wire.to_bytes());
+        }
+        self.raw_change_password(user_id, None, current_password, new_password)
+    }
+
+    pub(crate) fn raw_change_password(
+        &self,
+        user_id: WireIdentifier,
+        account: Option<&User>,
+        current_password: &str,
+        new_password: &str,
+    ) -> Message<RoutedRequestHeader> {
+        // Raw fixtures store their deterministic password value directly.
+        let (user_id, access_revision, password_hash) = account.map_or_else(
+            || (user_id, 0, String::new()),
+            |account| {
+                (
+                    WireIdentifier::numeric(account.id),
+                    account.access_revision,
+                    if account.password_hash.as_ref() == current_password {
+                        new_password.to_owned()
+                    } else {
+                        String::new()
+                    },
+                )
+            },
+        );
+        let wire = ResolvedChangePasswordRequest {
+            user_id,
+            access_revision,
+            password_hash,
+            keep_session: true,
         };
         self.build_request(Operation::ChangePassword, &wire.to_bytes())
     }

@@ -21,29 +21,10 @@ use iggy_common::IggyError;
 #[allow(clippy::missing_errors_doc)]
 impl Permissioner {
     pub fn get_stream(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.manage_streams || global_permissions.read_streams)
-        {
-            return Ok(());
-        }
-
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
-            && (stream_permissions.manage_stream || stream_permissions.read_stream)
-        {
-            return Ok(());
-        }
-
-        Err(IggyError::Unauthorized)
-    }
-
-    pub fn get_streams(&self, user_id: u32) -> Result<(), IggyError> {
-        if let Some(global_permissions) = self.users_permissions.get(&user_id)
-            && (global_permissions.manage_streams || global_permissions.read_streams)
-        {
-            return Ok(());
-        }
-
-        Err(IggyError::Unauthorized)
+        self.read_grants(user_id, stream_id)
+            .reads_stream()
+            .then_some(())
+            .ok_or(IggyError::Unauthorized)
     }
 
     pub fn create_stream(&self, user_id: u32) -> Result<(), IggyError> {

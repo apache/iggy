@@ -196,7 +196,7 @@ wire_code_enum! {
     WireSessionClosedReason {
         Logout = 0,
         Expired = 1,
-        /// The user was deactivated or deleted.
+        /// A user delete, deactivation, password change, or delete of the session's token.
         Revoked = 2,
     }
 }

@@ -127,8 +127,11 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
 /// on session retirement. Revision 2 batches `Commit` and `CommitReply`
 /// frames, one entry per group. Revision 3 retires ended sessions in batches:
 /// retirement reports and session finalization carry a walk watermark instead
-/// of one session and a namespace revision.
-pub const REPLICA_WIRE_REVISION: u32 = 3;
+/// of one session and a namespace revision. Revision 4 binds sessions to the
+/// credential that opened them: `Register` carries an access revision and a
+/// token id, a password change carries the revision it verified, and the client
+/// table transfer carries each session's token.
+pub const REPLICA_WIRE_REVISION: u32 = 4;
 
 /// Oldest protocol version this build accepts at login.
 ///

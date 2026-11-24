@@ -57,6 +57,11 @@ pub trait CliCommand: Send {
     fn prefer_explicit_credentials(&self) -> bool {
         false
     }
+    /// The personal access token the command deletes. Deleting the token a
+    /// command signed in with ends its session, so the sign-out after it may find none.
+    fn deleted_token(&self) -> Option<String> {
+        None
+    }
     async fn execute_cmd(&mut self, client: &dyn Client) -> Result<(), Error>;
     async fn execute_with_iggy_client(&mut self, client: &IggyClient) -> Result<(), Error> {
         self.execute_cmd(client).await
