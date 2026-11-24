@@ -65,7 +65,7 @@ public interface IIggyStream
     Task UpdateStreamAsync(Identifier streamId, StreamUpdate update, CancellationToken token = default);
 
     /// <summary>
-    ///     Retrieves information about all streams.
+    ///     Retrieves information about the streams the caller may read.
     /// </summary>
     /// <remarks>
     ///     Over TCP the client reads the list in pages of 1000 in id order, so the result is not one consistent read:
@@ -81,7 +81,7 @@ public interface IIggyStream
     Task<IReadOnlyList<StreamResponse>> GetStreamsAsync(CancellationToken token = default);
 
     /// <summary>
-    ///     Reads one page of streams.
+    ///     Reads one page of the streams the caller may read.
     /// </summary>
     /// <remarks>
     ///     The query is checked before anything is sent. To read the next page, send the same query with the

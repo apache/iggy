@@ -165,8 +165,17 @@ impl UserClient for HttpClient {
         Ok(identity_info)
     }
 
+    /// A token the server refuses as unauthenticated has no session left to
+    /// end, as after a password change, so the logout holds and the token is
+    /// dropped too. Any other refusal keeps the token.
     async fn logout_user(&self) -> Result<(), IggyError> {
-        self.delete(&format!("{PATH}/logout")).await?;
+        if !self.is_authenticated().await {
+            return Err(IggyError::Unauthenticated);
+        }
+        match self.delete_session(&format!("{PATH}/logout")).await {
+            Ok(_) | Err(IggyError::Unauthenticated) => {}
+            Err(error) => return Err(error),
+        }
         self.set_access_token(None).await;
         Ok(())
     }
@@ -235,6 +244,69 @@ mod tests {
                 Err(IggyError::InvalidUsername)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn given_refused_token_when_logging_out_should_succeed_and_drop_it() {
+        let server =
+            ScriptedServer::start(vec![Reply::error(401, &IggyError::Unauthenticated)]).await;
+        let client = server.client();
+
+        client.logout_user().await.unwrap();
+
+        assert_eq!(server.requests().len(), 1);
+        assert!(matches!(
+            client.delete_user(&Identifier::numeric(1).unwrap()).await,
+            Err(IggyError::Unauthenticated)
+        ));
+        assert!(server.requests().is_empty(), "no token is left to send");
+    }
+
+    #[tokio::test]
+    async fn given_a_refusal_that_is_not_unauthenticated_when_logging_out_should_keep_the_token() {
+        for refusal in [
+            Reply::error(401, &IggyError::InvalidPersonalAccessToken),
+            Reply::text(401, "<html>proxy sign-in required</html>"),
+        ] {
+            let server = ScriptedServer::start(vec![refusal, Reply::empty(204)]).await;
+            let client = server.client();
+
+            assert!(matches!(
+                client.logout_user().await,
+                Err(IggyError::HttpResponseError(401, _))
+            ));
+            client.logout_user().await.unwrap();
+
+            assert_eq!(server.requests().len(), 2, "the token stays for a retry");
+        }
+    }
+
+    #[tokio::test]
+    async fn given_no_token_when_logging_out_should_refuse_before_sending() {
+        let server = ScriptedServer::start(vec![Reply::empty(204)]).await;
+        let client = server.client();
+        client.set_access_token(None).await;
+
+        assert!(matches!(
+            client.logout_user().await,
+            Err(IggyError::Unauthenticated)
+        ));
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn given_server_failure_when_logging_out_should_keep_the_token() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(500, &IggyError::Error),
+            Reply::empty(204),
+        ])
+        .await;
+        let client = server.client();
+
+        assert!(client.logout_user().await.is_err());
+        client.logout_user().await.unwrap();
+
+        assert_eq!(server.requests().len(), 2);
     }
 
     #[tokio::test]

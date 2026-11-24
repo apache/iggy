@@ -209,7 +209,7 @@ pub async fn load_partition_or_fence(
             if source.kind() == std::io::ErrorKind::InvalidData =>
         {
             error!(%error, namespace_raw = namespace.inner(), "unreadable retirement fence; refusing partition");
-            partitions.fence(namespace, created_revision);
+            partitions.refuse(namespace, created_revision);
             return Ok(None);
         }
         Err(error) => return Err(error),
@@ -253,12 +253,12 @@ pub async fn load_partition_or_fence(
                  partition was created without any record of it: refusing to serve it from \
                  offset 0; delete and recreate the topic to accept the loss"
             );
-            partitions.fence(namespace, created_revision);
+            partitions.refuse(namespace, created_revision);
             return Ok(None);
         }
         Err(source) if source.kind() == std::io::ErrorKind::InvalidData => {
             error!(%source, namespace_raw = namespace.inner(), "unreadable initialization record; refusing partition");
-            partitions.fence(namespace, created_revision);
+            partitions.refuse(namespace, created_revision);
             return Ok(None);
         }
         Err(source) => {
@@ -361,7 +361,7 @@ pub async fn load_partition_or_fence(
                 "cannot tell which incarnation this partition directory belongs to; \
                  tombstoning the partition instead of serving it"
             );
-            partitions.fence(namespace, created_revision);
+            partitions.refuse(namespace, created_revision);
             return Ok(None);
         }
         Err(source) => return Err(revision_io(source)),
@@ -479,7 +479,7 @@ pub async fn load_partition_or_fence(
                      segment files in place and tombstoning it instead of serving it \
                      empty"
                 );
-                partitions.fence(namespace, created_revision);
+                partitions.refuse(namespace, created_revision);
                 return Ok(None);
             }
             if replica_count > 1 {
@@ -528,7 +528,7 @@ pub async fn load_partition_or_fence(
                         "failed to quarantine the refused segment files; leaving this \
                          partition tombstoned rather than rebuilding over them"
                     );
-                    partitions.fence(namespace, created_revision);
+                    partitions.refuse(namespace, created_revision);
                     return Ok(None);
                 }
             }
@@ -586,7 +586,7 @@ pub async fn load_partition_or_fence(
                  partition instead of serving it"
             );
             partition_stats.zero_out_all();
-            partitions.fence(namespace, created_revision);
+            partitions.refuse(namespace, created_revision);
             Ok(None)
         }
         Err(error) => Err(error),

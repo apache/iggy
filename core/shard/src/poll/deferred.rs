@@ -44,8 +44,9 @@ use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
-use iggy_common::{DeferredPollOptions, IggyError, PollingKind, PollingStrategy};
+use iggy_common::{DeferredPollOptions, IggyError, IggyTimestamp, PollingKind, PollingStrategy};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -106,7 +107,8 @@ pub enum PollQuotaIdentity {
 pub struct DeferredPollContext {
     pub session: Option<SessionAttachment>,
     pub user_id: u32,
-    pub user_created_at: Option<u64>,
+    /// What the credential of a caller without a session proved.
+    pub credential: Option<CredentialProof>,
     pub quota: PollQuotaIdentity,
     pub primary: bool,
 }
@@ -135,6 +137,10 @@ pub struct DeferredPollRequest {
     /// started from. `None` means from its admission. A fetch that resolved
     /// its starts before it waited sets that time.
     pub stores_fenced_from: Option<u64>,
+    /// Whether the owner holds this read for a partition that cannot serve
+    /// yet. A fetch clears it for a read beside others, because a held read
+    /// keeps back the replies of the reads beside it.
+    pub holdable: bool,
     pub(crate) deadline: u64,
     pub(crate) request_deadline: u64,
 }
@@ -157,6 +163,7 @@ impl DeferredPollRequest {
             commit_gate: None,
             oversized_turn: None,
             stores_fenced_from: None,
+            holdable: true,
             deadline: 0,
             request_deadline: 0,
         }
@@ -1162,10 +1169,11 @@ where
         namespace: IggyNamespace,
         context: &DeferredPollContext,
     ) -> Result<(), IggyError> {
+        let now_micros = self.bus.realtime_micros();
         if context
             .session
             .as_ref()
-            .is_some_and(|session| !session.is_valid())
+            .is_some_and(|session| !session.is_valid_at(now_micros))
         {
             return Err(IggyError::StaleClient);
         }
@@ -1178,10 +1186,14 @@ where
             return Err(IggyError::TransientNotAccepted);
         }
         let metadata = &self.plane.metadata().mux_stm;
-        if context.user_created_at.is_some_and(|created_at| {
-            !metadata
-                .users()
-                .read(|users| users.is_active_account(context.user_id, created_at))
+        if context.credential.is_some_and(|credential| {
+            !metadata.users().read(|users| {
+                users.accepts_credential_at(
+                    context.user_id,
+                    &credential,
+                    IggyTimestamp::from(now_micros),
+                )
+            })
         }) {
             return Err(IggyError::Unauthenticated);
         }

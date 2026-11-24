@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <initializer_list>
 #include <memory>
 #include <random>
@@ -394,15 +395,27 @@ class E2ETestFixture : public ::testing::Test {
 
     void CleanupStreams(iggy::ffi::Client *client) {
         for (const auto &stream_name : tracked_stream_names_) {
-            iggy::ffi::ErrorInfo error_info{};
-            EXPECT_NO_THROW(client->delete_stream(make_string_identifier(stream_name), error_info));
+            EXPECT_NO_THROW(DeleteTrackedStream(client, make_string_identifier(stream_name)));
         }
         for (const auto stream_id : tracked_stream_ids_) {
-            iggy::ffi::ErrorInfo error_info{};
-            EXPECT_NO_THROW(client->delete_stream(make_numeric_identifier(stream_id), error_info));
+            EXPECT_NO_THROW(DeleteTrackedStream(client, make_numeric_identifier(stream_id)));
         }
         tracked_stream_names_.clear();
         tracked_stream_ids_.clear();
+    }
+
+    static void DeleteTrackedStream(iggy::ffi::Client *client, iggy::ffi::Identifier stream) {
+        iggy::ffi::ErrorInfo error_info{};
+        try {
+            client->delete_stream(std::move(stream), error_info);
+        } catch (const std::exception &) {
+            if (!error_info.has_operation_id || std::string(error_info.kind) != "operation_uncertain") {
+                throw;
+            }
+            constexpr auto timeout = std::chrono::duration_cast<std::chrono::microseconds>(
+                iggy::IggyBlockingClient::kDefaultResolutionTimeout);
+            client->resolve_operation(error_info.operation_id, timeout.count(), error_info);
+        }
     }
 
     void CleanupStreamsBestEffort(iggy::ffi::Client *client) noexcept {
