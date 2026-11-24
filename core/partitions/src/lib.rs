@@ -106,6 +106,13 @@ pub use segment_upload::{
     ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
     UploadError, UploadOutcome, upload_segment,
 };
+mod segment_verify;
+pub use segment_verify::{
+    ObjectHead, SEGMENT_VERIFY_BATCH_MAX, SEGMENT_VERIFY_INTERVAL, SegmentHeads, SegmentVerifyJob,
+    SegmentVerifyOutcome, SegmentVerifyReport, Unanswered, VerifyBegin,
+};
+mod segment_verify_job;
+pub use segment_verify_job::{ExecutorSegmentVerifier, SegmentVerifier, head_segments};
 pub mod long_term;
 mod long_term_delete;
 pub use long_term_delete::{

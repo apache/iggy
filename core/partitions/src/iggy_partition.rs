@@ -255,6 +255,13 @@ where
     /// outlives the view, so the late result of an earlier view's publish is
     /// never taken for the one in flight.
     pub(crate) manifest_publish_jobs: u64,
+    /// What this replica's verify passes found of the store's copy of the
+    /// stored segments, while it is the primary. `None` until its first pass.
+    pub(crate) segment_verifies: Option<Box<crate::segment_verify::SegmentVerifies>>,
+    /// Number of the last verify job this partition started. It outlives the
+    /// view, so the late result of an earlier view's job is never taken for
+    /// the one in flight.
+    pub(crate) segment_verify_jobs: u64,
     /// The fetches of remote segments' indexes that polls have in flight.
     pub(crate) index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
@@ -1200,6 +1207,8 @@ where
             long_term_backlog: Box::default(),
             fresh_proofs: None,
             manifest_publish_jobs: 0,
+            segment_verifies: None,
+            segment_verify_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),

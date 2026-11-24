@@ -273,11 +273,20 @@ pub struct GaugeShare {
     pub wal_reload_bytes: u64,
     pub repair_ring_entries: usize,
     pub repair_ring_bytes: u64,
+    /// Stored segments that a verify pass found with an object missing.
+    pub stored_segments_missing: usize,
+    /// Stored segments that a verify pass found with an object that differs
+    /// from the chain's record.
+    pub stored_segments_diverged: usize,
 }
 
 impl GaugeShare {
     const fn replaced(self, old: Self, new: Self) -> Self {
         Self {
+            stored_segments_missing: self.stored_segments_missing - old.stored_segments_missing
+                + new.stored_segments_missing,
+            stored_segments_diverged: self.stored_segments_diverged - old.stored_segments_diverged
+                + new.stored_segments_diverged,
             wal_disk_bytes: self.wal_disk_bytes - old.wal_disk_bytes + new.wal_disk_bytes,
             wal_retained_bytes: self.wal_retained_bytes - old.wal_retained_bytes
                 + new.wal_retained_bytes,

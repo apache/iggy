@@ -606,6 +606,28 @@ sets its files aside and rejoins by state transfer. Each shard exports
 `partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
 `partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
+The primary of each partition of a tiered topic checks once a day that the
+store still holds the segments its chain records as stored, and once more each
+time it becomes the primary, as after a restart. The check sends one HEAD for
+the `.log` and one for the `.index` of each segment, at most 64 segments a job,
+in the housekeeping jobs that wait for fetches and uploads. It lists nothing,
+reads no object and leaves the read cache alone. An object the store does not
+hold counts as missing. A `.log` of another size than the chain records, or
+with another CRC32C than the one the store computed when it took the upload,
+or, on a store that keeps no CRC32C, with another hash in its metadata, counts
+as diverged, and so does an `.index` that is not a whole number of entries. The
+node logs each such segment once as an error when it finds it, and once more
+when a later check finds it as recorded again. It repairs, deletes and fences
+nothing. A store error is no finding: after a timeout, a 5xx answer or
+throttling the next job checks the segment again, and after any other error
+the next pass does. Each shard exports `partition_segment_verify_passes_total`,
+`partition_stored_segments_verified_total`, and the gauges
+`partition_stored_segments_missing` and `partition_stored_segments_diverged`
+over the partitions it leads, which drop to 0 when it stops leading them. No
+provider computes a CRC32C again on a HEAD, so the check compares what the
+store recorded when it took the object, not the bytes it holds now: a byte that
+flips inside an object file of the `fs` backend is not found.
+
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
 an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iggy::prelude::*;
-use iggy_object_store::{FsStore, ObjectStore, PartitionManifest};
+use iggy_object_store::{FsStore, ObjectStore, PartitionManifest, PutBody, PutOptions};
 use integration::harness::{TestBinary, TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
@@ -45,6 +45,13 @@ pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
 pub(crate) const METRICS_DEADLINE: Duration = Duration::from_secs(30);
 const CHAIN_REBUILDS: &str = "partition_chain_rebuilds_total";
 const CHAIN_REBUILD_REFUSALS: &str = "partition_chain_rebuild_refusals_total";
+const VERIFY_PASSES: &str = "partition_segment_verify_passes_total";
+const SEGMENTS_VERIFIED: &str = "partition_stored_segments_verified_total";
+const SEGMENTS_MISSING: &str = "partition_stored_segments_missing";
+const SEGMENTS_DIVERGED: &str = "partition_stored_segments_diverged";
+const MISSING_SEGMENT_LOG: &str = "a segment the partition stored is missing from the object store";
+const DIVERGED_SEGMENT_LOG: &str =
+    "a segment the partition stored differs in the object store from what the partition recorded";
 
 #[tokio::test]
 async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_back_from_the_store()
@@ -430,6 +437,164 @@ async fn given_every_segment_on_disk_when_the_chain_file_is_lost_should_serve_wi
             .stdout_contains("waits for the object store to account"),
         "the partition waited for the store"
     );
+}
+
+/// A primary verifies the stored segments on its first pass after a restart.
+/// One whose object is gone is reported, and once the object is back the
+/// next pass reports nothing.
+#[tokio::test]
+async fn given_a_stored_segment_deleted_from_the_store_when_the_primary_verifies_should_report_it_missing_until_it_is_back()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let aside = tempfile::tempdir().expect("a directory for the deleted object");
+    let (mut harness, stored) = Box::pin(single_node_with_evicted_segments(store.path())).await;
+
+    harness.server_mut().stop().expect("the server stops");
+    let object = files_named(store.path(), &stored[0]).remove(0);
+    let moved = aside.path().join(&stored[0]);
+    std::fs::copy(&object, &moved).expect("keep the object aside");
+    std::fs::remove_file(&object).expect("delete the object");
+    harness.server_mut().start().expect("the server starts");
+    let http = HttpClient::login_root(&harness).await;
+
+    assert_eq!(settled_verify_pass(&http).await, stored.len() as u64);
+    assert_eq!(metric(&http, SEGMENTS_MISSING).await, 1);
+    assert_eq!(metric(&http, SEGMENTS_DIVERGED).await, 0);
+    assert_eq!(
+        harness.server().stdout_occurrences(MISSING_SEGMENT_LOG),
+        1,
+        "the missing segment is logged once"
+    );
+
+    harness.server_mut().stop().expect("the server stops");
+    std::fs::copy(&moved, &object).expect("put the object back");
+    harness.server_mut().start().expect("the server starts");
+    let http = HttpClient::login_root(&harness).await;
+
+    assert_eq!(settled_verify_pass(&http).await, stored.len() as u64);
+    assert_eq!(metric(&http, SEGMENTS_MISSING).await, 0);
+    assert_eq!(metric(&http, SEGMENTS_DIVERGED).await, 0);
+    assert!(!harness.server().stdout_contains(MISSING_SEGMENT_LOG));
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    assert_reads_every_message(&client, &stream, &topic).await;
+}
+
+/// Other bytes under a stored segment's key, of the same length and with the
+/// same metadata, differ only in the CRC32C the store computed of them.
+#[tokio::test]
+async fn given_a_stored_segment_replaced_in_the_store_when_the_primary_verifies_should_report_it_diverged()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let (mut harness, stored) = Box::pin(single_node_with_evicted_segments(store.path())).await;
+
+    harness.server_mut().stop().expect("the server stops");
+    let object = files_named(store.path(), &stored[0]).remove(0);
+    replace_object(store.path().to_owned(), object).await;
+    harness.server_mut().start().expect("the server starts");
+    let http = HttpClient::login_root(&harness).await;
+
+    assert_eq!(settled_verify_pass(&http).await, stored.len() as u64);
+    assert_eq!(metric(&http, SEGMENTS_DIVERGED).await, 1);
+    assert_eq!(metric(&http, SEGMENTS_MISSING).await, 0);
+    assert_eq!(
+        harness.server().stdout_occurrences(DIVERGED_SEGMENT_LOG),
+        1,
+        "the replaced segment is logged once"
+    );
+    assert!(harness.server().stdout_contains("the store's CRC32C is"));
+}
+
+/// A pass only asks the store about the objects. It reads no byte of them,
+/// so the read cache of the shards does nothing while it runs.
+#[tokio::test]
+async fn given_stored_segments_the_store_holds_when_the_primary_verifies_should_report_nothing_and_leave_the_read_cache_alone()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let (mut harness, stored) = Box::pin(single_node_with_evicted_segments(store.path())).await;
+
+    harness.server_mut().stop().expect("the server stops");
+    harness.server_mut().start().expect("the server starts");
+    let http = HttpClient::login_root(&harness).await;
+
+    assert_eq!(settled_verify_pass(&http).await, stored.len() as u64);
+    assert_eq!(metric(&http, SEGMENTS_MISSING).await, 0);
+    assert_eq!(metric(&http, SEGMENTS_DIVERGED).await, 0);
+    let counts = read_cache_counts(&http).await;
+    assert_eq!(
+        (
+            counts.block_hits,
+            counts.block_misses,
+            counts.demand_bytes,
+            counts.blocks_fetched_ahead,
+            counts.held_bytes
+        ),
+        (0, 0, 0, 0, 0),
+        "the pass went through the read cache: {counts:?}"
+    );
+}
+
+/// A single node whose tiered topic holds the test's messages, with every
+/// sealed segment in the store and off the disk. Returns the names of the
+/// segment logs in the store.
+async fn single_node_with_evicted_segments(store: &Path) -> (TestHarness, Vec<String>) {
+    let mut harness = single_node_with_fs_store(store);
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    wait_until_only_the_open_segment_is_local(store, &harness.server().data_path()).await;
+    let stored = segment_logs(store);
+    (harness, stored)
+}
+
+/// Waits until a verify pass ended and the counts settled, and returns how
+/// many segments the passes checked.
+async fn settled_verify_pass(http: &HttpClient) -> u64 {
+    settled_metric(http, VERIFY_PASSES, |passes| passes > 0).await;
+    settled_metric(http, SEGMENTS_VERIFIED, |_| true).await
+}
+
+/// Puts other bytes of the same length, with the same metadata, under the
+/// key of the object file at `path`, through the provider on a compio
+/// runtime, as the provider does not run on the harness's.
+async fn replace_object(store: PathBuf, path: PathBuf) {
+    let key = path
+        .strip_prefix(&store)
+        .expect("an object file in the store")
+        .to_string_lossy()
+        .into_owned();
+    tokio::task::spawn_blocking(move || {
+        compio::runtime::Runtime::new()
+            .expect("a compio runtime")
+            .block_on(async {
+                let store = FsStore::new(&store);
+                let held = store.head(&key).await.expect("the object");
+                let object = store
+                    .get_range(&key, 0..held.size)
+                    .await
+                    .expect("the object's bytes");
+                let mut bytes = object.bytes.to_vec();
+                bytes[0] ^= 0xff;
+                let options = PutOptions {
+                    metadata: held.metadata,
+                    ..PutOptions::default()
+                };
+                store
+                    .put(&key, PutBody::from_bytes(bytes), &options)
+                    .await
+                    .expect("the replacement");
+            });
+    })
+    .await
+    .expect("the replacement does not panic");
 }
 
 fn server_with_fs_store(store: &Path) -> TestHarness {

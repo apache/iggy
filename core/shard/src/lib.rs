@@ -47,6 +47,7 @@ mod primary_rebalance;
 pub mod rewrite_pacing;
 mod router;
 mod segment_uploads;
+mod segment_verifies;
 mod served_reads;
 pub mod shards_table;
 mod store_view_reads;
@@ -1306,6 +1307,20 @@ pub enum LifecycleFrame {
     /// The result of a publish that a [`Self::PublishManifest`] pass started,
     /// sent by the task that ran it.
     ManifestPublishFinished(Box<FinishedManifestPublish>),
+    /// Per-shard pass over a partition of a tiered topic: start the next job
+    /// of its verify pass, which checks that the store still holds the
+    /// segments the partition stored, when this replica is the primary and
+    /// no job is in flight. The timer task stamps `now`. Does nothing on a
+    /// shard without a verifier.
+    VerifySegments {
+        namespace: IggyNamespace,
+        /// The incarnation the pass was staged for.
+        created_revision: u64,
+        now: IggyTimestamp,
+    },
+    /// The result of a job that a [`Self::VerifySegments`] pass started,
+    /// sent by the task that ran it.
+    SegmentVerifyFinished(Box<FinishedSegmentVerify>),
     /// The result of an attempt at the upload of a fresh object, sent by the
     /// task that ran it.
     FreshUploadFinished(Box<FinishedFreshUpload>),
@@ -1479,6 +1494,17 @@ pub struct FinishedManifestPublish {
     /// The partition's number for the publish.
     pub id: u64,
     pub outcome: partitions::ManifestPublishOutcome,
+}
+
+/// What the task running a verify job hands back to the pump.
+pub struct FinishedSegmentVerify {
+    pub namespace: IggyNamespace,
+    /// The incarnation that started the job. Slab ids are reused after a
+    /// delete, so the namespace alone can name a later partition.
+    pub created_revision: u64,
+    /// The partition's number for the job.
+    pub id: u64,
+    pub outcome: partitions::SegmentVerifyOutcome,
 }
 
 /// What the task running an object-delete job hands back to the pump.
@@ -2303,6 +2329,16 @@ where
     /// so the next manifest pass takes them from here.
     undelivered_manifest_publishes: Rc<RefCell<Vec<FinishedManifestPublish>>>,
 
+    /// Late-bound verifier of the segments tiered partitions stored. `None`
+    /// on a shard without an object store, and before its node passes the
+    /// store identity check.
+    segment_verifier: RefCell<Option<Rc<dyn partitions::SegmentVerifier>>>,
+
+    /// Results of verify jobs whose frame the inbox refused. The partition
+    /// counts such a job as in flight until it sees the result, so the next
+    /// verify pass takes them from here.
+    undelivered_segment_verifies: Rc<RefCell<Vec<FinishedSegmentVerify>>>,
+
     /// The partitions whose changed manifest waits out
     /// [`partitions::MANIFEST_STORE_INTERVAL`], by namespace and incarnation.
     /// The pump's tick stages each one's pass once it passed, whether the
@@ -2718,6 +2754,8 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            segment_verifier: RefCell::new(None),
+            undelivered_segment_verifies: Rc::default(),
             manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
@@ -3714,6 +3752,8 @@ where
             undelivered_object_deletes: Rc::default(),
             manifest_publisher: RefCell::new(None),
             undelivered_manifest_publishes: Rc::default(),
+            segment_verifier: RefCell::new(None),
+            undelivered_segment_verifies: Rc::default(),
             manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),

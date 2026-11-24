@@ -42,6 +42,7 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::remote_segments::IndexCheck;
 use crate::segment_chain::{SegmentHasher, SegmentRecord};
 use crate::segment_recovery::MAX_RECOVERABLE_BATCH_BYTES;
+use crate::segment_verify::{index_divergence, log_divergence};
 use crate::state_transfer::{ChunkHasher, hash_segment_range};
 
 /// Bytes of a file that one piece of a put body holds.
@@ -258,14 +259,7 @@ pub async fn store_segment<S: ObjectStore>(
         Ok(()) => {}
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(&log_key).await.map_err(UploadError::Store)?;
-            let same_bytes = held.crc32c.map_or_else(
-                || {
-                    SegmentMetadata::try_from(&held.metadata)
-                        .is_ok_and(|metadata| metadata.hash == record.hash)
-                },
-                |crc32c| crc32c == record.crc32c,
-            );
-            if held.size != record.size || !same_bytes {
+            if log_divergence(&held, record).is_some() {
                 return Err(UploadError::Diverged { key: log_key });
             }
         }
@@ -283,7 +277,7 @@ pub async fn store_segment<S: ObjectStore>(
         // stored only has to be one.
         Err(ObjectStoreError::PreconditionFailed { .. }) => {
             let held = store.head(index_key).await.map_err(UploadError::Store)?;
-            if held.size == 0 || held.size % IGGY_INDEX_SIZE as u64 != 0 {
+            if index_divergence(&held).is_some() {
                 return Err(UploadError::Diverged {
                     key: index_key.to_owned(),
                 });
