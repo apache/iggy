@@ -64,6 +64,7 @@ These settings live under `[cluster.coordinator]` and apply when the server has 
 | `skip_shard_zero_for_replicas` | `true` | Places replica connections on peer shards instead of shard 0 |
 | `replica_connections_per_peer` | `1` | Replica links per peer. Every node must use the same value. |
 | `skip_shard_zero_for_clients` | `false` | When enabled, excludes shard 0 from client connection placement |
+| `skip_shard_zero_for_partitions` | `false` | When enabled, places no partition on shard 0, so a stall of the metadata plane there cannot stop the heartbeats of partition groups. Keep `skip_shard_zero_for_replicas` enabled with it, and use the same value on every node. A server with one shard refuses to start with it enabled. Older server binaries refuse a TOML configuration that contains this key. Remove the key before a rollback to one of them. |
 
 ## Node roster
 

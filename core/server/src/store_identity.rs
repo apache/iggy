@@ -58,7 +58,7 @@
 
 use std::pin::pin;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use consensus::MetadataHandle;
 use futures::future::{Either, select};
@@ -70,7 +70,7 @@ use journal::superblock::SuperblockStore;
 use metadata::AppliedFrontier;
 use metadata::change_log::ChangeLog;
 use metadata::impls::metadata::StreamsFrontend;
-use metadata::stm::stream::StreamsInner;
+use metadata::stm::stream::{Streams, StreamsInner};
 use partitions::{
     FreshObjectSweeper, FreshObjectUploader, LongTermMerger, LongTermWriter, ManifestPublisher,
     ObjectDeleter, SegmentUploader, SegmentVerifier, StoreViewReader, TopicObjects,
@@ -116,6 +116,9 @@ pub struct IdentityChecker<S> {
     /// [`StoreIdentity::check_conditional_create`]. A check sends one until
     /// it does.
     conditional_create_checked: bool,
+    /// The cluster the last check found in the store while metadata held no
+    /// topic restored from it. See [`Self::wait`].
+    unrestored_claim: Option<u128>,
 }
 
 /// What one check of the store identity found.
@@ -193,9 +196,18 @@ pub async fn run<S: ObjectStore>(
             .applied_frontier()
             .store_identity_verified();
         handlers.sync(&shard, verified.then(|| own_cluster_uid(&shard)).flatten());
-        // `Ok`: the stop fired, or its sender is gone. `Err`: the wait ran
-        // out.
-        if compio::time::timeout(delay, stop.recv()).await.is_ok() {
+        let wait = async {
+            match checker.as_ref() {
+                Some(checker) => {
+                    checker
+                        .wait(shard.plane.metadata().mux_stm.streams(), delay)
+                        .await;
+                }
+                None => compio::time::sleep(delay).await,
+            }
+        };
+        // `Right`: the stop fired, or its sender is gone.
+        if let Either::Right(_) = select(pin!(wait), pin!(stop.recv())).await {
             return;
         }
     }
@@ -227,6 +239,7 @@ impl<S: ObjectStore> IdentityChecker<S> {
             last: None,
             recovery,
             conditional_create_checked: false,
+            unrestored_claim: None,
         }
     }
 
@@ -275,6 +288,10 @@ impl<S: ObjectStore> IdentityChecker<S> {
             }
             _ => false,
         };
+        self.unrestored_claim = match check {
+            IdentityCheck::Foreign(Some(found)) if !awaits_recovery => Some(found),
+            _ => None,
+        };
         let delay = self.record(
             check,
             cluster_uid,
@@ -286,6 +303,24 @@ impl<S: ObjectStore> IdentityChecker<S> {
             delay.min(RETRY_INTERVAL)
         } else {
             delay
+        }
+    }
+
+    /// Wait `delay` before the next check. Ends early once `streams` holds
+    /// topics restored from the cluster the last check found, since replica
+    /// 0 claims the store right after the restore.
+    async fn wait(&self, streams: &Streams, delay: Duration) {
+        let Some(found) = self.unrestored_claim else {
+            compio::time::sleep(delay).await;
+            return;
+        };
+        let deadline = Instant::now() + delay;
+        while !streams.read(|inner| restores_from(inner, found)) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            compio::time::sleep(left.min(WATCH_INTERVAL)).await;
         }
     }
 
@@ -587,10 +622,17 @@ mod tests {
 
     use bytes::Bytes;
     use futures::executor::block_on;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::{Operation, WireEncode, WireIdentifier, WireName, WireOptions};
     use iggy_object_store::{
         DeleteOutcome, FsStore, InlineTierExecutor, ListPage, ListRequest, MemoryStore, ObjectMeta,
         ObjectRange, PutBody, PutMode, PutOptions, RecordingStore, StoreCall,
     };
+    use metadata::stm::shadow::{ShadowStream, ShadowTopicRequest, ShadowTopicTarget};
+    use metadata::stm::{StateHandler, StateMachine as _};
     use partitions::{
         ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
         ExecutorLongTermWriter, ExecutorManifestPublisher, ExecutorSegmentVerifier,
@@ -599,13 +641,52 @@ mod tests {
 
     use super::test_stores::IgnoresCondition;
     use super::*;
-    use crate::dispatch::test_support::{SpyBus, test_shard};
+    use crate::dispatch::test_support::{SpyBus, prepare_message, test_shard};
 
     const OURS: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
     const THEIRS: u128 = 7;
 
     fn layout() -> KeyLayout {
         KeyLayout::new("iggy").unwrap()
+    }
+
+    /// The stream and the one-partition topic that a recovery of
+    /// `cluster_uid` restores.
+    fn restore_requests(cluster_uid: u128) -> [ShadowTopicRequest; 2] {
+        let source = ShadowStream {
+            origin: "dc-a".to_owned(),
+            cluster_uid,
+            stream_id: 0,
+        };
+        [
+            ShadowTopicRequest::RestoreStream {
+                source: source.clone(),
+                name: WireName::new("orders").unwrap(),
+            },
+            ShadowTopicRequest::RestoreTopic {
+                target: ShadowTopicTarget {
+                    stream_id: 0,
+                    source,
+                    topic_id: 0,
+                    created_revision: 5,
+                },
+                create: Box::new(CreateTopicWithAssignmentsRequest {
+                    request: CreateTopicRequest {
+                        stream_id: WireIdentifier::numeric(0),
+                        partitions_count: 1,
+                        name: WireName::new("payments").unwrap(),
+                        options: WireOptions::empty(),
+                    },
+                    derived_options: WireOptions::empty(),
+                    partitions: vec![CreatedPartitionAssignment {
+                        partition_id: 0,
+                        consensus_group_id: 1,
+                        initial_view: 0,
+                        members: Vec::new(),
+                    }],
+                }),
+            },
+        ]
     }
 
     fn check(store: &impl ObjectStore, cluster_uid: u128, claim: bool) -> IdentityCheck {
@@ -1062,54 +1143,62 @@ mod tests {
 
     #[test]
     fn given_topics_restored_from_a_cluster_when_its_root_is_checked_should_know_it_is_recovered() {
-        use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
-        use iggy_binary_protocol::requests::topics::{
-            CreateTopicRequest, CreateTopicWithAssignmentsRequest,
-        };
-        use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
-        use metadata::stm::StateHandler;
-        use metadata::stm::shadow::{ShadowStream, ShadowTopicRequest, ShadowTopicTarget};
-
         let mut inner = StreamsInner::new();
-        let source = ShadowStream {
-            origin: "dc-a".to_owned(),
-            cluster_uid: THEIRS,
-            stream_id: 0,
-        };
         assert!(!restores_from(&inner, THEIRS));
-        let restore_stream = ShadowTopicRequest::RestoreStream {
-            source: source.clone(),
-            name: WireName::new("orders").unwrap(),
-        };
-        let restore_topic = ShadowTopicRequest::RestoreTopic {
-            target: ShadowTopicTarget {
-                stream_id: 0,
-                source,
-                topic_id: 0,
-                created_revision: 5,
-            },
-            create: Box::new(CreateTopicWithAssignmentsRequest {
-                request: CreateTopicRequest {
-                    stream_id: WireIdentifier::numeric(0),
-                    partitions_count: 1,
-                    name: WireName::new("payments").unwrap(),
-                    options: WireOptions::empty(),
-                },
-                derived_options: WireOptions::empty(),
-                partitions: vec![CreatedPartitionAssignment {
-                    partition_id: 0,
-                    consensus_group_id: 1,
-                    initial_view: 0,
-                    members: Vec::new(),
-                }],
-            }),
-        };
-        let now = iggy_common::IggyTimestamp::now();
-        assert_eq!(restore_stream.apply(&mut inner, now).code, 0);
-        assert_eq!(restore_topic.apply(&mut inner, now).code, 0);
+        let now = IggyTimestamp::now();
+        for request in restore_requests(THEIRS) {
+            assert_eq!(request.apply(&mut inner, now).code, 0);
+        }
 
         assert!(restores_from(&inner, THEIRS));
         assert!(!restores_from(&inner, OURS));
+    }
+
+    /// A node that found the claim before replica 0 restored the topics
+    /// checks again once the restore applies, not at the recheck interval.
+    #[compio::test]
+    async fn given_a_foreign_claim_when_its_restore_applies_during_the_wait_should_end_the_wait() {
+        let bus = SpyBus::default();
+        let shard = test_shard(&bus, 1, 3, 1);
+        let mux_stm = &shard.plane.metadata().mux_stm;
+        let mut checker = IdentityChecker::new(
+            MemoryStore::new(),
+            layout(),
+            false,
+            Duration::from_secs(5),
+            None,
+        );
+        checker.unrestored_claim = Some(THEIRS);
+        let short = Duration::from_millis(10);
+
+        let started = Instant::now();
+        checker.wait(mux_stm.streams(), short).await;
+        assert!(
+            started.elapsed() >= short,
+            "no restore, so the wait runs out"
+        );
+
+        let restore = async {
+            compio::time::sleep(short).await;
+            for (request, id) in restore_requests(THEIRS).iter().zip(1..) {
+                mux_stm
+                    .update(prepare_message(
+                        Operation::ShadowTopic,
+                        1,
+                        id,
+                        &request.to_bytes(),
+                    ))
+                    .unwrap();
+            }
+        };
+        let wait = compio::time::timeout(
+            RETRY_INTERVAL,
+            checker.wait(mux_stm.streams(), RECHECK_INTERVAL),
+        );
+        let (waited, ()) = futures::join!(wait, restore);
+
+        assert!(mux_stm.streams().read(|inner| restores_from(inner, THEIRS)));
+        assert!(waited.is_ok(), "the restore ends the wait");
     }
 
     #[test]

@@ -49,6 +49,7 @@ use metadata::stm::consumer_group::{
     LeaveConsumerGroupRequest as ReplicatedLeaveConsumerGroupRequest,
 };
 use server_common::Message;
+use server_common::sharding::IggyNamespace;
 use std::rc::Rc;
 
 /// Retain the authenticated member identity in the replicated join or leave.
@@ -95,10 +96,16 @@ pub fn maybe_rewrite_consumer_group_request(
 /// read path -- which resolves the same id from metadata -- and the reconciler
 /// purge agree, and a re-created group (new id) never inherits a stale offset.
 /// Individual-consumer ops and every other operation pass through untouched.
+///
+/// The group is that of the topic of `namespace`, which the caller resolved
+/// before its waits. The owner of that partition keys the offset by the id,
+/// and a rename during a wait can give the name of the topic to another one,
+/// whose group of the same name has another id.
 #[allow(clippy::cast_possible_truncation)]
 pub fn maybe_rewrite_consumer_offset_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
+    namespace: IggyNamespace,
 ) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
@@ -115,6 +122,9 @@ where
         return Ok(request);
     }
     let body = request_body(&request);
+    // An id of a namespace fits the 32 bits of a wire identifier. The clamp
+    // names no stream or topic, so the request is refused, as below.
+    let numeric = |id: usize| WireIdentifier::Numeric(u32::try_from(id).unwrap_or(u32::MAX));
     // The store/delete ops differ only in the decode type; this collapses
     // their identical decode -> resolve group id -> rewrite consumer id ->
     // re-encode bodies. Individual consumers pass through. A group identifier
@@ -131,8 +141,8 @@ where
             }
             let group_id = resolve_offset_group_id(
                 shard.plane.metadata().mux_stm.streams(),
-                &wire.stream_id,
-                &wire.topic_id,
+                &numeric(namespace.stream_id()),
+                &numeric(namespace.topic_id()),
                 &wire.consumer.id,
             )?;
             // The partition-plane group-offset key is u32 (see the documented
@@ -380,6 +390,7 @@ mod tests {
                 PapayaShardsTable::new(),
                 PartitionConsensusConfig::new(1, ReplicaTopology::new(0, replica_count), bus),
                 None,
+                false,
                 ShardMetrics::for_shard(),
             )
             .unwrap(),
