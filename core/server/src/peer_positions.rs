@@ -52,7 +52,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::StreamsInner;
 use server_common::sharding::IggyNamespace;
 use shard::geo_positions::{GeoPositionSettings, PeerPositions, local_logs};
-use shard::shards_table::calculate_shard_assignment;
+use shard::shards_table::PartitionShards;
 use tracing::{debug, warn};
 
 use crate::peer_manifests::{NodePlace, backoff, list_all, micros};
@@ -192,7 +192,13 @@ impl PeerPositionLister {
             state_ref.settle(failed, now, interval);
             for (peer_origin, objects, listed) in read {
                 if listed {
-                    hand_out(&shard, &peer_origin, &objects, &logs, place.total_shards);
+                    hand_out(
+                        &shard,
+                        &peer_origin,
+                        &objects,
+                        &logs,
+                        place.partition_shards,
+                    );
                 }
                 state_ref.objects.insert(peer_origin, objects);
             }
@@ -347,11 +353,11 @@ fn hand_out(
     origin: &str,
     objects: &Objects,
     logs: &[shard::geo_positions::LocalLog],
-    total_shards: u16,
+    partition_shards: PartitionShards,
 ) {
     let merged = merged(objects);
     let mut by_shard: Vec<Vec<(IggyNamespace, u64, PartitionPositions)>> =
-        vec![Vec::new(); usize::from(total_shards)];
+        vec![Vec::new(); usize::from(partition_shards.shard_count())];
     for local in logs {
         let Some(partitions) = merged.get(&local.log) else {
             continue;
@@ -360,7 +366,7 @@ fn hand_out(
             let Some(positions) = partitions.get(partition_id) else {
                 continue;
             };
-            let owner = calculate_shard_assignment(namespace, u32::from(total_shards));
+            let owner = partition_shards.shard_for(namespace);
             if let Some(owned) = by_shard.get_mut(usize::from(owner)) {
                 owned.push((*namespace, *created_revision, positions.clone()));
             }

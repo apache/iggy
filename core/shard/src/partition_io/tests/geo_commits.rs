@@ -111,7 +111,7 @@ fn shadow_metadata(
     );
     stream.topics.insert(topic);
     let mut inner = StreamsInner::default();
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let metadata = IoTestMetadata::new((Users::default(), (inner.into(), ())));
     IggyMetadata::new(None, None, None, None, metadata, None)
 }

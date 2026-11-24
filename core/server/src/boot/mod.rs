@@ -57,37 +57,42 @@ use crate::boot::threads::{
     validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
-use crate::dispatch::reads::read_frontier_budget;
+use crate::dispatch::reads::{partition_frontier_budget, read_frontier_budget};
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::geo_peers::PeerAuth;
 use crate::server_error::ServerError;
 use crate::shell::{
-    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellShard, heartbeat_timings,
 };
 use crate::tiered_storage::SharedStore;
+use configs::cluster::ClusterConfig;
 use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::Operation;
+use iggy_binary_protocol::{Operation, PrepareHeader};
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use message_bus::replica::handshake::ReplicaHandshakeCtx;
 use message_bus::transports::tls::install_default_crypto_provider;
-use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use message_bus::{IggyMessageBus, MessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
+use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
 use shard::peers::SharedPeerStatus;
+use shard::shards_table::PartitionShards;
 use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -367,8 +372,22 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
-    check_repair_ring_share(&config.partition, total_shards)?;
-    check_wal_reload_share(&config.partition, total_shards)?;
+    let partition_shards = PartitionShards::new(
+        total_shards,
+        config.cluster.coordinator.skip_shard_zero_for_partitions,
+    );
+    check_partition_shards(partition_shards)?;
+    if partition_frames_cross_shard_zero(&config.cluster, total_shards) {
+        warn!(
+            "cluster.coordinator.skip_shard_zero_for_partitions is true, but \
+             cluster.coordinator.skip_shard_zero_for_replicas is false, so a replica link stays \
+             on shard 0 and the partition frames to that peer still cross shard 0. Set \
+             cluster.coordinator.skip_shard_zero_for_replicas to true."
+        );
+    }
+    let owning_shards = partition_shards.owner_count();
+    check_repair_ring_share(&config.partition, owning_shards)?;
+    check_wal_reload_share(&config.partition, owning_shards)?;
     let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
         usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
             ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
@@ -408,7 +427,8 @@ pub fn bootstrap(
     // would gate reads on a number nothing moves - and it carries the held
     // reads' budget, which is sized from the configured commit-broadcast
     // cadence and which a peer shard has no other way to learn.
-    let mut metadata_applied_frontier = AppliedFrontier::new(read_frontier_budget(&config));
+    let mut metadata_applied_frontier = AppliedFrontier::new(read_frontier_budget(&config))
+        .with_partition_request_budget(partition_frontier_budget(&config));
     if config.cluster.enabled && config.cluster.nodes.len() > 1 {
         metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
             std::time::Instant::now(),
@@ -905,6 +925,7 @@ async fn shard_main(
     if shard_id == 0 {
         let notifier = make_metadata_commit_notifier(senders_for_notifier, metrics_for_notifier);
         shard.plane.metadata().set_commit_notifier(Some(notifier));
+        install_checkpoint_spawner(&shard);
     } else {
         drop(senders_for_notifier);
         drop(metrics_for_notifier);
@@ -942,7 +963,6 @@ async fn shard_main(
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
         Rc::clone(&shard),
-        total_shards,
         Rc::new(config.clone()),
         topology.cluster_id,
         topology.self_replica_id,
@@ -1270,6 +1290,85 @@ async fn shard_main(
     Ok(())
 }
 
+/// Skipping shard 0 on a node with one shard leaves no shard to own a
+/// partition, so the node refuses to start with it.
+fn check_partition_shards(partition_shards: PartitionShards) -> Result<(), ServerError> {
+    if partition_shards.skip_shard_zero() && partition_shards.shard_count() == 1 {
+        error!(
+            "cluster.coordinator.skip_shard_zero_for_partitions is true, but the node runs 1 shard, \
+             so no shard can own a partition. Set it to false, or give the node more than one shard \
+             with sharding.cpu_allocation."
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a replica link on shard 0 carries partition frames although no
+/// partition is placed there: link 0 to at least one peer, for the other
+/// shards of its range. With one link per shard that range holds only shard
+/// 0, so the replicas flag moves no link and the link carries no partition
+/// frame.
+const fn partition_frames_cross_shard_zero(cluster: &ClusterConfig, total_shards: u16) -> bool {
+    let coordinator = &cluster.coordinator;
+    cluster.enabled
+        && cluster.nodes.len() > 1
+        && coordinator.skip_shard_zero_for_partitions
+        && !coordinator.skip_shard_zero_for_replicas
+        && coordinator.replica_connections_per_peer < total_shards
+}
+
+/// Every shard that owns partitions sheds its repair rings against an equal
+/// share of the node budget, so their count decides what the budget is worth.
+fn check_repair_ring_share(
+    config: &PartitionConfig,
+    owning_shards: u16,
+) -> Result<(), ServerError> {
+    let share = config.journal_memory_shard_bytes_max(owning_shards);
+    let ring = config.evicted_ring_bytes_max.as_bytes_u64();
+    if share == 0 {
+        error!(
+            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {owning_shards} partition shards",
+            config.journal_memory_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    if share < ring {
+        warn!(
+            "each of {owning_shards} partition shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
+             less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
+        );
+    } else {
+        info!(
+            "each of {owning_shards} partition shards gets {share} bytes of partition.journal_memory_node_bytes_max"
+        );
+    }
+    Ok(())
+}
+
+/// A share of nothing queues a checkpoint for every op, so the node refuses
+/// to start with it.
+fn check_wal_reload_share(config: &PartitionConfig, owning_shards: u16) -> Result<(), ServerError> {
+    let share = config.wal_reload_shard_bytes_max(owning_shards);
+    if share == 0 {
+        error!(
+            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {owning_shards} partition shards",
+            config.wal_reload_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    info!(
+        "each of {owning_shards} partition shards gets {share} bytes of partition.wal_reload_node_bytes_max"
+    );
+    Ok(())
+}
+
 /// Build the closure that broadcasts a
 /// [`LifecycleFrame::MetadataCommitTick`] to every shard's inbox after a
 /// partition-shaped metadata operation commits on shard 0.
@@ -1279,52 +1378,6 @@ async fn shard_main(
 /// and dropped (the periodic tick recovers). Installed via
 /// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
 /// sole writer of the metadata state machine.
-/// Every shard sheds its repair rings against an equal share of the node
-/// budget, so the shard count decides what the budget is worth.
-fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.journal_memory_shard_bytes_max(total_shards);
-    let ring = config.evicted_ring_bytes_max.as_bytes_u64();
-    if share == 0 {
-        error!(
-            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
-            config.journal_memory_node_bytes_max
-        );
-        return Err(ServerError::Config(
-            configs::ConfigurationError::InvalidConfigurationValue,
-        ));
-    }
-    if share < ring {
-        warn!(
-            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
-             less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
-        );
-    } else {
-        info!(
-            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max"
-        );
-    }
-    Ok(())
-}
-
-/// A share of nothing queues a checkpoint for every op, so the node refuses
-/// to start with it.
-fn check_wal_reload_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.wal_reload_shard_bytes_max(total_shards);
-    if share == 0 {
-        error!(
-            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
-            config.wal_reload_node_bytes_max
-        );
-        return Err(ServerError::Config(
-            configs::ConfigurationError::InvalidConfigurationValue,
-        ));
-    }
-    info!(
-        "each of {total_shards} shards gets {share} bytes of partition.wal_reload_node_bytes_max"
-    );
-    Ok(())
-}
-
 fn make_metadata_commit_notifier(
     senders: Vec<TaggedSender>,
     metrics: ShardMetrics,
@@ -1352,6 +1405,35 @@ fn make_metadata_commit_notifier(
             }
         }
     })
+}
+
+/// Run the metadata checkpoint jobs of `shard` as detached tasks on its bus, so
+/// the commit path that starts one never waits for its snapshot write. Shard 0
+/// only, the sole metadata writer.
+///
+/// The spawner lives inside the shard's metadata, so it holds the shard weakly.
+/// A job that finds the shard gone is dropped with the metadata it would fence.
+pub fn install_checkpoint_spawner<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>)
+where
+    B: MessageBus + Clone + 'static,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let weak_shard = Rc::downgrade(shard);
+    let bus = shard.bus.clone();
+    shard
+        .plane
+        .metadata()
+        .set_checkpoint_spawner(Some(Rc::new(move |job| {
+            let weak_shard = Weak::clone(&weak_shard);
+            bus.spawn(async move {
+                if let Some(shard) = weak_shard.upgrade() {
+                    shard.plane.metadata().run_checkpoint_job(job).await;
+                }
+            });
+        })));
 }
 
 /// Filter at the broadcast site, keeping unrelated ops off the SDK reply
@@ -1399,6 +1481,7 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::cluster::ClusterCoordinatorConfig;
 
     /// The two crates keep their own copy of the bounds, and they must not
     /// drift apart.
@@ -1508,6 +1591,64 @@ mod tests {
         }
         std::fs::write(&marker, STORAGE_FORMAT).unwrap();
         assert!(validate_storage_format(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn given_partitions_off_shard_zero_when_booting_one_shard_should_refuse() {
+        assert!(check_partition_shards(PartitionShards::new(1, true)).is_err());
+        assert!(check_partition_shards(PartitionShards::new(1, false)).is_ok());
+        assert!(check_partition_shards(PartitionShards::new(2, true)).is_ok());
+    }
+
+    #[test]
+    fn given_partitions_off_shard_zero_when_a_replica_link_stays_on_it_should_warn() {
+        const SHARDS: u16 = 4;
+        let coordinator = ClusterCoordinatorConfig {
+            skip_shard_zero_for_partitions: true,
+            skip_shard_zero_for_replicas: false,
+            replica_connections_per_peer: 1,
+            ..ClusterCoordinatorConfig::default()
+        };
+        let cluster = |coordinator: ClusterCoordinatorConfig| ClusterConfig {
+            enabled: true,
+            coordinator,
+            ..ClusterConfig::default()
+        };
+        assert!(partition_frames_cross_shard_zero(
+            &cluster(coordinator.clone()),
+            SHARDS
+        ));
+
+        let standalone = ClusterConfig {
+            enabled: false,
+            ..cluster(coordinator.clone())
+        };
+        let mut one_node = cluster(coordinator.clone());
+        one_node.nodes.truncate(1);
+        let partitions_on_shard_zero = cluster(ClusterCoordinatorConfig {
+            skip_shard_zero_for_partitions: false,
+            ..coordinator
+        });
+        let links_off_shard_zero = cluster(ClusterCoordinatorConfig {
+            skip_shard_zero_for_replicas: true,
+            ..coordinator
+        });
+        let one_link_per_shard = cluster(ClusterCoordinatorConfig {
+            replica_connections_per_peer: SHARDS,
+            ..coordinator
+        });
+        for (case, cluster) in [
+            ("standalone", standalone),
+            ("one node", one_node),
+            ("partitions on shard 0", partitions_on_shard_zero),
+            ("links off shard 0", links_off_shard_zero),
+            ("one link per shard", one_link_per_shard),
+        ] {
+            assert!(
+                !partition_frames_cross_shard_zero(&cluster, SHARDS),
+                "{case}"
+            );
+        }
     }
 
     /// A share of nothing sheds every ring to its newest entry from the

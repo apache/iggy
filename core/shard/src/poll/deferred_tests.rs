@@ -50,8 +50,9 @@ use crate::poll::test_support::{
 use crate::poll::timeout_tests::{PollTestBus, evict_messages_for_disk_dispatch};
 use crate::shards_table::PapayaShardsTable;
 use crate::{
-    ConsumerOffsetRead, LifecycleFrame, PARTITION_READ_TIMEOUT, PartitionConsensusConfig,
-    PartitionRead, Receiver, ReplicaTopology, ShardFrame, ShardIdentity, channel, shard_channel,
+    ConsumerOffsetRead, LifecycleFrame, OffsetReadDeadlines, PARTITION_READ_TIMEOUT,
+    PartitionConsensusConfig, PartitionRead, Receiver, ReplicaTopology, ShardFrame, ShardIdentity,
+    channel, shard_channel,
 };
 
 const DEADLINE: u64 = 100;
@@ -133,7 +134,7 @@ async fn shard_of(
     }
     topic.consumer_groups.insert(0, Box::new(group));
     stream.topics.insert(topic);
-    inner.items.insert(stream);
+    inner.items.insert(Arc::new(stream));
     let users = Users::default();
     users.ensure_root_user("iggy", "password-hash");
     let metadata = IggyMetadata::new(
@@ -2165,7 +2166,7 @@ async fn fan_out_evaluates_its_own_targets_in_place_merges_admissions_and_cancel
             }
         };
         let (ready, ()) = futures::join!(
-            owner.wait_for_messages(readiness_caller(), targets, duration, ANY_MESSAGE),
+            owner.wait_for_messages(readiness_caller(), targets, duration, ANY_MESSAGE, None),
             owners
         );
         if later {
@@ -2224,21 +2225,31 @@ async fn given_stored_offsets_of_this_shard_and_another_when_read_should_read_in
             namespace,
             read,
             reply,
+            hold,
         })) = remote_inbox.recv().await
         else {
             panic!("the other owner gets one frame");
         };
-        let PartitionRead::ConsumerOffsetsOnPrimary { reads } = &read else {
+        let PartitionRead::ConsumerOffsetsOnPrimary { reads, .. } = &read else {
             panic!("the frame reads the stored offsets of its partitions");
         };
         assert_eq!(
             reads.iter().map(|read| read.namespace).collect::<Vec<_>>(),
             [partition_namespace(1), partition_namespace(2)]
         );
-        owner.on_partition_read(namespace, read, reply).await;
+        owner.on_partition_read(namespace, read, reply, hold).await;
     };
 
-    let (offsets, ()) = futures::join!(owner.consumer_offsets_on_primary(reads), remote_owner);
+    let (offsets, ()) = futures::join!(
+        owner.consumer_offsets_on_primary(
+            reads,
+            OffsetReadDeadlines {
+                hold_until: u64::MAX,
+                answer_by: u64::MAX,
+            },
+        ),
+        remote_owner
+    );
 
     let offsets: Vec<_> = offsets
         .into_iter()
@@ -2342,7 +2353,10 @@ async fn pump(shard: &TestShard, inbox: &Inbox) {
                 namespace,
                 read,
                 reply,
-            } => shard.on_partition_read(namespace, read, reply).await,
+                hold,
+            } => {
+                shard.on_partition_read(namespace, read, reply, hold).await;
+            }
             _ => panic!("a readiness test sends readiness frames and reads only"),
         }
     }
@@ -2383,7 +2397,8 @@ async fn mirror_on(
             readiness_caller(),
             vec![target],
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait {
@@ -2432,7 +2447,8 @@ async fn wait_through_on(
             readiness_caller(),
             vec![target],
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             pump(watcher, &inboxes[0]).await;
@@ -2486,7 +2502,13 @@ async fn zero_wait_or_next_target_asks_the_owner_without_a_watch() {
     ] {
         let target = readiness_target(&watcher, 0, strategy);
         let (ready, ()) = futures::join!(
-            watcher.wait_for_messages(readiness_caller(), vec![target], duration, ANY_MESSAGE),
+            watcher.wait_for_messages(
+                readiness_caller(),
+                vec![target],
+                duration,
+                ANY_MESSAGE,
+                None
+            ),
             async {
                 let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait {
                     wait,
@@ -2517,7 +2539,8 @@ async fn mirror_that_refuses_a_target_sends_it_to_the_owner() {
             readiness_caller(),
             vec![target],
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             let Ok(ShardFrame::Lifecycle(LifecycleFrame::ReadinessWait {
@@ -2586,7 +2609,8 @@ async fn wait_that_ends_on_another_ready_target_asks_the_owner_of_a_mirror_witho
             readiness_caller(),
             targets,
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             pump(&owner, &inboxes[1]).await;
@@ -2617,7 +2641,8 @@ async fn mirror_that_a_wait_found_behind_keeps_its_pushes_while_waits_name_it() 
             readiness_caller(),
             behind,
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             pump(&owner, &inboxes[1]).await;
@@ -2644,7 +2669,8 @@ async fn mirror_that_a_wait_found_behind_keeps_its_pushes_while_waits_name_it() 
             readiness_caller(),
             current,
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             yield_now().await;
@@ -2675,7 +2701,8 @@ async fn wait_whose_owner_refuses_the_second_evaluation_keeps_its_answer() {
             readiness_caller(),
             targets,
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             pump(&owner, &inboxes[1]).await;
@@ -2712,7 +2739,8 @@ async fn wait_reads_a_mirror_that_a_push_refreshed_after_its_last_evaluation() {
             readiness_caller(),
             targets,
             PARTITION_READ_TIMEOUT,
-            ANY_MESSAGE
+            ANY_MESSAGE,
+            None
         ),
         async {
             // The park asks for pushes, and each commit then comes in a frame of its own.
@@ -2874,7 +2902,8 @@ async fn commits_push_nothing_to_a_watcher_without_a_parked_wait() {
                 readiness_caller(),
                 vec![target],
                 PARTITION_READ_TIMEOUT,
-                ANY_MESSAGE
+                ANY_MESSAGE,
+                None
             ),
             pump(&watcher, &inboxes[0])
         );
@@ -2899,7 +2928,8 @@ async fn parked_waits_get_the_pushes_until_a_push_finds_none_parked() {
                 readiness_caller(),
                 vec![target],
                 PARTITION_READ_TIMEOUT,
-                ANY_MESSAGE
+                ANY_MESSAGE,
+                None
             ),
             async {
                 pump(&watcher, &inboxes[0]).await;
@@ -3115,7 +3145,7 @@ async fn wait_fires_at_the_min_count_sum_of_targets_on_two_owners() {
         .map(|partition| readiness_target(&watcher, partition, PollingStrategy::offset(1)))
         .collect();
     let (ready, ()) = futures::join!(
-        watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 2),
+        watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 2, None),
         async {
             pump(&watcher, &inboxes[usize::from(WATCHER)]).await;
             for (partition, owner) in owners.iter().enumerate() {
@@ -3142,7 +3172,7 @@ async fn expired_wait_returns_the_targets_below_min_count_or_nothing() {
             .map(|partition| readiness_target(&watcher, partition, PollingStrategy::offset(1)))
             .collect();
         let (ready, ()) = futures::join!(
-            watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 3),
+            watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 3, None),
             async {
                 pump(&watcher, &inboxes[0]).await;
                 // The wait takes its admission answer before the clock moves.
@@ -3183,7 +3213,7 @@ async fn known_bytes_are_what_a_read_from_the_start_returns() {
         readiness_target(&watcher, 1, PollingStrategy::offset(0)),
     ];
     let (ready, ()) = futures::join!(
-        watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 4),
+        watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 4, None),
         async {
             pump(&watcher, &inboxes[0]).await;
             commit(&owner, &["second", "third"], 2).await;
@@ -3240,7 +3270,7 @@ async fn one_commit_gives_one_push_one_fire_and_no_cancel() {
         .map(|partition| readiness_target(&watcher, partition, PollingStrategy::offset(1)))
         .collect();
     let (ready, ()) = futures::join!(
-        watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 1),
+        watcher.wait_for_messages(readiness_caller(), targets, PARTITION_READ_TIMEOUT, 1, None),
         async {
             pump(&watcher, &inboxes[0]).await;
             commit(&owner, &["second"], 2).await;

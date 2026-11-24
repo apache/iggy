@@ -23,7 +23,10 @@ use crate::stm::result::{
     DeletePersonalAccessTokenResult, DeleteUserResult, DeletedResource, RevokedToken,
     UpdatePermissionsResult, UpdateUserResult,
 };
-use crate::stm::snapshot::{MetadataSnapshot, SnapshotError, Snapshotable};
+use crate::stm::snapshot::{
+    ArraySteps, FillSnapshot, MetadataCapture, MetadataSnapshot, SnapshotError, Snapshotable,
+    encode_array_len, encode_value,
+};
 use crate::stm::stream::{PatchError, patched_options, public_reply_options};
 use crate::stm::walk::{Directed, range_after};
 use crate::stm::{ApplyContext, StateHandler};
@@ -1530,6 +1533,47 @@ impl UsersSnapshot {
     }
 }
 
+/// The length of the msgpack array a [`UsersSnapshot`] encodes as.
+const USERS_SNAPSHOT_FIELDS: usize = 3;
+
+/// Writes what the derived `Serialize` of [`UsersSnapshot`] writes, one step
+/// at a time: one user or the tokens of one user per step. The permissioner
+/// is one step, because `to_snapshot` leaves its lists empty.
+#[derive(Debug)]
+pub(crate) struct UsersEncoder {
+    head_written: bool,
+    items: ArraySteps<(usize, UserSnapshot)>,
+    personal_access_tokens: ArraySteps<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)>,
+    permissioner: PermissionerSnapshot,
+}
+
+impl From<UsersSnapshot> for UsersEncoder {
+    fn from(snapshot: UsersSnapshot) -> Self {
+        Self {
+            head_written: false,
+            items: snapshot.items.into(),
+            personal_access_tokens: snapshot.personal_access_tokens.into(),
+            permissioner: snapshot.permissioner,
+        }
+    }
+}
+
+impl UsersEncoder {
+    /// Append the next step to `out` and return whether steps remain.
+    pub(crate) fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        if !self.head_written {
+            encode_array_len(out, USERS_SNAPSHOT_FIELDS)?;
+            self.head_written = true;
+        }
+        // The list of users that ended lets the tokens start in the same step.
+        if self.items.encode_next(out)? || self.personal_access_tokens.encode_next(out)? {
+            return Ok(true);
+        }
+        encode_value(out, &self.permissioner)?;
+        Ok(false)
+    }
+}
+
 impl Snapshotable for Users {
     type Snapshot = UsersSnapshot;
 
@@ -1721,6 +1765,13 @@ impl UsersInner {
 }
 
 impl_fill_restore!(Users, users, index_read_grants);
+
+impl FillSnapshot<MetadataCapture> for Users {
+    fn fill_snapshot(&self, capture: &mut MetadataCapture) -> Result<(), SnapshotError> {
+        capture.users = Some(self.to_snapshot());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -600,14 +600,14 @@ fn create_stream(
     stream.id = id;
     stream.created_op = state.apply_context.metadata_op;
     stream.shadow = Some(source.clone());
-    let inserted = state.items.insert(stream);
+    let inserted = state.items.insert(Arc::new(stream));
     debug_assert_eq!(inserted, id, "vacant_key must match the insert slot");
     state.index.insert(name, id);
     state.created_index.insert((timestamp.as_micros(), id));
     let changes = state
         .items
         .get(id)
-        .and_then(stream_body)
+        .and_then(|stream| stream_body(stream))
         .map(|body| {
             AppliedChange::new(
                 &WireMetadataChange::StreamCreated(body),
@@ -640,7 +640,9 @@ fn rename_stream(
         Some(_) => return ApplyReply::err(ShadowTopicResult::StreamNameAlreadyExists),
         None => {}
     }
-    let stream = &mut state.items[stream_id];
+    let Some(stream) = state.items.make_mut(stream_id) else {
+        return ApplyReply::err(ShadowTopicResult::StreamNotFound);
+    };
     state.index.remove(&stream.name);
     stream.name = name.clone();
     state.index.insert(name, stream_id);
@@ -733,11 +735,18 @@ fn detach_topic(
     let Some((stream_id, topic_id)) = shadow_topic_ids(state, target) else {
         return ApplyReply::err(ShadowTopicResult::TopicNotFound);
     };
-    if let Some(shadow) = state.items[stream_id]
+    // Read first: `make_mut` copies a stream that a checkpoint capture shares.
+    let attached = state.items[stream_id]
         .topics
-        .get_mut(topic_id)
-        .and_then(|topic| topic.shadow.as_mut())
-        && shadow.deleted_at.is_none()
+        .get(topic_id)
+        .and_then(|topic| topic.shadow.as_ref())
+        .is_some_and(|shadow| shadow.deleted_at.is_none());
+    if attached
+        && let Some(shadow) = state
+            .items
+            .make_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+            .and_then(|topic| topic.shadow.as_mut())
     {
         shadow.deleted_at = Some(deleted_at);
     }
@@ -794,7 +803,7 @@ fn restore_stream(
     let mut stream = Stream::with_stats(name.clone(), timestamp, state.stats_registry.stream(id));
     stream.id = id;
     stream.created_op = state.apply_context.metadata_op;
-    if !state.items.insert_at(id, stream) {
+    if !state.items.insert_at(id, Arc::new(stream)) {
         return ApplyReply::err(ShadowTopicResult::InvalidStreamId);
     }
     state.index.insert(name, id);
@@ -802,7 +811,7 @@ fn restore_stream(
     let changes = state
         .items
         .get(id)
-        .and_then(stream_body)
+        .and_then(|stream| stream_body(stream))
         .map(|body| {
             AppliedChange::new(
                 &WireMetadataChange::StreamCreated(body),

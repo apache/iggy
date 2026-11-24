@@ -6531,6 +6531,344 @@ mod tests {
         );
     }
 
+    /// A backup of a three-replica metadata group and the repair stream of the
+    /// root user that its primary served. The backup did not take the stream.
+    struct ServedMetadataRepair {
+        backup: IoTestShard,
+        /// The `RepairPrepare` of the root user, then the `RepairDone` that
+        /// ends the stream.
+        stream: [Message<GenericHeader>; 2],
+        root_header: PrepareHeader,
+        _peers: Vec<IoTestShard>,
+        _inboxes: Vec<TaggedSender>,
+        _directory: tempfile::TempDir,
+    }
+
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
+    async fn served_metadata_repair() -> ServedMetadataRepair {
+        const REPLICAS: u8 = 3;
+        const PRIMARY: usize = 0;
+        const BACKUP: usize = 2;
+        const ROOT_OP: u64 = 1;
+        const STEP_LIMIT: usize = 10_000;
+        let root_slot = usize::try_from(ROOT_OP).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let frames: Vec<MetadataFrames> = (0..REPLICAS)
+            .map(|_| Rc::new(RefCell::new(Vec::new())))
+            .collect();
+        let mut owners = Vec::new();
+        for replica in 0..REPLICAS {
+            let bus = Rc::new(IggyMessageBus::new(0));
+            let captured = Rc::clone(&frames[usize::from(replica)]);
+            bus.set_replica_forward_fn(Box::new(move |target, _, frame| {
+                let message =
+                    Message::<GenericHeader>::try_from(Owned::copy_from_slice(frame.as_slice()))
+                        .unwrap();
+                captured.borrow_mut().push((target, message));
+                Ok(())
+            }));
+            for peer in (0..REPLICAS).filter(|peer| *peer != replica) {
+                crate::test_support::connect_replica_on(&bus, peer, 1);
+            }
+            let (mut owner, inbox_owner) = test_owner(&bus, None);
+            let consensus = VsrConsensus::new(
+                1,
+                replica,
+                REPLICAS,
+                METADATA_GROUP,
+                Rc::clone(&bus),
+                LocalPipeline::new(),
+            );
+            consensus.set_incarnation(u128::from(replica) + 1);
+            consensus.init();
+            consensus.mark_superblock_durable(0, 0);
+            let journal =
+                PrepareJournal::open(&directory.path().join(format!("metadata-{replica}.wal")), 0)
+                    .await
+                    .unwrap();
+            owner.plane.inner_mut().0 = IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                IoTestMetadata::new((
+                    UsersInner::new().into(),
+                    (StreamsInner::default().into(), ()),
+                )),
+                None,
+            );
+            owners.push((owner, inbox_owner));
+        }
+        let (mut owners, inboxes): (Vec<_>, Vec<_>) = owners.into_iter().unzip();
+        let metadata = |replica: usize| &owners[replica].plane.inner().0;
+        let consensus = |replica| metadata(replica).consensus.as_ref().unwrap();
+        let journal = |replica| metadata(replica).journal.as_ref().unwrap();
+        let take = |source: usize, target: usize, command: Command| {
+            let mut pending = frames[source].borrow_mut();
+            let index = pending
+                .iter()
+                .position(|(replica, message)| {
+                    usize::from(*replica) == target && message.header().command == command
+                })
+                .unwrap_or_else(|| panic!("missing {command:?} from {source} to {target}"));
+            pending.remove(index).1
+        };
+
+        // The primary journals the root user, and no backup hears the prepare.
+        let root_request = CreateUserRequest {
+            username: WireName::new("root").unwrap(),
+            password: "hash".to_owned(),
+            status: iggy_common::UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let mut root = Box::pin(metadata(PRIMARY).submit_root_user_in_process(&root_request));
+        for _ in 0..STEP_LIMIT {
+            assert!(futures::poll!(&mut root).is_pending());
+            if journal(PRIMARY).header(root_slot).is_some() {
+                break;
+            }
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        let root_header = *journal(PRIMARY).header(root_slot).unwrap();
+        frames[PRIMARY].borrow_mut().clear();
+
+        // The backup probes, adopts the primary's view and fetches the op.
+        consensus(BACKUP).init_as_backup();
+        consensus(BACKUP).begin_view_probe();
+        for _ in 0..STEP_LIMIT {
+            owners[BACKUP].tick_metadata().await;
+            if frames[BACKUP]
+                .borrow()
+                .iter()
+                .any(|(_, frame)| frame.header().command == Command::RequestStartView)
+            {
+                break;
+            }
+        }
+        let probe = take(BACKUP, PRIMARY, Command::RequestStartView);
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(probe).unwrap())
+            .await;
+        let announced = take(PRIMARY, BACKUP, Command::StartView);
+        owners[BACKUP]
+            .on_message(MessageBag::try_from(announced).unwrap())
+            .await;
+        let request = take(BACKUP, PRIMARY, Command::RequestPrepares);
+        owners[PRIMARY]
+            .on_message(MessageBag::try_from(request).unwrap())
+            .await;
+        let stream = [
+            take(PRIMARY, BACKUP, Command::RepairPrepare),
+            take(PRIMARY, BACKUP, Command::RepairDone),
+        ];
+        drop(root);
+        let backup = owners.swap_remove(BACKUP);
+        ServedMetadataRepair {
+            backup,
+            stream,
+            root_header,
+            _peers: owners,
+            _inboxes: inboxes,
+            _directory: directory,
+        }
+    }
+
+    /// A repaired metadata prepare appends only under `journal_gate`, so a WAL
+    /// rewrite that holds the gate, as a view reconcile does, cannot lose it
+    /// from the rewritten file.
+    #[compio::test]
+    async fn given_held_journal_writes_when_a_metadata_repair_arrives_should_append_after_release()
+    {
+        /// Runtime turns the held repair gets, each long enough for a WAL append.
+        const HELD_TURNS: usize = 20;
+        let ServedMetadataRepair {
+            backup,
+            stream: [repaired, _],
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let journal = metadata.journal.as_ref().unwrap();
+        let root_slot = usize::try_from(root_header.op).unwrap();
+
+        let writes = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        let mut ingest = Box::pin(backup.on_message(MessageBag::try_from(repaired).unwrap()));
+        for _ in 0..HELD_TURNS {
+            assert!(
+                futures::poll!(&mut ingest).is_pending(),
+                "the repair ended while journal writes were held"
+            );
+            compio::runtime::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            journal.header(root_slot).is_none(),
+            "the repaired prepare landed while journal writes were held"
+        );
+
+        drop(writes);
+        ingest.await;
+        assert_eq!(
+            journal.header(root_slot).map(|header| header.checksum),
+            Some(root_header.checksum),
+            "the repaired prepare must land once journal writes are released"
+        );
+    }
+
+    /// A WAL trim keeps the answer of the peer off the plane, also after its
+    /// end while kept frames remain. The tick counted the session as idle
+    /// meanwhile, asked for the range again and spent its attempts.
+    #[compio::test]
+    async fn given_repair_frames_kept_for_a_wal_trim_when_the_plane_ticks_should_not_count_the_session_as_stalled()
+     {
+        let ServedMetadataRepair { backup, stream, .. } = served_metadata_repair().await;
+        let idle_ticks = || {
+            backup
+                .metadata_repair
+                .borrow()
+                .as_ref()
+                .map(|session| session.idle_ticks)
+        };
+        backup.tick_metadata().await;
+        let counted = idle_ticks().expect("the backup waits for the repair stream");
+        assert!(counted > 0, "a tick without an answer counts as idle");
+
+        let trim = backup.plane.inner().0.announce_checkpoint_trim();
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .now_or_never()
+                .expect("a repair frame must not wait for the WAL trim on the pump");
+        }
+        backup.tick_metadata().await;
+        assert_eq!(idle_ticks(), Some(counted), "the trim is pending");
+
+        drop(trim);
+        backup.tick_metadata().await;
+        assert_eq!(
+            idle_ticks(),
+            Some(counted),
+            "the kept frames have not reached the plane yet"
+        );
+    }
+
+    /// The WAL trim of a checkpoint job holds `journal_gate` for a whole
+    /// rewrite. A repaired prepare that waited for it on the pump stopped the
+    /// ticks of every partition group of shard 0.
+    #[compio::test]
+    async fn given_a_pending_wal_trim_when_a_metadata_repair_arrives_should_keep_its_frames_in_order_until_the_trim_ends()
+     {
+        let ServedMetadataRepair {
+            backup,
+            stream,
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let journal = metadata.journal.as_ref().unwrap();
+        let root_slot = usize::try_from(root_header.op).unwrap();
+
+        // As a checkpoint job: it announces its trim, then takes the gate.
+        let trim = metadata.announce_checkpoint_trim();
+        let rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .now_or_never()
+                .expect("a repair frame must not wait for the WAL trim on the pump");
+        }
+        assert!(
+            backup.pop_gated_metadata_frame().is_none(),
+            "no repair frame reaches the plane while the trim is pending"
+        );
+        assert!(journal.header(root_slot).is_none());
+
+        drop(rewrite);
+        drop(trim);
+        let mut replayed = Vec::new();
+        while let Some(frame) = backup.pop_gated_metadata_frame() {
+            replayed.push(frame.command());
+            backup.deliver_message(frame, None).await;
+        }
+        assert_eq!(
+            replayed,
+            [Command::RepairPrepare, Command::RepairDone],
+            "the end of the stream stays behind the prepare that it walks"
+        );
+        assert_eq!(
+            journal.header(root_slot).map(|header| header.checksum),
+            Some(root_header.checksum),
+            "the repaired prepare lands once the trim ended"
+        );
+    }
+
+    /// A repaired prepare can pass the pump's test and then write the
+    /// superblock. A WAL trim that starts during that write would hold the
+    /// append on the pump for the whole rewrite.
+    #[compio::test]
+    async fn given_a_wal_trim_that_starts_under_a_repaired_prepare_when_it_reaches_the_append_should_drop_it()
+     {
+        let ServedMetadataRepair {
+            backup,
+            stream: [repaired, _],
+            root_header,
+            ..
+        } = served_metadata_repair().await;
+        let metadata = &backup.plane.inner().0;
+        let _trim = metadata.announce_checkpoint_trim();
+        let _rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+
+        // Past the pump's test, as a frame that was in flight when the trim started.
+        backup
+            .deliver_message(MessageBag::try_from(repaired).unwrap(), None)
+            .now_or_never()
+            .expect("a repaired prepare must not wait for the WAL trim on the pump");
+
+        assert!(
+            metadata
+                .journal
+                .as_ref()
+                .unwrap()
+                .header(usize::try_from(root_header.op).unwrap())
+                .is_none(),
+            "the repair fetches a dropped prepare again"
+        );
+    }
+
+    /// Each repaired prepare asks for a reconcile of the view log. With a
+    /// proven log it changes nothing, and its wait for `journal_gate` held
+    /// the pump for the WAL rewrite of a checkpoint job that took the gate
+    /// during the append.
+    #[compio::test]
+    async fn given_a_proven_view_log_when_reconciling_under_held_journal_writes_should_not_wait() {
+        let ServedMetadataRepair { backup, stream, .. } = served_metadata_repair().await;
+        for frame in stream {
+            backup
+                .on_message(MessageBag::try_from(frame).unwrap())
+                .await;
+        }
+        let metadata = &backup.plane.inner().0;
+        assert!(!metadata.consensus.as_ref().unwrap().view_log_unproven());
+
+        let _rewrite = metadata
+            .hold_journal_writes()
+            .now_or_never()
+            .expect("nothing else holds the backup's journal gate");
+        backup
+            .reconcile_metadata_view_divergence()
+            .now_or_never()
+            .expect("a reconcile with nothing to do must not wait for the journal gate");
+    }
+
     type MetadataFrames = Rc<RefCell<Vec<(u8, Message<GenericHeader>)>>>;
 
     #[allow(clippy::future_not_send)]
@@ -11130,7 +11468,7 @@ mod tests {
             ));
         }
         stream.topics.insert(topic);
-        inner.items.insert(stream);
+        inner.items.insert(Arc::new(stream));
         let metadata = IoTestMetadata::new((Users::default(), (inner.into(), ())));
         let metadata = IggyMetadata::new(None, None, None, None, metadata, None);
         let (sender, inbox, replies) = shard_channel(0, 2, 1);
@@ -11148,6 +11486,7 @@ mod tests {
             routes,
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus.clone()),
             None,
+            false,
             ShardMetrics::for_shard(),
         )
         .expect("valid shard wiring");

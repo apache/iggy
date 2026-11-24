@@ -459,12 +459,17 @@ pub struct ShardMetrics {
     partition_frames_rejected_stale_total: Counter,
     partition_frames_rejected_ahead_total: Counter,
     partition_frames_incarnation_mismatch_total: Family<FrameCommandLabel, Counter>,
+    partition_frames_dropped_unbuilt_total: Counter,
+    partition_held_reads_expired_total: Counter,
+    partition_held_reads_refused_total: Counter,
+    partition_held_reads: Gauge,
     partition_requests_denied_transient_total: Counter,
     partition_prepare_gap_drops_total: Counter,
     metadata_prepare_gap_drops_total: Counter,
     partition_applied_log_contradictions_total: Counter,
     metadata_applied_log_contradictions_total: Counter,
     metadata_read_frontier_refusals_total: Counter,
+    partition_request_frontier_refusals_total: Counter,
     client_requests_denied_queue_full_total: Counter,
     replica_socket_reads_total: Counter,
     replica_inbound_frames_total: Counter,
@@ -719,12 +724,17 @@ impl ShardMetrics {
             partition_frames_rejected_stale_total: Counter::default(),
             partition_frames_rejected_ahead_total: Counter::default(),
             partition_frames_incarnation_mismatch_total: Family::default(),
+            partition_frames_dropped_unbuilt_total: Counter::default(),
+            partition_held_reads_expired_total: Counter::default(),
+            partition_held_reads_refused_total: Counter::default(),
+            partition_held_reads: Gauge::default(),
             partition_requests_denied_transient_total: Counter::default(),
             partition_prepare_gap_drops_total: Counter::default(),
             metadata_prepare_gap_drops_total: Counter::default(),
             partition_applied_log_contradictions_total: Counter::default(),
             metadata_applied_log_contradictions_total: Counter::default(),
             metadata_read_frontier_refusals_total: Counter::default(),
+            partition_request_frontier_refusals_total: Counter::default(),
             client_requests_denied_queue_full_total: Counter::default(),
             replica_socket_reads_total: Counter::default(),
             replica_inbound_frames_total: Counter::default(),
@@ -1670,6 +1680,21 @@ impl ShardMetrics {
         self.metadata_read_frontier_refusals_total.get()
     }
 
+    /// Bumped every time a partition request is refused because this node's
+    /// applied frontier did not reach what the caller was told committed: at
+    /// the end of its wait for the frontier, or without a wait after an
+    /// earlier request of its connection waited in vain at the same frontier.
+    pub fn record_partition_request_frontier_refusal(&self) {
+        self.partition_request_frontier_refusals_total.inc();
+    }
+
+    /// Current value of [`Self::record_partition_request_frontier_refusal`],
+    /// for tests that assert a refusal was counted rather than scraping it.
+    #[must_use]
+    pub fn partition_request_frontier_refusals_value(&self) -> u64 {
+        self.partition_request_frontier_refusals_total.get()
+    }
+
     /// Increment `frame_drops_total{variant, reason}` by 1.
     ///
     /// Callers should pass label constants from [`frame_drop_variant`]
@@ -2160,6 +2185,70 @@ impl ShardMetrics {
             .map_or(0, |counter| counter.get())
     }
 
+    /// Bumped when a partition control frame is dropped because its partition
+    /// is not built on this shard yet: the create is committed and the
+    /// reconciler has not built it, or local metadata has not applied the
+    /// create. Ordinary after a create, where the incarnation mismatch and
+    /// the unknown namespace are not.
+    pub fn record_partition_frame_dropped_unbuilt(&self) {
+        self.partition_frames_dropped_unbuilt_total.inc();
+    }
+
+    /// Snapshot of `partition_frames_dropped_unbuilt_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_frames_dropped_unbuilt_value(&self) -> u64 {
+        self.partition_frames_dropped_unbuilt_total.get()
+    }
+
+    /// Bumped when a held partition read reaches the end of its hold before
+    /// its partition can serve: not built, a primary that still starts or,
+    /// for a lookup of the primary, an older incarnation. A lookup gets what
+    /// the partition here says, or `NotFound`. A batch of offset reads is
+    /// answered entry by entry, each as a read of its own. Every other read
+    /// is refused as `TransientNotAccepted`.
+    pub fn record_partition_held_read_expired(&self) {
+        self.partition_held_reads_expired_total.inc();
+    }
+
+    /// Snapshot of `partition_held_reads_expired_total`. Test/simulator
+    /// accessor.
+    #[cfg(any(test, feature = "simulator"))]
+    #[must_use]
+    pub fn partition_held_reads_expired_value(&self) -> u64 {
+        self.partition_held_reads_expired_total.get()
+    }
+
+    /// Bumped when a partition read that would be held is answered at once,
+    /// because the shard or the namespace of the read holds as many reads as
+    /// its cap allows. A lookup of a partition that is not built then gets
+    /// `NotFound`, the answer that the hold exists to avoid.
+    pub fn record_partition_held_read_refused(&self) {
+        self.partition_held_reads_refused_total.inc();
+    }
+
+    /// Snapshot of `partition_held_reads_refused_total`. Test-only accessor.
+    #[cfg(test)]
+    #[must_use]
+    pub fn partition_held_reads_refused_value(&self) -> u64 {
+        self.partition_held_reads_refused_total.get()
+    }
+
+    /// Republished by every pump tick: the reads held on this shard as the
+    /// shard cap counts them, each read of an offset batch on its own.
+    pub fn set_partition_held_reads(&self, held: usize) {
+        self.partition_held_reads
+            .set(i64::try_from(held).unwrap_or(i64::MAX));
+    }
+
+    /// Test-only read of [`Self::set_partition_held_reads`].
+    #[cfg(test)]
+    #[must_use]
+    pub fn partition_held_reads_value(&self) -> i64 {
+        self.partition_held_reads.get()
+    }
+
     /// Total frame drops across every `{variant, reason}` pair.
     ///
     /// Simulator assertion hook: a run without injected loss must keep
@@ -2641,6 +2730,27 @@ impl ShardMetrics {
             self.partition_frames_incarnation_mismatch_total.clone(),
         );
         registry.register(
+            "partition_frames_dropped_unbuilt",
+            "partition control frames dropped because their partition is not built here yet",
+            self.partition_frames_dropped_unbuilt_total.clone(),
+        );
+        registry.register(
+            "partition_held_reads_expired",
+            "held partition reads that reached the end of their hold before their partition \
+             could serve",
+            self.partition_held_reads_expired_total.clone(),
+        );
+        registry.register(
+            "partition_held_reads_refused",
+            "partition reads answered without a hold because a held-read cap was spent",
+            self.partition_held_reads_refused_total.clone(),
+        );
+        registry.register(
+            "partition_held_reads",
+            "partition reads held on this shard, each read of an offset batch counted",
+            self.partition_held_reads.clone(),
+        );
+        registry.register(
             "partition_requests_denied_transient",
             "partition requests answered with a retriable transient denial",
             self.partition_requests_denied_transient_total.clone(),
@@ -2719,6 +2829,12 @@ impl ShardMetrics {
             "metadata_read_frontier_refusals",
             "metadata reads refused because this node never applied the caller's committed op",
             self.metadata_read_frontier_refusals_total.clone(),
+        );
+        registry.register(
+            "partition_request_frontier_refusals",
+            "partition requests refused because this node did not apply the caller's committed \
+             metadata op in time",
+            self.partition_request_frontier_refusals_total.clone(),
         );
         registry.register(
             "client_requests_denied_queue_full",
