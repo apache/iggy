@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 import { setTimeout as sleep } from 'node:timers/promises';
 import type { PartitionReader } from '../stream/partition-reader.js';
 import { ConsumerKind } from '../wire/offset/offset.utils.js';
-import { CommitPolicy, Consumer, Partitioning, PollingStrategy } from '../wire/index.js';
+import { CommitAfter, CommitPolicy, Consumer, Partitioning, PollingStrategy } from '../wire/index.js';
 import { generateMessages } from '../tcp.sm.utils.js';
 import { getTestClient } from './test-client.utils.js';
 
@@ -87,6 +87,35 @@ describe('e2e -> partition-reader', async () => {
 
   const range = (first: bigint, last: bigint): bigint[] =>
     Array.from({ length: Number(last - first) + 1 }, (_, index) => first + BigInt(index));
+
+  for (const commit of [CommitPolicy.Manual, CommitPolicy.OnRead,
+    CommitPolicy.Auto({ interval: 3_600_000, after: CommitAfter.Processing })]) {
+    it(`e2e -> consumer::${commit.kind}: new iterations keep unread messages and restart after delivery`, async () => {
+      const name = `${commit.kind}-resume-iteration`;
+      const consumer = await client.consumer({
+        name, streamId, topicId, partitions: [PARTITION], start: PollingStrategy.First,
+        options: { count: 2, maxWait: 100, commit }
+      });
+      const received: bigint[] = [];
+      try {
+        for (let iteration = 0; iteration < 3; iteration++) {
+          for await (const { message } of consumer) {
+            received.push(message.headers.offset);
+            break;
+          }
+        }
+        assert.deepEqual(received, [0n, 1n, 2n]);
+      } finally {
+        await consumer.shutdown();
+      }
+      const restarted = await open(name, CommitPolicy.Manual, PollingStrategy.Next);
+      try {
+        assert.deepEqual(await nextOffsets(restarted, 1), [commit.kind === 'manual' ? 0n : 3n]);
+      } finally {
+        await restarted.close();
+      }
+    });
+  }
 
   for (const [policy, commit] of POLICIES) {
     it(`e2e -> partition-reader::${policy}: a timestamp start delivers the first message at the timestamp first`,
