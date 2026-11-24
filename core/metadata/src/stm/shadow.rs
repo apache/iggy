@@ -1550,7 +1550,7 @@ mod tests {
             .push(RETIRED_CLUSTER);
         let removed = inner.items.iter().map(|(id, _)| id).collect::<Vec<_>>();
         for id in removed {
-            inner.items[id].shadow = None;
+            inner.items.make_mut(id).unwrap().shadow = None;
         }
 
         assert_eq!(
