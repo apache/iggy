@@ -203,7 +203,7 @@ public enum MetadataTokenDeletedReason: UInt8, Sendable, Hashable, CaseIterable,
 public enum MetadataSessionClosedReason: UInt8, Sendable, Hashable, CaseIterable, CustomStringConvertible {
     case logout = 0
     case expired = 1
-    /// The user was deactivated or deleted.
+    /// A user delete, deactivation, password change, or delete of the session's token.
     case revoked = 2
 
     public var description: String {

@@ -73,6 +73,7 @@ where
     shards_table: T,
     partition_consensus: PartitionConsensusConfig<B>,
     coord_config: CoordinatorConfig,
+    skip_shard_zero_for_partitions: bool,
     metrics: ShardMetrics,
 }
 
@@ -101,6 +102,7 @@ where
         shards_table: T,
         partition_consensus: PartitionConsensusConfig<B>,
         coord_config: CoordinatorConfig,
+        skip_shard_zero_for_partitions: bool,
         metrics: ShardMetrics,
     ) -> Self {
         Self {
@@ -117,6 +119,7 @@ where
             shards_table,
             partition_consensus,
             coord_config,
+            skip_shard_zero_for_partitions,
             metrics,
         }
     }
@@ -232,6 +235,7 @@ where
             self.shards_table,
             self.partition_consensus,
             coordinator,
+            self.skip_shard_zero_for_partitions,
             self.metrics,
         )?;
 

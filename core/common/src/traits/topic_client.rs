@@ -39,22 +39,24 @@ pub trait TopicClient {
     /// The list is read page by page, so it is not one consistent read. A topic
     /// that someone creates or deletes during the read can appear or not
     /// appear. If the stream goes missing after the first page, the read
-    /// fails as [`Self::get_topics_page`] does.
+    /// fails as [`Self::get_topics_page`] does for a caller with a global
+    /// read grant, and ends there for any other caller.
     /// A server that answers a page with the cursor it was sent fails the read
     /// with `IggyError::InvalidFormat`.
     ///
-    /// Authentication is required, and the permission to read the topics.
+    /// Authentication is required. The list holds the topics the caller may read.
     async fn get_topics(&self, stream_id: &Identifier) -> Result<Vec<Topic>, IggyError>;
     /// One page of the topics of a stream. Read the next page with
     /// [`NamedPageQuery::next`] until the page has no `next`.
     ///
-    /// For a missing stream, the first page is empty and has no `next`. A
-    /// page read with a cursor fails instead, because the stream was deleted
+    /// For a missing stream, or one the caller may read no topic of, the first
+    /// page is empty and has no `next`. For a caller with a global read grant,
+    /// a page read with a cursor fails instead, because the stream was deleted
     /// during the walk: a binary transport returns
     /// `IggyError::StreamIdNotFound`, and `HttpClient` returns
     /// `IggyError::ResourceNotFound`.
     ///
-    /// Authentication is required, and the permission to read the topics.
+    /// Authentication is required. The page holds the topics the caller may read.
     async fn get_topics_page(
         &self,
         stream_id: &Identifier,

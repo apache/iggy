@@ -1002,7 +1002,7 @@ mod tests {
         for topic in [1, 2] {
             inner
                 .items
-                .get_mut(0)
+                .make_mut(0)
                 .unwrap()
                 .topics
                 .get_mut(topic)
@@ -1069,7 +1069,7 @@ mod tests {
         let mut inner = deleting.read(Clone::clone);
         inner
             .items
-            .get_mut(0)
+            .make_mut(0)
             .unwrap()
             .topics
             .get_mut(HIDDEN_TOPIC)

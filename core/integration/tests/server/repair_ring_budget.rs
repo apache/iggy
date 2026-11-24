@@ -16,8 +16,9 @@
 // under the License.
 
 //! The repair ring budget of a running server. Boot splits
-//! `partition.journal_memory_node_bytes_max` across the shards, and the tick of
-//! every shard sheds against its share and reports it.
+//! `partition.journal_memory_node_bytes_max` across the shards that own
+//! partitions, and the tick of each of them sheds against that share and
+//! reports it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -32,21 +33,46 @@ const NODE_BUDGET: &str = "1 GiB";
 const NODE_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 /// One sample per shard. A shard without a ring budget never sets its own.
 const SHARE_GAUGE: &str = "partition_repair_ring_budget_bytes{";
+/// Two shards own partitions when shard 0 is skipped. One shard would refuse
+/// to start with the skip on.
+const SKIPPING_SHARDS: &str = "3";
 const REPORT_DEADLINE: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[tokio::test]
 #[serial_test::parallel]
 async fn given_a_node_ring_budget_when_the_shards_tick_should_report_an_equal_share_each() {
+    assert_every_owner_reports_an_equal_share(false).await;
+}
+
+#[tokio::test]
+#[serial_test::parallel]
+async fn given_partitions_off_shard_zero_when_the_shards_tick_should_split_the_budget_between_the_others()
+ {
+    assert_every_owner_reports_an_equal_share(true).await;
+}
+
+/// A shard that owns no partition takes no share, so its sample stays 0 and
+/// the samples add up to the node budget.
+async fn assert_every_owner_reports_an_equal_share(skip_shard_zero: bool) {
+    let mut envs = HashMap::from([(
+        "IGGY_PARTITION_JOURNAL_MEMORY_NODE_BYTES_MAX".to_string(),
+        NODE_BUDGET.to_string(),
+    )]);
+    if skip_shard_zero {
+        envs.extend([
+            (
+                "IGGY_CLUSTER_COORDINATOR_SKIP_SHARD_ZERO_FOR_PARTITIONS".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "IGGY_SHARDING_CPU_ALLOCATION".to_string(),
+                SKIPPING_SHARDS.to_string(),
+            ),
+        ]);
+    }
     let mut harness = TestHarness::builder()
-        .server(
-            TestServerConfig::builder()
-                .extra_envs(HashMap::from([(
-                    "IGGY_PARTITION_JOURNAL_MEMORY_NODE_BYTES_MAX".to_string(),
-                    NODE_BUDGET.to_string(),
-                )]))
-                .build(),
-        )
+        .server(TestServerConfig::builder().extra_envs(envs).build())
         .cluster_nodes(1)
         .build()
         .expect("build harness");
@@ -56,14 +82,22 @@ async fn given_a_node_ring_budget_when_the_shards_tick_should_report_an_equal_sh
     let deadline = Instant::now() + REPORT_DEADLINE;
     loop {
         let shares = reported_shares(&http).await;
-        let equal_share = NODE_BUDGET_BYTES.checked_div(shares.len() as u64);
-        if shares.iter().all(|&share| Some(share) == equal_share) && !shares.is_empty() {
+        // The exposition lists the shards in order, so shard 0 comes first.
+        let first_owner = usize::from(skip_shard_zero).min(shares.len());
+        let (without_partitions, owners) = shares.split_at(first_owner);
+        let owning_shards = owners.len() as u64;
+        let equal_share = NODE_BUDGET_BYTES.checked_div(owning_shards);
+        if owners.iter().all(|&share| Some(share) == equal_share)
+            && without_partitions.iter().all(|&share| share == 0)
+            && !owners.is_empty()
+        {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "within {REPORT_DEADLINE:?} every shard must report an equal share of \
-             {NODE_BUDGET_BYTES} bytes, last shares: {shares:?}"
+            "within {REPORT_DEADLINE:?} each of {owning_shards} partition shards must \
+             report its share of {NODE_BUDGET_BYTES} bytes and no other shard a share, \
+             last shares: {shares:?}"
         );
         sleep(POLL_INTERVAL).await;
     }
