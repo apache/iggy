@@ -10191,6 +10191,7 @@ dependencies = [
  "clock",
  "configs",
  "consensus",
+ "crc32c",
  "enumset",
  "futures",
  "iggy_binary_protocol",

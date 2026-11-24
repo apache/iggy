@@ -29,10 +29,12 @@ clap = { workspace = true }
 clock = { workspace = true }
 configs = { workspace = true }
 consensus = { workspace = true }
+crc32c = { workspace = true }
 enumset = { workspace = true }
 futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+iggy_object_store = { workspace = true }
 indexmap = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
@@ -52,7 +54,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
-iggy_object_store = { workspace = true }
 # Test-only feature on a crate this package already depends on: the fault
 # hooks the partition-driver tests arm must not compile into anything that
 # ships. See `partitions/Cargo.toml`.
