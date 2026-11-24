@@ -2300,6 +2300,7 @@ fn materialise_partition(
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
     let mut retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    let peer_log = peer_log_of(replica, namespace, retained.as_mut());
     let unsynced_lost = replica
         .unsynced_partition_logs
         .borrow_mut()
@@ -2337,14 +2338,7 @@ fn materialise_partition(
                 .with_members(members)
                 .with_created_op(created_op),
         );
-        // Before the pump hands the partition its first frame: its log holds
-        // one kind of batch for good.
-        if replica.placing_namespaces.borrow().contains(&namespace)
-            && let Some(partition) = owner_shard.plane.partitions().get_mut_by_ns(&namespace)
-        {
-            partition.set_places_batches(true);
-        }
-        follow_peer_log(owner_shard, metadata_consensus.replica(), namespace, epoch);
+        finish_build(replica, owner_shard, namespace, epoch, peer_log);
     }
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -2355,34 +2349,64 @@ fn materialise_partition(
     true
 }
 
-/// Have the partition of `namespace` follow its peer's log when it belongs
-/// to a shadow topic, as the production reconciler has it follow once it
-/// built it.
-fn follow_peer_log(shard: &Replica, replica_id: u8, namespace: IggyNamespace, epoch: u64) {
+/// Where the partition of `namespace` reads its peer's log, when it belongs
+/// to a shadow topic. Its `retained` state then keeps no segment, as boot
+/// finds none: the committed manifest of its state machines puts them back
+/// once it follows its peer's log again. Its journal stays, as its WAL does.
+fn peer_log_of(
+    replica: &SimReplica,
+    namespace: IggyNamespace,
+    retained: Option<&mut RetainedPartitionState>,
+) -> Option<(String, iggy_object_store::ObjectPrefix)> {
+    let shard = &replica.shards[0];
     let peer_log = shard.plane.metadata().mux_stm.streams().read(|inner| {
         let stream = inner.items.get(namespace.stream_id())?;
         let topic = stream.topics.get(namespace.topic_id())?;
         server::peer_log_of(stream, topic, namespace)
-    });
-    let Some((origin, prefix)) = peer_log else {
-        return;
-    };
+    })?;
+    if let Some(retained) = retained {
+        while retained.log.retire_back().is_some() {}
+        retained.log.add_persisted_segment(
+            partitions::Segment::new(0, shard.plane.partitions().config().segment_size),
+            server_common::SegmentStorage::default(),
+            None,
+            None,
+        );
+    }
+    Some(peer_log)
+}
+
+/// What a partition of `namespace` takes before the pump hands it its first
+/// frame: whether it places its batches, which its log holds one kind of
+/// for good, and the log of its peer when it belongs to a shadow topic, which
+/// the production reconciler has it follow once it built it.
+fn finish_build(
+    replica: &SimReplica,
+    shard: &Replica,
+    namespace: IggyNamespace,
+    epoch: u64,
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
+) {
     let Some(partition) = shard.plane.partitions().get_mut_by_ns(&namespace) else {
         return;
     };
-    if partition.peer_log().is_some() {
-        return;
+    if replica.placing_namespaces.borrow().contains(&namespace) {
+        partition.set_places_batches(true);
     }
+    let Some((origin, prefix)) = peer_log else {
+        return;
+    };
     // A server names the indexes that the partition's polls fetch after its
     // directory. Here they go to the node's memory, under a directory of this
     // incarnation that no other partition shares.
     partition.set_partition_dir(format!(
-        "simulated/replica-{replica_id}/{}-{epoch}",
+        "simulated/replica-{}/{}-{epoch}",
+        partition.consensus().replica(),
         namespace.inner()
     ));
     partition
         .follow_peer_log(origin, prefix)
-        .expect("a new shadow partition follows its peer's log");
+        .expect("a shadow partition built from its committed state follows its peer's log");
 }
 
 /// Every committed partition of a geo topic, this cluster's own or a peer's

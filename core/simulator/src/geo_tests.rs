@@ -62,6 +62,9 @@ const SETTLE_STEPS: usize = 3_000;
 /// manifest, the peer's listing of topic objects and of manifests.
 const FOLLOW_STEPS: usize = 12_000;
 
+/// How long a peer keeps the shadow of a topic that its origin deleted.
+const TOMBSTONE_GRACE: Duration = Duration::from_secs(30);
+
 /// `clusters` clusters of three replicas, each with one client logged in.
 fn geo_world(seed: u64, clusters: u8, faults: BucketFaults) -> (GeoWorld, SimClient) {
     let mut world = GeoWorld::new(&GeoWorldOptions {
@@ -70,6 +73,7 @@ fn geo_world(seed: u64, clusters: u8, faults: BucketFaults) -> (GeoWorld, SimCli
         replicas: REPLICAS,
         clients: vec![CLIENT_ID],
         faults,
+        tombstone_grace: TOMBSTONE_GRACE,
     });
     let client = SimClient::new(CLIENT_ID);
     for cluster in 0..world.cluster_count() {
@@ -114,7 +118,11 @@ fn complete(
     }
     let reply = answered.expect("the metadata operation is answered");
     let code = metadata::stm::result::result_code(reply.body());
-    assert_eq!(code, Some(0), "the metadata operation succeeds");
+    // A delete answers before the fences of its partitions install.
+    assert!(
+        code == Some(0) || code == Some(IggyError::TransientNotCommitted.as_code()),
+        "the metadata operation succeeds: {code:?}"
+    );
     let op = reply.header().op;
     let applied = (0..SETTLE_STEPS).any(|_| {
         world.step();
@@ -438,6 +446,52 @@ fn given_one_seed_when_a_faulty_run_goes_twice_should_replay_the_schedule_and_th
     assert_eq!(run(), run());
 }
 
+/// The shadow of the geo topic on the peer, once the peer created it.
+fn shadow_of(world: &GeoWorld) -> Option<IggyNamespace> {
+    let shadow_stream =
+        shadow_stream_name(ORIGINS[ORIGIN], STREAM).expect("the shadow stream's name fits");
+    namespace_of(world, PEER, &shadow_stream, TOPIC)
+}
+
+/// Step until the peer's shadow serves every one of `payloads` once, in
+/// order, and return the shadow. `None` when it does not within `steps`.
+fn await_shadow_serving(
+    world: &mut GeoWorld,
+    payloads: &[Vec<u8>],
+    steps: usize,
+) -> Option<IggyNamespace> {
+    const CHECK_EVERY: usize = 100;
+    for _ in 0..steps / CHECK_EVERY {
+        for _ in 0..CHECK_EVERY {
+            world.step();
+        }
+        let Some(shadow) = shadow_of(world) else {
+            continue;
+        };
+        let Some(replica) = primary(world, PEER, shadow) else {
+            continue;
+        };
+        if polled(world, PEER, replica, shadow)
+            .is_ok_and(|bytes| holds_once_in_order(&bytes, payloads))
+        {
+            return Some(shadow);
+        }
+    }
+    None
+}
+
+/// The offset that each live replica of the peer committed for `shadow`.
+fn shadow_commits(world: &GeoWorld, shadow: IggyNamespace) -> Vec<(u8, u64)> {
+    let sim = world.sim(PEER);
+    (0..REPLICAS)
+        .filter(|replica| !sim.is_crashed(*replica))
+        .filter_map(|replica| {
+            sim.offsets(usize::from(replica), shadow)
+                .map(|offsets| (replica, offsets.commit_offset))
+        })
+        .collect()
+}
+
 #[test]
 fn given_two_clusters_when_the_origin_publishes_should_serve_its_log_on_the_peer() {
     const SENDS: usize = 8;
@@ -448,30 +502,215 @@ fn given_two_clusters_when_the_origin_publishes_should_serve_its_log_on_the_peer
         send(&mut world, ORIGIN, &client, namespace, payload);
     }
 
-    let shadow_stream =
-        shadow_stream_name(ORIGINS[ORIGIN], STREAM).expect("the shadow stream's name fits");
-    let mut served = None;
-    for _ in 0..FOLLOW_STEPS / 100 {
-        for _ in 0..100 {
-            world.step();
+    let shadow = await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS);
+
+    assert!(
+        shadow.is_some(),
+        "the peer serves the origin's log in {FOLLOW_STEPS} steps"
+    );
+    assert_no_foreign_writes(&world);
+}
+
+#[test]
+fn given_a_shadow_when_a_client_sends_to_it_should_refuse_and_store_nothing() {
+    const SENDS: usize = 4;
+    let (mut world, client) = geo_world(0x6745_4F42, 2, BucketFaults::default());
+    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
+    for payload in &payloads {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    let shadow = await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS)
+        .expect("the peer serves the origin's log");
+    world.sim(PEER).discover_partition_contexts(&client);
+    let foreign = b"geo-write-to-a-shadow".to_vec();
+
+    let target = primary(&world, PEER, shadow).expect("the shadow has a primary");
+    let request = client.send_messages(shadow, &[Bytes::copy_from_slice(&foreign)]);
+    let request_id = request.header().request;
+    world
+        .sim_mut(PEER)
+        .submit_request(client.client_id(), target, request.into_generic());
+    let status = (0..ANSWER_STEPS).find_map(|_| {
+        world.step()[PEER]
+            .iter()
+            .find(|reply| reply.header().request == request_id)
+            .map(|reply| reply.header().status)
+    });
+    let after = await_shadow_serving(&mut world, &payloads, ANSWER_STEPS);
+
+    assert!(
+        status.is_some_and(|status| status != 0),
+        "the shadow refuses the send: {status:?}"
+    );
+    assert_eq!(
+        after,
+        Some(shadow),
+        "the shadow still serves the origin's log"
+    );
+    let bytes = polled(&mut world, PEER, target, shadow).expect("the poll is served");
+    assert_eq!(
+        positions(&bytes, std::slice::from_ref(&foreign)),
+        None,
+        "the shadow holds no foreign write"
+    );
+    assert_proven_in_bucket(&world, ORIGIN, &payloads);
+    let peer_bucket = world.bucket(PEER);
+    assert!(
+        peer_bucket
+            .keys()
+            .iter()
+            .filter_map(|key| peer_bucket.object(key))
+            .all(|object| {
+                !object
+                    .windows(foreign.len())
+                    .any(|window| window == foreign.as_slice())
+            }),
+        "the peer stored nothing of the refused send"
+    );
+    assert_no_foreign_writes(&world);
+}
+
+#[test]
+fn given_a_cut_link_to_the_origin_when_it_heals_should_catch_up_and_never_move_back() {
+    const SENDS: usize = 12;
+    let (mut world, client) = geo_world(0x6745_4F43, 2, BucketFaults::default());
+    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
+    for payload in &payloads[..SENDS / 2] {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    let shadow = await_shadow_serving(&mut world, &payloads[..SENDS / 2], FOLLOW_STEPS)
+        .expect("the peer serves the first half");
+    let mut highest = shadow_commits(&world, shadow);
+
+    world
+        .bucket(ORIGIN)
+        .set_cut(crate::bucket::ClusterId(1), true);
+    for payload in &payloads[SENDS / 2..] {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    for _ in 0..FOLLOW_STEPS / 4 {
+        world.step();
+        // G5: a peer's floor never moves back.
+        for (replica, commit) in shadow_commits(&world, shadow) {
+            if let Some((_, seen)) = highest.iter_mut().find(|(seen, _)| *seen == replica) {
+                assert!(
+                    commit >= *seen,
+                    "replica {replica} moved back to {commit} from {seen}"
+                );
+                *seen = commit;
+            }
         }
-        let Some(shadow) = namespace_of(&world, PEER, &shadow_stream, TOPIC) else {
-            continue;
-        };
-        let Some(replica) = primary(&world, PEER, shadow) else {
-            continue;
-        };
-        if let Ok(bytes) = polled(&mut world, PEER, replica, shadow)
-            && holds_once_in_order(&bytes, &payloads)
-        {
-            served = Some(bytes);
-            break;
-        }
+    }
+    let cut_off = shadow_commits(&world, shadow);
+    world
+        .bucket(ORIGIN)
+        .set_cut(crate::bucket::ClusterId(1), false);
+    let healed = await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS);
+
+    assert!(
+        cut_off
+            .iter()
+            .all(|(_, commit)| *commit < u64::try_from(SENDS).expect("fits") - 1),
+        "a cut peer reads nothing new: {cut_off:?}"
+    );
+    assert_eq!(
+        healed,
+        Some(shadow),
+        "the peer catches up once the link heals"
+    );
+    assert_no_foreign_writes(&world);
+}
+
+#[test]
+fn given_the_peer_dc_stops_when_it_starts_again_should_catch_up() {
+    const SENDS: usize = 8;
+    let (mut world, client) = geo_world(0x6745_4F44, 2, BucketFaults::default());
+    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
+    for payload in &payloads[..SENDS / 2] {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    await_shadow_serving(&mut world, &payloads[..SENDS / 2], FOLLOW_STEPS)
+        .expect("the peer serves the first half");
+
+    for replica in 0..REPLICAS {
+        world.sim_mut(PEER).replica_crash(replica);
+    }
+    for payload in &payloads[SENDS / 2..] {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    for replica in 0..REPLICAS {
+        world.sim_mut(PEER).replica_restart(replica);
     }
 
     assert!(
-        served.is_some(),
-        "the peer serves the origin's log in {FOLLOW_STEPS} steps"
+        await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS).is_some(),
+        "the peer catches up once it starts again"
     );
+    assert_no_foreign_writes(&world);
+}
+
+#[test]
+fn given_the_origin_dc_stops_when_it_starts_again_should_keep_serving_and_take_sends() {
+    const SENDS: usize = 8;
+    let (mut world, client) = geo_world(0x6745_4F45, 2, BucketFaults::default());
+    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
+    for payload in &payloads[..SENDS / 2] {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    await_shadow_serving(&mut world, &payloads[..SENDS / 2], FOLLOW_STEPS)
+        .expect("the peer serves the first half");
+
+    for replica in 0..REPLICAS {
+        world.sim_mut(ORIGIN).replica_crash(replica);
+    }
+    let while_down = await_shadow_serving(&mut world, &payloads[..SENDS / 2], ANSWER_STEPS);
+    for replica in 0..REPLICAS {
+        world.sim_mut(ORIGIN).replica_restart(replica);
+    }
+    for payload in &payloads[SENDS / 2..] {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+
+    assert!(
+        while_down.is_some(),
+        "the peer serves what the origin published while the origin is down"
+    );
+    assert_proven_in_bucket(&world, ORIGIN, &payloads);
+    assert_read_once_in_order(&mut world, ORIGIN, namespace, &payloads);
+    assert!(
+        await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS).is_some(),
+        "the peer follows the origin again"
+    );
+    assert_no_foreign_writes(&world);
+}
+
+#[test]
+fn given_a_deleted_geo_topic_when_its_grace_passes_should_retire_the_shadow() {
+    const SENDS: usize = 4;
+    const RETIRE_STEPS: usize = 30_000;
+    let (mut world, client) = geo_world(0x6745_4F46, 2, BucketFaults::default());
+    let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+    let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
+    for payload in &payloads {
+        send(&mut world, ORIGIN, &client, namespace, payload);
+    }
+    await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS).expect("the peer serves the log");
+
+    complete(
+        &mut world,
+        ORIGIN,
+        &client,
+        &client.delete_topic(STREAM, TOPIC),
+    );
+    let retired = (0..RETIRE_STEPS).any(|_| {
+        world.step();
+        shadow_of(&world).is_none()
+    });
+
+    assert!(retired, "the peer retires the shadow after the grace");
     assert_no_foreign_writes(&world);
 }

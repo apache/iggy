@@ -23,6 +23,8 @@
 //! peer. One world step steps every cluster once, in an order that the
 //! world's PRNG draws, so a run replays from its seed.
 
+use std::time::Duration;
+
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
@@ -51,6 +53,9 @@ pub struct GeoWorldOptions {
     pub clients: Vec<u128>,
     /// The faults of every bucket.
     pub faults: BucketFaults,
+    /// How long a peer keeps a deleted topic's shadow after the origin
+    /// tombstoned it.
+    pub tombstone_grace: Duration,
 }
 
 /// Per-stream seeds of a world, drawn from its seed. Each cluster keeps its
@@ -118,7 +123,8 @@ impl GeoWorld {
                     },
                 );
                 let mut geo =
-                    SimGeo::new(ORIGINS[index], cluster_id(index), buckets[index].clone());
+                    SimGeo::new(ORIGINS[index], cluster_id(index), buckets[index].clone())
+                        .with_tombstone_grace(options.tombstone_grace);
                 for (peer, bucket) in buckets.iter().enumerate() {
                     if peer != index {
                         geo = geo.with_peer(ORIGINS[peer], bucket.clone());

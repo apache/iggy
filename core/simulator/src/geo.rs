@@ -31,6 +31,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io;
 use std::rc::Rc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use clock::Clock;
@@ -126,6 +127,14 @@ impl SimGeo {
             origin: origin.to_owned(),
             bucket,
         });
+        self
+    }
+
+    /// Retire a peer's deleted topic `grace` after its origin tombstoned
+    /// it, in place of the default of a day.
+    #[must_use]
+    pub fn with_tombstone_grace(mut self, grace: Duration) -> Self {
+        self.geo.tombstone_grace = grace.into();
         self
     }
 
