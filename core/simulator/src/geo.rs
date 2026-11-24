@@ -169,6 +169,12 @@ impl Simulator {
         self.geo.as_ref()
     }
 
+    /// Put this cluster's wall clock `skew_micros` from the one every
+    /// simulator starts with. Call it before the first step.
+    pub fn set_clock_skew_micros(&self, skew_micros: i64) {
+        self.executor.timer().set_realtime_skew_micros(skew_micros);
+    }
+
     /// The cluster's `cluster_uid`, once a live replica applied the first
     /// metadata operation.
     #[must_use]

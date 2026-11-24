@@ -67,6 +67,17 @@ const TOMBSTONE_GRACE: Duration = Duration::from_secs(30);
 
 /// `clusters` clusters of three replicas, each with one client logged in.
 fn geo_world(seed: u64, clusters: u8, faults: BucketFaults) -> (GeoWorld, SimClient) {
+    skewed_geo_world(seed, clusters, faults, [0, 0])
+}
+
+/// [`geo_world`] with each cluster's wall clock `skews_micros` from the
+/// shared one.
+fn skewed_geo_world(
+    seed: u64,
+    clusters: u8,
+    faults: BucketFaults,
+    skews_micros: [i64; 2],
+) -> (GeoWorld, SimClient) {
     let mut world = GeoWorld::new(&GeoWorldOptions {
         seed,
         clusters,
@@ -74,6 +85,7 @@ fn geo_world(seed: u64, clusters: u8, faults: BucketFaults) -> (GeoWorld, SimCli
         clients: vec![CLIENT_ID],
         faults,
         tombstone_grace: TOMBSTONE_GRACE,
+        clock_skews_micros: skews_micros,
     });
     let client = SimClient::new(CLIENT_ID);
     for cluster in 0..world.cluster_count() {
@@ -713,4 +725,38 @@ fn given_a_deleted_geo_topic_when_its_grace_passes_should_retire_the_shadow() {
 
     assert!(retired, "the peer retires the shadow after the grace");
     assert_no_foreign_writes(&world);
+}
+
+#[test]
+fn given_clusters_whose_clocks_disagree_when_the_origin_publishes_and_deletes_should_follow_and_retire()
+ {
+    const SENDS: usize = 4;
+    const RETIRE_STEPS: usize = 30_000;
+    // The origin's clock runs 45 s behind the shared one and the peer's 45 s
+    // ahead of it, a gap of three graces.
+    let skews = [-45_000_000, 45_000_000];
+    for (seed, skews) in [(0x6745_4F47, skews), (0x6745_4F48, [skews[1], skews[0]])] {
+        let (mut world, client) = skewed_geo_world(seed, 2, BucketFaults::default(), skews);
+        let namespace = create_geo_topic(&mut world, ORIGIN, &client);
+        let payloads: Vec<Vec<u8>> = (0..SENDS).map(payload).collect();
+        for payload in &payloads {
+            send(&mut world, ORIGIN, &client, namespace, payload);
+        }
+
+        let served = await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS);
+        complete(
+            &mut world,
+            ORIGIN,
+            &client,
+            &client.delete_topic(STREAM, TOPIC),
+        );
+        let retired = (0..RETIRE_STEPS).any(|_| {
+            world.step();
+            shadow_of(&world).is_none()
+        });
+
+        assert!(served.is_some(), "skews {skews:?}: the peer serves the log");
+        assert!(retired, "skews {skews:?}: the peer retires the shadow");
+        assert_no_foreign_writes(&world);
+    }
 }

@@ -56,6 +56,11 @@ pub struct GeoWorldOptions {
     /// How long a peer keeps a deleted topic's shadow after the origin
     /// tombstoned it.
     pub tombstone_grace: Duration,
+    /// How far each cluster's wall clock is from the shared one, in
+    /// microseconds, by cluster index. A peer compares the origin's
+    /// `deleted_at` with its own clock, so a skew moves when it retires a
+    /// shadow.
+    pub clock_skews_micros: [i64; 2],
 }
 
 /// Per-stream seeds of a world, drawn from its seed. Each cluster keeps its
@@ -130,6 +135,7 @@ impl GeoWorld {
                         geo = geo.with_peer(ORIGINS[peer], bucket.clone());
                     }
                 }
+                sim.set_clock_skew_micros(options.clock_skews_micros[index]);
                 sim.enable_geo(geo);
                 sim
             })
