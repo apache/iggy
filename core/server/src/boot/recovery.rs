@@ -20,7 +20,7 @@
 use crate::boot::topology::{RosterCells, TcpTopology, build_cluster_roster};
 use crate::consumer_group::lease::ConsumerGroupLiveness;
 use crate::dispatch::host::ServerHost;
-use crate::partition_helpers::load_partition_or_fence;
+use crate::partition_helpers::{ChainRecovery, load_partition_or_fence};
 use crate::server_error::ServerError;
 use crate::session_manager::SessionManager;
 use crate::shell::{
@@ -58,7 +58,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// A partition this shard owns, with what building it needs from metadata.
 struct OwnedPartition {
@@ -313,11 +313,29 @@ pub(in crate::boot) async fn build_shard_for_thread(
             partition_metadata.replica_set(topology.replica_count),
             Rc::clone(&bus),
             &partitions,
+            None,
         )
         .await;
+        if let Ok((_, ChainRecovery::Refused)) = &loaded {
+            metrics.record_chain_rebuild_refusal();
+        }
         let partition = match loaded {
-            Ok(Some(partition)) => partition,
-            Ok(None) => continue,
+            Ok((Some(partition), _)) => partition,
+            Ok((None, _)) => continue,
+            // The store is out of reach until the node passes its identity
+            // check, so the reconciler rebuilds the chain.
+            Err(error @ ServerError::PartitionChainMissing { .. }) => {
+                debug!(
+                    stream_id,
+                    topic_id,
+                    partition_id = partition_metadata.id,
+                    %error,
+                    "skipping this partition at boot; the reconciler reads the object store \
+                     for it"
+                );
+                unbuilt.push(namespace);
+                continue;
+            }
             // A refused claim is a failed superblock write, not damage: the
             // namespace stays materialisable, so skipping it here costs one
             // partition its start instead of the whole shard, and the

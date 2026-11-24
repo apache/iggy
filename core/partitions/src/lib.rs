@@ -17,6 +17,13 @@
 
 #![allow(clippy::future_not_send)]
 
+mod chain_rebuild;
+pub use chain_rebuild::{
+    ChainLoss, ChainLost, ChainLostReason, ExecutorStoreViewReader, LocalFront,
+    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, RebuildInput, RebuiltFront, StoreView,
+    StoreViewOutcome, StoreViewReader, StoreViewRequest, StoredLog, chain_loss, read_store_view,
+    rebuild_front,
+};
 mod consumer_offset_capacity;
 mod free_space;
 pub mod geo_positions;
@@ -62,11 +69,11 @@ pub mod segment_anchor;
 pub mod segment_chain;
 mod segment_upload;
 pub use object_delete::{
-    DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, MAX_QUEUED_INCARNATIONS,
-    ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
-    ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation,
-    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
-    sweep_long_term, sweep_segments, sweepable,
+    DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, ListedSegment,
+    MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome,
+    ObjectDeleteStart, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects,
+    delete_incarnation, delete_long_term_segments, delete_objects, delete_segments,
+    list_segment_starts, sweep_long_term, sweep_segments, sweepable,
 };
 mod fresh_proofs;
 pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
@@ -194,7 +201,8 @@ pub use poll_plan::{DISK_POLL_CHUNK_MAX, DISK_POLL_CHUNK_MIN, PollPlan, PollRead
 pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
     PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
-    load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
+    holds_neither_chain_nor_log, load_persisted_segments, load_persisted_segments_with_checkpoint,
+    load_placed_segments, load_tiered_segments,
 };
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};

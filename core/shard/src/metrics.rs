@@ -428,6 +428,9 @@ pub struct ShardMetrics {
     partitions_reconcile_repairs_total: Counter,
     partition_transfer_refusals_total: Counter,
     partition_applied_divergences_total: Counter,
+    partition_chain_rebuilds_total: Counter,
+    partition_chain_rebuild_refusals_total: Counter,
+    partitions_awaiting_chain_rebuild: Gauge,
     partitions_untrusted_log: Gauge,
     partitions_in_view_change: Gauge,
     partition_view_change_votes_held: Gauge,
@@ -712,6 +715,9 @@ impl ShardMetrics {
             partitions_reconcile_repairs_total: Counter::default(),
             partition_transfer_refusals_total: Counter::default(),
             partition_applied_divergences_total: Counter::default(),
+            partition_chain_rebuilds_total: Counter::default(),
+            partition_chain_rebuild_refusals_total: Counter::default(),
+            partitions_awaiting_chain_rebuild: Gauge::default(),
             partitions_untrusted_log: Gauge::default(),
             partitions_in_view_change: Gauge::default(),
             partition_view_change_votes_held: Gauge::default(),
@@ -1843,6 +1849,26 @@ impl ShardMetrics {
         self.partition_applied_divergences_total.get()
     }
 
+    /// Bumped when a tiered partition whose segment chain was gone gets it
+    /// back from the object store and loads over it.
+    pub fn record_chain_rebuild(&self) {
+        self.partition_chain_rebuilds_total.inc();
+    }
+
+    /// Bumped when a tiered partition whose segment chain is gone is refused,
+    /// because neither its disk nor the object store accounts for every
+    /// offset below its local log.
+    pub fn record_chain_rebuild_refusal(&self) {
+        self.partition_chain_rebuild_refusals_total.inc();
+    }
+
+    /// Republished whenever the set changes: the partitions on this shard
+    /// whose segment chain is gone and that wait for the object store.
+    pub fn set_partitions_awaiting_chain_rebuild(&self, waiting: usize) {
+        self.partitions_awaiting_chain_rebuild
+            .set(i64::try_from(waiting).unwrap_or(i64::MAX));
+    }
+
     /// Republished by every partition sweep: how many of this shard's
     /// partitions elected on a log that may lack acknowledged ops and are
     /// waiting for a trusted quorum or every replica to report before they
@@ -2538,6 +2564,21 @@ impl ShardMetrics {
             "adopted views that contradicted an applied partition op; non-zero means committed \
              history diverged",
             self.partition_applied_divergences_total.clone(),
+        );
+        registry.register(
+            "partition_chain_rebuilds",
+            "tiered partitions whose lost segment chain was rebuilt from the object store",
+            self.partition_chain_rebuilds_total.clone(),
+        );
+        registry.register(
+            "partition_chain_rebuild_refusals",
+            "tiered partitions refused because their segment chain is gone and offsets below              their local log are accounted for neither on disk nor in the object store",
+            self.partition_chain_rebuild_refusals_total.clone(),
+        );
+        registry.register(
+            "partitions_awaiting_chain_rebuild",
+            "tiered partitions whose segment chain is gone and that wait for the object store",
+            self.partitions_awaiting_chain_rebuild.clone(),
         );
         registry.register(
             "partitions_untrusted_log",

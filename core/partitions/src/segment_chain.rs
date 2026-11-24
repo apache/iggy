@@ -501,6 +501,17 @@ pub async fn create_chain(partition_dir: &str, prefix: &ObjectPrefix) -> io::Res
     crate::state_transfer::fsync_dir(partition_dir).await
 }
 
+/// Put `chain` in place as the chain of `partition_dir`, whole or not at all,
+/// and fsync the directory so it outlives a crash.
+///
+/// # Errors
+/// Any I/O failure, after which the previous chain, if any, may still be in
+/// place.
+pub async fn write_chain(partition_dir: &str, chain: &Chain) -> io::Result<()> {
+    replace_chain(partition_dir, chain.encode()).await?;
+    fsync_dir(partition_dir).await
+}
+
 /// Put `bytes` in place as the chain of `partition_dir`, whole or not at all.
 /// The caller fsyncs the directory.
 ///

@@ -17,13 +17,13 @@
 
 //! A server with the `fs` tiered storage backend and a tiered topic on it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iggy::prelude::*;
 use iggy_object_store::{FsStore, ObjectStore, PartitionManifest};
-use integration::harness::{TestHarness, TestServerConfig};
+use integration::harness::{TestBinary, TestHarness, TestServerConfig};
 use tokio::time::{Instant, sleep};
 
 use super::http_client::HttpClient;
@@ -43,6 +43,8 @@ pub(crate) const TIERING_DEADLINE: Duration = Duration::from_secs(60);
 pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// How long the shards may take to report the reads of a pass on `/metrics`.
 pub(crate) const METRICS_DEADLINE: Duration = Duration::from_secs(30);
+const CHAIN_REBUILDS: &str = "partition_chain_rebuilds_total";
+const CHAIN_REBUILD_REFUSALS: &str = "partition_chain_rebuild_refusals_total";
 
 #[tokio::test]
 async fn given_a_tiered_topic_when_its_segments_leave_the_disk_should_read_them_back_from_the_store()
@@ -255,8 +257,197 @@ async fn given_a_tiered_topic_with_a_small_read_cache_when_a_pass_reads_more_tha
     );
 }
 
+/// A node that lost the chain file of a partition whose front left the disk
+/// reads that front back from the store, instead of serving the partition
+/// from its first local segment.
+#[tokio::test]
+async fn given_an_evicted_front_when_the_chain_file_is_lost_should_rebuild_the_chain_and_read_every_message()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = single_node_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    let data_path = harness.server().data_path();
+    wait_until_only_the_open_segment_is_local(store.path(), &data_path).await;
+    drop(client);
+
+    harness.server_mut().stop().expect("the server stops");
+    let chain = the_chain_file(&data_path);
+    std::fs::remove_file(&chain).expect("delete the chain file");
+    harness
+        .server_mut()
+        .start()
+        .expect("the server starts again");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+
+    if let Err(error) = read_every_message_within(&client, &stream, &topic, TIERING_DEADLINE).await
+    {
+        panic!("after the chain file was lost: {error}");
+    }
+    assert!(chain.exists(), "the chain file was not written again");
+    let http = HttpClient::login_root(&harness).await;
+    assert_eq!(
+        settled_metric(&http, CHAIN_REBUILDS, |rebuilds| rebuilds > 0).await,
+        1
+    );
+}
+
+/// A store that lost the first segment of the evicted front cannot account
+/// for it, so the node refuses the partition and leaves its files as they
+/// were, rather than serving it from the next segment on.
+#[tokio::test]
+async fn given_an_evicted_front_whose_first_object_is_gone_when_the_chain_file_is_lost_should_refuse_the_partition()
+ {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = single_node_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_tiered_topic(&client, &stream).await;
+    send_every_message(&client, &stream, &topic).await;
+    let data_path = harness.server().data_path();
+    wait_until_only_the_open_segment_is_local(store.path(), &data_path).await;
+    drop(client);
+
+    harness.server_mut().stop().expect("the server stops");
+    let chain = the_chain_file(&data_path);
+    std::fs::remove_file(&chain).expect("delete the chain file");
+    let stored = segment_logs(store.path());
+    std::fs::remove_file(files_named(store.path(), &stored[0]).remove(0))
+        .expect("delete the first segment's object");
+    let partition_dir = chain.parent().expect("the partition directory").to_owned();
+    let local_logs = file_contents(&partition_dir, &["log"]);
+    let local_indexes = file_contents(&partition_dir, &["index"]);
+    harness
+        .server_mut()
+        .start()
+        .expect("the server starts again");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let http = HttpClient::login_root(&harness).await;
+
+    assert_eq!(
+        settled_metric(&http, CHAIN_REBUILD_REFUSALS, |refusals| refusals > 0).await,
+        1
+    );
+    assert_eq!(metric(&http, CHAIN_REBUILDS).await, 0);
+    let second_start = stored[1]
+        .strip_suffix(".log")
+        .and_then(|stem| stem.parse::<u64>().ok())
+        .expect("a segment object named by its start");
+    let refusal = format!(
+        "the offsets 0 to {} below the local log are not accounted for",
+        second_start - 1
+    );
+    assert!(
+        harness.server().stdout_contains(&refusal),
+        "the log does not name the unaccounted range: {refusal}"
+    );
+    assert!(
+        read_every_message(&client, &stream, &topic).await.is_err(),
+        "the refused partition served polls"
+    );
+    assert!(!chain.exists(), "the refusal created a chain file");
+    let logs = file_contents(&partition_dir, &["log"]);
+    assert_eq!(
+        logs.keys().collect::<Vec<_>>(),
+        local_logs.keys().collect::<Vec<_>>(),
+        "the refusal changed which segment logs are on disk"
+    );
+    assert!(logs == local_logs, "the refusal changed a segment log");
+    // Boot rewrites the index of the segment the WAL checkpoint names, so
+    // only the names are compared: the indexes of the evicted segments stay.
+    assert_eq!(
+        file_contents(&partition_dir, &["index"])
+            .keys()
+            .collect::<Vec<_>>(),
+        local_indexes.keys().collect::<Vec<_>>()
+    );
+}
+
+/// With every segment still on disk nothing below the local log can be
+/// missing, so the node serves the partition without reading the store.
+#[tokio::test]
+async fn given_every_segment_on_disk_when_the_chain_file_is_lost_should_serve_without_the_store() {
+    let store = tempfile::tempdir().expect("a directory for the object store");
+    let mut harness = single_node_with_fs_store(store.path());
+    harness.start().await.expect("the server boots");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let stream = Identifier::named(STREAM).expect("stream identifier");
+    let topic = Identifier::named(TOPIC).expect("topic identifier");
+    client
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create stream");
+    create_tiered_topic_with(
+        &client,
+        &stream,
+        &TopicCreateOptions {
+            local_retention_age: None,
+            ..tiered_topic_options()
+        },
+    )
+    .await;
+    send_every_message(&client, &stream, &topic).await;
+    let data_path = harness.server().data_path();
+    wait_for_upload(store.path()).await;
+    drop(client);
+
+    harness.server_mut().stop().expect("the server stops");
+    let stored = segment_logs(store.path());
+    let local = segment_logs(&data_path);
+    assert!(
+        stored.iter().all(|object| local.contains(object)),
+        "a segment left the disk: the store holds {stored:?}, the data directory {local:?}"
+    );
+    let chain = the_chain_file(&data_path);
+    std::fs::remove_file(&chain).expect("delete the chain file");
+    harness
+        .server_mut()
+        .start()
+        .expect("the server starts again");
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+
+    assert_reads_every_message(&client, &stream, &topic).await;
+    let http = HttpClient::login_root(&harness).await;
+    assert_eq!(metric(&http, CHAIN_REBUILDS).await, 0);
+    assert_eq!(metric(&http, CHAIN_REBUILD_REFUSALS).await, 0);
+    assert!(
+        !harness
+            .server()
+            .stdout_contains("waits for the object store to account"),
+        "the partition waited for the store"
+    );
+}
+
 fn server_with_fs_store(store: &Path) -> TestHarness {
     TestHarness::builder()
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store))
+                .build(),
+        )
+        .build()
+        .expect("the harness")
+}
+
+/// [`server_with_fs_store`] on one node, so each partition has one replica
+/// and no peer to restore it from.
+fn single_node_with_fs_store(store: &Path) -> TestHarness {
+    TestHarness::builder()
+        .cluster_nodes(1)
         .server(
             TestServerConfig::builder()
                 .extra_envs(fs_store_envs(store))
@@ -337,6 +528,18 @@ pub(crate) async fn wait_for_eviction(store: &Path, data_path: &Path) -> usize {
             Instant::now() < deadline,
             "within {TIERING_DEADLINE:?} no uploaded segment left the disk: the store holds \
              {uploaded:?}, the data directory {local:?}"
+        );
+        sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// Waits until the store holds a segment.
+async fn wait_for_upload(store: &Path) {
+    let deadline = Instant::now() + TIERING_DEADLINE;
+    while segment_logs(store).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "within {TIERING_DEADLINE:?} no segment reached the store"
         );
         sleep(POLL_INTERVAL).await;
     }
@@ -427,6 +630,35 @@ async fn read_cache_counts(http: &HttpClient) -> ReadCacheCounts {
     }
 }
 
+/// The sum of `series` over the shards once two scrapes a poll interval apart
+/// agree and `ready` accepts it, within [`METRICS_DEADLINE`].
+async fn settled_metric(http: &HttpClient, series: &str, ready: impl Fn(u64) -> bool) -> u64 {
+    let deadline = Instant::now() + METRICS_DEADLINE;
+    let mut last = metric(http, series).await;
+    loop {
+        sleep(POLL_INTERVAL).await;
+        let value = metric(http, series).await;
+        if value == last && ready(value) {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "within {METRICS_DEADLINE:?} {series} did not settle: {value}"
+        );
+        last = value;
+    }
+}
+
+async fn metric(http: &HttpClient, series: &str) -> u64 {
+    let exposition = http
+        .get("/metrics")
+        .await
+        .text()
+        .await
+        .expect("metrics text");
+    summed(&exposition, series)
+}
+
 /// The samples of `series` of every shard, summed.
 fn summed(exposition: &str, series: &str) -> u64 {
     exposition
@@ -485,6 +717,26 @@ pub(crate) async fn read_every_message(
     topic: &Identifier,
 ) -> Result<(), String> {
     read_every_message_in_polls_of(client, stream, topic, 10).await
+}
+
+/// [`read_every_message`] until it succeeds, within `within`. Returns the
+/// last failure once the time is up.
+async fn read_every_message_within(
+    client: &IggyClient,
+    stream: &Identifier,
+    topic: &Identifier,
+    within: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + within;
+    loop {
+        match read_every_message(client, stream, topic).await {
+            Ok(()) => return Ok(()),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(format!("within {within:?}: {error}"));
+            }
+            Err(_) => sleep(POLL_INTERVAL).await,
+        }
+    }
 }
 
 /// [`read_every_message`] with `count` messages a poll.
@@ -602,6 +854,35 @@ pub(crate) fn segment_logs(root: &Path) -> Vec<String> {
         .collect();
     logs.sort();
     logs
+}
+
+/// The bytes of every file directly in `directory` with one of
+/// `extensions`, by name.
+fn file_contents(directory: &Path, extensions: &[&str]) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(directory)
+        .expect("list the directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extensions.contains(&extension))
+        })
+        .map(|path| {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            (name, std::fs::read(&path).expect("read the file"))
+        })
+        .collect()
+}
+
+/// The chain file of the test's one partition under `data_path`.
+fn the_chain_file(data_path: &Path) -> PathBuf {
+    let mut chains = files_named(data_path, "remote.chain");
+    assert_eq!(chains.len(), 1, "one chain file: {chains:?}");
+    chains.remove(0)
 }
 
 fn files_named(root: &Path, name: &str) -> Vec<PathBuf> {

@@ -47,21 +47,26 @@ use journal::superblock::{PingPongSuperblock, SuperblockContents};
 use message_bus::IggyMessageBus;
 use metadata::stm::stream::Partition;
 use metadata::{IdentityField, ReplicaIdentity};
+use partitions::segment_anchor::{SegmentAnchor, read_anchor};
+use partitions::segment_chain::{Chain, HEADER_SIZE, ObjectPrefix, RECORD_SIZE, write_chain};
 use partitions::{
-    IggyPartition, IggyPartitions, PartitionPersistence, PartitionRecoveryError,
-    PartitionRecoveryRefusal, PartitionsConfig, RecoveredLog, clamp_consumer_offsets,
-    create_partition_file_hierarchy, ensure_initial_segment, hydrate_partition_log,
+    ChainLoss, ChainLost, IggyPartition, IggyPartitions, LocalFront,
+    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, PartitionPersistence, PartitionRecoveryError,
+    PartitionRecoveryRefusal, PartitionsConfig, RebuildInput, RecoveredLog, StoreView,
+    StoreViewRequest, chain_loss, clamp_consumer_offsets, create_partition_file_hierarchy,
+    ensure_initial_segment, holds_neither_chain_nor_log, hydrate_partition_log,
     load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
-    recover_consumer_offsets,
+    load_tiered_segments, rebuild_front, recover_consumer_offsets,
 };
 use server_common::fatal::is_descriptor_exhaustion;
 use server_common::fs_utils::run_blocking;
 use server_common::sharding::IggyNamespace;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const PARTITION_INITIALIZATION_DIR: &str = "partition-initialization";
 const RETIREMENT_FENCE_FILE: &str = "retirement.fence";
@@ -169,6 +174,23 @@ pub async fn open_partition_superblock(
     Ok((Rc::new(superblock), recovered_state))
 }
 
+/// The partition a load brought back, `None` when it brought none back, and
+/// what the load did about a segment chain it found gone.
+pub type LoadedPartition = (Option<IggyPartition<Rc<IggyMessageBus>>>, ChainRecovery);
+
+/// What a load did about a segment chain it found gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChainRecovery {
+    /// The chain was there, or nothing below the local log can be missing
+    /// without it.
+    Kept,
+    /// The chain was rebuilt from the store, and the partition loaded over it.
+    Rebuilt,
+    /// A range below the local log is not accounted for, so the partition
+    /// was refused.
+    Refused,
+}
+
 /// Recover an owned partition from its on-disk state.
 ///
 /// Shared by boot and the reconciler so a partition this replica committed
@@ -180,7 +202,13 @@ pub async fn open_partition_superblock(
 /// namespace was tombstoned here, or that its directory belongs to a newer
 /// incarnation than local metadata knows; the arms below say when. Errors are
 /// transient I/O, left to the caller.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+///
+/// The partition of a tiered topic whose segment chain is gone fails the load
+/// with [`ServerError::PartitionChainMissing`] while something below its
+/// local log may have left the disk, unless `store_view` answers the request
+/// that error names. It then rebuilds the chain from the view, or refuses the
+/// partition when the view does not account for every offset below its log.
+#[allow(clippy::too_many_arguments)]
 pub async fn load_partition_or_fence(
     config: &ServerConfig,
     namespace: IggyNamespace,
@@ -192,6 +220,41 @@ pub async fn load_partition_or_fence(
     members: ReplicaSet,
     bus: Rc<IggyMessageBus>,
     partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+    store_view: Option<&StoreView>,
+) -> Result<LoadedPartition, ServerError> {
+    let mut chain = ChainRecovery::Kept;
+    let partition = Box::pin(load_or_fence(
+        config,
+        namespace,
+        partition_stats,
+        partition_metadata,
+        topic_runtime,
+        cluster_id,
+        self_replica_id,
+        members,
+        bus,
+        partitions,
+        store_view,
+        &mut chain,
+    ))
+    .await?;
+    Ok((partition, chain))
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn load_or_fence(
+    config: &ServerConfig,
+    namespace: IggyNamespace,
+    partition_stats: Arc<PartitionStats>,
+    partition_metadata: &Partition,
+    topic_runtime: TopicRuntimeOptions,
+    cluster_id: u128,
+    self_replica_id: u8,
+    members: ReplicaSet,
+    bus: Rc<IggyMessageBus>,
+    partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+    store_view: Option<&StoreView>,
+    chain: &mut ChainRecovery,
 ) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
     let replica_count = members.len();
     let created_revision = partition_metadata.created_revision;
@@ -385,7 +448,7 @@ pub async fn load_partition_or_fence(
     }
     // Heap-pinned: the loader's and the rebuilder's futures side by side
     // outgrow clippy's `large_futures` cap, and this runs once per partition.
-    match Box::pin(load_partition(
+    let loaded = match Box::pin(load_partition(
         config,
         partitions.config(),
         namespace,
@@ -396,9 +459,32 @@ pub async fn load_partition_or_fence(
         self_replica_id,
         members,
         Rc::clone(&bus),
+        store_view,
     ))
     .await
     {
+        // Once, and without the view: the chain is on disk now, and recovery
+        // checks it by the rules of any other chain.
+        Err(ServerError::PartitionChainRebuilt { .. }) => {
+            *chain = ChainRecovery::Rebuilt;
+            Box::pin(load_partition(
+                config,
+                partitions.config(),
+                namespace,
+                Arc::clone(&partition_stats),
+                partition_metadata,
+                topic_runtime,
+                cluster_id,
+                self_replica_id,
+                members,
+                Rc::clone(&bus),
+                None,
+            ))
+            .await
+        }
+        loaded => loaded,
+    };
+    match loaded {
         Ok(partition) => Ok(Some(partition)),
         // ONE damaged local chain must not take the node down. The shapes
         // this refuses are structural -- what a failed state-transfer
@@ -424,6 +510,12 @@ pub async fn load_partition_or_fence(
             reason,
             ..
         })) => {
+            // A rebuilt chain that recovery refuses counts as a refusal too.
+            if *chain == ChainRecovery::Rebuilt
+                || matches!(reason, PartitionRecoveryRefusal::ChainLost { .. })
+            {
+                *chain = ChainRecovery::Refused;
+            }
             let partition_dir = dir.to_string_lossy().into_owned();
             let rebuild_for_rejoin = replica_count > 1
                 || matches!(
@@ -605,6 +697,7 @@ async fn load_partition(
     self_replica_id: u8,
     members: ReplicaSet,
     bus: Rc<IggyMessageBus>,
+    store_view: Option<&StoreView>,
 ) -> Result<IggyPartition<Rc<IggyMessageBus>>, ServerError> {
     let replica_count = members.len();
     let stream_id = namespace.stream_id();
@@ -613,10 +706,28 @@ async fn load_partition(
     let first_initialization =
         partition_needs_initialization(config, namespace, partition_metadata.created_revision)
             .await?;
+    let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
+    // Before the prepare WAL opens and recreates the `.log` its frontier ends
+    // in: the refusal holds only while no `.log` stands in the directory, and
+    // the store may extend a local log backwards but never stands in for one.
+    if keeps_chain(runtime_options)
+        && !first_initialization
+        && holds_neither_chain_nor_log(partitions_config, namespace).await?
+    {
+        let local = LocalFront {
+            front: None,
+            watermark: partition_metadata.deleted_up_to_offset,
+            floor: None,
+            stems_without_log: &[],
+            replicated: replica_count > 1,
+        };
+        if let ChainLoss::Refuse(lost) = chain_loss(&local) {
+            return Err(chain_lost(&partition_dir, namespace, lost));
+        }
+    }
     // (view, log_view) come from the group's durable superblock when present;
     // a present but unverifiable record already refused boot inside
     // `open_partition_superblock`.
-    let partition_dir = config.get_partition_path(stream_id, topic_id, partition_id);
     let (superblock, recovered_state) = open_partition_superblock(
         &partition_dir,
         ReplicaIdentity {
@@ -707,14 +818,13 @@ async fn load_partition(
             source,
         },
     };
+    let history_published = !first_initialization
+        && journal::PartitionPrepareJournal::has_published_frontier(&wal_directory)
+            .await
+            .map_err(wal_error)?;
     let recovered_persistence = {
         let directory = wal_directory.clone();
-        if replica_count == 1
-            && !first_initialization
-            && !journal::PartitionPrepareJournal::has_published_frontier(&directory)
-                .await
-                .map_err(wal_error)?
-        {
+        if replica_count == 1 && !first_initialization && !history_published {
             return Err(wal_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "existing singleton partition is missing its prepare WAL frontier",
@@ -792,6 +902,23 @@ async fn load_partition(
         segment_checkpoint,
     )
     .await?;
+    // Only a directory this incarnation initialized and wrote history to:
+    // the store may extend a local log backwards, and never stands in for one.
+    let lost_chain = (keeps_chain(runtime_options)
+        && recovered.chain.is_none()
+        && history_published)
+        .then(|| LostChain {
+            front: recovered
+                .segments
+                .first()
+                .map(|recovered| recovered.segment.start_offset),
+            stems_without_log: recovered.stems_without_log.clone(),
+            watermark: partition_metadata.deleted_up_to_offset,
+            namespace,
+            created_revision: partition_metadata.created_revision,
+            prefix: partitions::object_prefix(namespace, partition_metadata.created_revision),
+            replicated: replica_count > 1,
+        });
     hydrate_partition_log(
         &mut partition,
         &partition_dir,
@@ -817,6 +944,29 @@ async fn load_partition(
     }
 
     open_partition_persistence(&mut partition, config, Some(recovered_persistence)).await?;
+    if let Some(lost) = lost_chain {
+        // The floor is known only now: advances the WAL holds past its
+        // checkpoint count, as a replica may have evicted on them.
+        let floor = partition.recovered_tiered_floor();
+        match lost.decide(floor) {
+            ChainLoss::Fresh => {}
+            ChainLoss::Refuse(refusal) => {
+                partition.stats.zero_out_all();
+                return Err(chain_lost(&partition_dir, namespace, refusal));
+            }
+            ChainLoss::Rebuild => {
+                let rebuilt =
+                    rebuild_lost_chain(&partition, &partition_dir, &lost, floor, store_view).await;
+                partition.stats.zero_out_all();
+                rebuilt?;
+                return Err(ServerError::PartitionChainRebuilt {
+                    stream_id,
+                    topic_id,
+                    partition_id,
+                });
+            }
+        }
+    }
     ensure_initial_segment(&mut partition, partitions_config, namespace, true).await?;
     if replica_count == 1 && !partition.durability().is_persisted() {
         partition
@@ -838,6 +988,166 @@ async fn load_partition(
         return Err(error);
     }
     Ok(partition)
+}
+
+/// Whether the partitions of a topic with `runtime_options` keep a chain file
+/// that lists their evicted segments. A partition that places its batches
+/// keeps its long-term log instead.
+const fn keeps_chain(runtime_options: TopicRuntimeOptions) -> bool {
+    runtime_options.tiered_storage && !runtime_options.places_batches
+}
+
+/// What a load knows of a tiered partition that found no chain file.
+struct LostChain {
+    /// The first offset of the first `.log` segment loading found.
+    front: Option<u64>,
+    stems_without_log: Vec<u64>,
+    watermark: u64,
+    namespace: IggyNamespace,
+    created_revision: u64,
+    prefix: ObjectPrefix,
+    replicated: bool,
+}
+
+impl LostChain {
+    fn local_front(&self, floor: Option<u64>) -> LocalFront<'_> {
+        LocalFront {
+            front: self.front,
+            watermark: self.watermark,
+            floor,
+            stems_without_log: &self.stems_without_log,
+            replicated: self.replicated,
+        }
+    }
+
+    fn decide(&self, floor: Option<u64>) -> ChainLoss {
+        chain_loss(&self.local_front(floor))
+    }
+}
+
+/// Rebuild the lost chain of `partition` from `store_view`, and write it.
+///
+/// # Errors
+/// [`ServerError::PartitionChainMissing`] while `store_view` does not answer
+/// what the partition asks of the store now, a refusal when the view does not
+/// account for every offset below the local log, and the I/O failure of a
+/// read of an anchor or of the write.
+async fn rebuild_lost_chain(
+    partition: &IggyPartition<Rc<IggyMessageBus>>,
+    partition_dir: &str,
+    lost: &LostChain,
+    floor: Option<u64>,
+    store_view: Option<&StoreView>,
+) -> Result<(), ServerError> {
+    let namespace = lost.namespace;
+    let local = lost.local_front(floor);
+    let front = lost.front.unwrap_or_default();
+    let local_sealed: Vec<(u64, u64)> = partition
+        .log
+        .segments()
+        .split_last()
+        .map_or(&[][..], |(_, sealed)| sealed)
+        .iter()
+        .filter(|segment| {
+            segment.sealed
+                && segment.size > IggyByteSize::default()
+                && floor.is_some_and(|floor| segment.end_offset <= floor)
+        })
+        .map(|segment| (segment.start_offset, segment.end_offset))
+        .collect();
+    let request = StoreViewRequest {
+        prefix: lost.prefix,
+        from: local.first_kept(),
+        front,
+        local_sealed: local_sealed.iter().map(|(start, _)| *start).collect(),
+    };
+    let Some(view) = store_view.filter(|view| view.request == request) else {
+        return Err(ServerError::PartitionChainMissing {
+            stream_id: namespace.stream_id(),
+            topic_id: namespace.topic_id(),
+            partition_id: namespace.partition_id(),
+            request: Box::new(request),
+        });
+    };
+    let anchors = read_anchors(partition_dir, &lost.stems_without_log, front).await?;
+    let rebuilt = rebuild_front(
+        view,
+        &RebuildInput {
+            local,
+            created_revision: lost.created_revision,
+            anchors: &anchors,
+            local_sealed: &local_sealed,
+        },
+    )
+    .map_err(|refusal| chain_lost(partition_dir, namespace, refusal))?;
+    match &view.manifest {
+        ManifestRead::TooLarge { size } => warn!(
+            namespace_raw = namespace.inner(),
+            size,
+            limit = MANIFEST_CROSS_CHECK_BYTES_MAX,
+            "the manifest is too large to read, so the rebuilt segment chain is not checked \
+             against it"
+        ),
+        ManifestRead::Undecodable(error) => warn!(
+            namespace_raw = namespace.inner(),
+            %error,
+            "the manifest does not decode, so the rebuilt segment chain is not checked against it"
+        ),
+        ManifestRead::Absent | ManifestRead::Read(_) => {}
+    }
+    let chain = Chain {
+        prefix: lost.prefix,
+        valid_len: (HEADER_SIZE + rebuilt.records.len() * RECORD_SIZE) as u64,
+        records: rebuilt.records,
+        torn_tail: false,
+    };
+    write_chain(partition_dir, &chain).await.map_err(|source| {
+        ServerError::PartitionChainRebuildIo {
+            dir: PathBuf::from(partition_dir),
+            source,
+        }
+    })?;
+    info!(
+        namespace_raw = namespace.inner(),
+        remote_segments = rebuilt.remote_segments,
+        confirmed_local_segments = rebuilt.confirmed_local,
+        trim_point = ?rebuilt.trim_point,
+        front,
+        "rebuilt the lost segment chain of the partition from the object store"
+    );
+    Ok(())
+}
+
+/// The anchors beside the segments starting at `stems` and at `front`, by
+/// the start offset of the segment each stands beside.
+async fn read_anchors(
+    partition_dir: &str,
+    stems: &[u64],
+    front: u64,
+) -> Result<BTreeMap<u64, SegmentAnchor>, ServerError> {
+    let mut anchors = BTreeMap::new();
+    for start in stems.iter().copied().chain([front]) {
+        let anchor = read_anchor(partition_dir, start).await.map_err(|source| {
+            ServerError::PartitionChainRebuildIo {
+                dir: PathBuf::from(partition_dir),
+                source,
+            }
+        })?;
+        anchors.extend(anchor.map(|anchor| (start, anchor)));
+    }
+    Ok(anchors)
+}
+
+/// The refusal of a partition whose lost chain leaves `refusal` unaccounted
+/// for.
+fn chain_lost(partition_dir: &str, namespace: IggyNamespace, refusal: ChainLost) -> ServerError {
+    ServerError::PartitionRecovery(PartitionRecoveryError::Refused {
+        dir: PathBuf::from(partition_dir),
+        stream_id: namespace.stream_id(),
+        topic_id: namespace.topic_id(),
+        partition_id: namespace.partition_id(),
+        reason: refusal.into(),
+    })
 }
 
 /// Restore the offset counter of a recovered partition from what boot could
@@ -933,6 +1243,16 @@ async fn recover_partition_segments(
             partitions_config,
             namespace,
             segment_size,
+            stats,
+            checkpoint,
+        )
+        .await
+    } else if keeps_chain(runtime_options) {
+        load_tiered_segments(
+            partitions_config,
+            namespace,
+            segment_size,
+            persisted,
             stats,
             checkpoint,
         )
@@ -1538,8 +1858,10 @@ mod tests {
                 ReplicaSet::all(replica_count),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap()
             .expect("a partition that never initialized must finish its committed creation");
             assert!(
@@ -1593,8 +1915,10 @@ mod tests {
                 ReplicaSet::all(replica_count),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap();
             if replica_count == 1 {
                 assert!(
@@ -1644,8 +1968,10 @@ mod tests {
                 ReplicaSet::all(replica_count),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap();
             let context = format!("replicas={replica_count} created_at={created_at}");
             assert_eq!(loaded.is_some(), served, "{context}");
@@ -1791,6 +2117,7 @@ mod tests {
                     REPLICA,
                     ReplicaSet::all(REPLICAS),
                     Rc::new(IggyMessageBus::new(0)),
+                    None,
                 ))
                 .await
             } else {
@@ -1860,8 +2187,10 @@ mod tests {
                 ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap();
             assert!(loaded.is_none());
             assert!(partitions.is_tombstoned(&namespace));
@@ -1928,6 +2257,7 @@ mod tests {
             REPLICA,
             ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
+            None,
         ))
         .await;
         assert!(matches!(
@@ -1949,8 +2279,10 @@ mod tests {
             ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
+            None,
         )
         .await
+        .map(|(partition, _)| partition)
         .unwrap();
         assert!(loaded.is_none());
         assert!(partitions.is_tombstoned(&namespace));
@@ -2295,6 +2627,7 @@ mod tests {
                 REPLICA,
                 ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
+                None,
             ))
             .await
             .unwrap();
@@ -2374,8 +2707,10 @@ mod tests {
                 ReplicaSet::all(1),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap();
             assert!(
                 outcome.is_none(),
@@ -2425,8 +2760,10 @@ mod tests {
                 ReplicaSet::all(1),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap();
             assert!(
                 recovered.is_none(),
@@ -2434,6 +2771,88 @@ mod tests {
             );
             assert_eq!(std::fs::read(&log_path).unwrap(), bytes);
             assert!(!directory.join("prepares-0").exists());
+        }
+    }
+
+    /// The store may hold every segment this partition ever stored, and
+    /// still only a prefix of what it acknowledged, so a tiered partition
+    /// whose disk lost every `.log` is not rebuilt from it.
+    #[compio::test]
+    async fn given_a_tiered_singleton_without_a_chain_or_a_log_when_loading_should_refuse_without_planting_a_segment()
+     {
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let namespace = IggyNamespace::new(1, 1, 0);
+        let runtime = TopicRuntimeOptions {
+            tiered_storage: true,
+            preallocate_segments: Some(false),
+            ..TopicRuntimeOptions::default()
+        };
+        drop(
+            build_partition_fresh(
+                &config,
+                &solo_partitions_config(&config),
+                namespace,
+                Arc::new(PartitionStats::default()),
+                0,
+                0,
+                runtime,
+                CLUSTER,
+                0,
+                ReplicaSet::all(1),
+                0,
+                Rc::new(IggyMessageBus::new(0)),
+            )
+            .await
+            .unwrap(),
+        );
+        let partitions_config = solo_partitions_config(&config);
+        let directory = config.get_partition_path(1, 1, 0);
+        let log_path = partitions_config.get_messages_path(1, 1, 0, 0);
+        std::fs::remove_file(&log_path).unwrap();
+        assert!(!Path::new(&partitions::segment_chain::chain_path(&directory)).exists());
+        let view = StoreView {
+            request: StoreViewRequest {
+                prefix: partitions::object_prefix(namespace, 0),
+                from: 0,
+                front: 100,
+                local_sealed: Vec::new(),
+            },
+            listed: BTreeMap::new(),
+            logs: BTreeMap::new(),
+            manifest: ManifestRead::Absent,
+        };
+
+        for store_view in [None, Some(&view)] {
+            let partitions = solo_partitions(&config);
+            let (partition, chain) = load_partition_or_fence(
+                &config,
+                namespace,
+                Arc::new(PartitionStats::default()),
+                &Partition::new(0, namespace.inner(), IggyTimestamp::now(), 0, 0),
+                runtime,
+                CLUSTER,
+                0,
+                ReplicaSet::all(1),
+                Rc::new(IggyMessageBus::new(0)),
+                &partitions,
+                store_view,
+            )
+            .await
+            .unwrap();
+
+            assert!(partition.is_none());
+            assert_eq!(chain, ChainRecovery::Refused);
+            assert!(partitions.is_tombstoned(&namespace));
+            assert!(!Path::new(&log_path).exists(), "a segment was planted");
+            assert!(
+                !Path::new(&partitions::segment_chain::chain_path(&directory)).exists(),
+                "a chain was created"
+            );
+            assert!(
+                Path::new(&partitions_config.get_index_path(1, 1, 0, 0)).exists(),
+                "the index the loader found was swept"
+            );
         }
     }
 
@@ -2530,6 +2949,7 @@ mod tests {
             REPLICA,
             ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
+            None,
         ))
         .await
         .unwrap();
@@ -2610,8 +3030,10 @@ mod tests {
                 ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             )
             .await
+            .map(|(partition, _)| partition)
             .unwrap()
             .unwrap();
             assert!(partition.requires_state_transfer());
@@ -2791,8 +3213,10 @@ mod tests {
             ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
             partitions,
+            None,
         )
         .await
+        .map(|(partition, _)| partition)
     }
 
     /// The reservation the partition left on disk, which is the only copy a
@@ -2986,6 +3410,7 @@ mod tests {
             REPLICA,
             ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
+            None,
         ))
         .await
         .expect("load the partition");
@@ -3074,8 +3499,10 @@ mod tests {
                 ReplicaSet::all(REPLICAS),
                 Rc::new(IggyMessageBus::new(0)),
                 &partitions,
+                None,
             ))
             .await
+            .map(|(partition, _)| partition)
             .expect("boot rebuilds the refused chain")
             .expect("the rebuilt partition");
 
@@ -3132,6 +3559,7 @@ mod tests {
             REPLICA,
             ReplicaSet::all(REPLICAS),
             Rc::new(IggyMessageBus::new(0)),
+            None,
         ))
         .await
         .expect("load the partition");
@@ -3248,6 +3676,7 @@ mod tests {
             ReplicaSet::all(1),
             Rc::new(IggyMessageBus::new(0)),
             &partitions,
+            None,
         ));
         // Segment provisioning finishes before the claim's detached file-open
         // task can run. Removing its directory here fails only that claim.
@@ -3263,7 +3692,7 @@ mod tests {
         }
         let unavailable = root.path().join("unavailable-partition");
         std::fs::rename(&dir, &unavailable).expect("make the claim's directory unavailable");
-        let loaded = loaded.await;
+        let loaded = loaded.await.map(|(partition, _)| partition);
         std::fs::rename(&unavailable, &dir).expect("restore the partition directory");
 
         match loaded {

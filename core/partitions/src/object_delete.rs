@@ -327,7 +327,9 @@ pub async fn list_segment_starts<S: ObjectStore>(
 ) -> Result<BTreeSet<u64>, ObjectStoreError> {
     Ok(list_incarnation(store, layout, prefix)
         .await?
-        .segment_starts)
+        .segments
+        .into_keys()
+        .collect())
 }
 
 /// List the segment objects of `prefix`, and read where each segment ends
@@ -424,7 +426,7 @@ pub async fn delete_incarnation<S: ObjectStore>(
     prefix: &ObjectPrefix,
 ) -> Result<usize, ObjectStoreError> {
     let listed = list_incarnation(store, layout, prefix).await?;
-    let start_offsets: Vec<u64> = listed.segment_starts.into_iter().collect();
+    let start_offsets: Vec<u64> = listed.segments.into_keys().collect();
     let mut calls = start_offsets.chunks(SEGMENTS_PER_DELETE_CALL);
     let mut segments_left = 0;
     for call in calls.by_ref() {
@@ -458,16 +460,24 @@ pub async fn delete_incarnation<S: ObjectStore>(
 
 /// What the store lists for one incarnation.
 #[derive(Default)]
-struct IncarnationObjects {
-    /// The first offset of every object of a segment keyed by its start.
-    segment_starts: BTreeSet<u64>,
+pub struct IncarnationObjects {
+    /// The objects of every segment keyed by its start, by that start.
+    pub segments: BTreeMap<u64, ListedSegment>,
     /// The first and the last offset of every object of a long-term segment.
     long_term: BTreeSet<(u64, u64)>,
 }
 
+/// The sizes of the objects the store lists for one segment keyed by its
+/// start. `None` for an object it does not list.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListedSegment {
+    pub log_size: Option<u64>,
+    pub index_size: Option<u64>,
+}
+
 /// The segment objects the store lists for `prefix`, of both kinds of key.
 /// A key the layout did not build for this incarnation is left out.
-async fn list_incarnation<S: ObjectStore>(
+pub async fn list_incarnation<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
     prefix: &ObjectPrefix,
@@ -484,7 +494,11 @@ async fn list_incarnation<S: ObjectStore>(
         for object in &page.objects {
             if let Some(key) = layout.parse_segment_key(&object.key) {
                 if key.prefix == *prefix {
-                    listed.segment_starts.insert(key.start_offset);
+                    let segment = listed.segments.entry(key.start_offset).or_default();
+                    match key.object {
+                        SegmentObject::Log => segment.log_size = Some(object.size),
+                        SegmentObject::Index => segment.index_size = Some(object.size),
+                    }
                 }
             } else if let Some(key) = layout.parse_long_term_key(&object.key)
                 && key.prefix == *prefix

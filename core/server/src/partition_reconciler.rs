@@ -184,10 +184,12 @@
 use crate::geo_topics::GeoTopics;
 use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
-    build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
+    ChainRecovery, LoadedPartition, build_partition_fresh, load_partition_or_fence,
+    record_partition_retirement_fence,
 };
 use crate::peer_manifests::{NodePlace, PeerManifestLister};
 use crate::peer_positions::PeerPositionLister;
+use crate::server_error::ServerError;
 use crate::shadow_topics::{ShadowTopics, peer_log_of};
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
@@ -202,12 +204,15 @@ use iggy_binary_protocol::{
     WireIdentifier,
 };
 use iggy_common::{
-    ConsumerKind, IggyError, IggyTimestamp, StreamEncryption, check_critical_options,
+    ConsumerKind, IggyError, IggyTimestamp, PartitionStats, StreamEncryption, TopicRuntimeOptions,
+    check_critical_options,
 };
 use iggy_object_store::{TierJobCancelled, TierScope};
+use journal::superblock::PingPongSuperblock;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::AUTO_COMMIT_CLIENT_ID;
+use message_bus::IggyMessageBus;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::lifecycle::{
@@ -216,8 +221,9 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, RecoveryPlan, Segment, StreamKeyIdentity, TOPIC_OBJECT_RETRY,
-    delete_partitions_from_disk, object_prefix, read_created_revision,
+    IggyPartition, IggyPartitions, RecoveryPlan, Segment, StoreView, StoreViewRequest,
+    StreamKeyIdentity, TOPIC_OBJECT_RETRY, delete_partitions_from_disk, object_prefix,
+    read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -368,6 +374,9 @@ pub struct ReconcilerCtx {
     /// When the next pass over the partitions of geo topics may be staged,
     /// in microseconds since the Unix epoch.
     next_topic_object_check_at: Cell<u64>,
+    /// The tiered partitions whose segment chain is gone and that wait for
+    /// what the store holds of them, with what each asks of it.
+    chain_rebuilds: RefCell<AHashMap<IggyNamespace, StoreViewRequest>>,
 }
 
 impl ReconcilerCtx {
@@ -414,6 +423,7 @@ impl ReconcilerCtx {
             peer_manifests,
             peer_positions,
             next_topic_object_check_at: Cell::new(0),
+            chain_rebuilds: RefCell::new(AHashMap::new()),
         }
     }
 
@@ -542,6 +552,27 @@ impl ReconcilerCtx {
     fn forget_failures(&self, ns: IggyNamespace) {
         self.record_success(ns, FailureCause::Add);
         self.record_success(ns, FailureCause::Delete);
+        self.stop_waiting_for_chain(ns);
+    }
+
+    /// Note that the partition `ns` waits for the store to rebuild its chain
+    /// with what `request` asks of it. Returns whether it did not wait yet.
+    fn wait_for_chain(&self, ns: IggyNamespace, request: StoreViewRequest) -> bool {
+        let mut waiting = self.chain_rebuilds.borrow_mut();
+        let first = waiting.insert(ns, request).is_none();
+        self.shard
+            .metrics()
+            .set_partitions_awaiting_chain_rebuild(waiting.len());
+        first
+    }
+
+    fn stop_waiting_for_chain(&self, ns: IggyNamespace) {
+        let mut waiting = self.chain_rebuilds.borrow_mut();
+        if waiting.remove(&ns).is_some() {
+            self.shard
+                .metrics()
+                .set_partitions_awaiting_chain_rebuild(waiting.len());
+        }
     }
 }
 
@@ -1272,21 +1303,18 @@ async fn reconcile_target(
     };
 
     let built = if prior_life_on_disk {
-        load_partition_or_fence(
-            ctx.config.as_ref(),
+        Box::pin(load_prior_life(
+            ctx,
             ns,
-            partition_stats,
+            &partition_stats,
             &partition_metadata,
             topic_runtime,
-            ctx.cluster_id,
-            ctx.self_replica_id,
-            partition_metadata.replica_set(ctx.replica_count),
-            Rc::clone(&ctx.shard.bus),
             partitions,
-        )
+        ))
         .await
         .map(|partition| partition.map(Box::new))
     } else {
+        ctx.stop_waiting_for_chain(ns);
         build_partition_fresh(
             ctx.config.as_ref(),
             partitions.config(),
@@ -1357,9 +1385,14 @@ async fn reconcile_target(
         // knows, and the commit that moves metadata on brings the namespace
         // back.
         Ok(None) => Convergence::Converged,
+        // `load_prior_life` said why already.
+        Err(ServerError::PartitionChainMissing { .. }) => {
+            ctx.record_failure(ns, FailureCause::Add, now);
+            Convergence::Pending
+        }
         // Retrying cannot bring the history back; the tombstone keeps every
         // later check from rebuilding it empty.
-        Err(err @ crate::server_error::ServerError::PartitionLostWithStorage { .. }) => {
+        Err(err @ ServerError::PartitionLostWithStorage { .. }) => {
             error!(
                 shard = shard_id,
                 ns_raw = ns.inner(),
@@ -1383,6 +1416,138 @@ async fn reconcile_target(
             Convergence::Pending
         }
     }
+}
+
+/// Load the partition `ns` from the directory a prior life left on disk.
+///
+/// A tiered partition whose segment chain is gone fails the load while
+/// something below its local log may have left the disk. It then waits for
+/// what the store holds of it, read once this node passes its store identity
+/// check, and loads again with it. The wait ends with the load that rebuilt
+/// the chain or refused the partition.
+///
+/// # Errors
+/// [`ServerError::PartitionChainMissing`] while the partition waits for the
+/// store, and any error of the load.
+async fn load_prior_life(
+    ctx: &ReconcilerCtx,
+    ns: IggyNamespace,
+    partition_stats: &Arc<PartitionStats>,
+    partition_metadata: &Partition,
+    topic_runtime: TopicRuntimeOptions,
+    partitions: &IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let load = PriorLife {
+        ctx,
+        ns,
+        partition_stats,
+        partition_metadata,
+        topic_runtime,
+        partitions,
+    };
+    let waiting = ctx.chain_rebuilds.borrow().get(&ns).cloned();
+    let request = match waiting {
+        Some(request) => request,
+        None => match load.load(None).await {
+            Err(ServerError::PartitionChainMissing { request, .. }) => {
+                if ctx.wait_for_chain(ns, (*request).clone()) {
+                    warn!(
+                        shard = ctx.shard.id,
+                        stream_id = ns.stream_id(),
+                        topic_id = ns.topic_id(),
+                        partition_id = ns.partition_id(),
+                        from = request.from,
+                        front = request.front,
+                        "the segment chain of a tiered partition is gone; the partition waits \
+                         for the object store to account for the offsets below its local log"
+                    );
+                }
+                *request
+            }
+            loaded => return count_chain_recovery(ctx, loaded),
+        },
+    };
+    let missing = |request: StoreViewRequest| ServerError::PartitionChainMissing {
+        stream_id: ns.stream_id(),
+        topic_id: ns.topic_id(),
+        partition_id: ns.partition_id(),
+        request: Box::new(request),
+    };
+    let Some(reader) = ctx.shard.store_view_reader() else {
+        debug!(
+            shard = ctx.shard.id,
+            ns_raw = ns.inner(),
+            "the node does not pass its store identity check yet; the rebuild of the segment \
+             chain waits"
+        );
+        return Err(missing(request));
+    };
+    let scope = TierScope::new();
+    let view = match reader.read(request.clone(), scope.token()).await {
+        Ok(Ok(view)) => view,
+        Ok(Err(error)) => {
+            warn!(
+                shard = ctx.shard.id,
+                ns_raw = ns.inner(),
+                %error,
+                "the object store did not answer the read that rebuilds a lost segment chain; \
+                 it is read again"
+            );
+            return Err(missing(request));
+        }
+        Err(TierJobCancelled) => return Err(missing(request)),
+    };
+    let loaded = load.load(Some(&view)).await;
+    if let Err(ServerError::PartitionChainMissing { request, .. }) = &loaded {
+        ctx.wait_for_chain(ns, (**request).clone());
+        return loaded.map(|(partition, _)| partition);
+    }
+    ctx.stop_waiting_for_chain(ns);
+    count_chain_recovery(ctx, loaded)
+}
+
+/// What [`load_prior_life`] loads a partition with.
+struct PriorLife<'a> {
+    ctx: &'a ReconcilerCtx,
+    ns: IggyNamespace,
+    partition_stats: &'a Arc<PartitionStats>,
+    partition_metadata: &'a Partition,
+    topic_runtime: TopicRuntimeOptions,
+    partitions: &'a IggyPartitions<Rc<IggyMessageBus>, PingPongSuperblock>,
+}
+
+impl PriorLife<'_> {
+    async fn load(&self, store_view: Option<&StoreView>) -> Result<LoadedPartition, ServerError> {
+        let ctx = self.ctx;
+        Box::pin(load_partition_or_fence(
+            ctx.config.as_ref(),
+            self.ns,
+            Arc::clone(self.partition_stats),
+            self.partition_metadata,
+            self.topic_runtime,
+            ctx.cluster_id,
+            ctx.self_replica_id,
+            self.partition_metadata.replica_set(ctx.replica_count),
+            Rc::clone(&ctx.shard.bus),
+            self.partitions,
+            store_view,
+        ))
+        .await
+    }
+}
+
+/// Count what a load did about a lost segment chain.
+fn count_chain_recovery(
+    ctx: &ReconcilerCtx,
+    loaded: Result<LoadedPartition, ServerError>,
+) -> Result<Option<IggyPartition<Rc<IggyMessageBus>>>, ServerError> {
+    let (partition, chain) = loaded?;
+    match chain {
+        ChainRecovery::Kept => {}
+        ChainRecovery::Rebuilt => ctx.shard.metrics().record_chain_rebuild(),
+        ChainRecovery::Refused => ctx.shard.metrics().record_chain_rebuild_refusal(),
+    }
+    Ok(partition)
 }
 
 /// What the recovery of `retired_cluster_uid` took of the partition `ns` of
