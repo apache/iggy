@@ -20,6 +20,7 @@ pub mod bus;
 pub mod client;
 pub mod deps;
 pub mod executor;
+pub mod geo;
 pub mod network;
 pub mod packet;
 pub mod ready_queue;
@@ -279,6 +280,8 @@ pub struct Simulator {
     /// gives the rebuilt shards the same one.
     repair_ring_bytes_max: Option<usize>,
     consumer_offsets_max: usize,
+    /// Geo topics of this cluster, see [`Self::enable_geo`]. `None` without.
+    geo: Option<geo::SimGeo>,
     // The liveness fence directory survives replica restarts and is removed last.
     _system_directory: Option<tempfile::TempDir>,
 }
@@ -636,6 +639,7 @@ impl Simulator {
             every_partition_due: false,
             repair_ring_bytes_max,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
+            geo: None,
             _system_directory: system_directory,
         }
     }
@@ -1099,6 +1103,7 @@ impl Simulator {
         self.run_pumps();
 
         self.reconcile_transitions();
+        self.drive_geo();
         self.run_pumps();
 
         // Phase 2: Drain each replica's outbox into the network.
@@ -1314,6 +1319,7 @@ impl Simulator {
     fn reconcile_transitions(&mut self) {
         let now = self.realtime_micros();
         let timeout = rebalancing_timeout_micros();
+        let builds_geo_topics = self.geo.is_some();
         for (index, replica) in self.replicas.iter().enumerate() {
             if self
                 .crashed
@@ -1349,6 +1355,17 @@ impl Simulator {
                         true,
                     );
                 }
+            }
+            // A geo topic comes from a client and not from a fixture, so its
+            // partitions are built as the production reconciler builds every
+            // committed partition.
+            if builds_geo_topics {
+                targets.extend(
+                    streams
+                        .read(geo_partitions)
+                        .into_iter()
+                        .map(|namespace| (namespace, true)),
+                );
             }
             for transition in streams.consumer_group_pending_revocations() {
                 targets.insert(
@@ -1799,6 +1816,9 @@ impl Simulator {
                 replica.deferred_partitions.borrow_mut().insert(namespace);
             }
         }
+
+        // After the partitions, as boot wires the store once it built them.
+        self.wire_geo(replica_index);
 
         // Reconnect to the network and mark the replica live again.
         self.network
@@ -2333,6 +2353,24 @@ fn materialise_partition(
     true
 }
 
+/// Every committed partition of a geo topic.
+fn geo_partitions(inner: &metadata::stm::stream::StreamsInner) -> Vec<IggyNamespace> {
+    let mut namespaces = Vec::new();
+    for (stream_id, stream) in &inner.items {
+        for (topic_id, topic) in &stream.topics {
+            if topic.is_geo() {
+                namespaces.extend(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|partition| IggyNamespace::new(stream_id, topic_id, partition.id)),
+                );
+            }
+        }
+    }
+    namespaces
+}
+
 /// The partition group, incarnation and view of a message the persist gate
 /// holds until the replica's view is durable, or `None` for any other message.
 /// `PrepareOk` names no incarnation, so it is left out. A `StartViewChange` is
@@ -2436,6 +2474,9 @@ mod stale_prepare_commit_tests;
 
 #[cfg(test)]
 mod placed_batches_tests;
+
+#[cfg(test)]
+mod geo_tests;
 
 #[cfg(test)]
 mod replication_flow_tests;
