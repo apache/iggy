@@ -209,6 +209,10 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
         self.last_op.get()
     }
 
+    fn slot_count(&self) -> Option<usize> {
+        self.slot_count.get()
+    }
+
     /// Slots left before a checkpoint is forced, mirroring
     /// `PrepareJournal::remaining_capacity`: the ring holds `slot_count`, everything
     /// at or below the watermark is reclaimable, so `last_op - snapshot_op` is
@@ -368,63 +372,20 @@ impl<S: Storage<Buffer = Vec<u8>>> Journal for SimJournal<S> {
     ///
     /// The watermark moves last, as in `PrepareJournal::drain`: advancing it before
     /// the entries are gone would make live entries look evictable.
-    async fn drain(&self, ops: RangeInclusive<u64>) -> std::io::Result<Vec<Self::Entry>> {
+    async fn drain(&self, ops: RangeInclusive<u64>) -> std::io::Result<usize> {
         #[cfg(debug_assertions)]
         let _guard = JournalAccessGuard::new(&self.accessing);
         let end_op = *ops.end();
-        let doomed: Vec<u64> = {
-            let headers = unsafe { &*self.headers.get() };
-            let mut doomed: Vec<u64> = headers
-                .keys()
-                .copied()
-                .filter(|op| ops.contains(op))
-                .collect();
-            // Sorted: the trait promises op order, and hash order would make a
-            // replay of this drain diverge.
-            doomed.sort_unstable();
-            doomed
-        };
-
-        let mut drained = Vec::with_capacity(doomed.len());
-        for op in doomed {
-            // Read before removing, through `Storage` rather than the
-            // `MemStorage`-only sync path, so this stays generic. The borrow does
-            // NOT span the read, unlike `entry`'s: the block ends it and yields only
-            // `Copy` data, so the `.await` holds no reference into the `UnsafeCell`.
-            // Deliberate, since `drain` invalidates every outstanding
-            // `header`/`previous_header` reference too.
-            let located = {
-                let headers = unsafe { &*self.headers.get() };
-                let offsets = unsafe { &*self.offsets.get() };
-                headers
-                    .get(&op)
-                    .and_then(|header| offsets.get(&op).map(|offset| (header.size, *offset)))
-            };
-            // Propagated, not swallowed. Dropping the entry loses a WAL record while
-            // reporting a successful drain; `PrepareJournal` returns the error and
-            // poisons itself, and a harness surviving what production refuses to
-            // cannot find the bug this path exists to catch.
-            if let Some((size, offset)) = located {
-                let buffer = self.storage.read_at(offset, vec![0; size as usize]).await?;
-                let message =
-                    Message::try_from(Owned::<4096>::copy_from_slice(&buffer)).map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!("drain: op {op} does not decode as a prepare"),
-                        )
-                    })?;
-                drained.push(message);
-            }
-            let headers = unsafe { &mut *self.headers.get() };
-            let offsets = unsafe { &mut *self.offsets.get() };
-            headers.remove(&op);
-            offsets.remove(&op);
-        }
+        let headers = unsafe { &mut *self.headers.get() };
+        let offsets = unsafe { &mut *self.offsets.get() };
+        let held = headers.len();
+        headers.retain(|op, _| !ops.contains(op));
+        offsets.retain(|op, _| !ops.contains(op));
 
         if end_op > self.snapshot_op.get() {
             self.snapshot_op.set(end_op);
         }
-        Ok(drained)
+        Ok(held - headers.len())
     }
 }
 

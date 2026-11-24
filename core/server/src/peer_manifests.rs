@@ -53,7 +53,7 @@ use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::StreamsInner;
 use server_common::sharding::IggyNamespace;
 use shard::ListedPeerManifest;
-use shard::shards_table::calculate_shard_assignment;
+use shard::shards_table::PartitionShards;
 use tracing::{debug, warn};
 
 use crate::shell::ServerShard;
@@ -92,7 +92,7 @@ struct Wanted {
 pub struct NodePlace {
     pub self_replica_id: u8,
     pub replica_count: u8,
-    pub total_shards: u16,
+    pub partition_shards: PartitionShards,
 }
 
 impl PeerManifestLister {
@@ -193,7 +193,7 @@ impl PeerManifestLister {
             }
             state.borrow_mut().settle(failed, now, interval);
             for (origin, manifests) in found {
-                hand_out(&shard, &origin, now, manifests, place.total_shards);
+                hand_out(&shard, &origin, now, manifests, place.partition_shards);
             }
         });
     }
@@ -302,11 +302,12 @@ fn hand_out(
     origin: &str,
     now: IggyTimestamp,
     manifests: Vec<ListedPeerManifest>,
-    total_shards: u16,
+    partition_shards: PartitionShards,
 ) {
-    let mut by_shard: Vec<Vec<ListedPeerManifest>> = vec![Vec::new(); usize::from(total_shards)];
+    let mut by_shard: Vec<Vec<ListedPeerManifest>> =
+        vec![Vec::new(); usize::from(partition_shards.shard_count())];
     for manifest in manifests {
-        let owner = calculate_shard_assignment(&manifest.namespace, u32::from(total_shards));
+        let owner = partition_shards.shard_for(&manifest.namespace);
         if let Some(owned) = by_shard.get_mut(usize::from(owner)) {
             owned.push(manifest);
         }

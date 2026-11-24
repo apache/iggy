@@ -413,6 +413,23 @@ pub struct ClusterCoordinatorConfig {
     /// shard-0 parallelism more than replicas do.
     #[serde(default)]
     pub skip_shard_zero_for_clients: bool,
+    /// Place no partition on shard 0, so a stall of the metadata plane there
+    /// cannot stop the heartbeats of partition groups. Keep
+    /// `skip_shard_zero_for_replicas` on with it, or a replica link can still
+    /// sit on shard 0. With two shards every partition lands on shard 1. A
+    /// node with one shard refuses to start with this on, because no shard
+    /// would own a partition. Placement is recomputed at every boot and no
+    /// shard id is stored, so a restart may change this freely. Run the same
+    /// value on every node: a node that differs still routes correctly, but
+    /// frames between it and its peers can take an extra hop between shards,
+    /// as with differing shard counts. In both cases a peer can send
+    /// partition frames over link 0, and a node keeps that link on shard 0
+    /// when the shard range of the link holds only shard 0. Nodes with the
+    /// same shard count and the same value never do that. Older server
+    /// binaries reject a TOML config containing this key. Remove the key
+    /// before a rollback to one.
+    #[serde(default)]
+    pub skip_shard_zero_for_partitions: bool,
 }
 
 fn default_skip_shard_zero_for_replicas() -> bool {
@@ -429,6 +446,7 @@ impl Default for ClusterCoordinatorConfig {
             skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
             replica_connections_per_peer: default_replica_connections_per_peer(),
             skip_shard_zero_for_clients: false,
+            skip_shard_zero_for_partitions: false,
         }
     }
 }

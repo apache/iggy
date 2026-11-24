@@ -26,8 +26,8 @@ pub enum AppRoute {
     Explore,
     #[at("/runs/:uuid")]
     Run { uuid: String },
-    /// The run link from before `/runs`. Embed snippets on other pages still point here, so it
-    /// moves to the run's page.
+    /// The run link from before `/runs`. Embed snippets on other pages still point here. The
+    /// server moves it to the run's page with a 301, so this route serves `trunk serve` only.
     #[at("/benchmarks/:uuid")]
     OldRun { uuid: String },
     /// The runs are in the query: `?runs=a,b,c`, the baseline first.
@@ -37,7 +37,7 @@ pub enum AppRoute {
     #[at("/compare/releases")]
     CompareReleases,
     /// The link form from before the query. It stays an alias of `?runs=left,right`, so shared
-    /// links keep working.
+    /// links keep working. The server moves it to the query form with a 301.
     #[at("/compare/:left/:right")]
     ComparePair { left: String, right: String },
     /// The OpenMessaging Benchmark runs, a part of the site of its own.
@@ -77,6 +77,17 @@ pub fn moved(props: &MovedProps) -> Html {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bench_dashboard_shared::pages::PAGE_PATHS;
+
+    #[test]
+    fn given_router_when_listing_routes_should_name_the_pages_that_the_server_serves() {
+        let mut routes = AppRoute::routes();
+        routes.sort_unstable();
+        let mut pages = PAGE_PATHS.to_vec();
+        pages.sort_unstable();
+
+        assert_eq!(routes, pages);
+    }
 
     #[test]
     fn given_releases_path_when_recognized_should_open_releases_compare_not_run_pair() {

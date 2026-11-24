@@ -713,6 +713,22 @@ replica_connections_per_peer = 1
 # from shard-0 parallelism more than replicas do.
 skip_shard_zero_for_clients = false
 
+# Place no partition on shard 0, so a stall of the metadata plane there cannot
+# stop the heartbeats of partition groups. Keep skip_shard_zero_for_replicas
+# on with it, or a replica link can still sit on shard 0. With two shards
+# every partition lands on shard 1. A server with one shard refuses to start
+# with this on, because no shard would own a partition. Placement is
+# recomputed at every boot and no shard id is stored, so a restart may change
+# this freely. Run the same value on every node: a node that differs still
+# routes correctly, but frames between it and its peers can take an extra hop
+# between shards, as with differing shard counts. In both cases a peer can
+# send partition frames over link 0, and a node keeps that link on shard 0
+# when the shard range of the link holds only shard 0. Nodes with the same
+# shard count and the same value never do that.
+# Older server binaries reject a TOML config containing this key. Remove the
+# key before a rollback to one.
+skip_shard_zero_for_partitions = false
+
 # Full roster of cluster members. Byte-identical on every node. The running
 # node's identity is resolved at launch from the '--replica-id <N>' CLI
 # flag, which selects the entry in this list that describes the current
@@ -966,10 +982,10 @@ key_file = "core/certs/iggy_key.pem"
 # Metadata consensus plane tunables (shard 0's VSR replica: users,
 # streams, topics, sessions). Size these together: a deeper prepare queue
 # admits more concurrent in-flight metadata ops (e.g. login storms), and
-# the journal must hold enough slots that a forced checkpoint (triggered
-# when remaining slots fall to the checkpoint margin, which itself is
-# max(64, prepare_queue_depth)) stays rare. Validation enforces
-# journal_slots >= 4 * max(64, prepare_queue_depth).
+# the journal must hold enough slots that a background checkpoint, started
+# once half of them committed, ends before the remaining slots fall to the
+# checkpoint margin, max(64, prepare_queue_depth), where appends wait for it.
+# Validation enforces journal_slots >= 4 * max(64, prepare_queue_depth).
 [metadata]
 # Depth of the metadata prepare queue: how many uncommitted metadata ops
 # may be in flight at once. Submits beyond it are rejected with the
@@ -980,12 +996,36 @@ key_file = "core/certs/iggy_key.pem"
 prepare_queue_depth = 32
 
 # Size of the metadata WAL's in-memory index, in slots (one committed but
-# not-yet-snapshotted op per slot). Larger values buy more headroom
-# between forced checkpoints at the cost of memory and bigger WAL
-# rewrites per checkpoint. Reducing this for an existing data directory is
-# refused at boot if the live WAL suffix collides in the smaller index;
-# restore the previous value to recover.
-journal_slots = 1024
+# not-yet-snapshotted op per slot). A background checkpoint starts once half
+# of them committed past the last one; the checkpoint margin is the fallback.
+# Larger values buy rarer checkpoints and more time for each, at the cost of
+# index memory (one prepare header per slot, about 17 MiB at the default) and
+# a longer replay at boot. The maximum is 1048576.
+# Reducing this for an existing data directory is refused at boot if the live
+# WAL suffix collides in the smaller index; restore the previous value to
+# recover. An older server with a smaller default counts as a reduction.
+# Before a rollback to it, set this key to the value that the node runs, also
+# when the boot would pass: without the key the node runs 1024 beside peers
+# with more.
+# Run the same value on every node. A replica that joins by state transfer
+# must hold every op after the snapshot it receives. A replica with fewer
+# slots than the primary refuses a transfer whose tail does not fit and logs
+# an error that names this key.
+# Nodes of different server versions refuse the replica links of each other,
+# so a version upgrade stops every node first: see the Upgrading page of the
+# docs. Two defaults of this key can meet only between builds of one version.
+# A build from before this default uses 1024 when the key is absent. It does
+# not refuse a transfer: it stalls on the tail, takes no later op and sends
+# no ack, until it restarts with at least the value of the primary. To
+# replace such builds node by node, set journal_slots = 1024 on each node as
+# you replace it, so that every node runs 1024 meanwhile. After the last
+# node, raise the value node by node: the backups first, the metadata
+# primary last. The order holds only while the primary stays the same. If a
+# view change makes a raised node the primary before you raised every node,
+# a node with the smaller value can refuse a transfer as described above.
+# Raise that node next: it joins once it restarts with the value of the
+# primary.
+journal_slots = 65536
 
 # Initial capacity of the metadata session registry, shared by binary clients
 # and HTTP sessions. Live and unretired sessions occupy slots. A full registry
@@ -1212,8 +1252,10 @@ evicted_ring_bytes_max = "64 MiB"
 # their buffers, about 4 KiB each. A buffer counts for its whole allocation,
 # which is a multiple of 4 KiB, so a small op costs far more here than its
 # length. The count leaves out the map overhead of the rings, so it is a
-# lower bound. Each shard gets an equal share, because a shard can shed only
-# its own partitions. Must be > 0, and the share must be at least 1 byte.
+# lower bound. Each shard that owns partitions gets an equal share, because a
+# shard can shed only its own partitions. With
+# cluster.coordinator.skip_shard_zero_for_partitions on, shard 0 owns none.
+# Must be > 0, and the share must be at least 1 byte.
 # Past its share, a shard sheds in three steps on each tick:
 # 1. The rings that grew earliest release batches to their segments, until
 #    the shard is one eighth under the share.
@@ -1252,9 +1294,9 @@ checkpoint_max_delay = "5 min"
 
 # Node-wide cap on the partition WAL bytes above the checkpoints. A boot loads
 # these bytes into memory again, so this bounds what a restart reloads. Each
-# shard gets an equal share. Past its share, a shard queues checkpoints for
-# the partitions whose first op since their checkpoint is oldest, until the
-# queued bytes cover the excess. The queue paces these checkpoints like the
+# shard that owns partitions gets an equal share. Past its share, a shard
+# queues checkpoints for the partitions whose first op since their checkpoint
+# is oldest, until the queued bytes cover the excess. The queue paces these checkpoints like the
 # others. A boot reloads at most the share plus what the partitions write
 # while they wait in the queue. Must be > 0, and the share must be at least
 # 1 byte. partition_wal_reload_bytes reports the bytes of a shard,
