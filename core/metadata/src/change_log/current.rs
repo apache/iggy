@@ -345,6 +345,7 @@ impl Projection<'_> {
                 for (user_id, name) in users
                     .personal_access_token_name_index
                     .range((lower, Bound::Unbounded))
+                    .map(|(key, _)| key)
                 {
                     let (Some(user), Some(token), Ok(wire_name)) = (
                         users.items.get(*user_id as usize),

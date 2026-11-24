@@ -122,35 +122,179 @@ impl ShardsTable for PapayaShardsTable {
     }
 }
 
-/// Deterministic partition-to-shard assignment using Murmur3 hash.
+/// The shards of one node that host partitions, and the hash that places a
+/// partition namespace on one of them.
 ///
-/// Given a packed `IggyNamespace` and the total number of shards, returns the
-/// shard id that should own the partition.  The upper bits of the Murmur3 hash
-/// are used to avoid the weak lower bits for small integer inputs.
-#[must_use]
-pub fn calculate_shard_assignment(ns: &IggyNamespace, shard_count: u32) -> u16 {
-    calculate_shard_from_consensus_ns(ns.inner(), shard_count)
+/// The router, the reconciler and boot recovery must place with the same value,
+/// or a partition loads on one shard while its frames route to another. A node
+/// places by its own configuration alone: every inbound frame is hashed again
+/// by the receiver, and no shard index crosses the wire. Nodes whose shard
+/// count or skip flag differ therefore stay correct, but a group can then sit
+/// on different shard indexes on the two nodes, so its frames arrive on a link
+/// of another shard range and commit batches between them split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartitionShards {
+    count: u16,
+    skip_shard_zero: bool,
 }
 
-/// Raw-`u64` variant of [`calculate_shard_assignment`].
-///
-/// Consensus control-plane messages (`StartViewChange`, `DoViewChange`,
-/// `StartView`, `Commit`) carry a `namespace: u64` in their header that is
-/// NOT an [`IggyNamespace`] bit-packed layout — it's an opaque consensus
-/// namespace picked by the partition group. Hash the raw `u64` with the
-/// same algorithm as partition lookups so the shard that owns the
-/// consensus group is deterministically the same across every node. Single
-/// shard (`shard_count == 1`) always returns `0` regardless of `ns`.
-#[must_use]
-pub fn calculate_shard_from_consensus_ns(ns: u64, shard_count: u32) -> u16 {
-    // Zero shards is a bootstrap invariant violation: the cluster validator
-    // rejects it at config load, and `IggyShard` ctors also guarantee at
-    // least one shard. A debug_assert here makes the invariant explicit so
-    // any future code path that skips the validator trips loudly before
-    // the `%` panics with an opaque "attempt to mod by zero".
-    debug_assert!(shard_count > 0, "shard_count must be > 0");
-    let mut hasher = Murmur3Hasher::default();
-    hasher.write_u64(ns);
-    let hash = hasher.finish32();
-    ((hash >> 16) % shard_count) as u16
+impl PartitionShards {
+    /// `count` is the node's shard count. With `skip_shard_zero` and more than
+    /// one shard, no partition lands on shard 0, which runs the metadata plane.
+    #[must_use]
+    pub const fn new(count: u16, skip_shard_zero: bool) -> Self {
+        // The config validator and the shard ctors guarantee a shard. A zero
+        // count would otherwise surface as an opaque remainder-by-zero panic.
+        debug_assert!(count > 0, "shard count must be > 0");
+        Self {
+            count,
+            skip_shard_zero,
+        }
+    }
+
+    /// Every shard of the node, shard 0 included.
+    #[must_use]
+    pub const fn shard_count(self) -> u16 {
+        self.count
+    }
+
+    #[must_use]
+    pub const fn skip_shard_zero(self) -> bool {
+        self.skip_shard_zero
+    }
+
+    /// The shards that own partitions. The per-node partition budgets split
+    /// between them only. Boot refuses `skip_shard_zero` on a node with one
+    /// shard, and that shard still owns every partition here, so a test shard
+    /// built that way cannot divide by zero.
+    #[must_use]
+    pub const fn owner_count(self) -> u16 {
+        if self.skip_shard_zero && self.count > 1 {
+            self.count - 1
+        } else {
+            self.count
+        }
+    }
+
+    /// The lowest shard that owns partitions. The shards below it own none.
+    #[must_use]
+    pub const fn first_owner(self) -> u16 {
+        self.count - self.owner_count()
+    }
+
+    /// The shard that owns the partition at `namespace`.
+    #[must_use]
+    pub fn shard_for(self, namespace: &IggyNamespace) -> u16 {
+        self.shard_for_consensus_ns(namespace.inner())
+    }
+
+    /// The shard that owns the consensus group `ns`.
+    ///
+    /// Consensus control-plane messages (`StartViewChange`, `DoViewChange`,
+    /// `StartView`, `Commit`) carry the group's `namespace: u64` raw. A
+    /// partition group uses its packed [`IggyNamespace`], and
+    /// [`Self::shard_for`] hashes the same value, so a partition and its group
+    /// share a shard.
+    /// The upper 16 bits of the Murmur3 hash are used because the low bits are
+    /// weak for small integer inputs.
+    #[must_use]
+    pub fn shard_for_consensus_ns(self, ns: u64) -> u16 {
+        let mut hasher = Murmur3Hasher::default();
+        hasher.write_u64(ns);
+        let high = (hasher.finish32() >> 16) as u16;
+        self.first_owner() + high % self.owner_count()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    const SHARD_COUNTS: [u16; 5] = [1, 2, 3, 4, 8];
+    /// Enough namespaces that every shard of the largest count gets one.
+    const NAMESPACES: u64 = 4096;
+
+    /// Owners under the formula before the skip flag existed, one per entry of
+    /// `SHARD_COUNTS`, computed with that code.
+    const UNSKIPPED_OWNERS: [(u64, [u16; 5]); 6] = [
+        (0, [0, 1, 1, 1, 5]),
+        (1, [0, 1, 0, 3, 7]),
+        (42, [0, 1, 2, 3, 7]),
+        (1 << 20, [0, 1, 1, 1, 1]),
+        (0xDEAD_BEEF, [0, 1, 0, 1, 5]),
+        (u64::MAX >> 1, [0, 1, 0, 1, 1]),
+    ];
+
+    fn owners(shards: PartitionShards) -> BTreeSet<u16> {
+        (0..NAMESPACES)
+            .map(|ns| shards.shard_for_consensus_ns(ns))
+            .collect()
+    }
+
+    #[test]
+    fn given_skip_and_several_shards_when_placing_should_use_every_shard_but_zero() {
+        for count in SHARD_COUNTS.into_iter().filter(|count| *count > 1) {
+            let shards = PartitionShards::new(count, true);
+            assert_eq!(
+                owners(shards),
+                (1..count).collect::<BTreeSet<_>>(),
+                "{count} shards"
+            );
+            assert_eq!(shards.owner_count(), count - 1, "{count} shards");
+            assert_eq!(shards.first_owner(), 1, "{count} shards");
+        }
+    }
+
+    #[test]
+    fn given_one_shard_when_placing_should_always_pick_shard_zero() {
+        for skip_shard_zero in [false, true] {
+            let shards = PartitionShards::new(1, skip_shard_zero);
+            assert_eq!(
+                owners(shards),
+                BTreeSet::from([0]),
+                "skip_shard_zero = {skip_shard_zero}"
+            );
+            assert_eq!(
+                shards.owner_count(),
+                1,
+                "skip_shard_zero = {skip_shard_zero}"
+            );
+            assert_eq!(
+                shards.first_owner(),
+                0,
+                "skip_shard_zero = {skip_shard_zero}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_no_skip_when_placing_should_keep_the_unskipped_owners() {
+        for (ns, expected) in UNSKIPPED_OWNERS {
+            let actual = SHARD_COUNTS
+                .map(|count| PartitionShards::new(count, false).shard_for_consensus_ns(ns));
+            assert_eq!(actual, expected, "namespace {ns:#x}");
+        }
+        assert_eq!(
+            owners(PartitionShards::new(4, false)),
+            BTreeSet::from([0, 1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn given_a_partition_when_placing_should_put_it_on_the_shard_of_its_consensus_group() {
+        for count in SHARD_COUNTS {
+            for skip_shard_zero in [false, true] {
+                let shards = PartitionShards::new(count, skip_shard_zero);
+                for partition in 0..64 {
+                    let namespace = IggyNamespace::new(1, 2, partition);
+                    assert_eq!(
+                        shards.shard_for(&namespace),
+                        shards.shard_for_consensus_ns(namespace.inner()),
+                        "{shards:?}, partition {partition}"
+                    );
+                }
+            }
+        }
+    }
 }

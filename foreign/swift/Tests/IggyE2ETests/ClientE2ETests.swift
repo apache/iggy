@@ -356,7 +356,7 @@ struct UserE2ETests {
             try await client.updatePermissions(userID, permissions: nil)
             #expect(try await client.getUser(userID)?.permissions == nil)
             try await client.deleteUser(userID)
-            #expect(try await client.getUser(userID) == nil)
+            #expect(try await client.getUser(Identifier(named: updated.username)) == nil)
         }
     }
 

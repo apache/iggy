@@ -19,8 +19,9 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use futures::future::join_all;
+use iggy::prelude::locking::IggyRwLockFn;
 use iggy::prelude::*;
-use iggy_common::MAX_METADATA_CHANGES_LIMIT;
+use iggy_common::{MAX_METADATA_CHANGES_LIMIT, VsrSessionControl};
 use integration::harness::{TestHarness, disk};
 use integration::iggy_harness;
 use tokio::time::sleep;
@@ -30,8 +31,8 @@ const WRITERS: usize = 3;
 const STREAMS_PER_WRITER: usize = 5;
 const STREAMS: [MetadataChangeGroup; 1] = [MetadataChangeGroup::Streams];
 const SESSIONS: [MetadataChangeGroup; 1] = [MetadataChangeGroup::Sessions];
-// With `journal_slots = 256` and the checkpoint margin, every node
-// checkpoints and drains its journal once 192 operations committed.
+// With `journal_slots = 256`, every node checkpoints and drains its
+// journal once 128 operations committed.
 const STREAMS_PAST_CHECKPOINT: usize = 220;
 const CHECKPOINT_MARKER: &str = "forced checkpoint completed";
 const INSTALL_MARKER: &str = "metadata state transfer installed";
@@ -206,6 +207,87 @@ async fn given_checkpoints_and_state_transfer_when_following_should_serve_record
     assert_eq!(installed[..reference.len()], reference[..]);
 }
 
+#[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
+async fn given_checkpointed_token_sessions_when_the_primary_changes_should_revoke_only_the_deleted_token_after_transfer(
+    harness: &mut TestHarness,
+) {
+    let leader = disk::leader_node_index(harness).await;
+    let replacement = (leader + 2) % harness.cluster_size();
+    let root = harness.root_client_for_node(leader).await.expect("root");
+    let mut sessions = Vec::new();
+    for name in ["retire", "keep"] {
+        let token = root
+            .create_personal_access_token(name, PersonalAccessTokenExpiry::NeverExpire)
+            .await
+            .expect("create token");
+        let client = harness
+            .node(leader)
+            .tcp_client()
+            .expect("TCP endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        client
+            .login_with_personal_access_token(&token.token)
+            .await
+            .expect("token login");
+        let identity = {
+            let handle = client.client();
+            let transport = handle.read().await;
+            let ClientWrapper::Tcp(tcp) = &*transport else {
+                panic!("expected TCP");
+            };
+            tcp.session_identity().await.expect("bound session")
+        };
+        sessions.push((client, identity));
+    }
+    create_streams(&root, "tokens", STREAMS_PAST_CHECKPOINT).await;
+    for node in 0..harness.cluster_size() {
+        await_marker(harness, node, CHECKPOINT_MARKER).await;
+    }
+    harness
+        .restart_node_from_clean_slate(replacement)
+        .expect("replace follower");
+    await_marker(harness, replacement, INSTALL_MARKER).await;
+    let reader = node_reader(harness, replacement).await;
+    let current = MetadataChangesQuery {
+        start: MetadataChangeStart::Current(None),
+        groups: vec![MetadataChangeGroup::Users, MetadataChangeGroup::Sessions],
+        limit: MAX_METADATA_CHANGES_LIMIT,
+        ..MetadataChangesQuery::default()
+    };
+    let installed = until_ok(&reader, &current).await;
+    let has_session = |items: &[MetadataCurrentItem], index: usize| {
+        let (_, expected) = &sessions[index];
+        items.iter().any(|item| {
+            matches!(item, MetadataCurrentItem::Session(session)
+            if session.client_id == expected.client_id && session.session == expected.session)
+        })
+    };
+    assert!(has_session(&installed.items, 0) && has_session(&installed.items, 1));
+    let anchor = installed.next.expect("installed frontier");
+    harness
+        .kill_node(leader)
+        .expect("stop the original primary");
+    create_after_failover(harness, replacement, "after-token-failover")
+        .await
+        .delete_personal_access_token("retire")
+        .await
+        .expect("delete token");
+    let retired = &sessions[0].1;
+    follow(&reader, &anchor, &SESSIONS, |records| {
+        records.iter().any(|record| {
+            matches!(&record.change, MetadataChange::SessionClosed(closed)
+            if closed.client_id == retired.client_id && closed.session == retired.session
+            && closed.reason == MetadataSessionClosedReason::Revoked)
+        })
+    })
+    .await;
+    let remaining = until_ok(&reader, &current).await;
+    assert!(!has_session(&remaining.items, 0));
+    assert!(has_session(&remaining.items, 1));
+}
+
 #[iggy_harness(
     cluster_nodes = 3,
     server(
@@ -249,7 +331,7 @@ async fn node_readers(harness: &TestHarness) -> Vec<IggyClient> {
 
 /// An HTTP client of one node. HTTP reads answer from the node they reach,
 /// so each reader sees that node's own log.
-async fn node_reader(harness: &TestHarness, node: usize) -> IggyClient {
+pub(super) async fn node_reader(harness: &TestHarness, node: usize) -> IggyClient {
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
         let builder = harness.node(node).http_client().expect("HTTP endpoint");
@@ -305,7 +387,7 @@ async fn create_streams(writer: &IggyClient, label: &str, count: usize) {
 /// Create a stream through `node` while the cluster elects a new primary. An
 /// attempt whose reply was lost may have committed, so an existing name
 /// counts as done.
-async fn create_after_failover(harness: &TestHarness, node: usize, name: &str) {
+async fn create_after_failover(harness: &TestHarness, node: usize, name: &str) -> IggyClient {
     let deadline = Instant::now() + CONVERGE_TIMEOUT;
     loop {
         if let Ok(client) = harness.root_client_for_node(node).await {
@@ -313,7 +395,7 @@ async fn create_after_failover(harness: &TestHarness, node: usize, name: &str) {
                 .create_stream(name, &StreamCreateOptions::default())
                 .await
             {
-                Ok(_) | Err(IggyError::StreamNameAlreadyExists(_)) => return,
+                Ok(_) | Err(IggyError::StreamNameAlreadyExists(_)) => return client,
                 Err(_) => {}
             }
         }

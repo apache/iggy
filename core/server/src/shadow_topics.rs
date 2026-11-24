@@ -767,12 +767,16 @@ fn shadow_streams_of<'a>(
     inner: &'a StreamsInner,
     origin: &'a str,
 ) -> impl Iterator<Item = (usize, &'a Stream)> + 'a {
-    inner.items.iter().filter(move |(_, stream)| {
-        stream
-            .shadow
-            .as_ref()
-            .is_some_and(|shadow| shadow.origin == origin)
-    })
+    inner
+        .items
+        .iter()
+        .map(|(stream_id, stream)| (stream_id, stream.as_ref()))
+        .filter(move |(_, stream)| {
+            stream
+                .shadow
+                .as_ref()
+                .is_some_and(|shadow| shadow.origin == origin)
+        })
 }
 
 /// A detach or a removal that committed metadata lacks for `origin`.

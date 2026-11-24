@@ -46,6 +46,10 @@ impl CliCommand for DeletePersonalAccessTokenCmd {
         )
     }
 
+    fn deleted_token(&self) -> Option<String> {
+        Some(self.delete_token.name.clone())
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         client
             .delete_personal_access_token(&self.delete_token.name)

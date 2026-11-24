@@ -42,13 +42,15 @@ pub(super) struct Lease {
 
 pub struct SessionActivity {
     session: ConsumerSession,
+    pub(crate) source_deadline: u64,
     last_seen: Cell<Instant>,
 }
 
 impl SessionActivity {
-    pub(crate) fn new(session: ConsumerSession) -> Self {
+    pub(crate) fn new(session: ConsumerSession, source_deadline: u64) -> Self {
         Self {
             session,
+            source_deadline,
             last_seen: Cell::new(Instant::now()),
         }
     }
@@ -203,12 +205,16 @@ impl ConsumerGroupLiveness {
         &mut self,
         now: Instant,
         timeout: Duration,
+        now_micros: u64,
     ) -> Vec<ConsumerSession> {
         let mut sessions = Vec::new();
         self.local_sessions.retain(|_, activity| {
             let Some(activity) = activity.upgrade() else {
                 return false;
             };
+            if now_micros >= activity.source_deadline {
+                return false;
+            }
             if now.saturating_duration_since(activity.last_seen.get()) < timeout {
                 sessions.push(activity.session);
             }
@@ -510,19 +516,20 @@ mod tests {
             client_id: 1,
             session: 2,
         };
-        let activity = Rc::new(SessionActivity::new(identity));
+        let activity = Rc::new(SessionActivity::new(identity, 100));
         let mut tracker = ConsumerGroupLiveness::default();
         tracker.observe_local_session(&activity);
         let now = Instant::now();
-        assert_eq!(tracker.local_activity(now, TIMEOUT), vec![identity]);
-        assert_eq!(tracker.local_activity(now + TIMEOUT, TIMEOUT), []);
+        assert_eq!(tracker.local_activity(now, TIMEOUT, 99), vec![identity]);
+        assert_eq!(tracker.local_activity(now + TIMEOUT, TIMEOUT, 99), []);
         activity.touch();
         assert_eq!(
-            tracker.local_activity(Instant::now(), TIMEOUT),
+            tracker.local_activity(Instant::now(), TIMEOUT, 99),
             vec![identity]
         );
+        assert_eq!(tracker.local_activity(now, TIMEOUT, 100), []);
         drop(activity);
-        assert_eq!(tracker.local_activity(now, TIMEOUT), []);
+        assert_eq!(tracker.local_activity(now, TIMEOUT, 99), []);
         assert!(tracker.local_sessions.is_empty());
     }
 }

@@ -19,7 +19,7 @@ use crate::change_log::{
     ChangeLogCapacities, ChangeLogError, MetadataChangeLog, change_actor, session_closed,
     session_registered, session_revoked,
 };
-use crate::impls::metadata::IggySnapshot;
+use crate::impls::metadata::{IggySnapshot, Revocation};
 use crate::stm::authz::{GatedApply, reject_stale_session};
 use crate::stm::snapshot::{MetadataSnapshot, RestoreSnapshot, Snapshot, SnapshotError};
 use crate::stm::{ApplyContext, StateMachine};
@@ -31,7 +31,7 @@ use iggy_binary_protocol::WireDecode;
 use iggy_binary_protocol::consensus::{CHECKSUM_UNSEALED, Operation, PrepareHeader};
 use iggy_binary_protocol::requests::system::FinalizeSessionRequest;
 use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
-use iggy_common::IggyError;
+use iggy_common::{IggyError, IggyTimestamp};
 use journal::Journal as _;
 use journal::prepare_journal::{JournalError, PrepareJournal};
 use journal::superblock::{
@@ -708,7 +708,11 @@ where
             let registration = RegisterRequest::decode_from(prepare.body()).map_err(|_| {
                 RecoveryError::RetryProtection(consensus::ClientTableWireError::InvalidReply)
             })?;
-            if !mux_stm.is_active_account(header.user_id, registration.user_created_at) {
+            if !mux_stm.accepts_registration(
+                header.user_id,
+                &registration.credential,
+                iggy_common::IggyTimestamp::from(header.timestamp),
+            ) {
                 change_log.append(header, Vec::new())?;
                 last_applied_op = Some(header.op);
                 continue;
@@ -716,16 +720,11 @@ where
             let inserted = !client_table.contains(header.client);
             let reply = build_reply_message(header, &bytes::Bytes::new());
             client_table
-                .commit_register(
-                    header.client,
-                    header.user_id,
-                    registration.bind_verifier,
-                    reply,
-                )
+                .commit_registration(header.client, header.user_id, &registration, reply)
                 .map_err(RecoveryError::RetryProtection)?;
             let epoch = client_table.get_epoch(header.client).unwrap_or(header.op);
             let mut changes: Vec<_> = inserted
-                .then(|| session_registered(header, registration.user_created_at, epoch))
+                .then(|| session_registered(header, registration.credential.user_created_at, epoch))
                 .into_iter()
                 .collect();
             changes.extend(mux_stm.refresh_session(
@@ -786,16 +785,29 @@ where
         })?;
         // WAL replay must recompute authorization denials identically to the
         // primary/backup commit paths, so it goes through the same gate.
-        let mut reply = reject_stale_session(header, &client_table)
-            .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
-        if let Some(user) = reply.revoked_user {
-            let mut sessions = client_table.end_user_sessions(user.user_id, header.op);
+        let prepared_at = IggyTimestamp::from(header.timestamp);
+        let mut reply = reject_stale_session(header, &client_table, |user_id, token_id| {
+            mux_stm.holds_live_token(user_id, token_id, prepared_at)
+        })
+        .map_or_else(|| mux_stm.gated_update(entry), Ok)?;
+        let revocations = reply
+            .revoked_user
+            .map(|user| Revocation::of_user(user, reply.kept_session_client))
+            .into_iter()
+            .chain(reply.revoked_token.map(Revocation::Token));
+        for revocation in revocations {
+            let mut sessions = revocation.end_sessions(&mut client_table, header.op);
             sessions.sort_by_key(|identity| identity.client_id);
             let actor = change_actor(&ApplyContext::from(header));
             let client_ids: Vec<u128> =
                 sessions.iter().map(|identity| identity.client_id).collect();
             reply.changes.extend(sessions.iter().map(|identity| {
-                session_revoked(user, identity.client_id, identity.session, actor)
+                session_revoked(
+                    revocation.user(),
+                    identity.client_id,
+                    identity.session,
+                    actor,
+                )
             }));
             reply
                 .changes
@@ -959,7 +971,10 @@ mod tests {
     use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
     use crate::stm::snapshot::{SNAPSHOT_FORMAT_VERSION, Snapshotable};
     use crate::stm::stream::{Streams, StreamsSnapshot};
-    use crate::stm::user::{CreatePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES, Users};
+    use crate::stm::user::{
+        ChangePasswordRequest, CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
+        PAT_TOKEN_HASH_BYTES, Users,
+    };
     use consensus::{CLIENTS_TABLE_MAX, HistoryCertificate};
     use iggy_binary_protocol::consensus::{Command, Operation};
     use iggy_binary_protocol::primitives::metadata_changes::WireMetadataChangeKind;
@@ -970,11 +985,12 @@ mod tests {
     use iggy_binary_protocol::requests::topics::{
         CreateTopicRequest, CreateTopicWithAssignmentsRequest,
     };
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
     use iggy_binary_protocol::requests::users::{
         CreateUserRequest, DeleteUserRequest, UpdateUserResolvedRequest,
     };
     use iggy_binary_protocol::{WireEncode, WireIdentifier, WireName, WireOptions, result_code};
-    use iggy_common::{MetadataChangeClass, UserStatus};
+    use iggy_common::{IggyTimestamp, MetadataChangeClass, UserStatus};
     use journal::Journal;
     use server_common::iobuf::Owned;
     use std::cell::RefCell;
@@ -1117,7 +1133,7 @@ mod tests {
         request: u64,
     ) -> Message<PrepareHeader> {
         let registration = RegisterRequest {
-            user_created_at: 1,
+            credential: CredentialProof::account(1, 1),
             bind_verifier: [0x5a; 32],
         }
         .to_bytes();
@@ -2252,9 +2268,11 @@ mod tests {
                 options: WireOptions::empty(),
             }
             .to_bytes();
+            // Each op is stamped with its own number, so an account created at
+            // op N has creation time N and access revision N.
             let register = |created_at| {
                 RegisterRequest {
-                    user_created_at: created_at,
+                    credential: CredentialProof::account(created_at, created_at),
                     bind_verifier: [0x5a; 32],
                 }
                 .to_bytes()
@@ -2451,8 +2469,10 @@ mod tests {
         for (operation, register_first, replace) in [
             (Operation::DeleteUser, true, false),
             (Operation::UpdateUserResolved, true, false),
+            (Operation::ChangePassword, true, false),
             (Operation::DeleteUser, false, false),
             (Operation::UpdateUserResolved, false, false),
+            (Operation::ChangePassword, false, false),
             (Operation::DeleteUser, false, true),
         ] {
             let directory = tempdir().unwrap();
@@ -2460,7 +2480,7 @@ mod tests {
             std::fs::create_dir_all(&metadata_dir).unwrap();
             let register = |user_created_at| {
                 RegisterRequest {
-                    user_created_at,
+                    credential: CredentialProof::account(user_created_at, user_created_at),
                     bind_verifier: [0x5a; 32],
                 }
                 .to_bytes()
@@ -2476,6 +2496,15 @@ mod tests {
             let revocation = if operation == Operation::DeleteUser {
                 DeleteUserRequest {
                     user_id: WireIdentifier::numeric(USER),
+                }
+                .to_bytes()
+            } else if operation == Operation::ChangePassword {
+                // The user was created at op 2, its access revision.
+                ChangePasswordRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    access_revision: 2,
+                    keep_session: true,
+                    password_hash: "new-hash".to_owned(),
                 }
                 .to_bytes()
             } else {
@@ -2641,6 +2670,307 @@ mod tests {
 
     #[compio::test]
     #[allow(clippy::too_many_lines)]
+    async fn given_a_token_delete_and_a_self_password_change_when_replaying_wal_should_end_the_sessions_live_apply_ended()
+     {
+        const CLIENT: u128 = 0x21;
+        const ROOT_CLIENT: u128 = CLIENT + 1;
+        const PASSWORD_CLIENT: u128 = CLIENT + 2;
+        const LATE_CLIENT: u128 = CLIENT + 3;
+        const OTHER_CLIENT: u128 = CLIENT + 4;
+        const USER: u32 = 1;
+        const ROOT_SESSION: u64 = 1;
+        // Each op is stamped with its own number: the user is created at op 2,
+        // its token at op 3 and the token session registers at op 4.
+        const CREATED_AT: u64 = 2;
+        const TOKEN_ID: u64 = 3;
+        const TOKEN_SESSION: u64 = 4;
+        const PASSWORD_SESSION: u64 = 5;
+        const EXPIRED_WRITE: u64 = 6;
+        const DELETE_OP: u64 = 7;
+        // The refused late registration takes op 8.
+        const OTHER_SESSION: u64 = 9;
+        const CHANGE_OP: u64 = 10;
+        const TOKEN_HASH: [u8; PAT_TOKEN_HASH_BYTES] = [b'c'; PAT_TOKEN_HASH_BYTES];
+        type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
+        let directory = tempdir().unwrap();
+        let metadata_dir = directory.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let register = |credential| {
+            RegisterRequest {
+                credential,
+                bind_verifier: [0x5a; 32],
+            }
+            .to_bytes()
+        };
+        let token_proof = CredentialProof::token(CREATED_AT, TOKEN_ID);
+        let entries = [
+            (
+                Operation::Register,
+                register(CredentialProof::account(1, 1)),
+                ROOT_CLIENT,
+                0,
+                0,
+            ),
+            (
+                Operation::CreateUser,
+                CreateUserRequest {
+                    username: WireName::new("user").unwrap(),
+                    password: "hash".to_owned(),
+                    status: UserStatus::Active.as_code(),
+                    permissions: None,
+                    options: WireOptions::empty(),
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::CreatePersonalAccessToken,
+                CreatePersonalAccessTokenRequest {
+                    user_id: USER,
+                    name: WireName::new("ci").unwrap(),
+                    expiry: EXPIRED_WRITE - TOKEN_ID,
+                    token_hash: TOKEN_HASH,
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (Operation::Register, register(token_proof), CLIENT, USER, 0),
+            (
+                Operation::Register,
+                register(CredentialProof::account(CREATED_AT, CREATED_AT)),
+                PASSWORD_CLIENT,
+                USER,
+                0,
+            ),
+            (
+                Operation::CreatePersonalAccessToken,
+                CreatePersonalAccessTokenRequest {
+                    user_id: USER,
+                    name: WireName::new("after-expiry").unwrap(),
+                    expiry: 0,
+                    token_hash: [b'd'; PAT_TOKEN_HASH_BYTES],
+                }
+                .to_bytes(),
+                CLIENT,
+                USER,
+                TOKEN_SESSION,
+            ),
+            (
+                Operation::DeletePersonalAccessToken,
+                DeletePersonalAccessTokenRequest {
+                    user_id: USER,
+                    name: WireName::new("ci").unwrap(),
+                    only_if_expired: false,
+                }
+                .to_bytes(),
+                ROOT_CLIENT,
+                0,
+                ROOT_SESSION,
+            ),
+            (
+                Operation::Register,
+                register(token_proof),
+                LATE_CLIENT,
+                USER,
+                0,
+            ),
+            (
+                Operation::Register,
+                register(CredentialProof::account(CREATED_AT, CREATED_AT)),
+                OTHER_CLIENT,
+                USER,
+                0,
+            ),
+            // The password session changes its own password and stays.
+            (
+                Operation::ChangePassword,
+                ChangePasswordRequest {
+                    user_id: WireIdentifier::numeric(USER),
+                    access_revision: CREATED_AT,
+                    keep_session: true,
+                    password_hash: "new-hash".to_owned(),
+                }
+                .to_bytes(),
+                PASSWORD_CLIENT,
+                USER,
+                PASSWORD_SESSION,
+            ),
+        ];
+        let last_op = entries.len() as u64;
+        let stm = UserStm::default();
+        stm.users().ensure_root_user("root", "hash");
+        let table = RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX));
+        let live_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        let mut parent = 0;
+        let mut before_delete = None;
+        {
+            let journal = PrepareJournal::open(&metadata_dir.join("journal.wal"), 0)
+                .await
+                .unwrap();
+            for (index, (operation, body, client, user_id, session)) in
+                entries.into_iter().enumerate()
+            {
+                let op = index as u64 + 1;
+                let mut prepare = make_prepare(op, body.len());
+                prepare.as_mut_slice()[HEADER_SIZE..].copy_from_slice(&body);
+                let prepare = consensus::seal_prepare_checksum(prepare.transmute_header(
+                    |old, header: &mut PrepareHeader| {
+                        *header = old;
+                        header.operation = operation;
+                        header.timestamp = op;
+                        header.client = client;
+                        header.user_id = user_id;
+                        header.session = session;
+                        header.request = if operation == Operation::Register {
+                            0
+                        } else {
+                            op
+                        };
+                        header.parent = parent;
+                        header.checksum_body = u128::from(iggy_common::calculate_checksum(&body));
+                    },
+                ));
+                parent = prepare.header().checksum;
+                let committed =
+                    apply_committed_prepare(&stm, &table, true, |_| {}, prepare.clone());
+                if op == EXPIRED_WRITE {
+                    assert_eq!(
+                        result_code(committed.reply.body()),
+                        Some(IggyError::StaleClient.as_code())
+                    );
+                }
+                live_log
+                    .append(prepare.header(), committed.changes)
+                    .expect("live ops append in order");
+                journal.append(prepare).await.unwrap();
+                // Both sessions are open and the token is live, so the restored
+                // token ids alone decide which sessions the replayed delete ends.
+                if op == PASSWORD_SESSION {
+                    let mut checkpoint = <IggySnapshot as Snapshot>::create(&stm, op, 0).unwrap();
+                    checkpoint.snapshot_mut().client_table = Some(table.borrow().to_snapshot());
+                    checkpoint.snapshot_mut().change_log = live_log.snapshot();
+                    before_delete = Some(checkpoint);
+                }
+            }
+            journal.storage_ref().fsync().await.unwrap();
+        }
+        let live = table.borrow().encode();
+        let expected_ended = vec![
+            iggy_binary_protocol::requests::system::SessionIdentity {
+                client_id: CLIENT,
+                session: TOKEN_SESSION,
+                metadata_watermark: DELETE_OP,
+            },
+            iggy_binary_protocol::requests::system::SessionIdentity {
+                client_id: OTHER_CLIENT,
+                session: OTHER_SESSION,
+                metadata_watermark: CHANGE_OP,
+            },
+        ];
+        assert_eq!(
+            table.borrow().ended_sessions().collect::<Vec<_>>(),
+            expected_ended
+        );
+        assert_eq!(
+            table.borrow().get_epoch(PASSWORD_CLIENT),
+            Some(PASSWORD_SESSION)
+        );
+        assert_eq!(table.borrow().get_epoch(LATE_CLIENT), None);
+
+        let recovered = recover::<UserStm>(
+            directory.path(),
+            SOLO,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |stm| stm.users().ensure_root_user("root", "hash"),
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(recovered.last_applied_op, Some(last_op));
+        assert!(
+            recovered.client_table.encode() == live,
+            "WAL replay must rebuild the live table"
+        );
+        assert_eq!(
+            recovered.change_log.snapshot(),
+            live_log.snapshot(),
+            "WAL replay must rebuild the live change log"
+        );
+        drop(recovered);
+
+        let mut checkpoint = <IggySnapshot as Snapshot>::create(&stm, last_op, 0).unwrap();
+        checkpoint.snapshot_mut().client_table = Some(table.borrow().to_snapshot());
+        checkpoint
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .await
+            .unwrap();
+        let restarted = recover::<UserStm>(
+            directory.path(),
+            SOLO,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |stm| stm.users().ensure_root_user("root", "hash"),
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .expect("restart must accept the checkpointed table");
+        assert_eq!(
+            restarted.client_table.ended_sessions().collect::<Vec<_>>(),
+            expected_ended
+        );
+        assert_eq!(restarted.client_table.token_id(CLIENT), TOKEN_ID);
+        assert_eq!(restarted.client_table.token_id(PASSWORD_CLIENT), 0);
+        assert!(
+            !restarted
+                .mux_stm
+                .users()
+                .read(|users| users.accepts_credential_at(
+                    USER,
+                    &token_proof,
+                    IggyTimestamp::from(100)
+                )),
+            "the deleted token must not come back from the checkpoint"
+        );
+        drop(restarted);
+
+        before_delete
+            .expect("a checkpoint before the delete")
+            .persist(&metadata_dir.join("snapshot.bin"))
+            .await
+            .unwrap();
+        let replayed = recover::<UserStm>(
+            directory.path(),
+            SOLO,
+            journal::prepare_journal::DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |stm| stm.users().ensure_root_user("root", "hash"),
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .expect("restart must replay the delete over the earlier checkpoint");
+        assert_eq!(replayed.last_applied_op, Some(last_op));
+        // A restored entry keeps only its latest reply, so compare the checkpoint forms.
+        let checkpointed = |table: &ClientTable| {
+            rmp_serde::to_vec(&table.to_snapshot()).expect("the table encodes")
+        };
+        assert!(
+            checkpointed(&replayed.client_table) == checkpointed(&table.borrow()),
+            "replay over the checkpoint must rebuild the live table"
+        );
+        assert_eq!(
+            replayed.change_log.snapshot(),
+            live_log.snapshot(),
+            "replay over the checkpoint must rebuild the live change log"
+        );
+    }
+
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
     async fn given_memberships_ended_by_logout_and_revocation_when_replaying_wal_should_rebuild_the_live_change_log()
      {
         const ROOT_CLIENT: u128 = 0x10;
@@ -2654,7 +2984,7 @@ mod tests {
         type UserStm = MuxStateMachine<iggy_common::variadic!(Users, Streams)>;
         let register = |user_created_at| {
             RegisterRequest {
-                user_created_at,
+                credential: CredentialProof::account(user_created_at, user_created_at),
                 bind_verifier: [0x5a; 32],
             }
             .to_bytes()

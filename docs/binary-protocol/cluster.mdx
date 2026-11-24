@@ -319,10 +319,12 @@ RequestPrepares asks for a retained operation range. RepairPrepare sends the ori
 
 State transfer handles larger gaps. RequestStateTransfer obtains a manifest, then RequestStateChunk and StateChunk transfer artifacts. The receiver checks each complete artifact against its manifest length and checksum before using it. The manifest has magic `ISM1`, a u32 entry count, a u8 entry length and a trailing XxHash3-64 checksum. Entries contain kind, frontier, length and checksum.
 
+Server 0.10.0 uses replica wire revision 1, writes metadata snapshot format 15, reads formats 14 and 15, and transfers the client table as `ICT5`. Server 0.10.1-edge.2 uses replica wire revision 4 and the formats below.
+
 | Kind | Artifact | Current format |
 | --- | --- | --- |
-| 0 | Metadata snapshot | MessagePack version 15, readers accept 14 and 15 |
-| 1 | Client table | `ICT5` |
+| 0 | Metadata snapshot | MessagePack version 21, readers accept 21 |
+| 1 | Client table | `ICT6` |
 | 2 | Segment log | Canonical batch records |
 | 3 | Consumer offsets and partition state | `ICO1` version 9, readers accept 8 and 9 |
 
