@@ -21,6 +21,7 @@
 
 use crate::api;
 use crate::error::{IggyBenchDashboardError, Result};
+use crate::state::start::StartData;
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use std::future::Future;
@@ -46,18 +47,34 @@ pub struct DashboardData {
 #[derive(Properties, PartialEq)]
 pub struct DataProviderProps {
     pub children: Html,
+    /// The data of a page that the server rendered. The provider starts from it and fetches
+    /// nothing, so the first render gives the HTML of the server.
+    #[prop_or_default]
+    pub start: Option<Rc<StartData>>,
 }
 
 #[function_component(DataProvider)]
 pub fn data_provider(props: &DataProviderProps) -> Html {
-    let summaries = use_state_eq(|| Loadable::Loading);
-    let config = use_state_eq(|| Loadable::Loading);
+    let summaries = use_state_eq(|| {
+        start_value(
+            props
+                .start
+                .as_ref()
+                .and_then(|start| start.summaries.clone()),
+        )
+    });
+    let config =
+        use_state_eq(|| start_value(props.start.as_ref().and_then(|start| start.config.clone())));
     {
         let summaries = summaries.clone();
         let config = config.clone();
         use_effect_with((), move |_| {
-            fetch_into(summaries, api::fetch_benchmark_summaries());
-            fetch_into(config, api::fetch_dashboard_config());
+            if matches!(*summaries, Loadable::Loading) {
+                fetch_into(summaries, api::fetch_benchmark_summaries());
+            }
+            if matches!(*config, Loadable::Loading) {
+                fetch_into(config, api::fetch_dashboard_config());
+            }
         });
     }
     let reload = {
@@ -88,6 +105,11 @@ pub fn data_provider(props: &DataProviderProps) -> Html {
 #[hook]
 pub fn use_dashboard_data() -> DashboardData {
     use_context::<DashboardData>().expect("DataProvider wraps the router")
+}
+
+/// `Ready` with a part of the start data, else `Loading` until the provider fetches it.
+pub fn start_value<T>(value: Option<T>) -> Loadable<T> {
+    value.map_or(Loadable::Loading, |value| Loadable::Ready(Rc::new(value)))
 }
 
 /// Shows the loading state until `request` ends, then its result.

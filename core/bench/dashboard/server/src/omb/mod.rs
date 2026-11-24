@@ -111,10 +111,6 @@ impl OmbCache {
         })
     }
 
-    pub fn has_run(&self, id: OmbRunId) -> bool {
-        self.runs().files.contains_key(&id)
-    }
-
     pub fn files(&self, id: OmbRunId) -> Option<OmbRunFiles> {
         self.runs().files.get(&id).map(|(_, files)| files.clone())
     }

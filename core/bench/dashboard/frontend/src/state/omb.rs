@@ -26,7 +26,8 @@ use bench_dashboard_shared::omb::summary::OmbRunList;
 use yew::prelude::*;
 
 use crate::api;
-use crate::state::data::{Loadable, fetch_into};
+use crate::state::data::{Loadable, fetch_into, start_value};
+use crate::state::start::StartData;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OmbData {
@@ -39,14 +40,25 @@ pub struct OmbData {
 #[derive(Properties, PartialEq)]
 pub struct OmbDataProviderProps {
     pub children: Html,
+    /// The data of a page that the server rendered. With the OMB runs in it, the provider starts
+    /// from them and fetches nothing.
+    #[prop_or_default]
+    pub start: Option<Rc<StartData>>,
 }
 
 #[function_component(OmbDataProvider)]
 pub fn omb_data_provider(props: &OmbDataProviderProps) -> Html {
-    let runs = use_state_eq(|| Loadable::Loading);
-    // Set while a fetch is on its way or has succeeded. A ref and not a state, so two pages that ask
-    // in the same moment start one fetch.
-    let asked = use_mut_ref(|| false);
+    let runs = use_state_eq(|| {
+        start_value(
+            props
+                .start
+                .as_ref()
+                .and_then(|start| start.omb_runs.clone()),
+        )
+    });
+    // Set while a fetch is on its way or has succeeded, or when the list came with the page. A ref
+    // and not a state, so two pages that ask in the same moment start one fetch.
+    let asked = use_mut_ref(|| matches!(*runs, Loadable::Ready(_)));
     let reload = {
         let runs = runs.clone();
         use_callback((), move |(), _| fetch_once(runs.clone(), Rc::clone(&asked)))

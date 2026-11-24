@@ -29,10 +29,14 @@ mod related;
 use std::rc::Rc;
 
 use bench_dashboard_shared::embed::OmbChartType;
+use bench_dashboard_shared::labels::{messages_text, milliseconds, version_detail};
 use bench_dashboard_shared::omb::chart::WindowMetric;
 use bench_dashboard_shared::omb::compare::OmbComparability;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::{
+    environment_text, mebibytes_text, run_name, short_id, size_and_length, workload_heading,
+};
 use bench_dashboard_shared::omb::result::OmbPercentiles;
 use bench_dashboard_shared::omb::setup::{OmbSetup, omb_setup_download_name};
 use bench_dashboard_shared::omb::summary::{OmbRunList, OmbRunSummary};
@@ -54,15 +58,12 @@ use crate::components::embed::{EmbedButton, EmbedCard, EmbedChart, EmbedProvider
 use crate::components::headline::kpi_card;
 use crate::components::ladder::{Rung, percentile_ladder};
 use crate::components::page::{breadcrumbs, loadable, page_shell, section_head};
-use crate::components::run_labels::{messages_text, milliseconds, version_detail};
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
 use crate::pages::omb::common::{
     CONSUME_HINT, EndToEnd, LineOrder, MESSAGES_HINT, NOT_MEASURED, PUBLISH_THROUGHPUT_HINT,
-    conditions, driver_tag, environment_text, mebibytes_text, omb_crumb, omb_page_head, run_name,
-    runs_status, short_id, time_view, version_view,
+    driver_tag, omb_crumb, omb_page_head, runs_status, time_view, version_view,
 };
-use crate::pages::omb::list::workload_crumb;
 use crate::pages::run::chart::SERIES_COLOR_VARS;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, fetch_into};
@@ -459,8 +460,9 @@ fn embed_charts(run: &OmbRunSummary) -> Vec<EmbedChart> {
         .collect()
 }
 
+/// The heading names the run by its workload values, not by the workload `name`. A crawler indexes
+/// the heading, and the name is free text from the workload file.
 fn head(run: &OmbRunSummary) -> Html {
-    let workload = workload_crumb(&run.workload.name);
     let environment = run.environment().and_then(environment_text);
     let detail = run
         .version
@@ -468,7 +470,7 @@ fn head(run: &OmbRunSummary) -> Html {
         .and_then(|version| version_detail(version.commit.as_deref(), version.release));
     let above = html! {
         <>
-            { breadcrumbs(&[omb_crumb(), workload], &short_id(run.id)) }
+            { breadcrumbs(&[omb_crumb()], &short_id(run.id)) }
             <p class="run-meta">
                 { driver_tag(&run.driver) }
                 { version_view(run) }
@@ -493,8 +495,8 @@ fn head(run: &OmbRunSummary) -> Html {
     omb_page_head(
         above,
         None,
-        &run.workload.name,
-        &conditions(run),
+        &workload_heading(&run.workload),
+        &size_and_length(run),
         html! { <ShareButton class={classes!("run-action")} labeled={true} /> },
     )
 }

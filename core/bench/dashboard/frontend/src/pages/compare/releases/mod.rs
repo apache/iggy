@@ -27,6 +27,11 @@ use std::rc::Rc;
 
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::delta::DeltaVerdict;
+use bench_dashboard_shared::format::runs_text;
+use bench_dashboard_shared::labels::{
+    CONDITION_SEPARATOR, RELEASE_LABEL, metric_name, metric_value_text,
+};
+use bench_dashboard_shared::summary::RATE_LIMITED_HEADLINES;
 use gloo::console::error;
 use yew::prelude::*;
 use yew_router::prelude::{use_location, use_navigator};
@@ -37,15 +42,10 @@ use crate::components::headline::{Judgment, judged_chip, metric_hint, verdict_lo
 use crate::components::page::{
     Crumb, breadcrumbs, data_status, page_head, page_shell, section_head,
 };
-use crate::components::run_labels::{
-    CONDITION_SEPARATOR, NO_RATE_LIMIT_NOTE, RELEASE_LABEL, version_tag_view,
-};
+use crate::components::run_labels::{NO_RATE_LIMIT_NOTE, version_tag_view};
 use crate::components::select_field::SelectField;
 use crate::components::share_button::ShareButton;
-use crate::format::runs_text;
-use crate::pages::run::change::{
-    Change, RATE_LIMITED_HEADLINES, metric_name, metric_value_text, percent_text,
-};
+use crate::pages::run::change::{Change, percent_text};
 use crate::pages::run::history::NO_VALUE;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, use_dashboard_data};

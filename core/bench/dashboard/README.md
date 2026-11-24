@@ -139,6 +139,15 @@ report changes, the server builds new files for the run after it loads the runs 
   - Response: PNG image, from the cache after the first request. To show it smaller on a page, set the
     `width` of the `img` tag
 
+- `GET /embed/{uuid}/card.png`
+  - Get the preview card of a run: the image that a link to the run page shows
+  - Parameters:
+    - `uuid`: UUID of the benchmark
+  - Response: PNG image of 1200 x 630 px, from the cache after the first request. The card names the
+    workload and the numbers that the run is about. A run with a rate limit shows its P50, P99 and P99.9
+    latency, because the limit sets its throughput. A run without a rate limit shows its throughput only. The
+    server draws the text with the system fonts, and the Docker image installs `fonts-dejavu-core` for it
+
 ### OMB Runs
 
 These endpoints serve the OpenMessaging Benchmark runs of `--omb-results-dir`. An OMB run id has 16 lowercase
@@ -198,6 +207,14 @@ configuration.
   - Response: PNG image, from the cache after the first request, as for the `iggy-bench` charts. If the
     sidecar changes the machines or the Iggy version, the next request builds the page or the PNG again
 
+- `GET /embed/omb/{id}/card.png`
+  - Get the preview card of an OMB run, as for `/embed/{uuid}/card.png`
+  - Parameters:
+    - `id`: OMB run id
+  - Response: PNG image of 1200 x 630 px. The card shows the publish throughput, the publish P99 and, if the
+    run measured it, the end-to-end P99. It names the workload by its topology and actors, not by the workload
+    name
+
 The OMB chart types:
 
 - `latency`: the publish latency P50, P99 and P99.9 of each window, in ms
@@ -239,14 +256,64 @@ The page answers send `Cache-Control: no-cache`, because each frontend build cha
 `index.html`. The compare pages send `X-Robots-Tag: noindex, follow`, because their query picks the runs. Every
 answer under `/api` and `/embed` sends `X-Robots-Tag: noindex`.
 
+Each page answer also has the head of its page. Link previews and most crawlers do not run the app, so the server
+writes the head into the page. The server replaces the part of `index.html` from the comment `page-head-start` to
+the comment `page-head-end` with these tags:
+
+- `<title>` and the description. A run page names the run, the version, the machine, its main numbers and its
+  conditions. The main numbers of an iggy-bench run without a rate limit are its throughput and its message
+  rate, without a latency, as on its card. The title also names what tells apart the workloads of one kind. For an iggy-bench run, this is the
+  durability and the rate limit. For an OMB run, it is the message size, the measured publish rate and the driver.
+  The Overview names the numbers of its headline cards
+- `<meta name="robots" content="noindex, follow">` on the compare pages
+- the canonical link, and the Open Graph and Twitter card tags. The image of a run page is its preview card,
+  from `card.png` below the embed path of the run. Every other page shows `assets/og-image.png`
+- JSON-LD structured data: the breadcrumbs, `WebSite` on the Overview, and `Dataset` on each run page
+
+Explore has two lists: the official runs at `/explore` and all runs at `/explore?scope=all`. Each list is a page
+of its own. A search or a filter only narrows a list, so the canonical link of a view is the list of its scope.
+
+The canonical link, `og:url`, `og:image` and the structured data need absolute links, so they need `--public-url`.
+Without it, the head has the title, the description and the other Open Graph tags only. When the reader moves to
+another page, the app sets the title from the same text in the `shared` crate. `trunk serve` on port 8060 serves
+`index.html` itself, so the head tags show only on the port of the server.
+
+### Server Rendering
+
+The server renders the Overview, Explore, Methodology, the OMB run list, each run page and each OMB run page to
+HTML. Readers see the content before the scripts load, and crawlers that do not run scripts read it. The compare
+pages and the not-found pages show the splash until the app starts.
+
+- The server depends on the frontend crate with its `ssr` feature, and renders the same component tree as the
+  browser, below a router that holds the requested path
+- It replaces the part of `index.html` from the comment `page-body-start` to the comment `page-body-end` with
+  `<div id="app">` and the rendered HTML
+- After the app root, the page gets `<script id="start-data" type="application/json">` with the API answers that
+  the render used. These are the run summaries and the configuration on the iggy-bench pages, and the OMB run
+  list on the OMB pages. The browser starts from this data and does not request it, so its first render gives
+  the same HTML. Then the app hydrates the page, which means that it takes over the HTML instead of building it
+  again. The Trunk build turns on the `hydration` feature for this
+- A render takes about 1 ms for 365 runs. If a render panics or takes longer than 5 seconds, the answer is the
+  page with the splash and without start data. Then the browser renders the page
+- Charts and the parts that need the run report or the OMB result show their loading state in the rendered
+  HTML. The browser draws them after it hydrates the page
+- Build the server and `frontend/dist` from the same commit. The browser hydrates a page only with the
+  components that rendered it
+
+Code that runs while a component renders must not call browser APIs, because the server runs it too. Read storage
+or the window in an effect, which runs in the browser only. The first render in the browser must also give the
+same HTML as the server. So a value from storage, such as the theme, must change the page in an effect. A script
+at the start of the body sets the dark theme before the first paint.
+
 The page paths are in `shared/src/pages.rs`. When you add a page to the frontend router, add its path there and
 its route in `server/src/handlers/pages.rs`. A test on each side fails until the three match.
 
 - `GET /robots.txt`
   - Allows every crawler. With `--public-url`, the file also names the sitemap
 - `GET /sitemap.xml`
-  - Lists `/`, `/explore`, `/methodology`, every run page, `/omb` and every OMB run page, with absolute links.
-    The `lastmod` of a run page is the time of the run
+  - Lists `/`, `/explore`, `/explore?scope=all`, `/methodology`, every run page, `/omb` and every OMB run page,
+    with absolute links. The `lastmod` of a run page is the time of the run. The `lastmod` of a list is the time
+    of its newest run
   - Needs `--public-url`. Without it, the answer is 404
 
 `/health` and the `/api` endpoints return JSON, with three exceptions. `/api/artifacts/{uuid}` returns a ZIP file,
@@ -463,7 +530,7 @@ Options:
       --embed-cache-max-gib <GIB>    Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the files that readers used least recently [default: 10]
       --config <CONFIG>              Dashboard configuration file: official suites, headline workloads, and thresholds [default: dashboard.toml]
       --omb-results-dir <DIR>        Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
-      --public-url <URL>             Address at which readers open the dashboard, for example `https://benchmarks.iggy.apache.org`. robots.txt and sitemap.xml use it for absolute links. Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
+      --public-url <URL>             Address at which readers open the dashboard, for example `https://benchmarks.iggy.apache.org`. robots.txt, sitemap.xml and the page heads use it for absolute links. Without it, robots.txt names no sitemap, /sitemap.xml answers 404, and the pages have no canonical link and no preview image
   -h, --help                         Print help
   -V, --version                      Print version
 ```
@@ -481,8 +548,8 @@ directory holds the file for the official AWS suites. If a run's `suite` label i
 official. If the file is missing or invalid, the server does not start.
 
 On a public host, set `--public-url` to the address at which readers open the dashboard, without a path. The
-sitemap and `robots.txt` need absolute links, and the server does not build them from the `Host` header of a
-request. If the argument is not set, the server logs a warning at start.
+sitemap, `robots.txt` and the head of each page need absolute links. The server does not build them from the
+`Host` header of a request. If the argument is not set, the server logs a warning at start.
 
 ### Environment Variables for Development
 

@@ -19,6 +19,7 @@
 //! configuration, for example `Iggy-persisted` next to `Iggy`. Each driver shows its newest run.
 
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::NO_VALUE;
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 use yew::prelude::*;
 
@@ -27,7 +28,7 @@ use super::history::{
 };
 use crate::pages::compare::runs::with_baseline;
 use crate::pages::omb::common::{
-    NO_VALUE, OmbCompareLink, day_view, driver_tag, line_order, oldest_first, version_view,
+    OmbCompareLink, day_view, driver_tag, line_order, oldest_first, version_view,
 };
 use crate::state::selection::MAX_COMPARED_RUNS;
 

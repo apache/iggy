@@ -1302,8 +1302,12 @@ code.flag {
 
 .explore-scope-option {
     flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     padding: 0 14px;
     border-radius: 9px;
+    text-decoration: none;
 }
 
 .explore-scope-option:hover,
@@ -1311,7 +1315,7 @@ code.flag {
     color: var(--text);
 }
 
-.explore-scope-option[aria-pressed="true"],
+.explore-scope-option[aria-current="page"],
 .explore-kind[aria-pressed="true"] {
     border-color: var(--accent-dim);
     background: var(--accent-soft);

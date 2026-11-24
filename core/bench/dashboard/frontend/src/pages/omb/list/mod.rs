@@ -21,6 +21,7 @@
 mod catalog;
 mod query;
 
+use bench_dashboard_shared::omb::labels::NO_VALUE;
 use std::rc::Rc;
 
 use gloo::console::error;
@@ -37,7 +38,7 @@ use crate::components::run_labels::version_tag_view;
 use crate::components::select_field::SelectField;
 use crate::pages::explore::{HistoryEntry, SEARCH_KEY, focus_search};
 use crate::pages::omb::common::{
-    DRIVER_HINT, END_TO_END_LATENCY_HINT, NO_VALUE, NOT_MEASURED, OMB_CRUMB, OmbCompareToggle,
+    DRIVER_HINT, END_TO_END_LATENCY_HINT, NOT_MEASURED, OMB_CRUMB, OmbCompareToggle,
     OmbCompareTray, PUBLISH_LATENCY_HINT, PUBLISH_THROUGHPUT_HINT, day_view, loaded_runs,
     omb_page_head, run_route,
 };
@@ -140,16 +141,6 @@ pub fn omb_runs_page() -> Html {
         </>
     };
     page_shell(&scroll_ref, content)
-}
-
-/// A breadcrumb to the run list narrowed to one workload.
-pub fn workload_crumb(workload_name: &str) -> Crumb {
-    let mut query = OmbQuery::default();
-    query.set_facet(Facet::Workload, Some(workload_name.to_owned()));
-    Crumb {
-        query: query.to_pairs(),
-        ..Crumb::new(workload_name, AppRoute::OmbRuns)
-    }
 }
 
 #[function_component(RunRowView)]
@@ -430,25 +421,5 @@ fn latency_metric(latency: &Latency) -> Html {
             <span class="explore-main">{ latency.p99.as_str() }</span>
             <span class="explore-sub">{ format!("P50 {}", latency.p50) }</span>
         </>
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_support::OMB_RC1_DEFAULT;
-
-    #[test]
-    fn given_fixture_workload_when_crumb_built_should_link_list_narrowed_to_it() {
-        let name = OMB_RC1_DEFAULT.summary().workload.name;
-
-        let crumb = workload_crumb(&name);
-
-        assert_eq!(crumb.label, name);
-        assert_eq!(crumb.route, AppRoute::OmbRuns);
-        assert_eq!(
-            OmbQuery::from_pairs(crumb.query),
-            OmbQuery::from_pairs([("workload", name.as_str())])
-        );
     }
 }

@@ -26,6 +26,7 @@ pub mod headline;
 pub mod ladder;
 pub mod layout;
 pub mod page;
+pub mod page_title;
 pub mod run_labels;
 pub mod section_nav;
 pub mod select_field;

@@ -30,7 +30,12 @@ use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::delta::Metric;
 use bench_dashboard_shared::embed::ChartType;
+use bench_dashboard_shared::history::HistoryLine;
 use bench_dashboard_shared::identity::KindFamily;
+use bench_dashboard_shared::labels::{
+    conditions, messages_text, metric_name, metric_value_text, milliseconds, short_id,
+    version_detail, version_tag,
+};
 use bench_dashboard_shared::metrics::GroupMetrics;
 use bench_dashboard_shared::series::{SeriesMetric, SeriesScope};
 use bench_dashboard_shared::summary::BenchmarkSummary;
@@ -40,14 +45,11 @@ use yew::prelude::*;
 use yew_router::prelude::Link;
 
 use self::advanced::Advanced;
-use self::change::{
-    Change, Headline, HistoryLine, change, headlines, metric_name, metric_value_text,
-    regression_text,
-};
+use self::change::{Change, Headline, change, headlines, regression_text};
 use self::chart::{LATENCY_CHART_NOTE, SERIES_COLOR_VARS, SeriesChart};
 use self::facts::{
-    Command, Fact, FactGroup, NO_OPTIONS_NOTE, bench_host, conditions, environment, ladder,
-    ladder_side, option_groups, parameters, topic_note,
+    Command, Fact, FactGroup, NO_OPTIONS_NOTE, bench_host, environment, ladder, ladder_side,
+    option_groups, parameters, topic_note,
 };
 use self::history::{History, history_view};
 use self::related::{RelatedGroup, related_runs, related_view};
@@ -62,8 +64,7 @@ use crate::components::page::{
     Crumb, breadcrumbs, data_status, loadable, page_head, page_shell, section_head,
 };
 use crate::components::run_labels::{
-    DayLabel, END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, messages_text, milliseconds,
-    short_id, version_detail, version_tag, version_tag_view,
+    DayLabel, END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, version_tag_view,
 };
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;

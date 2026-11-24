@@ -20,13 +20,13 @@
 
 use bench_dashboard_shared::delta::Metric;
 use bench_dashboard_shared::identity::WorkloadField;
+use bench_dashboard_shared::labels::{metric_name, version_tag};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use yew::prelude::*;
 
-use super::change::metric_name;
 use super::facts::{FieldValue, field_value};
 use super::history::{NO_VALUE, VERSION_HEADER, link_cell, link_header, main_value_text};
-use crate::components::run_labels::{NO_RATE_LIMIT_NOTE, version_tag, version_tag_view};
+use crate::components::run_labels::{NO_RATE_LIMIT_NOTE, version_tag_view};
 
 const NO_RELATED_NOTE: &str = "No run on this machine and topology differs from this run in \
                                exactly one parameter.";
