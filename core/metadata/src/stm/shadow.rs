@@ -921,13 +921,17 @@ fn set_read_cache(
     let Some((stream_id, topic_id)) = shadow_topic_ids(state, target) else {
         return ApplyReply::err(ShadowTopicResult::TopicNotFound);
     };
-    let stream = &mut state.items[stream_id];
+    // Read first: `make_mut` copies a stream that a checkpoint capture shares.
+    let stream = &state.items[stream_id];
     let Some(topic) = stream.topics.get(topic_id) else {
         return ApplyReply::err(ShadowTopicResult::TopicNotFound);
     };
     let before = topic_body(stream, topic);
     let mut options = topic.options.clone();
     read_cache.store_in(&mut options);
+    let Some(stream) = state.items.make_mut(stream_id) else {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    };
     let Some(topic) = stream.topics.get_mut(topic_id) else {
         return ApplyReply::err(ShadowTopicResult::TopicNotFound);
     };

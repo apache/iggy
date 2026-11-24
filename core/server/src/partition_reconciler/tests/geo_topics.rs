@@ -461,7 +461,7 @@ async fn given_an_update_of_the_read_cache_of_a_geo_topic_when_the_metadata_prim
     let tmp = TempDir::new().unwrap();
     let config = geo_config(&tmp);
     let (shard, objects, key) = geo_primary(&config);
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
     let start = IggyTimestamp::now();
     geo_topics_pass(&ctx, start).await;
     let first = stored_object(&objects, key);
