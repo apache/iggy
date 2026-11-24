@@ -700,6 +700,7 @@ mod tests {
             PapayaShardsTable::new(),
             PartitionConsensusConfig::new(1, ReplicaTopology::new(0, 1), bus),
             CoordinatorConfig::default(),
+            false,
             crate::metrics::ShardMetrics::for_shard(),
         )
         .build()

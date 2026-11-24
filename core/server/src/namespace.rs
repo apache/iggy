@@ -224,13 +224,28 @@ where
         .is_none_or(|members| members.is_none_or(|members| members.member(node).is_some()))
 }
 
+/// What [`partition_primary`] asks of the shard that owns a partition which
+/// cannot serve yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryLookup {
+    /// The owner holds the lookup while the partition starts, also while an
+    /// older incarnation is in its place, for [`shard::PARTITION_BUILD_HOLD`]
+    /// at most.
+    Hold,
+    /// The owner answers at once with what the partition says now. A primary
+    /// on this node that cannot serve yet is no primary.
+    AnswerNow,
+}
+
 /// The primary of `namespace`'s group. A node storing the partition answers
-/// from its own replica; any other node answers with the view the group's
-/// primary last reported, or the committed initial view before any report.
+/// from its own replica, as `lookup` says. Any other node answers with the
+/// view the group's primary last reported, or the committed initial view
+/// before any report.
 #[allow(clippy::future_not_send)]
 pub async fn partition_primary<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
+    lookup: PrimaryLookup,
 ) -> Option<PartitionReadReply>
 where
     B: ShellBus,
@@ -250,9 +265,11 @@ where
         members.is_none_or(|members| members.member(topology.self_replica_id).is_some())
     });
     if stored {
-        return shard
-            .partition_read(namespace, PartitionRead::Primary)
-            .await;
+        let read = match lookup {
+            PrimaryLookup::Hold => PartitionRead::Primary,
+            PrimaryLookup::AnswerNow => PartitionRead::PrimaryNow,
+        };
+        return shard.partition_read(namespace, read).await;
     }
     let (members, created_view, reported) = route?;
     // A stale view costs one NotPrimary hop; no view leaves the route empty.
@@ -517,7 +534,7 @@ mod tests {
             &[1, 2],
         );
 
-        let route = partition_primary(&shard, namespace).await;
+        let route = partition_primary(&shard, namespace, PrimaryLookup::Hold).await;
 
         assert!(
             matches!(

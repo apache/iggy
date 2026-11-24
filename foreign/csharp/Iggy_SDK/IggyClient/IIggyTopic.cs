@@ -26,13 +26,15 @@ namespace Apache.Iggy.IggyClient;
 public interface IIggyTopic
 {
     /// <summary>
-    ///     Retrieves information about all topics in a specified stream.
+    ///     Retrieves information about the topics of a stream. The list holds only the topics the caller may read.
     /// </summary>
     /// <remarks>
     ///     Over TCP the client reads the list in pages of 1000 in id order, so the result is not one consistent read:
     ///     a topic that someone creates or deletes during the read can be in it or not. Every page keeps the sign-in
     ///     and the call deadline that the read started with. Over HTTP the server returns the whole list in one reply,
-    ///     but it builds that reply from pages of 1000, so it is not one consistent read either.
+    ///     but it builds that reply from pages of 1000, so it is not one consistent read either. If the stream goes
+    ///     missing after the first page, the read fails as <see cref="GetTopicsPageAsync" /> does for a caller with a
+    ///     global read grant, and ends there for any other caller.
     /// </remarks>
     /// <param name="streamId">The identifier of the stream containing the topics (numeric ID or name).</param>
     /// <param name="token">The cancellation token to cancel the operation.</param>
@@ -43,8 +45,9 @@ public interface IIggyTopic
     Task<IReadOnlyList<TopicResponse>> GetTopicsAsync(Identifier streamId, CancellationToken token = default);
 
     /// <summary>
-    ///     Reads one page of the topics of a stream. For a stream that does not exist, a read without a cursor returns
-    ///     an empty last page.
+    ///     Reads one page of the topics of a stream. The page holds only the topics the caller may read. For a stream
+    ///     that does not exist, or one the caller may read no topic of, a read without a cursor returns an empty last
+    ///     page.
     /// </summary>
     /// <remarks>
     ///     The query is checked before anything is sent. To read the next page, send the same query with the
@@ -56,8 +59,8 @@ public interface IIggyTopic
     /// <returns>A task that represents the asynchronous operation and returns the page.</returns>
     /// <exception cref="Exceptions.IggyInvalidStatusCodeException">
     ///     Invalid command (code 3) for a query the page rules refuse, or for a cursor the server cannot use. Stream
-    ///     not found (code 1009) for a read with a cursor when the stream does not exist: the stream was deleted
-    ///     during the walk.
+    ///     not found (code 1009) for a caller with a global read grant that reads with a cursor when the stream does
+    ///     not exist: the stream was deleted during the walk.
     /// </exception>
     Task<Page<TopicResponse>> GetTopicsPageAsync(Identifier streamId, NamedPageQuery query,
         CancellationToken token = default);

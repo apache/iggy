@@ -29,7 +29,6 @@
 //! the node refuses every probe so that no primary comes back to it.
 
 use crate::commit_batch;
-use crate::shards_table::calculate_shard_assignment;
 use crate::{
     IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, ShardsTable,
     dispatch_partition_journal_actions, dispatch_partition_wire_actions,
@@ -252,6 +251,9 @@ pub struct PrimaryRebalance {
     pending: BTreeMap<IggyNamespace, PendingMove>,
     /// Identity and local receipt time of the newest accepted metadata probe.
     received_probe: Option<((u32, u64, u128), Instant)>,
+    /// The earliest probe of the view with evidence whose commit this node
+    /// has not applied yet. Its credit waits for that commit.
+    held_probe: Option<HeldProbe>,
     /// When this node's partition admission last opened under this authority.
     /// A probe sent before then carried no fresh quorum evidence.
     admission_opened: Option<Instant>,
@@ -441,6 +443,7 @@ impl PrimaryRebalance {
         // the separately published deadline through that transition.
         *self = Self {
             received_probe: self.received_probe,
+            held_probe: self.held_probe,
             ..Self::default()
         };
     }
@@ -501,6 +504,28 @@ impl PrimaryRebalance {
     }
 }
 
+/// A metadata probe that waits for this node to apply its commit.
+///
+/// Under a steady metadata load a probe often names a commit that reaches
+/// this node a moment later. Without the wait such a probe gives no credit,
+/// and a run of them closes partition admission on a healthy backup.
+#[derive(Debug, Clone, Copy)]
+struct HeldProbe {
+    view: u32,
+    commit: u64,
+    /// Upper bound of the age of the evidence at `received`.
+    evidence_age: Duration,
+    received: Instant,
+}
+
+impl HeldProbe {
+    /// Upper bound of the age of the evidence at `now`.
+    fn evidence_age_at(&self, now: Instant) -> Duration {
+        self.evidence_age
+            .saturating_add(now.saturating_duration_since(self.received))
+    }
+}
+
 impl Default for PrimaryRebalance {
     fn default() -> Self {
         Self {
@@ -518,6 +543,7 @@ impl Default for PrimaryRebalance {
             cursor: None,
             pending: BTreeMap::new(),
             received_probe: None,
+            held_probe: None,
             admission_opened: None,
             moves: Vec::new(),
             next_watch: Instant::now(),
@@ -657,6 +683,9 @@ where
             state.replication = PartitionReplication::default();
             state.replication_pass = PartitionReplicationPass::default();
             drop(state);
+            if self.id == 0 {
+                self.credit_held_probe(consensus);
+            }
             metadata.observe_replica_readiness(&[]);
             metadata.observe_tiered_storage_readiness(false);
             if self.id == 0 {
@@ -1491,7 +1520,7 @@ where
         let namespace = IggyNamespace::from_raw(raw);
         self.shards_table
             .shard_for(namespace)
-            .unwrap_or_else(|| calculate_shard_assignment(&namespace, self.shard_count))
+            .unwrap_or_else(|| self.partition_shards.shard_for(&namespace))
     }
 
     fn send_local_rebalance(&self, shard: u16, frame: LocalRebalance) {
@@ -1533,19 +1562,69 @@ where
         if header.quorum_age_ns == PrimaryRebalanceHeader::NO_QUORUM_EVIDENCE {
             return;
         }
+        let evidence_age = Duration::from_nanos(header.quorum_age_ns)
+            .saturating_add(now.saturating_duration_since(previous_received));
+        match self.applied_probe_commit(consensus, header.view, header.commit) {
+            Some(true) => {
+                self.primary_rebalance.borrow_mut().held_probe = None;
+                self.credit_partition_admission(consensus, now, evidence_age);
+            }
+            Some(false) => {
+                let held = &mut self.primary_rebalance.borrow_mut().held_probe;
+                // The commit of an earlier probe is applied first. A backup
+                // that applies later than the next probe arrives would never
+                // reach the commit of the newest one. A probe of the same
+                // commit takes the place when its evidence is younger.
+                if held.is_none_or(|held| {
+                    held.view != header.view
+                        || (held.commit == header.commit
+                            && evidence_age < held.evidence_age_at(now))
+                }) {
+                    *held = Some(HeldProbe {
+                        view: header.view,
+                        commit: header.commit,
+                        evidence_age,
+                        received: now,
+                    });
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Whether this node applied the metadata that a probe of `view` at
+    /// `commit` stands for. `None` when that probe can never give credit.
+    fn applied_probe_commit(
+        &self,
+        consensus: &VsrConsensus<B>,
+        view: u32,
+        commit: u64,
+    ) -> Option<bool> {
         let floor = match consensus.adopted_view_head() {
-            Some((view, head)) if view == header.view => head,
-            None if header.view == 0 => 0,
-            _ => return,
+            Some((adopted, head)) if adopted == view => head,
+            None if view == 0 => 0,
+            _ => return None,
         };
-        if header.commit >= floor && self.plane.metadata().applied_frontier().get() >= header.commit
-        {
-            self.credit_partition_admission(
-                consensus,
-                now,
-                Duration::from_nanos(header.quorum_age_ns)
-                    .saturating_add(now.saturating_duration_since(previous_received)),
-            );
+        (commit >= floor).then(|| self.plane.metadata().applied_frontier().get() >= commit)
+    }
+
+    /// Gives the credit of the held probe once this node applied its commit.
+    /// That equals a probe that arrived later: the evidence is the same, and
+    /// its age counts on from the receipt. A probe of another view is dropped.
+    fn credit_held_probe(&self, consensus: &VsrConsensus<B>) {
+        let Some(probe) = self.primary_rebalance.borrow().held_probe else {
+            return;
+        };
+        let applied = (probe.view == consensus.view())
+            .then(|| self.applied_probe_commit(consensus, probe.view, probe.commit))
+            .flatten();
+        if applied == Some(false) {
+            return;
+        }
+        self.primary_rebalance.borrow_mut().held_probe = None;
+        if applied == Some(true) {
+            let now = self.bus.monotonic_now();
+            self.credit_partition_admission(consensus, now, probe.evidence_age_at(now));
         }
     }
 

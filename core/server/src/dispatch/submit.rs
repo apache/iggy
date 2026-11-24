@@ -36,10 +36,15 @@ use crate::reply_frame::committed_reply_header;
 use crate::shell::{ShellBus, ShellShard};
 use ahash::AHashMap;
 use consensus::{Consensus, MetadataHandle};
+use futures::future::join_all;
+use iggy_binary_protocol::requests::messages::MIN_DEFERRED_POLL_REPLY_MARGIN_US;
+use iggy_binary_protocol::requests::partitions::CreatePartitionsRequest;
+use iggy_binary_protocol::requests::topics::CreateTopicRequest;
 use iggy_binary_protocol::{
     Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
     PrepareHeader, RoutedRequestHeader, WireDecode, WireEncode, WireIdentifier,
 };
+use iggy_common::BINARY_OPERATION_TIMEOUT;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::MetadataSubmitError;
@@ -50,8 +55,10 @@ use metadata::stm::stream::{Streams, TruncatePartitionRequest};
 use secrecy::ExposeSecret;
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
+use shard::{PartitionRead, PartitionReadReply, bus_timeout};
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::task::Poll;
 use std::time::Duration;
 use tracing::{trace, warn};
 
@@ -63,6 +70,13 @@ const COMPLETION_RELAY_BROADCASTS: u32 = 2;
 
 /// Covers the commit of the completion and the delivery of the broadcasts.
 const COMPLETION_RELAY_MARGIN: Duration = Duration::from_millis(500);
+
+/// How long after the arrival of a create its committed reply waits for the
+/// partition builds at most. A binary client stops its wait
+/// [`BINARY_OPERATION_TIMEOUT`] after it sent the request and then reports an
+/// unknown outcome, so the reply leaves one reply margin before that.
+const CREATE_REPLY_BUDGET: Duration = BINARY_OPERATION_TIMEOUT
+    .saturating_sub(Duration::from_micros(MIN_DEFERRED_POLL_REPLY_MARGIN_US));
 
 /// Shard 0's end of the RPC, run for an inbound [`shard::MetadataSubmit`]:
 /// a peer shard has verified credentials and owns the session locally, and
@@ -347,8 +361,51 @@ pub(in crate::dispatch) fn handle_metadata_submit<B, MJ, S, SB>(
 /// `None` = no verdict, for example after shard 0 refused the forward. The
 /// outcome is unknown, so callers answer `TransientNotCommitted`, which
 /// licenses only a replay of the same request id.
+///
+/// The committed reply of a create that adds partitions returns only after
+/// `await_created_partitions`. A replay of that create gets its cached reply
+/// through here too, so it waits the same way on the node that serves it.
+/// That wait ends [`CREATE_REPLY_BUDGET`] after `arrived_us`, the bus clock
+/// reading at which the request arrived, so a create that committed late
+/// still answers its client in time.
 #[allow(clippy::future_not_send)]
 pub async fn submit_client_request_on_owner<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    request: Message<RoutedRequestHeader>,
+    arrived_us: u64,
+) -> Option<Message<GenericHeader>>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let create = PartitionCreate::named_by(&request);
+    let reply = submit_before_partition_wait(shard, request).await?;
+    if let Some(create) = &create {
+        let budget = u64::try_from(CREATE_REPLY_BUDGET.as_micros()).unwrap_or(u64::MAX);
+        let remaining = arrived_us
+            .saturating_add(budget)
+            .saturating_sub(shard.bus.monotonic_micros());
+        // A wait that ends here drops its reply receivers only: the owners
+        // end their holds as they do after a read timeout.
+        if remaining > 0 {
+            let wait = await_created_partitions(shard, create, &reply);
+            let _ = bus_timeout(&shard.bus, Duration::from_micros(remaining), wait).await;
+        }
+    }
+    Some(reply)
+}
+
+/// [`submit_client_request_on_owner`] without its wait for the partitions of
+/// a create.
+///
+/// Only for a caller that holds a lock across the submit which the wait must
+/// not extend. That caller reads [`PartitionCreate::named_by`] before the
+/// submit and runs [`await_created_partitions`] before it answers the client.
+#[allow(clippy::future_not_send)]
+pub async fn submit_before_partition_wait<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
 ) -> Option<Message<GenericHeader>>
@@ -360,19 +417,124 @@ where
     SB: SuperblockStore + 'static,
 {
     if shard.id == 0 {
-        return shard
+        shard
             .plane
             .metadata()
             .submit_request_in_process(request)
             .await
-            .ok();
+            .ok()
+    } else {
+        let (reply, rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
+        shard.forward_metadata_submit(shard::MetadataSubmit::ClientRequest {
+            request: request.into_generic(),
+            reply,
+        });
+        rx.recv().await.ok().flatten()
     }
-    let (reply, rx) = shard::channel::<Option<Message<GenericHeader>>>(1);
-    shard.forward_metadata_submit(shard::MetadataSubmit::ClientRequest {
-        request: request.into_generic(),
-        reply,
-    });
-    rx.recv().await.ok().flatten()
+}
+
+/// The topic that a client request adds partitions to, read before the submit
+/// consumes the request. The committed reply does not name the stream.
+pub struct PartitionCreate {
+    stream_id: WireIdentifier,
+    topic_id: WireIdentifier,
+}
+
+impl PartitionCreate {
+    /// `None` for a request that creates no partition, or whose body does not
+    /// decode, which the metadata primary refuses.
+    pub fn named_by(request: &Message<RoutedRequestHeader>) -> Option<Self> {
+        match request.header().operation {
+            Operation::CreateTopic => {
+                let create = CreateTopicRequest::decode_from(request.body()).ok()?;
+                Some(Self {
+                    stream_id: create.stream_id,
+                    topic_id: WireIdentifier::String(create.name),
+                })
+            }
+            Operation::CreatePartitions => {
+                let create = CreatePartitionsRequest::decode_from(request.body()).ok()?;
+                Some(Self {
+                    stream_id: create.stream_id,
+                    topic_id: create.topic_id,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Wait until the shards of this node have built the partitions that the
+/// committed `reply` created and that this node stores.
+///
+/// The create is committed whatever the builds do, and the reply is not
+/// changed. The wait only makes a request that follows the reply find the
+/// partitions on this node. It asks the owner shard of each partition for its
+/// primary: the owner holds that read until it inserts the partition, also
+/// while it still has an older incarnation under the same ids, and answers
+/// at once when the partition is there. Every answer ends the wait
+/// for its partition, also the `NotFound` of an owner whose hold ended and
+/// the missing answer of an owner that did not reply within the read budget.
+///
+/// The names resolve against metadata that already holds the create. A
+/// rename or a delete that commits before this runs leaves nothing to wait
+/// for, because no other partition has the op of `reply`.
+#[allow(clippy::future_not_send)]
+pub async fn await_created_partitions<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    create: &PartitionCreate,
+    reply: &Message<GenericHeader>,
+) where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let Some(created_op) = committed_reply_header(reply)
+        .filter(|header| {
+            matches!(
+                header.operation,
+                Operation::CreateTopicWithAssignments | Operation::CreatePartitionsWithAssignments
+            )
+        })
+        .map(|header| header.op)
+    else {
+        return;
+    };
+    let created = shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .partitions_created_at(
+            &create.stream_id,
+            &create.topic_id,
+            created_op,
+            shard.replica_topology().self_replica_id,
+        );
+    let mut reads = Vec::with_capacity(created.len());
+    let mut refusing_owners = Vec::new();
+    for namespace in created {
+        let owner = shard.partition_shards().shard_for(&namespace);
+        if refusing_owners.contains(&owner) {
+            continue;
+        }
+        let mut read = Box::pin(shard.partition_read(namespace, PartitionRead::Primary));
+        // The first poll sends the read. A `Rejected` on that poll comes from
+        // an owner inbox that refused it, or from an owner that answered
+        // before the poll ended: the reply does not tell them apart. A full
+        // inbox refuses the next reads too and logs each refusal, so the
+        // other partitions of that owner get no read and no wait. At worst
+        // the reply leaves before their build, and the owner then holds the
+        // first request for them. The other owners still get their reads.
+        match futures::poll!(read.as_mut()) {
+            Poll::Ready(Some(PartitionReadReply::Rejected(_))) => refusing_owners.push(owner),
+            Poll::Ready(_) => {}
+            Poll::Pending => reads.push(read),
+        }
+    }
+    join_all(reads).await;
 }
 
 /// Commit the retention decision of a tiered partition's primary as a
@@ -830,14 +992,15 @@ fn relay_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletionKey, CompletionRelays, commit_retention_truncate, committed_reply_commit,
-        decode_relayed_truncation, forward_completion_message, handle_metadata_submit,
-        relay_message, retention_truncate_request,
+        CREATE_REPLY_BUDGET, CompletionKey, CompletionRelays, commit_retention_truncate,
+        committed_reply_commit, decode_relayed_truncation, forward_completion_message,
+        handle_metadata_submit, relay_message, retention_truncate_request,
+        submit_client_request_on_owner,
     };
     use crate::dispatch::host::ServerHost;
     use crate::dispatch::test_support::{
-        FIRST_BOOT, SpyBus, TestShard, create_one_partition, prepare_message, request_message,
-        test_shard,
+        FIRST_BOOT, SpyBus, TestShard, attach_root_session, create_one_partition, prepare_message,
+        request_message, test_shard,
     };
     use crate::reply_frame::{build_deny_reply, build_reply_from_bytes};
     use bytes::Bytes;
@@ -848,14 +1011,20 @@ mod tests {
     };
     use futures::FutureExt as _;
     use futures::channel::oneshot;
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::consumer_groups::CreateConsumerGroupRequest;
-    use iggy_binary_protocol::requests::topics::DeleteTopicRequest;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
+    };
     use iggy_binary_protocol::{
         Command, ConsensusHeader, ForwardCompletionHeader, GenericHeader, HEADER_SIZE, Operation,
-        StartViewChangeHeader, WireEncode, WireIdentifier, WireName,
+        PrepareHeader, RoutedRequestHeader, StartViewChangeHeader, WireEncode, WireIdentifier,
+        WireName, WireOptions,
     };
-    use iggy_common::{IggyDuration, IggyError};
+    use iggy_common::{IggyDuration, IggyError, TopicCreateOptions};
     use journal::prepare_journal::PrepareJournal;
+    use message_bus::MessageBus as _;
     use metadata::MetadataSubmitError;
     use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateMachine as _;
@@ -870,7 +1039,11 @@ mod tests {
     use server_common::iobuf::Owned;
     use server_common::sharding::IggyNamespace;
     use server_common::{MESSAGE_ALIGN, Message};
-    use shard::ShardHost as _;
+    use shard::shards_table::PartitionShards;
+    use shard::{
+        LifecycleFrame, PartitionRead, PartitionReadReply, ShardFrame, ShardHost as _,
+        shard_channel,
+    };
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::Arc;
@@ -963,6 +1136,380 @@ mod tests {
             committed_reply_commit(&request.into_generic()),
             None,
             "only a `Reply` carries a commit position"
+        );
+    }
+
+    /// The client whose `CreateTopic` the [`CreateFixture`] commits.
+    const CREATOR: u128 = 1;
+    /// The session that `prepare_message` stamps.
+    const CREATOR_SESSION: u64 = 1;
+    const CREATE_REQUEST: u64 = 2;
+    const CREATE_OP: u64 = 7;
+
+    /// Replica 0 of [`REPLICAS`] with one stream. The test owns the inbox of
+    /// every shard, so it plays the owner of every partition and decides when
+    /// a partition counts as built.
+    struct CreateFixture {
+        shard: Rc<TestShard>,
+        owner_inboxes: Vec<shard::Receiver<ShardFrame>>,
+        create: CreateTopicWithAssignmentsRequest,
+    }
+
+    impl CreateFixture {
+        /// One shard. `members` lists the nodes of each partition of the
+        /// topic that [`Self::commit_create`] creates. An empty list is every
+        /// node.
+        fn new(bus: &SpyBus, inbox_capacity: usize, members: &[&[u8]]) -> Self {
+            Self::with_owners(bus, &[inbox_capacity], members)
+        }
+
+        /// One shard for each entry of `inbox_capacities`.
+        fn with_owners(bus: &SpyBus, inbox_capacities: &[usize], members: &[&[u8]]) -> Self {
+            let mut shard = test_shard(bus, PRIMARY, REPLICAS, FIRST_BOOT);
+            let (senders, owner_inboxes) = (0u16..)
+                .zip(inbox_capacities)
+                .map(|(owner, capacity)| {
+                    let (sender, inbox, _replies) = shard_channel(owner, *capacity, 1);
+                    (sender, inbox)
+                })
+                .unzip();
+            shard.attach_senders(senders);
+            let mux_stm = &shard.plane.metadata().mux_stm;
+            mux_stm.users().ensure_root_user("iggy", "hash");
+            attach_root_session(&shard, CREATOR, CREATOR_SESSION);
+            mux_stm
+                .update(prepare_message(
+                    Operation::CreateStream,
+                    CREATOR,
+                    1,
+                    &CreateStreamRequest {
+                        name: WireName::new("stream").unwrap(),
+                        options: WireOptions::empty(),
+                    }
+                    .to_bytes(),
+                ))
+                .unwrap();
+            let replication_factor = members
+                .first()
+                .filter(|members| !members.is_empty())
+                .map(|members| u32::try_from(members.len()).unwrap());
+            let partitions: Vec<_> = (0u32..)
+                .zip(members)
+                .map(|(partition_id, members)| CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id,
+                    consensus_group_id: u64::from(partition_id) + 1,
+                    members: members.to_vec(),
+                })
+                .collect();
+            let create = CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::String(WireName::new("stream").unwrap()),
+                    partitions_count: u32::try_from(partitions.len()).unwrap(),
+                    name: WireName::new("topic").unwrap(),
+                    options: TopicCreateOptions {
+                        replication_factor,
+                        ..Default::default()
+                    }
+                    .to_wire()
+                    .unwrap(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions,
+            };
+            Self {
+                shard: Rc::new(shard),
+                owner_inboxes,
+                create,
+            }
+        }
+
+        /// Commits the `CreateTopic` as request `request` of [`CREATOR`] at
+        /// metadata op `op`, and returns the client request. Its reply is in
+        /// the client table, as after a commit whose reply never reached the
+        /// client, so the returned request gets that reply.
+        fn commit_create(&self, request: u64, op: u64) -> Message<RoutedRequestHeader> {
+            let metadata = self.shard.plane.metadata();
+            let prepare = prepare_message(
+                Operation::CreateTopicWithAssignments,
+                CREATOR,
+                request,
+                &self.create.to_bytes(),
+            )
+            .transmute_header(|old, header: &mut PrepareHeader| {
+                *header = old;
+                header.op = op;
+            });
+            metadata::apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                |_| {},
+                prepare,
+            );
+            request_message(
+                Operation::CreateTopic,
+                CREATOR,
+                CREATOR_SESSION,
+                request,
+                &self.create.request.to_bytes(),
+            )
+        }
+
+        /// The bus clock reading of a request that arrives now.
+        fn arrived_now(&self) -> u64 {
+            self.shard.bus.monotonic_micros()
+        }
+
+        /// The read that the owner of a new partition was asked: the
+        /// partition, and the sender of the answer.
+        fn asked(&self) -> Option<(IggyNamespace, shard::Sender<PartitionReadReply>)> {
+            self.asked_on(0)
+        }
+
+        /// [`Self::asked`] for the shard `owner`.
+        fn asked_on(
+            &self,
+            owner: u16,
+        ) -> Option<(IggyNamespace, shard::Sender<PartitionReadReply>)> {
+            match self.owner_inboxes[usize::from(owner)].try_recv().ok()? {
+                ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    namespace,
+                    read: PartitionRead::Primary,
+                    reply,
+                    ..
+                }) => Some((namespace, reply)),
+                _ => panic!("only primary reads go to the owner"),
+            }
+        }
+    }
+
+    /// A create that committed late must answer its client before the client
+    /// stops waiting, so the reply budget ends the wait for an owner that
+    /// stays silent.
+    #[compio::test]
+    async fn given_committed_create_when_reply_budget_ends_should_reply_without_owner_answer() {
+        const NOW: u64 = 100_000_000;
+        const LEFT: Duration = Duration::from_secs(5);
+        let bus = SpyBus::default();
+        bus.monotonic.set(Some(NOW));
+        // The read budget of the owner takes the first timer and never ends,
+        // so only the reply budget can end the wait.
+        let (_read_budget, held) = oneshot::channel();
+        *bus.held_timer.borrow_mut() = Some(held);
+        bus.instant_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let spent = u64::try_from(CREATE_REPLY_BUDGET.saturating_sub(LEFT).as_micros()).unwrap();
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, NOW - spent)
+            .now_or_never()
+            .expect("the reply budget ends the wait");
+
+        assert!(
+            fixture.asked().is_some(),
+            "the owner was asked and did not answer"
+        );
+        assert_eq!(bus.sleeps.borrow().last(), Some(&LEFT));
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_reply_budget_is_spent_should_reply_at_once() {
+        const NOW: u64 = 100_000_000;
+        let bus = SpyBus::default();
+        bus.monotonic.set(Some(NOW));
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let spent = u64::try_from(CREATE_REPLY_BUDGET.as_micros()).unwrap();
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, NOW - spent)
+            .now_or_never()
+            .expect("no time is left for the wait");
+
+        assert!(fixture.asked().is_none(), "no owner is asked");
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+    }
+
+    /// Sends the committed create again and plays the owner of its partition.
+    /// The reply must wait for `answer`, and then be the committed success.
+    async fn assert_reply_waits_for_owner(answer: PartitionReadReply) {
+        let bus = SpyBus::default();
+        // The answer of the owner ends the wait, never the read budget.
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
+        assert!(
+            futures::poll!(reply.as_mut()).is_pending(),
+            "the reply waits for the owner of the new partition"
+        );
+        let (namespace, answer_to) = fixture.asked().expect("the owner is asked");
+        assert_eq!(namespace, IggyNamespace::new(0, 0, 0));
+        answer_to.try_send(answer).unwrap();
+
+        assert_eq!(
+            committed_reply_commit(&reply.await.unwrap()),
+            Some(CREATE_OP)
+        );
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_partition_is_unbuilt_should_hold_reply_until_insert() {
+        assert_reply_waits_for_owner(PartitionReadReply::Primary {
+            view: 0,
+            primary: PRIMARY,
+        })
+        .await;
+    }
+
+    /// The owner ends its hold with `NotFound` when it did not build the
+    /// partition in time. The create is committed all the same.
+    #[compio::test]
+    async fn given_committed_create_when_hold_ends_without_a_build_should_reply_success() {
+        assert_reply_waits_for_owner(PartitionReadReply::NotFound).await;
+    }
+
+    #[compio::test]
+    async fn given_committed_create_when_node_stores_no_partition_should_reply_at_once() {
+        let bus = SpyBus::default();
+        let fixture = CreateFixture::new(&bus, 1, &[&[1, 2]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, fixture.arrived_now())
+            .now_or_never()
+            .expect("no partition to wait for");
+
+        assert_eq!(committed_reply_commit(&reply.unwrap()), Some(CREATE_OP));
+        assert!(fixture.asked().is_none());
+    }
+
+    /// The second create of one topic name commits as a rejection. The
+    /// partition of the first create is still unbuilt, and is not waited for.
+    #[compio::test]
+    async fn given_failed_create_when_replying_should_not_wait() {
+        let bus = SpyBus::default();
+        let fixture = CreateFixture::new(&bus, 1, &[&[]]);
+        fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+        let request = fixture.commit_create(CREATE_REQUEST + 1, CREATE_OP + 1);
+
+        let reply = submit_client_request_on_owner(&fixture.shard, request, fixture.arrived_now())
+            .now_or_never()
+            .expect("a rejection waits for nothing")
+            .unwrap();
+
+        assert_eq!(reply.header().command, Command::Reply);
+        assert_eq!(committed_reply_commit(&reply), None);
+        assert!(fixture.asked().is_none());
+    }
+
+    /// An owner inbox with room for one frame takes the read of partition 0
+    /// and refuses the read of partition 1. The reply waits for the read that
+    /// the owner took, and for nothing else.
+    #[compio::test]
+    async fn given_committed_create_when_owner_inbox_refuses_a_read_should_wait_for_the_reads_it_took()
+     {
+        let bus = SpyBus::default();
+        bus.frozen_timers.set(true);
+        let fixture = CreateFixture::new(&bus, 1, &[&[], &[]]);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
+        assert!(futures::poll!(reply.as_mut()).is_pending());
+        let (namespace, answer_to) = fixture.asked().expect("the owner took one read");
+        assert_eq!(namespace, IggyNamespace::new(0, 0, 0));
+        answer_to
+            .try_send(PartitionReadReply::Primary {
+                view: 0,
+                primary: PRIMARY,
+            })
+            .unwrap();
+
+        assert_eq!(
+            committed_reply_commit(&reply.await.unwrap()),
+            Some(CREATE_OP)
+        );
+        assert!(fixture.asked().is_none());
+    }
+
+    /// The inbox of the owner of partition 0 has room for one frame, so it
+    /// refuses the read of its next partition. The partitions of the other
+    /// owner come after that refusal too, and the reply must wait for them.
+    #[compio::test]
+    async fn given_committed_create_when_one_owner_inbox_refuses_should_wait_for_the_other_owner() {
+        const PARTITIONS: usize = 8;
+        let placement = PartitionShards::new(2, false);
+        let owner_of = |partition: usize| placement.shard_for(&IggyNamespace::new(0, 0, partition));
+        let full = owner_of(0);
+        let roomy = 1 - full;
+        let mut inbox_capacities = [PARTITIONS; 2];
+        inbox_capacities[usize::from(full)] = 1;
+        let refused = (1..PARTITIONS)
+            .find(|partition| owner_of(*partition) == full)
+            .expect("the full owner has a second partition");
+        let roomy_partitions: Vec<_> = (0..PARTITIONS)
+            .filter(|partition| owner_of(*partition) == roomy)
+            .collect();
+        assert!(
+            roomy_partitions.last().is_some_and(|last| *last > refused),
+            "a partition of the other owner follows the refusal"
+        );
+        let bus = SpyBus::default();
+        bus.frozen_timers.set(true);
+        let every_node: &[u8] = &[];
+        let fixture =
+            CreateFixture::with_owners(&bus, &inbox_capacities, &[every_node; PARTITIONS]);
+        assert_eq!(fixture.shard.partition_shards(), placement);
+        let request = fixture.commit_create(CREATE_REQUEST, CREATE_OP);
+
+        let mut reply = Box::pin(submit_client_request_on_owner(
+            &fixture.shard,
+            request,
+            fixture.arrived_now(),
+        ));
+        assert!(futures::poll!(reply.as_mut()).is_pending());
+        let (taken, answer_to) = fixture
+            .asked_on(full)
+            .expect("the full owner took one read");
+        assert_eq!(taken, IggyNamespace::new(0, 0, 0));
+        let primary = || PartitionReadReply::Primary {
+            view: 0,
+            primary: PRIMARY,
+        };
+        answer_to.try_send(primary()).unwrap();
+        let asked: Vec<_> = std::iter::from_fn(|| fixture.asked_on(roomy)).collect();
+        assert_eq!(
+            asked
+                .iter()
+                .map(|(namespace, _)| *namespace)
+                .collect::<Vec<_>>(),
+            roomy_partitions
+                .iter()
+                .map(|partition| IggyNamespace::new(0, 0, *partition))
+                .collect::<Vec<_>>(),
+            "every partition of the other owner is asked"
+        );
+        assert!(
+            futures::poll!(reply.as_mut()).is_pending(),
+            "the reply waits for the other owner"
+        );
+        for (_, answer_to) in asked {
+            answer_to.try_send(primary()).unwrap();
+        }
+
+        assert_eq!(
+            committed_reply_commit(&reply.await.unwrap()),
+            Some(CREATE_OP)
         );
     }
 
