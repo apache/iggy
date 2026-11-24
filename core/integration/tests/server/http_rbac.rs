@@ -271,19 +271,25 @@ async fn given_http_requests_when_denied_should_carry_typed_status_and_body(harn
     let alice = root.login("alice", "alice-pass").await;
 
     // Dispatch read gate: an ungranted read is 403 with a typed Unauthorized body.
-    let read = alice.get("/streams").await;
+    let read = alice.get("/streams/rbac-s1").await;
     assert_eq!(
         read.status(),
         StatusCode::FORBIDDEN,
-        "alice GET /streams must be 403"
+        "alice GET /streams/rbac-s1 must be 403"
     );
     assert_error_body(
         read,
         UNAUTHORIZED_ID,
         UNAUTHORIZED_CODE,
-        "alice GET /streams",
+        "alice GET /streams/rbac-s1",
     )
     .await;
+
+    // A list holds only what the caller may read, so without a grant it is empty.
+    let list = alice.get("/streams").await;
+    assert_eq!(list.status(), StatusCode::OK, "alice GET /streams");
+    let listed: Value = list.json().await.expect("stream list JSON");
+    assert_eq!(listed, json!([]), "alice GET /streams lists nothing");
 
     // In-apply control gate: the denial rides the metadata result section back as
     // a typed Unauthorized body, still under a 403.

@@ -534,7 +534,12 @@ fn given_response_vectors_when_decoding_should_match_typed_projection() {
         );
 
         let stored = vector.state.stored_options().expect("stored state builds");
-        let public = public_options(OptionsScope::Stream, &stored).expect("stream projects");
+        let public = vector.state.public_options().expect("stream projects");
+        assert_eq!(
+            vector.expected.shadow_origin, vector.state.shadow_origin,
+            "{}",
+            vector.case
+        );
         let (options, derived_options) =
             resource_options_to_wire_split(&public).expect("blocks encode");
         let rebuilt = GetStreamResponse {

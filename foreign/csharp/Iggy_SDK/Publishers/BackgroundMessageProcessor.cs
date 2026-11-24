@@ -479,8 +479,9 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
     }
 
     /// <summary>
-    ///     Sends the materialized wire batch, applying exponential-backoff retry when enabled. On terminal failure
-    ///     the batch is published to the message-batch-failed event (snapshotted, since the wire list is reused).
+    ///     Sends the materialized wire batch, applying exponential-backoff retry when enabled to every failure but a
+    ///     refusal no resend changes. On terminal failure the batch is published to the message-batch-failed event
+    ///     (snapshotted, since the wire list is reused).
     /// </summary>
     private async Task SendWithRetry(List<Message> wire, CancellationToken ct)
     {
@@ -547,6 +548,17 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
 
                 return;
             }
+            catch (IggyInvalidStatusCodeException ex) when (IsFinalRefusal(ex))
+            {
+                LogFailedToSendBatch(ex, wire.Count);
+                if (_messageBatchErrorAggregator.HasSubscribers)
+                {
+                    _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(ex, SnapshotForFailure(wire),
+                        attempt + 1));
+                }
+
+                return;
+            }
             catch (Exception ex)
             {
                 lastException = ex;
@@ -578,6 +590,15 @@ internal sealed partial class BackgroundMessageProcessor : IAsyncDisposable
             _messageBatchErrorAggregator.Publish(new MessageBatchFailedEventArgs(lastException!,
                 SnapshotForFailure(wire), maxAttempts));
         }
+    }
+
+    /// <summary>
+    ///     A server verdict that every resend of the batch would get again: a shadow stream serves another
+    ///     datacenter's topics and takes no writes.
+    /// </summary>
+    private static bool IsFinalRefusal(IggyInvalidStatusCodeException refusal)
+    {
+        return refusal is { FromServer: true, StatusCode: VsrError.SHADOW_STREAM_READ_ONLY };
     }
 
     private async Task SendWithRecovery(List<Message> wire, CancellationToken ct)

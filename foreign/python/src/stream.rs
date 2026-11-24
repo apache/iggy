@@ -121,6 +121,13 @@ impl StreamDetails {
     pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
         self.inner.encryption_kek_fingerprints()
     }
+
+    /// The geo origin whose topics this shadow stream serves, such as
+    /// `"dc-a"`. `None` for any stream that is not a shadow stream.
+    #[getter]
+    pub fn shadow_origin(&self) -> Option<String> {
+        self.inner.shadow_origin()
+    }
 }
 
 /// Summary information returned by `IggyClient.get_streams()`.
@@ -220,5 +227,12 @@ impl Stream {
     #[getter]
     pub fn encryption_kek_fingerprints(&self) -> Vec<String> {
         self.inner.encryption_kek_fingerprints()
+    }
+
+    /// The geo origin whose topics this shadow stream serves, such as
+    /// `"dc-a"`. `None` for any stream that is not a shadow stream.
+    #[getter]
+    pub fn shadow_origin(&self) -> Option<String> {
+        self.inner.shadow_origin()
     }
 }

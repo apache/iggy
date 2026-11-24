@@ -46,7 +46,9 @@ fn short_reserve() -> Arc<FreeSpaceReserve> {
     reserve_with(RESERVE_BYTES - 1)
 }
 
-fn send_request<B: MessageBus>(partition: &IggyPartition<B>) -> Message<RoutedRequestHeader> {
+pub(super) fn send_request<B: MessageBus>(
+    partition: &IggyPartition<B>,
+) -> Message<RoutedRequestHeader> {
     let namespace = partition.namespace();
     let mut send = checksumless_send_request(namespace, 1).transmute_header(
         |header, next: &mut RoutedRequestHeader| {
@@ -121,6 +123,7 @@ async fn given_a_short_data_disk_when_a_send_is_retried_should_answer_the_outcom
                         base_offset: 0,
                         message_count: 1,
                         size_bytes: 0,
+                        placed: None,
                     }),
                 ),
             );

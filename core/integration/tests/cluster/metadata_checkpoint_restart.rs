@@ -37,13 +37,12 @@
 //!   and replay the WAL suffix on top.
 //!
 //! Checkpoint placement in the 3-node cases is config-driven: with
-//! `metadata.journal_slots = 256` and the built-in checkpoint margin (64), a
-//! checkpoint fires when the journal holds 192 committed ops, i.e. at op 192,
-//! 384, ... The register commits at op 1 and request K at op K + 1, so request
-//! 191 lands checkpoint one and request 383 lands checkpoint two. Requests
-//! here are sequential with one in flight, which keeps that arithmetic exact;
-//! the `forced checkpoint completed` markers below pin it rather than trust
-//! it.
+//! `metadata.journal_slots = 256` a checkpoint starts once half the journal,
+//! 128 ops, committed past the last one, i.e. at op 128, 256, ... The register
+//! commits at op 1 and request K at op K + 1, so request 127 lands checkpoint
+//! one and request 255 lands checkpoint two. Requests here are sequential with
+//! one in flight, which keeps that arithmetic exact; the `forced checkpoint
+//! completed` markers below pin it rather than trust it.
 
 use super::client_table_restart::{
     commit_request, create_stream_payload, register, resume_request, tcp_addr, tcp_addrs,
@@ -54,9 +53,8 @@ use integration::iggy_harness;
 use std::time::Duration;
 use tokio::time::{Instant, sleep};
 
-/// With `journal_slots = 256` and the margin floor (64), a checkpoint fires
-/// every 192 committed ops.
-const CHECKPOINT_EVERY: u64 = 192;
+/// With `journal_slots = 256` a checkpoint starts every 128 committed ops.
+const CHECKPOINT_EVERY: u64 = 128;
 
 /// Requests that land the commit log exactly on the first checkpoint:
 /// register = op 1, request K = op K + 1.
@@ -69,6 +67,8 @@ const MARKER_BUDGET: Duration = Duration::from_secs(30);
 const MARKER_POLL: Duration = Duration::from_millis(200);
 
 const INSTALL_MARKER: &str = "metadata state transfer installed";
+
+const CHECKPOINT_MARKER: &str = "forced checkpoint completed";
 
 /// Poll until `node`'s stdout contains `marker` `at_least` times.
 async fn await_marker(
@@ -96,16 +96,15 @@ async fn await_marker(
 /// primary needs its snapshot on disk to offer a transfer, and the restarted
 /// node's own drained journal is the precondition the test is about.
 ///
-/// Generations are counted per node, not matched by op: the trigger fires on
-/// journal occupancy but each node snapshots at its own applied watermark,
-/// so a backup checkpoints one op behind the primary (191 vs 192 for the
-/// first generation here).
+/// Generations are counted per node, not matched by op: each node starts its
+/// checkpoint at its own commit point, so a node that learns of commits in a
+/// batch checkpoints at a later op.
 async fn await_checkpoint_on_all_nodes(harness: &TestHarness, generation: usize) {
     for node in 0..3 {
         await_marker(
             harness,
             node,
-            "forced checkpoint completed",
+            CHECKPOINT_MARKER,
             generation,
             "checkpoint wait",
         )
@@ -117,9 +116,9 @@ async fn await_checkpoint_on_all_nodes(harness: &TestHarness, generation: usize)
 // a checkpoint, so the transfer descriptor's `commit_op == snapshot_seq` and
 // the post-install tail repair has nothing to fetch (`commit_min ==
 // commit_max` skips it). The below-floor retry then proves the reply ring
-// rode the transferred table: request 191's reply was minted at op 192, and
+// rode the transferred table: request 127's reply was minted at op 128, and
 // replay starts at `snapshot_seq + 1`, so no node re-executes it. The
-// checkpoint drain keeps op 192's entry as the commit-point header a
+// checkpoint drain keeps op 128's entry as the commit-point header a
 // `DoViewChange` needs, but never replays it.
 #[iggy_harness(cluster_nodes = 3, server(metadata.journal_slots = "256"))]
 async fn given_drained_journal_when_node_restarts_should_install_snapshot_only(
@@ -281,11 +280,9 @@ async fn given_installed_snapshot_when_node_restarts_again_should_transfer_again
     .await;
 }
 
-/// The prepare WAL has `SLOT_COUNT = 1024` slots and the coordinator checkpoints at
-/// `<= CHECKPOINT_MARGIN` (64) remaining, so after ~960 uncheckpointed ops. 1024
-/// stream creates clears that with room for a WAL suffix above the checkpoint, and
-/// stays under `MAX_STREAMS`.
-const STREAMS: u32 = 1024;
+/// With `journal_slots = 256` the checkpoint starts at op 128 and the next one only
+/// at op 256, so 200 stream creates drain a prefix and leave a WAL suffix above it.
+const STREAMS: u32 = 200;
 
 const RECOVER_TIMEOUT: Duration = Duration::from_secs(60);
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -334,8 +331,8 @@ async fn wait_for_stream(harness: &TestHarness, stream: &str) -> IggyClient {
 // it in the superblock, and DRAINS the snapshotted prefix from the WAL. A restart
 // after that must fold the snapshot back in as the recovery floor and replay only the
 // committed suffix on top, rather than rely on a full WAL replay, which no longer
-// holds the drained ops. This drives a real checkpoint by pushing the metadata WAL
-// past `CHECKPOINT_MARGIN`, restarts the process, and asserts that a stream from the
+// holds the drained ops. This drives a real checkpoint by filling half the metadata
+// WAL, restarts the process, and asserts that a stream from the
 // drained prefix, recoverable only from the snapshot, and one from the WAL suffix
 // both survive.
 //
@@ -343,7 +340,10 @@ async fn wait_for_stream(harness: &TestHarness, stream: &str) -> IggyClient {
 // bulk creation is fast and the WAL is fully committed with no uncommitted suffix to
 // reconcile, exercising checkpoint and snapshot-fold recovery in isolation without an
 // election in the mix.
-#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "0..1"))]
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(sharding.cpu_allocation = "0..1", metadata.journal_slots = "256")
+)]
 async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_from_snapshot_and_wal(
     harness: &mut TestHarness,
 ) {
@@ -356,20 +356,10 @@ async fn given_checkpointed_metadata_when_solo_replica_restarts_should_recover_f
     }
     drop(client);
 
-    // Crossing CHECKPOINT_MARGIN must have driven the coordinator to persist a snapshot
-    // and drain the WAL prefix behind it.
-    let snapshot_path = harness
-        .node(0)
-        .data_path()
-        .join("metadata")
-        .join("snapshot.bin");
-    let snapshot_len = std::fs::metadata(&snapshot_path).map(|m| m.len()).ok();
-    assert!(
-        snapshot_len.is_some_and(|len| len > 0),
-        "{STREAMS} committed metadata ops must cross CHECKPOINT_MARGIN and persist a \
-         non-empty snapshot at {}, got {snapshot_len:?}",
-        snapshot_path.display()
-    );
+    // Filling half the WAL must have driven the coordinator to persist a snapshot and
+    // drain the WAL prefix behind it. The snapshot file is on disk before the drain,
+    // and a restart before it replays the whole WAL.
+    await_marker(harness, 0, CHECKPOINT_MARKER, 1, "solo checkpoint").await;
 
     // Restart the solo node: recovery loads the snapshot, holding the drained prefix,
     // and replays the committed WAL suffix on top.

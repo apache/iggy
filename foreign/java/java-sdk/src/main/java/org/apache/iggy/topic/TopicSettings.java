@@ -53,6 +53,14 @@ final class TopicSettings {
                 .flatMap(value -> compressionNamed(value.asString()));
     }
 
+    static Optional<TopicType> topicType(Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
+        return text(options, derived, TopicOptionKey.TOPIC_TYPE).flatMap(TopicType::fromValue);
+    }
+
+    static Optional<GeoMode> geoMode(Map<String, HeaderValue> options, Map<String, HeaderValue> derived) {
+        return text(options, derived, TopicOptionKey.GEO_MODE).flatMap(GeoMode::fromValue);
+    }
+
     static String compressionName(CompressionAlgorithm algorithm) {
         return algorithm.name().toLowerCase(Locale.ROOT);
     }
@@ -64,6 +72,13 @@ final class TopicSettings {
             }
         }
         return Optional.empty();
+    }
+
+    private static Optional<String> text(
+            Map<String, HeaderValue> options, Map<String, HeaderValue> derived, TopicOptionKey key) {
+        return value(options, derived, key)
+                .filter(value -> value.kind() == HeaderKind.String)
+                .map(HeaderValue::asString);
     }
 
     private static Optional<HeaderValue> value(

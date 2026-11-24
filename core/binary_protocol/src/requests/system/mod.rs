@@ -26,6 +26,7 @@ pub mod get_metadata_changes;
 pub mod get_snapshot;
 pub mod get_stats;
 pub mod ping;
+pub mod retire_geo_origin;
 pub mod retire_sessions;
 pub mod update_resource;
 
@@ -42,5 +43,6 @@ pub use get_metadata_changes::{GetMetadataChangesRequest, WireMetadataChangeStar
 pub use get_snapshot::GetSnapshotRequest;
 pub use get_stats::GetStatsRequest;
 pub use ping::PingRequest;
+pub use retire_geo_origin::RetireGeoOriginRequest;
 pub use retire_sessions::{MAX_SESSIONS_PER_RETIREMENT, RetireSessionsRequest};
 pub use update_resource::{MAX_RESET_KEYS, ResourceTarget, UpdateResourceRequest, WireResetKeys};

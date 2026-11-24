@@ -1,0 +1,54 @@
+---
+title: Metadata Changes
+description: "Follow resource and activity changes, retain a position and rebuild after history expires."
+---
+
+The metadata change log records public results of committed metadata operations. It includes resource changes, permissions, sessions and consumer group membership. Reading it requires root or the global `manage_servers` permission.
+
+## Select a starting point
+
+| Start | Use |
+| --- | --- |
+| Earliest | Read the oldest retained changes |
+| Latest | Establish a position at the current end |
+| After | Continue after a saved cursor |
+| Current | Read pages of current state before following changes |
+
+A cursor identifies a position in this log. Save the returned `next` value after applying the corresponding records. Cursor text starts with `mc1_`. Current-state page tokens start with `cs1_`. Treat both as opaque values and use the SDK parsers.
+
+Queries can select resource or activity groups. Current-state queries must include parent groups, such as streams when topics are selected. Limits range from 1 through 1000. Time bounds are not valid with Latest or Current starts.
+
+## Handle each response
+
+| Status | Action |
+| --- | --- |
+| Ok | Apply records or current items and save the returned position |
+| Behind | Wait and retry without advancing the position |
+| Expired | Rebuild because the requested history is no longer retained |
+| Reset | Rebuild because the cursor belongs to a different history |
+
+A rebuild reads Current pages, then follows changes from the returned anchor. Keep the rebuilt state private until a change page reports no more records and reaches at least the last current page's `head_op`. A sequence of current pages alone does not establish that the mirror caught up.
+
+Unknown record kinds retain their codes and raw bodies. Stop without advancing the cursor when the application cannot apply a record. Skipping it can leave a mirror inconsistent. Key material is never exposed in stream records. Their public options contain only the key source and fingerprints.
+
+## SDK methods
+
+| SDK | Method |
+| --- | --- |
+| Rust | `get_metadata_changes` |
+| Python | `get_metadata_changes` |
+| Node.js | `system.getMetadataChanges` |
+| Go | `GetMetadataChanges` |
+| Java | `getMetadataChanges` on the system client |
+| C# | `GetMetadataChangesAsync` |
+| C++ | `GetMetadataChanges` |
+| PHP | `getMetadataChanges` |
+| Swift | `getMetadataChanges` |
+
+The [Python implementation example](https://github.com/apache/iggy/blob/server-0.10.0/foreign/python/README.md#metadata-changes) shows follow and rebuild loops. The other SDK source guides show their equivalent typed queries.
+
+## Retention and node freshness
+
+`metadata.change_log_resource_capacity` defaults to 65536 records. `metadata.change_log_activity_capacity` defaults to 16384 records. Each budget also limits record bodies to 128 MiB. A busy activity log does not evict resource history. Nodes can retain different depths.
+
+A node can lag behind the metadata primary. A cursor that is valid elsewhere can receive Behind from that node. Wait or use a node that has caught up. Expired and Reset require rebuilding, not a loop over the same stale position.

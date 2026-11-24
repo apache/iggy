@@ -463,24 +463,45 @@ pub enum ServerError {
         #[source]
         source: iggy_object_store::ObjectStoreError,
     },
+    #[error(
+        "tiered storage cannot start: the object store took a create-only put over the \
+         existing store identity object {key:?}, so it ignores conditional creates, which \
+         uploads rely on. Point tiered_storage.backend ({backend}) and tiered_storage.endpoint \
+         at a store that refuses a create over an existing object"
+    )]
+    TieredStorageConditionalCreate {
+        key: String,
+        backend: configs::tiered_storage::TieredStorageBackend,
+        #[source]
+        source: iggy_object_store::ObjectStoreError,
+    },
     #[error("tiered storage cannot start: no runtime for the boot probe")]
     TieredStorageProbeRuntime {
         #[source]
         source: std::io::Error,
     },
     #[error(
-        "tiered storage cannot start: the {source_name} of the s3 backend handed out no credentials"
+        "tiered storage cannot start: the {source_name} of {subject} handed out no credentials"
     )]
     TieredStorageCredentials {
+        subject: String,
         source_name: &'static str,
         #[source]
-        source: iggy_object_store::s3::credentials::CredentialError,
+        source: iggy_object_store::credentials::CredentialError,
     },
-    #[error("tiered storage cannot start: the credentials refresher of the s3 backend")]
+    #[error("tiered storage cannot start: the credentials refresher of {subject}")]
     TieredStorageCredentialsThread {
+        subject: String,
         #[source]
         source: std::io::Error,
     },
+    #[error("tiered storage cannot start: the gcs backend has no access token")]
+    TieredStorageGcsKeyFile {
+        #[source]
+        source: iggy_object_store::gcs::credentials::KeyFileError,
+    },
+    #[error("geo peer {origin:?} can never be read: {reason}")]
+    GeoPeer { origin: String, reason: String },
 }
 
 /// Per-shard outcome captured by [`crate::boot::ShardHandles::join_all`]

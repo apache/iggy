@@ -30,7 +30,6 @@ use iggy_binary_protocol::responses::messages::fetch_messages::FetchMessagesResp
 use iggy_binary_protocol::{Operation, ReplyHeader, RoutedRequestHeader, WirePollingStrategy};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
-use shard::shards_table::calculate_shard_assignment;
 
 use crate::Simulator;
 use crate::client::SimClient;
@@ -110,8 +109,8 @@ fn cluster() -> (Simulator, SimClient, [IggyNamespace; 2]) {
         network,
     );
     let first = IggyNamespace::new(0, 0, 0);
-    let owner =
-        |namespace: &IggyNamespace| calculate_shard_assignment(namespace, u32::from(SHARDS));
+    let placement = sim.replicas[0].shards[0].partition_shards();
+    let owner = |namespace: &IggyNamespace| placement.shard_for(namespace);
     let second = (1..PARTITION_CANDIDATES)
         .map(|partition| IggyNamespace::new(0, 0, partition))
         .find(|namespace| owner(namespace) != owner(&first))

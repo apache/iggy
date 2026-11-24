@@ -57,6 +57,7 @@ internal static class VsrError
     internal const int STREAM_ID_NOT_FOUND = 1009;
     internal const int STREAM_NAME_NOT_FOUND = 1010;
     internal const int INVALID_STREAM_NAME = 1013;
+    internal const int SHADOW_STREAM_READ_ONLY = 1021;
     internal const int TOPIC_ID_NOT_FOUND = 2010;
     internal const int TOPIC_NAME_NOT_FOUND = 2011;
     internal const int INVALID_TOPIC_NAME = 2014;

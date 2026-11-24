@@ -248,6 +248,7 @@ impl TestHarnessBuilder {
             jwks_config: self.jwks_config,
             jwks_server: None,
             floci_bucket: None,
+            gcs_bucket: None,
             started: false,
             peer_relays,
         })

@@ -108,6 +108,73 @@ public sealed class TopicResponse
     public ulong LocalRetentionSize => OptionValues.UInt64(Options, DerivedOptions, TopicOptionKey.LocalRetentionSize);
 
     /// <summary>
+    ///     Whether the topic is normal or geo, read from the topic's options. <see cref="Enums.TopicType.Normal" />
+    ///     when the server reports no type.
+    /// </summary>
+    [JsonIgnore]
+    public TopicType TopicType =>
+        OptionValues.Find(Options, DerivedOptions, TopicOptionKey.TopicType) is { Kind: HeaderKind.String } value
+        && value.ToString() == "geo"
+            ? Enums.TopicType.Geo
+            : Enums.TopicType.Normal;
+
+    /// <summary>
+    ///     How a geo topic writes its messages, read from the topic's options. Null on a normal topic.
+    /// </summary>
+    [JsonIgnore]
+    public GeoMode? GeoMode =>
+        OptionValues.Find(Options, DerivedOptions, TopicOptionKey.GeoMode) is { Kind: HeaderKind.String } value
+            ? value.ToString() switch
+            {
+                "geo" => Enums.GeoMode.Geo,
+                "geo_tiered" => Enums.GeoMode.GeoTiered,
+                _ => null
+            }
+            : null;
+
+    /// <summary>
+    ///     The longest time a send waits for the upload of its fresh object to start, read from the topic's options.
+    ///     This and the five durations below are null unless a geo topic sets them, and each node then applies its
+    ///     server setting of the same name.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan? FreshUploadInterval =>
+        OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.FreshUploadInterval);
+
+    /// <summary>
+    ///     The shortest time between two uploads of the positions that the offsets its consumer groups store
+    ///     themselves wait for, read from the topic's options.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan? ConsumerOffsetUploadInterval =>
+        OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.ConsumerOffsetUploadInterval);
+
+    /// <summary>How often a node uploads the changed positions of the topic's consumer groups, read from its options.</summary>
+    [JsonIgnore]
+    public TimeSpan? PositionsPublishInterval =>
+        OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.PositionsPublishInterval);
+
+    /// <summary>
+    ///     How long the tombstone and the objects of the deleted topic stay in the object store, read from the
+    ///     topic's options.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan? TombstoneGrace => OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.TombstoneGrace);
+
+    /// <summary>
+    ///     How long, after a node starts, the group polls of the topic's partitions wait for the positions of the geo
+    ///     peers, read from the topic's options.
+    /// </summary>
+    [JsonIgnore]
+    public TimeSpan? PositionsResumeTimeout =>
+        OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.PositionsResumeTimeout);
+
+    /// <summary>The longest wait between two long-term rewrites of a partition, read from the topic's options.</summary>
+    [JsonIgnore]
+    public TimeSpan? LongTermRewriteMaxInterval =>
+        OptionValues.Duration(Options, DerivedOptions, TopicOptionKey.LongTermRewriteMaxInterval);
+
+    /// <summary>
     ///     Number of messages in the topic.
     /// </summary>
     public required ulong MessagesCount { get; init; }

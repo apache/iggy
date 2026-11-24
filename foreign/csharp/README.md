@@ -237,7 +237,8 @@ await client.ConnectAsync();
 
 - **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
   authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
-  Disconnecting removes only that binding. Logout, committed lease expiry or user deactivation ends the session.
+  Disconnecting removes only that binding. Logout, committed lease expiry, a user delete or deactivation, a password
+  change from another session, or a delete of the token the session was opened with ends the session.
   A `StaleClient` eviction also removes only the binding of that link. The reconnect binds the same session
   again, so its consumer-group memberships stay.
   A committed `StaleClient` result means that the server ended the session, for example because the user was
@@ -247,7 +248,7 @@ await client.ConnectAsync();
   table. The client closes that link and binds the session again on a new link. If the session ended, that bind
   fails with `Unauthenticated` and the client signs in again. Otherwise the session, its retained operations and
   its consumer-group memberships stay.
-  Password changes and PAT changes or expiry do not end an established session.
+  With server 0.10.1-edge.2, a password change keeps only the binary session that submitted it. A valid PAT can open a new session after a password change. Deleting or expiring it ends access for sessions opened with it.
   A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
   retains the identity while that replica's background reconnect retries the bind. An unresolved mutation
   cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.
@@ -542,6 +543,13 @@ await client.UpdateUserAsync(Identifier.String("alice"), new UserUpdate { Status
 ```
 
 Settings fixed at creation, such as compression, cannot be updated. `DescribeOptionsAsync(OptionsScope.Topic)` lists every key the server knows with its kind and whether it can be updated or reset. For a key newer than this SDK, set it through `Options` and reset it through `RawReset`, and the server decides whether the change is allowed.
+
+A geo topic also takes six durations: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`,
+`PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and
+`LongTermRewriteMaxInterval`. Each one overrides the server setting of the same name on every node.
+Zero is a value for them, so the SDK sends it. On a geo topic, an update can set them, and they are
+the only options that it can change there. An update cannot reset them. The server refuses them on a
+normal topic. When the topic does not set a duration, its property on `TopicResponse` is null.
 
 Note: Stream and topic names use hyphens instead of spaces. Iggy automatically replaces spaces with hyphens.
 

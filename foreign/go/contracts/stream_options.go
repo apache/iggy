@@ -43,6 +43,9 @@ const (
 	// StreamOptionEncryptionKekFingerprint is read-only: the comma-joined
 	// fingerprints of the server keys that wrap the stream's key.
 	StreamOptionEncryptionKekFingerprint StreamOptionKey = "encryption_kek_fingerprint"
+	// StreamOptionShadowOrigin is read-only: the geo origin whose topics a
+	// shadow stream serves. The server reports it on shadow streams only.
+	StreamOptionShadowOrigin StreamOptionKey = "shadow_origin"
 )
 
 // StreamEncryptionKeyLength is the size of a stream data key in bytes.

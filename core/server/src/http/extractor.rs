@@ -31,9 +31,11 @@ use axum::http::HeaderMap;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
 use axum::response::{IntoResponse, Response};
+use consensus::MetadataHandle;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_common::{
-    IggyError, IggyTimestamp, OptionInputValue, OptionsUpdate, PersonalAccessToken, RESET_FIELD,
-    SendMessages, erase_buffer,
+    IggyError, OptionInputValue, OptionsUpdate, PersonalAccessToken, RESET_FIELD, SendMessages,
+    erase_buffer,
 };
 use send_wrapper::SendWrapper;
 use serde::Deserializer as _;
@@ -47,6 +49,7 @@ use super::session::HttpSession;
 use super::state::HttpInner;
 use crate::dispatch::session_ops::verify_pat_credentials_with_expiry;
 use crate::http::ClientAddr;
+use crate::http::state::ensure_active_user;
 
 /// Bearer scheme prefix in the `Authorization` header.
 const BEARER: &str = "Bearer ";
@@ -57,13 +60,15 @@ const JWT_KEY_PREFIX: &str = "jwt:";
 const PAT_KEY_PREFIX: &str = "pat:";
 
 /// What [`resolve_credential`] proved about a bearer: the JWT id when it is a
-/// JWT, the account behind it and its expiry in seconds. The partition route
-/// layer stores it in the request extensions for the extractor behind it.
+/// JWT, the account behind it, what the credential proved about that account
+/// and its expiry in Unix microseconds. The partition route layer stores it in
+/// the request extensions for the extractor behind it.
 #[derive(Clone)]
 pub(in crate::http) struct VerifiedBearer {
     pub jwt_id: Option<String>,
+    pub trusted_issuer: bool,
     pub user_id: u32,
-    pub user_created_at: IggyTimestamp,
+    pub credential: CredentialProof,
     pub expiry: u64,
 }
 
@@ -250,7 +255,8 @@ impl<'de> Visitor<'de> for RefusedMemberVisitor<'_> {
 pub struct Credential {
     key: String,
     pub user_id: u32,
-    user_created_at: IggyTimestamp,
+    proof: CredentialProof,
+    trusted_issuer: bool,
     expiry: u64,
 }
 
@@ -267,8 +273,14 @@ impl Credential {
         state: &HttpInner,
     ) -> Result<Rc<HttpSession>, AuthError> {
         state
-            .resolve_session(&self.key, self.user_id, self.user_created_at, self.expiry)
+            .resolve_session(&self.key, self.user_id, self.proof, self.expiry)
             .await
+            .map_err(|error| match error {
+                AuthError::Unauthenticated(IggyError::Unauthenticated) if self.trusted_issuer => {
+                    AuthError::SessionNotAccepted
+                }
+                error => error,
+            })
     }
 }
 
@@ -286,18 +298,20 @@ impl FromRequestParts<HttpState> for Credential {
                 bearer,
                 verified.jwt_id.as_deref(),
                 verified.user_id,
-                verified.user_created_at,
+                &verified.credential,
             ),
             user_id: verified.user_id,
-            user_created_at: verified.user_created_at,
+            proof: verified.credential,
+            trusted_issuer: verified.trusted_issuer,
             expiry: verified.expiry,
         })
     }
 }
 
-/// Read-only caller identity: the account's id and creation timestamp, plus the
-/// request path/query used for follower redirects. The timestamp prevents user
-/// ID reuse from changing the caller across a wait.
+/// Read-only caller identity: the account's id and what its credential proved,
+/// plus the request path/query used for follower redirects. The proof prevents
+/// user ID reuse, a password change or a token delete from passing a wait
+/// unnoticed.
 ///
 /// Unlike [`Authenticated`], it verifies the bearer WITHOUT minting or
 /// Registering a VSR session. Reads are served from the local metadata STM and
@@ -307,7 +321,7 @@ impl FromRequestParts<HttpState> for Credential {
 /// [`resolve_credential`] chokepoint, so a JWT and a PAT are honored identically.
 pub struct Identity {
     pub user_id: u32,
-    pub user_created_at: IggyTimestamp,
+    pub credential: CredentialProof,
     /// Original request path + query (e.g. `/streams?consistency=linearizable`),
     /// captured so a linearizable read that reaches a follower can build the
     /// `Location` for its 307 redirect to the primary. Empty only when the URI
@@ -351,7 +365,7 @@ impl FromRequestParts<HttpState> for Identity {
         }
         Ok(Self {
             user_id: verified.user_id,
-            user_created_at: verified.user_created_at,
+            credential: verified.credential,
             path_and_query,
             client_ip,
         })
@@ -403,40 +417,50 @@ async fn verified_bearer(
 /// synchronous. Also the forward middleware's verify-only gate: a follower
 /// proves the bearer before relaying a request, without minting a session.
 ///
-/// The `created_at` names the account behind the credential, because a deleted
+/// The proof names the account behind the credential, because a deleted
 /// user's id goes to the next user created. A self-issued JWT must name the
-/// account that holds its id now, and a trusted-issuer JWT resolves the
-/// username its issuer config names.
+/// account that holds its id now at the revision it was issued at, and a
+/// trusted-issuer JWT resolves the username its issuer config names. A
+/// self-issued JWT from a node ahead of this one is refused as retryable.
 pub(in crate::http) async fn resolve_credential(
     state: &HttpState,
     bearer: &str,
 ) -> Result<VerifiedBearer, AuthError> {
+    let started_at_op = state.shard.plane.metadata().applied_frontier().get();
     if let Ok(token) = state.jwt.decode(bearer).await {
-        let (user_id, user_created_at) = match token.subject {
+        let trusted_issuer = matches!(token.subject, TokenSubject::TrustedIssuer(_));
+        let (user_id, credential) = match token.subject {
             TokenSubject::Account {
                 user_id,
-                created_at,
-            } => (
-                user_id,
-                state.ensure_active_user(user_id, Some(created_at))?,
-            ),
-            TokenSubject::TrustedIssuer(issuer) => state.trusted_issuer_user(&issuer)?,
+                credential,
+                cluster_uid,
+            } => {
+                if state.lags_behind(user_id, &credential, cluster_uid)? {
+                    return Err(AuthError::SessionNotAccepted);
+                }
+                ensure_active_user(&state.shard, user_id, &credential)?;
+                (user_id, credential)
+            }
+            TokenSubject::TrustedIssuer(issuer) => {
+                state.trusted_issuer_user(&issuer, started_at_op)?
+            }
         };
         return Ok(VerifiedBearer {
             jwt_id: Some(token.jti),
+            trusted_issuer,
             user_id,
-            user_created_at,
-            expiry: token.exp,
+            credential,
+            expiry: token.exp.saturating_mul(1_000_000),
         });
     }
 
-    let (user_id, user_created_at, expiry) =
-        verify_pat_credentials_with_expiry(&state.shard, bearer)
-            .map_err(|_| IggyError::Unauthenticated)?;
+    let (user_id, credential, expiry) = verify_pat_credentials_with_expiry(&state.shard, bearer)
+        .map_err(|_| IggyError::Unauthenticated)?;
     Ok(VerifiedBearer {
         jwt_id: None,
+        trusted_issuer: false,
         user_id,
-        user_created_at,
+        credential,
         expiry,
     })
 }
@@ -447,7 +471,7 @@ pub(in crate::http) fn credential_key(
     bearer: &str,
     jwt_id: Option<&str>,
     user_id: u32,
-    user_created_at: IggyTimestamp,
+    credential: &CredentialProof,
 ) -> String {
     // External issuers choose their own jti, and their configured username
     // can resolve to another account later. Scope the key to this account.
@@ -460,8 +484,8 @@ pub(in crate::http) fn credential_key(
         },
         |jwt_id| {
             format!(
-                "{JWT_KEY_PREFIX}{user_id}:{}:{jwt_id}",
-                user_created_at.as_micros()
+                "{JWT_KEY_PREFIX}{user_id}:{}:{}:{}:{jwt_id}",
+                credential.user_created_at, credential.access_revision, credential.token_id
             )
         },
     )
@@ -489,6 +513,29 @@ mod tests {
 
     const LAYER_USER_ID: u32 = 7;
 
+    #[compio::test]
+    async fn given_refused_account_proof_when_registering_should_allow_a_trusted_issuer_to_retry() {
+        let state = read_state();
+        for trusted_issuer in [false, true] {
+            let credential = Credential {
+                key: "test".to_owned(),
+                user_id: LAYER_USER_ID,
+                proof: CredentialProof::account(1, 1),
+                trusted_issuer,
+                expiry: u64::MAX,
+            };
+            let result = credential.session(&state).await;
+            if trusted_issuer {
+                assert!(matches!(result, Err(AuthError::SessionNotAccepted)));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AuthError::Unauthenticated(IggyError::Unauthenticated))
+                ));
+            }
+        }
+    }
+
     /// The partition route layer verifies the bearer before its handler runs,
     /// so the extractor behind it reuses that proof. A bearer that would not
     /// verify shows the extractor did not verify it again.
@@ -497,8 +544,9 @@ mod tests {
         let state = read_state();
         let verified = VerifiedBearer {
             jwt_id: Some("layer-jti".to_owned()),
+            trusted_issuer: false,
             user_id: LAYER_USER_ID,
-            user_created_at: IggyTimestamp::from(1),
+            credential: CredentialProof::account(1, 1),
             expiry: u64::MAX,
         };
 
@@ -514,7 +562,7 @@ mod tests {
                 "not-a-token",
                 verified.jwt_id.as_deref(),
                 LAYER_USER_ID,
-                verified.user_created_at
+                &verified.credential
             )
         );
         let identity = Identity::from_request_parts(&mut parts, &state)

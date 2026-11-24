@@ -17,29 +17,36 @@
 
 //! Partition convergence across shards on one node.
 //!
-//! `create_topic` returns on metadata commit, before the owning shard has run
-//! `build_partition_fresh`, so a produce issued immediately after races
-//! materialisation. Nothing about that race is resolved on the shard the client
-//! is connected to: `shards_table` is a cache of the deterministic hash
-//! assignment and may hold a row before the partition exists. The owning shard
-//! resolves it, by parking the frame until its partition lands
-//! (`park_if_unmaterialised`) and by fencing a mismatched incarnation
-//! (`serves_committed_incarnation`), answering anything it cannot yet serve
+//! The node that answers `create_topic` holds the reply until its shards have
+//! built the partitions it stores, for a bounded time
+//! (`dispatch::submit::await_created_partitions`). A produce issued immediately
+//! after finds its partition, unless the wait ended before the build.
+//! Neither step is resolved on the shard the client is connected to:
+//! `shards_table` is a cache of the deterministic hash assignment and may hold
+//! a row before the partition exists. The owning shard resolves both. It
+//! answers the wait when its partition lands, parks a frame that arrives before
+//! that (`park_if_unmaterialised`), fences a mismatched incarnation
+//! (`serves_committed_incarnation`), and answers anything it cannot yet serve
 //! with a retriable status the SDK replays.
 //!
-//! Forcing two shards is the point. Existing coverage of these fences is
-//! single-shard, where the shard that admits the request is also the one that
-//! owns the partition, so the cross-core path never runs: the hash fallback in
-//! `router::route_typed`, the frame crossing into a peer's inbox, and that
-//! peer's park queue draining on its own pump. Roughly half of the topics below
-//! hash to a shard other than the one homing the connection.
+//! Forcing more than one partition shard is the point. Existing coverage of
+//! these fences is single-shard, where the shard that admits the request is
+//! also the one that owns the partition, so the cross-core path never runs: the
+//! hash fallback in `router::route_typed`, the frame crossing into a peer's
+//! inbox, and that peer's park queue draining on its own pump. The first test
+//! runs three shards under both placements. With shard 0 as an owner the
+//! topics below land on all three shards, and with partitions kept off shard 0
+//! they split between shards 1 and 2. Under both, some of them hash to a shard
+//! other than the one homing the connection.
 //!
 //! That split is a murmur3 outcome and is invisible from here -- this test would
 //! stay green while silently degrading to single-shard if the hash or the shard
 //! count changed. It is pinned instead where the assignment is a pure function,
-//! by `partition_reconciler::tests::integration_topic_set_straddles_both_shards`,
-//! which asserts over the same namespaces this test creates. Change the topic
-//! count or the stream here and that guard has to move with it.
+//! by the `partition_reconciler` test
+//! `given_the_integration_topics_when_placed_on_three_shards_should_straddle_shards`,
+//! which asserts over the same namespaces this test creates, once per
+//! placement. Change the topic count or the stream here and that guard has to
+//! move with it.
 //!
 //! Scope, stated plainly: this is a convergence test, not a barrier test. It
 //! cannot tell a request served straight through from one that parked and was
@@ -54,8 +61,8 @@ use integration::iggy_harness;
 
 const STREAM: &str = "convergence-stream";
 const PARTITION_ID: u32 = 0;
-/// Enough topics that the murmur3 assignment lands on both shards; every one is
-/// asserted, so which side each falls on does not matter.
+/// Enough topics that the murmur3 assignment lands on more than one partition
+/// shard. Every one is asserted, so which shard each falls on does not matter.
 const TOPICS: u32 = 8;
 
 fn topic_name(index: u32) -> String {
@@ -139,10 +146,16 @@ fn assert_no_degraded_park_paths(harness: &TestHarness) {
     }
 }
 
-/// Topics are created in a batch first, so several materialisations are in
-/// flight at once when the produces start.
-#[iggy_harness(cluster_nodes = 1, server(sharding.cpu_allocation = "2"))]
-async fn given_two_shards_when_producing_right_after_create_topic_should_round_trip(
+/// Every topic is created before the first produce. Runs once per placement:
+/// with shard 0 as a partition owner, and with partitions kept off it.
+#[iggy_harness(
+    cluster_nodes = 1,
+    server(
+        sharding.cpu_allocation = "3",
+        cluster.coordinator.skip_shard_zero_for_partitions = ["false", "true"]
+    )
+)]
+async fn given_three_shards_when_producing_right_after_create_topic_should_round_trip(
     harness: &TestHarness,
 ) {
     let client = harness.new_client().await.unwrap();

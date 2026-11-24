@@ -37,12 +37,12 @@ pub trait StreamClient {
     /// A server that answers a page with the cursor it was sent fails the read
     /// with `IggyError::InvalidFormat`.
     ///
-    /// Authentication is required, and the permission to read the streams.
+    /// Authentication is required. The list holds the streams the caller may read.
     async fn get_streams(&self) -> Result<Vec<Stream>, IggyError>;
     /// One page of the streams. Read the next page with
     /// [`NamedPageQuery::next`] until the page has no `next`.
     ///
-    /// Authentication is required, and the permission to read the streams.
+    /// Authentication is required. The page holds the streams the caller may read.
     async fn get_streams_page(&self, query: &NamedPageQuery) -> Result<Page<Stream>, IggyError>;
     /// Create a new stream.
     ///
