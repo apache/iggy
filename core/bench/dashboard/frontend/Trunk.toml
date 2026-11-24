@@ -37,6 +37,12 @@ backend = "http://127.0.0.1:8061/embed/"
 [[proxies]]
 backend = "http://127.0.0.1:8061/health"
 
+[[proxies]]
+backend = "http://127.0.0.1:8061/robots.txt"
+
+[[proxies]]
+backend = "http://127.0.0.1:8061/sitemap.xml"
+
 [[hooks]]
 stage = "pre_build"
 command = "scripts/copy_echarts.sh"

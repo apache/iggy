@@ -46,7 +46,8 @@ struct IggyUserClient {
 
 enum Credentials {
     UserNameAndPassword(IggyUserClient),
-    PersonalAccessToken(SecretString),
+    /// A token, with its keyring name when it was read by name.
+    PersonalAccessToken(SecretString, Option<String>),
     SessionWithToken(SecretString, String),
 }
 
@@ -101,7 +102,10 @@ impl<'a> IggyCredentials<'a> {
             let token = entry.get_password()?;
 
             return Ok(Self {
-                credentials: Some(Credentials::PersonalAccessToken(SecretString::from(token))),
+                credentials: Some(Credentials::PersonalAccessToken(
+                    SecretString::from(token),
+                    Some(token_name.clone()),
+                )),
                 iggy_client: None,
                 login_required,
             });
@@ -109,9 +113,10 @@ impl<'a> IggyCredentials<'a> {
 
         if let Some(token) = &cli_options.token {
             Ok(Self {
-                credentials: Some(Credentials::PersonalAccessToken(SecretString::from(
-                    token.clone(),
-                ))),
+                credentials: Some(Credentials::PersonalAccessToken(
+                    SecretString::from(token.clone()),
+                    None,
+                )),
                 iggy_client: None,
                 login_required,
             })
@@ -146,7 +151,10 @@ impl<'a> IggyCredentials<'a> {
             // --token flag and fail on the credentials group conflict rules
             // whenever -u/-p are also present.
             Ok(Self {
-                credentials: Some(Credentials::PersonalAccessToken(SecretString::from(token))),
+                credentials: Some(Credentials::PersonalAccessToken(
+                    SecretString::from(token),
+                    None,
+                )),
                 iggy_client: None,
                 login_required,
             })
@@ -197,7 +205,7 @@ impl<'a> IggyCredentials<'a> {
                             )
                         })?;
                 }
-                Credentials::PersonalAccessToken(token_value) => {
+                Credentials::PersonalAccessToken(token_value, _) => {
                     let _ = client
                         .login_with_personal_access_token(token_value.expose_secret())
                         .await
@@ -211,6 +219,7 @@ impl<'a> IggyCredentials<'a> {
                         if matches!(
                             err,
                             IggyError::Unauthenticated
+                                | IggyError::InvalidPersonalAccessToken
                                 | IggyError::ResourceNotFound(_)
                                 | IggyError::PersonalAccessTokenExpired(_, _)
                         ) {
@@ -230,16 +239,92 @@ impl<'a> IggyCredentials<'a> {
         Ok(())
     }
 
-    pub(crate) async fn logout_user(&self) -> anyhow::Result<(), anyhow::Error> {
+    pub(crate) async fn logout_user(
+        &self,
+        deleted_token: Option<&str>,
+    ) -> anyhow::Result<(), anyhow::Error> {
         if let Some(client) = self.iggy_client
             && self.login_required
         {
-            client
-                .logout_user()
-                .await
-                .with_context(|| "Problem with server logout".to_string())?;
+            let session_may_have_ended =
+                deleted_token.is_some_and(|token_name| self.signed_in_with(token_name));
+            match client.logout_user().await {
+                // A deleted token ends the sessions it opened, and the client may already know.
+                Err(IggyError::Unauthenticated | IggyError::Disconnected)
+                    if session_may_have_ended => {}
+                Err(error @ (IggyError::Unauthenticated | IggyError::Disconnected))
+                    if deleted_token.is_some()
+                        && let Some(Credentials::PersonalAccessToken(token, None)) =
+                            &self.credentials =>
+                {
+                    // A raw token has no name. Only a credential refusal confirms that it is gone.
+                    match client
+                        .login_with_personal_access_token(token.expose_secret())
+                        .await
+                    {
+                        Err(IggyError::InvalidPersonalAccessToken) => {}
+                        Ok(_) => {
+                            client
+                                .logout_user()
+                                .await
+                                .context("Problem with server logout")?;
+                            return Err(error).context("Problem with server logout");
+                        }
+                        Err(_) => return Err(error).context("Problem with server logout"),
+                    }
+                }
+                result => result.with_context(|| "Problem with server logout".to_string())?,
+            }
         }
 
         Ok(())
+    }
+
+    /// Whether the sign-in credential has the given token name.
+    fn signed_in_with(&self, token_name: &str) -> bool {
+        match &self.credentials {
+            Some(Credentials::SessionWithToken(_, server_address)) => {
+                ServerSession::new(server_address.clone()).get_token_name() == token_name
+            }
+            Some(Credentials::PersonalAccessToken(_, name)) => name.as_deref() == Some(token_name),
+            Some(Credentials::UserNameAndPassword(_)) | None => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn given_the_credentials_of_a_command_when_it_deletes_a_token_should_relax_the_sign_out_only_for_its_own()
+     {
+        let with = |credentials| IggyCredentials {
+            credentials: Some(credentials),
+            iggy_client: None,
+            login_required: true,
+        };
+        let token = || SecretString::from("token");
+        let session = with(Credentials::SessionWithToken(
+            token(),
+            "127.0.0.1:8090".to_owned(),
+        ));
+        let named = with(Credentials::PersonalAccessToken(
+            token(),
+            Some("ci".to_owned()),
+        ));
+        let raw = with(Credentials::PersonalAccessToken(token(), None));
+        let password = with(Credentials::UserNameAndPassword(IggyUserClient {
+            username: "iggy".to_owned(),
+            password: token(),
+        }));
+        let session_token = ServerSession::new("127.0.0.1:8090".to_owned()).get_token_name();
+
+        assert!(session.signed_in_with(&session_token));
+        assert!(!session.signed_in_with("ci"));
+        assert!(named.signed_in_with("ci"));
+        assert!(!named.signed_in_with("other"));
+        assert!(!raw.signed_in_with("other"));
+        assert!(!password.signed_in_with("ci"));
     }
 }

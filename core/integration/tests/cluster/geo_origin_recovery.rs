@@ -48,6 +48,7 @@ use super::geo_mode_faults::{
     LEADER_RESTART_PAUSE, NODES, await_store_claim, cluster_with_fs_store, metadata_leader,
     store_on_disk,
 };
+use super::metadata_changes::node_reader;
 use crate::server::scenarios::geo_mode_faults_scenario::{
     Answer, Bucket, Ledger, MESSAGE_BYTES, PARTITION_ID, POLL_INTERVAL, STORE_PREFIX, Topics,
     geo_manifest, message, read_indexes,
@@ -142,6 +143,27 @@ async fn given_a_bucket_of_an_origin_that_lost_every_disk_when_a_cluster_with_em
         timestamps, written.timestamps,
         "the timestamps each batch committed at"
     );
+
+    let deadline = Instant::now() + RECOVERY_DEADLINE;
+    for node in 0..NODES {
+        let local = node_reader(&harness, node).await;
+        loop {
+            if let Ok(Some(topic)) = local.get_topic(&topics.stream, &topics.geo).await
+                && topic.partitions.iter().any(|partition| {
+                    partition.id == PARTITION_ID
+                        && partition.current_offset == written.cutover_through
+                })
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "node {node} never installed the recovered partition through offset {}",
+                written.cutover_through
+            );
+            sleep(POLL_INTERVAL).await;
+        }
+    }
 
     let next = written.cutover_through + 1;
     let mut sent = vec![message(next, MESSAGE_BYTES)];

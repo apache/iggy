@@ -1125,18 +1125,17 @@ impl IggyClient {
         })
     }
 
-    /// Return all streams, in id order.
+    /// Return the streams the user may read, in id order.
     ///
     /// The list is read in pages of 1,000, so it is not one consistent read.
     /// A stream that someone creates or deletes during the read can appear or
     /// not appear. `get_streams_page` reads one page.
     ///
     /// Returns:
-    ///     A list of `Stream` summaries.
+    ///     A list of `Stream` summaries, the streams the user may read.
     ///
     /// Raises:
-    ///     RuntimeError: If the client is not authenticated, the user lacks global
-    ///         `read_streams` or `manage_streams` permission, or the request fails.
+    ///     RuntimeError: If the client is not authenticated or the request fails.
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[list[Stream]]", imports=("collections.abc")))]
     fn get_streams<'a>(&self, py: Python<'a>) -> PyResult<Bound<'a, PyAny>> {
         let inner = self.inner.clone();
@@ -1146,7 +1145,7 @@ impl IggyClient {
         })
     }
 
-    /// Reads one page of the streams.
+    /// Reads one page of the streams the user may read.
     ///
     /// Pass the page's `next` as `cursor`, with the same other arguments, to
     /// read the next page. The read ends at the first page whose `next` is
@@ -1170,9 +1169,9 @@ impl IggyClient {
     ///         anything is sent. The server refuses a cursor that it cannot
     ///         use, such as the cursor of another order, with the same code.
     ///         Over HTTP, a refusal from the server has code 300 (HTTP response
-    ///         error), and its message holds the server error body. A user
-    ///         without the permission to read the streams gets the
-    ///         unauthorized code.
+    ///         error), and its message holds the server error body. The page
+    ///         holds the streams the user may read, so a user without a
+    ///         grant gets an empty page.
     #[pyo3(signature = (*, order=None, descending=false, limit=None, cursor=None, name=None))]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[StreamsPage]", imports=("collections.abc")))]
     fn get_streams_page<'a>(
@@ -1359,11 +1358,14 @@ impl IggyClient {
         })
     }
 
-    /// Get all topics in a stream, in id order.
+    /// Get the topics of a stream, in id order. The list holds only the
+    /// topics the user may read.
     ///
     /// The list is read in pages of 1,000, so it is not one consistent read.
     /// A topic that someone creates or deletes during the read can appear or
-    /// not appear. `get_topics_page` reads one page.
+    /// not appear. If the stream goes missing after the first page, the read
+    /// fails for a user with a global read grant, and ends there for any other
+    /// user. `get_topics_page` reads one page.
     ///
     /// Args:
     ///     stream_id: Stream identifier as `str | int`.
@@ -1391,8 +1393,10 @@ impl IggyClient {
         })
     }
 
-    /// Reads one page of the topics of a stream. A missing stream gives an
-    /// empty page without `next`.
+    /// Reads one page of the topics of a stream. A missing stream, or one the
+    /// user may read no topic of, gives an empty page without `next`. For a
+    /// user with a global read grant, a page read with a cursor raises
+    /// `IggyError` instead, because the stream was deleted during the walk.
     ///
     /// Takes the keyword arguments of `get_streams_page`, with the same
     /// cursor rules.
@@ -1406,8 +1410,8 @@ impl IggyClient {
     /// Raises:
     ///     ValueError: If the identifier is invalid.
     ///     OverflowError: If `limit` is outside the unsigned 32-bit range.
-    ///     IggyError: As for `get_streams_page`. A user without the permission
-    ///         to read the topics gets the unauthorized code.
+    ///     IggyError: As for `get_streams_page`. The page holds the topics
+    ///         the user may read.
     #[pyo3(signature = (stream_id, *, order=None, descending=false, limit=None, cursor=None, name=None))]
     #[allow(clippy::too_many_arguments)]
     #[gen_stub(override_return_type(type_repr="collections.abc.Awaitable[TopicsPage]", imports=("collections.abc")))]

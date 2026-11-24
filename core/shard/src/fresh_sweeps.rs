@@ -50,7 +50,7 @@
 //! Every step reports back as a frame, and a frame the inbox refused loses
 //! the sweep it belongs to and nothing else. The next sweep lists again.
 
-use crate::shards_table::{ShardsTable, calculate_shard_assignment};
+use crate::shards_table::ShardsTable;
 use crate::{IggyShard, LifecycleFrame, ShardFrame};
 use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_common::IggyTimestamp;
@@ -438,8 +438,7 @@ where
                         topic.partitions.iter().all(|partition| {
                             let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
                             partition.replica_set(replicas).member(replica).is_none()
-                                || calculate_shard_assignment(&namespace, self.shard_count)
-                                    != self.id
+                                || self.partition_shards.shard_for(&namespace) != self.id
                                 || partitions.contains(&namespace)
                         })
                     })
