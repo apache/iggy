@@ -48,15 +48,17 @@ use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStore, ObjectStoreError,
     ReadOnlyStore, StoreIdentity,
 };
-use message_bus::{IggyMessageBus, MessageBus};
+use journal::superblock::SuperblockStore;
+use message_bus::IggyMessageBus;
 use metadata::impls::metadata::StreamsFrontend;
+use partitions::{DiskIndexFiles, IndexFiles};
 use shard::metrics::ShardMetrics;
 use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, SharedPeerStatus};
 use shard::{Receiver, Sender, channel};
 use tracing::{debug, error, info, warn};
 
 use crate::server_error::ServerError;
-use crate::shell::ServerShard;
+use crate::shell::{ServerShard, ShellBus, ShellShard};
 use crate::store_identity::own_cluster_uid;
 use crate::tiered_storage::{S3Location, gcs_config, identity_timeout, service_config};
 
@@ -148,7 +150,12 @@ pub fn start(
     if config.peers.is_empty() {
         return None;
     }
-    shard.set_peer_stores(stores(config, tiered, bus, statuses, auth));
+    serve_peers(
+        tiered,
+        shard,
+        &(Rc::new(DiskIndexFiles) as Rc<dyn IndexFiles>),
+        peers(config, statuses, auth),
+    );
     if shard.id != 0 {
         return None;
     }
@@ -170,36 +177,63 @@ pub fn start(
     Some(stop_tx)
 }
 
-/// One read-only store and one tier service per peer, for one shard.
-/// `preflight` refused the boot already when a store or a layout fails.
-fn stores<B>(
-    config: &GeoConfig,
+/// One geo peer as a shard reads it.
+pub struct ServedPeer {
+    /// The peer's `geo.origin`.
+    pub origin: String,
+    pub layout: KeyLayout,
+    pub store: ReadOnlyStore,
+    /// What the identity checks of the node found of the peer.
+    pub status: SharedPeerStatus,
+}
+
+/// Give `shard` a tier service over each of `peers`, in place of the ones it
+/// had, with the caps and timeouts of `tiered`. The polls of the peers'
+/// segments keep the indexes they fetch in `index_files`.
+pub fn serve_peers<B, MJ, S, SB>(
     tiered: &TieredStorageConfig,
-    bus: &B,
-    statuses: &[SharedPeerStatus],
-    auth: &PeerAuth,
-) -> PeerStores<B>
-where
-    B: MessageBus + Clone + 'static,
+    shard: &ShellShard<B, MJ, S, SB>,
+    index_files: &Rc<dyn IndexFiles>,
+    peers: impl IntoIterator<Item = ServedPeer>,
+) where
+    B: ShellBus + Unpin,
+    SB: SuperblockStore,
 {
     let service = service_config(tiered);
-    let stores = config
+    let stores = peers
+        .into_iter()
+        .map(|peer| {
+            PeerStore::new(
+                peer.origin,
+                peer.layout,
+                peer.store,
+                shard.bus.clone(),
+                &service,
+                peer.status,
+            )
+            .with_index_files(Rc::clone(index_files))
+        })
+        .collect();
+    shard.set_peer_stores(PeerStores::new(stores));
+}
+
+/// The configured peers with their stores. `preflight` refused the boot
+/// already when a store or a layout fails.
+fn peers(config: &GeoConfig, statuses: &[SharedPeerStatus], auth: &PeerAuth) -> Vec<ServedPeer> {
+    config
         .peers
         .iter()
         .zip(statuses)
         .enumerate()
         .filter_map(|(index, (peer, status))| {
-            Some(PeerStore::new(
-                peer.origin.clone(),
-                layout(peer).ok()?,
-                store(peer, auth.of(index)).ok()?,
-                bus.clone(),
-                &service,
-                status.clone(),
-            ))
+            Some(ServedPeer {
+                origin: peer.origin.clone(),
+                layout: layout(peer).ok()?,
+                store: store(peer, auth.of(index)).ok()?,
+                status: status.clone(),
+            })
         })
-        .collect();
-    PeerStores::new(stores)
+        .collect()
 }
 
 /// The identity check of each peer. Each check gets a store of its own,
@@ -849,13 +883,12 @@ mod tests {
         let shard = test_shard(&bus, 0, 1, 1);
         assert!(shard.peer_stores().is_empty());
 
-        shard.set_peer_stores(stores(
-            &config,
+        serve_peers(
             &tiered,
-            &bus,
-            &statuses,
-            &PeerAuth::default(),
-        ));
+            &shard,
+            &(Rc::new(DiskIndexFiles) as Rc<dyn IndexFiles>),
+            peers(&config, &statuses, &PeerAuth::default()),
+        );
         let peers = shard.peer_stores();
         assert_eq!(peers.len(), 2);
         assert!(

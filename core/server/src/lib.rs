@@ -39,8 +39,9 @@ pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSI
 // simulator consumes `shell`, `boot::ServerHost`, the reconciler exports
 // (`LifecycleReports`, `reconcile_partition_lifecycles`,
 // `reconcile_pending_revocations`), the geo passes (`GeoPasses`,
-// `NodePlace`) and the store wiring (`serve_tiered_storage`, `TierHandlers`,
-// `own_cluster_uid`). Everything else is internal to the crate.
+// `NodePlace`, `peer_log_of`) and the store wiring (`serve_tiered_storage`,
+// `serve_peers`, `ServedPeer`, `TierHandlers`, `own_cluster_uid`). Everything
+// else is internal to the crate.
 
 // boot: process entry, shard threads, recovery orchestration.
 pub mod boot;
@@ -72,6 +73,7 @@ pub(crate) mod http;
 pub(crate) mod geo_passes;
 pub use geo_passes::GeoPasses;
 pub(crate) mod geo_peers;
+pub use geo_peers::{ServedPeer, serve_peers};
 pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
 pub(crate) mod origin_recovery;
@@ -89,6 +91,7 @@ pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
 pub(crate) mod shadow_topics;
+pub use shadow_topics::peer_log_of;
 pub(crate) mod snapshot;
 pub(crate) mod store_identity;
 pub use store_identity::{TierHandlers, own_cluster_uid};
