@@ -21,6 +21,7 @@ pub mod client;
 pub mod deps;
 pub mod executor;
 pub mod geo;
+pub mod geo_world;
 pub mod network;
 pub mod packet;
 pub mod ready_queue;
@@ -2343,6 +2344,7 @@ fn materialise_partition(
         {
             partition.set_places_batches(true);
         }
+        follow_peer_log(owner_shard, metadata_consensus.replica(), namespace, epoch);
     }
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -2353,12 +2355,43 @@ fn materialise_partition(
     true
 }
 
-/// Every committed partition of a geo topic.
+/// Have the partition of `namespace` follow its peer's log when it belongs
+/// to a shadow topic, as the production reconciler has it follow once it
+/// built it.
+fn follow_peer_log(shard: &Replica, replica_id: u8, namespace: IggyNamespace, epoch: u64) {
+    let peer_log = shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let stream = inner.items.get(namespace.stream_id())?;
+        let topic = stream.topics.get(namespace.topic_id())?;
+        server::peer_log_of(stream, topic, namespace)
+    });
+    let Some((origin, prefix)) = peer_log else {
+        return;
+    };
+    let Some(partition) = shard.plane.partitions().get_mut_by_ns(&namespace) else {
+        return;
+    };
+    if partition.peer_log().is_some() {
+        return;
+    }
+    // A server names the indexes that the partition's polls fetch after its
+    // directory. Here they go to the node's memory, under a directory of this
+    // incarnation that no other partition shares.
+    partition.set_partition_dir(format!(
+        "simulated/replica-{replica_id}/{}-{epoch}",
+        namespace.inner()
+    ));
+    partition
+        .follow_peer_log(origin, prefix)
+        .expect("a new shadow partition follows its peer's log");
+}
+
+/// Every committed partition of a geo topic, this cluster's own or a peer's
+/// shadow.
 fn geo_partitions(inner: &metadata::stm::stream::StreamsInner) -> Vec<IggyNamespace> {
     let mut namespaces = Vec::new();
     for (stream_id, stream) in &inner.items {
         for (topic_id, topic) in &stream.topics {
-            if topic.is_geo() {
+            if topic.is_geo() || topic.shadow.is_some() {
                 namespaces.extend(
                     topic
                         .partitions
