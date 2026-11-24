@@ -39,6 +39,7 @@ use crate::{IggyIndex, IggyIndexReader, PartitionsConfig, Segment};
 use compio::buf::{IntoInner, IoBuf};
 use compio::fs;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_common::{IggyByteSize, IggyError, MAX_MESSAGE_SIZE_UPPER_BYTES, PartitionStats};
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::truncate_file;
@@ -718,7 +719,6 @@ pub async fn load_persisted_segments(
 /// checkpointed file is shorter than the checkpoint, or with
 /// [`PartitionRecoveryRefusal::CheckpointSizeMismatch`] when the walk proves
 /// a different length.
-#[allow(clippy::too_many_lines)]
 pub async fn load_persisted_segments_with_checkpoint(
     config: &PartitionsConfig,
     namespace: IggyNamespace,
@@ -726,6 +726,59 @@ pub async fn load_persisted_segments_with_checkpoint(
     durable_segments: bool,
     stats: &PartitionStats,
     checkpoint: Option<journal::partition_journal::SegmentPosition>,
+) -> Result<RecoveredLog, PartitionRecoveryError> {
+    load_segments(
+        config,
+        namespace,
+        segment_size,
+        durable_segments,
+        stats,
+        checkpoint,
+        false,
+    )
+    .await
+}
+
+/// [`load_persisted_segments_with_checkpoint`] for a partition that places
+/// its batches, whose segments hold placed batches: a batch header and where
+/// the messages sit in the object store.
+///
+/// Every segment is walked from its first byte, whatever its index says: a
+/// placed batch carries its own checksum, and the walk reads no message. The
+/// index of each segment is rebuilt from the walk.
+///
+/// # Errors
+///
+/// As [`load_persisted_segments_with_checkpoint`].
+pub async fn load_placed_segments(
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+    segment_size: IggyByteSize,
+    stats: &PartitionStats,
+    checkpoint: Option<journal::partition_journal::SegmentPosition>,
+) -> Result<RecoveredLog, PartitionRecoveryError> {
+    // No index is evidence here, so nothing depends on how durable it is.
+    load_segments(
+        config,
+        namespace,
+        segment_size,
+        false,
+        stats,
+        checkpoint,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn load_segments(
+    config: &PartitionsConfig,
+    namespace: IggyNamespace,
+    segment_size: IggyByteSize,
+    durable_segments: bool,
+    stats: &PartitionStats,
+    checkpoint: Option<journal::partition_journal::SegmentPosition>,
+    placed: bool,
 ) -> Result<RecoveredLog, PartitionRecoveryError> {
     let stream_id = namespace.stream_id();
     let topic_id = namespace.topic_id();
@@ -789,7 +842,18 @@ pub async fn load_persisted_segments_with_checkpoint(
                 }),
             );
         }
-        let bounds = if checkpoint_segment {
+        let bounds = if placed {
+            let messages = open_messages_file(identity, &messages_path).await?;
+            let mut scanner = FileScanner::new(&messages, messages_size, &mut scratch);
+            recover_placed_by_walking_log(
+                identity,
+                &mut scanner,
+                &messages_path,
+                start_offset,
+                messages_size,
+            )
+            .await?
+        } else if checkpoint_segment {
             let messages = open_messages_file(identity, &messages_path).await?;
             let mut scanner = FileScanner::new(&messages, messages_size, &mut scratch);
             recover_by_walking_log(
@@ -2401,6 +2465,110 @@ async fn recover_by_walking_log(
              log; the WAL replay indexes the bytes past the checkpoint again"
         ),
     }
+    Ok(Some(WalkedBounds {
+        start_timestamp,
+        end_timestamp,
+        end_offset,
+        messages_size: position,
+        index_size: rebuilt_index.len() as u64,
+        rebuilt_index: Some(rebuilt_index),
+    }))
+}
+
+/// [`recover_by_walking_log`] for a segment of placed batches.
+///
+/// Placed batches have one size, so the walk steps from one to the next
+/// without reading a length, and each one passes its own checksum. Bytes
+/// past the walked prefix are a torn tail unless a placed batch decodes
+/// somewhere in them, at any multiple of that size from the damage: such a
+/// batch was appended after the damaged one, so truncating would erase it.
+async fn recover_placed_by_walking_log(
+    identity: PartitionIdentity<'_>,
+    scanner: &mut FileScanner<'_>,
+    messages_path: &str,
+    start_offset: u64,
+    messages_size: u64,
+) -> Result<Option<WalkedBounds>, PartitionRecoveryError> {
+    let read_failure = |source: io::Error| scan_read_failure(identity, messages_path, &source);
+    let mut position = 0u64;
+    let mut start_timestamp = None;
+    let mut end_offset = start_offset;
+    let mut end_timestamp = 0;
+    let mut expected_offset = start_offset;
+    let mut rebuilt_index = Vec::new();
+    let mut last_indexed_position: Option<u64> = None;
+    while position < messages_size {
+        let Some(header) = scanner
+            .slice_at(position, PLACED_BATCH_SIZE)
+            .await
+            .map_err(read_failure)?
+            .and_then(|placed| PlacedBatch::decode(placed).ok())
+            .map(|placed| placed.header)
+            .filter(|header| header.message_count > 0)
+        else {
+            break;
+        };
+        if header.partition_id != identity.partition_id as u64 {
+            return Err(identity.refusal(PartitionRecoveryRefusal::ForeignBatch {
+                start_offset,
+                batch_partition_id: header.partition_id,
+                position,
+            }));
+        }
+        if header.base_offset != expected_offset {
+            return Err(
+                identity.refusal(PartitionRecoveryRefusal::OffsetDiscontinuity {
+                    start_offset,
+                    expected_offset,
+                    found_offset: header.base_offset,
+                    position,
+                }),
+            );
+        }
+        end_offset = header
+            .base_offset
+            .saturating_add(u64::from(header.message_count) - 1);
+        end_timestamp = header.base_timestamp;
+        start_timestamp.get_or_insert(header.base_timestamp);
+        expected_offset = end_offset.saturating_add(1);
+        if last_indexed_position
+            .is_none_or(|indexed| position.saturating_sub(indexed) >= REBUILT_INDEX_STRIDE_BYTES)
+        {
+            push_index_entry(
+                &mut rebuilt_index,
+                header.base_offset,
+                header.base_timestamp,
+                position,
+            );
+            last_indexed_position = Some(position);
+        }
+        position += PLACED_BATCH_SIZE as u64;
+        if scanner.take_refilled() {
+            yield_to_reactor().await;
+        }
+    }
+    let mut survivor = position.saturating_add(PLACED_BATCH_SIZE as u64);
+    while survivor < messages_size {
+        if scanner
+            .slice_at(survivor, PLACED_BATCH_SIZE)
+            .await
+            .map_err(read_failure)?
+            .is_some_and(|placed| PlacedBatch::decode(placed).is_ok())
+        {
+            return Err(identity.refusal(PartitionRecoveryRefusal::InteriorDamage {
+                start_offset,
+                damage_position: position,
+                survivor_position: survivor,
+            }));
+        }
+        survivor += PLACED_BATCH_SIZE as u64;
+        if scanner.take_refilled() {
+            yield_to_reactor().await;
+        }
+    }
+    let Some(start_timestamp) = start_timestamp else {
+        return Ok(None);
+    };
     Ok(Some(WalkedBounds {
         start_timestamp,
         end_timestamp,

@@ -620,6 +620,19 @@ mod tests {
         assert_eq!(err.to_kafka_error_code(), ERROR_NOT_LEADER_OR_FOLLOWER);
     }
 
+    /// A geo or shadow partition refuses the reads of external offsets with 58 until it took the
+    /// positions of its peers. The Java client fails `OffsetFetch` on 6 and 7, and retries 14.
+    #[test]
+    fn given_an_offset_read_refused_until_the_peers_positions_arrive_should_answer_a_retriable_14()
+    {
+        let err = BridgeError::Iggy(IggyError::TransientNotAccepted);
+
+        assert_eq!(
+            err.to_offset_error_code(),
+            ERROR_COORDINATOR_LOAD_IN_PROGRESS
+        );
+    }
+
     #[test]
     fn uncertain_operation_maps_to_request_timed_out() {
         let err = BridgeError::Iggy(IggyError::OperationUncertain(42));

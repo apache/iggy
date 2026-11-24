@@ -41,12 +41,14 @@ use bytes::Bytes;
 use consensus::{PartitionsHandle, Status, TimeoutManager};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader, RequestPreparesHeader};
 use server_common::sharding::IggyNamespace;
+use shard::{CONSENSUS_TICK_INTERVAL, DEFAULT_PARTITION_IO_CAPACITY};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::Simulator;
 use crate::client::SimClient;
 use crate::packet::{Packet, ProcessId};
 use crate::partition_repair_driver_tests::cluster;
+use crate::tests::submit_and_wait_for_reply;
 use crate::workload::{
     self, Workload,
     invariants::Invariants,
@@ -79,6 +81,36 @@ const PARTITION_TICKS: u64 = 10 * TimeoutManager::VIEW_CHANGE_STATUS_TICKS;
 const ELECTION_TICKS_MAX: u64 = TimeoutManager::NORMAL_HEARTBEAT_TICKS
     + TimeoutManager::COMMIT_MESSAGE_TICKS
     + TimeoutManager::START_VIEW_CHANGE_MESSAGE_TICKS;
+/// Groups that all start on replica 0, so the rebalancer owes 40 moves.
+const BULK_GROUPS: usize = 60;
+/// The 5 s that the rebalancer waits for a stable cluster, then 10 probe
+/// intervals of 1 s.
+const BULK_SPREAD_TICKS: u64 = 1_500;
+/// Enough for 20 handoffs at 4 per tick, each with its view change.
+const HANDOFF_TICKS: u64 = 200;
+/// `PARTITION_VIEW_CHANGE_VOTES_PER_TICK_MAX` of the shard, which also paces
+/// the handoff.
+const HANDOFFS_PER_TICK_MAX: usize = 4;
+/// Past `STABLE_INTERVAL` of the rebalancer (500 ticks) and 10 of its rounds,
+/// so it had the time to move primaries to a node that left.
+const AFTER_HANDOFF_TICKS: u64 = 1_500;
+/// Groups that replica 0 leads from their start. No write tells them apart,
+/// so their heartbeats leave on the same ticks.
+const MANY_GROUPS: usize = 24;
+/// Before `STABLE_INTERVAL` of the rebalancer (500 ticks), so it moved no
+/// primary yet.
+const QUIET_TICKS: u64 = 300;
+/// Four groups for each superblock write that a shard runs at a time, so the
+/// write of a group waits for up to three others.
+const QUEUED_GROUPS: usize = 4 * DEFAULT_PARTITION_IO_CAPACITY;
+/// The last group of the queue waits four writes, 800 ticks: past one
+/// `VIEW_CHANGE_STATUS_TICKS` (500) and inside two.
+const SUPERBLOCK_WRITE_TICKS: u32 = 200;
+/// One view change that fails on the wait and one that completes. A wait past
+/// two status periods costs one more.
+const RESTART_VIEW_CHANGES_MAX: u32 = 2;
+/// 200 s of virtual time.
+const RESTART_TICKS_MAX: u64 = 20_000;
 /// Past `NORMAL_HEARTBEAT_TICKS` (500): the cut lasts long enough that the
 /// group replica 2 led fails over and replica 2 starts a view change itself.
 const CUT_TICKS: u64 = 600;
@@ -235,7 +267,7 @@ fn given_a_missed_committed_prepare_when_pull_repair_is_unavailable_should_rejoi
                 partition.held_through(),
                 partition.replication_progress(),
                 partition.view_fenced(),
-                partition.repair
+                partition.repair().copied()
             )),
     );
     assert!(sim.network.delivered_any(Command::PrepareProgress));
@@ -350,6 +382,171 @@ fn given_a_crashed_primary_should_elect_a_new_one_within_the_election_bound() {
     );
 }
 
+/// More groups lose their primary on one tick than a shard casts heartbeat
+/// votes for per tick. The survivors hold some votes back, and each group
+/// still changes its view once, within the election bound.
+#[test]
+fn given_a_crashed_primary_of_many_groups_should_hold_votes_and_change_each_view_once() {
+    let (mut sim, _client) = cluster(SEED);
+    let namespaces: Vec<_> = (0..MANY_GROUPS)
+        .map(|partition| IggyNamespace::new(1, 1, partition))
+        .collect();
+    for &namespace in &namespaces {
+        sim.init_partition(namespace);
+    }
+    for _ in 0..QUIET_TICKS {
+        sim.step();
+    }
+    let view = healthy_view(&sim, namespaces[0]);
+    assert!(
+        namespaces.iter().all(|&namespace| {
+            sim.primary_index(namespace) == Some(LEADER) && healthy_view(&sim, namespace) == view
+        }),
+        "replica 0 must lead every group in one view before the fault"
+    );
+    sim.replica_crash(LEADER);
+
+    let mut held_max = 0;
+    let mut elected = vec![None; MANY_GROUPS];
+    for _ in 0..ELECTION_TICKS_MAX + MANY_GROUPS as u64 {
+        sim.step();
+        held_max = held_max.max(votes_held(&sim, LEADER));
+        for (elected, &namespace) in elected.iter_mut().zip(&namespaces) {
+            if elected.is_none() {
+                *elected = (0..sim.replica_count)
+                    .filter(|&replica| replica != LEADER)
+                    .filter_map(|replica| {
+                        sim.partition_consensus_state(usize::from(replica), namespace)
+                    })
+                    .find(|state| state.is_primary && state.status == Status::Normal)
+                    .map(|state| state.view);
+            }
+        }
+    }
+
+    assert!(
+        held_max > 0,
+        "the heartbeat timers of {MANY_GROUPS} groups fired on one tick, and no shard held a vote"
+    );
+    assert_eq!(
+        elected,
+        vec![Some(view + 1); MANY_GROUPS],
+        "the view in which a survivor first led each group"
+    );
+}
+
+/// Every replica restarts with more groups than its I/O lane has slots, and
+/// each superblock write takes long enough that the last group of the queue
+/// waits past one status timeout. A replica that gives up on a view while its
+/// own write still waits leaves a view that no peer heard of, and the next
+/// view costs every replica one more write in the same queue.
+///
+/// The first view fails for every group: its primary needs a second write,
+/// behind the first write of every group, before its `StartView` leaves. The
+/// second view has twice the time and completes.
+#[test]
+fn given_slow_superblock_writes_when_every_replica_restarts_should_change_each_view_at_most_twice()
+{
+    let (mut sim, client) = cluster(SEED);
+    sim.register_client_with_primary(&client);
+    let namespaces: Vec<_> = (0..QUEUED_GROUPS)
+        .map(|partition| IggyNamespace::new(1, 1, partition))
+        .collect();
+    for &namespace in &namespaces {
+        sim.init_partition(namespace);
+    }
+    for _ in 0..QUIET_TICKS {
+        sim.step();
+    }
+    let views: Vec<u32> = namespaces
+        .iter()
+        .map(|&namespace| highest_view(&sim, namespace))
+        .collect();
+    set_superblock_write_ticks(&sim, SUPERBLOCK_WRITE_TICKS);
+    for replica in 0..sim.replica_count {
+        sim.replica_crash(replica);
+    }
+    for replica in 0..sim.replica_count {
+        sim.replica_restart(replica);
+    }
+
+    // A view after the one in which a group first serves again is a move of
+    // the rebalancer.
+    let mut served_in: Vec<Option<u32>> = vec![None; namespaces.len()];
+    for _ in 0..RESTART_TICKS_MAX {
+        if !served_in.contains(&None) {
+            break;
+        }
+        sim.step();
+        for (served, &namespace) in served_in.iter_mut().zip(&namespaces) {
+            if served.is_none() {
+                *served = serving_view(&sim, namespace);
+            }
+        }
+    }
+    let changes: Vec<Option<u32>> = served_in
+        .iter()
+        .zip(&views)
+        .map(|(served, &view)| served.map(|served| served - view))
+        .collect();
+    assert!(
+        changes
+            .iter()
+            .all(|changes| changes.is_some_and(|changes| changes <= RESTART_VIEW_CHANGES_MAX)),
+        "view changes of each group until it served again, `None` for a group that did not \
+         within {RESTART_TICKS_MAX} ticks of the restart: {changes:?}"
+    );
+
+    // A hold that never opens also keeps the views low, so a group must
+    // commit again.
+    set_superblock_write_ticks(&sim, 0);
+    for _ in 0..2 * SUPERBLOCK_WRITE_TICKS {
+        sim.step();
+    }
+    let namespace = namespaces[QUEUED_GROUPS - 1];
+    let primary = (0..RESTART_TICKS_MAX)
+        .find_map(|_| {
+            sim.step();
+            serving_primary(&sim, namespace)
+        })
+        .expect("the last group of the queue has a primary after the restart");
+    sim.discover_partition_contexts(&client);
+    let request = client.send_messages(namespace, &[Bytes::from_static(b"after-restart")]);
+    let reply = submit_and_wait_for_reply(&mut sim, client.client_id(), primary, request);
+    assert_eq!(reply.header().status, 0);
+}
+
+/// The rebalancer plans a round of moves per probe interval. One move per
+/// interval needs 40 intervals to spread these groups, and the test gives 10.
+#[test]
+fn given_many_groups_on_one_replica_when_rebalancing_should_spread_them_in_a_few_rounds() {
+    let mut run = Run::new(BULK_GROUPS, 0);
+    assert!(
+        run.namespaces
+            .iter()
+            .all(|&namespace| run.sim.primary_index(namespace) == Some(LEADER)),
+        "replica 0 must lead every group at the start"
+    );
+
+    let replies: u64 = (0..BULK_SPREAD_TICKS).map(|_| run.tick()).sum();
+
+    let mut led = [0_usize; 3];
+    for &namespace in &run.namespaces {
+        let primary = run.sim.primary_index(namespace).expect("a primary");
+        led[usize::from(primary)] += 1;
+    }
+    assert_eq!(led, [BULK_GROUPS / 3; 3], "groups that each replica leads");
+    // The primary of view 1 or 2 is replica 1 or 2, so a higher view shows a
+    // group that moved a second time.
+    let moved_twice: Vec<_> = run
+        .namespaces
+        .iter()
+        .filter(|&&namespace| healthy_view(&run.sim, namespace) > 2)
+        .collect();
+    assert!(moved_twice.is_empty(), "{moved_twice:?}");
+    assert!(replies > 0, "the workload must keep committing");
+}
+
 #[test]
 fn given_a_primary_cut_off_should_be_replaced_and_rejoin_as_a_backup() {
     let mut run = Run::single();
@@ -381,6 +578,190 @@ fn given_a_primary_cut_off_should_be_replaced_and_rejoin_as_a_backup() {
         .partition_consensus_state(usize::from(LEADER), namespace)
         .is_some_and(|state| state.status == Status::Normal && !state.is_primary);
     assert!(rejoined, "replica 0 must rejoin the partition as a backup");
+}
+
+/// A node that leaves hands off the groups it leads, and gets none back,
+/// whether it leads the metadata plane (replica 0) or not. So its stop costs
+/// no group a heartbeat timeout.
+#[test]
+fn given_a_replica_that_leaves_should_hand_off_its_groups_and_get_none_back() {
+    for leaving in [LEADER, LAGGING_PEER] {
+        let mut run = Run::new(BULK_GROUPS, BULK_SPREAD_TICKS);
+        assert_eq!(
+            run.sim.metadata_primary_index(),
+            Some(LEADER),
+            "replica 0 must lead the metadata plane"
+        );
+        assert_eq!(run.led(), [BULK_GROUPS / 3; 3], "groups led at the start");
+        let handed_off: Vec<bool> = run
+            .namespaces
+            .iter()
+            .map(|&namespace| run.sim.primary_index(namespace) == Some(leaving))
+            .collect();
+
+        run.begin_primary_handoff(leaving);
+        let (changes, replies) = run.count_view_changes(HANDOFF_TICKS);
+
+        assert!(
+            !run.primary_handoff_pending(leaving),
+            "replica {leaving} must end its handoff"
+        );
+        assert_eq!(
+            run.led()[usize::from(leaving)],
+            0,
+            "groups that replica {leaving} leads after its handoff"
+        );
+        let mut led = [BULK_GROUPS / 2; 3];
+        led[usize::from(leaving)] = 0;
+        assert_eq!(
+            run.led(),
+            led,
+            "the other replicas must share the groups of replica {leaving}"
+        );
+        let expected: Vec<u32> = handed_off.iter().map(|&moved| u32::from(moved)).collect();
+        assert_eq!(
+            changes, expected,
+            "each group of replica {leaving} changes its view once, and no other group does"
+        );
+        assert!(replies > 0, "the workload must keep committing");
+
+        let (_, replies) = run.count_view_changes(AFTER_HANDOFF_TICKS);
+        assert_eq!(
+            run.led(),
+            led,
+            "the rebalancer must give replica {leaving} no group back"
+        );
+        assert!(replies > 0, "the workload must keep committing");
+
+        run.sim.replica_crash(leaving);
+        let (changes, _) = run.count_view_changes(ELECTION_TICKS_MAX);
+        assert_eq!(
+            changes,
+            vec![0; BULK_GROUPS],
+            "no group may wait for a heartbeat timeout after replica {leaving} stops"
+        );
+    }
+}
+
+/// The handoff starts a few view changes per tick, as a failover does, and it
+/// ends only after the last of them. A node that shut its bus down earlier
+/// would cut them.
+#[test]
+fn given_a_replica_that_leaves_should_pace_its_handoff_and_wait_for_its_view_changes() {
+    let mut run = Run::new(BULK_GROUPS, BULK_SPREAD_TICKS);
+    let leading = |run: &Run| {
+        run.namespaces
+            .iter()
+            .filter_map(|&namespace| {
+                run.sim
+                    .partition_consensus_state(usize::from(LEADER), namespace)
+            })
+            .filter(|state| state.is_primary && state.status == Status::Normal)
+            .count()
+    };
+    let led_at_start = leading(&run);
+    assert_eq!(led_at_start, BULK_GROUPS / 3);
+    let per_tick_max = HANDOFFS_PER_TICK_MAX * run.sim.replicas[usize::from(LEADER)].shards.len();
+
+    run.begin_primary_handoff(LEADER);
+    let mut ticks = 0_usize;
+    while run.primary_handoff_pending(LEADER) {
+        run.tick();
+        ticks += 1;
+        assert!(
+            led_at_start - leading(&run) <= per_tick_max * ticks,
+            "replica 0 gave up more than {per_tick_max} groups per tick by tick {ticks}"
+        );
+        assert!(
+            (ticks as u64) < HANDOFF_TICKS,
+            "replica 0 must end its handoff"
+        );
+    }
+
+    let in_view_change = run
+        .namespaces
+        .iter()
+        .filter_map(|&namespace| {
+            run.sim
+                .partition_consensus_state(usize::from(LEADER), namespace)
+        })
+        .filter(|state| state.status != Status::Normal)
+        .count();
+    assert_eq!(
+        (leading(&run), in_view_change),
+        (0, 0),
+        "groups that replica 0 still leads or still changes the view of, at the end"
+    );
+}
+
+/// Every node gets the stop signal at once. Each hands off to peers that leave
+/// too, so a pass that visited a group twice would send it around forever. A
+/// replica stops its pass once both peers handed it a group. Without that,
+/// every group changes its view for nothing.
+#[test]
+fn given_every_replica_leaves_at_once_should_end_each_handoff() {
+    let mut run = Run::new(BULK_GROUPS, BULK_SPREAD_TICKS);
+
+    for replica in 0..run.sim.replica_count {
+        run.begin_primary_handoff(replica);
+    }
+    let (changes, _) = run.count_view_changes(HANDOFF_TICKS);
+
+    for replica in 0..run.sim.replica_count {
+        assert!(
+            !run.primary_handoff_pending(replica),
+            "replica {replica} must end its handoff"
+        );
+    }
+    let replicas = u32::from(run.sim.replica_count);
+    let sent_around: Vec<_> = run
+        .namespaces
+        .iter()
+        .zip(&changes)
+        .filter(|&(_, &changes)| changes > replicas)
+        .collect();
+    assert!(sent_around.is_empty(), "{sent_around:?}");
+    let handed_off = changes.iter().filter(|&&changes| changes > 0).count();
+    assert!(
+        handed_off <= BULK_GROUPS / 2,
+        "{handed_off} of {BULK_GROUPS} groups changed their view between replicas that all leave"
+    );
+    assert_eq!(
+        run.led().iter().sum::<usize>(),
+        BULK_GROUPS,
+        "each group must have a primary after the handoffs"
+    );
+}
+
+/// A peer that restarted probes for the view and votes in no election, so a
+/// handoff to it holds its view change until the status timeout. The pass
+/// stops waiting for such a handoff at its deadline, and the group still gets
+/// a primary after the node is gone.
+#[test]
+fn given_a_peer_that_just_restarted_when_a_replica_leaves_should_end_the_handoff_before_the_status_timeout()
+ {
+    let mut run = Run::new(BULK_GROUPS, BULK_SPREAD_TICKS);
+    run.sim.replica_crash(LAGGING_PEER);
+    run.sim.replica_restart(LAGGING_PEER);
+
+    run.begin_primary_handoff(LEADER);
+    let mut ticks = 0_u64;
+    while run.primary_handoff_pending(LEADER) {
+        run.tick();
+        ticks += 1;
+        assert!(
+            ticks < TimeoutManager::VIEW_CHANGE_STATUS_TICKS,
+            "replica {LEADER} must not wait for the status timeout of a handoff to replica {LAGGING_PEER}"
+        );
+    }
+
+    run.sim.replica_crash(LEADER);
+    run.count_view_changes(AFTER_HANDOFF_TICKS);
+    assert_eq!(
+        run.led().iter().sum::<usize>(),
+        BULK_GROUPS,
+        "each group must have a primary after replica {LEADER} left"
+    );
 }
 
 /// The groups after the rebalancer spread them, with the workload that keeps
@@ -474,6 +855,54 @@ impl Run {
         changes
     }
 
+    /// Groups that each replica leads.
+    fn led(&self) -> [usize; 3] {
+        let mut led = [0; 3];
+        for &namespace in &self.namespaces {
+            if let Some(primary) = self.sim.primary_index(namespace) {
+                led[usize::from(primary)] += 1;
+            }
+        }
+        led
+    }
+
+    /// What the stop signal does on each shard of `replica`.
+    fn begin_primary_handoff(&self, replica: u8) {
+        for shard in &self.sim.replicas[usize::from(replica)].shards {
+            shard.begin_primary_handoff();
+        }
+    }
+
+    fn primary_handoff_pending(&self, replica: u8) -> bool {
+        self.sim.replicas[usize::from(replica)]
+            .shards
+            .iter()
+            .any(|shard| shard.primary_handoff_pending())
+    }
+
+    /// Runs `ticks` and returns how often each group changed its view, with
+    /// the replies of the workload.
+    fn count_view_changes(&mut self, ticks: u64) -> (Vec<u32>, u64) {
+        let mut views: Vec<u32> = self
+            .namespaces
+            .iter()
+            .map(|&namespace| highest_view(&self.sim, namespace))
+            .collect();
+        let mut changes = vec![0_u32; self.namespaces.len()];
+        let mut replies = 0;
+        for _ in 0..ticks {
+            replies += self.tick();
+            for (index, &namespace) in self.namespaces.iter().enumerate() {
+                let view = highest_view(&self.sim, namespace);
+                if view != views[index] {
+                    changes[index] += 1;
+                    views[index] = view;
+                }
+            }
+        }
+        (changes, replies)
+    }
+
     /// Whether a replica other than `failed` becomes a `Normal` primary of the
     /// group and of the metadata plane within `ELECTION_TICKS_MAX`.
     fn others_lead_within_election_bound(&mut self, failed: u8) -> bool {
@@ -524,6 +953,46 @@ fn set_peer_links(sim: &mut Simulator, replica: u8, enabled: bool) {
     }
 }
 
+/// The highest view a replica holds for `namespace`.
+fn highest_view(sim: &Simulator, namespace: IggyNamespace) -> u32 {
+    (0..sim.replica_count)
+        .filter_map(|replica| sim.partition_consensus_state(usize::from(replica), namespace))
+        .map(|state| state.view)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Makes every superblock write of a partition group take `ticks` from now
+/// on, on every replica.
+fn set_superblock_write_ticks(sim: &Simulator, ticks: u32) {
+    for replica in &sim.replicas {
+        for (_, superblock) in replica.partition_superblocks.borrow().values() {
+            superblock.set_write_delay(sim.executor.timer(), CONSENSUS_TICK_INTERVAL * ticks);
+        }
+    }
+}
+
+/// The view in which `namespace` serves: a primary and a quorum of the
+/// replicas run in normal status in it.
+fn serving_view(sim: &Simulator, namespace: IggyNamespace) -> Option<u32> {
+    let states: Vec<_> = (0..sim.replica_count)
+        .filter_map(|replica| sim.partition_consensus_state(usize::from(replica), namespace))
+        .filter(|state| state.status == Status::Normal)
+        .collect();
+    let view = states.iter().find(|state| state.is_primary)?.view;
+    let quorum = usize::from(sim.replica_count) / 2 + 1;
+    (states.iter().filter(|state| state.view == view).count() >= quorum).then_some(view)
+}
+
+/// The replica that leads `namespace` in the view in which it serves.
+fn serving_primary(sim: &Simulator, namespace: IggyNamespace) -> Option<u8> {
+    let view = serving_view(sim, namespace)?;
+    (0..sim.replica_count).find(|&replica| {
+        sim.partition_consensus_state(usize::from(replica), namespace)
+            .is_some_and(|state| state.is_primary && state.view == view)
+    })
+}
+
 /// The highest view replicas 0 and 1 hold for `namespace`.
 fn healthy_view(sim: &Simulator, namespace: IggyNamespace) -> u32 {
     (0..sim.replica_count)
@@ -532,6 +1001,18 @@ fn healthy_view(sim: &Simulator, namespace: IggyNamespace) -> u32 {
         .map(|state| state.view)
         .max()
         .unwrap_or(0)
+}
+
+/// `partition_view_change_votes_held` summed over every shard of every node
+/// but `down`.
+fn votes_held(sim: &Simulator, down: u8) -> i64 {
+    sim.replicas
+        .iter()
+        .enumerate()
+        .filter(|(replica, _)| *replica != usize::from(down))
+        .flat_map(|(_, replica)| replica.shards.iter())
+        .map(|shard| shard.metrics().partition_view_changes_value().1)
+        .sum()
 }
 
 /// The highest metadata view replicas 0 and 1 hold.

@@ -103,6 +103,15 @@ internal static class TcpContracts
         return bytes.ToArray();
     }
 
+    internal static byte[] RetireGeoOrigin(string origin)
+    {
+        var originLength = WireName.ByteCount(origin, nameof(origin));
+        var bytes = new byte[1 + originLength];
+        bytes[0] = (byte)originLength;
+        Encoding.UTF8.GetBytes(origin, bytes.AsSpan(1));
+        return bytes;
+    }
+
     internal static byte[] DeletePersonalRequestToken(string name)
     {
         var nameLength = WireName.ByteCount(name, nameof(name));

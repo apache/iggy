@@ -18,7 +18,7 @@
 //! The facts that a run's page lists: its conditions, command, parameters, options, environment and
 //! latency percentiles, as text built from the typed fields of the summary and the report.
 
-use std::{fmt, iter};
+use std::iter;
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::delta::Metric;
@@ -28,7 +28,9 @@ use bench_dashboard_shared::summary::{BenchmarkSummary, actors, kind_name};
 use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
 use bench_report::hardware::BenchmarkHardware;
 use bench_report::numeric_parameter::BenchmarkNumericParameter;
-use bench_report::options::{BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions};
+use bench_report::options::{
+    BenchmarkMaxTopicSize, BenchmarkMessageExpiry, BenchmarkOptions, BenchmarkTopicStorage,
+};
 use bench_report::params::{BenchmarkDataVolume, BenchmarkParams};
 use bench_report::server_stats::BenchmarkServerStats;
 use bench_report::transport::BenchmarkTransport;
@@ -196,26 +198,21 @@ pub fn option_groups(params: &BenchmarkParams) -> Vec<FactGroup> {
             ),
             fact("Max topic size", max_topic_size_text(topic.max_topic_size)),
             fact("Message expiry", message_expiry_text(topic.message_expiry)),
+            fact("Topic storage", topic_storage_text(topic.storage)),
         ],
     }];
     if let Some(consumer) = &options.consumer {
-        let mut facts = vec![
-            fact(
-                "Offset durability",
-                durability_text(consumer.consumer_offset_durability),
-            ),
-            fact("Max wait", duration_text(consumer.max_wait_us)),
-            fact("Min count", group_digits(consumer.min_count.into())),
-            fact("Max bytes", max_bytes_text(consumer.max_bytes)),
-        ];
-        facts.extend(
-            consumer
-                .read_amplification
-                .map(|factor| fact("Read amplification", amplification_text(factor))),
-        );
         groups.push(FactGroup {
             title: "Consumer",
-            facts,
+            facts: vec![
+                fact(
+                    "Offset durability",
+                    durability_text(consumer.consumer_offset_durability),
+                ),
+                fact("Max wait", duration_text(consumer.max_wait_us)),
+                fact("Min count", group_digits(consumer.min_count.into())),
+                fact("Max bytes", max_bytes_text(consumer.max_bytes)),
+            ],
         });
     }
     groups.push(FactGroup {
@@ -296,6 +293,7 @@ pub fn field_value(field: WorkloadField, key: &WorkloadKey) -> FieldValue {
             },
             text: message_expiry_text(topic.message_expiry),
         },
+        WorkloadField::TopicStorage => word(topic_storage_text(topic.storage)),
         WorkloadField::ConsumerOffsetDurability => poll.map_or_else(not_polled, |options| {
             word(durability_text(options.consumer_offset_durability))
         }),
@@ -307,9 +305,6 @@ pub fn field_value(field: WorkloadField, key: &WorkloadKey) -> FieldValue {
             size: options.max_bytes.map(u64::from),
             text: max_bytes_text(options.max_bytes),
         }),
-        WorkloadField::ReadAmplification => poll
-            .and_then(|options| options.read_amplification.as_deref())
-            .map_or_else(not_polled, |factor| word(&amplification_text(factor))),
         WorkloadField::WarmupTime => amount(
             key.client.warmup_time_us,
             duration_text(key.client.warmup_time_us),
@@ -589,6 +584,14 @@ fn max_topic_size_text(size: BenchmarkMaxTopicSize) -> String {
     }
 }
 
+const fn topic_storage_text(storage: BenchmarkTopicStorage) -> &'static str {
+    match storage {
+        BenchmarkTopicStorage::Local => "local",
+        BenchmarkTopicStorage::Tiered => "tiered",
+        BenchmarkTopicStorage::Geo => "geo",
+    }
+}
+
 fn message_expiry_text(expiry: BenchmarkMessageExpiry) -> String {
     match expiry {
         BenchmarkMessageExpiry::ServerDefault => SERVER_DEFAULT.to_owned(),
@@ -602,11 +605,6 @@ fn max_bytes_text(bytes: Option<u32>) -> String {
         || BENCH_DEFAULT.to_owned(),
         |bytes| format_bytes(bytes.into()),
     )
-}
-
-/// The report holds the factor as a number and the workload key as its exact text.
-fn amplification_text(factor: impl fmt::Display) -> String {
-    format!("{factor}x")
 }
 
 const fn yes_no(value: bool) -> &'static str {
@@ -718,6 +716,7 @@ mod tests {
                 ("Messages required to save", "server default"),
                 ("Max topic size", "unlimited"),
                 ("Message expiry", "never"),
+                ("Topic storage", "local"),
                 ("Offset durability", "replicated"),
                 ("Max wait", "1 s"),
                 ("Min count", "1"),

@@ -1,0 +1,4 @@
+{
+  "title": "Rust",
+  "pages": ["intro", "examples", "high-level-sdk", "stream-builder"]
+}

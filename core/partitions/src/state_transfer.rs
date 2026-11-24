@@ -53,6 +53,7 @@ use consensus::{
     ArtifactProgress, DedupWatermark, Sequencer as _, StateArtifactHasher, state_artifact_checksum,
 };
 use iggy_binary_protocol::batch::BatchProducer;
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::requests::partitions::retire_consumer_group_owners::CONSUMER_GROUP_OWNERS_MAX;
 use iggy_binary_protocol::requests::partitions::{
     InstallConsumerGroupOwnerRequest, RetireConsumerGroupOwnersRequest,
@@ -67,7 +68,7 @@ use message_bus::MessageBus;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::fs_utils::run_blocking;
 use server_common::iobuf::Owned;
-use server_common::send_messages::{decode_batch_slice, decode_prepare_slice};
+use server_common::send_messages::{decode_batch_slice, decode_prepare_batch};
 use server_common::sharding::IggyNamespace;
 use server_common::yield_to_reactor;
 use server_common::{DISK_USAGE, Message};
@@ -183,6 +184,27 @@ pub struct PartitionTransferSession {
     pub seed: Option<PrefixSeed>,
     /// Chunk payload bytes that crossed the network in this session.
     pub pulled_len: u64,
+    pub slot: TransferSlot,
+}
+
+/// Counts one live transfer session against the shard's transfer cap. The
+/// session owns it, so every path that drops a session frees the slot, a
+/// partition dropped during its transfer included.
+#[derive(Debug)]
+pub struct TransferSlot(Rc<Cell<usize>>);
+
+impl TransferSlot {
+    #[must_use]
+    pub fn new(inflight: &Rc<Cell<usize>>) -> Self {
+        inflight.set(inflight.get() + 1);
+        Self(Rc::clone(inflight))
+    }
+}
+
+impl Drop for TransferSlot {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
 }
 
 /// The local copy of the leading bytes of one offered segment artifact.
@@ -1412,8 +1434,9 @@ impl std::error::Error for SegmentWalkError {}
 pub(crate) async fn walk_segment_payload(
     base_offset: u64,
     bytes: &[u8],
+    placed: bool,
 ) -> Result<(SegmentWalkStats, Vec<u8>), SegmentWalkError> {
-    let mut walk = SegmentWalk::new(base_offset);
+    let mut walk = SegmentWalk::new(base_offset, placed);
     walk.advance(bytes).await?;
     walk.finish()
 }
@@ -1421,6 +1444,10 @@ pub(crate) async fn walk_segment_payload(
 /// A walk that stops at the end of the bytes it was given and resumes there,
 /// so a seeded prefix and the suffix that completes it are each walked once.
 pub(crate) struct SegmentWalk {
+    /// Whether the payload holds placed batches: the segment of a partition
+    /// that places its batches. Each one passes its own checksum, where a
+    /// whole batch passes its batch and message checksums.
+    placed: bool,
     base_offset: u64,
     /// Payload bytes walked so far.
     position: usize,
@@ -1431,8 +1458,9 @@ pub(crate) struct SegmentWalk {
 }
 
 impl SegmentWalk {
-    pub(crate) const fn new(base_offset: u64) -> Self {
+    pub(crate) const fn new(base_offset: u64, placed: bool) -> Self {
         Self {
+            placed,
             base_offset,
             position: 0,
             next_offset: base_offset,
@@ -1461,13 +1489,23 @@ impl SegmentWalk {
                 since_yield = 0;
                 yield_to_reactor().await;
             }
-            let batch = decode_batch_slice(&bytes[self.position..]).map_err(|source| {
-                SegmentWalkError::Batch {
-                    position: self.position as u64,
-                    source,
-                }
-            })?;
-            let header = batch.header;
+            let (header, stored_len) = if self.placed {
+                let placed = PlacedBatch::decode(&bytes[self.position..]).map_err(|_| {
+                    SegmentWalkError::Batch {
+                        position: self.position as u64,
+                        source: iggy_common::IggyError::InvalidCommand,
+                    }
+                })?;
+                (placed.header, PLACED_BATCH_SIZE)
+            } else {
+                let batch = decode_batch_slice(&bytes[self.position..]).map_err(|source| {
+                    SegmentWalkError::Batch {
+                        position: self.position as u64,
+                        source,
+                    }
+                })?;
+                (batch.header, batch.header.total_size())
+            };
             if self.stats.is_none() && header.base_offset != self.base_offset {
                 return Err(SegmentWalkError::BaseOffsetMismatch {
                     expected: self.base_offset,
@@ -1546,8 +1584,8 @@ impl SegmentWalk {
             // at the 256-byte command header (no zero-step loop is possible)
             // and `decode_batch_slice` already rejects a body shorter than
             // `total_size()`.
-            self.position += header.total_size();
-            since_yield += header.total_size();
+            self.position += stored_len;
+            since_yield += stored_len;
         }
         Ok(())
     }
@@ -1670,7 +1708,8 @@ pub(crate) enum TransferPlanSlot {
     /// A request waits for the flush that has to come before the capture.
     Wanted,
     Pinned(Rc<TransferPlan>),
-    Failed(PartitionTransferUnavailable),
+    /// Boxed: the error takes 80 bytes, and every partition holds a slot.
+    Failed(Box<PartitionTransferUnavailable>),
 }
 
 /// Why a partition cannot serve a state transfer right now.
@@ -2481,6 +2520,15 @@ where
     B: MessageBus,
     SB: SuperblockStore,
 {
+    /// The first op past a pinned transfer plan. The offer for that plan needs
+    /// every body from this op on in memory.
+    pub(crate) fn pinned_transfer_tail(&self) -> Option<u64> {
+        match &*self.transfer_plan.borrow() {
+            Some(TransferPlanSlot::Pinned(plan)) => Some(plan.commit_op.saturating_add(1)),
+            _ => None,
+        }
+    }
+
     /// Pin before building the manifest: flushing and hashing can span several
     /// rounds while writes keep evicting the suffix the receiver will need.
     pub fn retain_transfer_tail(&self, peer: u8, nonce: u128, tick: u64) -> bool {
@@ -2576,6 +2624,15 @@ where
         }
     }
 
+    /// Whether a served repair tail holds a lease that
+    /// [`Self::expire_transfer_tails`] must end on a later tick.
+    pub(crate) fn holds_transfer_tail_lease(&self) -> bool {
+        self.served_repair_tails
+            .borrow()
+            .values()
+            .any(|tail| tail.lease.is_some())
+    }
+
     pub fn expire_transfer_tails(&self, tick: u64, idle_ticks_max: u64) {
         for tail in self.served_repair_tails.borrow_mut().values_mut() {
             if tick.saturating_sub(tail.last_active_tick) >= idle_ticks_max {
@@ -2639,7 +2696,7 @@ where
             .as_ref()
             .is_err_and(PartitionTransferUnavailable::resumable)
         {
-            self.transfer_plan.borrow_mut().take();
+            self.drop_transfer_plan();
         }
         offer
     }
@@ -2675,7 +2732,7 @@ where
             // simulator models partition state transfer.
             return Err(PartitionTransferUnavailable::NoPartitionDir);
         }
-        if self.repair.is_some() {
+        if self.repair().is_some() {
             return Err(PartitionTransferUnavailable::RepairInProgress);
         }
         // A primary by index over an empty log passes every gate above yet can
@@ -2757,7 +2814,7 @@ where
         // awaits, and the yields inside `hash_segment_range` move the reactor,
         // not this shard's consensus ticks. A cold pass over multi-GiB
         // retention therefore silences every group on this core for its whole
-        // duration, past `heartbeat_timeout`, on the node that by construction
+        // duration, past `commit_busy_heartbeat_timeout`, on the node that by construction
         // is the primary of those groups.
         //
         // Bounded per round instead. The memo carries partial progress, so a
@@ -2846,6 +2903,7 @@ where
                 .memory_retained_from()
                 .is_none_or(|retained_from| retained_from > plan.commit_op.saturating_add(1))
         {
+            self.drop_transfer_plan();
             *self.transfer_plan.borrow_mut() = Some(TransferPlanSlot::Wanted);
             self.notify_io();
             return Err(PartitionTransferUnavailable::FlushPending);
@@ -3082,7 +3140,7 @@ where
     /// name segments that retention may be about to unlink.
     pub fn clear_state_transfer_offer_cache(&self) {
         self.transfer_offer_cache.borrow_mut().take();
-        self.transfer_plan.borrow_mut().take();
+        self.drop_transfer_plan();
     }
 
     fn validate_consumer_offset_transfer_counts(&self) -> Result<(), PartitionTransferUnavailable> {
@@ -3111,13 +3169,15 @@ where
     /// Snapshot committed durable offsets only. Eager auto-commit progress and
     /// follower-local cursor entries stay in the live maps until a replicated
     /// store commits them, so neither can be promoted by state transfer.
-    fn offsets_wire_snapshot(&self) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
+    pub(crate) fn offsets_wire_snapshot(
+        &self,
+    ) -> Result<ConsumerOffsetsWire, PartitionTransferUnavailable> {
         self.validate_consumer_offset_transfer_counts()?;
-        let consumer_map = self.consumer_offsets.pin();
+        let consumer_map = self.consumer_offsets.borrow();
         let consumers = self.snapshot_offset_kind(ConsumerKind::Consumer, |id| {
             consumer_map.contains_key(&(id as usize))
         })?;
-        let group_map = self.consumer_group_offsets.pin();
+        let group_map = self.consumer_group_offsets.borrow();
         let groups = self.snapshot_offset_kind(ConsumerKind::ConsumerGroup, |id| {
             group_map.contains_key(&ConsumerGroupId(id as usize))
         })?;
@@ -3257,6 +3317,7 @@ where
             memo.adopted.remove(&entry.frontier);
         }
         Ok(SegmentSpillJob {
+            placed: self.places_batches(),
             partition_dir,
             entry: *entry,
             bytes,
@@ -3264,7 +3325,6 @@ where
         })
     }
 
-    #[cfg(test)]
     pub(crate) async fn spill_transfer_segment(
         &self,
         entry: &consensus::StateArtifact,
@@ -3305,18 +3365,14 @@ where
     /// while the scan runs, because the pull waits for it. The call that
     /// finds the scan landed returns what it reused.
     pub fn drive_reuse_scan(&mut self) -> Poll<Option<ReusedSegments>> {
-        let Some(scan) = self
-            .transfer
-            .as_ref()
-            .and_then(|session| session.scan.as_ref())
-        else {
+        let Some(scan) = self.transfer().and_then(|session| session.scan.as_ref()) else {
             return Poll::Ready(None);
         };
         let Some(scanned) = scan.result.borrow_mut().take() else {
             return Poll::Pending;
         };
         let reused = self.accept_reuse_scan(scanned);
-        let Some(session) = self.transfer.as_mut() else {
+        let Some(session) = self.transfer_mut() else {
             return Poll::Ready(None);
         };
         let segments = ReusedSegments::new(&session.artifacts, &reused);
@@ -3325,10 +3381,9 @@ where
             session.artifacts[index as usize] = TransferArtifact::Staged(meta);
         }
         let seed = self
-            .transfer
-            .as_ref()
+            .transfer()
             .and_then(|session| self.plan_prefix_seed(&session.artifacts));
-        if let Some(session) = self.transfer.as_mut() {
+        if let Some(session) = self.transfer_mut() {
             session.seed = seed;
         }
         // The I/O turn that reports a landed scan leaves the ready queue ahead
@@ -3355,6 +3410,7 @@ where
             .map(|(entry, index)| (index, *entry, self.held_segment(entry)))
             .collect();
         Some(ReuseScanJob {
+            placed: self.places_batches(),
             partition_dir,
             namespace_raw: self.consensus().group(),
             memoized,
@@ -3457,7 +3513,7 @@ where
     /// pump. A failed read leaves the artifact to a whole pull.
     pub fn drive_prefix_seed(&mut self) -> bool {
         let namespace_raw = self.namespace().inner();
-        let Some(session) = self.transfer.as_mut() else {
+        let Some(session) = self.transfer_mut() else {
             return false;
         };
         let next = session
@@ -3483,11 +3539,12 @@ where
                 else {
                     return false;
                 };
+                let placed = self.places_batches();
                 let read =
                     self.spawn_local_work(prefix_read_stopped, move |cancelled| async move {
-                        read_segment_prefix(&log_path, entry, len, &cancelled).await
+                        read_segment_prefix(&log_path, entry, len, placed, &cancelled).await
                     });
-                if let Some(session) = self.transfer.as_mut() {
+                if let Some(session) = self.transfer_mut() {
                     session.seed = Some(PrefixSeed::Reading { artifact, read });
                 }
                 true
@@ -4191,7 +4248,7 @@ where
                     current: self
                         .retry_checkpoint_path(install.commit_op)
                         .map_err(|_| iggy_common::IggyError::CannotDeleteFile)?,
-                    keep_current: install.commit_op > 0,
+                    keep_current: true,
                 },
                 InstallFilePhase::ReclaimRetry,
             ),
@@ -4456,9 +4513,9 @@ where
 
     /// Clear the offset table for the installed one, which keeps `emptied_at`.
     fn clear_install_offsets(&mut self, emptied_at: u64) {
-        self.consumer_offsets.pin().clear();
-        self.consumer_group_offsets.pin().clear();
-        self.last_polled_offsets.pin().clear();
+        self.consumer_offsets.get_mut().clear();
+        self.consumer_group_offsets.get_mut().clear();
+        self.last_polled_offsets.get_mut().clear();
         self.durable_consumer_offsets.clear();
         self.durable_consumer_offsets.set_emptied_at(emptied_at);
         self.explicit_offset_stores
@@ -4482,11 +4539,13 @@ where
         let entry = ConsumerOffset::new(kind, id, value, path);
         match kind {
             ConsumerKind::Consumer => {
-                self.consumer_offsets.pin().insert(id as usize, entry);
+                self.consumer_offsets
+                    .borrow_mut()
+                    .insert(id as usize, entry);
             }
             ConsumerKind::ConsumerGroup => {
                 self.consumer_group_offsets
-                    .pin()
+                    .borrow_mut()
                     .insert(ConsumerGroupId(id as usize), entry);
             }
             // Recorded below: the durable table is the only store of an external offset.
@@ -4518,6 +4577,8 @@ where
                 operation: None,
             });
         }
+        // A transfer can carry a newer peer manifest than the log follows.
+        self.follow_committed_peer_manifest();
         self.restore_producers(std::mem::take(&mut install.offsets_wire.producers));
         self.required_metadata_frontier = self
             .required_metadata_frontier
@@ -4628,6 +4689,7 @@ where
             self.log.journal().inner.restore_checkpoint_prepare(
                 install.commit_op,
                 Owned::<4096>::copy_from_slice(&install.offsets_wire.checkpoint_prepare).into(),
+                None,
             );
             self.consensus().note_journal_mutation();
         }
@@ -4638,7 +4700,7 @@ where
         self.pending_owner_install.set(None);
         self.owner_install_barrier = 0;
         self.observed_view = self.consensus().view();
-        self.repair = None;
+        self.set_repair(None);
         self.forget_recovered_commit();
         self.transfer_offer_cache.borrow_mut().take();
     }
@@ -4666,7 +4728,7 @@ where
         self.stats.zero_out_all();
         self.stats.increment_segments_count(1);
         self.stats.set_current_offset(end);
-        self.repair = None;
+        self.set_repair(None);
         self.transfer_offer_cache.borrow_mut().take();
     }
 
@@ -4762,7 +4824,7 @@ where
                         )))
                 || (header.operation == Operation::SendMessages
                     && header.checksum_body == 0
-                    && decode_prepare_slice(prepare.as_slice()).is_err())
+                    && decode_prepare_batch(prepare.as_slice()).is_err())
             {
                 return Err(ConsumerOffsetsWireError::InvalidPrepareChecksum.into());
             }
@@ -5101,7 +5163,7 @@ pub(crate) const OFFER_HASH_CHUNK_LEN: usize = 4 << 20;
 ///
 /// A BYTE budget standing in for a time bound, so the margin is storage-class
 /// specific: 256 MiB is roughly a quarter second on commodity `NVMe` against
-/// the shipped 5 s `heartbeat_timeout`, but about 2 s on a throttled cloud
+/// the shipped 5 s `commit_busy_heartbeat_timeout`, but about 2 s on a throttled cloud
 /// volume at 125 MB/s baseline, which is most of that window. Sized for the
 /// slower case still leaving room, and large enough that ordinary retention
 /// finishes in one round. An elapsed-time clamp would bound it properly on
@@ -5220,6 +5282,7 @@ pub(crate) async fn read_segment_prefix(
     log_path: &str,
     entry: consensus::StateArtifact,
     len: u64,
+    placed: bool,
     cancelled: &Cell<bool>,
 ) -> std::io::Result<(Vec<u8>, SeededPrefix)> {
     let capacity = usize::try_from(entry.len).map_err(std::io::Error::other)?;
@@ -5240,7 +5303,7 @@ pub(crate) async fn read_segment_prefix(
         hash_segment_range(log_path, position, end, &mut hasher, Some(&mut bytes)).await?;
         position = end;
     }
-    let mut walk = SegmentWalk::new(entry.frontier);
+    let mut walk = SegmentWalk::new(entry.frontier, placed);
     let walk = walk.advance(&bytes).await.is_ok().then_some(walk);
     Ok((bytes, SeededPrefix { len, hasher, walk }))
 }
@@ -5286,6 +5349,8 @@ const fn segment_spill_stopped() -> Result<SpilledSegment, SpillError> {
 }
 
 struct SegmentSpillJob {
+    /// Whether the segment holds placed batches.
+    placed: bool,
     partition_dir: String,
     entry: consensus::StateArtifact,
     bytes: Vec<u8>,
@@ -5298,6 +5363,7 @@ impl SegmentSpillJob {
             return Err(SpillError::Cancelled);
         }
         let Self {
+            placed,
             partition_dir,
             entry,
             bytes,
@@ -5328,7 +5394,7 @@ impl SegmentSpillJob {
                 frontier: entry.frontier,
             });
         }
-        let mut walk = walk.unwrap_or_else(|| SegmentWalk::new(entry.frontier));
+        let mut walk = walk.unwrap_or_else(|| SegmentWalk::new(entry.frontier, placed));
         walk.advance(&bytes).await.map_err(SpillError::Walk)?;
         let (stats, index_bytes) = walk.finish().map_err(SpillError::Walk)?;
         if cancelled.get() {
@@ -5382,6 +5448,8 @@ impl SegmentSpillJob {
 /// A reuse scan that a detached task runs. It holds no partition state, so
 /// the pump runs while it does.
 struct ReuseScanJob {
+    /// Whether the segments hold placed batches.
+    placed: bool,
     partition_dir: String,
     namespace_raw: u64,
     memoized: BTreeMap<u64, StagedSegmentMeta>,
@@ -5457,7 +5525,7 @@ impl ReuseScanJob {
     ) -> Option<StagedSegmentMeta> {
         if let Some(held) = held
             && let Some(meta) = held
-                .link(&self.partition_dir, entry, self.namespace_raw)
+                .link(&self.partition_dir, entry, self.namespace_raw, self.placed)
                 .await
         {
             return Some(meta);
@@ -5475,7 +5543,7 @@ impl ReuseScanJob {
         if !verify_state_artifact_yielding(entry, &bytes).await {
             return None;
         }
-        adopt_staged_segment(&self.partition_dir, entry, &bytes)
+        adopt_staged_segment(&self.partition_dir, entry, &bytes, self.placed)
             .await
             .ok()
     }
@@ -5499,6 +5567,7 @@ impl HeldSegment {
         partition_dir: &str,
         entry: &consensus::StateArtifact,
         namespace_raw: u64,
+        placed: bool,
     ) -> Option<StagedSegmentMeta> {
         let log_metadata = compio::fs::metadata(&self.log_path).await.ok()?;
         // The install opens the log at exactly the manifest length.
@@ -5521,7 +5590,7 @@ impl HeldSegment {
             );
             return None;
         }
-        let mut meta = adopt_staged_segment(partition_dir, entry, &bytes)
+        let mut meta = adopt_staged_segment(partition_dir, entry, &bytes, placed)
             .await
             .ok()?;
         meta.linked = true;
@@ -5544,8 +5613,9 @@ async fn adopt_staged_segment(
     partition_dir: &str,
     entry: &consensus::StateArtifact,
     bytes: &[u8],
+    placed: bool,
 ) -> Result<StagedSegmentMeta, SpillError> {
-    let (stats, index_bytes) = walk_segment_payload(entry.frontier, bytes)
+    let (stats, index_bytes) = walk_segment_payload(entry.frontier, bytes, placed)
         .await
         .map_err(SpillError::Walk)?;
     let (log_staging, index_staging) = staging_paths(partition_dir, entry.frontier);
@@ -5810,7 +5880,14 @@ where
     /// # Errors
     /// Returns an error for missing, corrupt, or incompatible retry protection.
     pub async fn restore_retry_checkpoint(&mut self, through_op: u64) -> std::io::Result<()> {
-        if through_op == 0 {
+        // Only an install at op 0 writes a checkpoint there, as a recovery
+        // from the object store does: no op carries what it installed.
+        let installed_at_zero = through_op == 0
+            && match self.retry_checkpoint_path(0) {
+                Ok(path) => compio::fs::metadata(&path).await.is_ok(),
+                Err(_) => false,
+            };
+        if through_op == 0 && !installed_at_zero {
             self.state_machines.reset();
             if self.partition_dir.is_some()
                 && let Err(error) = self.reclaim_retry_checkpoints(through_op).await
@@ -5874,6 +5951,7 @@ where
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         self.restore_machines(wire.machines.as_ref(), through_op)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.follow_committed_peer_manifest();
         *self.dedup_mut() = table;
         self.restore_producers(wire.producers);
         self.history_transition = wire.history_transition;
@@ -5898,8 +5976,7 @@ where
 
     // Call only after publication or validated recovery, under the partition owner.
     pub(crate) async fn reclaim_retry_checkpoints(&self, through_op: u64) -> std::io::Result<()> {
-        reclaim_retry_checkpoint_files(&self.retry_checkpoint_path(through_op)?, through_op > 0)
-            .await
+        reclaim_retry_checkpoint_files(&self.retry_checkpoint_path(through_op)?, true).await
     }
 }
 

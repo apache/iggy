@@ -21,8 +21,10 @@ also show OpenMessaging Benchmark (OMB) results of Iggy, in a separate part of t
 - Methodology (`/methodology`) explains how to run `iggy-bench`, and what every number, threshold and badge
   means.
 
-A run's charts can also be embedded in another page as an iframe or a PNG. On a phone, tables turn into
-labeled blocks.
+A run's charts can also be embedded in another page as an iframe or a PNG. On a run page, the embed button in
+the corner of a chart opens a dialog with that chart. The Embed card in the Artifacts section opens the same
+dialog. In the dialog, you pick the chart, the format, the theme and the size. The dialog shows a preview from
+the same link and gives the code to copy. On a phone, tables turn into labeled blocks.
 
 ![Dashboard](../../../assets/benchmarking_platform.png)
 
@@ -94,6 +96,27 @@ The server provides the following HTTP endpoints:
 
 ### Embedded Charts
 
+The subtext of an embedded chart gives each actor group's throughput as the dashboard pages do: the user data
+of the group divided by the run time of its slowest actor. `Avg Per Producer` (or consumer) is that rate divided
+by the number of actors in the group. The `iggy-bench` HTML charts and console output still add up the actors'
+own rates.
+
+The server keeps every embed page and PNG that it builds in `embed/` under `--cache-dir`. If a file is not in
+the cache yet, a request for it waits for a build. Requests that miss the same file take turns, so one build
+serves them all. Requests for other files do not wait. If a request ends early, its build continues, and the next
+request gets the stored file. The cache holds 10 GiB by default, set with `--embed-cache-max-gib`. A new file can
+take the cache past the limit. Then the server deletes the files that readers used least recently, until the
+cache is 10% below the limit. At start, the server applies the same rule to the files that it finds. The disk
+can also fill before the cache reaches its limit. Then the server deletes at least a tenth of the cache, least
+recently used first, and writes the new file once more.
+
+The name of each file starts with a stamp of the server binary: the first 16 hexadecimal digits of its BLAKE3
+hash. After an upgrade, the server builds every embed file again. It does not delete the files of the old binary
+at once. Nothing reads them again, so they are the least recently used files, and the cache deletes them first.
+If the server cannot read its own binary, it logs a warning and uses a stamp of that start. Then a restart builds
+every file again. The name of an `iggy-bench` file also holds the stamp of the run's `report.json`. When the
+report changes, the server builds new files for the run after it loads the runs again.
+
 - `GET /embed/{uuid}?type={type}&theme={theme}&action={action}`
   - Get a page with the interactive chart of a run, for an iframe
   - Parameters:
@@ -101,7 +124,7 @@ The server provides the following HTTP endpoints:
     - `type`: `latency` (default), `throughput`, or `distribution`
     - `theme`: `dark` (default) or `light`
     - `action`: optional, `download` gives a page that saves the chart as a PNG file in the browser
-  - Response: HTML page
+  - Response: HTML page, from the cache after the first request. A theme other than `light` gives the dark page
 
 - `GET /embed/{uuid}/chart.png?type={type}&theme={theme}&width={width}&height={height}&legend={legend}`
   - Get the chart of a run as an image, rendered on the server
@@ -109,10 +132,12 @@ The server provides the following HTTP endpoints:
     - `uuid`: UUID of the benchmark
     - `type`: `latency` (default), `throughput`, or `distribution`
     - `theme`: `dark` (default), `light`, `dark_nobg`, or `light_nobg` (transparent background)
-    - `width`, `height`: image size in pixels, from 1 to 4096 (default 1600 x 1200)
+    - `width`, `height`: image size in pixels. The size must be 1600 x 1200 (the default), 1200 x 800,
+      1920 x 1080 or 1200 x 630. Any other size gets 400, so the cache holds a fixed number of files per
+      chart. Give both `width` and `height`, or neither
     - `legend`: `true` (default) or `false`
-  - Response: PNG image. At the default size it is built on the first request and then served from
-    `--cache-dir`. Other sizes are built on every request.
+  - Response: PNG image, from the cache after the first request. To show it smaller on a page, set the
+    `width` of the `img` tag
 
 ### OMB Runs
 
@@ -147,6 +172,83 @@ hexadecimal characters. A UUID of an `iggy-bench` run is not an OMB run id, so i
     of `.json`, so the downloads of several runs do not overwrite each other. 404 for a run without a sidecar,
     and for a sidecar that does not parse or has a key that looks like a secret.
 
+### OMB Embedded Charts
+
+These endpoints draw the charts of one OMB run in the units of OMB: MiB/s, 10 s windows and the latency of each
+message. No chart shows an `iggy-bench` number. The first subtext line names the machines from the sidecar, the
+OMB driver and the Iggy version. The driver name, for example `Iggy-persisted`, is the only label of the driver
+configuration.
+
+- `GET /embed/omb/{id}?type={type}&theme={theme}&action={action}`
+  - Get a page with the interactive chart of an OMB run, for an iframe
+  - Parameters:
+    - `id`: OMB run id
+    - `type`: an OMB chart type from the list below. The default is `latency`
+    - `theme`: `dark` (default) or `light`. Any other value gets 400, `dark_nobg` and `light_nobg` too
+    - `action`: optional, `download` gives a page that saves the chart as a PNG file in the browser. Any other
+      value gets 400
+  - Response: HTML page, from the cache after the first request
+
+- `GET /embed/omb/{id}/chart.png?type={type}&theme={theme}&width={width}&height={height}&legend={legend}`
+  - Get the chart of an OMB run as an image, rendered on the server
+  - Parameters:
+    - `id`: OMB run id
+    - `type`: an OMB chart type from the list below. The default is `latency`
+    - `theme`, `width`, `height`, `legend`: as for `/embed/{uuid}/chart.png`
+  - Response: PNG image, from the cache after the first request, as for the `iggy-bench` charts. If the
+    sidecar changes the machines or the Iggy version, the next request builds the page or the PNG again
+
+The OMB chart types:
+
+- `latency`: the publish latency P50, P99 and P99.9 of each window, in ms
+- `end_to_end_latency`: the end-to-end latency P50, P99 and P99.9 of each window, in ms. A run without
+  consumers did not measure it, so it gets 404
+- `throughput`: the publish and consume throughput of each window, in MiB/s. A run without consumers has no
+  consume line
+- `ladder`: the publish and end-to-end latency of the whole run at P50, P75, P95, P99, P99.9, P99.99 and the
+  maximum, on a log axis
+- `quantiles`: the publish and end-to-end latency at every percentile of the merged histograms, on a log axis,
+  against a percentile axis that counts nines
+
+An OMB run id is a hash of the result file. If the file changes, the run gets a new id, and the URLs with the
+old id get 404. The embed pages of both frameworks send no `X-Frame-Options` header and no `frame-ancestors`
+policy, so other sites can frame them.
+
+The `iggy-bench` PNG files send `Cache-Control: public, max-age=86400`, so a browser or a proxy can keep them
+for a day. A report seldom changes after upload. If it changes, a browser or a proxy can show the old PNG for up
+to a day. The `iggy-bench` embed pages send `Cache-Control: public, max-age=3600`. Each page loads an ECharts
+file whose name holds the ECharts version, and an upgrade of ECharts removes the old file.
+
+The OMB embed pages and PNG files send `Cache-Control: public, max-age=3600`, because the setup sidecar of a run
+can change. A sidecar change reaches a cached OMB page or PNG within that hour. Error answers send no
+`Cache-Control`.
+
+### Pages and Crawlers
+
+The server answers each page path of the frontend router with `frontend/dist/index.html`. The status tells
+crawlers whether the page exists:
+
+- 200: `/`, `/explore`, `/methodology`, `/omb`, the compare pages, and the page of each run that the server loaded
+- 301: `/benchmarks/{uuid}` to `/runs/{uuid}`, and `/compare/{left}/{right}` to `/compare?runs={left},{right}`.
+  A run id in uppercase or without hyphens moves to its lowercase form. A page path with a trailing slash moves to
+  the path without it
+- 404: every other path, an unknown run, and a run id that does not parse. The body is the app, which shows its
+  not-found page
+
+The page answers send `Cache-Control: no-cache`, because each frontend build changes the script names in
+`index.html`. The compare pages send `X-Robots-Tag: noindex, follow`, because their query picks the runs. Every
+answer under `/api` and `/embed` sends `X-Robots-Tag: noindex`.
+
+The page paths are in `shared/src/pages.rs`. When you add a page to the frontend router, add its path there and
+its route in `server/src/handlers/pages.rs`. A test on each side fails until the three match.
+
+- `GET /robots.txt`
+  - Allows every crawler. With `--public-url`, the file also names the sitemap
+- `GET /sitemap.xml`
+  - Lists `/`, `/explore`, `/methodology`, every run page, `/omb` and every OMB run page, with absolute links.
+    The `lastmod` of a run page is the time of the run
+  - Needs `--public-url`. Without it, the answer is 404
+
 `/health` and the `/api` endpoints return JSON, with three exceptions. `/api/artifacts/{uuid}` returns a ZIP file,
 and the two OMB downloads return the original files. The embed endpoints return HTML or PNG. All of them use
 standard HTTP status codes:
@@ -156,8 +258,8 @@ standard HTTP status codes:
 - 404: Resource not found
 - 500: Server error
 
-An unknown `/api` path returns 404 with a JSON error. Every other path serves the frontend from `frontend/dist`.
-A page path with no file there gets `index.html` with 200, so the frontend's page links work.
+An unknown `/api` path returns 404 with a JSON error. Every other path serves a file from `frontend/dist`, or a
+page as [Pages and Crawlers](#pages-and-crawlers) describes.
 
 ## Prerequisites
 
@@ -323,14 +425,16 @@ Using a named volume:
 
 #### Environment Variables
 
-| Variable          | Default                     | Description                                                         |
-| ----------------- | --------------------------- | ------------------------------------------------------------------- |
-| `HOST`            | `0.0.0.0`                   | Server host address                                                 |
-| `PORT`            | `80`                        | Server port                                                         |
-| `RESULTS_DIR`     | `/data/performance_results` | Directory for performance results                                   |
-| `CONFIG`          | `/app/dashboard.toml`       | Dashboard configuration file. The image holds the official one      |
-| `CACHE_DIR`       | not set                     | Directory for cached PNG files and artifact zips. See `--cache-dir` |
-| `OMB_RESULTS_DIR` | not set                     | Directory for OMB results. See `--omb-results-dir`                  |
+| Variable              | Default                     | Description                                                      |
+| --------------------- | --------------------------- | ---------------------------------------------------------------- |
+| `HOST`                | `0.0.0.0`                   | Server host address                                              |
+| `PORT`                | `80`                        | Server port                                                      |
+| `RESULTS_DIR`         | `/data/performance_results` | Directory for performance results                                |
+| `CONFIG`              | `/app/dashboard.toml`       | Dashboard configuration file. The image holds the official one   |
+| `CACHE_DIR`           | not set                     | Directory for cached embeds and artifact zips. See `--cache-dir` |
+| `EMBED_CACHE_MAX_GIB` | not set                     | Size limit of the embed cache. See `--embed-cache-max-gib`       |
+| `OMB_RESULTS_DIR`     | not set                     | Directory for OMB results. See `--omb-results-dir`               |
+| `PUBLIC_URL`          | not set                     | Address at which readers open the dashboard. See `--public-url`  |
 
 #### Volume Permissions
 
@@ -355,23 +459,30 @@ Options:
       --results-dir <RESULTS_DIR>    Directory containing performance results [default: ./performance_results]
       --log-level <LOG_LEVEL>        Log level (trace, debug, info, warn, error) [default: info]
       --cors-origins <CORS_ORIGINS>  Allowed CORS origins (comma-separated) [default: *]
-      --cache-dir <CACHE_DIR>        Directory for cached PNG files and artifact zips [default: /tmp/iggy-bench-dashboard]
+      --cache-dir <CACHE_DIR>        Directory for cached PNG files, embed pages and artifact zips [default: /tmp/iggy-bench-dashboard]
+      --embed-cache-max-gib <GIB>    Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the files that readers used least recently [default: 10]
       --config <CONFIG>              Dashboard configuration file: official suites, headline workloads, and thresholds [default: dashboard.toml]
       --omb-results-dir <DIR>        Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
+      --public-url <URL>             Address at which readers open the dashboard, for example `https://benchmarks.iggy.apache.org`. robots.txt and sitemap.xml use it for absolute links. Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
   -h, --help                         Print help
   -V, --version                      Print version
 ```
 
 The server only reads `--results-dir` and `--omb-results-dir`. It writes the files it generates to
-`--cache-dir`: chart PNG files of the default size for `/embed/{uuid}/chart.png` under `embed/` and artifact
-zips for `/api/artifacts/{uuid}` under `artifacts/`. Each file is built on the first request and reused later. When a file in a run directory
-changes or is removed, the server rebuilds that run's artifact zip. To rebuild the PNG files, delete the
-directory. The default is `iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If
+`--cache-dir`: the embed pages and PNG files of `/embed/...` under `embed/`, up to `--embed-cache-max-gib`, and
+artifact zips for `/api/artifacts/{uuid}` under `artifacts/`. Each file is built on the first request and reused
+later. When a file in a run directory changes or is removed, the server rebuilds that run's artifact zip. After
+an upgrade, or after a change to a run's `report.json`, the server builds new embed files. To delete the old
+embed files at once, delete `embed/`. The default is `iggy-bench-dashboard` in the system temp directory (`$TMPDIR`, usually `/tmp`). If
 `--cache-dir` is inside `--results-dir` or `--omb-results-dir`, the server does not start.
 
 The server reads `--config` at start. The default is `dashboard.toml` in the working directory, and this
 directory holds the file for the official AWS suites. If a run's `suite` label is in `[[suites]]`, the run is
 official. If the file is missing or invalid, the server does not start.
+
+On a public host, set `--public-url` to the address at which readers open the dashboard, without a path. The
+sitemap and `robots.txt` need absolute links, and the server does not build them from the `Host` header of a
+request. If the argument is not set, the server logs a warning at start.
 
 ### Environment Variables for Development
 

@@ -18,6 +18,7 @@
 //! OpenMessaging Benchmark (OMB) runs from `--omb-results-dir`. They have their own cache, watcher
 //! and endpoints, so they never mix with the iggy-bench runs.
 
+pub mod embed;
 mod loader;
 #[cfg(test)]
 pub(crate) mod test_fixtures;
@@ -108,6 +109,10 @@ impl OmbCache {
             summary: runs.list.runs[*position].clone(),
             files: files.clone(),
         })
+    }
+
+    pub fn has_run(&self, id: OmbRunId) -> bool {
+        self.runs().files.contains_key(&id)
     }
 
     pub fn files(&self, id: OmbRunId) -> Option<OmbRunFiles> {

@@ -126,6 +126,7 @@ where
                 .map_err(|_| IggyError::InvalidCommand)?;
             // A producer counts its sequence per partition, so its batch must
             // name one. Refused before `Balanced` moves its cursor.
+            refuse_shadow_stream(shard, &header.stream_id)?;
             if !matches!(header.partitioning, WirePartitioning::PartitionId(_))
                 && body
                     .get(4 + metadata_length + BATCH_PRODUCER_OFFSET)
@@ -162,6 +163,7 @@ where
         Operation::DeleteSegments => {
             let request =
                 DeleteSegmentsRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            refuse_shadow_stream(shard, &request.stream_id)?;
             resolve_partition_namespace(
                 shard,
                 &request.stream_id,
@@ -172,6 +174,31 @@ where
         _ => return Err(IggyError::FeatureUnavailable),
     };
     Ok(namespace.inner())
+}
+
+/// Refuse a client write to a shadow stream, whose partitions read another
+/// cluster's log and take no messages or trims of their own.
+pub fn refuse_shadow_stream<B, MJ, S, SB>(
+    shard: &Rc<ShellShard<B, MJ, S, SB>>,
+    stream_id: &WireIdentifier,
+) -> Result<(), IggyError>
+where
+    B: ShellBus,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    if shard
+        .plane
+        .metadata()
+        .mux_stm
+        .streams()
+        .is_shadow_stream(stream_id)
+    {
+        return Err(IggyError::ShadowStreamReadOnly);
+    }
+    Ok(())
 }
 
 /// Whether this node stores `namespace`: true for one every node stores, and
@@ -197,13 +224,28 @@ where
         .is_none_or(|members| members.is_none_or(|members| members.member(node).is_some()))
 }
 
+/// What [`partition_primary`] asks of the shard that owns a partition which
+/// cannot serve yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryLookup {
+    /// The owner holds the lookup while the partition starts, also while an
+    /// older incarnation is in its place, for [`shard::PARTITION_BUILD_HOLD`]
+    /// at most.
+    Hold,
+    /// The owner answers at once with what the partition says now. A primary
+    /// on this node that cannot serve yet is no primary.
+    AnswerNow,
+}
+
 /// The primary of `namespace`'s group. A node storing the partition answers
-/// from its own replica; any other node answers with the view the group's
-/// primary last reported, or the committed initial view before any report.
+/// from its own replica, as `lookup` says. Any other node answers with the
+/// view the group's primary last reported, or the committed initial view
+/// before any report.
 #[allow(clippy::future_not_send)]
 pub async fn partition_primary<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     namespace: IggyNamespace,
+    lookup: PrimaryLookup,
 ) -> Option<PartitionReadReply>
 where
     B: ShellBus,
@@ -223,9 +265,11 @@ where
         members.is_none_or(|members| members.member(topology.self_replica_id).is_some())
     });
     if stored {
-        return shard
-            .partition_read(namespace, PartitionRead::Primary)
-            .await;
+        let read = match lookup {
+            PrimaryLookup::Hold => PartitionRead::Primary,
+            PrimaryLookup::AnswerNow => PartitionRead::PrimaryNow,
+        };
+        return shard.partition_read(namespace, read).await;
     }
     let (members, created_view, reported) = route?;
     // A stale view costs one NotPrimary hop; no view leaves the route empty.
@@ -490,7 +534,7 @@ mod tests {
             &[1, 2],
         );
 
-        let route = partition_primary(&shard, namespace).await;
+        let route = partition_primary(&shard, namespace, PrimaryLookup::Hold).await;
 
         assert!(
             matches!(

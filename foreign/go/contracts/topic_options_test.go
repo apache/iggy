@@ -104,6 +104,34 @@ func TestTopicOptions_ConstructorsEncodeKeyAndValue(t *testing.T) {
 			wantKind:  Uint32,
 			wantValue: []byte{3, 0, 0, 0},
 		},
+		{
+			name:      "normal topic type",
+			entry:     TopicTypeOption(TopicTypeNormal),
+			wantKey:   "topic_type",
+			wantKind:  String,
+			wantValue: []byte("normal"),
+		},
+		{
+			name:      "geo topic type",
+			entry:     TopicTypeOption(TopicTypeGeo),
+			wantKey:   "topic_type",
+			wantKind:  String,
+			wantValue: []byte("geo"),
+		},
+		{
+			name:      "geo mode",
+			entry:     GeoModeOption(GeoModeGeo),
+			wantKey:   "geo_mode",
+			wantKind:  String,
+			wantValue: []byte("geo"),
+		},
+		{
+			name:      "geo tiered mode",
+			entry:     GeoModeOption(GeoModeGeoTiered),
+			wantKey:   "geo_mode",
+			wantKind:  String,
+			wantValue: []byte("geo_tiered"),
+		},
 	}
 
 	for _, test := range tests {
@@ -137,6 +165,8 @@ func TestTopicOptions_ConstructorEntriesSurviveTheHeaderCodec(t *testing.T) {
 		PreallocateSegmentsOption(false),
 		ReplicationFactorOption(3),
 		TieredStorageOption(false),
+		TopicTypeOption(TopicTypeGeo),
+		GeoModeOption(GeoModeGeoTiered),
 	}
 
 	decoded, err := DeserializeHeaders(GetHeadersBytes(entries))

@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::embed_cache::DEFAULT_MAX_GIB;
 use crate::error::IggyBenchDashboardServerError;
+use crate::public_url::PublicUrl;
 use clap::{CommandFactory, Parser, error::ErrorKind};
 use serde::Deserialize;
 use std::fs;
@@ -48,9 +50,19 @@ pub struct IggyBenchDashboardServerArgs {
     #[arg(long, default_value = "*")]
     pub cors_origins: String,
 
-    /// Directory for cached PNG files and artifact zips
+    /// Directory for cached PNG files, embed pages and artifact zips
     #[arg(long, default_value_os_t = default_cache_dir())]
     pub cache_dir: PathBuf,
+
+    /// Size limit of the cached PNG files and embed pages, in GiB. Past it, the server deletes the
+    /// files that readers used least recently
+    #[arg(
+        long,
+        value_name = "GIB",
+        default_value_t = DEFAULT_MAX_GIB,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub embed_cache_max_gib: u64,
 
     /// Dashboard configuration file: official suites, headline workloads, and thresholds
     #[arg(long, default_value = "dashboard.toml")]
@@ -59,6 +71,12 @@ pub struct IggyBenchDashboardServerArgs {
     /// Directory containing OpenMessaging Benchmark (OMB) results, one run per subdirectory
     #[arg(long, value_name = "DIR")]
     pub omb_results_dir: Option<PathBuf>,
+
+    /// Address at which readers open the dashboard, for example
+    /// `https://benchmarks.iggy.apache.org`. robots.txt and sitemap.xml use it for absolute links.
+    /// Without it, robots.txt names no sitemap, and /sitemap.xml answers 404
+    #[arg(long, value_name = "URL")]
+    pub public_url: Option<PublicUrl>,
 }
 
 /// An `--omb-results-dir` that the server can't use.

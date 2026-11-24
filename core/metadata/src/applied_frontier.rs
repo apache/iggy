@@ -17,12 +17,11 @@
 
 //! The node-wide applied metadata frontier and the wait a read parks on.
 
-use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::PoisonError;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -56,40 +55,11 @@ pub struct AppliedFrontier {
     recovered_revision: AtomicU64,
     waiters: Mutex<Waiters>,
     read_budget: Duration,
+    partition_request_budget: Duration,
     partition_freshness: Option<PartitionFreshness>,
-    recovering_shards: AtomicUsize,
     tiered_storage_ready: AtomicBool,
     store_identity_verified: AtomicBool,
-}
-
-/// A shard's recovery state, shared with the node's primary placement probes.
-/// Dropping a shard releases its registration even during interrupted shutdown.
-pub struct PartitionRecovery {
-    frontier: Arc<AppliedFrontier>,
-    active: Cell<bool>,
-}
-
-impl PartitionRecovery {
-    pub fn set_active(&self, active: bool) {
-        if self.active.replace(active) == active {
-            return;
-        }
-        if active {
-            self.frontier
-                .recovering_shards
-                .fetch_add(1, Ordering::Release);
-        } else {
-            self.frontier
-                .recovering_shards
-                .fetch_sub(1, Ordering::Release);
-        }
-    }
-}
-
-impl Drop for PartitionRecovery {
-    fn drop(&mut self) {
-        self.set_active(false);
-    }
+    store_claimed_by_another: AtomicBool,
 }
 
 /// Volatile quorum evidence. Recovery restores metadata, never freshness.
@@ -130,9 +100,14 @@ impl AppliedFrontier {
     /// commit broadcasts at the built-in `COMMIT_MESSAGE_TICKS` interval.
     ///
     /// The server always overrides this from `[cluster]
-    /// commit_broadcast_interval`, and a test asserts the two agree at the
+    /// commit_busy_heartbeat_interval`, and a test asserts the two agree at the
     /// config default; this is what the simulator and unit fixtures get.
     pub const DEFAULT_READ_BUDGET: Duration = Duration::from_millis(3_000);
+
+    /// The budget of a partition request ahead of this frontier when nothing
+    /// sizes it from config: two commit broadcasts at the built-in
+    /// `COMMIT_MESSAGE_TICKS` interval.
+    pub const DEFAULT_PARTITION_REQUEST_BUDGET: Duration = Duration::from_millis(1_000);
 
     /// A frontier at zero whose held reads get `read_budget` before they fail
     /// retryable.
@@ -146,30 +121,17 @@ impl AppliedFrontier {
                 entries: Vec::new(),
             }),
             read_budget,
+            partition_request_budget: Self::DEFAULT_PARTITION_REQUEST_BUDGET,
             partition_freshness: None,
-            recovering_shards: AtomicUsize::new(0),
             tiered_storage_ready: AtomicBool::new(false),
             store_identity_verified: AtomicBool::new(false),
+            store_claimed_by_another: AtomicBool::new(false),
         }
-    }
-
-    #[must_use]
-    pub fn track_partition_recovery(self: &Arc<Self>) -> PartitionRecovery {
-        PartitionRecovery {
-            frontier: Arc::clone(self),
-            active: Cell::new(false),
-        }
-    }
-
-    #[must_use]
-    pub fn has_partition_recovery(&self) -> bool {
-        self.recovering_shards.load(Ordering::Acquire) != 0
     }
 
     /// Record whether the partitions of this node can read their remote
-    /// segments back. False until set. No boot path hands a partition those
-    /// reads yet (`IggyPartition::set_remote_segments`), so no boot path sets
-    /// this.
+    /// segments back. False until set, which the server does once it gave
+    /// them a store to read from.
     pub fn set_tiered_storage_ready(&self, ready: bool) {
         self.tiered_storage_ready.store(ready, Ordering::Release);
     }
@@ -201,6 +163,21 @@ impl AppliedFrontier {
         self.store_identity_verified.load(Ordering::Acquire)
     }
 
+    /// Record whether the last check that read this node's store identity
+    /// object found it naming another cluster, or holding bytes no cluster
+    /// wrote. False until the server's identity check sets it.
+    pub fn set_store_claimed_by_another(&self, claimed: bool) {
+        self.store_claimed_by_another
+            .store(claimed, Ordering::Release);
+    }
+
+    /// Whether this node's store names another cluster, as
+    /// [`Self::set_store_claimed_by_another`] last recorded it.
+    #[must_use]
+    pub fn store_claimed_by_another(&self) -> bool {
+        self.store_claimed_by_another.load(Ordering::Acquire)
+    }
+
     /// Arm admission for a multi-node process. `epoch` must use the bus clock;
     /// a newly constructed frontier has no credit, including after recovery.
     #[must_use]
@@ -214,6 +191,14 @@ impl AppliedFrontier {
             window: heartbeat_timeout.saturating_add(Self::PARTITION_FRESHNESS_MARGIN),
             until_ns: AtomicU64::new(0),
         });
+        self
+    }
+
+    /// Size the wait of a partition request ahead of this frontier from
+    /// config, as the server sizes `read_budget`.
+    #[must_use]
+    pub const fn with_partition_request_budget(mut self, budget: Duration) -> Self {
+        self.partition_request_budget = budget;
         self
     }
 
@@ -253,6 +238,14 @@ impl AppliedFrontier {
     #[must_use]
     pub const fn read_budget(&self) -> Duration {
         self.read_budget
+    }
+
+    /// How long a partition request ahead of this frontier may wait for it.
+    /// Shorter than [`Self::read_budget`], because the wait holds back the
+    /// requests that its connection sent after it.
+    #[must_use]
+    pub const fn partition_request_budget(&self) -> Duration {
+        self.partition_request_budget
     }
 
     /// Highest metadata op this NODE has applied and published.
@@ -444,24 +437,6 @@ mod tests {
                 "ready {ready}, verified {verified}"
             );
         }
-    }
-
-    #[test]
-    fn given_recovering_shards_when_one_finishes_should_wait_for_the_last_registration() {
-        let frontier = Arc::new(AppliedFrontier::default());
-        let first = frontier.track_partition_recovery();
-        let second = frontier.track_partition_recovery();
-        assert!(!frontier.has_partition_recovery());
-        first.set_active(true);
-        first.set_active(true);
-        second.set_active(true);
-        first.set_active(false);
-        assert!(frontier.has_partition_recovery());
-        drop(second);
-        assert!(!frontier.has_partition_recovery());
-        first.set_active(true);
-        drop(first);
-        assert!(!frontier.has_partition_recovery());
     }
 
     #[test]

@@ -1,0 +1,229 @@
+---
+title: High-level SDK
+description: "IggyPublisher and IggyConsumer for C#, with background batching, retries and automatic offset commits."
+---
+
+The per-call [`IIggyClient`](/docs/sdk/csharp/guide) API is explicit but verbose - you manage partitioning, batching, retries, and offsets yourself. The high-level `IggyPublisher` and `IggyConsumer` wrap that surface with fluent builders that handle:
+
+- **Background sending** with buffering, batching, and retries
+- **Automatic stream/topic/consumer-group creation**
+- **Automatic offset commits** (on each poll, after each received message, or manual)
+- **Consuming a topic as an async stream** (`IAsyncEnumerable`)
+- **Typed message (de)serialization**
+- Sending and receiving over **rented, pooled buffers** to avoid separate payload copies on TCP
+
+The fragments below reuse an authenticated `client` and the imports in the first example. The named streams/topics must already exist unless the snippet creates them. Both abstractions can be built from an existing connected client via `IggyPublisherBuilder.Create(...)` / `IggyConsumerBuilder.Create(...)`, or equivalently via the `client.CreatePublisherBuilder(...)` / `client.CreateConsumerBuilder(...)` extension methods from `Apache.Iggy.Extensions`.
+
+## IggyPublisher
+
+Configure a publisher, initialize it, then send. `InitAsync` validates (and optionally creates) the stream and topic:
+
+```csharp
+using Apache.Iggy.Contracts;
+using System.Buffers;
+using System.Text;
+using System.Text.Json;
+using Apache.Iggy;
+using Apache.Iggy.Consumers;
+using Apache.Iggy.Kinds;
+using Apache.Iggy.Messages;
+using Apache.Iggy.Publishers;
+
+await using var publisher = IggyPublisherBuilder.Create(
+    client,
+    Identifier.String("my-stream"),
+    Identifier.String("my-topic")
+)
+.WithPartitioning(Partitioning.None())
+.WithBackgroundSending(enabled: true, batchSize: 100)
+.WithRetry(maxAttempts: 3)
+.Build();
+
+await publisher.InitAsync();
+
+var messages = new List<Message>
+{
+    new(Guid.NewGuid(), "Message 1"u8.ToArray()),
+    new(0, "Message 2"u8.ToArray())
+};
+
+await publisher.SendMessagesAsync(messages);
+
+// Drain the background queue, then dispose
+await publisher.WaitUntilAllSendsAsync();
+```
+
+### Publisher builder options
+
+| Method | Description |
+|--------|-------------|
+| `WithConnection(protocol, address, login, password, receiveBufferSize = null, sendBufferSize = null, reconnectionSettings = null)` | Connection settings - only used when the builder creates its own client (i.e. the `Create(streamId, topicId)` overload, without an existing client). A builder-created TCP client auto-logs in and reuses the credentials across reconnects. For HTTP, supply an explicitly authenticated client |
+| `WithConnection(protocol, address, personalAccessToken, receiveBufferSize = null, sendBufferSize = null, reconnectionSettings = null)` | Same, authenticating with a personal access token instead of a username and password |
+| `WithPartitioning(partitioning)` | Routing strategy for produced messages (default: balanced) |
+| `CreateStreamIfNotExists(name)` | Auto-create the stream on `InitAsync` if missing |
+| `CreateTopicIfNotExists(name, topicPartitionsCount = 1, compressionAlgorithm = None, messageExpiry = TimeSpan.Zero, maxTopicSize = 0)` | Auto-create the topic on `InitAsync` if missing |
+| `WithRetry(enabled = true, maxAttempts = 3, initialDelay = 100ms, maxDelay = 10s, backoffMultiplier = 2.0)` | Retry background sends with exponential backoff. Direct sends surface errors |
+| `WithBackgroundSending(enabled = true, queueCapacity = 10000, batchSize = 100, flushInterval = 100ms, disposalTimeout = 5s)` | Queue and flush sends in the background for higher throughput |
+| `WithEncryptor(encryptor)` | Client-side payload encryption. Only valid on a builder-created client - for an external client, set `IggyClientConfigurator.MessageEncryptor` instead |
+| `SubscribeOnBackgroundError(handler)` | Observe background-processing errors (only fires when background sending is enabled) |
+| `SubscribeOnMessageBatchFailed(handler)` | Fires when a batch fails after all retries are exhausted (only with background sending - direct sends throw to the caller instead) |
+| `WithLogger(loggerFactory)` | Logger factory for diagnostics |
+
+**`WithRetry` parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | `bool` | `true` | Whether retry is enabled |
+| `maxAttempts` | `int` | `3` | Total send attempts, including the first send |
+| `initialDelay` | `TimeSpan?` | `100ms` | Delay before the first retry |
+| `maxDelay` | `TimeSpan?` | `10s` | Maximum delay between retries |
+| `backoffMultiplier` | `double` | `2.0` | Exponential backoff multiplier |
+
+**`WithBackgroundSending` parameters**
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `enabled` | `bool` | `true` | Whether background sending is enabled |
+| `queueCapacity` | `int` | `10000` | Max queued send calls (one slot per `SendMessagesAsync` call, regardless of batch size) |
+| `batchSize` | `int` | `100` | Flush threshold in messages. An individual send call is not split |
+| `flushInterval` | `TimeSpan?` | `100ms` | Interval at which pending messages are flushed |
+| `disposalTimeout` | `TimeSpan?` | `5s` | How long `DisposeAsync` waits for the processor to stop. Pending sends may be discarded |
+
+A batch also flushes once its accumulated payload reaches `IggyPublisherConfig.BackgroundMaxBatchBytes` (default 256 KiB, `0` disables the byte gate) - whichever of `batchSize` or the byte limit is hit first. This knob has no builder method. Set it on the config directly if needed. Await `WaitUntilAllSendsAsync` before disposal to finish queued sends. Disposal alone can discard them. Background send calls return an empty confirmation list before delivery, and failures are reported through the subscribed events.
+
+### Publishing with rented batches
+
+`SendMessagesAsync` accepts messages with `ReadOnlyMemory<byte>` payloads, which can share backing storage. On hot paths, build a `RentedMessageBatch` instead - every payload is written into a single buffer rented from the shared array pool - and hand it to `SendAsync`:
+
+```csharp
+using Apache.Iggy.Contracts;
+using System.Text.Json;
+using Apache.Iggy.Messages;
+
+using var builder = new RentedMessageBatchBuilder(sizeHint: 4096);
+
+foreach (var evt in events)
+{
+    // Serialize straight into the pooled buffer (static lambda + state = no closure allocation)
+    builder.Add(evt, static (e, writer) =>
+    {
+        using var json = new Utf8JsonWriter(writer);
+        JsonSerializer.Serialize(json, e);
+    }, Guid.NewGuid());
+}
+
+var batch = builder.Build();
+await publisher.SendAsync(batch);
+await publisher.WaitUntilAllSendsAsync();
+```
+
+`RentedMessageBatchBuilder`:
+
+| Member | Description |
+|--------|-------------|
+| `new RentedMessageBatchBuilder(sizeHint = 1024)` | Initial capacity hint (bytes) for the rented buffer |
+| `Add(payload, id = null, userHeaders = null)` | Copies a `ReadOnlySpan<byte>` payload into the shared buffer |
+| `Add(state, writePayload, id = null, userHeaders = null)` | Writes the payload via an `Action<TState, IBufferWriter<byte>>` callback directly into the buffer |
+| `Count` | Number of payloads added so far |
+| `Build()` | Materializes the `RentedMessageBatch`. The builder must not be used afterwards |
+
+A `null` message id sends the message with id 0, letting the server assign one.
+
+Ownership rules:
+
+- `publisher.SendAsync(batch)` **takes ownership** - do not dispose the batch yourself. Its buffer returns to the pool once the batch is sent (immediately, or after the background flush).
+- For a direct low-level send, pass `batch.Messages` to `client.SendMessagesAsync(...)` yourself, `await` it, then dispose the batch (`using var batch = builder.Build()`).
+- After disposal, `batch.Messages` and every payload's `Span` throw `ObjectDisposedException` instead of reading recycled pool memory.
+- Dispose the builder only when abandoning it before `Build()`. A `using` on the builder is safe either way (it becomes a no-op after `Build()`).
+
+### Typed publisher
+
+For automatic object serialization, use `IggyPublisherBuilder<T>` with an `ISerializer<T>`:
+
+```csharp
+await using var publisher = IggyPublisherBuilder<Order>.Create(
+    client,
+    Identifier.String("orders-stream"),
+    Identifier.String("orders-topic"),
+    new OrderSerializer()
+).Build();
+
+await publisher.InitAsync();
+await publisher.SendAsync(new List<Order> { new(Guid.NewGuid(), 99.90m) });
+
+record Order(Guid OrderId, decimal Amount);
+
+class OrderSerializer : ISerializer<Order>
+{
+    public void Serialize(Order data, IBufferWriter<byte> writer) =>
+        writer.Write(JsonSerializer.SerializeToUtf8Bytes(data));
+}
+```
+
+Besides the collection overload, `SendAsync` also accepts a single item (`SendAsync(order, messageId: null, userHeaders: null)`) or a collection of `(data, messageId, userHeaders)` tuples when you need per-message ids or headers.
+
+For JSON you don't need a custom serializer - the built-in `SystemTextJsonSerializer<T>` (in `Apache.Iggy.Publishers`) writes System.Text.Json output directly into the send buffer, with optional `JsonSerializerOptions`:
+
+```csharp
+await using var publisher = IggyPublisherBuilder<Order>.Create(
+    client,
+    Identifier.String("orders-stream"),
+    Identifier.String("orders-topic"),
+    new SystemTextJsonSerializer<Order>()
+).Build();
+```
+
+With background sending enabled, typed values are serialized at flush time. Keep them immutable or pass a snapshot until `WaitUntilAllSendsAsync` completes.
+
+There is **no built-in deserializer counterpart** - consumers implement `IDeserializer<T>` themselves (see [Typed consumer](#typed-consumer)).
+
+## IggyConsumer
+
+The consumer reads through a `PartitionReader` and yields one message at a time. A standalone consumer requires `WithPartitions`. A group consumer follows the server assignment.
+
+```csharp
+using Apache.Iggy.Contracts;
+using System.Text;
+using Apache.Iggy;
+using Apache.Iggy.Consumers;
+using Apache.Iggy.Kinds;
+
+await using var consumer = IggyConsumerBuilder.Create(
+    client, Identifier.String("my-stream"), Identifier.String("my-topic"), Consumer.New(1))
+    .WithPartitions(0)
+    .WithPollingStrategy(PollingStrategy.Next())
+    .WithPollOptions(new PollOptions { Count = 100, MaxWait = TimeSpan.FromSeconds(5) })
+    .Build();
+await consumer.InitAsync();
+await foreach (var received in consumer.ReceiveAsync())
+{
+    Console.WriteLine(Encoding.UTF8.GetString(received.Message.Payload));
+    await consumer.CommitAsync(received.Checkpoint!);
+}
+```
+
+The fragment assumes a connected client. Manual commits are the default. Commit the checkpoint after processing. `DisposeAsync` calls `ShutdownAsync` to close the reader and leave the group.
+
+### Consumer groups
+
+Use `Consumer.Group("my-group")` and `WithConsumerGroup("my-group", createIfNotExists: true)`. Do not supply standalone partitions. Set `WithPollOptions(new PollOptions { Commit = CommitPolicy.Auto() })` for automatic commits after processing.
+
+`AutoCommit.Default` stores every 10,000 messages or five seconds. `CommitAfter.Processing` counts a message when enumeration advances or a `ConsumeAsync` handler succeeds. A handler exception ends consumption and leaves that message uncounted. `CommitAfter.Marked` supports explicit progress marking after concurrent work.
+
+`CommitPolicy.OnRead` submits the offset before processing. It cannot be combined with a consumer encryptor. See [Deferred polling](/docs/sdk/deferred-polling).
+
+### Consumer builder options
+
+Use `WithPollOptions` for count, wait, minimum count, byte budget and commit policy. Use `WithPartitions` for standalone partition selection, and `WithPollingStrategy` for the initial position. The previous `WithBatchSize`, `WithPollingInterval`, `WithPartitionId` and `WithAutoCommitMode` consumer methods are replaced.
+
+A read error that stops a partition ends enumeration with `ReadException`. Inspect `StopsPartition`, `IsResumable` and `Skip` before selecting a new start with `SeekAsync`. Automatic retries do not discard an undecodable record without an application decision.
+
+### Consuming with rented buffers
+
+`ReceiveRentedAsync` exposes payloads from a pooled buffer. Dispose each yielded message before moving on, and copy bytes that must survive disposal. Read limits and commit policies are the same as for `ReceiveAsync`.
+
+### Typed consumer
+
+`IggyConsumerBuilder<T>` accepts an `IDeserializer<T>` and exposes `ReceiveDeserializedAsync`. Keep the typed builder in a variable before configuring it because inherited fluent methods return the base builder type. Use `WithPollOptions` to select the commit policy, and inspect each message status before accepting its progress.
+
+See the [C# examples](/docs/sdk/csharp/examples) for complete producer and consumer programs.

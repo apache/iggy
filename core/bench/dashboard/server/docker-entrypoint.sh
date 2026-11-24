@@ -33,6 +33,12 @@ fi
 if [ -n "${CACHE_DIR:-}" ]; then
     ARGS+=(--cache-dir "${CACHE_DIR}")
 fi
+if [ -n "${EMBED_CACHE_MAX_GIB:-}" ]; then
+    ARGS+=(--embed-cache-max-gib "${EMBED_CACHE_MAX_GIB}")
+fi
+if [ -n "${PUBLIC_URL:-}" ]; then
+    ARGS+=(--public-url "${PUBLIC_URL}")
+fi
 if [ -n "${OMB_RESULTS_DIR:-}" ]; then
     echo "Checking OMB results directory:"
     ls -la "${OMB_RESULTS_DIR}"

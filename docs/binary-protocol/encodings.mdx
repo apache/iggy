@@ -1,0 +1,143 @@
+---
+title: Shared encodings
+description: "The primitives command payloads are built from: names, identifiers, consumers and the other shared encodings."
+---
+
+Primitives the [command payloads](/docs/binary-protocol/commands) are built from.
+
+## Name
+
+Length-prefixed UTF-8 string, used for stream, topic, group, user, and token names:
+
+```text
+[length: u8][value: UTF-8, 1-255 bytes]
+```
+
+## Identifier
+
+Polymorphic identifier of a stream, topic, user, or consumer group:
+
+```text
+[kind: u8][length: u8][value: N bytes]
+```
+
+- Numeric: `kind = 1`, `length = 4`, value is a u32.
+- String: `kind = 2`, `length = 1..255`, value is UTF-8 bytes.
+
+## Consumer
+
+Identifies a consumer or a consumer group in message and offset commands:
+
+```text
+[kind: u8][id: Identifier]
+```
+
+- `kind = 1`: consumer.
+- `kind = 2`: consumer group.
+- `kind = 3`: externally managed group offsets. This kind cannot poll or join native consumer groups.
+
+## Optional partition id
+
+Several commands take an optional partition id encoded as 5 fixed bytes:
+
+```text
+[flag: u8][partition_id: u32]
+```
+
+`flag = 1` means the id is set. `flag = 0` means none (the value bytes are then zero). Group polls and group offset writes require an explicit assigned partition. Plain-consumer polls and consumer-offset reads use partition 0 when the id is omitted.
+
+## Partitioning
+
+How `SendMessages` picks the target partition:
+
+```text
+[kind: u8][length: u8][value: 0-255 bytes]
+```
+
+- `Balanced`: `kind = 1`, `length = 0`, no value. The binary client resolves it to an explicit partition before sending.
+- `PartitionId`: `kind = 2`, `length = 4`, value is a u32 partition id.
+- `MessagesKey`: `kind = 3`, `length = 1..255`, value is a routing key hashed to a partition.
+
+The Rust binary SDK resolves balanced and key routing client-side and sends `kind = 2`. The binary server requires explicit partition routing. The HTTP API can resolve the other strategies.
+
+## Polling strategy
+
+Fixed 9 bytes:
+
+```text
+[kind: u8][value: u64]
+```
+
+| Kind | Name | Meaning of `value` |
+|------|------|--------------------|
+| 1 | Offset | Start at this offset |
+| 2 | Timestamp | Start at this timestamp (microseconds) |
+| 3 | First | Start from the beginning (`value` ignored) |
+| 4 | Last | Start from the end (`value` ignored) |
+| 5 | Next | Continue after the stored consumer offset (`value` ignored) |
+
+## Header kinds
+
+Typed values used by user headers and option values. The kind byte:
+
+| Code | Kind | Code | Kind |
+|------|------|------|------|
+| 1 | Raw | 9 | Uint8 |
+| 2 | String | 10 | Uint16 |
+| 3 | Bool | 11 | Uint32 |
+| 4 | Int8 | 12 | Uint64 |
+| 5 | Int16 | 13 | Uint128 |
+| 6 | Int32 | 14 | Float32 |
+| 7 | Int64 | 15 | Float64 |
+| 8 | Int128 | | |
+
+Integers are little-endian. `Bool` is one byte.
+
+## User headers block
+
+A user headers block (inside a [message frame](/docs/binary-protocol/messages)) is a flat run of TLV fields:
+
+```text
+[kind: u8][length: u32][data: length bytes]
+```
+
+Fields pair up: first the key, then the value. Keys and values can both use the header kinds above. Every `length` must be 1..=255, kind 0 is rejected, and the block must consume its byte range exactly. The wire validator preserves unknown non-zero kind codes. A typed SDK accessor may still reject a kind it does not recognize.
+
+## Options block
+
+`CreateStream`, `CreateTopic`, `CreateUser` and `UpdateResource` end with a key-value **options block** that reuses the user-headers TLV encoding. The block runs from its start to the end of the payload (no length prefix, and the validator requires exact consumption) and may be empty.
+
+On top of the TLV walk, options enforce: string keys only (kind 2, valid UTF-8), no duplicate keys, at most 1024 entries, and at most 100000 bytes total.
+
+Semantics:
+
+- **Create** requests resolve absent keys to server defaults and persist the effective values. Updates use explicit reset keys to restore defaults. Zero retention sentinels do not reset a value. See [update semantics](/docs/server/topic-options).
+- **Update** requests are patches: keys absent from the block are left alone, never reset. A client built before a key existed cannot erase it.
+- Unknown keys are rejected at the wire edge, never silently skipped.
+
+The catalog is discoverable with DescribeOptions, code 13, using scope 1 for topics, 2 for streams and 3 for users. All three catalogs have entries. Stream keys are create-only and secret. Stream and topic names and user identity/status can be updated. Topic retention fields can be reset, while compression and storage policies are fixed at creation. See [Topic options](/docs/server/topic-options) and [Stream options](/docs/server/stream-options).
+
+## Compression
+
+The `compression_algorithm` value used by topic options:
+
+| Code / name | Algorithm |
+|-------------|-----------|
+| 1, `none` | No compression (default) |
+| 2, `gzip` | Gzip |
+
+Any other value is rejected. The option is a **placeholder today**: the value is validated, persisted, and echoed back, but it does not enable automatic payload compression or decompression. To compress today, do it client-side and tag messages via user headers - see the [message headers examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-headers) in the Iggy repo.
+
+## Partition context
+
+A served partition context is 24 bytes:
+
+```text
+[incarnation: u64][owner_generation: u64][metadata_op: u64]
+```
+
+The incarnation identifies the partition history. The owner generation identifies group ownership and is zero for ordinary consumers. The metadata operation establishes the minimum metadata needed to interpret the context. Poll replies, continuations and checkpoints preserve these fields.
+
+## Option catalog flags
+
+DescribeOptions entries report mutability and visibility. Bit 0 means updatable, bit 1 resettable, bit 2 secret, bit 3 read-only and bit 4 critical. A critical key must be understood before a node serves the resource. Unknown client option keys are rejected.

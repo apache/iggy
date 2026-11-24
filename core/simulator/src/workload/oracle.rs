@@ -290,7 +290,7 @@ pub fn quiesce_failure_report(sim: &Simulator, workload: &Workload) -> String {
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace);
+                    .peek_by_ns(&namespace);
                 let _ = writeln!(
                     report,
                     "      {namespace:?}: {:?}",
@@ -950,7 +950,7 @@ fn assert_retired_owners_removed(
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace)
+                    .peek_by_ns(&namespace)
                     .map(|partition| (replica, partition))
             })
             .collect();
@@ -1018,7 +1018,7 @@ fn assert_partition_offsets_agree(
                 .partition_shard(namespace)
                 .plane
                 .partitions()
-                .get_by_ns(&namespace)
+                .peek_by_ns(&namespace)
             else {
                 continue;
             };
@@ -1496,7 +1496,7 @@ mod tests {
         workload.options.weights = ActionWeights::new(&[(Action::PollMessages, 100)]);
         sim.discover_partition_contexts(&clients[0]);
         let (target, poll) = workload
-            .build_request(&clients[0])
+            .build_request_on(&clients[0], &sim)
             .expect("an idle client polls");
         sim.submit_request(clients[0].client_id(), target, poll.into_generic());
 

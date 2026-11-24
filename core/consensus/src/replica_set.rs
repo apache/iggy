@@ -22,7 +22,7 @@ use std::{error::Error, fmt};
 ///
 /// Consensus state and frame headers address replicas by member index; only
 /// the message bus addresses nodes, so sends translate through this set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ReplicaSet {
     nodes: [u8; REPLICAS_MAX],
     len: u8,

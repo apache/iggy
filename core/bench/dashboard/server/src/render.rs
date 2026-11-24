@@ -18,56 +18,37 @@
 use crate::cache::read_report;
 use crate::dedicated_thread::{DedicatedThread, ThreadStopped};
 use crate::error::IggyBenchDashboardServerError;
+use bench_dashboard_shared::embed::ChartType;
 use bench_report::report::BenchmarkReport;
 use charming::Chart;
 use charming::renderer::image_renderer::{ImageFormat, ImageRenderer};
 use charming::theme::Theme;
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::str::FromStr;
 use tracing::info;
+
+/// charming writes the text between two of these marks as JavaScript, and keeps its own copy of
+/// the mark private.
+pub(crate) const RAW_MARK: &str = "#*#*#*#";
 
 const RENDER_THREAD: &str = "png-render";
 const CHART_THREAD: &str = "embed-chart";
-
-/// The chart of a run that an embed shows, named as in the `type` query parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChartType {
-    Latency,
-    Throughput,
-    Distribution,
-}
-
-impl FromStr for ChartType {
-    type Err = IggyBenchDashboardServerError;
-
-    fn from_str(chart_type: &str) -> Result<Self, Self::Err> {
-        match chart_type {
-            "latency" => Ok(Self::Latency),
-            "throughput" => Ok(Self::Throughput),
-            "distribution" => Ok(Self::Distribution),
-            _ => Err(IggyBenchDashboardServerError::BadRequest(format!(
-                "Invalid chart type: '{chart_type}'. Must be 'latency', 'throughput', or 'distribution'"
-            ))),
-        }
-    }
-}
-
-impl fmt::Display for ChartType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Latency => "latency",
-            Self::Throughput => "throughput",
-            Self::Distribution => "distribution",
-        })
-    }
-}
 
 /// A run's chart with the line that names its machine and server version.
 pub struct EmbedChart {
     pub chart: Chart,
     pub hardware_line: String,
+}
+
+/// `text` without charming's raw mark, so text from a result file stays text when
+/// `Chart::to_string` writes the chart for a page or for the PNG renderer. One pass can join the
+/// halves around a removed mark into a new mark, so the removal repeats.
+pub fn without_raw_mark(text: &str) -> String {
+    let mut plain = text.to_owned();
+    while plain.contains(RAW_MARK) {
+        plain = plain.replace(RAW_MARK, "");
+    }
+    plain
 }
 
 /// Dedicated threads that build and render the charts of the embed endpoints.
@@ -86,8 +67,15 @@ pub struct PngRenderPool {
 
 impl PngRenderPool {
     pub fn new() -> io::Result<Self> {
-        let thread = DedicatedThread::start(RENDER_THREAD, |job: RenderJob| {
-            Self::render(&job.chart, job.width, job.height, job.dark)
+        Self::with_renderer(Self::render)
+    }
+
+    /// A pool whose render thread runs `render` in place of charming's V8 renderer.
+    pub(crate) fn with_renderer(
+        mut render: impl FnMut(&Chart, u32, u32, bool) -> Result<Vec<u8>, String> + Send + 'static,
+    ) -> io::Result<Self> {
+        let thread = DedicatedThread::start(RENDER_THREAD, move |job: RenderJob| {
+            render(&job.chart, job.width, job.height, job.dark)
         })?;
         let charts = DedicatedThread::start(CHART_THREAD, EmbedChart::load)?;
 
@@ -95,20 +83,20 @@ impl PngRenderPool {
         Ok(Self { thread, charts })
     }
 
-    pub fn default_pool() -> io::Result<Self> {
-        Self::new()
-    }
-
+    /// The `chart_type` chart of the report at `report`, with `subtext` in place of the report's
+    /// own subtext.
     pub async fn load_chart(
         &self,
         report: PathBuf,
         chart_type: ChartType,
+        subtext: String,
         dark: bool,
     ) -> Result<EmbedChart, IggyBenchDashboardServerError> {
         self.charts
             .run(ChartJob {
                 report,
                 chart_type,
+                subtext,
                 dark,
             })
             .await
@@ -151,6 +139,7 @@ impl PngRenderPool {
 struct ChartJob {
     report: PathBuf,
     chart_type: ChartType,
+    subtext: String,
     dark: bool,
 }
 
@@ -164,13 +153,18 @@ struct RenderJob {
 impl EmbedChart {
     fn load(job: ChartJob) -> Result<Self, IggyBenchDashboardServerError> {
         let report = read_report(&job.report)?;
+        let subtext = &job.subtext;
         let chart = match job.chart_type {
-            ChartType::Latency => bench_report::create_latency_chart(&report, job.dark, false),
-            ChartType::Throughput => {
-                bench_report::create_throughput_chart(&report, job.dark, false)
+            ChartType::Latency => {
+                bench_report::create_latency_chart_with_subtext(&report, subtext, job.dark, false)
             }
+            ChartType::Throughput => bench_report::create_throughput_chart_with_subtext(
+                &report, subtext, job.dark, false,
+            ),
             ChartType::Distribution => {
-                bench_report::create_latency_distribution_chart(&report, job.dark, false)
+                bench_report::create_latency_distribution_chart_with_subtext(
+                    &report, subtext, job.dark, false,
+                )
             }
         };
         Ok(Self {
@@ -220,5 +214,14 @@ mod tests {
             EmbedChart::hardware_line(&report),
             "ip-10-0-0-40 @ Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz (server 0.9.0)"
         );
+    }
+
+    #[test]
+    fn given_mark_split_around_another_mark_when_removing_should_leave_no_mark() {
+        let split = format!("#{RAW_MARK}*#*#*#");
+
+        assert_eq!(without_raw_mark(&split), "");
+        assert_eq!(without_raw_mark(&format!("a{RAW_MARK}b")), "ab");
+        assert_eq!(without_raw_mark("OMB #1 *fast*"), "OMB #1 *fast*");
     }
 }

@@ -71,8 +71,9 @@ func (t *CreateTopic) MarshalBinary() ([]byte, error) {
 // options builds the trailing options block. partitions_count is not an
 // option: it fills the command's own fixed field. Keys carrying the
 // server-default sentinel (expiry 0, size 0, compression none) are omitted so
-// the server derives them and returns them as derived entries. Both
-// durability keys are always sent, replicated unless named otherwise.
+// the server derives them and returns them as derived entries. A geo topic's
+// durations have no such sentinel, so a zero one is sent. Both durability
+// keys are always sent, replicated unless named otherwise.
 func (t *CreateTopic) options() ([]iggcon.HeaderEntry, error) {
 	typed, err := t.typedOptions()
 	if err != nil {
@@ -150,7 +151,39 @@ func (t *CreateTopic) typedOptions() ([]iggcon.HeaderEntry, error) {
 	if options.LocalRetentionSize != nil && *options.LocalRetentionSize != 0 {
 		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionSize), *options.LocalRetentionSize))
 	}
+	if options.TopicType != nil {
+		typed = append(typed, iggcon.TopicTypeOption(*options.TopicType))
+	}
+	if options.GeoMode != nil {
+		typed = append(typed, iggcon.GeoModeOption(*options.GeoMode))
+	}
+	typed = appendGeoDurations(typed,
+		geoDuration{iggcon.TopicOptionFreshUploadInterval, options.FreshUploadInterval},
+		geoDuration{iggcon.TopicOptionConsumerOffsetUploadInterval, options.ConsumerOffsetUploadInterval},
+		geoDuration{iggcon.TopicOptionPositionsPublishInterval, options.PositionsPublishInterval},
+		geoDuration{iggcon.TopicOptionTombstoneGrace, options.TombstoneGrace},
+		geoDuration{iggcon.TopicOptionPositionsResumeTimeout, options.PositionsResumeTimeout},
+		geoDuration{iggcon.TopicOptionLongTermRewriteMaxInterval, options.LongTermRewriteMaxInterval},
+	)
 	return typed, nil
+}
+
+// geoDuration is one duration of a geo topic with the key it travels under.
+type geoDuration struct {
+	key   iggcon.TopicOptionKey
+	value *iggcon.Duration
+}
+
+// appendGeoDurations appends the durations that are set, in microseconds.
+// Zero is a value of these keys, not the server-default sentinel of an
+// expiry, so it is sent.
+func appendGeoDurations(typed []iggcon.HeaderEntry, durations ...geoDuration) []iggcon.HeaderEntry {
+	for _, duration := range durations {
+		if duration.value != nil {
+			typed = append(typed, uint64Option(string(duration.key), uint64(*duration.value)))
+		}
+	}
+	return typed
 }
 
 type GetTopic struct {
@@ -200,17 +233,23 @@ func (d *DeleteTopic) MarshalBinary() ([]byte, error) {
 // UpdateTopic patches a topic through the generic UpdateResource command.
 // Create-only settings, compression included, have no field here.
 type UpdateTopic struct {
-	StreamId           iggcon.Identifier
-	TopicId            iggcon.Identifier
-	Name               *string
-	MessageExpiry      *iggcon.Duration
-	MaxTopicSize       *uint64
-	TieredStorage      *bool
-	LocalRetentionAge  *iggcon.Duration
-	LocalRetentionSize *uint64
-	Reset              []iggcon.TopicOptionKey
-	RawReset           []string
-	Options            []iggcon.HeaderEntry
+	StreamId                     iggcon.Identifier
+	TopicId                      iggcon.Identifier
+	Name                         *string
+	MessageExpiry                *iggcon.Duration
+	MaxTopicSize                 *uint64
+	TieredStorage                *bool
+	LocalRetentionAge            *iggcon.Duration
+	LocalRetentionSize           *uint64
+	FreshUploadInterval          *iggcon.Duration
+	ConsumerOffsetUploadInterval *iggcon.Duration
+	PositionsPublishInterval     *iggcon.Duration
+	TombstoneGrace               *iggcon.Duration
+	PositionsResumeTimeout       *iggcon.Duration
+	LongTermRewriteMaxInterval   *iggcon.Duration
+	Reset                        []iggcon.TopicOptionKey
+	RawReset                     []string
+	Options                      []iggcon.HeaderEntry
 }
 
 func (u *UpdateTopic) Code() Code {
@@ -219,7 +258,7 @@ func (u *UpdateTopic) Code() Code {
 
 // MarshalBinary encodes the patch. A zero expiry, retention or size is the
 // server-default sentinel and changes nothing, Reset returns a key to its
-// default.
+// default. A zero duration of a geo topic is a value and is sent.
 func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	var typed []iggcon.HeaderEntry
 	if u.Name != nil {
@@ -240,6 +279,14 @@ func (u *UpdateTopic) MarshalBinary() ([]byte, error) {
 	if u.LocalRetentionSize != nil && *u.LocalRetentionSize != 0 {
 		typed = append(typed, uint64Option(string(iggcon.TopicOptionLocalRetentionSize), *u.LocalRetentionSize))
 	}
+	typed = appendGeoDurations(typed,
+		geoDuration{iggcon.TopicOptionFreshUploadInterval, u.FreshUploadInterval},
+		geoDuration{iggcon.TopicOptionConsumerOffsetUploadInterval, u.ConsumerOffsetUploadInterval},
+		geoDuration{iggcon.TopicOptionPositionsPublishInterval, u.PositionsPublishInterval},
+		geoDuration{iggcon.TopicOptionTombstoneGrace, u.TombstoneGrace},
+		geoDuration{iggcon.TopicOptionPositionsResumeTimeout, u.PositionsResumeTimeout},
+		geoDuration{iggcon.TopicOptionLongTermRewriteMaxInterval, u.LongTermRewriteMaxInterval},
+	)
 	reset := make([]string, 0, len(u.Reset))
 	for _, key := range u.Reset {
 		reset = append(reset, string(key))

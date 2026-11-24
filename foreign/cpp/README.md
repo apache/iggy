@@ -35,12 +35,20 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 ## Resource options
 
 Streams, topics and users take typed create and update options. Unset settings use the server default on create and keep their stored value on update. `SetRawEntries()` and `RawReset()` name keys newer than this SDK build and leave the decision to the server. `DescribeOptions()` serves each scope's catalog. A topic update can change `MessageExpiry`, `MaxTopicSize`, `LocalRetentionAge` and `LocalRetentionSize`, reset each of them, and turn `TieredStorage` on, never off.
+
+A geo topic also takes six durations, each a `std::chrono::microseconds` that overrides the server
+setting of the same name on every node: `SetFreshUploadInterval`, `SetConsumerOffsetUploadInterval`,
+`SetPositionsPublishInterval`, `SetTombstoneGrace`, `SetPositionsResumeTimeout` and
+`SetLongTermRewriteMaxInterval`. Zero is a value and is sent as zero. A normal topic refuses them
+with `invalid_option_value`. An update can set them on a geo topic, the only settings it changes
+there, but cannot reset them. `Topic` and `TopicDetails` read each one back. If the topic leaves a
+duration to the server setting, its getter returns `std::nullopt`.
 
 ```cpp
 const std::string key_base64 = LoadStreamKey();

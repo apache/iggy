@@ -1,0 +1,1049 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+//! A consumer group that moves between two clusters on `fs`, `dc-a` and
+//! `dc-b`. The group reads the geo topic of `dc-a` there, and the shadow of
+//! that topic in `dc-b`. Its positions travel through the buckets.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use iggy::prelude::*;
+use iggy_object_store::{PositionHolder, PositionValue};
+use integration::harness::{
+    GeoCluster, GeoClusterPair, GeoSide, wait_for_consumer_group_assignment,
+};
+use tokio::time::{Instant, sleep};
+
+const STREAM: &str = "orders";
+const TOPIC: &str = "payments";
+const GROUP: &str = "billing";
+/// The Iggy group that the Kafka gateway keeps the offsets of the Kafka group
+/// `billing` in.
+const KAFKA_GROUP: &str = "kafka.cg.billing";
+/// A plain consumer, by name: its id is the name's hash.
+const REPORTER: &str = "reporter";
+/// The nodes of each cluster in the tests whose partitions have different
+/// leaders, and the partitions of their geo topic.
+const NODES: usize = 3;
+const PARTITIONS: u32 = 3;
+const PUBLISH_INTERVAL: Duration = Duration::from_millis(250);
+const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long a group may take to read what a test expects, or a position to
+/// reach the other cluster.
+const DEADLINE: Duration = Duration::from_secs(60);
+const RETRY: Duration = Duration::from_millis(50);
+
+#[tokio::test]
+async fn given_a_group_committing_on_partitions_led_by_different_nodes_when_its_datacenter_is_killed_should_resume_each_partition_on_the_exact_next_message()
+ {
+    let mut pair = started_pair(NODES).await;
+    let ids = create_and_follow(&pair, PARTITIONS).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    for partition in 0..PARTITIONS {
+        send(&client_a, partition, 0..100).await;
+        wait_until_shadow_serves(&client_b, ids, partition, 100).await;
+    }
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    let consumed: BTreeMap<u32, u64> = (0..PARTITIONS)
+        .map(|partition| (partition, 30 + 7 * u64::from(partition)))
+        .collect();
+
+    for (partition, count) in &consumed {
+        let group = group_a.on(*partition);
+        let mut read = Vec::new();
+        while (read.len() as u64) < *count {
+            let left = u32::try_from(count - read.len() as u64).unwrap_or(u32::MAX);
+            let polled = group.poll_manual(&client_a, left.min(10)).await;
+            let Some(last) = polled.last().copied() else {
+                sleep(RETRY).await;
+                continue;
+            };
+            read.extend(polled);
+            group.commit(&client_a, last).await;
+            assert_eq!(
+                bucket_offset(pair.a(), *partition).await,
+                Some(last),
+                "the bucket holds a commit of partition {partition} once it is acknowledged"
+            );
+        }
+        assert_eq!(read, (0..*count).collect::<Vec<_>>());
+    }
+    let objects = pair
+        .a()
+        .bucket()
+        .positions_objects()
+        .await
+        .expect("dc-a's bucket reads");
+    let publishers: BTreeSet<u8> = objects.iter().map(|object| object.key.replica).collect();
+    assert!(
+        publishers.len() > 1,
+        "the leaders of the partitions spread over the nodes: {objects:?}"
+    );
+    for object in &objects {
+        assert!(
+            object.partitions.len() < PARTITIONS as usize,
+            "node {} publishes partitions it does not lead: {object:?}",
+            object.key.replica
+        );
+    }
+
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after the last commit");
+    for (partition, count) in &consumed {
+        group_b
+            .on(*partition)
+            .wait_for_offset(&client_b, Some(count - 1))
+            .await;
+    }
+    let group_b = group_b.joined(&client_b).await;
+    for (partition, count) in &consumed {
+        assert_eq!(
+            group_b.on(*partition).consume(&client_b, 10).await,
+            (*count..count + 10).collect::<Vec<_>>(),
+            "the group resumes partition {partition} on the next message"
+        );
+    }
+}
+
+#[tokio::test]
+async fn given_a_partition_whose_leader_fails_when_another_node_takes_it_over_should_publish_the_position_it_had()
+ {
+    let mut pair = started_pair(NODES).await;
+    let ids = create_and_follow(&pair, PARTITIONS).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    for partition in 0..PARTITIONS {
+        send(&client_a, partition, 0..20).await;
+    }
+    let group_a = Group::join(&client_a, ids.own()).await;
+    for partition in 0..PARTITIONS {
+        group_a.on(partition).consume(&client_a, 10).await;
+    }
+    group_a.leave(&client_a).await;
+    for partition in 0..PARTITIONS {
+        wait_for_bucket_offset_on(pair.a(), partition, 9).await;
+    }
+    // Rounds of every node, in which a backup would store what it holds too.
+    sleep(4 * PUBLISH_INTERVAL).await;
+    let mut holders = BTreeMap::new();
+    for partition in 0..PARTITIONS {
+        let replicas = wait_for_bucket_offset_on(pair.a(), partition, 9).await;
+        assert_eq!(
+            replicas.len(),
+            1,
+            "only the leader of partition {partition} publishes it: {replicas:?}"
+        );
+        holders.insert(partition, replicas[0]);
+    }
+    let (partition, leader) = holders
+        .into_iter()
+        .find(|(_, replica)| *replica != 0)
+        .expect("a partition led by another node than the first");
+
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_node(usize::from(leader))
+        .expect("the leader fails");
+
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let replicas = wait_for_bucket_offset_on(pair.a(), partition, 9).await;
+        if replicas.iter().any(|replica| *replica != leader) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no node took over partition {partition} from node {leader} in the bucket"
+        );
+        sleep(RETRY).await;
+    }
+}
+
+#[tokio::test]
+async fn given_a_group_that_moved_back_in_one_datacenter_when_the_other_holds_a_higher_offset_should_keep_the_move_in_both()
+ {
+    let pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..100).await;
+    wait_until_shadow_serves(&client_b, ids, 0, 100).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    group_a.consume(&client_a, 60).await;
+    group_a.leave(&client_a).await;
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    group_b.wait_for_offset(&client_b, Some(59)).await;
+
+    let group_b = group_b.joined(&client_b).await;
+    group_b.store(&client_b, 20).await;
+    group_b.leave(&client_b).await;
+
+    group_a.wait_for_offset(&client_a, Some(20)).await;
+    // Several rounds of both clusters: neither moves the group forward again.
+    sleep(4 * (PUBLISH_INTERVAL + POLL_INTERVAL)).await;
+    assert_eq!(group_b.offset(&client_b).await, Some(20), "dc-b keeps it");
+    assert_eq!(group_a.offset(&client_a).await, Some(20), "dc-a took it");
+    let group_a = group_a.joined(&client_a).await;
+    assert_eq!(
+        group_a.consume(&client_a, 5).await,
+        (21..26).collect::<Vec<_>>(),
+        "dc-a reads on from the move"
+    );
+}
+
+#[tokio::test]
+async fn given_a_group_committing_on_read_when_its_datacenter_fails_should_resume_in_the_other_skipping_none_and_rereading_at_most_two_intervals()
+ {
+    const MESSAGES: u64 = 600;
+    const PACE: Duration = Duration::from_millis(20);
+    const CONSUME_FOR: Duration = Duration::from_secs(6);
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..MESSAGES).await;
+    wait_until_shadow_serves(&client_b, ids, 0, MESSAGES).await;
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+
+    let mut consumed_at = BTreeMap::new();
+    let started = Instant::now();
+    while started.elapsed() < CONSUME_FOR {
+        for offset in group_a.poll(&client_a, 1).await {
+            consumed_at.insert(offset, Instant::now());
+        }
+        sleep(PACE).await;
+    }
+    let failed_at = Instant::now();
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails");
+    let last = *consumed_at.keys().last().expect("dc-a consumed");
+    assert_eq!(
+        consumed_at.keys().copied().collect::<Vec<_>>(),
+        (0..=last).collect::<Vec<_>>()
+    );
+
+    let group_b = group_b.joined(&client_b).await;
+    let resumed = group_b.consume(&client_b, MESSAGES - last - 1).await;
+    let first = *resumed.first().expect("dc-b reads");
+    assert!(first <= last + 1, "dc-b skipped {} to {first}", last + 1);
+    assert_eq!(
+        resumed,
+        (first..first + resumed.len() as u64).collect::<Vec<_>>(),
+        "each message once, in order"
+    );
+    let reread: Vec<u64> = (first..=last).collect();
+    let bound = PUBLISH_INTERVAL + POLL_INTERVAL;
+    // A reconcile pass of dc-b, the fold and the adoption commits and the
+    // store calls add to the two intervals, more on a loaded host.
+    let slack = Duration::from_millis(1500);
+    for offset in &reread {
+        let age = failed_at.duration_since(consumed_at[offset]);
+        assert!(
+            age <= bound + slack,
+            "dc-b re-read offset {offset}, which dc-a consumed {age:?} before it failed; \
+             it re-read {} messages from {first}",
+            reread.len()
+        );
+    }
+    eprintln!(
+        "dc-a consumed through {last}; dc-b resumed at {first}, re-reading {} messages",
+        reread.len()
+    );
+}
+
+#[tokio::test]
+async fn given_a_group_committing_its_offsets_when_its_datacenter_is_killed_right_after_an_acknowledged_commit_should_resume_in_the_other_on_the_exact_next_message()
+ {
+    const MESSAGES: u64 = 600;
+    const PACE: Duration = Duration::from_millis(20);
+    const CONSUME_FOR: Duration = Duration::from_secs(4);
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..MESSAGES).await;
+    wait_until_shadow_serves(&client_b, ids, 0, MESSAGES).await;
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+
+    let mut read = Vec::new();
+    let mut latencies = Vec::new();
+    let started = Instant::now();
+    while started.elapsed() < CONSUME_FOR {
+        let polled = group_a.poll_manual(&client_a, 5).await;
+        if let Some(last) = polled.last().copied() {
+            read.extend(polled);
+            let commit_started = Instant::now();
+            group_a.commit(&client_a, last).await;
+            latencies.push(commit_started.elapsed());
+        }
+        sleep(PACE).await;
+    }
+    let last = *read.last().expect("dc-a read");
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after an acknowledged commit");
+    assert_eq!(read, (0..=last).collect::<Vec<_>>());
+
+    group_b.wait_for_offset(&client_b, Some(last)).await;
+    let group_b = group_b.joined(&client_b).await;
+    let resumed = group_b.consume(&client_b, 20).await;
+    assert_eq!(
+        resumed,
+        (last + 1..last + 21).collect::<Vec<_>>(),
+        "dc-b reads none of the acknowledged commits again and skips none"
+    );
+    latencies.sort_unstable();
+    eprintln!(
+        "{} commits, the last at {last}; commit latency median {:?}, p90 {:?}, max {:?}",
+        latencies.len(),
+        latencies[latencies.len() / 2],
+        latencies[latencies.len() * 9 / 10],
+        latencies[latencies.len() - 1]
+    );
+}
+
+#[tokio::test]
+async fn given_a_bucket_that_refuses_puts_when_a_group_commits_should_acknowledge_only_once_the_bucket_holds_the_position()
+ {
+    const REFUSING_FOR: Duration = Duration::from_secs(3);
+    let pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    send(&client_a, 0, 0..40).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    assert_eq!(group_a.poll_manual(&client_a, 10).await.len(), 10);
+    group_a.commit(&client_a, 9).await;
+    assert_eq!(bucket_offset(pair.a(), 0).await, Some(9));
+
+    let positions = pair
+        .a()
+        .bucket()
+        .path()
+        .join(pair.a().bucket().layout().positions_prefix())
+        .join(pair.a().origin());
+    std::fs::remove_dir_all(&positions).expect("the node's positions go");
+    std::fs::write(&positions, b"").expect("a file where the positions directory was");
+    let commit = tokio::spawn(async move {
+        assert_eq!(group_a.poll_manual(&client_a, 10).await.len(), 10);
+        group_a.commit(&client_a, 19).await;
+        Instant::now()
+    });
+    sleep(REFUSING_FOR).await;
+    assert!(
+        !commit.is_finished(),
+        "a commit whose position the bucket refuses is not acknowledged"
+    );
+
+    std::fs::remove_file(&positions).expect("the bucket takes puts again");
+    let acknowledged = tokio::time::timeout(DEADLINE, commit)
+        .await
+        .expect("the commit is acknowledged once the bucket takes it")
+        .expect("the committing task ends");
+    assert_eq!(
+        bucket_offset(pair.a(), 0).await,
+        Some(19),
+        "the bucket holds the position at the acknowledgement, {:?} after it",
+        acknowledged.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn given_a_group_that_moved_on_in_the_other_datacenter_when_its_first_datacenter_returns_should_resume_from_the_others_position()
+ {
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..100).await;
+    wait_until_shadow_serves(&client_b, ids, 0, 100).await;
+    let group_a = Group::join(&client_a, ids.own()).await;
+    group_a.consume(&client_a, 30).await;
+    group_a.leave(&client_a).await;
+    let group_b = Group::create(&client_b, ids.shadow()).await;
+    group_b.wait_for_offset(&client_b, Some(29)).await;
+    pair.cluster_mut(GeoSide::A)
+        .stop()
+        .await
+        .expect("dc-a fails");
+
+    let group_b = group_b.joined(&client_b).await;
+    assert_eq!(
+        group_b.consume(&client_b, 40).await,
+        (30..70).collect::<Vec<_>>()
+    );
+    group_b.leave(&client_b).await;
+    wait_for_bucket_offset(pair.b(), 69).await;
+    pair.cluster_mut(GeoSide::A)
+        .start()
+        .await
+        .expect("dc-a returns");
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let group_a = Group::create(&client_a, ids.own())
+        .await
+        .joined(&client_a)
+        .await;
+
+    assert_eq!(
+        group_a.consume(&client_a, 5).await,
+        (70..75).collect::<Vec<_>>(),
+        "the group's first read in dc-a after its return waits for dc-b's position"
+    );
+}
+
+#[tokio::test]
+async fn given_external_offsets_of_a_group_when_its_datacenter_is_killed_right_after_an_acknowledged_store_should_return_them_in_the_other_before_the_group_exists_there()
+ {
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..60).await;
+    let own = Reader::external(ids.own());
+    own.create_group(&client_a).await;
+    for offset in [10, 25, 37] {
+        own.store_once(&client_a, offset).await;
+    }
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after an acknowledged store");
+
+    let shadow = Reader::external(ids.shadow());
+    shadow.wait_for_offset(&client_b, Some(37)).await;
+    let (stream, topic) = ids.shadow();
+    assert!(
+        client_b
+            .get_consumer_group(&stream, &topic, &named(KAFKA_GROUP))
+            .await
+            .expect("dc-b reads its groups")
+            .is_none(),
+        "dc-b answers by the group's name, as the gateway reads before its first commit there"
+    );
+
+    shadow.create_group(&client_b).await;
+    shadow.store(&client_b, 42).await;
+    shadow.wait_for_offset(&client_b, Some(42)).await;
+    wait_for_bucket_position(
+        pair.b(),
+        &PositionHolder::ExternalGroup(KAFKA_GROUP.to_owned()),
+        42,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn given_a_plain_consumer_storing_its_offsets_when_its_datacenter_is_killed_should_resume_in_the_other_on_the_next_message()
+ {
+    let mut pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..200).await;
+    wait_until_shadow_serves(&client_b, ids, 0, 200).await;
+    let own = Reader::plain(ids.own());
+    let mut read = Vec::new();
+    while read.len() < 40 {
+        let polled = own.poll_manual(&client_a, 5).await;
+        if let Some(last) = polled.last().copied() {
+            read.extend(polled);
+            own.store_once(&client_a, last).await;
+        }
+    }
+    let last = *read.last().expect("dc-a read");
+    pair.cluster_mut(GeoSide::A)
+        .harness_mut()
+        .kill_cluster()
+        .expect("dc-a fails right after an acknowledged store");
+    assert_eq!(read, (0..=last).collect::<Vec<_>>());
+
+    let shadow = Reader::plain(ids.shadow());
+    shadow.wait_for_offset(&client_b, Some(last)).await;
+    let mut resumed = Vec::new();
+    let deadline = Instant::now() + DEADLINE;
+    while resumed.len() < 10 {
+        resumed.extend(shadow.poll_manual(&client_b, 10).await);
+        assert!(Instant::now() < deadline, "dc-b read {resumed:?}");
+    }
+    assert_eq!(
+        resumed,
+        (last + 1..last + 11).collect::<Vec<_>>(),
+        "dc-b reads none of the acknowledged stores again and skips none"
+    );
+}
+
+#[tokio::test]
+async fn given_a_plain_consumer_that_moved_back_in_one_datacenter_when_the_other_holds_a_higher_offset_should_keep_the_move_in_both()
+ {
+    let pair = started_pair(1).await;
+    let ids = create_and_follow(&pair, 1).await;
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    send(&client_a, 0, 0..60).await;
+    let own = Reader::plain(ids.own());
+    let shadow = Reader::plain(ids.shadow());
+    own.store(&client_a, 50).await;
+    shadow.wait_for_offset(&client_b, Some(50)).await;
+
+    own.store(&client_a, 20).await;
+
+    shadow.wait_for_offset(&client_b, Some(20)).await;
+    sleep(PUBLISH_INTERVAL + POLL_INTERVAL).await;
+    assert_eq!(
+        own.offset(&client_a).await,
+        Some(20),
+        "dc-b's higher offset from before the move does not come back"
+    );
+}
+
+/// The topic of `dc-a` and its shadow in `dc-b`.
+#[derive(Debug, Clone, Copy)]
+struct Ids {
+    shadow_stream_id: u32,
+    topic_id: u32,
+}
+
+impl Ids {
+    fn own(self) -> (Identifier, Identifier) {
+        (named(STREAM), named(TOPIC))
+    }
+
+    fn shadow(self) -> (Identifier, Identifier) {
+        (numeric(self.shadow_stream_id), numeric(self.topic_id))
+    }
+}
+
+/// The group on one topic of one cluster, read on one partition.
+struct Group {
+    stream: Identifier,
+    topic: Identifier,
+    partition: u32,
+}
+
+impl Group {
+    async fn create(client: &IggyClient, (stream, topic): (Identifier, Identifier)) -> Self {
+        retry(|| async {
+            match client.create_consumer_group(&stream, &topic, GROUP).await {
+                Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => Ok(()),
+                created => created.map(|_| ()),
+            }
+        })
+        .await;
+        Self {
+            stream,
+            topic,
+            partition: 0,
+        }
+    }
+
+    /// The group, read on `partition`.
+    fn on(&self, partition: u32) -> Self {
+        Self {
+            stream: self.stream.clone(),
+            topic: self.topic.clone(),
+            partition,
+        }
+    }
+
+    async fn join(client: &IggyClient, topic: (Identifier, Identifier)) -> Self {
+        Self::create(client, topic).await.joined(client).await
+    }
+
+    async fn joined(self, client: &IggyClient) -> Self {
+        let group = named(GROUP);
+        retry(|| client.join_consumer_group(&self.stream, &self.topic, &group)).await;
+        wait_for_consumer_group_assignment(
+            client,
+            &self.stream,
+            &self.topic,
+            &named(GROUP),
+            1,
+            DEADLINE,
+        )
+        .await;
+        self
+    }
+
+    async fn leave(&self, client: &IggyClient) {
+        let group = named(GROUP);
+        retry(|| client.leave_consumer_group(&self.stream, &self.topic, &group)).await;
+    }
+
+    /// One poll of the next `count` messages, committing them. Empty when
+    /// the cluster refused the poll.
+    async fn poll(&self, client: &IggyClient, count: u32) -> Vec<u64> {
+        client
+            .poll_messages(
+                &self.stream,
+                &self.topic,
+                self.partition,
+                &Consumer::group(named(GROUP)),
+                &PollingStrategy::next(),
+                PollOptions {
+                    count,
+                    commit: CommitPolicy::OnRead,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .map(|polled| {
+                polled
+                    .messages
+                    .iter()
+                    .map(|message| message.header.offset)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One poll of the next `count` messages that commits nothing. Empty
+    /// when the cluster refused the poll.
+    async fn poll_manual(&self, client: &IggyClient, count: u32) -> Vec<u64> {
+        client
+            .poll_messages(
+                &self.stream,
+                &self.topic,
+                self.partition,
+                &Consumer::group(named(GROUP)),
+                &PollingStrategy::next(),
+                PollOptions {
+                    count,
+                    commit: CommitPolicy::Manual,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .map(|polled| {
+                polled
+                    .messages
+                    .iter()
+                    .map(|message| message.header.offset)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Store `offset` as the group's offset, as an application commits a
+    /// checkpoint, and wait for the answer.
+    async fn commit(&self, client: &IggyClient, offset: u64) {
+        client
+            .store_consumer_offset(
+                &Consumer::group(named(GROUP)),
+                &self.stream,
+                &self.topic,
+                Some(self.partition),
+                offset,
+            )
+            .await
+            .expect("the cluster takes the commit");
+    }
+
+    /// Poll and commit until `count` messages arrived.
+    async fn consume(&self, client: &IggyClient, count: u64) -> Vec<u64> {
+        let deadline = Instant::now() + DEADLINE;
+        let mut offsets = Vec::new();
+        while (offsets.len() as u64) < count {
+            let left = u32::try_from(count - offsets.len() as u64)
+                .unwrap_or(u32::MAX)
+                .min(10);
+            offsets.extend(self.poll(client, left).await);
+            assert!(
+                Instant::now() < deadline,
+                "the group read {} of {count} messages: {offsets:?}",
+                offsets.len()
+            );
+            sleep(RETRY).await;
+        }
+        offsets
+    }
+
+    async fn store(&self, client: &IggyClient, offset: u64) {
+        let consumer = Consumer::group(named(GROUP));
+        retry(|| {
+            client.store_consumer_offset(
+                &consumer,
+                &self.stream,
+                &self.topic,
+                Some(self.partition),
+                offset,
+            )
+        })
+        .await;
+    }
+
+    async fn offset(&self, client: &IggyClient) -> Option<u64> {
+        client
+            .get_consumer_offset(
+                &Consumer::group(named(GROUP)),
+                &self.stream,
+                &self.topic,
+                Some(self.partition),
+            )
+            .await
+            .ok()
+            .flatten()
+            .map(|offset| offset.stored_offset)
+    }
+
+    async fn wait_for_offset(&self, client: &IggyClient, expected: Option<u64>) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let offset = self.offset(client).await;
+            if offset == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the group's offset stayed {offset:?}, not {expected:?}"
+            );
+            sleep(RETRY).await;
+        }
+    }
+}
+
+/// A reader of one topic of one cluster, read on partition 0, that has no
+/// members in Iggy: a plain consumer, or the external offsets of a group as
+/// the Kafka gateway keeps them.
+struct Reader {
+    consumer: Consumer,
+    stream: Identifier,
+    topic: Identifier,
+}
+
+impl Reader {
+    fn plain((stream, topic): (Identifier, Identifier)) -> Self {
+        Self {
+            consumer: Consumer::new(named(REPORTER)),
+            stream,
+            topic,
+        }
+    }
+
+    fn external((stream, topic): (Identifier, Identifier)) -> Self {
+        Self {
+            consumer: Consumer::external_group(named(KAFKA_GROUP)),
+            stream,
+            topic,
+        }
+    }
+
+    /// Create the Iggy group that holds the external offsets, as the
+    /// gateway does at a Kafka group's first commit to a topic.
+    async fn create_group(&self, client: &IggyClient) {
+        retry(|| async {
+            match client
+                .create_consumer_group(&self.stream, &self.topic, KAFKA_GROUP)
+                .await
+            {
+                Err(IggyError::ConsumerGroupNameAlreadyExists(_, _)) => Ok(()),
+                created => created.map(|_| ()),
+            }
+        })
+        .await;
+    }
+
+    /// One poll of the next `count` messages that commits nothing. Empty
+    /// when the cluster refused the poll.
+    async fn poll_manual(&self, client: &IggyClient, count: u32) -> Vec<u64> {
+        let polled: Vec<u64> = client
+            .poll_messages(
+                &self.stream,
+                &self.topic,
+                0,
+                &self.consumer,
+                &PollingStrategy::next(),
+                PollOptions {
+                    count,
+                    commit: CommitPolicy::Manual,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .map(|polled| {
+                polled
+                    .messages
+                    .iter()
+                    .map(|message| message.header.offset)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if polled.is_empty() {
+            sleep(RETRY).await;
+        }
+        polled
+    }
+
+    /// Store `offset` once, and wait for the answer.
+    async fn store_once(&self, client: &IggyClient, offset: u64) {
+        client
+            .store_consumer_offset(&self.consumer, &self.stream, &self.topic, Some(0), offset)
+            .await
+            .expect("the cluster takes the store");
+    }
+
+    async fn store(&self, client: &IggyClient, offset: u64) {
+        retry(|| {
+            client.store_consumer_offset(&self.consumer, &self.stream, &self.topic, Some(0), offset)
+        })
+        .await;
+    }
+
+    async fn offset(&self, client: &IggyClient) -> Option<u64> {
+        client
+            .get_consumer_offset(&self.consumer, &self.stream, &self.topic, Some(0))
+            .await
+            .ok()
+            .flatten()
+            .map(|offset| offset.stored_offset)
+    }
+
+    async fn wait_for_offset(&self, client: &IggyClient, expected: Option<u64>) {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let offset = self.offset(client).await;
+            if offset == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the reader's offset stayed {offset:?}, not {expected:?}"
+            );
+            sleep(RETRY).await;
+        }
+    }
+}
+
+async fn started_pair(nodes: usize) -> GeoClusterPair {
+    let mut pair = GeoClusterPair::builder()
+        .nodes(nodes)
+        .extra_env("IGGY_GEO_POSITIONS_PUBLISH_INTERVAL", "250ms")
+        .extra_env("IGGY_GEO_POSITIONS_POLL_INTERVAL", "250ms")
+        .extra_env("IGGY_SHARDING_RECONCILE_PERIODIC_INTERVAL", "250ms")
+        .extra_env("IGGY_GEO_MANIFEST_POLL_INTERVAL", "1s")
+        .build()
+        .expect("the pair");
+    pair.start().await.expect("both clusters boot");
+    pair
+}
+
+/// Create the geo topic of `partitions` partitions in `dc-a` and wait until
+/// `dc-b` adopts it.
+async fn create_and_follow(pair: &GeoClusterPair, partitions: u32) -> Ids {
+    let client_a = pair.a().root_client().await.expect("a client of dc-a");
+    client_a
+        .create_stream(STREAM, &StreamCreateOptions::default())
+        .await
+        .expect("create the stream");
+    let topic = pair
+        .a()
+        .create_geo_topic(&client_a, &named(STREAM), TOPIC, partitions)
+        .await
+        .expect("dc-a takes the geo topic");
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    let stream = pair
+        .b()
+        .wait_for_shadow_topic(&client_b, STREAM, topic.id)
+        .await
+        .expect("dc-b adopts the geo topic");
+    Ids {
+        shadow_stream_id: stream.id,
+        topic_id: topic.id,
+    }
+}
+
+/// Send the messages `indexes` to `partition` of the geo topic of `dc-a`,
+/// ten a send.
+async fn send(client: &IggyClient, partition: u32, indexes: std::ops::Range<u64>) {
+    let all: Vec<u64> = indexes.collect();
+    for chunk in all.chunks(10) {
+        let mut messages: Vec<IggyMessage> = chunk
+            .iter()
+            .map(|index| {
+                IggyMessage::builder()
+                    .payload(format!("message-{index}").into_bytes().into())
+                    .build()
+                    .expect("a message")
+            })
+            .collect();
+        client
+            .send_messages(
+                &named(STREAM),
+                &named(TOPIC),
+                &Partitioning::partition_id(partition),
+                &mut messages,
+            )
+            .await
+            .expect("dc-a takes the send");
+    }
+}
+
+/// Wait until the shadow in `dc-b` serves the first `count` messages of
+/// `partition`.
+async fn wait_until_shadow_serves(client: &IggyClient, ids: Ids, partition: u32, count: u64) {
+    let deadline = Instant::now() + DEADLINE;
+    let (stream, topic) = ids.shadow();
+    loop {
+        let served = client
+            .poll_messages(
+                &stream,
+                &topic,
+                partition,
+                &Consumer::default(),
+                &PollingStrategy::offset(count - 1),
+                PollOptions {
+                    count: 1,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            .is_ok_and(|polled| !polled.messages.is_empty());
+        if served {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dc-b never served offset {} of partition {partition}",
+            count - 1
+        );
+        sleep(RETRY).await;
+    }
+}
+
+/// Wait until the bucket of `cluster` holds `offset` as the group's
+/// position on partition 0.
+async fn wait_for_bucket_offset(cluster: &GeoCluster, offset: u64) {
+    wait_for_bucket_offset_on(cluster, 0, offset).await;
+}
+
+/// Wait until the bucket of `cluster` holds `offset` as the group's
+/// position on `partition`, and return the replicas whose objects hold it.
+async fn wait_for_bucket_offset_on(cluster: &GeoCluster, partition: u32, offset: u64) -> Vec<u8> {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let objects = cluster
+            .bucket()
+            .positions_objects()
+            .await
+            .expect("the bucket reads");
+        let replicas: Vec<u8> = objects
+            .iter()
+            .filter(|object| {
+                object
+                    .partitions
+                    .get(&partition)
+                    .and_then(|holders| holders.get(&PositionHolder::Group(GROUP.to_owned())))
+                    .is_some_and(|position| position.value == PositionValue::Offset(offset))
+            })
+            .map(|object| object.key.replica)
+            .collect();
+        if !replicas.is_empty() {
+            return replicas;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bucket of {} never held offset {offset} of partition {partition}: {objects:?}",
+            cluster.origin()
+        );
+        sleep(RETRY).await;
+    }
+}
+
+/// Wait until the bucket of `cluster` holds `offset` as the position of
+/// `holder` on partition 0.
+async fn wait_for_bucket_position(cluster: &GeoCluster, holder: &PositionHolder, offset: u64) {
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let objects = cluster
+            .bucket()
+            .positions_objects()
+            .await
+            .expect("the bucket reads");
+        let held = objects.iter().any(|object| {
+            object
+                .partitions
+                .get(&0)
+                .and_then(|holders| holders.get(holder))
+                .is_some_and(|position| position.value == PositionValue::Offset(offset))
+        });
+        if held {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the bucket of {} never held offset {offset} of {holder:?}: {objects:?}",
+            cluster.origin()
+        );
+        sleep(RETRY).await;
+    }
+}
+
+/// The group's offset on `partition` that the bucket of `cluster` holds, the
+/// highest across the objects of its nodes.
+async fn bucket_offset(cluster: &GeoCluster, partition: u32) -> Option<u64> {
+    cluster
+        .bucket()
+        .positions_objects()
+        .await
+        .expect("the bucket reads")
+        .iter()
+        .filter_map(|object| {
+            match object
+                .partitions
+                .get(&partition)?
+                .get(&PositionHolder::Group(GROUP.to_owned()))?
+                .value
+            {
+                PositionValue::Offset(offset) => Some(offset),
+                PositionValue::Unset | PositionValue::Deleted => None,
+            }
+        })
+        .max()
+}
+
+/// Run `call` until it succeeds, as an SDK does for a retryable refusal.
+async fn retry<F, Fut, T>(mut call: F) -> T
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, IggyError>>,
+{
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        match call().await {
+            Ok(value) => return value,
+            Err(error) => {
+                assert!(Instant::now() < deadline, "still refused: {error}");
+                sleep(RETRY).await;
+            }
+        }
+    }
+}
+
+fn named(name: &str) -> Identifier {
+    Identifier::named(name).expect("a valid identifier")
+}
+
+fn numeric(id: u32) -> Identifier {
+    Identifier::numeric(id).expect("a valid identifier")
+}

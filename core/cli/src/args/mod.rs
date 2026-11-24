@@ -33,6 +33,7 @@ use crate::args::{
     consumer_group::ConsumerGroupAction,
     consumer_offset::ConsumerOffsetAction,
     context::ContextAction,
+    geo::GeoAction,
     message::MessageAction,
     metadata::MetadataAction,
     partition::PartitionAction,
@@ -56,6 +57,7 @@ pub(crate) mod common;
 pub(crate) mod consumer_group;
 pub(crate) mod consumer_offset;
 pub(crate) mod context;
+pub(crate) mod geo;
 pub(crate) mod message;
 pub(crate) mod metadata;
 pub(crate) mod partition;
@@ -208,6 +210,9 @@ pub(crate) enum Command {
     /// cluster operations
     #[command(subcommand, visible_alias = "cl")]
     Cluster(ClusterAction),
+    /// geo peer operations
+    #[command(subcommand)]
+    Geo(GeoAction),
     /// consumer group operations
     #[command(subcommand, visible_alias = "g")]
     ConsumerGroup(ConsumerGroupAction),

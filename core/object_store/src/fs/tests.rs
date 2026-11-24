@@ -709,6 +709,23 @@ fn given_stale_scratch_file_when_listing_should_remove_only_it() {
     );
 }
 
+#[test]
+fn given_stale_scratch_file_when_a_foreign_store_lists_should_keep_it() {
+    let (directory, owner) = store();
+    let parent = directory.path().join("a");
+    shard_runtime().block_on(put(&owner, "a/object", b"x"));
+    let scratch = ".stale.0123456789abcdef0123456789abcdef".to_owned();
+    let file = std::fs::File::create(parent.join(&scratch)).expect("file");
+    file.set_modified(SystemTime::now() - Duration::from_hours(2))
+        .expect("modification time");
+    let foreign = FsStore::foreign(directory.path());
+
+    let listed = shard_runtime().block_on(list_keys(&foreign, "a/", 1000));
+
+    assert_eq!(listed, ["a/object"]);
+    assert_eq!(names(&parent), [scratch, "object".to_owned()]);
+}
+
 #[cfg(unix)]
 #[test]
 fn given_dot_names_and_links_when_listing_should_skip_them() {

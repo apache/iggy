@@ -79,9 +79,7 @@ public `uncertain: usize` field, so struct literals and exhaustive patterns must
 name it. `ConsumerGroupClientState` no longer has its public `partition_count` and
 `set_partition_context` methods.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 ## Mutation recovery
 
@@ -115,7 +113,7 @@ permission check. A fresh application send can duplicate an uncertain operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../server/README.md#metadata-freshness-and-counters).
 
 An explicit sign-in or logout ends earlier calls: unsent calls fail with 40,

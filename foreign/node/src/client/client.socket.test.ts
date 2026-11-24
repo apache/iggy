@@ -98,6 +98,7 @@ const UNAUTHENTICATED = 40;
 const UNAUTHORIZED = 41;
 const WAIT_LIMIT_MS = 2_000;
 const PARTITION_NOT_FOUND = 3007;
+const SHADOW_STREAM_READ_ONLY = 1021;
 /** How long a test server holds a logout reply while the client goes on. */
 const LOGOUT_DELAY_MS = 50;
 /** The error of a request whose link the server closed. */
@@ -2695,6 +2696,26 @@ describe('VSR client socket', () => {
           error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === 88);
       assert.ok(Date.now() <= deadline + 100, 'the original deadline bounds the call');
       assert.ok(framesOf(cluster.primary, Operation.SendMessages).length >= 2);
+    } finally {
+      await cluster.close();
+    }
+  });
+
+  it('sends a batch once that the server refuses as a write to a shadow stream', async () => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt8(REQUEST_OFFSET.operation) !== Operation.SendMessages)
+        return false;
+      socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), SHADOW_STREAM_READ_ONLY));
+      return true;
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await assert.rejects(
+        () => cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend,
+          { deadline: Date.now() + WAIT_LIMIT_MS }),
+        (error: unknown) => error instanceof ResponseError && error.fromServer &&
+          error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === SHADOW_STREAM_READ_ONLY);
+      assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 1, 'the batch went out again');
     } finally {
       await cluster.close();
     }

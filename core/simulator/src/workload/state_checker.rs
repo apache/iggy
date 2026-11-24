@@ -270,7 +270,7 @@ impl StateChecker {
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace)
+                    .peek_by_ns(&namespace)
                     .expect("a journaled partition is hosted");
                 let prepare = partition
                     .log
@@ -692,7 +692,7 @@ pub fn assert_applied_data_agrees(
                 .partition_shard(namespace)
                 .plane
                 .partitions()
-                .get_by_ns(&namespace)
+                .peek_by_ns(&namespace)
             else {
                 continue;
             };
@@ -1334,6 +1334,7 @@ mod tests {
         journal.restore_checkpoint_prepare(
             op,
             server_common::iobuf::Owned::copy_from_slice(&entry).into(),
+            None,
         );
     }
 

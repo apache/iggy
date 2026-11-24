@@ -62,6 +62,12 @@ pub fn sample(
         Outcome::InvalidOptionValue | Outcome::OptionsBlockTooLarge => {
             unreachable!("the simulator only sends an empty update options block")
         }
+        Outcome::InvalidStreamName => {
+            unreachable!("the simulator names no stream with the shadow prefix")
+        }
+        Outcome::ShadowStreamReadOnly => {
+            unreachable!("the simulator has no geo peers, so it holds no shadow stream")
+        }
     }
 }
 
