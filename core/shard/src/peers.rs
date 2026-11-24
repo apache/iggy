@@ -51,7 +51,7 @@ use futures::future::LocalBoxFuture;
 use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError, ReadOnlyStore, TierJobClass};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
-use partitions::{ExecutorObjects, RemoteObjects, RemoteSegments};
+use partitions::{DiskIndexFiles, ExecutorObjects, IndexFiles, RemoteObjects, RemoteSegments};
 
 use crate::IggyShard;
 use crate::shards_table::ShardsTable;
@@ -134,6 +134,8 @@ pub struct PeerStore<B> {
     layout: KeyLayout,
     service: PeerService<B>,
     status: SharedPeerStatus,
+    /// Where the polls of the peer's segments keep the indexes they fetch.
+    index_files: Rc<dyn IndexFiles>,
 }
 
 /// The peers of one shard, in the order of the configuration.
@@ -299,7 +301,16 @@ where
             layout,
             service: TierService::new(store, bus, config),
             status,
+            index_files: Rc::new(DiskIndexFiles),
         }
+    }
+
+    /// Keep the indexes that the polls of the peer's segments fetch in
+    /// `index_files`, and not on the local disk.
+    #[must_use]
+    pub fn with_index_files(mut self, index_files: Rc<dyn IndexFiles>) -> Self {
+        self.index_files = index_files;
+        self
     }
 }
 
@@ -308,6 +319,12 @@ impl<B> PeerStore<B> {
     #[must_use]
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// Where the polls of the peer's segments keep the indexes they fetch.
+    #[must_use]
+    pub fn index_files(&self) -> Rc<dyn IndexFiles> {
+        Rc::clone(&self.index_files)
     }
 
     /// The layout of the peer's root, under its prefix.
@@ -354,6 +371,7 @@ where
     pub fn remote_segments(&self) -> RemoteSegments {
         RemoteSegments::new(Rc::new(self.objects()), self.layout.clone())
             .with_runtime(Rc::new(self.service.bus().clone()))
+            .with_index_files(Rc::clone(&self.index_files))
     }
 
     /// Where the primaries of this peer's shadow partitions read its

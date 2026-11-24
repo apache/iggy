@@ -58,6 +58,7 @@ use message_bus::MessageBus;
 use server_common::SegmentStorage;
 
 use crate::iggy_partition::settle_cleaned_segment;
+use crate::index_files::IndexFiles;
 use crate::long_term::concatenated;
 use crate::poll_plan::PeerSegmentRun;
 use crate::remote_segments::index_file_name;
@@ -117,9 +118,9 @@ impl PeerManifestApplied {
     /// segments fetched.
     /// Best effort: a file that stays is never read again, and the next
     /// start of the partition sweeps it.
-    pub async fn remove_retired_indexes(self) {
+    pub async fn remove_retired_indexes(self, files: &dyn IndexFiles) {
         for path in &self.retired_indexes {
-            let _ = compio::fs::remove_file(path).await;
+            let _ = files.remove(path).await;
         }
     }
 }

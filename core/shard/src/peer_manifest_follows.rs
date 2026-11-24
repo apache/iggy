@@ -47,7 +47,7 @@ use iggy_object_store::PartitionManifest;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::RemoteObjects;
+use partitions::{DiskIndexFiles, IndexFiles, RemoteObjects};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
@@ -196,9 +196,13 @@ where
             };
             let retired = partition.take_retired_peer_indexes();
             if !retired.is_empty() {
+                let files = self.peer_stores().get(origin).map_or_else(
+                    || Rc::new(DiskIndexFiles) as Rc<dyn IndexFiles>,
+                    crate::peers::PeerStore::index_files,
+                );
                 self.bus.spawn(async move {
                     for path in retired {
-                        let _ = compio::fs::remove_file(&path).await;
+                        let _ = files.remove(&path).await;
                     }
                 });
             }

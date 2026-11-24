@@ -1659,25 +1659,39 @@ impl DiskReadPlan {
         path: &str,
     ) -> Result<Option<(IggyIndexReader, u64)>, DiskFault> {
         let SegmentSource::Remote(log) = &segment.source else {
-            return Ok(self.open_local_index(path).await.ok());
+            return Ok(self
+                .counted_index(path, IggyIndexReader::new(path).await)
+                .await
+                .ok());
         };
-        if let Ok((reader, entry_count)) = self.open_local_index(path).await
+        // A shard that has not connected its store yet cannot fetch the
+        // index now, and can once it has.
+        let files = self
+            .remote
+            .as_deref()
+            .ok_or(DiskFault::Retryable)?
+            .index_files();
+        if let Ok((reader, entry_count)) = self.counted_index(path, files.open(path).await).await
             && entry_count > 0
         {
             return Ok(Some((reader, entry_count)));
         }
         self.wait_for_index(segment, log, partition_dir, path)
             .await?;
-        self.open_local_index(path)
+        self.counted_index(path, files.open(path).await)
             .await
             .map(Some)
             .map_err(|()| DiskFault::Retryable)
     }
 
-    async fn open_local_index(&self, path: &str) -> Result<(IggyIndexReader, u64), ()> {
-        let reader = IggyIndexReader::new(path)
-            .await
-            .map_err(|error| self.warn_sparse_index_fallback(path, "open", &error))?;
+    /// The index that `opened` gives, with its number of entries.
+    async fn counted_index(
+        &self,
+        path: &str,
+        opened: Result<IggyIndexReader, IggyError>,
+    ) -> Result<(IggyIndexReader, u64), ()> {
+        let reader =
+            opened.map_err(|error| self.warn_sparse_index_fallback(path, "open", &error))?;
         let entry_count = reader
             .entry_count()
             .await

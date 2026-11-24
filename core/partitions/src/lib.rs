@@ -49,6 +49,8 @@ pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
 pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
+mod index_files;
+pub use index_files::{DiskIndexFiles, IndexFile, IndexFiles};
 mod read_runtime;
 pub use read_runtime::ReadRuntime;
 mod remote_segments;

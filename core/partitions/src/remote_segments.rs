@@ -34,7 +34,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
@@ -42,16 +41,16 @@ use iggy_object_store::{
     ErrorClass, KeyLayout, LongTermKey, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey,
     SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
 };
-use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::poll::PollHistoryId;
 use tracing::{error, warn};
 
 use crate::iggy_index::IGGY_INDEX_SIZE;
+use crate::index_files::{DiskIndexFiles, IndexFiles};
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
 use crate::read_runtime::{CompioRuntime, ReadRuntime};
-use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
+use crate::state_transfer::STAGING_SUFFIX;
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
 /// so every response can be checked on its own.
@@ -459,6 +458,7 @@ pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
     layout: KeyLayout,
     runtime: Rc<dyn ReadRuntime>,
+    index_files: Rc<dyn IndexFiles>,
     /// See [`INDEX_GET_TIMEOUT`].
     pub(crate) index_get_timeout: Duration,
     fresh: RefCell<FreshCache>,
@@ -466,13 +466,16 @@ pub struct RemoteSegments {
 
 impl RemoteSegments {
     /// Reads of `objects` that run on the compio runtime and the system
-    /// clock, until [`Self::with_runtime`] gives them another.
+    /// clock, until [`Self::with_runtime`] gives them another, and keep the
+    /// fetched indexes on the local disk, until [`Self::with_index_files`]
+    /// gives them another place.
     #[must_use]
     pub fn new(objects: Rc<dyn RemoteObjects>, layout: KeyLayout) -> Self {
         Self {
             objects,
             layout,
             runtime: Rc::new(CompioRuntime),
+            index_files: Rc::new(DiskIndexFiles),
             index_get_timeout: INDEX_GET_TIMEOUT,
             fresh: RefCell::new(FreshCache::new(FRESH_CACHE_BYTES)),
         }
@@ -489,6 +492,19 @@ impl RemoteSegments {
     /// The clock, the timer and the task spawner of the reads.
     pub(crate) fn runtime(&self) -> &dyn ReadRuntime {
         &*self.runtime
+    }
+
+    /// Keep the fetched indexes in `index_files`.
+    #[must_use]
+    pub fn with_index_files(mut self, index_files: Rc<dyn IndexFiles>) -> Self {
+        self.index_files = index_files;
+        self
+    }
+
+    /// Where the fetched indexes are.
+    #[must_use]
+    pub fn index_files(&self) -> &dyn IndexFiles {
+        &*self.index_files
     }
 
     /// Keep at most `budget` bytes of fresh objects in memory.
@@ -721,24 +737,25 @@ impl RemoteSegments {
         let written = self
             .stage_index(&key, log.len(), start_offset, &staging)
             .await;
+        let files = self.index_files();
         if written.is_err() {
             // Best effort: the staging sweeps remove what this leaves behind.
-            let _ = compio::fs::remove_file(&staging).await;
+            let _ = files.remove(&staging).await;
             return written;
         }
         if !fetch.may_publish() {
-            let _ = compio::fs::remove_file(&staging).await;
+            let _ = files.remove(&staging).await;
             return Err(DiskFault::Retryable);
         }
-        let renamed = compio::fs::rename(&staging, index_path).await;
+        let renamed = files.rename(&staging, index_path).await;
         if renamed.is_ok() && fetch.segment_retired() {
             // Retention unlinked the segment's files while the rename was in
             // flight, and may have looked for this one before it existed.
-            let _ = compio::fs::remove_file(index_path).await;
+            let _ = files.remove(index_path).await;
             return Err(DiskFault::Retryable);
         }
         let renamed = match renamed {
-            Ok(()) => fsync_dir(partition_dir).await,
+            Ok(()) => files.sync_directory(partition_dir).await,
             Err(error) => Err(error),
         };
         renamed.map_err(|error| {
@@ -760,9 +777,10 @@ impl RemoteSegments {
         start_offset: u64,
         staging: &str,
     ) -> Result<(), DiskFault> {
-        let mut file = compio::fs::File::create(staging)
+        let mut file = self
+            .index_files()
+            .create(staging)
             .await
-            .note_descriptor_exhaustion(|| format!("creating {staging}"))
             .map_err(|error| local_fault(staging, &error))?;
         let mut check = IndexCheck::new(start_offset, segment_size);
         let mut at = 0;
@@ -803,14 +821,15 @@ impl RemoteSegments {
                 );
                 return Err(DiskFault::Tiered);
             }
-            let compio::BufResult(result, _) = file.write_all_at(object.bytes, at).await;
-            result.map_err(|error| local_fault(staging, &error))?;
+            file.write_at(object.bytes, at)
+                .await
+                .map_err(|error| local_fault(staging, &error))?;
             at += expected;
             if at == size {
                 break;
             }
         }
-        file.sync_all()
+        file.sync()
             .await
             .map_err(|error| local_fault(staging, &error))
     }

@@ -384,7 +384,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
         segments_counted - 2
     );
     assert_eq!(Box::pin(polls_up_to(&mut follower, 9)).await, before);
-    Box::pin(applied.remove_retired_indexes()).await;
+    Box::pin(applied.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(first_index.exists(), "the first segment stayed");
 
     let front = Box::pin(store_merged(&origin.store, &[segments[0], middle])).await;
@@ -407,7 +407,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
         segments_counted - 3
     );
     assert_eq!(Box::pin(polls_up_to(&mut follower, 9)).await, before);
-    Box::pin(applied.remove_retired_indexes()).await;
+    Box::pin(applied.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(
         !first_index.exists(),
         "the index of a replaced segment is retired"

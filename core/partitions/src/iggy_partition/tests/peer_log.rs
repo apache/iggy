@@ -507,7 +507,7 @@ async fn given_a_read_of_a_segment_a_trim_dropped_when_completing_should_refuse_
         Box::pin(polled(&mut follower, PollingStrategy::offset(0), 10)).await,
         new_front
     );
-    Box::pin(trimmed.remove_retired_indexes()).await;
+    Box::pin(trimmed.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(!directory.path().join(format!("{:020}.index", 0)).exists());
 }
 
