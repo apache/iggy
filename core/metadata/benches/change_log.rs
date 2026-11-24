@@ -32,7 +32,7 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest,
 };
 use iggy_binary_protocol::requests::users::CreateUserRequest;
-use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
 use iggy_binary_protocol::{
     Command, Operation, PrepareHeader, WireEncode, WireIdentifier, WireName, WireOptions,
 };
@@ -46,7 +46,7 @@ use metadata::change_log::{
 };
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::Streams;
-use metadata::stm::user::{ROOT_USER_CREATED_AT_MICROS, Users};
+use metadata::stm::user::{ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS, Users};
 use metadata::{MuxStateMachine, apply_committed_prepare};
 use server_common::Message;
 use server_common::iobuf::Owned;
@@ -151,7 +151,10 @@ fn record_sizes(replica: &mut Replica) {
         ROOT_CLIENT,
         Operation::Register,
         &RegisterRequest {
-            user_created_at: ROOT_USER_CREATED_AT_MICROS,
+            credential: CredentialProof::account(
+                ROOT_USER_CREATED_AT_MICROS,
+                ROOT_USER_ACCESS_REVISION,
+            ),
             bind_verifier: [0x5a; 32],
         },
     );

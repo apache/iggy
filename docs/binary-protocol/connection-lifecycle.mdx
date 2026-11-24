@@ -3,7 +3,7 @@ title: Connection lifecycle
 description: "How the protocol version is packed and checked, and the login-register handshake that authenticates a connection."
 ---
 
-Server 0.10.0 uses binary protocol 0.12.0. Clients must use a compatible release.
+Server 0.10.0 accepts client protocol 0.12.2. Server 0.10.1-edge.2 accepts client protocol 0.12.3.
 
 ## Protocol version
 
@@ -17,7 +17,7 @@ bits  9..0   patch
 value = major << 20 | minor << 10 | patch
 ```
 
-Integer order equals semver order. The value tracks the `iggy_binary_protocol` crate release. Under 0.x the compatibility gate is minor-scoped: the server accepts a client whose packed version is at least the server's minimum and whose `major.minor` is at most the server's. Patch releases never change the wire, so the upper bound ignores patch. The implemented minimum is the current version with its patch component zeroed. Compatibility across minor versions after 1.0.0 requires a future change to that calculation.
+The server checks the packed value against its inclusive minimum and maximum, including the patch component. The SDK package has its own version number.
 
 ## Login-register
 
@@ -82,4 +82,6 @@ BindSession, code 15, authenticates another connection for the same logical sess
 
 The client creates and protects the random binding secret for its session. The server stores a verifier. Session zero can resolve a lost registration reply using this retained secret. Binding supports connections to different partition primaries while preserving one session identity.
 
-Transport loss alone does not end a retained session. Logout, session expiry and account deactivation do. A password or PAT change does not revoke an already established session. Once the original session ends, unresolved operations cannot recover their old receipts through a new login.
+Transport loss alone does not end a retained session. Logout, session expiry and account deactivation do. On server 0.10.0, a password or PAT change leaves established sessions active. Once the original session ends, unresolved operations cannot recover their old receipts through a new login.
+
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.

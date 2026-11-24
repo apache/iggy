@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::namespace::PrimaryLookup;
 use crate::reply_frame::current_metadata_commit;
 use crate::shell::{ShellBus, ShellShard};
 use consensus::MetadataHandle;
@@ -84,7 +85,7 @@ where
     };
     let result = shard::bus_timeout(&shard.bus, SEGMENT_DELETE_TIMEOUT, async {
         let Some(PartitionReadReply::Primary { primary, .. }) =
-            crate::namespace::partition_primary(shard, namespace).await
+            crate::namespace::partition_primary(shard, namespace, PrimaryLookup::Hold).await
         else {
             return Err(IggyError::TransientNotAccepted);
         };
