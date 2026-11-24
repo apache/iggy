@@ -36,10 +36,11 @@ pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSI
 
 // Visibility rule: `pub` = named external consumer. main.rs consumes
 // `VERSION`, `boot` (including `boot::systemd`) and `server_error`; the
-// simulator consumes `shell`, `boot::ServerHost` and the reconciler exports
+// simulator consumes `shell`, `boot::ServerHost`, the reconciler exports
 // (`LifecycleReports`, `reconcile_partition_lifecycles`,
-// `reconcile_pending_revocations`). Everything else is internal to the
-// crate.
+// `reconcile_pending_revocations`) and the store wiring
+// (`serve_tiered_storage`, `TierHandlers`, `own_cluster_uid`). Everything
+// else is internal to the crate.
 
 // boot: process entry, shard threads, recovery orchestration.
 pub mod boot;
@@ -87,8 +88,10 @@ pub(crate) mod segment_cleaner;
 pub(crate) mod shadow_topics;
 pub(crate) mod snapshot;
 pub(crate) mod store_identity;
+pub use store_identity::{TierHandlers, own_cluster_uid};
 pub(crate) mod sysinfo_printer;
 pub(crate) mod tiered_storage;
+pub use tiered_storage::serve as serve_tiered_storage;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;
