@@ -23,6 +23,7 @@ import org.apache.iggy.client.blocking.IggyBaseClient;
 import org.apache.iggy.client.blocking.UsersClient;
 import org.apache.iggy.client.blocking.UsersClientBaseTest;
 import org.apache.iggy.exception.IggyAuthenticationException;
+import org.apache.iggy.user.UserInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -30,6 +31,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class UsersTcpClientTest extends UsersClientBaseTest {
+
+    private static final int MAX_SIGN_IN_PAUSE_MILLIS = 60;
+    private static final int SIGN_IN_PAUSE_STEP_MILLIS = 3;
 
     protected UsersClient usersClient;
 
@@ -48,5 +52,18 @@ class UsersTcpClientTest extends UsersClientBaseTest {
         assertThatThrownBy(() -> usersClient.login("iggy", "invalid-password"))
                 .isInstanceOf(IggyAuthenticationException.class);
         assertThat(usersClient.login("iggy", "iggy").userId()).isEqualTo(0L);
+    }
+
+    // After a sign-in the client attaches its session to the partition primaries in the background. The pauses
+    // walk the second sign-in across that attach, which must not end the session the second sign-in replaces.
+    @Test
+    void shouldSignInAgainWhileThePreviousSignInStillAttachesItsSession() throws InterruptedException {
+        for (int pauseMillis = 0; pauseMillis <= MAX_SIGN_IN_PAUSE_MILLIS; pauseMillis += SIGN_IN_PAUSE_STEP_MILLIS) {
+            usersClient.login("iggy", "iggy");
+            Thread.sleep(pauseMillis);
+
+            assertThat(usersClient.login("iggy", "iggy").userId()).isEqualTo(0L);
+            assertThat(usersClient.getUsers()).map(UserInfo::username).contains("iggy");
+        }
     }
 }
