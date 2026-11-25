@@ -17,9 +17,9 @@
 
 //! Partition reconciliation loop.
 //!
-//! One task per shard. On wake (commit tick or periodic safety tick), it
-//! checks each namespace of its work set against committed `Streams` STM and
-//! local `IggyPartitions`:
+//! One task per shard. On wake (commit tick, periodic safety tick or due
+//! repair step), it checks each namespace of its work set against committed
+//! `Streams` STM and local `IggyPartitions`:
 //! - non-owned namespaces: seed `shards_table` row pointing at owner.
 //! - owned namespaces: `build_partition_fresh` then enqueue
 //!   `ReconcileOp::InsertOwned` for pump-side apply.
@@ -179,10 +179,10 @@
 //!
 //! TODO(krishna): `serves_committed_incarnation` and the park stamp both call
 //! `Streams::created_revision_for_namespace`, now on the per-request fence path.
-//! It indexes directly and falls back to a scan only if partition ids are not
-//! dense, so the common case is O(1) -- but nothing in the type enforces that
-//! density, and a future sparse layout silently reverts every fenced request to a
-//! full scan. It wants a partition-id-keyed map in the STM.
+//! It indexes directly and falls back to a binary search only if partition ids
+//! are not dense, so the common case is O(1) -- but nothing in the type enforces
+//! that density, and a future sparse layout silently reverts every fenced request
+//! to that search. It wants a partition-id-keyed map in the STM.
 //!
 //! TODO(krishna): the transient deny answers with `IggyError::TransientNotAccepted`,
 //! which makes the SDK refresh its route and replay within the operation deadline.
@@ -250,7 +250,9 @@ const BACKOFF_BASE: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_mins(1);
 const GROUP_OFFSET_DELETES_PER_PASS: usize = 32;
 
-/// Checks between two yields to the shard's other tasks.
+/// Checks between two yields to the shard's other tasks. Also the size of a
+/// repair slice: the tree visits, the slots or the routing rows that one
+/// repair step reads.
 const VISITS_PER_YIELD: usize = 1_024;
 
 /// Checks with disk work (a build or a teardown) in one pass. The task runs
@@ -262,9 +264,9 @@ const DISK_VISITS_PER_PASS: usize = 64;
 /// the next repair cycle.
 const REPAIR_INTERVAL: Duration = Duration::from_mins(10);
 
-/// Time from the end of the round over one repair slice to the next slice. A
-/// pass starts at most one slice, so an idle shard starts one per periodic
-/// tick.
+/// Time from the end of the round over one repair slice to the next slice.
+/// The task wakes for a due slice, so the periodic tick does not set the
+/// pace of a cycle.
 const REPAIR_SLICE_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Consecutive same-cause failures before [`ReconcilerCtx::record_failure`]
@@ -568,12 +570,22 @@ impl ReconcilerCtx {
 
     /// The wait from the end of a full round to the first repair cycle after
     /// it. The full rounds of a node's shards end together at boot, so each
-    /// shard waits a different share of the interval longer. The shards then
-    /// do not run their slices in the same second.
+    /// shard waits a different share of the interval longer. That separates
+    /// only the starts: a cycle that lasts longer than the offset overlaps
+    /// the cycle of the next shard.
     fn first_cycle_delay(&self) -> Duration {
         let offset = REPAIR_INTERVAL * u32::from(self.shard.id)
             / u32::from(self.partition_shards.shard_count());
         REPAIR_INTERVAL + offset
+    }
+
+    /// The wait from the end of a pass to the next one when nothing wakes
+    /// the task: the periodic tick, or the time to the next repair step when
+    /// that step is due sooner.
+    fn pass_delay(&self, periodic: Duration) -> Duration {
+        self.next_repair_at.get().map_or(periodic, |at| {
+            periodic.min(at.saturating_duration_since(Instant::now()))
+        })
     }
 
     /// Warns when the repair acted on `ns` although no change announced it,
@@ -678,6 +690,8 @@ pub type WakeRx = Receiver<()>;
 /// One initial reconcile before the wait loop so a shard that comes up
 /// before shard 0's first `MetadataCommitTick` still converges. A pass that
 /// stopped at `DISK_VISITS_PER_PASS` is followed by the next one at once.
+/// The task also wakes for a due repair step, so a repair cycle does not
+/// wait for the periodic tick.
 pub async fn run_reconciler(
     ctx: Rc<ReconcilerCtx>,
     wake_rx: WakeRx,
@@ -700,7 +714,7 @@ pub async fn run_reconciler(
             capped = reconcile_once(&ctx).await;
             continue;
         }
-        let sleep = ctx.shard.bus.sleep(periodic);
+        let sleep = ctx.shard.bus.sleep(ctx.pass_delay(periodic));
         // Biased for the same reason as the shard pump: unbiased `select!`
         // polls arms in process-random order, which a deterministic
         // simulator cannot seed. Listed order is the intended priority.
@@ -960,7 +974,7 @@ fn committed_slice(
     cycle: &mut RepairCycle,
     position: TreePosition,
 ) -> RepairWalk {
-    let mut slice = Vec::new();
+    let mut slice = Vec::with_capacity(VISITS_PER_YIELD);
     let next = read_committed_targets(ctx, position, &mut slice);
     let partitions = ctx.shard.plane.partitions();
     for ns in &slice {
@@ -978,13 +992,11 @@ fn committed_slice(
 /// Compares the mounted partitions of the next `VISITS_PER_YIELD` slots with
 /// committed metadata.
 fn mounted_slice(ctx: &ReconcilerCtx, cycle: &mut RepairCycle, first_slot: usize) -> RepairWalk {
-    let slots: Vec<Option<IggyNamespace>> = ctx
+    let slots = ctx
         .shard
         .plane
         .partitions()
-        .slot_namespaces(first_slot)
-        .take(VISITS_PER_YIELD)
-        .collect();
+        .slot_namespaces(first_slot, VISITS_PER_YIELD);
     cycle.mounted += slots.iter().flatten().count();
     cycle.unmatched += add_unmatched(ctx, slots.iter().flatten().copied());
     if slots.len() < VISITS_PER_YIELD {
@@ -2933,15 +2945,16 @@ mod tests {
     use super::{
         CommittedTarget, Convergence, DISK_VISITS_PER_PASS, FailureCause, FailureRecord,
         FullRoundTrigger, GROUP_OFFSET_DELETES_PER_PASS, LIFECYCLE_FENCE_RETRY_MICROS,
-        PassCounters, REPAIR_INTERVAL, ReconcilerCtx, RepairCycle, RepairWalk, TreePosition,
-        VISITS_PER_YIELD, build_partition_fresh, delete_partitions_from_disk,
-        fetch_partition_build_inputs, fill_pending, fold_changes, group_offset_delete_request,
-        read_committed_targets, reconcile_group_offsets, reconcile_once,
-        reconcile_partition_lifecycles, reconcile_pending_revocations,
-        reconcile_retired_lifecycles, reconcile_target, repair_step, visit_pending,
+        PassCounters, REPAIR_INTERVAL, REPAIR_SLICE_INTERVAL, ReconcilerCtx, RepairCycle,
+        RepairWalk, TreePosition, VISITS_PER_YIELD, build_partition_fresh,
+        delete_partitions_from_disk, fetch_partition_build_inputs, fill_pending, fold_changes,
+        group_offset_delete_request, read_committed_targets, reconcile_group_offsets,
+        reconcile_once, reconcile_partition_lifecycles, reconcile_pending_revocations,
+        reconcile_retired_lifecycles, reconcile_target, repair_step, run_reconciler, visit_pending,
     };
     use bytes::Bytes;
     use configs::server::ServerConfig;
+    use configs::sharding::RECONCILE_PERIODIC_INTERVAL_MAX;
     use consensus::{
         MetadataHandle, PartitionsHandle, PlaneKind, Sequencer, StateTransferStage, Status,
     };
@@ -6709,6 +6722,89 @@ mod tests {
                 "shard {shard_id}"
             );
         }
+    }
+
+    /// The task sleeps to the next repair step when that step is due before
+    /// the periodic tick, so the tick does not set the pace of a cycle. The
+    /// pass after the sleep takes the due step and moves the next one
+    /// forward, so a wait of zero cannot repeat.
+    #[compio::test]
+    async fn given_a_repair_cycle_when_the_task_sleeps_should_wake_for_the_next_slice() {
+        const PERIODIC: Duration = RECONCILE_PERIODIC_INTERVAL_MAX;
+        let tmp = TempDir::new().unwrap();
+        let (_shard, ctx) = build_routing_only_shard(&tmp, 1).await;
+        assert_eq!(
+            ctx.pass_delay(PERIODIC),
+            PERIODIC,
+            "the first cycle is further away than a tick"
+        );
+
+        repair_pass(&ctx).await;
+        let slices = ctx.repair_cycle.get().expect("the cycle started").slices;
+        assert!(
+            ctx.pass_delay(PERIODIC) <= REPAIR_SLICE_INTERVAL,
+            "the next slice is due before the tick"
+        );
+
+        let due = Instant::now();
+        ctx.next_repair_at.set(Some(due));
+        assert_eq!(ctx.pass_delay(PERIODIC), Duration::ZERO);
+        reconcile_pass(&ctx).await;
+        assert_eq!(
+            ctx.repair_cycle.get().expect("the cycle goes on").slices,
+            slices + 1,
+            "the pass after the sleep must take the due slice"
+        );
+        assert!(
+            ctx.next_repair_at.get().is_some_and(|next| next > due),
+            "the pass must move the next step forward"
+        );
+
+        repair_slices(&ctx).await;
+        repair_pass(&ctx).await;
+        assert!(ctx.repair_cycle.get().is_none(), "the cycle ended");
+        assert_eq!(
+            ctx.pass_delay(PERIODIC),
+            PERIODIC,
+            "the next cycle is further away than a tick"
+        );
+    }
+
+    /// A cycle of three slices that waits one tick per slice takes more than
+    /// a minute at the longest tick. The loop must run it without the tick.
+    #[compio::test]
+    async fn given_the_longest_tick_when_a_repair_cycle_is_due_should_run_every_slice_before_the_tick()
+     {
+        const CYCLE_TIME_MAX: Duration = Duration::from_secs(10);
+        let tmp = TempDir::new().unwrap();
+        let (_shard, ctx) = build_routing_only_shard(&tmp, 1).await;
+        let ctx = Rc::new(ctx);
+        ctx.next_repair_at.set(Some(Instant::now()));
+        let (_wake_tx, wake_rx) = shard::channel::<()>(1);
+        let (stop_tx, stop_rx) = shard::channel::<()>(1);
+        let task = compio::runtime::spawn(run_reconciler(
+            Rc::clone(&ctx),
+            wake_rx,
+            stop_rx,
+            RECONCILE_PERIODIC_INTERVAL_MAX,
+        ));
+
+        let cycle = compio::time::timeout(CYCLE_TIME_MAX, async {
+            let mut started = false;
+            while !started || ctx.repair_cycle.get().is_some() {
+                started |= ctx.repair_cycle.get().is_some();
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        stop_tx.try_send(()).expect("the stop channel has room");
+        task.await.expect("the reconciler task must not panic");
+
+        assert!(
+            cycle.is_ok(),
+            "the cycle must end within {CYCLE_TIME_MAX:?} at a tick of \
+             {RECONCILE_PERIODIC_INTERVAL_MAX:?}"
+        );
     }
 
     /// A committed truncate reaches its partition through the change feed. The

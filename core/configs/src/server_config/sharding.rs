@@ -182,10 +182,8 @@ pub struct ShardingConfig {
     /// from shard 0. The tick retries partitions that a pass left unfinished
     /// (a backed-off build, an incomplete trim), checks local changes that no
     /// commit announces, ages parked requests, and covers dropped wake-ups
-    /// (the wake channel is capacity-1). On an idle shard it also paces the
-    /// partition repair, which starts at most one slice per pass. Values
-    /// above [`RECONCILE_PERIODIC_INTERVAL_MAX`] are rejected by the
-    /// validator.
+    /// (the wake channel is capacity-1). Values above
+    /// [`RECONCILE_PERIODIC_INTERVAL_MAX`] are rejected by the validator.
     #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub reconcile_periodic_interval: IggyDuration,

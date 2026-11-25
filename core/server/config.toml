@@ -927,9 +927,12 @@ shutdown_join_timeout = "30 s"
 # wakes on every metadata commit from shard 0. The tick retries partitions
 # that a pass left unfinished (a backed-off build, an incomplete trim),
 # checks local changes that no commit announces, ages parked requests and
-# covers dropped wake-ups. A repair checks every partition again in small
-# slices, at most one per pass and per 250 ms, so this tick sets its pace on
-# an idle shard. The repair starts again 10 minutes after it ended.
+# covers dropped wake-ups. The reconciler also compares every partition
+# with committed metadata again in the background, and this tick does not
+# change the pace of that. It reads 1,024 entries (streams, topics,
+# partitions, routing rows) every 250 ms, and starts again 10 minutes after
+# it ended. The time for all partitions grows with their number: about 17
+# minutes at one million streams of one partition each.
 reconcile_periodic_interval = "1 s"
 
 # WebSocket listener configuration. The frame-tuning knobs below are the

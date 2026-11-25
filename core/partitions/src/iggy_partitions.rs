@@ -1429,18 +1429,18 @@ where
         self.slots().iter().flatten().map(|slot| &slot.namespace)
     }
 
-    /// One item per slot from `first_slot` on, in slot order: the namespace
-    /// of the partition there, `None` for a vacant slot. A walk in parts
-    /// bounds the slots it reads with this, and goes on at the slot after the
-    /// last one it read.
-    pub fn slot_namespaces(
-        &self,
-        first_slot: usize,
-    ) -> impl Iterator<Item = Option<IggyNamespace>> {
+    /// One item per slot for up to `limit` slots from `first_slot` on, in
+    /// slot order: the namespace of the partition there, `None` for a vacant
+    /// slot. A walk in parts goes on at the slot after the last one it read.
+    /// Returns copies, so no borrow of the slots outlives the call and an
+    /// insert between two parts cannot invalidate one.
+    pub fn slot_namespaces(&self, first_slot: usize, limit: usize) -> Vec<Option<IggyNamespace>> {
         self.slots()
             .iter()
             .skip(first_slot)
+            .take(limit)
             .map(|slot| slot.as_ref().map(|slot| slot.namespace))
+            .collect()
     }
 
     /// The partition of `namespace`, tombstoned or not, with what its shard
@@ -3023,12 +3023,15 @@ mod tests {
         let partitions = shard_with(&[five, six, seven]);
         drop(partitions.remove(&six));
 
-        let slots = |first_slot| partitions.slot_namespaces(first_slot).collect::<Vec<_>>();
+        let slots = |first_slot, limit| partitions.slot_namespaces(first_slot, limit);
 
-        assert_eq!(slots(0), [Some(five), None, Some(seven)]);
-        assert_eq!(slots(1), [None, Some(seven)]);
-        assert_eq!(slots(3), []);
-        assert_eq!(slots(usize::MAX), []);
+        assert_eq!(slots(0, usize::MAX), [Some(five), None, Some(seven)]);
+        assert_eq!(slots(1, usize::MAX), [None, Some(seven)]);
+        assert_eq!(slots(0, 2), [Some(five), None], "a vacant slot counts");
+        assert_eq!(slots(2, 2), [Some(seven)]);
+        assert_eq!(slots(0, 0), []);
+        assert_eq!(slots(3, usize::MAX), []);
+        assert_eq!(slots(usize::MAX, usize::MAX), []);
     }
 
     /// The slot array holds boxes, so its growth moves pointers and never a
