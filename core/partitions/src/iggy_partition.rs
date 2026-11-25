@@ -5092,10 +5092,10 @@ where
     }
 
     /// Admit an automatic commit without advancing this read's progress.
-    /// `Some` carries an assigned prepare. `None` means the request is queued
-    /// or the durable offset already covers it, both of which leave the
-    /// caller free to apply local progress. Errors release any provisional
-    /// guard.
+    /// `Some` carries an assigned prepare. `None` means the request is queued,
+    /// merged into one that is, or the durable offset already covers it, all
+    /// of which leave the caller free to apply local progress. Errors release
+    /// any provisional guard.
     fn admit_poll_auto_commit(
         &self,
         kind: ConsumerKind,
@@ -5165,6 +5165,10 @@ where
         if self.local_request_must_queue()
             || self.consumer_offset_is_blocked(kind, consumer_id, Some(offset), true)
         {
+            let Err(request) = self.merge_queued_auto_commit(kind, consumer_id, offset, request)
+            else {
+                return Ok(None);
+            };
             let context = AutoCommitRequestContext { reservation };
             self.queue_local_request(
                 consensus::RequestEntry::with_auto_commit(request, context),
@@ -5181,6 +5185,71 @@ where
                 reservation,
             }))
         }
+    }
+
+    /// Fold the commit-on-read `request` of the consumer into its commit-on-read
+    /// store that still waits in the request queue, raising that store's offset
+    /// to `offset`. Returns `request` when there is none to fold into.
+    ///
+    /// A consumer's stores prepare one at a time, so with offsets that wait for
+    /// a flush each queued store would pay a flush of its own, and a consumer
+    /// that reads faster than the disk flushes would fill the queue with
+    /// stores that the latest one supersedes. Commit-on-read stores apply as a
+    /// maximum, so one store of the highest offset commits the same.
+    ///
+    /// Only the consumer's last queued offset operation takes the fold, and
+    /// only a commit-on-read store of the same owner: an explicit store or
+    /// delete queued after it must still land between the two. An ack-less
+    /// operation of the consumer, which waits outside the request queue in
+    /// the same order, prevents it too. So does an offset beyond the stored
+    /// messages, which could need a send queued behind the store.
+    fn merge_queued_auto_commit(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: u64,
+        request: Message<RoutedRequestHeader>,
+    ) -> Result<(), Message<RoutedRequestHeader>> {
+        if self.store_offset_range_error(kind, offset).is_some()
+            || self.no_ack.iter().any(|pending| {
+                pending.pending.kind == kind && pending.pending.consumer_id == consumer_id
+            })
+        {
+            return Err(request);
+        }
+        self.consensus.with_pipeline_mut(|pipeline| {
+            let Some(queued) = pipeline.last_request_mut(|queued| {
+                Self::parse_consumer_offset_request(
+                    queued.message.header().operation,
+                    &queued.message,
+                )
+                .is_ok_and(|(queued_kind, queued_id, _, _)| {
+                    queued_kind == kind && queued_id == consumer_id
+                })
+            }) else {
+                return Err(request);
+            };
+            let queued_offset = Self::parse_consumer_offset_request(
+                queued.message.header().operation,
+                &queued.message,
+            )
+            .ok()
+            .and_then(|(_, _, queued_offset, _)| queued_offset);
+            let (Some(queued_offset), Some(_)) = (queued_offset, queued.auto_commit()) else {
+                return Err(request);
+            };
+            let (queued_header, header) = (queued.message.header(), request.header());
+            if queued_header.operation != Operation::StoreConsumerOffset
+                || queued_header.owner_generation != header.owner_generation
+                || queued_header.size != header.size
+            {
+                return Err(request);
+            }
+            if offset > queued_offset {
+                queued.message = request;
+            }
+            Ok(())
+        })
     }
 
     fn next_local_request_order(&self) -> Result<LocalRequestOrder, IggyError> {
