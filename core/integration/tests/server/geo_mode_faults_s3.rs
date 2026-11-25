@@ -28,6 +28,7 @@ use tokio::io::copy_bidirectional;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{oneshot, watch};
 
+use super::http_client::HttpClient;
 use crate::server::scenarios::geo_mode_faults_scenario::{
     Answer, Bucket, Ledger, RawSender, StoreFault, Topics, assert_settled,
     produce_through_store_fault,
@@ -35,6 +36,10 @@ use crate::server::scenarios::geo_mode_faults_scenario::{
 
 const MESSAGES: u64 = 20;
 const MESSAGE_BYTES: usize = 1024;
+/// About 12 MiB in all, more than twice the smallest part size, so a
+/// long-term segment of them goes up in parts.
+const LARGE_MESSAGES: u64 = 24;
+const LARGE_MESSAGE_BYTES: usize = 512 * 1024;
 
 #[tokio::test]
 async fn given_a_geo_topic_on_s3_when_producing_should_store_the_sends_and_read_each_once_from_long_term_segments()
@@ -67,6 +72,62 @@ async fn given_a_geo_topic_on_s3_when_producing_should_store_the_sends_and_read_
     }
 
     assert_settled(&client, &topics, &geo, &bucket).await;
+}
+
+/// Floci takes S3 multipart uploads with a full object CRC32C and a
+/// conditional completion, so a long-term segment above twice the part size
+/// goes up in parts and reads back whole.
+#[tokio::test]
+async fn given_a_geo_topic_on_s3_when_a_long_term_segment_is_large_should_store_it_in_parts_and_read_it_back()
+ {
+    let mut harness = server_with_s3_store(&[("IGGY_TIERED_STORAGE_PART_SIZE", "5 MiB")]);
+    harness.start().await.expect("the server boots");
+    let bucket = Bucket::S3(
+        harness
+            .tiered_storage_bucket()
+            .expect("the harness makes a bucket for the s3 backend")
+            .clone(),
+    );
+    let client = harness.tcp_root_client().await.expect("tcp root client");
+    let topics = Topics::create(&client, "geo-s3-parts").await;
+
+    let mut geo = Ledger::default();
+    for _ in 0..LARGE_MESSAGES {
+        assert_eq!(
+            geo.send(&client, &topics.stream, &topics.geo, LARGE_MESSAGE_BYTES)
+                .await,
+            Answer::Acked
+        );
+    }
+
+    assert_settled(&client, &topics, &geo, &bucket).await;
+    let http = HttpClient::login_root(&harness).await;
+    let exposition = http
+        .get("/metrics")
+        .await
+        .text()
+        .await
+        .expect("the metrics text");
+    let completed = summed(&exposition, "object_store_parts_uploads_completed_total");
+    assert!(
+        completed >= 1,
+        "no upload in parts completed:\n{exposition}"
+    );
+    assert_eq!(
+        summed(&exposition, "object_store_parts_fallbacks_total"),
+        0,
+        "the store took the uploads in parts"
+    );
+}
+
+/// The sum of the samples of `name` over every shard.
+fn summed(exposition: &str, name: &str) -> u64 {
+    exposition
+        .lines()
+        .filter_map(|line| line.strip_prefix(name))
+        .filter_map(|rest| rest.rsplit_once(' '))
+        .filter_map(|(_, value)| value.parse::<u64>().ok())
+        .sum()
 }
 
 /// The relay between the server and Floci holds every connection while the

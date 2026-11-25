@@ -18,6 +18,8 @@
 //! The store that the jobs of a tier service get: the provider, with the
 //! timeouts and retries that [`ObjectStore`] leaves to its caller.
 
+mod parts;
+
 use std::cell::Cell;
 use std::future::{Future, poll_fn};
 use std::io;
@@ -31,18 +33,17 @@ use bytes::Bytes;
 use futures::future::{self, Either, FutureExt, LocalBoxFuture};
 use futures::{Stream, StreamExt};
 use iggy_object_store::{
-    DeleteOutcome, ErrorClass, FreshObjectId, ListPage, ListRequest, ObjectMeta, ObjectRange,
-    ObjectStore, ObjectStoreError, PutBody, PutMode, PutOptions, validate_metadata,
+    DeleteOutcome, ErrorClass, FreshObjectId, KeyLayout, ListPage, ListRequest, ObjectMeta,
+    ObjectRange, ObjectStore, ObjectStoreError, PutBody, PutMode, PutOptions, SweptUploads,
+    validate_metadata,
 };
 use message_bus::MessageBus;
 use tracing::debug;
 
 use crate::metrics::TierStoreCounters;
 
-/// The user metadata entry that names the put that stored an object. Every
-/// attempt of one put carries the same value, so a put that finds an object
-/// under its key tells its own from another writer's.
-pub const PUT_ID_METADATA: &str = "put-id";
+pub use iggy_object_store::PUT_ID_METADATA;
+pub use parts::PartsPolicy;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -72,6 +73,7 @@ pub struct StoreCallPolicy {
     /// took the last piece.
     pub attempt_answer_timeout: Duration,
     pub second_attempts: SecondAttempts,
+    pub parts: PartsPolicy,
 }
 
 /// Provisional values, settled with the other tier service defaults.
@@ -86,6 +88,7 @@ impl Default for StoreCallPolicy {
             attempt_stall_timeout: Duration::from_secs(1),
             attempt_answer_timeout: Duration::from_secs(5),
             second_attempts: SecondAttempts::default(),
+            parts: PartsPolicy::default(),
         }
     }
 }
@@ -130,13 +133,17 @@ impl SecondAttempts {
     }
 }
 
-/// The shard that a tier store puts for: its replica and shard, which keep
-/// the ids of its puts apart from those of other shards and nodes, and the
-/// counters of what its puts did.
+/// The shard that a tier store puts for.
+///
+/// Its replica and shard keep the ids of its puts apart from those of other
+/// shards and nodes. The layout is that of the root it puts under, and
+/// without one it puts no object in parts. The counters count what its puts
+/// did.
 #[derive(Debug, Clone, Default)]
 pub struct StoreWriter {
     pub replica: u8,
     pub shard: u16,
+    pub layout: Option<KeyLayout>,
     pub counters: TierStoreCounters,
 }
 
@@ -173,6 +180,10 @@ pub struct StoreWriter {
 /// connection, while one of [`SecondAttempts::slots`] is free, and the first
 /// attempt to store the object wins.
 ///
+/// A long-term segment of at least twice [`PartsPolicy::part_len`] goes up
+/// in parts, on a provider that takes them, see [`PartsPolicy`]. Only a
+/// create-only put held in memory whose options allow parts does.
+///
 /// A provider must therefore do the work that grows with the body while it
 /// takes the pieces, not after the last one. [`iggy_object_store::FsStore`]
 /// syncs its file as the pieces arrive for this reason.
@@ -184,9 +195,15 @@ pub struct TierStore<S, B> {
     bus: B,
     policy: StoreCallPolicy,
     ids: PutIds,
+    layout: Option<KeyLayout>,
     counters: TierStoreCounters,
     /// Second attempts that run now.
     second_attempts: Cell<usize>,
+    /// Parts of uploads in parts that run now and hold a slot of
+    /// [`PartsPolicy::in_flight`].
+    parts_in_flight: Cell<usize>,
+    /// Whether the store refused an upload in parts, so every put goes whole.
+    parts_refused: Cell<bool>,
 }
 
 impl<S, B> TierStore<S, B>
@@ -207,8 +224,11 @@ where
             bus,
             policy,
             ids,
+            layout: writer.layout,
             counters: writer.counters,
             second_attempts: Cell::new(0),
+            parts_in_flight: Cell::new(0),
+            parts_refused: Cell::new(false),
         }
     }
 
@@ -220,6 +240,12 @@ where
     #[cfg(test)]
     pub(crate) const fn counters(&self) -> &TierStoreCounters {
         &self.counters
+    }
+
+    /// The slots of [`PartsPolicy::in_flight`] that parts hold now.
+    #[cfg(test)]
+    pub(crate) const fn parts_in_flight(&self) -> usize {
+        self.parts_in_flight.get()
     }
 
     /// `call` until it succeeds, fails for a reason other than a transient
@@ -311,17 +337,6 @@ where
             .is_ok()
             .then_some(tagged)
     }
-
-    /// A slot for a second attempt, given back when it drops, `None` when
-    /// every slot is taken.
-    fn second_attempt_slot(&self) -> Option<SecondAttemptSlot<'_>> {
-        let running = self.second_attempts.get();
-        if running >= self.policy.second_attempts.slots {
-            return None;
-        }
-        self.second_attempts.set(running + 1);
-        Some(SecondAttemptSlot(&self.second_attempts))
-    }
 }
 
 impl<S, B> TierStore<S, B>
@@ -329,17 +344,21 @@ where
     S: ObjectStore,
     B: MessageBus + Clone + Unpin + 'static,
 {
-    /// One attempt at a put, which fails as a transport error when its
-    /// provider takes no piece of the body for `stall`, or gives no answer
-    /// for `answer` after the last piece.
-    async fn attempt(
+    /// One attempt to send `body` with `send`, which fails as a transport
+    /// error when the provider takes no piece of the body for `stall`, or
+    /// gives no answer for `answer` after the last piece.
+    async fn watched<T, F, Fut>(
         &self,
         key: &str,
         body: PutBody,
-        options: &PutOptions,
         stall: Duration,
         answer: Duration,
-    ) -> Result<(), ObjectStoreError> {
+        send: F,
+    ) -> Result<T, ObjectStoreError>
+    where
+        F: FnOnce(PutBody) -> Fut,
+        Fut: Future<Output = Result<T, ObjectStoreError>>,
+    {
         let len = body.len();
         let progress = Rc::new(Progress {
             at: Cell::new(self.bus.monotonic_micros()),
@@ -351,17 +370,29 @@ where
             progress: Rc::clone(&progress),
             bus: self.bus.clone(),
         };
-        let put = pin!(
-            self.provider
-                .put(key, PutBody::from_stream(len, watched), options)
-        );
+        let call = pin!(send(PutBody::from_stream(len, watched)));
         let quiet = pin!(self.quiet(&progress, stall, answer));
-        match future::select(put, quiet).await {
+        match future::select(call, quiet).await {
             Either::Left((result, _)) => result,
             Either::Right((timeout, _)) => Err(ObjectStoreError::Transport(format!(
                 "the put of {key:?} made no progress for {timeout:?}"
             ))),
         }
+    }
+
+    /// One attempt at a put, see [`Self::watched`].
+    async fn attempt(
+        &self,
+        key: &str,
+        body: PutBody,
+        options: &PutOptions,
+        stall: Duration,
+        answer: Duration,
+    ) -> Result<(), ObjectStoreError> {
+        self.watched(key, body, stall, answer, |watched| {
+            self.provider.put(key, watched, options)
+        })
+        .await
     }
 
     /// One attempt at a put whose body is held in memory, with a copy of
@@ -442,22 +473,76 @@ where
         } else {
             None
         };
-        let mut first: Option<LocalBoxFuture<'_, _>> =
-            Some(self.attempt_again(key, body, options).boxed_local());
-        let mut second: Option<LocalBoxFuture<'_, _>> = None;
-        let mut slow: Option<LocalBoxFuture<'_, ()>> =
+        let raced = self
+            .race(
+                key,
+                threshold,
+                || self.attempt_again(key, body, options).boxed_local(),
+                |error, other_runs| {
+                    if matches!(error, ObjectStoreError::PreconditionFailed { .. })
+                        && if_absent
+                        && (*reached || other_runs)
+                    {
+                        return true;
+                    }
+                    *reached |= error.put_may_have_stored();
+                    false
+                },
+            )
+            .await;
+        match raced.result {
+            Ok(()) => {
+                if raced.by_second {
+                    self.counters.record_second_attempt_win();
+                }
+                Ok(())
+            }
+            // The object under the key decides, and the other attempt is
+            // dropped already, which cancels it.
+            Err(refused) if raced.decided => match self.holder(key, body.len(), options).await {
+                Ok(Holder::Ours) => {
+                    debug!(key, "tier store put found the object it stored");
+                    self.counters.record_own_object_found();
+                    Ok(())
+                }
+                Ok(Holder::Another | Holder::Nothing) => Err(refused),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+
+    /// One attempt made by `attempt`, and a second one beside it once the
+    /// first runs past `threshold` while a slot of
+    /// [`SecondAttempts::slots`] is free. The first attempt to succeed wins,
+    /// and the other is dropped. A failure waits for the other attempt, unless
+    /// `decisive` says that it ends the race: it gets each failure and whether
+    /// the other attempt still runs.
+    async fn race<'a, T: 'a>(
+        &'a self,
+        key: &str,
+        threshold: Option<Duration>,
+        attempt: impl Fn() -> LocalBoxFuture<'a, Result<T, ObjectStoreError>>,
+        mut decisive: impl FnMut(&ObjectStoreError, bool) -> bool,
+    ) -> Raced<T> {
+        let mut first = Some(attempt());
+        let mut second: Option<LocalBoxFuture<'a, Result<T, ObjectStoreError>>> = None;
+        let mut slow: Option<LocalBoxFuture<'a, ()>> =
             threshold.map(|after| self.bus.sleep(after).boxed_local());
         loop {
             let (result, by_second) = match next_event(&mut first, &mut second, &mut slow).await {
                 Event::Slow => {
                     slow = None;
-                    if let Some(slot) = self.second_attempt_slot() {
+                    if let Some(slot) =
+                        take_slot(&self.second_attempts, self.policy.second_attempts.slots)
+                    {
                         debug!(key, "tier store put is slow, sending a second attempt");
                         self.counters.record_second_attempt();
+                        let again = attempt();
                         second = Some(
                             async move {
                                 let _slot = slot;
-                                self.attempt_again(key, body, options).await
+                                again.await
                             }
                             .boxed_local(),
                         );
@@ -476,53 +561,48 @@ where
             };
             let other_runs = first.is_some() || second.is_some();
             match result {
-                Ok(()) => {
-                    if by_second {
-                        self.counters.record_second_attempt_win();
-                    }
-                    return Ok(());
+                Ok(value) => {
+                    return Raced {
+                        result: Ok(value),
+                        by_second,
+                        decided: false,
+                    };
                 }
-                Err(refused @ ObjectStoreError::PreconditionFailed { .. })
-                    if if_absent && (*reached || other_runs) =>
-                {
-                    // The object under the key decides now, so the other
-                    // attempt is dropped, which cancels it.
-                    drop((first.take(), second.take()));
-                    return match self.holds_own_object(key, body.len(), options).await {
-                        Ok(true) => {
-                            debug!(key, "tier store put found the object it stored");
-                            self.counters.record_own_object_found();
-                            Ok(())
-                        }
-                        Ok(false) => Err(refused),
-                        Err(error) => Err(error),
+                Err(error) if decisive(&error, other_runs) => {
+                    return Raced {
+                        result: Err(error),
+                        by_second,
+                        decided: true,
+                    };
+                }
+                Err(error) if !other_runs => {
+                    return Raced {
+                        result: Err(error),
+                        by_second,
+                        decided: false,
                     };
                 }
                 Err(error) => {
-                    *reached |= error.put_may_have_stored();
-                    if !other_runs {
-                        return Err(error);
-                    }
                     debug!(key, %error, "one attempt of a tier store put failed, the other runs");
                 }
             }
         }
     }
 
-    /// Whether the object under `key` is the one that a put of `len` bytes
-    /// with `options` stores: an earlier attempt of the same put stored it.
-    async fn holds_own_object(
+    /// Who stored the object under `key`: the put of `len` bytes with
+    /// `options`, as an earlier attempt of it, another writer, or nobody.
+    async fn holder(
         &self,
         key: &str,
         len: u64,
         options: &PutOptions,
-    ) -> Result<bool, ObjectStoreError> {
+    ) -> Result<Holder, ObjectStoreError> {
         let Some(id) = options.metadata.get(PUT_ID_METADATA) else {
-            return Ok(false);
+            return Ok(Holder::Another);
         };
         let held = match self.head(key).await {
             Ok(held) => held,
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(false),
+            Err(ObjectStoreError::NotFound { .. }) => return Ok(Holder::Nothing),
             Err(error) => return Err(error),
         };
         let same_id = held.metadata.get(PUT_ID_METADATA) == Some(id);
@@ -531,7 +611,11 @@ where
             .crc32c
             .zip(options.crc32c)
             .is_none_or(|(stored, sent)| stored == sent);
-        Ok(same_id && same_size && same_crc32c)
+        Ok(if same_id && same_size && same_crc32c {
+            Holder::Ours
+        } else {
+            Holder::Another
+        })
     }
 
     /// A put that streams: one attempt with the progress timeout.
@@ -557,10 +641,15 @@ where
         body: PutBody,
         options: &PutOptions,
     ) -> Result<(), ObjectStoreError> {
-        match self.tagged(&body, options) {
-            Some(tagged) => self.put_repeatable(key, &body, &tagged).await,
-            None => self.put_once(key, body, options).await,
+        let Some(tagged) = self.tagged(&body, options) else {
+            return self.put_once(key, body, options).await;
+        };
+        if let Some(ranges) = self.parts_plan(&body, &tagged)
+            && let Some(stored) = self.put_in_parts(key, &body, &tagged, &ranges).await
+        {
+            return stored;
         }
+        self.put_repeatable(key, &body, &tagged).await
     }
 
     async fn get_range(
@@ -586,22 +675,54 @@ where
         self.retried("LIST", request.prefix, || self.provider.list(request))
             .await
     }
+
+    async fn sweep_uploads(
+        &self,
+        layout: &KeyLayout,
+        older_than: Duration,
+        after: Option<&str>,
+    ) -> Result<SweptUploads, ObjectStoreError> {
+        self.retried("SWEEP", layout.root(), || {
+            self.provider.sweep_uploads(layout, older_than, after)
+        })
+        .await
+    }
 }
 
-/// What ended the wait of a round.
-enum Event {
-    First(Result<(), ObjectStoreError>),
-    Second(Result<(), ObjectStoreError>),
+/// How a race of attempts ended.
+struct Raced<T> {
+    result: Result<T, ObjectStoreError>,
+    /// The second attempt gave the result.
+    by_second: bool,
+    /// The result is a failure that ended the race at once.
+    decided: bool,
+}
+
+/// Who stored the object under a key, as a put that the store refused finds
+/// it.
+enum Holder {
+    /// An earlier attempt of the same put.
+    Ours,
+    /// Another writer, or one that the put cannot tell from another.
+    Another,
+    /// Nobody: the key holds no object.
+    Nothing,
+}
+
+/// What ended the wait of a race.
+enum Event<T> {
+    First(Result<T, ObjectStoreError>),
+    Second(Result<T, ObjectStoreError>),
     /// The first attempt ran past the threshold of a second one.
     Slow,
 }
 
 /// The next of the attempts that ends, or the threshold that passes.
-async fn next_event(
-    first: &mut Option<LocalBoxFuture<'_, Result<(), ObjectStoreError>>>,
-    second: &mut Option<LocalBoxFuture<'_, Result<(), ObjectStoreError>>>,
+async fn next_event<T>(
+    first: &mut Option<LocalBoxFuture<'_, Result<T, ObjectStoreError>>>,
+    second: &mut Option<LocalBoxFuture<'_, Result<T, ObjectStoreError>>>,
     slow: &mut Option<LocalBoxFuture<'_, ()>>,
-) -> Event {
+) -> Event<T> {
     poll_fn(|context| {
         if let Some(attempt) = first.as_mut()
             && let Poll::Ready(result) = attempt.as_mut().poll(context)
@@ -634,6 +755,17 @@ fn worth_another_attempt(error: &ObjectStoreError, options: &PutOptions) -> bool
     }
 }
 
+/// One of the `limit` slots that `running` counts, given back when it drops,
+/// `None` when every slot is taken.
+fn take_slot(running: &Cell<usize>, limit: usize) -> Option<Slot<'_>> {
+    let taken = running.get();
+    if taken >= limit {
+        return None;
+    }
+    running.set(taken + 1);
+    Some(Slot(running))
+}
+
 /// Mints the ids of the puts of one store in the layout of a
 /// [`FreshObjectId`]: the bus's wall clock when the store started, the
 /// replica and the shard keep them apart across restarts and nodes, and a
@@ -655,11 +787,10 @@ impl PutIds {
     }
 }
 
-/// A running second attempt, which frees its slot when it ends or is
-/// dropped.
-struct SecondAttemptSlot<'a>(&'a Cell<usize>);
+/// A slot that [`take_slot`] took, which it gives back when it drops.
+struct Slot<'a>(&'a Cell<usize>);
 
-impl Drop for SecondAttemptSlot<'_> {
+impl Drop for Slot<'_> {
     fn drop(&mut self) {
         self.0.set(self.0.get().saturating_sub(1));
     }

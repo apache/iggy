@@ -101,8 +101,9 @@ pub use segment_metadata::{SEGMENT_HASH_LEN, SegmentMetadata, SegmentMetadataErr
 pub use store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, MAX_KEY_LEN,
     MAX_KEY_SEGMENT_LEN, MAX_KEY_SEGMENTS, MAX_KEYS_PER_REQUEST, MAX_METADATA_LEN, ObjectMeta,
-    ObjectRange, ObjectStore, PutBody, PutMode, PutOptions, UserMetadata, validate_delete,
-    validate_key, validate_metadata, validate_prefix, validate_range,
+    ObjectRange, ObjectStore, PUT_ID_METADATA, PartsLimits, PartsUpload, PutBody, PutMode,
+    PutOptions, PutParts, StoredPart, SweptUploads, UserMetadata, validate_delete, validate_key,
+    validate_metadata, validate_prefix, validate_range,
 };
 pub use tier::{
     ScopeCancelled, TierExecutor, TierJobCancelled, TierJobClass, TierJobHandle, TierJobRequest,

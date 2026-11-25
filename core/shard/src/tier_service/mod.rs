@@ -67,7 +67,9 @@ use iggy_object_store::{
 };
 use message_bus::MessageBus;
 
-pub use store::{PUT_ID_METADATA, SecondAttempts, StoreCallPolicy, StoreWriter, TierStore};
+pub use store::{
+    PUT_ID_METADATA, PartsPolicy, SecondAttempts, StoreCallPolicy, StoreWriter, TierStore,
+};
 
 const MIB: u64 = 1024 * 1024;
 

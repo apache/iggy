@@ -113,9 +113,11 @@ fn plain_http_tls_config() -> Result<rustls::ClientConfig, ObjectStoreError> {
 /// left from one whose answer was lost, and that drop a request.
 #[cfg(test)]
 pub mod test_endpoints {
-    use std::io::Read;
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex, mpsc};
     use std::time::Duration;
 
     /// An `http` endpoint on this host where nothing listens, so a connect
@@ -183,6 +185,103 @@ pub mod test_endpoints {
             }
             false
         }
+    }
+
+    /// One request that a [`Recorder`] took.
+    #[derive(Debug, Clone)]
+    pub struct Recorded {
+        pub method: String,
+        pub target: String,
+        /// By lowercase name.
+        pub headers: BTreeMap<String, String>,
+        pub body: Vec<u8>,
+    }
+
+    /// The status, the extra headers and the body of an answer.
+    pub type Answer = (u16, Vec<(&'static str, String)>, Vec<u8>);
+
+    /// An HTTP server that keeps every request and answers each with what
+    /// `answer` makes of it, one connection at a time.
+    pub struct Recorder {
+        pub endpoint: String,
+        requests: Arc<Mutex<Vec<Recorded>>>,
+    }
+
+    impl Recorder {
+        pub fn start(answer: fn(&Recorded) -> Answer) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let requests: Arc<Mutex<Vec<Recorded>>> = Arc::default();
+            let kept = Arc::clone(&requests);
+            std::thread::spawn(move || {
+                for connection in listener.incoming() {
+                    let Ok(mut connection) = connection else {
+                        return;
+                    };
+                    let Some(request) = read_whole(&mut connection) else {
+                        continue;
+                    };
+                    let (status, headers, body) = answer(&request);
+                    kept.lock().unwrap().push(request);
+                    let mut reply = format!(
+                        "HTTP/1.1 {status} Fake\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        body.len()
+                    );
+                    for (name, value) in headers {
+                        let _ = write!(reply, "{name}: {value}\r\n");
+                    }
+                    reply.push_str("\r\n");
+                    let _ = connection.write_all(reply.as_bytes());
+                    let _ = connection.write_all(&body);
+                }
+            });
+            Self { endpoint, requests }
+        }
+
+        pub fn requests(&self) -> Vec<Recorded> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// One whole request from `connection`, `None` when it ends first.
+    fn read_whole(connection: &mut TcpStream) -> Option<Recorded> {
+        let mut received = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        let end = loop {
+            if let Some(end) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+                break end;
+            }
+            match connection.read(&mut buffer) {
+                Ok(0) | Err(_) => return None,
+                Ok(read) => received.extend_from_slice(&buffer[..read]),
+            }
+        };
+        let head = String::from_utf8_lossy(&received[..end]).into_owned();
+        let mut lines = head.split("\r\n");
+        let mut request_line = lines.next().unwrap_or_default().split(' ');
+        let method = request_line.next().unwrap_or_default().to_owned();
+        let target = request_line.next().unwrap_or_default().to_owned();
+        let headers: BTreeMap<String, String> = lines
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect();
+        let declared: usize = headers
+            .get("content-length")
+            .and_then(|length| length.parse().ok())
+            .unwrap_or(0);
+        let mut body = received[end + 4..].to_vec();
+        while body.len() < declared {
+            match connection.read(&mut buffer) {
+                Ok(0) | Err(_) => return None,
+                Ok(read) => body.extend_from_slice(&buffer[..read]),
+            }
+        }
+        Some(Recorded {
+            method,
+            target,
+            headers,
+            body,
+        })
     }
 
     /// Reads the head of one request, and with `take_body` its declared body.

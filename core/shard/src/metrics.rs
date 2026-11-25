@@ -297,6 +297,11 @@ pub struct TierStoreCounters {
     second_attempts: Counter,
     second_attempt_wins: Counter,
     own_objects_found: Counter,
+    parts_uploads: Counter,
+    parts_uploads_completed: Counter,
+    parts_uploads_aborted: Counter,
+    parts_fallbacks: Counter,
+    parts_sent: Counter,
 }
 
 impl TierStoreCounters {
@@ -319,6 +324,46 @@ impl TierStoreCounters {
     /// earlier attempt of the same put stored.
     pub(crate) fn record_own_object_found(&self) {
         self.own_objects_found.inc();
+    }
+
+    /// An upload in parts began.
+    pub(crate) fn record_parts_upload(&self) {
+        self.parts_uploads.inc();
+    }
+
+    /// An upload in parts created its object.
+    pub(crate) fn record_parts_upload_completed(&self) {
+        self.parts_uploads_completed.inc();
+    }
+
+    /// An upload in parts ended without its object and was aborted.
+    pub(crate) fn record_parts_upload_aborted(&self) {
+        self.parts_uploads_aborted.inc();
+    }
+
+    /// A put that would go up in parts went whole, because the store does
+    /// not take uploads in parts.
+    pub(crate) fn record_parts_fallback(&self) {
+        self.parts_fallbacks.inc();
+    }
+
+    /// One attempt at a part went out.
+    pub(crate) fn record_part_sent(&self) {
+        self.parts_sent.inc();
+    }
+
+    /// Test-only read: uploads in parts begun, completed, aborted, fallen
+    /// back to a whole put, and parts sent.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn parts_values(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.parts_uploads.get(),
+            self.parts_uploads_completed.get(),
+            self.parts_uploads_aborted.get(),
+            self.parts_fallbacks.get(),
+            self.parts_sent.get(),
+        )
     }
 
     /// Test-only read: put retries, second attempts, second attempt wins and
@@ -357,6 +402,32 @@ impl TierStoreCounters {
             "create-only puts that the object store refused because an earlier attempt of the same \
              put had stored the object, counted as stored",
             self.own_objects_found.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads",
+            "uploads in parts of large objects to the object store that began",
+            self.parts_uploads.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads_completed",
+            "uploads in parts that created their object",
+            self.parts_uploads_completed.clone(),
+        );
+        registry.register(
+            "object_store_parts_uploads_aborted",
+            "uploads in parts that ended without their object and were aborted",
+            self.parts_uploads_aborted.clone(),
+        );
+        registry.register(
+            "object_store_parts_fallbacks",
+            "puts that would have gone up in parts and went whole, because the object store does \
+             not take uploads in parts",
+            self.parts_fallbacks.clone(),
+        );
+        registry.register(
+            "object_store_parts_sent",
+            "attempts at the parts of uploads in parts",
+            self.parts_sent.clone(),
         );
     }
 }

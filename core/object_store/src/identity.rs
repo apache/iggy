@@ -81,6 +81,7 @@ impl StoreIdentity {
             mode: PutMode::IfAbsent,
             metadata: UserMetadata::default(),
             crc32c: Some(crc32c::crc32c(body.as_bytes())),
+            ..PutOptions::default()
         };
         match store
             .put(&layout.identity_key(), PutBody::from_bytes(body), &options)
@@ -141,6 +142,7 @@ impl StoreIdentity {
             mode: PutMode::Overwrite,
             metadata: UserMetadata::default(),
             crc32c: Some(crc32c::crc32c(body.as_bytes())),
+            ..PutOptions::default()
         };
         store
             .put(&layout.identity_key(), PutBody::from_bytes(body), &options)

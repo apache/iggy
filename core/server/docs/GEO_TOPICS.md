@@ -1012,7 +1012,9 @@ Requests to a cluster's own bucket:
 
 Storage: a message stays in its fresh object until at least 10 minutes after every message of
 that object is published, and in a long-term segment until retention removes it. Each replica
-keeps 320 bytes per batch on its disk.
+keeps 320 bytes per batch on its disk. On GCS, a bucket with soft delete on keeps each deleted
+fresh object billable for its retention, 7 days by default, so turn soft delete off on the bucket
+to avoid it.
 
 ## Metrics
 

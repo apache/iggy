@@ -922,6 +922,7 @@ impl RecoveryPlan {
             mode: PutMode::Overwrite,
             metadata: UserMetadata::default(),
             crc32c: Some(crc32c::crc32c(&bytes)),
+            ..PutOptions::default()
         };
         store
             .put(

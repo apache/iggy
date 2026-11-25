@@ -42,6 +42,14 @@ macro_rules! gcs_store {
 
 iggy_object_store::contract_cases!(gcs_store);
 iggy_object_store::if_absent_contract_cases!(gcs_store);
+// fake-gcs-server composes over an object whatever `ifGenerationMatch` says,
+// and answers a compose of a missing source with 500, not 404, so the cases
+// of a refused or a lost upload in parts run against S3 and a real bucket
+// only.
+gcs_store!(
+    given_parts_when_completing_should_create_the_whole_object_once,
+    given_an_abandoned_upload_when_sweeping_should_remove_it_only_past_the_grace,
+);
 
 #[test]
 fn given_missing_bucket_when_listing_should_fail_as_bucket_not_found() {

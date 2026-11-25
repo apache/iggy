@@ -19,7 +19,7 @@
 //! clock that moves only when nothing else can run, so no test sleeps.
 
 use std::cell::{Cell, RefCell};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::ops::Range;
@@ -35,8 +35,9 @@ use futures::channel::oneshot;
 use futures::future::{self, LocalBoxFuture};
 use futures::{FutureExt, StreamExt};
 use iggy_object_store::{
-    DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, ObjectStore,
-    ObjectStoreError, PutBody, PutMode, PutOptions, UserMetadata,
+    DeleteOutcome, KeyLayout, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange,
+    ObjectStore, ObjectStoreError, PartsLimits, PartsUpload, PutBody, PutMode, PutOptions,
+    PutParts, StoredPart, SweptUploads, UserMetadata,
 };
 use message_bus::{
     BusMessage, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn, SendError,
@@ -44,7 +45,11 @@ use message_bus::{
 use server_common::MESSAGE_ALIGN;
 use server_common::iobuf::Frozen;
 
-use super::{PUT_ID_METADATA, SecondAttempts, StoreCallPolicy, StoreWriter, TierStore};
+use super::{
+    PUT_ID_METADATA, PartsPolicy, SecondAttempts, StoreCallPolicy, StoreWriter, TierStore,
+};
+
+mod parts;
 
 const MIB: usize = 1024 * 1024;
 const PIECE: usize = 256 * 1024;
@@ -303,6 +308,50 @@ struct ScriptedStore {
     refusals: Rc<Cell<usize>>,
     /// Changes what a head reports.
     disguise: Cell<Option<Disguise>>,
+    /// What the store takes of uploads in parts, `None` when it takes none.
+    limits: Cell<Option<PartsLimits>>,
+    /// Errors that the next begins of uploads in parts return, in order.
+    begin_refusals: RefCell<VecDeque<fn() -> ObjectStoreError>>,
+    begun: Cell<usize>,
+    /// What the attempts at parts do, in order, and then each commits.
+    part_scripts: RefCell<VecDeque<Script>>,
+    /// What the completions do, in order, and then each commits.
+    complete_scripts: RefCell<VecDeque<Script>>,
+    /// The uploads in parts that the store holds, by id.
+    uploads: Rc<RefCell<BTreeMap<String, Pending>>>,
+    part_attempts: Cell<usize>,
+    parts_running: Rc<Cell<usize>>,
+    most_parts_running: Rc<Cell<usize>>,
+    completions: Cell<usize>,
+    aborts: Cell<usize>,
+}
+
+/// An upload in parts that the store holds.
+struct Pending {
+    /// When it began, on the bus's clock.
+    began_at: u64,
+    parts: BTreeMap<u32, Vec<u8>>,
+}
+
+/// One part in flight, which counts itself out when it ends or is dropped.
+struct Running {
+    running: Rc<Cell<usize>>,
+}
+
+impl Running {
+    fn new(running: &Rc<Cell<usize>>, most: &Cell<usize>) -> Self {
+        running.set(running.get() + 1);
+        most.set(most.get().max(running.get()));
+        Self {
+            running: Rc::clone(running),
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.running.set(self.running.get() - 1);
+    }
 }
 
 impl ScriptedStore {
@@ -317,7 +366,37 @@ impl ScriptedStore {
             commits: Rc::default(),
             refusals: Rc::default(),
             disguise: Cell::new(None),
+            limits: Cell::new(None),
+            begin_refusals: RefCell::default(),
+            begun: Cell::new(0),
+            part_scripts: RefCell::default(),
+            complete_scripts: RefCell::default(),
+            uploads: Rc::default(),
+            part_attempts: Cell::new(0),
+            parts_running: Rc::default(),
+            most_parts_running: Rc::default(),
+            completions: Cell::new(0),
+            aborts: Cell::new(0),
         }
+    }
+
+    /// Takes the pieces of `body` as `script` says, and its bytes.
+    async fn take(&self, body: PutBody, script: Script) -> Result<Vec<u8>, ObjectStoreError> {
+        let mut pieces = body.into_pieces();
+        let mut bytes = Vec::new();
+        let mut taken = 0;
+        loop {
+            if script.stall_after == Some(taken) {
+                future::pending::<()>().await;
+            }
+            self.bus.sleep(script.piece_delay).await;
+            let Some(piece) = pieces.next().await else {
+                break;
+            };
+            bytes.extend_from_slice(&piece.map_err(ObjectStoreError::Body)?);
+            taken += 1;
+        }
+        Ok(bytes)
     }
 
     fn script(&self, scripts: impl IntoIterator<Item = Script>) {
@@ -451,6 +530,213 @@ impl ObjectStore for ScriptedStore {
     async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
         self.objects.list(request).await
     }
+
+    fn parts_limits(&self) -> Option<PartsLimits> {
+        self.limits.get()
+    }
+
+    fn begin_parts(
+        &self,
+        key: &str,
+        _options: &PutOptions,
+        _layout: &KeyLayout,
+    ) -> impl Future<Output = Result<PartsUpload, ObjectStoreError>> {
+        future::ready(self.begin(key))
+    }
+
+    async fn put_part(
+        &self,
+        upload: &PartsUpload,
+        number: u32,
+        body: PutBody,
+        crc32c: u32,
+    ) -> Result<StoredPart, ObjectStoreError> {
+        let _running = Running::new(&self.parts_running, &self.most_parts_running);
+        self.part_attempts.set(self.part_attempts.get() + 1);
+        let script = self
+            .part_scripts
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Script::of(Outcome::Commit));
+        let lost = match script.outcome {
+            Outcome::NotSent => {
+                return Err(ObjectStoreError::NotSent("connection refused".to_owned()));
+            }
+            Outcome::Hang => {
+                self.take(body, script).await?;
+                return future::pending().await;
+            }
+            Outcome::Refuse(error) => {
+                self.take(body, script).await?;
+                self.bus
+                    .sleep(script.commit_after + script.answer_after)
+                    .await;
+                return Err(error());
+            }
+            Outcome::LoseAnswer(error) => Some(error),
+            Outcome::Commit => None,
+        };
+        let bytes = self.take(body, script).await?;
+        if PutBody::from_bytes(bytes.clone()).crc32c() != Some(crc32c) {
+            return Err(ObjectStoreError::ChecksumMismatch {
+                key: upload.key.clone(),
+            });
+        }
+        // The store side, which commits the part whether the caller waits or
+        // not.
+        let (answer, answered) = oneshot::channel();
+        let uploads = Rc::clone(&self.uploads);
+        let bus = self.bus.clone();
+        let id = upload.id.clone();
+        let key = upload.key.clone();
+        self.bus.spawn(async move {
+            bus.sleep(script.commit_after).await;
+            let stored = match uploads.borrow_mut().get_mut(&id) {
+                Some(pending) => {
+                    pending.parts.insert(number, bytes);
+                    Ok(StoredPart {
+                        number,
+                        tag: format!("etag-{number}"),
+                        crc32c,
+                    })
+                }
+                None => Err(ObjectStoreError::NotFound { key }),
+            };
+            let _ = answer.send(stored);
+        });
+        let stored = answered
+            .await
+            .unwrap_or_else(|_| Err(ObjectStoreError::Transport("no commit".to_owned())));
+        self.bus.sleep(script.answer_after).await;
+        lost.map_or(stored, |error| Err(error()))
+    }
+
+    async fn complete_parts(
+        &self,
+        upload: &PartsUpload,
+        parts: &[StoredPart],
+        options: &PutOptions,
+        _len: u64,
+    ) -> Result<(), ObjectStoreError> {
+        self.completions.set(self.completions.get() + 1);
+        let script = self
+            .complete_scripts
+            .borrow_mut()
+            .pop_front()
+            .unwrap_or(Script::of(Outcome::Commit));
+        let lost = match script.outcome {
+            Outcome::NotSent => {
+                return Err(ObjectStoreError::NotSent("connection refused".to_owned()));
+            }
+            Outcome::Hang => return future::pending().await,
+            Outcome::Refuse(error) => {
+                self.bus
+                    .sleep(script.commit_after + script.answer_after)
+                    .await;
+                return Err(error());
+            }
+            Outcome::LoseAnswer(error) => Some(error),
+            Outcome::Commit => None,
+        };
+        let (answer, answered) = oneshot::channel();
+        let uploads = Rc::clone(&self.uploads);
+        let objects = Rc::clone(&self.objects);
+        let commits = Rc::clone(&self.commits);
+        let refusals = Rc::clone(&self.refusals);
+        let bus = self.bus.clone();
+        let id = upload.id.clone();
+        let key = upload.key.clone();
+        let numbers: Vec<u32> = parts.iter().map(|part| part.number).collect();
+        let options = options.clone();
+        self.bus.spawn(async move {
+            bus.sleep(script.commit_after).await;
+            let Some(bytes) = uploads.borrow().get(&id).and_then(|pending| {
+                numbers
+                    .iter()
+                    .map(|number| pending.parts.get(number).map(Vec::as_slice))
+                    .collect::<Option<Vec<&[u8]>>>()
+                    .map(|parts| parts.concat())
+            }) else {
+                let _ = answer.send(Err(ObjectStoreError::NotFound { key }));
+                return;
+            };
+            let created = objects
+                .put(&key, PutBody::from_bytes(bytes), &options)
+                .await;
+            match &created {
+                Ok(()) => {
+                    commits.set(commits.get() + 1);
+                    uploads.borrow_mut().remove(&id);
+                }
+                Err(ObjectStoreError::PreconditionFailed { .. }) => {
+                    refusals.set(refusals.get() + 1);
+                }
+                Err(_) => {}
+            }
+            let _ = answer.send(created);
+        });
+        let created = answered
+            .await
+            .unwrap_or_else(|_| Err(ObjectStoreError::Transport("no commit".to_owned())));
+        self.bus.sleep(script.answer_after).await;
+        lost.map_or(created, |error| Err(error()))
+    }
+
+    fn abort_parts(
+        &self,
+        upload: &PartsUpload,
+        _parts: u32,
+    ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+        self.aborts.set(self.aborts.get() + 1);
+        self.uploads.borrow_mut().remove(&upload.id);
+        future::ready(Ok(()))
+    }
+
+    fn sweep_uploads(
+        &self,
+        _layout: &KeyLayout,
+        older_than: Duration,
+        _after: Option<&str>,
+    ) -> impl Future<Output = Result<SweptUploads, ObjectStoreError>> {
+        future::ready(Ok(self.sweep(older_than)))
+    }
+}
+
+impl ScriptedStore {
+    /// A begin of an upload in parts, as the next refusal says.
+    fn begin(&self, key: &str) -> Result<PartsUpload, ObjectStoreError> {
+        self.begun.set(self.begun.get() + 1);
+        if let Some(refusal) = self.begin_refusals.borrow_mut().pop_front() {
+            return Err(refusal());
+        }
+        let id = format!("upload-{}", self.begun.get());
+        self.uploads.borrow_mut().insert(
+            id.clone(),
+            Pending {
+                began_at: self.bus.monotonic_micros(),
+                parts: BTreeMap::new(),
+            },
+        );
+        Ok(PartsUpload {
+            key: key.to_owned(),
+            id,
+        })
+    }
+
+    /// A sweep of the uploads that began more than `older_than` ago.
+    fn sweep(&self, older_than: Duration) -> SweptUploads {
+        let now = self.bus.monotonic_micros();
+        let older = u64::try_from(older_than.as_micros()).unwrap_or(u64::MAX);
+        let mut uploads = self.uploads.borrow_mut();
+        let before = uploads.len();
+        uploads.retain(|_, pending| now.saturating_sub(pending.began_at) < older);
+        let removed = (before - uploads.len()) as u64;
+        SweptUploads {
+            removed,
+            kept: uploads.len() as u64,
+            ..SweptUploads::default()
+        }
+    }
 }
 
 type Store = TierStore<ScriptedStore, VirtualBus>;
@@ -469,6 +755,7 @@ fn policy() -> StoreCallPolicy {
             after_per_mib: Duration::from_millis(60),
             slots: 2,
         },
+        parts: PartsPolicy::default(),
     }
 }
 

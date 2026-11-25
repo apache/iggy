@@ -57,6 +57,19 @@ const ATTEMPT_TIMEOUT_BOUNDS: RangeInclusive<Duration> =
 /// The most that `second_attempt_after_per_mib` adds for each MiB.
 const SECOND_ATTEMPT_PER_MIB_MAX: Duration = Duration::from_hours(1);
 
+/// The fewest bytes of a part of an upload in parts: S3's minimum for every
+/// part but the last.
+pub const PART_SIZE_MIN: u64 = 5 * 1024 * 1024;
+
+/// The most bytes of a part: S3's maximum.
+pub const PART_SIZE_MAX: u64 = 5 * 1024 * 1024 * 1024;
+
+/// The shortest grace of the sweep of abandoned uploads in parts. An upload
+/// in parts gives up at half the grace, and the other half covers the skew
+/// between the clocks of the node and of the store, up to the 15 minutes
+/// that S3 accepts in a signature.
+pub const ABANDONED_UPLOAD_GRACE_MIN: Duration = Duration::from_mins(30);
+
 /// The JSON API of Google Cloud Storage, which an empty `gcs.endpoint`
 /// names.
 pub const GCS_ENDPOINT: &str = "https://storage.googleapis.com";
@@ -329,6 +342,26 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_second_attempt_after_per_mib")]
     #[config_env(leaf)]
     pub second_attempt_after_per_mib: IggyDuration,
+    /// The bytes of one part of an upload in parts. A long-term segment of at
+    /// least twice this goes up in parts on `s3` and `gcs`, side by side, and
+    /// one request then creates the object. Every other put goes whole. `gcs` composes at
+    /// most 32 parts, so a part takes at least a 32nd of its object. Zero
+    /// puts every object whole. Otherwise from [`PART_SIZE_MIN`] to
+    /// [`PART_SIZE_MAX`].
+    #[serde(default = "default_part_size")]
+    #[config_env(leaf)]
+    pub part_size: IggyByteSize,
+    /// How old an upload in parts that never completed must be before the
+    /// sweep of the root removes it: what a crash or a cancelled put leaves,
+    /// the parts of an S3 multipart upload or the temporary objects of a GCS
+    /// upload. An upload in parts gives up at half the grace, so the sweep
+    /// never meets a live one. Zero or `disabled` turns the sweep off, and an
+    /// upload in parts then has no deadline. Otherwise at least
+    /// [`ABANDONED_UPLOAD_GRACE_MIN`].
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_abandoned_upload_grace")]
+    #[config_env(leaf)]
+    pub abandoned_upload_grace: IggyDuration,
     /// The bytes of what one shard reads from object stores that it keeps in
     /// memory for the next polls of the same bytes, which also hold the
     /// fresh objects it uploads. Zero keeps nothing that reads fetch and
@@ -438,6 +471,11 @@ pub struct TierJobsConfig {
     /// first attempt.
     #[serde(default = "default_second_attempts")]
     pub second_attempts: u32,
+    /// Parts of uploads in parts in flight at once, over all the uploads in
+    /// parts of the shard. An upload with no part in flight sends one even
+    /// when they are all taken.
+    #[serde(default = "default_parts_in_flight")]
+    pub parts_in_flight: u32,
 }
 
 /// What the `mock_s3` backend adds to the time of each store call. Its
@@ -493,6 +531,8 @@ impl Default for TieredStorageConfig {
             put_attempt_answer_timeout: default_put_attempt_answer_timeout(),
             second_attempt_after: default_second_attempt_after(),
             second_attempt_after_per_mib: default_second_attempt_after_per_mib(),
+            part_size: default_part_size(),
+            abandoned_upload_grace: default_abandoned_upload_grace(),
             read_cache_size: default_read_cache_size(),
             read_cache_block_size: default_read_cache_block_size(),
             read_ahead: default_read_ahead(),
@@ -518,6 +558,7 @@ impl Default for TierJobsConfig {
             deletes: default_deletes(),
             housekeeping: default_housekeeping(),
             second_attempts: default_second_attempts(),
+            parts_in_flight: default_parts_in_flight(),
         }
     }
 }
@@ -549,7 +590,8 @@ impl Display for TieredStorageConfig {
              url_style: {}, credentials: {}, gcs: {}, jobs: {}, mock_s3: {}, \
              request_timeout: {}, progress_timeout: {}, max_attempts: {}, retry_delay: {}, \
              max_retry_delay: {}, put_attempt_stall_timeout: {}, put_attempt_answer_timeout: {}, \
-             second_attempt_after: {}, second_attempt_after_per_mib: {}, read_cache_size: {}, \
+             second_attempt_after: {}, second_attempt_after_per_mib: {}, part_size: {}, \
+             abandoned_upload_grace: {}, read_cache_size: {}, \
              read_cache_block_size: {}, \
              read_ahead: {}, fresh_upload_interval: {}, long_term_backlog_limit: {}, \
              fresh_pending_bytes: {}, fresh_partition_pending_bytes: {}, orphan_grace: {} }}",
@@ -573,6 +615,8 @@ impl Display for TieredStorageConfig {
             self.put_attempt_answer_timeout,
             self.second_attempt_after,
             self.second_attempt_after_per_mib,
+            self.part_size,
+            self.abandoned_upload_grace,
             self.read_cache_size,
             self.read_cache_block_size,
             self.read_ahead,
@@ -591,7 +635,7 @@ impl Display for TierJobsConfig {
             f,
             "{{ demand_fetches: {}, demand_fetch_bytes: {}, uploads: {}, upload_bytes: {}, \
              fresh_uploads: {}, speculative_fetches: {}, speculative_fetch_bytes: {}, \
-             deletes: {}, housekeeping: {}, second_attempts: {} }}",
+             deletes: {}, housekeeping: {}, second_attempts: {}, parts_in_flight: {} }}",
             self.demand_fetches,
             self.demand_fetch_bytes,
             self.uploads,
@@ -602,6 +646,7 @@ impl Display for TierJobsConfig {
             self.deletes,
             self.housekeeping,
             self.second_attempts,
+            self.parts_in_flight,
         )
     }
 }
@@ -681,6 +726,7 @@ impl TieredStorageConfig {
             ("deletes", jobs.deletes),
             ("housekeeping", jobs.housekeeping),
             ("second_attempts", jobs.second_attempts),
+            ("parts_in_flight", jobs.parts_in_flight),
         ];
         if let Some((name, _)) = counts.iter().find(|(_, count)| *count == 0) {
             return refuse(&format!("jobs.{name} must be greater than zero"));
@@ -726,6 +772,7 @@ impl TieredStorageConfig {
             return refuse("max_retry_delay must not be shorter than retry_delay");
         }
         self.validate_second_attempts()?;
+        self.validate_parts()?;
         self.validate_read_cache()?;
         if self.fresh_upload_interval.get_duration() > FRESH_UPLOAD_INTERVAL_MAX {
             return refuse(&format!(
@@ -757,6 +804,26 @@ impl TieredStorageConfig {
             return refuse(&format!(
                 "second_attempt_after_per_mib must be at most {}",
                 IggyDuration::new(SECOND_ATTEMPT_PER_MIB_MAX)
+            ));
+        }
+        Ok(())
+    }
+
+    /// The part size and the grace of the sweep, each of which zero turns
+    /// off.
+    fn validate_parts(&self) -> Result<(), ConfigurationError> {
+        let part_size = self.part_size.as_bytes_u64();
+        if part_size != 0 && !(PART_SIZE_MIN..=PART_SIZE_MAX).contains(&part_size) {
+            return refuse(&format!(
+                "part_size is {part_size} B and must be 0 (no uploads in parts) or between \
+                 {PART_SIZE_MIN} B and {PART_SIZE_MAX} B"
+            ));
+        }
+        let grace = self.abandoned_upload_grace.get_duration();
+        if !grace.is_zero() && grace < ABANDONED_UPLOAD_GRACE_MIN {
+            return refuse(&format!(
+                "abandoned_upload_grace must be 0 (disabled) or at least {}",
+                IggyDuration::new(ABANDONED_UPLOAD_GRACE_MIN)
             ));
         }
         Ok(())
@@ -914,6 +981,14 @@ fn default_second_attempt_after_per_mib() -> IggyDuration {
     IggyDuration::new(Duration::from_millis(60))
 }
 
+fn default_part_size() -> IggyByteSize {
+    IggyByteSize::from(8 * 1024 * 1024)
+}
+
+fn default_abandoned_upload_grace() -> IggyDuration {
+    IggyDuration::new_from_secs(60 * 60)
+}
+
 fn default_read_cache_size() -> IggyByteSize {
     IggyByteSize::from(64 * 1024 * 1024)
 }
@@ -984,6 +1059,10 @@ const fn default_housekeeping() -> u32 {
 
 const fn default_second_attempts() -> u32 {
     4
+}
+
+const fn default_parts_in_flight() -> u32 {
+    8
 }
 
 #[cfg(test)]
@@ -1723,6 +1802,88 @@ mod tests {
         }
         for config in at_the_bounds {
             assert!(config.validate().is_ok(), "{config}");
+        }
+    }
+
+    #[test]
+    fn given_no_parts_keys_when_reading_the_section_should_use_their_defaults() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "s3", "bucket": "b", "region": "r"}"#).unwrap();
+
+        assert_eq!(config.part_size.as_bytes_u64(), 8 << 20);
+        assert_eq!(
+            config.abandoned_upload_grace.get_duration(),
+            Duration::from_hours(1)
+        );
+        assert_eq!(config.jobs.parts_in_flight, 8);
+        assert!(config.validate().is_ok(), "{config}");
+        let printed = config.to_string();
+        for shown in [
+            "part_size: 8.39 MB",
+            "abandoned_upload_grace: 1h",
+            "parts_in_flight: 8",
+        ] {
+            assert!(printed.contains(shown), "{shown} in {printed}");
+        }
+    }
+
+    #[test]
+    fn given_parts_keys_when_reading_the_section_should_take_them_and_zero_turns_each_off() {
+        let config: TieredStorageConfig = serde_json::from_str(
+            r#"{"backend": "s3", "bucket": "b", "region": "r", "part_size": "16 MiB",
+                "abandoned_upload_grace": "2 h", "jobs": {"parts_in_flight": 4}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.part_size.as_bytes_u64(), 16 << 20);
+        assert_eq!(
+            config.abandoned_upload_grace.get_duration(),
+            Duration::from_hours(2)
+        );
+        assert_eq!(config.jobs.parts_in_flight, 4);
+        assert!(config.validate().is_ok(), "{config}");
+        for grace in ["disabled", "0"] {
+            let off: TieredStorageConfig = serde_json::from_str(&format!(
+                r#"{{"backend": "s3", "bucket": "b", "region": "r", "part_size": "0",
+                    "abandoned_upload_grace": "{grace}"}}"#
+            ))
+            .unwrap();
+
+            assert_eq!(off.part_size.as_bytes_u64(), 0);
+            assert!(off.abandoned_upload_grace.is_zero(), "{grace}");
+            assert!(off.validate().is_ok(), "{grace}");
+        }
+    }
+
+    #[test]
+    fn given_parts_values_outside_their_bounds_when_validating_should_refuse() {
+        let part = |size: &str| TieredStorageConfig {
+            part_size: size.parse().unwrap(),
+            ..fs_config()
+        };
+        let grace = |text: &str| TieredStorageConfig {
+            abandoned_upload_grace: duration(text),
+            ..fs_config()
+        };
+        let no_parts_in_flight = TieredStorageConfig {
+            jobs: TierJobsConfig {
+                parts_in_flight: 0,
+                ..TierJobsConfig::default()
+            },
+            ..fs_config()
+        };
+
+        for refused in [
+            part("4 MiB"),
+            part("5242879 B"),
+            part("6 GiB"),
+            grace("29 min"),
+            grace("1 s"),
+            no_parts_in_flight,
+        ] {
+            assert!(refused.validate().is_err(), "{refused}");
+        }
+        for accepted in [part("5 MiB"), part("5 GiB"), grace("30 min")] {
+            assert!(accepted.validate().is_ok(), "{accepted}");
         }
     }
 

@@ -72,8 +72,9 @@ pub use object_delete::{
     ClaimReadOutcome, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY,
     IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteJob,
     ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE,
-    RootListOutcome, SweptObjects, delete_incarnation, delete_long_term_segments, delete_objects,
-    delete_segments, list_segment_starts, sweep_long_term, sweep_segments, sweepable,
+    RootListOutcome, SweptObjects, UploadSweepOutcome, delete_incarnation,
+    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
+    sweep_long_term, sweep_segments, sweepable,
 };
 mod orphan_sweep;
 pub use orphan_sweep::{

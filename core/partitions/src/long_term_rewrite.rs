@@ -52,8 +52,9 @@ use iggy_binary_protocol::batch::BATCH_HEADER_SIZE;
 use iggy_binary_protocol::placement::PlacedBatch;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, SegmentKey, SegmentObject,
-    TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope, TierScopeToken,
+    KeyLayout, LongTermKey, ManifestSegment, ObjectPrefix, ObjectStore, PutParts, SegmentKey,
+    SegmentObject, TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScope,
+    TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
@@ -68,7 +69,7 @@ use crate::placed_read::{BatchPiece, PlacedReadPlan};
 use crate::poll_plan::DiskFault;
 use crate::remote_segments::RemoteRange;
 use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
-use crate::segment_upload::{UploadError, memory_body, store_segment};
+use crate::segment_upload::{LogPut, UploadError, memory_body, store_segment};
 use crate::state_machine::CommandKind;
 use crate::state_transfer::ChunkHasher;
 
@@ -241,9 +242,14 @@ impl SegmentRewrite {
         store_segment(
             store,
             &record,
-            key(SegmentObject::Log),
+            LogPut {
+                key: key(SegmentObject::Log),
+                body: future::ready(Ok(memory_body(&log))),
+                // The one put of a large object that no producer waits for,
+                // where the round trips of an upload in parts pay off.
+                parts: PutParts::Allowed,
+            },
             &key(SegmentObject::Index),
-            future::ready(Ok(memory_body(&log))),
             future::ready(Ok(memory_body(&index))),
             crc32c::crc32c(&index),
         )

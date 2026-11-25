@@ -754,6 +754,49 @@ after a later put of other bytes. Each shard exports
 `object_store_put_second_attempt_wins_total` and
 `object_store_put_own_objects_found_total`.
 
+A long-term segment of at least twice `part_size`, 8 MiB by default, goes up in
+parts on the `s3` and `gcs` backends. Every other put goes whole, such as a
+fresh object that producers wait for. Up to `jobs.parts_in_flight` parts go
+side by side over all the uploads of a shard, and an upload with no part in
+flight always sends one. Each part is sent again and given a second attempt as
+a put is: the same part with the same bytes replaces itself, so no part needs a
+check. Then one request creates the object whole and create-only, with the
+user metadata and the CRC32C of the whole object, which the store checks. On
+`s3` the upload is a multipart upload with a full object CRC32C, and the
+completion carries `If-None-Match: *`. On `gcs` each part is a temporary object
+under `<prefix>/meta/uploads/<put-id>/`, a compose with `ifGenerationMatch=0`
+joins them, and the node deletes them. GCS ignores a CRC32C in a compose, so
+the node compares the CRC32C that the compose reports and deletes the object
+under its own generation when they differ. GCS composes at most 32 parts, so a
+part takes at least a 32nd of its object there. On GCS, a bucket with soft
+delete on keeps deleted objects billable for its retention, 7 days by default,
+so each long-term segment stored in parts is billed about twice for that time.
+Turning soft delete off on the bucket, or `part_size = "0"`, avoids it. The
+completion is sent again after a failure, and the object under the key settles
+a completion that may have reached the store, as for a put. An upload that ends
+without its object is aborted, and one that runs past half of
+`abandoned_upload_grace` gives up.
+A store that refuses multipart uploads or the full object checksum as not
+implemented makes the node put every object whole from then on, and the node
+logs that once. Each shard exports `object_store_parts_uploads_total`,
+`object_store_parts_uploads_completed_total`,
+`object_store_parts_uploads_aborted_total`, `object_store_parts_fallbacks_total`
+and `object_store_parts_sent_total`.
+
+A crash or a cancelled put can leave an upload in parts behind: the parts of an
+S3 multipart upload, which S3 keeps and charges for until it is aborted, or the
+temporary objects of a GCS upload. Shard 0 of the caught-up metadata primary
+removes the ones that began more than `abandoned_upload_grace` ago, 1 hour by
+default, every hour or every grace when that is shorter. It sweeps only while
+its node passes the store identity check, and only once the identity object it
+reads names this cluster. On `s3` it lists the multipart uploads under the
+prefix and aborts the old ones whose keys this cluster builds, and on `gcs` it
+deletes the old temporary objects. The grace protects a live upload on another
+shard or node: an upload gives up at half the grace, and the other half covers
+the skew between the clocks. `abandoned_upload_grace = "disabled"` turns the
+sweep off, and an upload in parts then has no deadline. The grace is at least
+30 minutes, so its second half takes the 15 minutes of skew that S3 accepts.
+
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:
 

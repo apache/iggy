@@ -47,7 +47,8 @@ use partitions::{
     RemoteSegments,
 };
 use shard::tier_service::{
-    ClassLimits, SecondAttempts, StoreCallPolicy, StoreWriter, TierService, TierServiceConfig,
+    ClassLimits, PartsPolicy, SecondAttempts, StoreCallPolicy, StoreWriter, TierService,
+    TierServiceConfig,
 };
 use shard::{Sender, channel};
 use tracing::{info, warn};
@@ -272,6 +273,7 @@ pub fn start(
     let writer = StoreWriter {
         replica: replica_id,
         shard: shard.id,
+        layout: Some(layout.clone()),
         counters: shard.metrics().tier_store_counters(),
     };
     let service =
@@ -382,8 +384,22 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
                 after_per_mib: config.second_attempt_after_per_mib.get_duration(),
                 slots: usize::try_from(jobs.second_attempts).unwrap_or(usize::MAX),
             },
+            parts: PartsPolicy {
+                part_len: config.part_size.as_bytes_u64(),
+                in_flight: usize::try_from(jobs.parts_in_flight).unwrap_or(usize::MAX),
+                deadline: parts_deadline(config),
+            },
         },
     }
+}
+
+/// How long an upload in parts may run: half the grace of the sweep of
+/// abandoned uploads, so the sweep never meets a live one, and no limit
+/// without the sweep.
+#[must_use]
+pub fn parts_deadline(config: &TieredStorageConfig) -> Option<Duration> {
+    let grace = config.abandoned_upload_grace.get_duration();
+    (!grace.is_zero()).then(|| grace / 2)
 }
 
 /// The configured store, or `None` without a backend. An `s3` store signs

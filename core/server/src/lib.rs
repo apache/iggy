@@ -90,6 +90,7 @@ pub(crate) mod snapshot;
 pub(crate) mod store_identity;
 pub(crate) mod sysinfo_printer;
 pub(crate) mod tiered_storage;
+pub(crate) mod upload_sweep;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

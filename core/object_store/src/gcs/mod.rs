@@ -31,6 +31,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::ops::Range;
 use std::rc::Rc;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
@@ -43,12 +44,14 @@ pub use credentials::{AccessToken, GcsAuth, SharedToken};
 
 use crate::error::ObjectStoreError;
 use crate::http::{streamed, transport};
+use crate::layout::KeyLayout;
 use crate::store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, MAX_KEYS_PER_REQUEST, ObjectMeta,
-    ObjectRange, ObjectStore, PutBody, PutMode, PutOptions, validate_delete, validate_key,
-    validate_metadata, validate_prefix, validate_range,
+    ObjectRange, ObjectStore, PUT_ID_METADATA, PartsLimits, PartsUpload, PutBody, PutMode,
+    PutOptions, StoredPart, SweptUploads, validate_delete, validate_key, validate_metadata,
+    validate_prefix, validate_range,
 };
-use json::{ErrorBody, UploadMetadata};
+use json::{ErrorBody, ObjectResource, UploadMetadata};
 
 /// The JSON API of Google Cloud Storage.
 pub const DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
@@ -72,6 +75,10 @@ const GENERATION_HEADER: &str = "x-goog-generation";
 /// How many pages a listing follows by their token, within one call, while
 /// they come back empty. The API can answer an empty page with a token.
 const MAX_EMPTY_PAGES: usize = 16;
+/// The most source objects of one compose, so the most parts of an upload.
+pub const MAX_COMPOSE_SOURCES: u32 = 32;
+/// The most temporary objects that one page of a sweep lists and deletes.
+const SWEEP_PAGE_LEN: usize = 100;
 
 /// Where a [`GcsStore`] sends its requests, and how it authorizes them.
 #[derive(Debug, Clone)]
@@ -324,34 +331,14 @@ impl GcsStore {
         classify(status, error, subject, &self.bucket)
     }
 
-    /// Deletes the object under `key`. A missing object counts as deleted.
-    async fn delete_one(&self, key: &str) -> Result<(), ObjectStoreError> {
-        let response = self
-            .send(
-                Method::DELETE,
-                &self.object_url(key),
-                &[],
-                cyper::Body::empty(),
-            )
-            .await?;
-        if response.status().is_success() {
-            return Ok(());
-        }
-        let (status, error) = read_failure(response).await;
-        match self.failure(status, &error, &Subject::Object(key)) {
-            ObjectStoreError::NotFound { .. } => Ok(()),
-            error => Err(error),
-        }
-    }
-}
-
-impl ObjectStore for GcsStore {
-    async fn put(
+    /// One upload of `body` under `key`, and the store's answer when it
+    /// committed the object.
+    async fn upload_object(
         &self,
         key: &str,
         body: PutBody,
         options: &PutOptions,
-    ) -> Result<(), ObjectStoreError> {
+    ) -> Result<cyper::Response, ObjectStoreError> {
         validate_key(key)?;
         validate_metadata(&options.metadata)?;
         let len = body.len();
@@ -400,13 +387,82 @@ impl ObjectStore for GcsStore {
         }
         let response = sent?;
         if response.status().is_success() {
-            // The store committed the object. Reading the answer lets the
-            // connection serve the next request.
-            let _ = response.bytes().await;
-            return Ok(());
+            return Ok(response);
         }
         let (status, error) = read_failure(response).await;
         Err(self.failure(status, &error, &Subject::Upload(key)))
+    }
+
+    /// Deletes the objects under `keys`, a few at once. A missing object
+    /// counts as deleted. Returns how many the store refused to delete.
+    async fn delete_each(&self, keys: &[String]) -> usize {
+        stream::iter(keys)
+            .map(|key| self.delete_one(key))
+            .buffer_unordered(DELETE_CONCURRENCY)
+            .filter(|deleted| std::future::ready(deleted.is_err()))
+            .count()
+            .await
+    }
+
+    /// The keys of the first `parts` temporary objects of `upload`.
+    fn part_keys(upload: &PartsUpload, parts: u32) -> Vec<String> {
+        (1..=parts)
+            .map(|number| format!("{}{number:05}", upload.id))
+            .collect()
+    }
+
+    /// Deletes the object under `key` only while it is `generation`, so a
+    /// later object under the key stays.
+    async fn delete_generation(&self, key: &str, generation: u64) -> Result<(), ObjectStoreError> {
+        let url = format!("{}?ifGenerationMatch={generation}", self.object_url(key));
+        let response = self
+            .send(Method::DELETE, &url, &[], cyper::Body::empty())
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let (status, error) = read_failure(response).await;
+        match self.failure(status, &error, &Subject::Object(key)) {
+            ObjectStoreError::NotFound { .. } | ObjectStoreError::PreconditionFailed { .. } => {
+                Ok(())
+            }
+            error => Err(error),
+        }
+    }
+
+    /// Deletes the object under `key`. A missing object counts as deleted.
+    async fn delete_one(&self, key: &str) -> Result<(), ObjectStoreError> {
+        let response = self
+            .send(
+                Method::DELETE,
+                &self.object_url(key),
+                &[],
+                cyper::Body::empty(),
+            )
+            .await?;
+        if response.status().is_success() {
+            return Ok(());
+        }
+        let (status, error) = read_failure(response).await;
+        match self.failure(status, &error, &Subject::Object(key)) {
+            ObjectStoreError::NotFound { .. } => Ok(()),
+            error => Err(error),
+        }
+    }
+}
+
+impl ObjectStore for GcsStore {
+    async fn put(
+        &self,
+        key: &str,
+        body: PutBody,
+        options: &PutOptions,
+    ) -> Result<(), ObjectStoreError> {
+        let response = self.upload_object(key, body, options).await?;
+        // The store committed the object. Reading the answer lets the
+        // connection serve the next request.
+        let _ = response.bytes().await;
+        Ok(())
     }
 
     async fn get_range(
@@ -558,6 +614,208 @@ impl ObjectStore for GcsStore {
             }
         }
     }
+
+    /// Up to [`MAX_COMPOSE_SOURCES`] parts, each a temporary object of its
+    /// own, which one compose joins.
+    fn parts_limits(&self) -> Option<PartsLimits> {
+        Some(PartsLimits {
+            min_part_len: 1,
+            max_parts: MAX_COMPOSE_SOURCES,
+        })
+    }
+
+    /// Sends nothing: the upload is the prefix of its temporary objects,
+    /// named after the put id of `options`, or after a random id without
+    /// one.
+    async fn begin_parts(
+        &self,
+        key: &str,
+        options: &PutOptions,
+        layout: &KeyLayout,
+    ) -> Result<PartsUpload, ObjectStoreError> {
+        validate_key(key)?;
+        validate_metadata(&options.metadata)?;
+        let upload_id = options
+            .metadata
+            .get(PUT_ID_METADATA)
+            .and_then(|id| u128::from_str_radix(id, 16).ok())
+            .unwrap_or_else(rand::random);
+        Ok(PartsUpload {
+            key: key.to_owned(),
+            id: layout.upload_prefix(upload_id),
+        })
+    }
+
+    /// Stores the part as a temporary object, whose CRC32C the store checks.
+    /// Its generation pins it as a source of the compose.
+    async fn put_part(
+        &self,
+        upload: &PartsUpload,
+        number: u32,
+        body: PutBody,
+        crc32c: u32,
+    ) -> Result<StoredPart, ObjectStoreError> {
+        let key = format!("{}{number:05}", upload.id);
+        let options = PutOptions {
+            crc32c: Some(crc32c),
+            ..PutOptions::default()
+        };
+        let response = self.upload_object(&key, body, &options).await?;
+        let stored = json::parse_object(&response.bytes().await.map_err(transport)?)?;
+        Ok(StoredPart {
+            number,
+            tag: stored.generation.to_string(),
+            crc32c,
+        })
+    }
+
+    /// Composes the temporary objects into the object, with
+    /// `ifGenerationMatch=0` for a create-only put and the user metadata, and
+    /// then deletes them. The compose takes no CRC32C to check, so the
+    /// provider compares the CRC32C of the composed object with the expected
+    /// one, and deletes the object under its own generation when they
+    /// differ.
+    async fn complete_parts(
+        &self,
+        upload: &PartsUpload,
+        parts: &[StoredPart],
+        options: &PutOptions,
+        _len: u64,
+    ) -> Result<(), ObjectStoreError> {
+        let key = upload.key.as_str();
+        validate_key(key)?;
+        validate_metadata(&options.metadata)?;
+        if parts.is_empty() || parts.len() > MAX_COMPOSE_SOURCES as usize {
+            return Err(ObjectStoreError::InvalidRequest(format!(
+                "a compose takes 1 to {MAX_COMPOSE_SOURCES} parts, not {}",
+                parts.len()
+            )));
+        }
+        let mut url = format!("{}/compose", self.object_url(key));
+        match options.mode {
+            PutMode::Overwrite => {}
+            PutMode::IfAbsent => url.push_str("?ifGenerationMatch=0"),
+        }
+        let body = compose_request(upload, parts, options)?;
+        let headers = [("content-type", "application/json".to_owned())];
+        let response = self
+            .send(Method::POST, &url, &headers, cyper::Body::from(body))
+            .await?;
+        if !response.status().is_success() {
+            let (status, error) = read_failure(response).await;
+            return Err(self.failure(status, &error, &Subject::Object(key)));
+        }
+        let composed = json::parse_object(&response.bytes().await.map_err(transport)?)?;
+        if let Some(expected) = options.crc32c
+            && composed_crc32c(&composed)? != Some(expected)
+        {
+            self.delete_generation(key, composed.generation).await?;
+            return Err(ObjectStoreError::ChecksumMismatch {
+                key: key.to_owned(),
+            });
+        }
+        // The object is whole. A temporary that stays goes with the sweep.
+        let part_count = u32::try_from(parts.len()).unwrap_or(MAX_COMPOSE_SOURCES);
+        self.delete_each(&Self::part_keys(upload, part_count)).await;
+        Ok(())
+    }
+
+    /// Deletes the temporary objects of the upload.
+    async fn abort_parts(&self, upload: &PartsUpload, parts: u32) -> Result<(), ObjectStoreError> {
+        let keys = Self::part_keys(upload, parts.min(MAX_COMPOSE_SOURCES));
+        match self.delete_each(&keys).await {
+            0 => Ok(()),
+            failed => Err(ObjectStoreError::Unavailable(format!(
+                "the store kept {failed} of the {} temporary objects of {:?}",
+                keys.len(),
+                upload.key
+            ))),
+        }
+    }
+
+    /// Lists the temporary objects of uploads in parts, and deletes those
+    /// that the store last changed before the cutoff, by this node's clock.
+    async fn sweep_uploads(
+        &self,
+        layout: &KeyLayout,
+        older_than: Duration,
+        after: Option<&str>,
+    ) -> Result<SweptUploads, ObjectStoreError> {
+        let prefix = layout.uploads_prefix();
+        let request = ListRequest::new(&prefix).with_max_keys(SWEEP_PAGE_LEN);
+        let request = after.map_or(request, |after| request.after(after));
+        let page = self.list(&request).await?;
+        let cutoff = SystemTime::now()
+            .checked_sub(older_than)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        let mut swept = SweptUploads {
+            next: page.next,
+            ..SweptUploads::default()
+        };
+        let mut abandoned = Vec::new();
+        for object in page.objects {
+            if layout.parse_upload_part_key(&object.key).is_none() {
+                continue;
+            }
+            if object.last_modified >= cutoff {
+                swept.kept += 1;
+            } else {
+                abandoned.push(object.key);
+            }
+        }
+        let failed = self.delete_each(&abandoned).await;
+        swept.failed = failed as u64;
+        swept.removed = (abandoned.len() - failed) as u64;
+        Ok(swept)
+    }
+}
+
+/// The body of a compose of the temporary objects of `upload` into its
+/// object: each source pinned to the generation that its put answered, and
+/// the destination with the user metadata. The CRC32C goes along, although
+/// the API documents that a compose ignores it.
+fn compose_request(
+    upload: &PartsUpload,
+    parts: &[StoredPart],
+    options: &PutOptions,
+) -> Result<String, ObjectStoreError> {
+    let sources = parts
+        .iter()
+        .map(|part| {
+            let generation: u64 = part.tag.parse().map_err(|_| {
+                ObjectStoreError::InvalidRequest(format!(
+                    "part {} of {:?} has no generation but {:?}",
+                    part.number, upload.key, part.tag
+                ))
+            })?;
+            Ok(serde_json::json!({
+                "name": format!("{}{:05}", upload.id, part.number),
+                "generation": generation.to_string(),
+            }))
+        })
+        .collect::<Result<Vec<_>, ObjectStoreError>>()?;
+    let mut destination = serde_json::json!({ "contentType": "application/octet-stream" });
+    if !options.metadata.is_empty() {
+        destination["metadata"] = serde_json::json!(options.metadata);
+    }
+    if let Some(crc32c) = options.crc32c {
+        destination["crc32c"] = serde_json::json!(json::encode_crc32c(crc32c));
+    }
+    Ok(serde_json::json!({
+        "kind": "storage#composeRequest",
+        "sourceObjects": sources,
+        "destination": destination,
+    })
+    .to_string())
+}
+
+/// The CRC32C that the answer to a compose reports for the object.
+fn composed_crc32c(composed: &ObjectResource) -> Result<Option<u32>, ObjectStoreError> {
+    composed
+        .crc32c
+        .as_deref()
+        .map(json::parse_crc32c)
+        .transpose()
 }
 
 /// What one answer to a listing makes of the page.
@@ -778,6 +1036,9 @@ mod tests {
     /// Whether an error is the one that a case expects.
     type Expected = fn(&ObjectStoreError) -> bool;
 
+    /// What the fake store answers to the request of a case.
+    type Answers = fn(&Captured) -> Answer;
+
     /// One request that [`FakeGcs`] took.
     #[derive(Debug, Clone)]
     struct Captured {
@@ -994,6 +1255,7 @@ mod tests {
             mode: PutMode::IfAbsent,
             metadata: UserMetadata::from([("end-offset".to_owned(), "99".to_owned())]),
             crc32c: Some(crc32c::crc32c(b"hello world")),
+            ..PutOptions::default()
         };
 
         let create = store.upload("iggy/a b", &options);
@@ -1295,6 +1557,7 @@ mod tests {
             mode: PutMode::IfAbsent,
             metadata: UserMetadata::new(),
             crc32c: Some(crc32c::crc32c(&body)),
+            ..PutOptions::default()
         };
 
         crate::contract::shard_runtime()
@@ -1404,6 +1667,357 @@ mod tests {
             "{result:?}"
         );
         assert!(result.unwrap_err().put_may_have_stored());
+    }
+
+    const PART_BYTES: &[u8] = b"part one, part two";
+
+    fn parts_layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    fn temporaries() -> PartsUpload {
+        PartsUpload {
+            key: "a/b".to_owned(),
+            id: parts_layout().upload_prefix(0x2a),
+        }
+    }
+
+    fn object_json(name: &str, generation: u64, crc32c: u32, updated: &str) -> Vec<u8> {
+        serde_json::json!({
+            "name": name,
+            "size": "18",
+            "generation": generation.to_string(),
+            "updated": updated,
+            "crc32c": json::encode_crc32c(crc32c),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn given_an_upload_in_parts_when_beginning_should_name_its_temporaries_after_the_put_id() {
+        let store = GcsStore::new(config(DEFAULT_ENDPOINT)).unwrap();
+        let options = PutOptions {
+            metadata: UserMetadata::from([(PUT_ID_METADATA.to_owned(), format!("{:032x}", 0x2a))]),
+            ..PutOptions::default()
+        };
+
+        let begun = crate::contract::shard_runtime()
+            .block_on(store.begin_parts("a/b", &options, &parts_layout()))
+            .unwrap();
+
+        assert_eq!(begun, temporaries());
+    }
+
+    #[test]
+    fn given_a_part_when_putting_should_store_a_checked_temporary_and_keep_its_generation() {
+        let fake = FakeGcs::start(|request| {
+            (
+                200,
+                object_json(
+                    "t",
+                    77,
+                    crc32c::crc32c(&request.body),
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        });
+        let store = fake.store(GcsAuth::Anonymous);
+        let bytes = Bytes::from_static(PART_BYTES);
+        let crc32c = crc32c::crc32c(&bytes);
+
+        let stored = crate::contract::shard_runtime()
+            .block_on(store.put_part(&temporaries(), 2, PutBody::from_bytes(bytes), crc32c))
+            .unwrap();
+
+        assert_eq!(
+            stored,
+            StoredPart {
+                number: 2,
+                tag: "77".to_owned(),
+                crc32c,
+            }
+        );
+        let [request] = fake.requests().try_into().unwrap();
+        assert_eq!(
+            request.target,
+            "/upload/storage/v1/b/segments/o?uploadType=multipart&name=iggy%2Fmeta%2Fuploads%2F\
+             0000000000000000000000000000002a%2F00002"
+        );
+        let text = String::from_utf8_lossy(&request.body);
+        assert!(
+            text.contains(&json::encode_crc32c(crc32c)),
+            "the part carries its CRC32C: {text}"
+        );
+    }
+
+    fn stored_parts() -> Vec<StoredPart> {
+        vec![
+            StoredPart {
+                number: 1,
+                tag: "11".to_owned(),
+                crc32c: 1,
+            },
+            StoredPart {
+                number: 2,
+                tag: "12".to_owned(),
+                crc32c: 2,
+            },
+        ]
+    }
+
+    fn create_options() -> PutOptions {
+        PutOptions {
+            mode: PutMode::IfAbsent,
+            metadata: UserMetadata::from([(PUT_ID_METADATA.to_owned(), "2a".to_owned())]),
+            crc32c: Some(crc32c::crc32c(PART_BYTES)),
+            ..PutOptions::default()
+        }
+    }
+
+    #[test]
+    fn given_parts_when_completing_a_create_only_put_should_compose_them_and_delete_them() {
+        let fake = FakeGcs::start(|request| {
+            if request.method == "DELETE" {
+                return (204, Vec::new());
+            }
+            (
+                200,
+                object_json(
+                    "a/b",
+                    99,
+                    crc32c::crc32c(PART_BYTES),
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        });
+        let store = fake.store(GcsAuth::Anonymous);
+
+        crate::contract::shard_runtime()
+            .block_on(store.complete_parts(&temporaries(), &stored_parts(), &create_options(), 18))
+            .unwrap();
+
+        let requests = fake.requests();
+        let compose = &requests[0];
+        assert_eq!(compose.method, "POST");
+        assert_eq!(
+            compose.target,
+            "/storage/v1/b/segments/o/a%2Fb/compose?ifGenerationMatch=0"
+        );
+        let body: serde_json::Value = serde_json::from_slice(&compose.body).unwrap();
+        let prefix = parts_layout().upload_prefix(0x2a);
+        assert_eq!(
+            body["sourceObjects"],
+            serde_json::json!([
+                { "name": format!("{prefix}00001"), "generation": "11" },
+                { "name": format!("{prefix}00002"), "generation": "12" },
+            ])
+        );
+        assert_eq!(body["destination"]["metadata"][PUT_ID_METADATA], "2a");
+        assert_eq!(
+            body["destination"]["crc32c"],
+            json::encode_crc32c(crc32c::crc32c(PART_BYTES))
+        );
+        let mut deleted: Vec<&str> = requests[1..]
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect();
+        deleted.sort_unstable();
+        let encoded = |number: u32| {
+            format!(
+                "/storage/v1/b/segments/o/{}",
+                encode(&format!("{prefix}{number:05}"))
+            )
+        };
+        assert_eq!(deleted, [encoded(1), encoded(2)]);
+    }
+
+    #[test]
+    fn given_an_overwrite_when_completing_should_compose_without_a_condition() {
+        let fake = FakeGcs::start(|request| {
+            if request.method == "DELETE" {
+                return (204, Vec::new());
+            }
+            (
+                200,
+                object_json(
+                    "a/b",
+                    99,
+                    crc32c::crc32c(PART_BYTES),
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        });
+        let store = fake.store(GcsAuth::Anonymous);
+        let options = PutOptions {
+            mode: PutMode::Overwrite,
+            ..create_options()
+        };
+
+        crate::contract::shard_runtime()
+            .block_on(store.complete_parts(&temporaries(), &stored_parts(), &options, 18))
+            .unwrap();
+
+        assert_eq!(
+            fake.requests()[0].target,
+            "/storage/v1/b/segments/o/a%2Fb/compose"
+        );
+    }
+
+    /// A compose takes no CRC32C to check, so the provider compares the one
+    /// it reports and takes the object back on a mismatch.
+    #[test]
+    fn given_a_composed_object_of_another_crc32c_when_completing_should_delete_it_and_fail() {
+        let fake = FakeGcs::start(|request| {
+            if request.method == "DELETE" {
+                return (204, Vec::new());
+            }
+            (
+                200,
+                object_json(
+                    "a/b",
+                    99,
+                    crc32c::crc32c(PART_BYTES) ^ 1,
+                    "2026-01-01T00:00:00Z",
+                ),
+            )
+        });
+        let store = fake.store(GcsAuth::Anonymous);
+
+        let completed = crate::contract::shard_runtime().block_on(store.complete_parts(
+            &temporaries(),
+            &stored_parts(),
+            &create_options(),
+            18,
+        ));
+
+        assert!(
+            matches!(&completed, Err(ObjectStoreError::ChecksumMismatch { key }) if key == "a/b"),
+            "{completed:?}"
+        );
+        let requests = fake.requests();
+        let [_, taken_back] = requests.as_slice() else {
+            panic!("{requests:?}");
+        };
+        assert_eq!(taken_back.method, "DELETE");
+        assert_eq!(
+            taken_back.target,
+            "/storage/v1/b/segments/o/a%2Fb?ifGenerationMatch=99"
+        );
+    }
+
+    #[test]
+    fn given_more_parts_than_a_compose_takes_when_completing_should_refuse_before_any_request() {
+        let fake = FakeGcs::start(|_| (200, Vec::new()));
+        let store = fake.store(GcsAuth::Anonymous);
+        let parts: Vec<StoredPart> = (1..=MAX_COMPOSE_SOURCES + 1)
+            .map(|number| StoredPart {
+                number,
+                tag: "1".to_owned(),
+                crc32c: 0,
+            })
+            .collect();
+
+        let completed = crate::contract::shard_runtime().block_on(store.complete_parts(
+            &temporaries(),
+            &parts,
+            &create_options(),
+            18,
+        ));
+
+        assert!(
+            matches!(completed, Err(ObjectStoreError::InvalidRequest(_))),
+            "{completed:?}"
+        );
+        assert!(fake.requests().is_empty());
+        assert_eq!(store.parts_limits().unwrap().max_parts, MAX_COMPOSE_SOURCES);
+    }
+
+    #[test]
+    fn given_answers_to_a_compose_when_classifying_should_tell_a_conflict_from_a_lost_part() {
+        let cases: [(Answers, Expected); 2] = [
+            (
+                |_| (412, Vec::new()),
+                |error| matches!(error, ObjectStoreError::PreconditionFailed { key } if key == "a/b"),
+            ),
+            (
+                |_| (404, Vec::new()),
+                |error| matches!(error, ObjectStoreError::NotFound { .. }),
+            ),
+        ];
+        for (answer, expected) in cases {
+            let fake = FakeGcs::start(answer);
+            let store = fake.store(GcsAuth::Anonymous);
+
+            let completed = crate::contract::shard_runtime().block_on(store.complete_parts(
+                &temporaries(),
+                &stored_parts(),
+                &create_options(),
+                18,
+            ));
+
+            let error = completed.unwrap_err();
+            assert!(expected(&error), "{error:?}");
+        }
+    }
+
+    /// Lists two temporaries, one old and one young, and an old object under
+    /// the prefix that is no temporary; deletes are answered 204.
+    fn temporaries_listing(request: &Captured) -> Answer {
+        if request.method == "DELETE" {
+            return (204, Vec::new());
+        }
+        let at = |age: chrono::TimeDelta| (chrono::Utc::now() - age).to_rfc3339();
+        let layout = KeyLayout::new("iggy").unwrap();
+        let item = |name: String, updated: String| {
+            serde_json::json!({
+                "name": name,
+                "size": "1",
+                "generation": "1",
+                "updated": updated,
+            })
+        };
+        let body = serde_json::json!({
+            "items": [
+                item(layout.upload_part_key(1, 1), at(chrono::TimeDelta::hours(2))),
+                item(layout.upload_part_key(2, 1), at(chrono::TimeDelta::minutes(5))),
+                item(format!("{}stray", layout.uploads_prefix()), at(chrono::TimeDelta::hours(2))),
+            ]
+        });
+        (200, body.to_string().into_bytes())
+    }
+
+    #[test]
+    fn given_temporaries_when_sweeping_should_delete_only_the_old_ones() {
+        let fake = FakeGcs::start(temporaries_listing);
+        let store = fake.store(GcsAuth::Anonymous);
+        let layout = parts_layout();
+
+        let swept = crate::contract::shard_runtime()
+            .block_on(store.sweep_uploads(&layout, Duration::from_secs(3600), None))
+            .unwrap();
+
+        assert_eq!((swept.removed, swept.kept, swept.failed), (1, 1, 0));
+        let requests = fake.requests();
+        assert!(
+            requests[0]
+                .target
+                .contains("prefix=iggy%2Fmeta%2Fuploads%2F"),
+            "{}",
+            requests[0].target
+        );
+        let deleted: Vec<&str> = requests
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.target.as_str())
+            .collect();
+        assert_eq!(
+            deleted,
+            [format!(
+                "/storage/v1/b/segments/o/{}",
+                encode(&layout.upload_part_key(1, 1))
+            )]
+        );
     }
 
     #[test]

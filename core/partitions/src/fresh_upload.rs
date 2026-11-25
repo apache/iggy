@@ -132,7 +132,8 @@ mod tests {
     use super::*;
     use iggy_object_store::{
         DeleteOutcome, FreshObject, InlineTierExecutor, ListPage, ListRequest, MemoryStore,
-        ObjectMeta, ObjectRange, PutBody, RecordingStore, StoreCall, TierJobHandle, TierScope,
+        ObjectMeta, ObjectRange, PutBody, PutParts, RecordingStore, StoreCall, TierJobHandle,
+        TierScope,
     };
     use std::cell::RefCell;
     use std::future::Future;
@@ -221,6 +222,78 @@ mod tests {
         assert_eq!(
             uploader.executor().requests.take(),
             [(TierJobClass::FreshUpload, size)]
+        );
+    }
+
+    /// A store that keeps the options of each put it takes.
+    struct KeepsPutOptions {
+        inner: MemoryStore,
+        puts: RefCell<Vec<PutOptions>>,
+    }
+
+    impl ObjectStore for KeepsPutOptions {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            self.puts.borrow_mut().push(options.clone());
+            self.inner.put(key, body, options).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            self.inner.get_range(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.inner.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.inner.list(request).await
+        }
+    }
+
+    /// Producers wait for the upload, so the begin and the completion of an
+    /// upload in parts must never come before their answer.
+    #[compio::test]
+    async fn given_a_fresh_object_when_uploading_should_put_it_whole() {
+        let uploader = ExecutorFreshUploader::new(
+            InlineTierExecutor::new(KeepsPutOptions {
+                inner: MemoryStore::new(),
+                puts: RefCell::default(),
+            }),
+            layout(),
+        );
+        let bytes = object(b"messages");
+
+        let outcome = uploader
+            .upload(
+                FreshObjectId::new(1, 2, 3, 4).unwrap(),
+                bytes.clone(),
+                TierScope::new().token(),
+            )
+            .await;
+
+        assert!(matches!(outcome, Ok(Ok(()))), "{outcome:?}");
+        let puts = uploader.executor().store().puts.take();
+        assert_eq!(
+            puts,
+            [PutOptions {
+                mode: PutMode::IfAbsent,
+                crc32c: Some(crc32c::crc32c(&bytes)),
+                parts: PutParts::Whole,
+                ..PutOptions::default()
+            }]
         );
     }
 

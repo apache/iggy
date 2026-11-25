@@ -25,7 +25,7 @@ use quick_xml::escape::escape;
 use serde::Deserialize;
 
 use crate::error::ObjectStoreError;
-use crate::store::{ListPage, ListedObject};
+use crate::store::{ListPage, ListedObject, StoredPart};
 
 /// The code and the message of an S3 error body.
 #[derive(Debug, Default, Deserialize)]
@@ -73,6 +73,49 @@ struct Contents {
 struct DeleteResult {
     #[serde(default, rename = "Error")]
     errors: Vec<DeleteError>,
+}
+
+#[derive(Deserialize)]
+struct InitiateMultipartUploadResult {
+    #[serde(rename = "UploadId")]
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListMultipartUploadsResult {
+    #[serde(default, rename = "Upload")]
+    uploads: Vec<ListedUpload>,
+    #[serde(default)]
+    is_truncated: bool,
+    next_key_marker: Option<String>,
+    next_upload_id_marker: Option<String>,
+    encoding_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct ListedUpload {
+    key: String,
+    upload_id: String,
+    initiated: String,
+}
+
+/// One multipart upload in progress, as a listing of them reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingUpload {
+    pub key: String,
+    pub upload_id: String,
+    pub initiated: SystemTime,
+}
+
+/// One page of a `ListMultipartUploads` answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadsPage {
+    pub uploads: Vec<PendingUpload>,
+    /// The key marker and the upload id marker of the next page, `None` on
+    /// the last one.
+    pub next: Option<(String, String)>,
 }
 
 /// The error in `body`. A HEAD answer has no body, and a proxy can send one
@@ -141,6 +184,94 @@ pub fn delete_request<'a>(keys: impl IntoIterator<Item = &'a str>) -> String {
     }
     body.push_str("</Delete>");
     body
+}
+
+/// The upload id of a `CreateMultipartUpload` answer.
+///
+/// # Errors
+/// [`ObjectStoreError::Malformed`] for a body that is not such an answer.
+pub fn parse_initiate(body: &[u8]) -> Result<String, ObjectStoreError> {
+    let result: InitiateMultipartUploadResult = parse(body)?;
+    if result.id.is_empty() {
+        return Err(ObjectStoreError::Malformed(
+            "a multipart upload without an upload id".to_owned(),
+        ));
+    }
+    Ok(result.id)
+}
+
+/// The body of a `CompleteMultipartUpload` request: each part with its
+/// number, its etag and its CRC32C, in order.
+pub fn complete_request(parts: &[StoredPart], encode_crc32c: impl Fn(u32) -> String) -> String {
+    let mut body = String::from(
+        r#"<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    );
+    for part in parts {
+        body.push_str("<Part><PartNumber>");
+        body.push_str(&part.number.to_string());
+        body.push_str("</PartNumber><ETag>\"");
+        body.push_str(&escape(unquote_etag(&part.tag)));
+        body.push_str("\"</ETag><ChecksumCRC32C>");
+        body.push_str(&encode_crc32c(part.crc32c));
+        body.push_str("</ChecksumCRC32C></Part>");
+    }
+    body.push_str("</CompleteMultipartUpload>");
+    body
+}
+
+/// The error that a `CompleteMultipartUpload` answer of 200 holds, `None`
+/// for an answer that holds the completed object. The store sends its status
+/// before it finishes the work, so a failure comes in the body of a 200.
+pub fn embedded_error(body: &[u8]) -> Option<ErrorBody> {
+    let text = std::str::from_utf8(body).ok()?;
+    let start = text.trim_start();
+    let root = start
+        .strip_prefix("<?xml")
+        .and_then(|declared| declared.split_once("?>"))
+        .map_or(start, |(_, rest)| rest)
+        .trim_start();
+    root.starts_with("<Error>").then(|| parse_error(body))
+}
+
+/// One page of a `ListMultipartUploads` answer.
+///
+/// # Errors
+/// [`ObjectStoreError::Malformed`] for a body that is not such an answer.
+pub fn parse_uploads(body: &[u8]) -> Result<UploadsPage, ObjectStoreError> {
+    let result: ListMultipartUploadsResult = parse(body)?;
+    let url_encoded = result.encoding_type.as_deref() == Some("url");
+    let decode = |key: String| {
+        if url_encoded {
+            decode_url_key(&key)
+        } else {
+            Ok(key)
+        }
+    };
+    let next = match (
+        result.is_truncated,
+        result.next_key_marker,
+        result.next_upload_id_marker,
+    ) {
+        (false, _, _) => None,
+        (true, Some(key), Some(upload_id)) => Some((decode(key)?, upload_id)),
+        (true, _, _) => {
+            return Err(ObjectStoreError::Malformed(
+                "a truncated listing of uploads without its markers".to_owned(),
+            ));
+        }
+    };
+    let uploads = result
+        .uploads
+        .into_iter()
+        .map(|upload| {
+            Ok(PendingUpload {
+                key: decode(upload.key)?,
+                upload_id: upload.upload_id,
+                initiated: parse_timestamp(&upload.initiated)?,
+            })
+        })
+        .collect::<Result<_, ObjectStoreError>>()?;
+    Ok(UploadsPage { uploads, next })
 }
 
 /// An etag as the store quotes it in headers and listings, without the
