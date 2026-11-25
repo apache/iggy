@@ -110,6 +110,12 @@ impl From<SystemTime> for IggyTimestamp {
     }
 }
 
+impl From<IggyTimestamp> for SystemTime {
+    fn from(timestamp: IggyTimestamp) -> Self {
+        timestamp.0
+    }
+}
+
 impl Add<SystemTime> for IggyTimestamp {
     type Output = IggyTimestamp;
 

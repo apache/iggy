@@ -219,7 +219,11 @@ pub fn serve_peers<B, MJ, S, SB>(
 
 /// The configured peers with their stores. `preflight` refused the boot
 /// already when a store or a layout fails.
-fn peers(config: &GeoConfig, statuses: &[SharedPeerStatus], auth: &PeerAuth) -> Vec<ServedPeer> {
+fn peers(
+    config: &GeoConfig,
+    statuses: &[SharedPeerStatus],
+    auth: &PeerAuth,
+) -> impl Iterator<Item = ServedPeer> {
     config
         .peers
         .iter()
@@ -233,7 +237,6 @@ fn peers(config: &GeoConfig, statuses: &[SharedPeerStatus], auth: &PeerAuth) -> 
                 status: status.clone(),
             })
         })
-        .collect()
 }
 
 /// The identity check of each peer. Each check gets a store of its own,

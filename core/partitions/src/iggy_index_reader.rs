@@ -20,6 +20,7 @@ use bytes::{Buf, Bytes};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use iggy_common::IggyError;
+use std::borrow::Cow;
 use tracing::trace;
 
 /// Reader for the sparse index file written by [`crate::IggyIndexWriter`].
@@ -94,8 +95,9 @@ impl IggyIndexReader {
         Ok(size / IGGY_INDEX_SIZE as u64)
     }
 
-    /// The `len` bytes at `position`, all of them or an error.
-    async fn read_exact_at(&self, position: u64, len: usize) -> Result<Vec<u8>, IggyError> {
+    /// The `len` bytes at `position`, all of them or an error: read into a
+    /// buffer of their own from a file, and borrowed from memory.
+    async fn read_exact_at(&self, position: u64, len: usize) -> Result<Cow<'_, [u8]>, IggyError> {
         match &self.source {
             Source::File(file) => {
                 // `with_capacity` (len 0): `read_exact_at` fills the spare
@@ -105,19 +107,19 @@ impl IggyIndexReader {
                 let (result, buffer): (std::io::Result<()>, Vec<u8>) =
                     file.read_exact_at(buffer, position).await.into();
                 result.map_err(|_| IggyError::CannotReadFile)?;
-                Ok(buffer)
+                Ok(Cow::Owned(buffer))
             }
             Source::Bytes(bytes) => usize::try_from(position)
                 .ok()
                 .and_then(|start| bytes.get(start..start.checked_add(len)?))
-                .map(<[u8]>::to_vec)
+                .map(Cow::Borrowed)
                 .ok_or(IggyError::CannotReadFile),
         }
     }
 
     async fn read_entry_at(&self, byte_position: u64) -> Result<IggyIndex, IggyError> {
         let buffer = self.read_exact_at(byte_position, IGGY_INDEX_SIZE).await?;
-        let mut view = buffer.as_slice();
+        let mut view: &[u8] = &buffer;
         let offset = view.get_u64_le();
         let timestamp = view.get_u64_le();
         let position = view.get_u64_le();
@@ -182,7 +184,7 @@ impl IggyIndexReader {
         let buffer = self.read_exact_at(0, count * IGGY_INDEX_SIZE).await?;
 
         let mut cache = IggyIndexCache::with_capacity(count);
-        let mut view = buffer.as_slice();
+        let mut view: &[u8] = &buffer;
         for _ in 0..count {
             let offset = view.get_u64_le();
             let timestamp = view.get_u64_le();

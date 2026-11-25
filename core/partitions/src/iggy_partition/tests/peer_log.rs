@@ -30,8 +30,8 @@ use crate::journal::MessageLookup;
 use crate::poll_plan::{PollPlan, PollReadResult, PollTier};
 use crate::segment_chain::PrefixAccess;
 use crate::{
-    PeerLogError, PeerManifestContradiction, PeerManifestRefusal, RemoteObjects, RemoteSegments,
-    SegmentLocation, upload_segment,
+    IndexFile, IndexFiles, PeerLogError, PeerManifestContradiction, PeerManifestRefusal,
+    RemoteObjects, RemoteSegments, SegmentLocation, upload_segment,
 };
 use futures::FutureExt;
 use futures::channel::oneshot;
@@ -43,7 +43,9 @@ use iggy_object_store::{
     SegmentKey, SegmentObject, StoreCall,
 };
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::future::Future;
+use std::io;
 use std::ops::Range;
 use std::pin::Pin;
 use std::time::Duration;
@@ -125,10 +127,33 @@ pub(super) fn follower(
     (directory, partition)
 }
 
+/// [`follower`] without a directory, as a simulated node builds it. Its
+/// polls keep the indexes that they fetch in `index_files`.
+pub(super) fn follower_without_files(
+    objects: Rc<dyn RemoteObjects>,
+    index_files: &MemoryIndexFiles,
+) -> Box<IggyPartition<IggyMessageBus>> {
+    let mut partition = without_files();
+    partition.follow_peer_log(ORIGIN_ROOT, PREFIX).unwrap();
+    partition.set_remote_segments(Rc::new(
+        RemoteSegments::new(objects, origin_layout())
+            .with_index_files(Rc::new(index_files.clone())),
+    ));
+    partition
+}
+
 /// A partition of stream 5 with a directory and an incarnation of its own,
 /// which follows nothing yet.
 pub(super) fn unattached() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
     let directory = tempfile::tempdir().unwrap();
+    let mut partition = without_files();
+    partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
+    (directory, partition)
+}
+
+/// A partition of stream 5 with an incarnation of its own and no directory,
+/// which follows nothing yet.
+fn without_files() -> Box<IggyPartition<IggyMessageBus>> {
     let namespace = IggyNamespace::new(5, 2, 0);
     let consensus = VsrConsensus::new(
         TEST_CLUSTER,
@@ -145,8 +170,99 @@ pub(super) fn unattached() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageB
         IggyByteSize::from(1024 * 1024),
     ));
     partition.set_created_revision(FOLLOWER_REVISION);
-    partition.set_partition_dir(directory.path().to_string_lossy().into_owned());
-    (directory, partition)
+    partition
+}
+
+/// The `.index` files of a node that keeps them in memory, by path.
+#[derive(Clone, Default)]
+pub(super) struct MemoryIndexFiles(Rc<RefCell<BTreeMap<String, Vec<u8>>>>);
+
+impl MemoryIndexFiles {
+    /// Whether it holds a file whose name is `name`.
+    pub(super) fn holds(&self, name: &str) -> bool {
+        self.0
+            .borrow()
+            .keys()
+            .any(|path| path.rsplit('/').next() == Some(name))
+    }
+}
+
+/// A file of [`MemoryIndexFiles`] that a fetch writes.
+struct MemoryIndexFile {
+    files: MemoryIndexFiles,
+    path: String,
+}
+
+impl IndexFiles for MemoryIndexFiles {
+    fn create<'a>(&'a self, path: &'a str) -> LocalBoxFuture<'a, io::Result<Box<dyn IndexFile>>> {
+        self.0.borrow_mut().insert(path.to_owned(), Vec::new());
+        let file = MemoryIndexFile {
+            files: self.clone(),
+            path: path.to_owned(),
+        };
+        async move { Ok(Box::new(file) as Box<dyn IndexFile>) }.boxed_local()
+    }
+
+    fn rename<'a>(
+        &'a self,
+        source: &'a str,
+        target: &'a str,
+    ) -> LocalBoxFuture<'a, io::Result<()>> {
+        let mut files = self.0.borrow_mut();
+        let moved = files
+            .remove(source)
+            .map(|bytes| files.insert(target.to_owned(), bytes));
+        drop(files);
+        async move {
+            moved
+                .map(drop)
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
+        }
+        .boxed_local()
+    }
+
+    fn sync_directory<'a>(&'a self, _directory: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
+        async { Ok(()) }.boxed_local()
+    }
+
+    fn remove<'a>(&'a self, path: &'a str) -> LocalBoxFuture<'a, io::Result<()>> {
+        let removed = self.0.borrow_mut().remove(path);
+        async move {
+            removed
+                .map(drop)
+                .ok_or_else(|| io::ErrorKind::NotFound.into())
+        }
+        .boxed_local()
+    }
+
+    fn open<'a>(&'a self, path: &'a str) -> LocalBoxFuture<'a, Result<IggyIndexReader, IggyError>> {
+        let bytes = self.0.borrow().get(path).cloned();
+        async move {
+            bytes
+                .map(|bytes| IggyIndexReader::from_bytes(path, Bytes::from(bytes)))
+                .ok_or(IggyError::CannotReadFile)
+        }
+        .boxed_local()
+    }
+}
+
+impl IndexFile for MemoryIndexFile {
+    fn write_at(&mut self, bytes: Bytes, position: u64) -> LocalBoxFuture<'_, io::Result<()>> {
+        let start = usize::try_from(position).unwrap();
+        let end = start + bytes.len();
+        let mut files = self.files.0.borrow_mut();
+        let file = files.entry(self.path.clone()).or_default();
+        if file.len() < end {
+            file.resize(end, 0);
+        }
+        file[start..end].copy_from_slice(&bytes);
+        drop(files);
+        async { Ok(()) }.boxed_local()
+    }
+
+    fn sync(&mut self) -> LocalBoxFuture<'_, io::Result<()>> {
+        async { Ok(()) }.boxed_local()
+    }
 }
 
 pub(super) fn plan<B: MessageBus>(
@@ -509,6 +625,33 @@ async fn given_a_read_of_a_segment_a_trim_dropped_when_completing_should_refuse_
     );
     Box::pin(trimmed.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(!directory.path().join(format!("{:020}.index", 0)).exists());
+}
+
+#[compio::test]
+async fn given_a_follower_without_files_when_a_trim_drops_a_polled_segment_should_remove_the_index_its_poll_fetched()
+ {
+    let bucket = tempfile::tempdir().unwrap();
+    let store = FsStore::new(bucket.path());
+    let (_origin_directory, _origin, manifest) = Box::pin(origin_in(&store)).await;
+    let index_files = MemoryIndexFiles::default();
+    let mut follower = follower_without_files(Rc::new(FsStore::new(bucket.path())), &index_files);
+    let _ = follower.apply_peer_manifest(&manifest).unwrap();
+    let from_front = plan(&mut follower, PollingStrategy::offset(0), 10)
+        .execute()
+        .await;
+    let first_index = format!("{:020}.index", 0);
+    assert_eq!(from_front.read_error, None);
+    assert!(index_files.holds(&first_index));
+
+    let trimmed = follower
+        .apply_peer_manifest(&first_segment_trimmed(&manifest))
+        .unwrap();
+    Box::pin(trimmed.remove_retired_indexes(&index_files)).await;
+
+    assert!(
+        !index_files.holds(&first_index),
+        "the index of the trimmed segment is removed where its poll put it"
+    );
 }
 
 #[compio::test]

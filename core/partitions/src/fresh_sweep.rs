@@ -190,6 +190,17 @@ impl FreshListing {
             .filter(|scope| scope.end != FreshListEnd::Complete)
             .count()
     }
+
+    /// How long before `now` the oldest listed object was stored. Zero
+    /// without objects, and for an object stored after `now`.
+    #[must_use]
+    pub fn oldest_age(&self, now: IggyTimestamp) -> Duration {
+        // A store can date an object before the Unix epoch, as a file's
+        // modification time can be, so the times are compared as they are.
+        self.oldest
+            .and_then(|oldest| SystemTime::from(now).duration_since(oldest).ok())
+            .unwrap_or_default()
+    }
 }
 
 /// What a listing ended as: what it found, or a cancellation before it
@@ -702,6 +713,7 @@ mod tests {
     use message_bus::IggyMessageBus;
     use server_common::sharding::ShardId;
     use std::sync::Arc;
+    use std::time::UNIX_EPOCH;
 
     const REPLICA: u8 = 1;
 
@@ -1176,6 +1188,24 @@ mod tests {
         sweep.forget(&[id(REPLICA, 1)]);
 
         assert_eq!(sweep.len(), 1);
+    }
+
+    #[test]
+    fn given_an_object_stored_before_the_unix_epoch_when_ageing_the_listing_should_count_from_its_time()
+     {
+        let mut listed = listing(&[id(REPLICA, 1)]);
+        listed.oldest = UNIX_EPOCH.checked_sub(Duration::from_secs(10));
+
+        assert_eq!(listed.oldest_age(at(5)), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn given_no_object_older_than_the_sweep_when_ageing_the_listing_should_answer_zero() {
+        let mut listed = listing(&[id(REPLICA, 1)]);
+        listed.oldest = Some(SystemTime::from(at(20)));
+
+        assert_eq!(listed.oldest_age(at(5)), Duration::ZERO);
+        assert_eq!(listing(&NONE).oldest_age(at(5)), Duration::ZERO);
     }
 
     fn placing() -> IggyNamespace {

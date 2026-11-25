@@ -521,14 +521,12 @@ where
             let settled = state.settle(listing, in_use, now, FRESH_OBJECT_GRACE);
             (settled, state.len())
         };
-        let oldest = listing.oldest.map_or(Duration::ZERO, |oldest| {
-            Duration::from_micros(
-                now.as_micros()
-                    .saturating_sub(IggyTimestamp::from(oldest).as_micros()),
-            )
-        });
-        self.metrics
-            .set_fresh_objects(listing.objects().len(), listing.bytes, oldest, unnamed);
+        self.metrics.set_fresh_objects(
+            listing.objects().len(),
+            listing.bytes,
+            listing.oldest_age(now),
+            unnamed,
+        );
         sweeps.held.set(None);
         self.metrics.set_fresh_sweeps_held(false);
         sweeps.settled.set(sweeps.settled.get() + 1);

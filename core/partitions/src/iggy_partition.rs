@@ -8211,6 +8211,15 @@ where
         }
     }
 
+    /// The directory where the polls of remote segments put the `.index`
+    /// files that they fetch, `None` while they fetch none.
+    pub(crate) fn fetched_index_dir(&self) -> Option<String> {
+        match self.partition_dir_resolution() {
+            PartitionDirResolution::Resolved(directory) => Some(directory),
+            PartitionDirResolution::NoFiles | PartitionDirResolution::Unresolvable => None,
+        }
+    }
+
     fn has_persisted_segment_bytes(&self) -> bool {
         self.log
             .segments()
