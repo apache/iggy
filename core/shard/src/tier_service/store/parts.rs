@@ -37,10 +37,14 @@ const MIB: u64 = 1024 * 1024;
 
 /// How a tier store uploads a long-term segment in parts.
 ///
-/// Each part is sent, sent again and given a second attempt as a create-only
-/// put whose body is held in memory is: a part with the same number and the
-/// same bytes replaces itself, so no part needs a check of what the store
-/// holds. The request that creates the object is the create-only one. It is
+/// Each part is sent, and sent again after a failure, as a create-only put
+/// whose body is held in memory is: a part with the same number and the same
+/// bytes replaces itself, so no part needs a check of what the store holds.
+/// A part gets no second attempt beside its first one. A part replaces what
+/// is under its name, so the attempt that loses could still land after the
+/// object exists: on GCS it would leave its temporary object behind, or
+/// replace the one that the compose names. The request that creates the
+/// object is the create-only one. It is
 /// sent again after a failure, and an object that an earlier completion may
 /// have created is checked as a put checks it. An upload that ends without
 /// its object is aborted, and one that a crash left is removed by the sweep
@@ -311,8 +315,7 @@ where
     }
 
     /// One part, sent again under the rules of a create-only put whose body
-    /// is held in memory, with a second attempt once it runs past the
-    /// threshold for its size.
+    /// is held in memory, one attempt at a time.
     async fn send_part(
         &self,
         upload: &PartsUpload,
@@ -320,28 +323,11 @@ where
         part: &PutBody,
         crc32c: u32,
     ) -> Result<StoredPart, ObjectStoreError> {
-        let threshold = self.policy.second_attempts.threshold(part.len());
         let mut delay = self.policy.retry_delay;
         let mut attempt = 1;
         loop {
-            let raced = self
-                .race(
-                    &upload.key,
-                    threshold,
-                    || {
-                        self.part_attempt(upload, number, part, crc32c)
-                            .boxed_local()
-                    },
-                    |_, _| false,
-                )
-                .await;
-            let error = match raced.result {
-                Ok(stored) => {
-                    if raced.by_second {
-                        self.counters.record_second_attempt_win();
-                    }
-                    return Ok(stored);
-                }
+            let error = match self.part_attempt(upload, number, part, crc32c).await {
+                Ok(stored) => return Ok(stored),
                 Err(error) => error,
             };
             // The CRC32C of a part is the provider's own, so a mismatch is a

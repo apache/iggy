@@ -758,9 +758,10 @@ A long-term segment of at least twice `part_size`, 8 MiB by default, goes up in
 parts on the `s3` and `gcs` backends. Every other put goes whole, such as a
 fresh object that producers wait for. Up to `jobs.parts_in_flight` parts go
 side by side over all the uploads of a shard, and an upload with no part in
-flight always sends one. Each part is sent again and given a second attempt as
-a put is: the same part with the same bytes replaces itself, so no part needs a
-check. Then one request creates the object whole and create-only, with the
+flight always sends one. Each part is sent again after a failure as a put is:
+the same part with the same bytes replaces itself, so no part needs a check. A
+part gets no second attempt beside its first, because the one that loses could
+land after the object exists. Then one request creates the object whole and create-only, with the
 user metadata and the CRC32C of the whole object, which the store checks. On
 `s3` the upload is a multipart upload with a full object CRC32C, and the
 completion carries `If-None-Match: *`. On `gcs` each part is a temporary object

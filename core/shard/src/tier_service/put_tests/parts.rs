@@ -135,22 +135,25 @@ fn given_a_part_that_fails_once_should_send_it_again_and_complete() {
 }
 
 #[test]
-fn given_a_part_past_its_threshold_should_send_it_a_second_attempt() {
+fn given_a_part_past_the_threshold_of_a_second_attempt_should_wait_for_its_first() {
     let (bus, store) = parts_store();
     let bytes = large(2);
-    store.provider().part_scripts.borrow_mut().extend([
-        commit_after(Duration::from_secs(4)),
-        commit_after(FAST),
-        commit_after(FAST),
-    ]);
+    let slow = Duration::from_secs(4);
+    store
+        .provider()
+        .part_scripts
+        .borrow_mut()
+        .extend([commit_after(slow), commit_after(FAST)]);
 
     bus.run(store.put("a/b", body(&bytes), &in_parts(&bytes)))
         .unwrap();
 
-    // The threshold of a part of 1 MiB, then a fast attempt.
-    assert_eq!(bus.now(), THRESHOLD + FAST);
-    assert_eq!(counted(&store), (0, 1, 1, 0));
-    bus.run_for(Duration::from_secs(10));
+    // A second attempt that loses could land after the object exists, so the
+    // slow part is waited for.
+    assert!(slow > THRESHOLD);
+    assert_eq!(bus.now(), slow);
+    assert_eq!(store.provider().part_attempts.get(), 2);
+    assert_eq!(counted(&store), (0, 0, 0, 0));
     assert_eq!(stored(&store, "a/b"), bytes);
     assert_eq!(store.provider().commits.get(), 1);
 }
