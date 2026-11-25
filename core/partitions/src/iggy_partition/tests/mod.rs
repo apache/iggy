@@ -2027,6 +2027,7 @@ async fn backup_with_counter(
 }
 
 mod age_roll;
+mod auto_commit_merge;
 mod chain_transfer;
 mod checkpoint_policy;
 mod consensus_tests;
