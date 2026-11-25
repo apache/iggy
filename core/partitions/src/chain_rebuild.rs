@@ -299,7 +299,7 @@ pub enum StoredLog {
 pub enum ManifestRead {
     Absent,
     Read(PartitionManifest),
-    /// Larger than [`MANIFEST_CROSS_CHECK_BYTES_MAX`], so not read.
+    /// Larger than [`MANIFEST_CROSS_CHECK_BYTES_MAX`], so not decoded.
     TooLarge {
         size: u64,
     },
@@ -529,22 +529,21 @@ async fn read_manifest<S: ObjectStore>(
     prefix: &ObjectPrefix,
 ) -> Result<ManifestRead, ObjectStoreError> {
     let key = layout.manifest_key(prefix);
-    let size = match store.head(&key).await {
-        Ok(meta) => meta.size,
-        Err(ObjectStoreError::NotFound { .. }) => return Ok(ManifestRead::Absent),
-        Err(error) => return Err(error),
-    };
-    if size > MANIFEST_CROSS_CHECK_BYTES_MAX {
-        return Ok(ManifestRead::TooLarge { size });
-    }
-    let bytes = if size == 0 {
-        Bytes::new()
-    } else {
-        match store.get_range(&key, 0..size).await {
-            Ok(read) => read.bytes,
-            Err(ObjectStoreError::NotFound { .. }) => return Ok(ManifestRead::Absent),
-            Err(error) => return Err(error),
+    // No head first: the primary replaces the manifest under this key, so a
+    // size read before the bytes can be of an older, shorter manifest. The
+    // read reports the size of the object its bytes come from.
+    let bytes = match store
+        .get_range(&key, 0..MANIFEST_CROSS_CHECK_BYTES_MAX)
+        .await
+    {
+        Ok(read) if read.size > MANIFEST_CROSS_CHECK_BYTES_MAX => {
+            return Ok(ManifestRead::TooLarge { size: read.size });
         }
+        Ok(read) => read.bytes,
+        Err(ObjectStoreError::NotFound { .. }) => return Ok(ManifestRead::Absent),
+        // An empty object has no readable range.
+        Err(ObjectStoreError::InvalidRange { start: 0, .. }) => Bytes::new(),
+        Err(error) => return Err(error),
     };
     Ok(
         PartitionManifest::decode(&bytes)

@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::ops::Range;
+
 use iggy_object_store::{
-    InlineTierExecutor, ManifestSegment, MemoryStore, PutBody, PutOptions, SEGMENT_HASH_LEN,
-    TierScope, UserMetadata,
+    DeleteOutcome, InlineTierExecutor, ListPage, ListRequest, ManifestSegment, MemoryStore,
+    ObjectMeta, ObjectRange, PutBody, PutOptions, SEGMENT_HASH_LEN, TierScope, UserMetadata,
 };
 
 use super::*;
@@ -960,6 +962,84 @@ async fn given_a_manifest_above_the_limit_when_reading_the_view_should_not_read_
             size: MANIFEST_CROSS_CHECK_BYTES_MAX + 1
         }
     );
+}
+
+#[compio::test]
+async fn given_a_stale_manifest_size_from_a_head_when_reading_the_view_should_read_it_whole() {
+    let layout = KeyLayout::new("iggy").unwrap();
+    let key = layout.manifest_key(&PREFIX);
+    let (ManifestRead::Read(older), ManifestRead::Read(current)) = (
+        manifest(&[(0, 9)], None),
+        manifest(&[(0, 9), (10, 19)], None),
+    ) else {
+        unreachable!()
+    };
+    let store = HeadBeforeReplace {
+        store: MemoryStore::new(),
+        key: key.clone(),
+        size: older.encode().len() as u64,
+    };
+    store
+        .put(
+            &key,
+            PutBody::from_bytes(current.encode()),
+            &PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let request = StoreViewRequest {
+        prefix: PREFIX,
+        from: 0,
+        front: 20,
+        local_sealed: Vec::new(),
+    };
+
+    let view = read_store_view(&store, &layout, request).await.unwrap();
+
+    assert_eq!(view.manifest, ManifestRead::Read(current));
+}
+
+/// A store whose head of `key` reports `size`, as a head that ran before the
+/// object was replaced by a longer one.
+struct HeadBeforeReplace {
+    store: MemoryStore,
+    key: String,
+    size: u64,
+}
+
+impl ObjectStore for HeadBeforeReplace {
+    async fn put(
+        &self,
+        key: &str,
+        body: PutBody,
+        options: &PutOptions,
+    ) -> Result<(), ObjectStoreError> {
+        ObjectStore::put(&self.store, key, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<ObjectRange, ObjectStoreError> {
+        ObjectStore::get_range(&self.store, key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+        let mut meta = ObjectStore::head(&self.store, key).await?;
+        if key == self.key {
+            meta.size = self.size;
+        }
+        Ok(meta)
+    }
+
+    async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+        ObjectStore::delete(&self.store, keys).await
+    }
+
+    async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+        ObjectStore::list(&self.store, request).await
+    }
 }
 
 fn zeros_crc32c(size: u64) -> u32 {
