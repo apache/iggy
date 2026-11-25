@@ -271,19 +271,25 @@ async fn given_http_requests_when_denied_should_carry_typed_status_and_body(harn
     let alice = root.login("alice", "alice-pass").await;
 
     // Dispatch read gate: an ungranted read is 403 with a typed Unauthorized body.
-    let read = alice.get("/streams").await;
+    let read = alice.get("/streams/rbac-s1").await;
     assert_eq!(
         read.status(),
         StatusCode::FORBIDDEN,
-        "alice GET /streams must be 403"
+        "alice GET /streams/rbac-s1 must be 403"
     );
     assert_error_body(
         read,
         UNAUTHORIZED_ID,
         UNAUTHORIZED_CODE,
-        "alice GET /streams",
+        "alice GET /streams/rbac-s1",
     )
     .await;
+
+    // A list holds only what the caller may read, so without a grant it is empty.
+    let list = alice.get("/streams").await;
+    assert_eq!(list.status(), StatusCode::OK, "alice GET /streams");
+    let listed: Value = list.json().await.expect("stream list JSON");
+    assert_eq!(listed, json!([]), "alice GET /streams lists nothing");
 
     // In-apply control gate: the denial rides the metadata result section back as
     // a typed Unauthorized body, still under a 403.
@@ -721,6 +727,33 @@ async fn given_http_only_routes_when_requested_should_return_expected_shapes(
         pat_names(alice.get("/personal-access-tokens").await).await,
         ["alice-alpha", "alice-zeta"],
         "PAT list must be a name-sorted JSON array of the caller's tokens"
+    );
+}
+
+/// The POST-only login route shadows `{name}`, which used to answer this DELETE with 405.
+#[iggy_harness]
+async fn given_pat_named_login_when_deleted_over_http_should_return_204(harness: &TestHarness) {
+    let root = HttpClient::login_root(harness).await;
+    assert_eq!(
+        root.post_json(
+            "/personal-access-tokens",
+            &json!({ "name": "login", "expiry": 0 }),
+        )
+        .await
+        .status(),
+        StatusCode::OK,
+        "create PAT named login must be 200"
+    );
+    assert_eq!(
+        root.delete("/personal-access-tokens/login").await.status(),
+        StatusCode::NO_CONTENT,
+        "DELETE of a PAT named login must be 204, not 405"
+    );
+    assert!(
+        pat_names(root.get("/personal-access-tokens").await)
+            .await
+            .is_empty(),
+        "the login-named PAT must be gone"
     );
 }
 

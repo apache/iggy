@@ -29,7 +29,7 @@ runs:
     - name: Setup Rust
       uses: ./.github/actions/utils/setup-rust
       with:
-        free-disk-space: ${{ inputs.task != 'test' }}
+        free-disk-space: "false"
 
     - name: Download runtime binaries
       if: inputs.task == 'test'
@@ -45,6 +45,7 @@ runs:
           --target runtime-prebuilt \
           --build-arg PREBUILT_IGGY_SERVER=target/debug/iggy-server \
           --build-arg PREBUILT_IGGY_CLI=target/debug/iggy \
+          --build-arg LICENSE_STAGE=license-skip \
           -t iggy-server:local .
       shell: bash
 
@@ -170,7 +171,12 @@ runs:
         # Propagate LLVM_PROFILE_FILE so the test step can write profraw data
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}" >> "$GITHUB_ENV"
 
-        cargo llvm-cov clean --workspace
+        # cargo-llvm-cov adds the coverage flags through a rustc wrapper that
+        # cargo's freshness check does not see, so maturin would reuse the
+        # uninstrumented build of the "Build Python wheel" step. `cargo
+        # llvm-cov clean` cannot remove that build: it passes --target-dir,
+        # which cargo refuses for a directory without CACHEDIR.TAG.
+        cargo clean -p apache-iggy
         echo "Building Python wheel with coverage instrumentation..."
         uv run --no-sync maturin develop
       shell: bash

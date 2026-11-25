@@ -158,7 +158,7 @@ async fn given_empty_partition_when_storing_an_external_group_offset_should_skip
         partition.durable_consumer_offset_count(ConsumerKind::ExternalGroup),
         1
     );
-    assert!(partition.consumer_group_offsets.pin().is_empty());
+    assert!(partition.consumer_group_offsets.borrow().is_empty());
 }
 
 /// The reconciler deletes a bounded number of dead keys per pass. Ordered
@@ -169,7 +169,7 @@ async fn given_dead_keys_of_both_kinds_when_listed_should_order_them_by_group_id
     let (partition, _) = recording_partition();
     for group_id in [1, 2, 3] {
         partition.seed_recovered_consumer_offset(ConsumerKind::ConsumerGroup, group_id, 11, 11);
-        partition.consumer_group_offsets.pin().insert(
+        partition.consumer_group_offsets.borrow_mut().insert(
             ConsumerGroupId(group_id as usize),
             ConsumerOffset::new(ConsumerKind::ConsumerGroup, group_id, 11, String::new()),
         );
@@ -731,12 +731,7 @@ async fn given_emptied_table_when_retained_across_a_restart_should_keep_the_empt
 #[compio::test]
 async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remove_the_marker() {
     let dir = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: dir.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&dir);
     let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
     persist_offset(&external_file, 1_000, true).await.unwrap();
     let offsets_dir = config.get_offsets_path(1, 1, 0);
@@ -750,7 +745,6 @@ async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remov
         &mut partition,
         &config,
         IggyNamespace::new(1, 1, 0),
-        10,
     )
     .await
     .unwrap();
@@ -766,12 +760,7 @@ async fn given_emptied_marker_beside_an_offset_file_when_recovering_should_remov
 async fn given_emptied_marker_beside_a_stranded_offset_file_when_recovering_should_remove_the_marker()
  {
     let dir = tempfile::tempdir().unwrap();
-    let config = PartitionsConfig {
-        path_layout: crate::PartitionPathLayout {
-            streams_root: dir.path().to_string_lossy().into_owned(),
-        },
-        ..repair_config()
-    };
+    let config = offsets_config(&dir);
     let external_file = format!("{}/9", config.get_external_group_offsets_path(1, 1, 0));
     persist_offset(&external_file, 1_000, true).await.unwrap();
     let offsets_dir = config.get_offsets_path(1, 1, 0);
@@ -785,7 +774,6 @@ async fn given_emptied_marker_beside_a_stranded_offset_file_when_recovering_shou
         &mut partition,
         &config,
         IggyNamespace::new(1, 1, 0),
-        10,
     )
     .await
     .unwrap();

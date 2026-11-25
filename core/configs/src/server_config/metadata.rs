@@ -26,7 +26,7 @@
 //!   with the transient "metadata prepare queue is full")
 //! - `journal_slots` -> `journal::prepare_journal::DEFAULT_SLOT_COUNT`
 //!   (the WAL's in-memory index; committed-but-unsnapshotted headroom
-//!   between forced checkpoints)
+//!   between checkpoints)
 //! - `clients_table_max` -> `consensus::CLIENTS_TABLE_MAX` (the VSR
 //!   client-table slot count; independent of the two above). The
 //!   HTTP session cap tracks it at half.
@@ -36,10 +36,13 @@
 //!   (records the metadata change log retains per retention class)
 //!
 //! The first two interlock through the forced-checkpoint margin
-//! (`max(64, prepare_queue_depth)` at bootstrap): while a checkpoint
-//! runs, up to a full prepare queue of already-pipelined ops appends
-//! into that margin, and `validate` keeps `journal_slots` far enough
-//! above it that checkpoints stay rare instead of back-to-back.
+//! (`max(64, prepare_queue_depth)` at bootstrap). A background checkpoint
+//! starts once half of `journal_slots` committed past the last one; the
+//! margin is the fallback that waits for it, or checkpoints inline, when
+//! appends outrun it. After a failed checkpoint up to a full prepare queue
+//! of already-pipelined ops appends into the margin, and `validate` keeps
+//! `journal_slots` far enough above it that the background checkpoint
+//! starts first.
 //!
 //! The defaults are duplicated literals rather than imports so
 //! `core/configs` does not grow build-time edges onto `core/consensus`
@@ -59,7 +62,7 @@ use serde::{Deserialize, Serialize};
 pub const DEFAULT_METADATA_PREPARE_QUEUE_DEPTH: usize = 32;
 
 /// Mirrors `journal::prepare_journal::DEFAULT_SLOT_COUNT`.
-pub const DEFAULT_METADATA_JOURNAL_SLOTS: usize = 1024;
+pub const DEFAULT_METADATA_JOURNAL_SLOTS: usize = 65_536;
 
 /// Floor of the forced-checkpoint margin
 /// (`metadata::SnapshotCoordinator::CHECKPOINT_MARGIN`); the effective
@@ -116,11 +119,14 @@ pub struct MetadataConfig {
     pub prepare_queue_depth: usize,
 
     /// Size of the metadata WAL's in-memory index, in slots (one
-    /// committed-but-unsnapshotted op per slot). Headroom between forced
-    /// checkpoints; more slots = rarer checkpoints, more memory, larger
-    /// per-checkpoint WAL rewrites. Reducing this for an existing data directory
-    /// is refused at boot when the live WAL suffix cannot fit without collisions;
-    /// restore the previous value to recover.
+    /// committed-but-unsnapshotted op per slot). A background checkpoint
+    /// starts once half of them committed past the last one, and the
+    /// forced-checkpoint margin is the fallback when it does not finish in
+    /// time. More slots = rarer checkpoints and more time for each, more
+    /// memory, a longer replay at boot. Reducing this for an existing data
+    /// directory is refused at boot when the live WAL suffix cannot fit
+    /// without collisions; restore the previous value to recover. An older
+    /// server with a smaller default counts as a reduction.
     pub journal_slots: usize,
 
     /// Initial capacity of the metadata session registry, shared by binary
@@ -193,8 +199,9 @@ impl Validatable<ConfigurationError> for MetadataConfig {
         }
         // The journal must comfortably out-size the checkpoint margin:
         // at `journal_slots == margin` every single prepare would force a
-        // checkpoint, and below it the journal could wrap. 4x keeps
-        // checkpoints amortized over at least 3/4 of the journal.
+        // checkpoint, and below it the journal could wrap. 4x starts the
+        // background checkpoint, at half the journal, a full margin before
+        // the forced one.
         let min_slots = 4 * self.checkpoint_margin();
         if self.journal_slots < min_slots {
             eprintln!(
@@ -348,6 +355,14 @@ mod tests {
         assert_eq!(
             MetadataConfig::default().clients_table_max,
             DEFAULT_METADATA_CLIENTS_TABLE_MAX
+        );
+    }
+
+    #[test]
+    fn embedded_default_matches_canonical_journal_slots() {
+        assert_eq!(
+            MetadataConfig::default().journal_slots,
+            DEFAULT_METADATA_JOURNAL_SLOTS
         );
     }
 

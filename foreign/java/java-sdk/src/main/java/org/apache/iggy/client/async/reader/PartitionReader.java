@@ -113,7 +113,8 @@ import static org.apache.iggy.client.async.reader.ReaderSupport.unwrap;
  *       each {@link #mark}, and stores the latest counted position at the interval or the event of the policy, before
  *       a rebalance takes a partition away, and in {@link #closeAsync()}.
  *   <li>The reader stays usable after a {@link ReadException} and retries by itself. {@code HistoryUnavailable} stops
- *       its partition until a {@link #seek} when the position came from an earlier read of a history that is gone. A
+ *       its partition until a {@link #seek} when the position came from an earlier read of a history that is gone.
+ *       {@code TieredReadFailed} stops its partition until a {@link #seek} at the first refusal. A
  *       refusal that a quick retry does not change, such as {@code Unauthorized}, is retried after a wait that doubles
  *       each time, and after six in a row it stops its partition until a {@link #seek} with one error. A refusal
  *       because another member owns a partition is not a leave: the partition keeps its state, names owner generation
@@ -1506,7 +1507,9 @@ public final class PartitionReader implements AutoCloseable {
             partition.retryAt = now + retryIntervalNanos;
             return;
         }
-        if (code == IggyErrorCode.HISTORY_UNAVAILABLE.getCode() && !partition.fromRead) {
+        // The read of a gap names the history of the batch that showed the gap. So with an open gap the server lost
+        // that history, and the same read would be refused again without end.
+        if (code == IggyErrorCode.HISTORY_UNAVAILABLE.getCode() && !partition.fromRead && partition.gapFrom == null) {
             log.warn("Partition {} has a new history, the reader reads it again", partition.id);
             regroup = true;
             partition.retryAt = now + retryIntervalNanos;
@@ -1514,9 +1517,15 @@ public final class PartitionReader implements AutoCloseable {
         }
         boolean stops = code == IggyErrorCode.HISTORY_UNAVAILABLE.getCode()
                 || code == IggyErrorCode.INVALID_SIZE_BYTES.getCode()
+                || code == IggyErrorCode.TIERED_READ_FAILED.getCode()
                 || ++partition.lastingRefusals >= LASTING_REFUSALS_BEFORE_STOP;
         ReadException failure = new ReadException(OptionalLong.of(partition.id), error, Optional.empty());
         if (stops) {
+            if (partition.gapFrom != null) {
+                // Only a seek resumes the partition, and it drops the gap, so the gap ends before the stop.
+                loseGapBefore(partition, partition.gapEnd);
+                closeGap(partition);
+            }
             partition.stopped = failure;
             queue.addLast(new Entry(partition.id, partition.generation, null, failure));
             return;

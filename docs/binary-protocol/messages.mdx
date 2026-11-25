@@ -1,0 +1,50 @@
+---
+title: Message batches
+description: "The batch layout messages travel and rest in, from the 256-byte batch header down to individual message frames."
+---
+
+Messages travel and rest in exactly one layout, the **batch**: the `SendMessages` body, the replicated record, the persisted segment record, and the poll reply all share it. There is no other message encoding.
+
+```text
+[batch header: 256 bytes][blob: message frames]
+frame = [frame header: 48 bytes][payload][user_headers]
+```
+
+## Batch header (256 bytes)
+
+| Offset | Size | Field | Type | Description |
+|--------|------|-------|------|-------------|
+| 0 | 8 | `partition_id` | u64 | Server-stamped at admission. Producers send zero. |
+| 8 | 8 | `base_offset` | u64 | Server-stamped when the batch is appended to the partition journal. Producers send zero. |
+| 16 | 8 | `base_timestamp` | u64 | Server-stamped at journal append (microseconds). Producers send zero. |
+| 24 | 8 | `origin_timestamp` | u64 | Producer-set: the earliest `origin_timestamp` among the batch's messages (microseconds). |
+| 32 | 8 | `batch_length` | u64 | Total batch size: 256 + blob length. |
+| 40 | 8 | `batch_checksum` | u64 | XxHash3-64 over the header fields (`partition_id`, `base_offset`, `base_timestamp`, `origin_timestamp`, `batch_length`, `message_count`, in that order, little-endian bytes) followed, when present, by the producer flag, ID, epoch and sequence, then each frame's 8 checksum bytes. Recomputed by the server when it stamps the header. |
+| 48 | 4 | `message_count` | u32 | Number of frames in the blob. |
+| 52 | 1 | flags | u8 | Bit 0 means producer fields are present. Other bits are rejected. |
+| 53 | 3 | reserved | bytes | Zero. |
+| 56 | 8 | `producer_id` | u64 | Producer identity, at most the signed 64-bit maximum. |
+| 64 | 2 | `epoch` | u16 | Producer epoch, at most the signed 16-bit maximum. |
+| 66 | 2 | reserved | bytes | Zero. |
+| 68 | 4 | `base_sequence` | u32 | First message sequence, at most the signed 32-bit maximum. |
+| 72 | 184 | reserved | bytes | Zero. |
+
+Without the producer-present flag, every producer field is zero. With it, the partition can deduplicate producer retries. Sequence numbers wrap after the signed 32-bit maximum. See [Idempotent producers](/docs/sdk/idempotent-producers).
+
+## Message frame header (48 bytes)
+
+| Offset | Size | Field | Type | Description |
+|--------|------|-------|------|-------------|
+| 0 | 8 | `checksum` | u64 | XxHash3-64 over frame bytes 8..48 followed by `payload` and `user_headers`. Producer-computed. Verified at admission. |
+| 8 | 16 | `id` | u128 | Message id (for example a UUID). |
+| 24 | 4 | `offset_delta` | u32 | Message offset = `base_offset + offset_delta`. Producer sends the frame's index in the batch. |
+| 28 | 4 | `timestamp_delta` | u32 | Microsecond delta against the batch `origin_timestamp`. One batch spans at most about 71.6 minutes of producer clock (`u32` microseconds). |
+| 32 | 4 | `user_headers_length` | u32 | Byte length of the user headers block. |
+| 36 | 4 | `payload_length` | u32 | Byte length of the payload. |
+| 40 | 8 | reserved | u64 | Must be zero. |
+
+After the 48 header bytes: `payload` (`payload_length` bytes), then `user_headers` (`user_headers_length` bytes). The payload comes **first**.
+
+A frame's absolute position is derived, not stored: offset = `base_offset + offset_delta`. The server-stamped time is the flat batch `base_timestamp` (the delta does not apply to it). Producer time resolves as `origin_timestamp + timestamp_delta`.
+
+The 64-byte `IggyMessageHeader` (checksum, id, offset, timestamp, origin_timestamp, lengths, reserved) that earlier protocol generations put in front of every message **no longer exists on the wire or on disk**. It survives only as an in-memory model.

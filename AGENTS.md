@@ -110,6 +110,7 @@ iggy/
 │   └── metadata, partitions, server_common, configs_derive, clock, tools
 ├── foreign/              Java / .NET / Python / Go / C++ / Node.js / Swift SDKs
 ├── bdd/                  Cross-language BDD (Gherkin)
+├── docs/                 Docs pages (MDX) of iggy.apache.org/docs
 ├── examples/             Per-SDK runnable examples
 ├── helm/                 Helm charts
 ├── web/                  Web UI
@@ -127,6 +128,7 @@ iggy/
 | Integration tests     | `core/integration/tests/`                |
 | Cross-SDK BDD         | `bdd/`                                   |
 | Benchmark suite       | `core/bench/`                            |
+| Docs pages            | `docs/`                                  |
 
 ## Skills
 
@@ -220,7 +222,7 @@ cargo test -p integration -- mcp::should_list_tools
 - **`test_logs/` grows quickly.** Wipe between major refactors.
 - **Miri only covers `binary_protocol` + `consensus`.** Cannot emulate `io_uring` syscalls. do not try to expand Miri to crates that pull `compio`.
 - **Integration crate has no `--test` target.** Filter by test path inside the single `mod.rs` binary.
-- **The integration harness runs prebuilt binaries and never builds them.** `Command::cargo_bin` only resolves a path, so a stale `iggy-server` or `iggy-mcp` is used silently. CI restores revision-checked artifacts from the runtime and Rust test builds; a local run does not build them, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
+- **The integration harness runs prebuilt binaries and never builds them.** `cargo_bin_path` only resolves a path, so a stale `iggy-server` or `iggy-mcp` is used silently. CI restores revision-checked artifacts from the runtime and Rust test builds; a local run does not build them, and a stale binary fails in ways that look like the change under test. Rebuild after anything that touches a launched binary or its config.
 
 ## Local state directories
 
@@ -236,6 +238,7 @@ Created by server or tests. Gitignored. Safe to delete to reset:
 - Conventional commits with scope: `feat(server): ...`. Subject <= 72 chars. Allowed types/scopes enforced by `.github/workflows/pr-title.yml`.
 - Body: why before what. No bullet lists of files changed.
 - Co-authored-by trailer when applicable.
+- A user-facing change updates `docs/` in the same PR, for example a new config key, CLI argument or SDK method. The connectors docs live in apache/iggy-connectors. See the Docs section of CONTRIBUTING.md.
 - Workspace + SDK versions sync via `scripts/extract-version.sh` and `scripts/ci/{sync-rust,python-sdk}-version{,-sync}.sh`.
 - Crate publish chain verified by `scripts/verify-crates-publish.sh` against `cargo-http-registry`.
 - Third-party license enumeration: `scripts/ci/third-party-licenses.sh` (ASF policy).

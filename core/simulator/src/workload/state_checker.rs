@@ -270,7 +270,7 @@ impl StateChecker {
                     .partition_shard(namespace)
                     .plane
                     .partitions()
-                    .get_by_ns(&namespace)
+                    .peek_by_ns(&namespace)
                     .expect("a journaled partition is hosted");
                 let prepare = partition
                     .log
@@ -692,7 +692,7 @@ pub fn assert_applied_data_agrees(
                 .partition_shard(namespace)
                 .plane
                 .partitions()
-                .get_by_ns(&namespace)
+                .peek_by_ns(&namespace)
             else {
                 continue;
             };
@@ -1161,8 +1161,8 @@ mod tests {
             }
         }
 
-        for replica_idx in 0..3usize {
-            let shard = sim.replicas[replica_idx].partition_shard(namespace);
+        for replica in &sim.replicas {
+            let shard = replica.partition_shard(namespace);
             let partitions = shard.plane.partitions();
             let config = partitions.config();
             let Some(partition) = partitions.get_mut_by_ns(&namespace) else {
@@ -1334,6 +1334,7 @@ mod tests {
         journal.restore_checkpoint_prepare(
             op,
             server_common::iobuf::Owned::copy_from_slice(&entry).into(),
+            None,
         );
     }
 

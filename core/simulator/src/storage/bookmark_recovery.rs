@@ -18,8 +18,9 @@
 //! Exercise consumer bookmark recovery across simulated power loss.
 //!
 //! A consumer offset is a bookmark: storing 2 means `Next` starts at message 3.
-//! Recovery must preserve bookmark 2 and return messages 3 and 4. The test
-//! covers individual consumers, groups, and external groups under both offset
+//! Recovery must preserve bookmark 2 and return messages 3 and 4. A bookmark
+//! whose history was lost must not come back under the new history. The tests
+//! cover individual consumers, groups, and external groups under both offset
 //! policies. An external group is never polled, so its bookmark is read
 //! directly.
 //!
@@ -152,18 +153,7 @@ impl BookmarkStorageHarness {
         )
         .await
         .unwrap();
-        let mut parent_checksum = 0;
-        for offset in 0..FRESH_MESSAGE_COUNT {
-            let operation_number = offset + 1;
-            // The helper fills the payload with the operation number, allowing
-            // polls to verify message contents as well as their offsets.
-            let prepare = owned_prepare(operation_number, parent_checksum, offset)
-                .transmute_header(|original, header: &mut PrepareHeader| {
-                    *header = original;
-                    header.partition_incarnation = CREATED_REVISION;
-                    header.checksum = header.identity_checksum();
-                });
-            parent_checksum = prepare.header().checksum;
+        for prepare in fresh_history() {
             journal.append(prepare.into_frozen()).await.unwrap();
         }
         journal.sync().await.unwrap();
@@ -178,7 +168,8 @@ impl BookmarkStorageHarness {
     /// Journal entries are appended and committed into a fresh in-memory partition
     /// before the shared server offset loader runs. This supplies real readable
     /// messages for `Next` without claiming to exercise the full server boot path.
-    async fn recover_partition(&self) -> TestPartition {
+    /// The journal must still hold `expected_messages`.
+    async fn recover_partition(&self, expected_messages: u64) -> TestPartition {
         let journal = PartitionPrepareJournal::open_with_storage(
             &self.journal_directory(),
             self.namespace.inner(),
@@ -189,25 +180,15 @@ impl BookmarkStorageHarness {
         .unwrap();
         let mut partition = self.empty_partition();
         for prepare in journal.prepares().await.unwrap() {
-            let operation_number = prepare.header().op;
-            partition.append_messages(prepare).await.unwrap();
-            partition
-                .consensus()
-                .sequencer()
-                .set_sequence(operation_number);
-            partition.consensus().advance_commit_max(operation_number);
-            partition.commit_journal(&partition_config()).await;
-            assert!(partition.fatal().is_none());
+            append_committed(&mut partition, prepare).await;
         }
-        let current_offset = partition.offsets().commit_offset;
-        assert_eq!(current_offset, FRESH_MESSAGE_COUNT - 1);
-        // The loader clamps saved progress to this offset, as server boot does.
+        assert_eq!(partition.offset_frontier(), expected_messages);
+        // The loader clamps saved progress to the recovered offset space, as server boot does.
         configure_consumer_offsets_with_storage(
             &self.storage,
             &mut partition,
             &self.config,
             self.namespace,
-            current_offset,
         )
         .await
         .unwrap();
@@ -371,6 +352,38 @@ fn consumers() -> [PollingConsumer; 2] {
     ]
 }
 
+/// Five prepares that hold one message each, at offsets 0 through 4.
+fn fresh_history() -> Vec<Message<PrepareHeader>> {
+    let mut parent_checksum = 0;
+    (0..FRESH_MESSAGE_COUNT)
+        .map(|offset| {
+            let operation_number = offset + 1;
+            // The helper fills the payload with the operation number, allowing
+            // polls to verify message contents as well as their offsets.
+            let prepare = owned_prepare(operation_number, parent_checksum, offset)
+                .transmute_header(|original, header: &mut PrepareHeader| {
+                    *header = original;
+                    header.partition_incarnation = CREATED_REVISION;
+                    header.checksum = header.identity_checksum();
+                });
+            parent_checksum = prepare.header().checksum;
+            prepare
+        })
+        .collect()
+}
+
+async fn append_committed(partition: &mut TestPartition, prepare: Message<PrepareHeader>) {
+    let operation_number = prepare.header().op;
+    partition.append_messages(prepare).await.unwrap();
+    partition
+        .consensus()
+        .sequencer()
+        .set_sequence(operation_number);
+    partition.consensus().advance_commit_max(operation_number);
+    partition.commit_journal(&partition_config()).await;
+    assert!(partition.fatal().is_none());
+}
+
 fn partition_config() -> PartitionsConfig {
     PartitionsConfig {
         messages_required_to_save: 100,
@@ -394,13 +407,64 @@ fn given_stored_progress_when_power_is_lost_should_recover_both_consumer_bookmar
             harness.persist_fresh_history().await;
 
             harness.storage.crash(Crash::PowerLoss);
-            let mut recovered = harness.recover_partition().await;
+            let mut recovered = harness.recover_partition(FRESH_MESSAGE_COUNT).await;
 
             assert_bookmarks(&recovered);
             harness.install_group_owner(&mut recovered).await;
             // Bookmark 2 means the first three messages were already consumed.
             harness
                 .poll_next_and_assert_messages(recovered, &[3, 4])
+                .await;
+        }
+    });
+}
+
+/// Bookmark 2 points into a history that never reached the disk, so the power loss
+/// took it. A bookmark says that message was consumed, so none fits a partition
+/// that holds nothing, and `Next` must start at the first message of the new
+/// history. The external group bookmark belongs to the external system and stays.
+#[test]
+fn given_stored_progress_when_history_is_lost_should_poll_new_history_from_its_start() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            let harness = BookmarkStorageHarness::with_stored_progress(policy).await;
+
+            harness.storage.crash(Crash::PowerLoss);
+            let mut recovered = harness.recover_partition(0).await;
+            for prepare in fresh_history() {
+                append_committed(&mut recovered, prepare).await;
+            }
+
+            let group_id = u32::try_from(GROUP_ID).expect("group id fits u32");
+            assert_eq!(
+                recovered.external_group_offset(group_id),
+                Some(STORED_OFFSET)
+            );
+            harness.install_group_owner(&mut recovered).await;
+            harness
+                .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
+                .await;
+        }
+    });
+}
+
+/// The removal has to reach the disk. A bookmark that comes back after the next
+/// power loss sits inside the new history, and `Next` skips every message below it.
+#[test]
+fn given_bookmarks_removed_at_recovery_when_power_is_lost_again_should_not_restore_them() {
+    block_on(async {
+        for policy in [Durability::Replicated, Durability::Persisted] {
+            let harness = BookmarkStorageHarness::with_stored_progress(policy).await;
+            harness.storage.crash(Crash::PowerLoss);
+            drop(harness.recover_partition(0).await);
+            harness.persist_fresh_history().await;
+
+            harness.storage.crash(Crash::PowerLoss);
+            let mut recovered = harness.recover_partition(FRESH_MESSAGE_COUNT).await;
+
+            harness.install_group_owner(&mut recovered).await;
+            harness
+                .poll_next_and_assert_messages(recovered, &[0, 1, 2, 3, 4])
                 .await;
         }
     });

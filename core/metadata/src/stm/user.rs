@@ -16,15 +16,19 @@
 // under the License.
 
 use crate::change_log::{AppliedChange, change_actor, user_body};
-use crate::permissioner::Permissioner;
+use crate::permissioner::{GrantsByCreation, Permissioner};
 use crate::stm::id_slab::IdSlab;
 use crate::stm::result::{
     ApplyReply, ChangePasswordResult, CreatePersonalAccessTokenResult, CreateUserResult,
-    DeletePersonalAccessTokenResult, DeleteUserResult, DeletedResource, UpdatePermissionsResult,
-    UpdateUserResult,
+    DeletePersonalAccessTokenResult, DeleteUserResult, DeletedResource, RevokedToken,
+    UpdatePermissionsResult, UpdateUserResult,
 };
-use crate::stm::snapshot::Snapshotable;
+use crate::stm::snapshot::{
+    ArraySteps, FillSnapshot, MetadataCapture, MetadataSnapshot, SnapshotError, Snapshotable,
+    encode_array_len, encode_value,
+};
 use crate::stm::stream::{PatchError, patched_options, public_reply_options};
+use crate::stm::walk::{Directed, range_after};
 use crate::stm::{ApplyContext, StateHandler};
 use crate::{collect_handlers, define_state, impl_fill_restore};
 use ahash::AHashMap;
@@ -32,16 +36,18 @@ use bytes::Bytes;
 use bytes::{BufMut, BytesMut};
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::WireOptions;
-use iggy_binary_protocol::codec::{WireDecode, WireEncode, read_u32_le, read_u64_le};
+use iggy_binary_protocol::codec::{
+    WireDecode, WireEncode, read_str, read_u8, read_u32_le, read_u64_le,
+};
 use iggy_binary_protocol::primitives::metadata_changes::{
     WireMetadataChange, WirePermissionsUpdatedReason, WireTokenBody, WireTokenDeletedBody,
     WireTokenDeletedReason, WireUserIdentityBody, WireUserKey, WireUserPermissionsBody,
 };
 #[cfg(any(test, feature = "simulator"))]
 use iggy_binary_protocol::primitives::permissions::{WireGlobalPermissions, WirePermissions};
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::requests::users::{
-    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
-    UpdateUserResolvedRequest,
+    CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
 };
 use iggy_binary_protocol::responses::users::get_user::UserDetailsResponse;
 use iggy_binary_protocol::responses::users::user_response::UserResponse;
@@ -53,12 +59,17 @@ use iggy_common::{
     PersonalAccessToken, ResourceOptions, StreamPermissions, UserId, UserStatus,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 /// Fixed timestamp for root fixtures in tests and the simulator.
 #[cfg(any(test, feature = "simulator"))]
 pub const ROOT_USER_CREATED_AT_MICROS: u64 = 1;
+
+/// Access revision of root fixtures in tests and the simulator: the op that
+/// creates root in a real cluster.
+#[cfg(any(test, feature = "simulator"))]
+pub const ROOT_USER_ACCESS_REVISION: u64 = 1;
 
 // ============================================================================
 // User Entity
@@ -71,6 +82,10 @@ pub struct User {
     pub password_hash: Arc<str>,
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
+    /// Op of account creation, the last password change or the last activation change.
+    /// Account proofs must match this revision. A raw personal access token proves
+    /// its own creation op and survives a password change.
+    pub access_revision: u64,
     pub permissions: Option<Arc<Permissions>>,
     pub options: ResourceOptions,
 }
@@ -83,6 +98,7 @@ impl Default for User {
             password_hash: Arc::from(""),
             status: UserStatus::default(),
             created_at: IggyTimestamp::default(),
+            access_revision: 0,
             permissions: None,
             options: ResourceOptions::new(),
         }
@@ -104,6 +120,7 @@ impl User {
             password_hash,
             status,
             created_at,
+            access_revision: 0,
             permissions,
             options: ResourceOptions::new(),
         }
@@ -119,7 +136,8 @@ define_state! {
         // differs across replicas (random seed), so this map MUST only be
         // touched via single-key `.get` / `.insert` / `.remove`. Never
         // iterate. Reach for `BTreeMap` the first time iteration is needed.
-        pub personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)>,
+        // Maps a token hash to its owner, its name and the op that created it.
+        pub personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>, u64)>,
         // Expiry-ordered index of expiring PATs: `(expiry_micros, user_id,
         // name)`. Never-expiring tokens are absent. Unlike the sibling
         // `AHashMap` index above, a `BTreeSet` is safe to iterate (its order
@@ -127,9 +145,37 @@ define_state! {
         // expired tokens in O(log n) per tick instead of scanning every token.
         pub(crate) personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)>,
         // `(user_id, name)` of every token, ordered, so current state pages
-        // seek by key instead of sorting the per-user maps. Never persisted.
-        pub(crate) personal_access_token_name_index: BTreeSet<(UserId, Arc<str>)>,
+        // seek by key instead of sorting the per-user maps, to the op that
+        // created the token. Rebuilt on restore.
+        pub(crate) personal_access_token_name_index: BTreeMap<(UserId, Arc<str>), u64>,
+        // The op that created each live token, to its owner and name. A name is
+        // reusable, so only this op tells a replacement from the token it replaced.
+        pub(crate) personal_access_token_id_index: BTreeMap<u64, (UserId, Arc<str>)>,
         pub(crate) permissioner: Permissioner,
+        pub(crate) grants_by_creation: AHashMap<UserId, Arc<GrantsByCreation>>,
+        // `(created_at micros, user id)` of every user, so a page in creation
+        // order seeks by key. Never persisted, rebuilt on restore.
+        pub(crate) created_index: BTreeSet<(u64, usize)>,
+    }
+}
+
+impl UsersInner {
+    /// The users after `after` in creation order, newest first when
+    /// `descending`. The key of a user is `(created_at micros, user id)`.
+    pub fn users_by_created(
+        &self,
+        after: Option<(u64, usize)>,
+        descending: bool,
+    ) -> impl Iterator<Item = ((u64, usize), &User)> {
+        Directed::new(
+            self.created_index
+                .range(range_after(after.as_ref(), descending)),
+            descending,
+        )
+        .filter_map(|&key| {
+            let user = self.items.get(key.1)?;
+            (user.created_at.as_micros() == key.0).then_some((key, user))
+        })
     }
 }
 
@@ -143,15 +189,84 @@ collect_handlers! {
         CreatePersonalAccessToken,
         DeletePersonalAccessToken,
     }
-    internal { RemoveGrants }
+    internal { RemoveGrants, IndexReadGrants }
 }
 
 impl UsersInner {
     #[must_use]
-    pub fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
-        self.items.get(user_id as usize).is_some_and(|user| {
-            user.status == UserStatus::Active && user.created_at.as_micros() == created_at
+    pub fn accepts_credential_at(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        now: IggyTimestamp,
+    ) -> bool {
+        self.credential_deadline_at(user_id, credential, now)
+            .is_some()
+    }
+
+    /// The source token deadline in microseconds, or the maximum for a proof without a deadline.
+    /// A stale, expired or unbound proof has no valid deadline.
+    #[must_use]
+    pub fn credential_deadline_at(
+        &self,
+        user_id: u32,
+        credential: &CredentialProof,
+        now: IggyTimestamp,
+    ) -> Option<u64> {
+        let user = self.items.get(user_id as usize)?;
+        if !credential.is_bound()
+            || user.status != UserStatus::Active
+            || user.created_at.as_micros() != credential.user_created_at
+            || (credential.access_revision != 0
+                && credential.access_revision != user.access_revision)
+        {
+            return None;
+        }
+        self.token_deadline_at(user_id, credential.token_id, now)
+    }
+
+    #[must_use]
+    pub fn token_deadline_at(
+        &self,
+        user_id: u32,
+        token_id: u64,
+        now: IggyTimestamp,
+    ) -> Option<u64> {
+        if token_id == 0 {
+            return Some(u64::MAX);
+        }
+        let token = self.token_of(user_id, token_id)?;
+        (!token.is_expired(now)).then(|| {
+            token
+                .expiry_at
+                .map_or(u64::MAX, |expiry| expiry.as_micros())
         })
+    }
+
+    /// The live token created at op `token_id`, when `user_id` owns it.
+    #[must_use]
+    pub fn token_of(&self, user_id: u32, token_id: u64) -> Option<&PersonalAccessToken> {
+        let (owner, name) = self.personal_access_token_id_index.get(&token_id)?;
+        if *owner != user_id {
+            return None;
+        }
+        self.personal_access_tokens.get(owner)?.get(name)
+    }
+
+    /// Whether the token `user_id` created at op `token_id` is live and unexpired at `now`.
+    #[must_use]
+    pub fn holds_live_token(&self, user_id: u32, token_id: u64, now: IggyTimestamp) -> bool {
+        self.token_of(user_id, token_id)
+            .is_some_and(|token| !token.is_expired(now))
+    }
+
+    /// The op that created the live token `name` of `user_id`.
+    #[must_use]
+    #[cfg(test)]
+    pub fn token_id_of(&self, user_id: u32, name: &str) -> Option<u64> {
+        self.personal_access_token_name_index
+            .get(&(user_id, Arc::from(name)))
+            .copied()
     }
 
     /// Run a grant check in the same snapshot as other user checks.
@@ -191,13 +306,22 @@ impl UsersInner {
             .and_then(|&id| self.items.get(id as usize))
     }
 
-    /// Id and stored password hash of the user named by `identifier`, `None`
-    /// when the user does not resolve.
+    /// Id, stored password hash and access revision of the user named by
+    /// `identifier`, `None` when the user does not resolve.
     #[must_use]
-    pub fn resolve_password_hash(&self, identifier: &WireIdentifier) -> Option<(UserId, Arc<str>)> {
+    pub fn resolve_password_hash(
+        &self,
+        identifier: &WireIdentifier,
+    ) -> Option<(UserId, Arc<str>, u64)> {
         self.resolve_user_id(identifier)
             .and_then(|user_id| self.items.get(user_id))
-            .map(|user| (user.id, Arc::clone(&user.password_hash)))
+            .map(|user| {
+                (
+                    user.id,
+                    Arc::clone(&user.password_hash),
+                    user.access_revision,
+                )
+            })
     }
 
     /// Clone the committed permissions of the user at slab `id`, if any.
@@ -233,27 +357,27 @@ impl UsersInner {
     /// Collect `(name, expiry_at)` for every live personal access token of
     /// one user, sorted by name.
     ///
-    /// Read-only accessor for the non-replicated list path (the caller lists
-    /// its own tokens). The backing per-user map is an `AHashMap`, whose
-    /// iteration order is seeded per process, so the collected list is
-    /// sorted before it is returned. Never lift this iteration into an apply
-    /// handler: apply must stay deterministic across replicas (see the
-    /// invariant on `personal_access_token_index`).
+    /// Serves the non-replicated list path (the caller lists its own tokens)
+    /// and the deactivation apply, which records one delete per token. The
+    /// backing per-user map is an `AHashMap`, whose iteration order is seeded
+    /// per process, so the collected list is sorted before it is returned.
+    /// Never iterate that map unsorted in an apply handler: apply must stay
+    /// deterministic across replicas (see the invariant on
+    /// `personal_access_token_index`).
     #[must_use]
     pub fn personal_access_tokens_of(
         &self,
         user_id: UserId,
     ) -> Vec<(Arc<str>, Option<IggyTimestamp>)> {
-        let mut tokens: Vec<_> = self
-            .personal_access_tokens
-            .get(&user_id)
-            .map(|user_tokens| {
-                user_tokens
-                    .values()
-                    .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let mut tokens: Vec<_> =
+            self.personal_access_tokens
+                .get(&user_id)
+                .map_or_default(|user_tokens| {
+                    user_tokens
+                        .values()
+                        .map(|pat| (Arc::clone(&pat.name), pat.expiry_at))
+                        .collect()
+                });
         tokens.sort_by(|(left, _), (right, _)| left.cmp(right));
         tokens
     }
@@ -271,7 +395,7 @@ impl UsersInner {
     }
 
     /// The checks `CreateUserRequest::apply` makes before it mutates state, and
-    /// the decoded options when they pass. `reject_dangling_grant` runs them
+    /// the decoded options when they pass. `apply_scoped_grants` runs them
     /// before it checks the grants, so their refusal wins.
     pub(crate) fn validate_create_user(
         &self,
@@ -293,7 +417,7 @@ impl UsersInner {
     }
 
     /// Slab id of the user whose grants `UpdatePermissionsRequest::apply`
-    /// replaces, or the refusal of that apply. `reject_dangling_grant` runs this
+    /// replaces, or the refusal of that apply. `apply_scoped_grants` runs this
     /// before it checks the grants, so the refusal wins.
     pub(crate) fn permissions_target(
         &self,
@@ -322,8 +446,12 @@ impl UsersInner {
         // cannot make replicas diverge.
         for pat in tokens.values() {
             self.personal_access_token_index.remove(&pat.token);
-            self.personal_access_token_name_index
-                .remove(&(user_id, Arc::clone(&pat.name)));
+            if let Some(token_id) = self
+                .personal_access_token_name_index
+                .remove(&(user_id, Arc::clone(&pat.name)))
+            {
+                self.personal_access_token_id_index.remove(&token_id);
+            }
             if let Some(expiry_at) = pat.expiry_at {
                 self.personal_access_token_expiry_index.remove(&(
                     expiry_at.as_micros(),
@@ -336,10 +464,6 @@ impl UsersInner {
 }
 
 impl Users {
-    pub fn is_active_account(&self, user_id: u32, created_at: u64) -> bool {
-        self.read(|users| users.is_active_account(user_id, created_at))
-    }
-
     #[must_use]
     pub fn read<F, R>(&self, f: F) -> R
     where
@@ -362,6 +486,22 @@ impl Users {
         rule: impl FnOnce(&Permissioner) -> Result<(), IggyError>,
     ) -> Result<(), IggyError> {
         self.read(|inner| inner.authorize(rule))
+    }
+
+    pub(crate) fn apply_with_read_grants(
+        &self,
+        command: UsersCommand,
+        index: IndexReadGrantsRequest,
+        timestamp: IggyTimestamp,
+        context: ApplyContext,
+    ) -> Result<ApplyReply, IggyError> {
+        self.inner
+            .try_apply_all([
+                command,
+                UsersCommand::IndexReadGrants(index, timestamp, context),
+            ])
+            .map_err(|_| IggyError::InvalidConfiguration)?;
+        Ok(self.read(|users| users.last_result.clone().unwrap_or_default()))
     }
 
     /// Drop every grant on a stream or topic that a committed delete removed.
@@ -437,7 +577,10 @@ impl Users {
                     options: WireOptions::empty(),
                 },
                 IggyTimestamp::from(ROOT_USER_CREATED_AT_MICROS),
-                ApplyContext::default(),
+                ApplyContext {
+                    metadata_op: ROOT_USER_ACCESS_REVISION,
+                    ..ApplyContext::default()
+                },
             ))
             .expect("root user bootstrap must run on the metadata writer");
     }
@@ -554,6 +697,75 @@ impl WireDecode for DeletePersonalAccessTokenRequest {
     }
 }
 
+/// Replicated password change, as the primary resolved it from the client
+/// request.
+///
+/// The primary verifies the current password against the stored hash and
+/// reads the target's access revision in the same read, pins the target to the
+/// id it verified, and hashes the new password. An empty `password_hash` is its
+/// refusal. Apply refuses a change whose revision moved since the verify, so a
+/// concurrent change verified against the replaced password has no effect.
+///
+/// Wire format:
+/// `[user_id:WireIdentifier][access_revision:u64][keep_session:u8][password_hash_len:u8][password_hash:N]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangePasswordRequest {
+    pub user_id: WireIdentifier,
+    pub access_revision: u64,
+    pub keep_session: bool,
+    pub password_hash: String,
+}
+
+impl WireEncode for ChangePasswordRequest {
+    fn encoded_size(&self) -> usize {
+        self.user_id.encoded_size() + 8 + 2 + self.password_hash.len()
+    }
+
+    fn encode(&self, buf: &mut BytesMut) {
+        self.user_id.encode(buf);
+        buf.put_u64_le(self.access_revision);
+        buf.put_u8(u8::from(self.keep_session));
+        debug_assert!(
+            u8::try_from(self.password_hash.len()).is_ok(),
+            "password hash exceeds u8 length prefix"
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        buf.put_u8(self.password_hash.len() as u8);
+        buf.put_slice(self.password_hash.as_bytes());
+    }
+}
+
+impl WireDecode for ChangePasswordRequest {
+    fn decode(buf: &[u8]) -> Result<(Self, usize), iggy_binary_protocol::WireError> {
+        let (user_id, mut pos) = WireIdentifier::decode(buf)?;
+        let access_revision = read_u64_le(buf, pos)?;
+        pos += 8;
+        let keep_session = match read_u8(buf, pos)? {
+            0 => false,
+            1 => true,
+            _ => {
+                return Err(iggy_binary_protocol::WireError::Validation(
+                    "invalid keep_session flag".into(),
+                ));
+            }
+        };
+        pos += 1;
+        let hash_len = read_u8(buf, pos)? as usize;
+        pos += 1;
+        let password_hash = read_str(buf, pos, hash_len)?;
+        pos += hash_len;
+        Ok((
+            Self {
+                user_id,
+                access_revision,
+                keep_session,
+                password_hash,
+            },
+            pos,
+        ))
+    }
+}
+
 impl StateHandler for CreateUserRequest {
     type State = UsersInner;
     #[allow(clippy::cast_possible_truncation)]
@@ -578,6 +790,7 @@ impl StateHandler for CreateUserRequest {
             password_hash: Arc::from(self.password.as_str()),
             status,
             created_at: timestamp,
+            access_revision: state.apply_context.metadata_op,
             permissions,
             options,
         };
@@ -586,6 +799,7 @@ impl StateHandler for CreateUserRequest {
         if let Some(user) = state.items.get_mut(id) {
             user.id = id as UserId;
         }
+        state.created_index.insert((timestamp.as_micros(), id));
 
         state.index.insert(username_arc, id as UserId);
         // A reused ID must not inherit token-index entries from its previous holder.
@@ -680,6 +894,7 @@ impl StateHandler for UpdateUserResolvedRequest {
                 }
             };
         let before = user_body(user);
+        let was_active = user.status == UserStatus::Active;
 
         let Some(user) = state.items.get_mut(user_id) else {
             return ApplyReply::err(UpdateUserResult::UserNotFound);
@@ -693,8 +908,15 @@ impl StateHandler for UpdateUserResolvedRequest {
             user.status = new_status;
         }
         user.options = options;
+        let is_active = user.status == UserStatus::Active;
+        let revoked = was_active && !is_active;
+        // A reactivation moves it too, so a lagging node can tell a token issued after it from a revoked one.
+        if was_active != is_active {
+            user.access_revision = state.apply_context.metadata_op;
+        }
         // An equal patch commits as ok but changes nothing public.
-        let changes = user_body(user)
+        let revoked_user = revoked.then(|| WireUserKey::from(&*user));
+        let mut changes: Vec<_> = user_body(user)
             .filter(|after| before.as_ref() != Some(after))
             .map(|body| {
                 AppliedChange::new(
@@ -704,8 +926,27 @@ impl StateHandler for UpdateUserResolvedRequest {
             })
             .into_iter()
             .collect();
+        if let Some(key) = revoked_user {
+            let actor = change_actor(&state.apply_context);
+            changes.extend(
+                state
+                    .personal_access_tokens_of(key.user_id)
+                    .into_iter()
+                    .filter_map(|(name, _)| {
+                        Some(AppliedChange::new(
+                            &WireMetadataChange::PersonalAccessTokenDeleted(WireTokenDeletedBody {
+                                user: key,
+                                name: WireName::new(name.as_ref()).ok()?,
+                                reason: WireTokenDeletedReason::Deleted,
+                            }),
+                            actor,
+                        ))
+                    }),
+            );
+            state.remove_personal_access_tokens(key.user_id);
+        }
         ApplyReply {
-            revoked_user: (user.status != UserStatus::Active).then(|| WireUserKey::from(&*user)),
+            revoked_user,
             changes,
             ..ApplyReply::ok(Bytes::new())
         }
@@ -743,8 +984,12 @@ impl StateHandler for DeleteUserRequest {
                     change_actor(&state.apply_context),
                 )
             }));
-            state.items.remove(user_id);
+            let removed = state.items.remove(user_id);
+            state
+                .created_index
+                .remove(&(removed.created_at.as_micros(), user_id));
             state.index.remove(&username);
+            state.grants_by_creation.remove(&(user_id as UserId));
             state.remove_personal_access_tokens(user_id as UserId);
             state
                 .permissioner
@@ -765,31 +1010,43 @@ impl StateHandler for ChangePasswordRequest {
             return ApplyReply::err(ChangePasswordResult::UserNotFound);
         };
 
-        // An empty `new_password` is the primary's signal that the caller's
+        // An empty `password_hash` is the primary's signal that the caller's
         // current password did not match or that the target did not resolve
         // there (see the server `verify_and_rewrite_change_password`). The
         // accept path always replicates a non-empty Argon2 hash, so this is
         // unambiguous. Rejecting here (rather than denying pre-consensus)
         // commits the op as a no-op, recording the request id in the
         // ClientTable so a retry of it dedups.
-        if self.new_password.is_empty() {
+        if self.password_hash.is_empty() {
             return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
         }
 
-        let mut changes = Vec::new();
-        if let Some(user) = state.items.get_mut(user_id) {
-            user.password_hash = Arc::from(self.new_password.as_str());
-            changes.extend(WireName::new(user.username.as_ref()).ok().map(|username| {
+        let metadata_op = state.apply_context.metadata_op;
+        let actor = change_actor(&state.apply_context);
+        let Some(user) = state.items.get_mut(user_id) else {
+            return ApplyReply::err(ChangePasswordResult::UserNotFound);
+        };
+        if user.access_revision != self.access_revision {
+            return ApplyReply::err(ChangePasswordResult::InvalidCredentials);
+        }
+        user.password_hash = Arc::from(self.password_hash.as_str());
+        user.access_revision = metadata_op;
+        let changes = WireName::new(user.username.as_ref())
+            .ok()
+            .map(|username| {
                 AppliedChange::new(
                     &WireMetadataChange::UserPasswordChanged(WireUserIdentityBody {
                         key: WireUserKey::from(&*user),
                         username,
                     }),
-                    change_actor(&state.apply_context),
+                    actor,
                 )
-            }));
-        }
+            })
+            .into_iter()
+            .collect();
         ApplyReply {
+            revoked_user: Some(WireUserKey::from(&*user)),
+            kept_session_client: self.keep_session.then_some(state.apply_context.client_id),
             changes,
             ..ApplyReply::ok(Bytes::new())
         }
@@ -805,6 +1062,7 @@ impl StateHandler for UpdatePermissionsRequest {
             Err(result) => return ApplyReply::err(result),
         };
 
+        state.grants_by_creation.remove(&(user_id as UserId));
         let mut changes = Vec::new();
         if let Some(user) = state.items.get_mut(user_id) {
             let before = user.permissions.as_deref().map(permissions_to_wire);
@@ -836,6 +1094,31 @@ impl StateHandler for UpdatePermissionsRequest {
             changes,
             ..ApplyReply::ok(Bytes::new())
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexReadGrantsRequest {
+    pub(crate) user_id: WireIdentifier,
+    pub(crate) index: Arc<GrantsByCreation>,
+}
+
+impl StateHandler for IndexReadGrantsRequest {
+    type State = UsersInner;
+
+    fn apply(&self, state: &mut UsersInner, _timestamp: IggyTimestamp) -> ApplyReply {
+        let reply = state
+            .last_result
+            .take()
+            .expect("index follows the permission change in one publication");
+        if reply.code == 0
+            && let Some(id) = state.resolve_user_id(&self.user_id)
+        {
+            state
+                .grants_by_creation
+                .insert(state.items[id].id, Arc::clone(&self.index));
+        }
+        reply
     }
 }
 
@@ -889,6 +1172,9 @@ impl StateHandler for RemoveGrantsRequest {
                         }
                     }
                 }
+            }
+            if let Some(index) = state.grants_by_creation.get_mut(&user.id) {
+                Arc::make_mut(index).remove(self.deleted);
             }
             user.permissions = Some(Arc::new(pruned));
             if let Ok(username) = WireName::new(user.username.as_ref()) {
@@ -1013,12 +1299,16 @@ impl StateHandler for CreatePersonalAccessTokenRequest {
                 Arc::clone(&name),
             ));
         }
+        let token_id = state.apply_context.metadata_op;
         state
             .personal_access_token_name_index
-            .insert((self.user_id, Arc::clone(&name)));
+            .insert((self.user_id, Arc::clone(&name)), token_id);
+        state
+            .personal_access_token_id_index
+            .insert(token_id, (self.user_id, Arc::clone(&name)));
         state
             .personal_access_token_index
-            .insert(token_hash, (self.user_id, name));
+            .insert(token_hash, (self.user_id, name, token_id));
         let changes = state
             .items
             .get(self.user_id as usize)
@@ -1069,9 +1359,12 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
         match user_tokens.remove(&name_arc) {
             Some(pat) => {
                 state.personal_access_token_index.remove(&pat.token);
-                state
+                let token_id = state
                     .personal_access_token_name_index
                     .remove(&(self.user_id, Arc::clone(&name_arc)));
+                if let Some(token_id) = token_id {
+                    state.personal_access_token_id_index.remove(&token_id);
+                }
                 if let Some(expiry_at) = pat.expiry_at {
                     state.personal_access_token_expiry_index.remove(&(
                         expiry_at.as_micros(),
@@ -1084,13 +1377,15 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
                 } else {
                     WireTokenDeletedReason::Deleted
                 };
-                let changes = state
+                let user = state
                     .items
                     .get(self.user_id as usize)
+                    .map(WireUserKey::from);
+                let changes = user
                     .map(|user| {
                         AppliedChange::new(
                             &WireMetadataChange::PersonalAccessTokenDeleted(WireTokenDeletedBody {
-                                user: WireUserKey::from(user),
+                                user,
                                 name: self.name.clone(),
                                 reason,
                             }),
@@ -1100,6 +1395,9 @@ impl StateHandler for DeletePersonalAccessTokenRequest {
                     .into_iter()
                     .collect();
                 ApplyReply {
+                    revoked_token: user
+                        .zip(token_id)
+                        .map(|(user, token_id)| RevokedToken { user, token_id }),
                     changes,
                     ..ApplyReply::ok(Bytes::new())
                 }
@@ -1117,6 +1415,7 @@ pub struct UserSnapshot {
     pub password_hash: String,
     pub status: UserStatus,
     pub created_at: IggyTimestamp,
+    pub access_revision: u64,
     pub permissions: Option<Permissions>,
     #[serde(default)]
     pub options: ResourceOptions,
@@ -1129,6 +1428,8 @@ pub struct PersonalAccessTokenSnapshot {
     pub name: String,
     pub token: String,
     pub expiry_at: Option<IggyTimestamp>,
+    /// The op that created the token.
+    pub id: u64,
 }
 
 /// Permissioner snapshot representation for serialization.
@@ -1153,6 +1454,124 @@ pub struct UsersSnapshot {
     pub items: Vec<(usize, UserSnapshot)>,
     pub personal_access_tokens: Vec<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)>,
     pub permissioner: PermissionerSnapshot,
+    #[serde(skip)]
+    pub(crate) grants_by_creation: AHashMap<UserId, Arc<GrantsByCreation>>,
+}
+
+impl UsersSnapshot {
+    pub(crate) fn index_read_grants(mut self, snapshot: &MetadataSnapshot) -> Self {
+        let Some(streams) = &snapshot.streams else {
+            return self;
+        };
+        if !self.items.iter().any(|(_, user)| {
+            user.permissions
+                .as_ref()
+                .is_some_and(|permissions| permissions.streams.is_some())
+        }) {
+            return self;
+        }
+        let mut stream_times = AHashMap::new();
+        let mut topic_times = AHashMap::new();
+        for (id, stream) in &streams.items {
+            stream_times.insert(*id, stream.created_at.as_micros());
+            for (topic_id, topic) in &stream.topics {
+                topic_times.insert((*id, *topic_id), topic.created_at.as_micros());
+            }
+        }
+        for (_, user) in &self.items {
+            if let Some(permissions) = &user.permissions
+                && permissions.streams.is_some()
+            {
+                let ordered = GrantsByCreation::from_grants(
+                    permissions,
+                    |id| stream_times.get(&id).copied(),
+                    |id, topic| topic_times.get(&(id, topic)).copied(),
+                );
+                self.grants_by_creation.insert(user.id, Arc::new(ordered));
+            }
+        }
+        self
+    }
+
+    pub(crate) fn validate_credential_ids(
+        &self,
+        sequence_number: u64,
+    ) -> Result<(), SnapshotError> {
+        let committed = 1..=sequence_number;
+        if self
+            .items
+            .iter()
+            .any(|(_, user)| !committed.contains(&user.access_revision))
+        {
+            return Err(SnapshotError::InvalidState(
+                "user access revision outside the checkpoint history",
+            ));
+        }
+        let mut token_ids = BTreeSet::new();
+        let mut owners = BTreeSet::new();
+        for (owner, tokens) in &self.personal_access_tokens {
+            if !owners.insert(owner) {
+                return Err(SnapshotError::InvalidState(
+                    "duplicate personal access token owner",
+                ));
+            }
+            let mut names = BTreeSet::new();
+            for (name, token) in tokens {
+                if token.user_id != *owner
+                    || &token.name != name
+                    || !names.insert(name)
+                    || !committed.contains(&token.id)
+                    || !token_ids.insert(token.id)
+                {
+                    return Err(SnapshotError::InvalidState(
+                        "invalid personal access token identity",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The length of the msgpack array a [`UsersSnapshot`] encodes as.
+const USERS_SNAPSHOT_FIELDS: usize = 3;
+
+/// Writes what the derived `Serialize` of [`UsersSnapshot`] writes, one step
+/// at a time: one user or the tokens of one user per step. The permissioner
+/// is one step, because `to_snapshot` leaves its lists empty.
+#[derive(Debug)]
+pub(crate) struct UsersEncoder {
+    head_written: bool,
+    items: ArraySteps<(usize, UserSnapshot)>,
+    personal_access_tokens: ArraySteps<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)>,
+    permissioner: PermissionerSnapshot,
+}
+
+impl From<UsersSnapshot> for UsersEncoder {
+    fn from(snapshot: UsersSnapshot) -> Self {
+        Self {
+            head_written: false,
+            items: snapshot.items.into(),
+            personal_access_tokens: snapshot.personal_access_tokens.into(),
+            permissioner: snapshot.permissioner,
+        }
+    }
+}
+
+impl UsersEncoder {
+    /// Append the next step to `out` and return whether steps remain.
+    pub(crate) fn encode_next(&mut self, out: &mut Vec<u8>) -> Result<bool, SnapshotError> {
+        if !self.head_written {
+            encode_array_len(out, USERS_SNAPSHOT_FIELDS)?;
+            self.head_written = true;
+        }
+        // The list of users that ended lets the tokens start in the same step.
+        if self.items.encode_next(out)? || self.personal_access_tokens.encode_next(out)? {
+            return Ok(true);
+        }
+        encode_value(out, &self.permissioner)?;
+        Ok(false)
+    }
 }
 
 impl Snapshotable for Users {
@@ -1172,6 +1591,7 @@ impl Snapshotable for Users {
                             password_hash: user.password_hash.to_string(),
                             status: user.status,
                             created_at: user.created_at,
+                            access_revision: user.access_revision,
                             permissions: user.permissions.as_ref().map(|p| (**p).clone()),
                             options: user.options.clone(),
                         },
@@ -1179,28 +1599,39 @@ impl Snapshotable for Users {
                 })
                 .collect();
 
-            let personal_access_tokens: Vec<(UserId, Vec<(String, PersonalAccessTokenSnapshot)>)> =
-                inner
-                    .personal_access_tokens
-                    .iter()
-                    .map(|(&user_id, tokens)| {
-                        let token_list: Vec<(String, PersonalAccessTokenSnapshot)> = tokens
-                            .iter()
-                            .map(|(name, pat)| {
-                                (
-                                    name.to_string(),
-                                    PersonalAccessTokenSnapshot {
-                                        user_id: pat.user_id,
-                                        name: pat.name.to_string(),
-                                        token: pat.token.to_string(),
-                                        expiry_at: pat.expiry_at,
-                                    },
-                                )
-                            })
-                            .collect();
-                        (user_id, token_list)
-                    })
-                    .collect();
+            let mut personal_access_tokens: Vec<(
+                UserId,
+                Vec<(String, PersonalAccessTokenSnapshot)>,
+            )> = inner
+                .personal_access_tokens
+                .iter()
+                .map(|(&user_id, tokens)| {
+                    let mut token_list: Vec<(String, PersonalAccessTokenSnapshot)> = tokens
+                        .iter()
+                        .map(|(name, pat)| {
+                            (
+                                name.to_string(),
+                                PersonalAccessTokenSnapshot {
+                                    user_id: pat.user_id,
+                                    name: pat.name.to_string(),
+                                    token: pat.token.to_string(),
+                                    expiry_at: pat.expiry_at,
+                                    // A token without an id writes 0, which the checkpoint validation refuses.
+                                    id: inner
+                                        .personal_access_token_name_index
+                                        .get(&(user_id, Arc::clone(name)))
+                                        .copied()
+                                        .unwrap_or(0),
+                                },
+                            )
+                        })
+                        .collect();
+                    token_list.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+                    (user_id, token_list)
+                })
+                .collect();
+
+            personal_access_tokens.sort_unstable_by_key(|(owner, _)| *owner);
 
             // The permissioner is a denormalized index of `User.permissions`.
             // Its `AHashMap`/`AHashSet` fields iterate in a per-replica-random
@@ -1220,6 +1651,7 @@ impl Snapshotable for Users {
                 items,
                 personal_access_tokens,
                 permissioner,
+                grants_by_creation: AHashMap::new(),
             }
         })
     }
@@ -1258,6 +1690,7 @@ impl UsersInner {
                 password_hash: Arc::from(user_snap.password_hash.as_str()),
                 status: user_snap.status,
                 created_at: user_snap.created_at,
+                access_revision: user_snap.access_revision,
                 permissions: user_snap.permissions.map(Arc::new),
                 options: user_snap.options,
             };
@@ -1270,11 +1703,13 @@ impl UsersInner {
 
         let mut personal_access_tokens: AHashMap<UserId, AHashMap<Arc<str>, PersonalAccessToken>> =
             AHashMap::new();
-        let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>)> =
+        let mut personal_access_token_index: AHashMap<Arc<str>, (UserId, Arc<str>, u64)> =
             AHashMap::new();
         let mut personal_access_token_expiry_index: BTreeSet<(u64, UserId, Arc<str>)> =
             BTreeSet::new();
-        let mut personal_access_token_name_index: BTreeSet<(UserId, Arc<str>)> = BTreeSet::new();
+        let mut personal_access_token_name_index: BTreeMap<(UserId, Arc<str>), u64> =
+            BTreeMap::new();
+        let mut personal_access_token_id_index: BTreeMap<u64, (UserId, Arc<str>)> = BTreeMap::new();
         for (user_id, tokens) in snapshot.personal_access_tokens {
             let mut token_map: AHashMap<Arc<str>, PersonalAccessToken> = AHashMap::new();
             for (name, pat_snap) in tokens {
@@ -1292,9 +1727,12 @@ impl UsersInner {
                         Arc::clone(&name),
                     ));
                 }
-                personal_access_token_index
-                    .insert(Arc::clone(&pat.token), (user_id, Arc::clone(&name)));
-                personal_access_token_name_index.insert((user_id, Arc::clone(&name)));
+                personal_access_token_index.insert(
+                    Arc::clone(&pat.token),
+                    (user_id, Arc::clone(&name), pat_snap.id),
+                );
+                personal_access_token_name_index.insert((user_id, Arc::clone(&name)), pat_snap.id);
+                personal_access_token_id_index.insert(pat_snap.id, (user_id, Arc::clone(&name)));
                 token_map.insert(name, pat);
             }
             personal_access_tokens.insert(user_id, token_map);
@@ -1303,22 +1741,37 @@ impl UsersInner {
         // Rebuild the permissioner from the restored users rather than the
         // snapshot vecs, which are intentionally empty (see `to_snapshot`).
         let permissioner = permissioner_of(&items);
+        let created_index = items
+            .iter()
+            .map(|(id, user)| (user.created_at.as_micros(), id))
+            .collect();
 
         Self {
             index,
             items,
+            created_index,
             personal_access_tokens,
             personal_access_token_index,
             personal_access_token_expiry_index,
             personal_access_token_name_index,
+            personal_access_token_id_index,
             permissioner,
+            grants_by_creation: snapshot.grants_by_creation,
+            installed_snapshot_op: 0,
             last_result: None,
             apply_context: ApplyContext::default(),
         }
     }
 }
 
-impl_fill_restore!(Users, users);
+impl_fill_restore!(Users, users, index_read_grants);
+
+impl FillSnapshot<MetadataCapture> for Users {
+    fn fill_snapshot(&self, capture: &mut MetadataCapture) -> Result<(), SnapshotError> {
+        capture.users = Some(self.to_snapshot());
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1464,8 +1917,134 @@ mod tests {
     }
 
     #[test]
+    fn given_credential_proofs_when_checking_should_accept_only_the_current_account_and_live_tokens()
+     {
+        const CREATED_AT: u64 = 50;
+        const REVISION: u64 = 5;
+        const TOKEN_ID: u64 = 6;
+        let mut users = UsersInner::new();
+        users.apply_context.metadata_op = REVISION;
+        let create = |username: &str| CreateUserRequest {
+            username: WireName::new(username).unwrap(),
+            password: "hash".to_owned(),
+            status: UserStatus::Active.as_code(),
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        create("alice").apply(&mut users, IggyTimestamp::from(CREATED_AT));
+        users.apply_context.metadata_op = TOKEN_ID;
+        // Expires at 60 + 1000 micros.
+        CreatePersonalAccessTokenRequest {
+            user_id: 0,
+            name: WireName::new("ci").unwrap(),
+            expiry: 1_000,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        }
+        .apply(&mut users, IggyTimestamp::from(60));
+        users.apply_context.metadata_op = 7;
+        create("bob").apply(&mut users, IggyTimestamp::from(70));
+        let account = CredentialProof::account(CREATED_AT, REVISION);
+        let token = CredentialProof::token(CREATED_AT, TOKEN_ID);
+
+        for (user_id, proof, now, accepted) in [
+            (0, account, 0, true),
+            (0, token, 1_059, true),
+            (0, token, 1_060, false),
+            (
+                0,
+                CredentialProof {
+                    access_revision: REVISION,
+                    ..token
+                },
+                100,
+                true,
+            ),
+            (
+                0,
+                CredentialProof::account(CREATED_AT, REVISION - 1),
+                0,
+                false,
+            ),
+            (
+                0,
+                CredentialProof::account(CREATED_AT + 1, REVISION),
+                0,
+                false,
+            ),
+            (
+                0,
+                CredentialProof::token(CREATED_AT, TOKEN_ID + 1),
+                0,
+                false,
+            ),
+            (
+                0,
+                CredentialProof {
+                    user_created_at: CREATED_AT,
+                    access_revision: 0,
+                    token_id: 0,
+                },
+                0,
+                false,
+            ),
+            (1, CredentialProof::token(70, TOKEN_ID), 0, false),
+        ] {
+            assert_eq!(
+                users.accepts_credential_at(user_id, &proof, IggyTimestamp::from(now)),
+                accepted,
+                "user {user_id} with {proof:?} at {now}"
+            );
+        }
+
+        let restored = UsersInner::inner_from_snapshot(Users::from(users.clone()).to_snapshot());
+        assert_eq!(restored.token_id_of(0, "ci"), Some(TOKEN_ID));
+        assert_eq!(
+            restored.items.get(0).map(|user| user.access_revision),
+            Some(REVISION)
+        );
+        assert!(restored.accepts_credential_at(0, &token, IggyTimestamp::from(100)));
+        assert!(restored.accepts_credential_at(0, &account, IggyTimestamp::from(100)));
+    }
+
+    #[test]
+    fn given_multiple_token_owners_when_checkpointing_should_encode_a_stable_order() {
+        let mut users = UsersInner::new();
+        for owner in 0..16u32 {
+            users.apply_context.metadata_op = u64::from(owner) + 1;
+            create_user(&mut users, &format!("owner-{owner}"));
+        }
+        for owner in (0..16u32).rev() {
+            for suffix in (1..=8u32).rev() {
+                users.apply_context.metadata_op = u64::from(16 + owner * 8 + suffix);
+                CreatePersonalAccessTokenRequest {
+                    user_id: owner,
+                    name: WireName::new(format!("token-{suffix}")).unwrap(),
+                    expiry: 0,
+                    token_hash: format!("{:064x}", users.apply_context.metadata_op)
+                        .as_bytes()
+                        .try_into()
+                        .unwrap(),
+                }
+                .apply(&mut users, IggyTimestamp::from(1));
+            }
+        }
+        let snapshot = Users::from(users).to_snapshot();
+        assert!(
+            snapshot
+                .personal_access_tokens
+                .iter()
+                .map(|(owner, _)| owner)
+                .is_sorted()
+        );
+        for (_, tokens) in snapshot.personal_access_tokens {
+            assert!(tokens.iter().map(|(name, _)| name).is_sorted());
+        }
+    }
+
+    #[test]
     fn given_token_lifecycle_when_indexing_names_should_follow_every_change_and_restore() {
         let mut users = UsersInner::new();
+        users.apply_context.metadata_op = 1;
         create_user(&mut users, "alice");
         let token = |name: &str| CreatePersonalAccessTokenRequest {
             user_id: 0,
@@ -1476,13 +2055,20 @@ mod tests {
         let names = |users: &UsersInner| {
             users
                 .personal_access_token_name_index
-                .iter()
+                .keys()
                 .map(|(user_id, name)| (*user_id, name.to_string()))
                 .collect::<Vec<_>>()
         };
-        for name in ["ci", "build"] {
+        for (op, name) in [(2, "ci"), (3, "build")] {
+            users.apply_context.metadata_op = op;
             token(name).apply(&mut users, IggyTimestamp::zero());
         }
+        let snapshot = Users::from(users.clone()).to_snapshot();
+        snapshot.validate_credential_ids(3).unwrap();
+        let restored = UsersInner::inner_from_snapshot(snapshot);
+        assert_eq!(restored.token_id_of(0, "ci"), Some(2));
+        assert_eq!(restored.token_id_of(0, "build"), Some(3));
+
         DeletePersonalAccessTokenRequest {
             user_id: 0,
             name: WireName::new("ci").unwrap(),
@@ -1493,6 +2079,7 @@ mod tests {
 
         let restored = UsersInner::inner_from_snapshot(Users::from(users.clone()).to_snapshot());
         assert_eq!(names(&restored), names(&users));
+        assert_eq!(restored.token_id_of(0, "build"), Some(3));
 
         users.remove_personal_access_tokens(0);
         assert_eq!(names(&users), [] as [(UserId, String); 0]);
@@ -2396,6 +2983,93 @@ mod tests {
         assert_eq!(
             users.items.get(0).map(|user| user.status),
             Some(UserStatus::Active)
+        );
+    }
+
+    fn user_creation_keys(users: &UsersInner) -> BTreeSet<(u64, usize)> {
+        users
+            .items
+            .iter()
+            .map(|(id, user)| (user.created_at.as_micros(), id))
+            .collect()
+    }
+
+    fn create_user_at(users: &mut UsersInner, username: &str, micros: u64) {
+        let request = CreateUserRequest {
+            username: WireName::new(username).unwrap(),
+            password: "hash".to_owned(),
+            status: 1,
+            permissions: None,
+            options: WireOptions::empty(),
+        };
+        let reply = StateHandler::apply(&request, users, IggyTimestamp::from(micros));
+        assert_eq!(reply.code, 0);
+    }
+
+    fn delete_user_at(users: &mut UsersInner, user_id: usize, micros: u64) {
+        let request = DeleteUserRequest {
+            user_id: WireIdentifier::numeric(u32::try_from(user_id).unwrap()),
+        };
+        let reply = StateHandler::apply(&request, users, IggyTimestamp::from(micros));
+        assert_eq!(reply.code, 0);
+    }
+
+    #[test]
+    fn given_random_user_creates_and_deletes_when_applied_should_keep_the_creation_index_exact() {
+        let mut users = UsersInner::new();
+        create_user_at(&mut users, "root", 1);
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        for step in 2..=400u64 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let deletable: Vec<usize> = users
+                .items
+                .iter()
+                .map(|(id, _)| id)
+                .filter(|&id| id != DEFAULT_ROOT_USER_ID as usize)
+                .collect();
+            if deletable.is_empty() || !seed.is_multiple_of(3) {
+                create_user_at(&mut users, &format!("user{step}"), step);
+            } else {
+                let pick = usize::try_from(seed % deletable.len() as u64).unwrap();
+                delete_user_at(&mut users, deletable[pick], step);
+            }
+            assert_eq!(
+                users.created_index,
+                user_creation_keys(&users),
+                "step {step}"
+            );
+        }
+        assert!(users.created_index.len() > 10);
+        let snapshot = Users::from(users.clone()).to_snapshot();
+        let restored = UsersInner::inner_from_snapshot(snapshot);
+        assert_eq!(restored.created_index, user_creation_keys(&users));
+    }
+
+    #[test]
+    fn given_a_reused_user_id_when_walking_by_creation_should_list_the_new_user_last() {
+        let mut users = UsersInner::new();
+        for (micros, username) in [(10, "root"), (20, "bravo"), (30, "charlie")] {
+            create_user_at(&mut users, username, micros);
+        }
+        delete_user_at(&mut users, 1, 40);
+        create_user_at(&mut users, "delta", 50);
+        assert_eq!(users.items[1].username.as_ref(), "delta");
+
+        let by_created = |after, descending| {
+            users
+                .users_by_created(after, descending)
+                .map(|((_, id), _)| id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(by_created(None, false), [0, 2, 1]);
+        assert_eq!(by_created(None, true), [1, 2, 0]);
+        assert_eq!(by_created(Some((30, 2)), false), [1]);
+        assert_eq!(
+            by_created(Some((20, 1)), true),
+            [0],
+            "a deleted key still splits"
         );
     }
 }

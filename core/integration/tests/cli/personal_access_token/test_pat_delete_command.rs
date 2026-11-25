@@ -74,6 +74,68 @@ impl IggyCmdTestCase for TestPatDeleteCmd {
     }
 }
 
+/// Deletes the token the command signed in with, which ends the command's own session.
+struct TestPatDeleteOwnTokenCmd {
+    name: String,
+    token: String,
+}
+
+#[async_trait]
+impl IggyCmdTestCase for TestPatDeleteOwnTokenCmd {
+    async fn prepare_server_state(&mut self, client: &dyn Client) {
+        self.token = client
+            .create_personal_access_token(&self.name, PersonalAccessTokenExpiry::NeverExpire)
+            .await
+            .expect("create the token")
+            .token;
+    }
+
+    fn get_command(&self) -> IggyCmdCommand {
+        IggyCmdCommand::new()
+            .opts(vec!["--token", self.token.as_str()])
+            .arg("pat")
+            .arg("delete")
+            .arg(self.name.as_str())
+    }
+
+    fn verify_command(&self, command_state: Assert) {
+        let message = format!(
+            "Executing delete personal access tokens with name: {}\nPersonal access token with name: {} deleted\n",
+            self.name, self.name
+        );
+
+        command_state.success().stdout(diff(message));
+    }
+
+    async fn verify_server_state(&self, client: &dyn Client) {
+        let tokens = client
+            .get_personal_access_tokens()
+            .await
+            .expect("list the tokens");
+        assert!(tokens.is_empty());
+    }
+}
+
+#[tokio::test]
+#[parallel]
+pub async fn given_the_token_the_command_signed_in_with_when_deleting_it_should_report_success() {
+    let mut iggy_cmd_test = IggyCmdTest::default();
+
+    iggy_cmd_test.setup().await;
+    iggy_cmd_test
+        .execute_test(TestPatDeleteOwnTokenCmd {
+            name: String::from("own"),
+            token: String::new(),
+        })
+        .await;
+    iggy_cmd_test
+        .execute_test(OverWebSocket(TestPatDeleteOwnTokenCmd {
+            name: String::from("own"),
+            token: String::new(),
+        }))
+        .await;
+}
+
 #[tokio::test]
 #[parallel]
 pub async fn should_be_successful() {

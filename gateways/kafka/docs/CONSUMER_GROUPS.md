@@ -463,12 +463,12 @@ short `session.timeout.ms`, or Java 4.1+ `CloseOptions.LEAVE_GROUP`.
 
 ## Capacity caps
 
-`GroupCoordinatorConfig` (no environment variables yet; `GatewayConfig.group`):
+`GroupCoordinatorConfig` (`GatewayConfig.group`; only `initial_rebalance_delay` has an environment variable so far):
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `min_session_timeout` / `max_session_timeout` | 6s / 30min | Kafka's `group.min/max.session.timeout.ms`; outside the range is `INVALID_SESSION_TIMEOUT` (26) |
-| `initial_rebalance_delay` | 3s | Kafka's `group.initial.rebalance.delay.ms`; a new group waits this out so consumers starting together land in one generation |
+| `initial_rebalance_delay` | 3s | Kafka's `group.initial.rebalance.delay.ms`; a new group waits this out so consumers starting together land in one generation. `IGGY_KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS` sets it in milliseconds, `0` included |
 | `max_groups` | 1000 | Beyond it, a new group is `COORDINATOR_NOT_AVAILABLE` (15, retriable) |
 | `max_members_per_group` | 1000 | Kafka's `group.max.size`; beyond it, `GROUP_MAX_SIZE_REACHED` (81) |
 | `max_total_members` | 10000 | Across every group, checked before a member id is minted; `COORDINATOR_NOT_AVAILABLE` (15) |

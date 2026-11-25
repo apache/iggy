@@ -18,6 +18,8 @@
 #![allow(clippy::future_not_send)]
 
 mod consumer_offset_capacity;
+mod free_space;
+pub mod geo_positions;
 mod iggy_index;
 mod iggy_index_reader;
 mod iggy_index_writer;
@@ -31,6 +33,12 @@ mod messages_writer;
 mod offset_recovery;
 pub mod offset_storage;
 mod partition_storage;
+mod peer_log;
+pub mod peer_manifests;
+pub use peer_log::{
+    AppliedManifest, PeerLog, PeerLogError, PeerManifestApplied, PeerManifestContradiction,
+    PeerManifestRefusal,
+};
 mod persistence;
 mod poll_plan;
 pub mod producer_state;
@@ -40,13 +48,80 @@ pub(crate) use persistence::PersistenceDrain;
 pub use persistence::{
     PartitionPersistence, PersistenceCompletion, PersistenceMetrics, PersistenceNotifier,
 };
-pub use repair_memory::RepairMemoryBudget;
+pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
+mod remote_segments;
+pub use remote_segments::{
+    ExecutorObjects, FRESH_CACHE_BYTES, RemoteObjects, RemoteRange, RemoteSegments,
+};
+mod object_delete;
 mod segment;
 pub mod segment_anchor;
+pub mod segment_chain;
+mod segment_upload;
+pub use object_delete::{
+    DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, MAX_QUEUED_INCARNATIONS,
+    ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, SweptObjects, delete_incarnation,
+    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
+    sweep_long_term, sweep_segments, sweepable,
+};
+mod fresh_proofs;
+pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
+mod fresh_upload;
+pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
+mod fresh_sweep;
+mod manifest_publish;
+pub use fresh_sweep::{
+    ExecutorFreshSweeper, FRESH_DELETES_PER_BATCH, FRESH_OBJECT_GRACE, FRESH_OBJECTS_PER_SWEEP,
+    FreshDeleteOutcome, FreshDeleted, FreshListCursor, FreshListEnd, FreshListOutcome,
+    FreshListRequest, FreshListScope, FreshListedScope, FreshListing, FreshObjectSweeper,
+    FreshObjectsInUse, FreshScanFailed, FreshSettled, FreshSweep, ProofFloors, list_fresh_objects,
+};
+mod origin_recovery;
+mod placed_read;
+mod proven_batch;
+pub use manifest_publish::{
+    ExecutorManifestPublisher, MANIFEST_REPEAT_AFTER, MANIFEST_RETRY_AFTER,
+    MANIFEST_RETRY_AFTER_MAX, MANIFEST_STORE_INTERVAL, ManifestPublishOutcome, ManifestPublisher,
+};
+pub use origin_recovery::{
+    DropReason, DroppedBatch, FRESH_INDEX_FIRST_READ, FreshScan, PartitionRecovery,
+    RECOVERY_PLAN_BATCHES_MAX, RecoveryInstallError, RecoveryPlan, RecoveryPlanError, SkipReason,
+    SkippedObject, plan_partition, scan_fresh_objects,
+};
+pub use proven_batch::{ProvenBatch, ProvenBatchError};
+mod topic_object;
+pub use segment_chain::object_prefix;
+pub use segment_upload::{
+    ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
+    UploadError, UploadOutcome, upload_segment,
+};
+pub mod long_term;
+mod long_term_delete;
+pub use long_term_delete::{
+    LONG_TERM_DELETE_DELAY, LONG_TERM_SWEEP_DEAD_MAX, LONG_TERM_SWEEP_INTERVAL, LongTermNames,
+    LongTermObject, SegmentSpan, SweptLongTerm,
+};
+mod long_term_merge;
+pub use long_term_merge::{
+    ExecutorLongTermMerger, LONG_TERM_MERGE_MIN_BYTES, LONG_TERM_MERGE_PRESSURE_BYTES,
+    LONG_TERM_MERGE_READ_BYTES, LONG_TERM_SEGMENTS_PRESSURE, LongTermMerger, MergeError,
+    MergeLimits, MergeOutcome, MergePass, MergeRun, MergeSettled, MergeStart, SegmentMerge,
+};
+mod long_term_rewrite;
+pub use long_term_rewrite::{
+    BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, PlannedSegment,
+    RewriteError, RewriteOutcome, RewriteStart, SegmentPlan, SegmentRewrite,
+};
+pub use topic_object::{
+    ExecutorTopicObjects, TOPIC_OBJECT_RETRY, TopicObjectOutcome, TopicObjects, delete_topic,
+    list_topic_keys,
+};
 mod segment_recovery;
 pub mod state_machine;
 pub mod state_transfer;
 mod stream_keyring;
+pub mod tiered_floor;
 mod types;
 mod view_fence;
 #[cfg(feature = "simulator")]
@@ -59,13 +134,17 @@ pub use wal_storage::{InjectedFile, InjectedStorage, WalFile, WalStorage};
 pub type WalStorage = ::journal::durable_storage::DiskStorage;
 
 pub use consumer_offset_capacity::{AutoCommitReservation, ConsumerOffsetCapacityError};
+pub use free_space::{FreeSpaceChange, FreeSpaceReserve};
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyError;
 pub use iggy_index::IggyIndex;
 pub use iggy_index_reader::IggyIndexReader;
 pub use iggy_index_writer::IggyIndexWriter;
-pub use iggy_partition::{IggyPartition, RetirementDebtStatus, SegmentRemoval};
-pub use iggy_partitions::IggyPartitions;
+pub use iggy_partition::{
+    BatchRetirement, CheckpointDelays, CheckpointTrigger, IggyPartition, LocalEnvelope,
+    RetirementDebtStatus, SegmentEviction, SegmentRemoval,
+};
+pub use iggy_partitions::{GaugeShare, IggyPartitions, SentReport, Sleeper};
 pub(crate) use io::PartitionIoVerdict;
 pub use io::{
     CapturedPartitionIo, MaterializationIoJob, MaterializationIoResult, PARTITION_IO_DRAIN_TIMEOUT,
@@ -103,27 +182,26 @@ pub use iggy_partition::{PollCompletion, PollReplication, PollVisibility};
 pub use messages_writer::MessagesWriter;
 pub use offset_storage::delete_persisted_offset;
 pub use partition_storage::{
-    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets,
-    configure_consumer_offsets_with_storage, create_partition_file_hierarchy,
-    delete_partitions_from_disk, ensure_initial_segment, hydrate_partition_log,
-    read_created_revision, read_revision_record, recover_consumer_offsets,
+    CREATED_REVISION_FILE, clamp_consumer_offsets, configure_consumer_offsets_with_storage,
+    create_partition_file_hierarchy, delete_partitions_from_disk, ensure_initial_segment,
+    hydrate_partition_log, read_created_revision, read_revision_record, recover_consumer_offsets,
     recover_consumer_offsets_with_storage, write_created_revision, write_revision_record,
 };
 pub use poll_plan::{DISK_POLL_CHUNK_MAX, PollPlan, PollReadResult};
-pub use segment::Segment;
+pub use segment::{Segment, SegmentLocation};
 pub use segment_recovery::{
-    PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredSegment, load_persisted_segments,
-    load_persisted_segments_with_checkpoint,
+    PartitionRecoveryError, PartitionRecoveryRefusal, RecoveredLog, RecoveredSegment,
+    load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
 };
 use server_common::Message;
 pub use server_common::send_messages::{IggyMessage, IggyMessageHeader, IggyMessages};
 pub use state_transfer::CONSUMER_OFFSETS_ENTRIES_MAX;
 pub use stream_keyring::{StreamKeyIdentity, StreamKeyring};
 pub use types::{
-    AppendResult, COMMIT_WALK_OPS_MAX, FatalCommit, Fragment, PartitionOffsets,
-    PartitionPathLayout, PartitionsConfig, PollFragments, PollQueryResult, PollingArgs,
-    PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS, RepairConclusion, RepairIngest,
-    RepairSession, SendMessagesResult,
+    AppendResult, COMMIT_WALK_OPS_MAX, ConsumerGroupOffsets, ConsumerOffsets, FatalCommit,
+    Fragment, PartitionOffsets, PartitionPathLayout, PartitionsConfig, PollFragments,
+    PollQueryResult, PollingArgs, PollingConsumer, REPAIR_MAX_STALL_RETRIES, REPAIR_RETRY_TICKS,
+    RepairConclusion, RepairIngest, RepairSession, SendMessagesResult,
 };
 
 /// A partition's message log, named so a caller can carry one across a rebuild.
@@ -139,6 +217,7 @@ pub type RetainedPartitionLog =
 /// Everything a partition hands its own next incarnation across a simulated
 /// restart.
 #[cfg(any(test, feature = "simulator"))]
+#[derive(Default)]
 pub struct RetainedPartitionState {
     pub log: RetainedPartitionLog,
     pub head_op: u64,
@@ -164,6 +243,25 @@ pub struct RetainedPartitionState {
         Option<iggy_binary_protocol::requests::partitions::RetireConsumerGroupOwnersRequest>,
     pub(crate) producers: producer_state::ProducerTable,
     pub(crate) machines: Option<state_machine::StateMachineSnapshot>,
+}
+
+#[cfg(any(test, feature = "simulator"))]
+impl RetainedPartitionState {
+    /// The state of a partition whose boot recovered a log with nothing in it:
+    /// the first segment of the chain, as
+    /// [`IggyPartition::with_in_memory_storage`] plants it, and no op.
+    /// `Default` alone leaves the chain without that segment.
+    #[must_use]
+    pub fn empty(segment_size: iggy_common::IggyByteSize) -> Self {
+        let mut state = Self::default();
+        state.log.add_persisted_segment(
+            Segment::new(0, segment_size),
+            server_common::SegmentStorage::default(),
+            None,
+            None,
+        );
+        state
+    }
 }
 
 /// Partition-level data plane operations.

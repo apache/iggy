@@ -31,6 +31,7 @@ use std::fmt;
 
 use configs::external_auth::ExternalAuthConfig;
 use futures::StreamExt;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 
@@ -73,6 +74,8 @@ impl Drop for CalloutGuard {
 fn build_http_client() -> Result<cyper::Client, String> {
     cyper::Client::builder()
         .redirect(cyper::redirect::Policy::none())
+        // The service's host is looked up off the shard thread.
+        .custom_resolver(iggy_object_store::ShardResolver::default())
         .build()
         .map_err(|e| format!("failed to build HTTP client (missing CA roots?): {e}"))
 }
@@ -371,23 +374,27 @@ pub async fn callout_external_auth(
 }
 
 /// Validate that a pre-provisioned user is eligible for external login:
-/// exists, active, not root, and carries no unrecognized critical options.
-/// Reused by the trusted-issuer JWT path.
+/// exists, active, not root, carries no unrecognized critical options, and
+/// holds the access revision it had at `started_at_op`, when the external
+/// verification began. Reused by the trusted-issuer JWT path.
+///
+/// # Errors
+/// Returns the condition the account fails.
 pub fn validate_provisioned_account(
     user: Option<&metadata::stm::user::User>,
-) -> Option<(u32, iggy_common::IggyTimestamp)> {
-    check_account_policy(user?).ok()
+    started_at_op: u64,
+) -> Result<(u32, CredentialProof), AccountRejection> {
+    check_account_policy(user.ok_or(AccountRejection::NotFound)?, started_at_op)
 }
 
-/// Why a pre-provisioned account was rejected. Logged for debugging but
-/// never exposed on the wire (the caller maps every variant to
-/// `InvalidCredentials`).
+/// Why a pre-provisioned account was rejected during external verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccountRejection {
     NotFound,
     Root,
     Inactive,
     CriticalOptions,
+    CredentialChanged,
 }
 
 impl std::fmt::Display for AccountRejection {
@@ -396,36 +403,44 @@ impl std::fmt::Display for AccountRejection {
             Self::NotFound => "user not found",
             Self::Root => "root account cannot be used for external auth",
             Self::Inactive => "user account is inactive",
+            Self::CredentialChanged => "account credentials changed during external verification",
             Self::CriticalOptions => "user has unrecognized critical options",
         })
     }
 }
 
 /// Resolve an externally authenticated username to a pre-provisioned Iggy
-/// user. Logs the specific rejection reason; the wire error is always
-/// `InvalidCredentials`.
+/// user and log the reason for a refused account.
+///
+/// # Errors
+/// Returns the account policy that refused the login.
 pub fn resolve_username(
     users: &metadata::stm::user::UsersInner,
     username: &str,
-) -> Result<(u32, iggy_common::IggyTimestamp), iggy_common::IggyError> {
-    let Some(user) = users.user_by_name(username) else {
-        tracing::warn!(username, reason = %AccountRejection::NotFound, "ext-auth account rejected");
-        return Err(iggy_common::IggyError::InvalidCredentials);
-    };
-    check_account_policy(user).map_err(|reason| {
-        tracing::warn!(username, user_id = user.id, reason = %reason, "ext-auth account rejected");
-        iggy_common::IggyError::InvalidCredentials
-    })
+    started_at_op: u64,
+) -> Result<(u32, CredentialProof), AccountRejection> {
+    validate_provisioned_account(users.user_by_name(username), started_at_op).inspect_err(
+        |reason| {
+            tracing::warn!(username, %reason, "ext-auth account rejected");
+        },
+    )
 }
 
+/// The proof names the account's current access revision: the external
+/// decision stands in for the password, so a password change or a revocation
+/// committed before the Register still refuses it.
 fn check_account_policy(
     user: &metadata::stm::user::User,
-) -> Result<(u32, iggy_common::IggyTimestamp), AccountRejection> {
+    started_at_op: u64,
+) -> Result<(u32, CredentialProof), AccountRejection> {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use iggy_common::{UserStatus, check_critical_options};
 
     if user.id == DEFAULT_ROOT_USER_ID {
         return Err(AccountRejection::Root);
+    }
+    if !(1..=started_at_op).contains(&user.access_revision) {
+        return Err(AccountRejection::CredentialChanged);
     }
     if user.status != UserStatus::Active {
         return Err(AccountRejection::Inactive);
@@ -433,12 +448,19 @@ fn check_account_policy(
     if check_critical_options(&user.options).is_err() {
         return Err(AccountRejection::CriticalOptions);
     }
-    Ok((user.id, user.created_at))
+    Ok((
+        user.id,
+        CredentialProof::account(user.created_at.as_micros(), user.access_revision),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dispatch::test_support::{TestMux, create_reader_request, prepare_message};
+    use iggy_binary_protocol::{Operation, WireEncode};
+    use metadata::impls::metadata::StreamsFrontend as _;
+    use metadata::stm::StateMachine as _;
 
     /// Deserialize JSON and validate, same as `callout_external_auth` does
     /// after receiving the HTTP body.
@@ -677,6 +699,7 @@ mod tests {
         metadata::stm::user::User {
             id,
             status,
+            access_revision: 1,
             created_at: iggy_common::IggyTimestamp::from(1_700_000_000_000_000),
             ..metadata::stm::user::User::default()
         }
@@ -684,7 +707,10 @@ mod tests {
 
     #[test]
     fn given_absent_user_when_validating_account_should_reject() {
-        assert!(validate_provisioned_account(None).is_none());
+        assert_eq!(
+            validate_provisioned_account(None, 1),
+            Err(AccountRejection::NotFound)
+        );
     }
 
     #[test]
@@ -693,20 +719,68 @@ mod tests {
             iggy_common::defaults::DEFAULT_ROOT_USER_ID,
             iggy_common::UserStatus::Active,
         );
-        assert!(validate_provisioned_account(Some(&root)).is_none());
+        assert_eq!(
+            validate_provisioned_account(Some(&root), 1),
+            Err(AccountRejection::Root)
+        );
     }
 
     #[test]
     fn given_inactive_user_when_validating_account_should_reject() {
         let inactive = test_user(1, iggy_common::UserStatus::Inactive);
-        assert!(validate_provisioned_account(Some(&inactive)).is_none());
+        assert_eq!(
+            validate_provisioned_account(Some(&inactive), 1),
+            Err(AccountRejection::Inactive)
+        );
+    }
+
+    #[test]
+    fn given_external_verification_in_flight_when_account_revision_changes_should_require_a_new_decision()
+     {
+        let mut user = test_user(1, iggy_common::UserStatus::Active);
+        user.access_revision = 12;
+        assert_eq!(
+            validate_provisioned_account(Some(&user), 11),
+            Err(AccountRejection::CredentialChanged)
+        );
+        assert!(validate_provisioned_account(Some(&user), 12).is_ok());
+    }
+
+    #[test]
+    fn given_revision_moved_during_verification_when_resolving_username_should_refuse_as_retryable()
+    {
+        let mux_stm = TestMux::default();
+        mux_stm.users().ensure_root_user("root", "hash");
+        // The reader commits at op 1, so it holds revision 1.
+        mux_stm
+            .update(prepare_message(
+                Operation::CreateUser,
+                1,
+                1,
+                &create_reader_request().to_bytes(),
+            ))
+            .expect("the reader commits");
+        let resolve = |username: &str, started_at_op| {
+            mux_stm
+                .users()
+                .read(|users| resolve_username(users, username, started_at_op))
+                .map(|_| ())
+        };
+
+        assert_eq!(
+            resolve("reader", 0),
+            Err(AccountRejection::CredentialChanged)
+        );
+        assert_eq!(resolve("reader", 1), Ok(()));
+        assert_eq!(resolve("root", 1), Err(AccountRejection::Root));
+        assert_eq!(resolve("nobody", 1), Err(AccountRejection::NotFound));
     }
 
     #[test]
     fn given_active_user_when_validating_account_should_accept() {
         let active = test_user(1, iggy_common::UserStatus::Active);
-        let result = validate_provisioned_account(Some(&active));
-        assert_eq!(result.unwrap().0, 1);
+        let result = validate_provisioned_account(Some(&active), 1);
+        assert_eq!(result.map(|(user_id, _)| user_id), Ok(1));
     }
 
     #[test]
@@ -723,6 +797,9 @@ mod tests {
                 OptionValue::explicit(HeaderValue::from(7u64)),
             ),
         ]);
-        assert!(validate_provisioned_account(Some(&user)).is_none());
+        assert_eq!(
+            validate_provisioned_account(Some(&user), 1),
+            Err(AccountRejection::CriticalOptions)
+        );
     }
 }

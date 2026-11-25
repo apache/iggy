@@ -18,19 +18,20 @@
 use super::codec::{OptionValueCodec, invalid};
 use super::key::OptionKey;
 use super::{
-    DEFAULT_MAX_TOPIC_SIZE, DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE,
-    DEFAULT_PREALLOCATE_SEGMENTS, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_PREALLOCATED_TOPIC_BYTES,
-    MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MAX_TOPIC_SEGMENT_SIZE,
-    MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope, PartitionResizePolicy, ResourceOptions,
-    erase_options,
+    DEFAULT_LOCAL_RETENTION_AGE, DEFAULT_LOCAL_RETENTION_SIZE, DEFAULT_MAX_TOPIC_SIZE,
+    DEFAULT_MESSAGE_EXPIRY, DEFAULT_MESSAGES_REQUIRED_TO_SAVE, DEFAULT_PREALLOCATE_SEGMENTS,
+    DEFAULT_SEGMENT_MAX_AGE, DEFAULT_SEGMENT_SIZE, DEFAULT_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    DEFAULT_TIERED_STORAGE, Durability, GeoMode, MAX_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
+    MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
+    PartitionResizePolicy, ResourceOptions, TopicCreateOptions, TopicType, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKey, HeaderKind, HeaderValue};
 use crate::utils::stream_key::{StreamEncryptionKey, StreamKeyOrigin, WrapSet};
 use crate::wire_conversions::options_block_size;
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::{WireHeaderKind, WireOptions, WireUserHeaderEntry};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,7 +69,7 @@ const TOPIC_ONLY: &[OptionsScope] = &[OptionsScope::Topic];
 const USER_ONLY: &[OptionsScope] = &[OptionsScope::User];
 
 /// Every option key, indexed by its `OptionKey` discriminant.
-pub static CATALOG: [OptionDescriptor; 20] = [
+pub static CATALOG: [OptionDescriptor; 33] = [
     OptionDescriptor {
         key: OptionKey::Name,
         scopes: STREAM_AND_TOPIC,
@@ -381,6 +382,241 @@ pub static CATALOG: [OptionDescriptor; 20] = [
         },
     },
     OptionDescriptor {
+        key: OptionKey::SegmentMaxAge,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_SEGMENT_MAX_AGE))),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would roll segments at different batches
+        // from its peers.
+        critical: true,
+        description: || {
+            format!(
+                "Start a new segment once a batch is stamped this long after the active \
+                 segment's first batch, in microseconds or a humantime string (e.g. 1h); at \
+                 least {} minutes, or never. Bounds how long a slow partition's active segment \
+                 stays unsealed, so retention and tiering reach it. A fully idle partition \
+                 stays open. Refused together with preallocate_segments",
+                MIN_SEGMENT_MAX_AGE / 60_000_000
+            )
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::TieredStorage,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Bool,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::EnableOnly,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_TIERED_STORAGE))),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would keep reading segments that its peers
+        // moved to the object store.
+        critical: true,
+        description: || {
+            "Move sealed segments to the object store and keep only the local retention on \
+             disk. An update can turn it on and never off, because the removed local \
+             segments cannot come back. Needs an object store on every node of the cluster: \
+             while one is not ready, turning it on is refused"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::LocalRetentionAge,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_LOCAL_RETENTION_AGE))),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How long a tiered topic keeps an uploaded segment on local disk, in microseconds              or a humantime string (e.g. 6h), or never. A value above a finite message_expiry              is refused, and the default yields to a shorter message_expiry. No effect              without tiered_storage"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::LocalRetentionSize,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::Const(|| Ok(HeaderValue::from(DEFAULT_LOCAL_RETENTION_SIZE))),
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "Topic-wide cap on the uploaded segments a tiered topic keeps on local disk, split              across all partitions, in bytes or a byte-size string (e.g. 10 GiB), or              unlimited. A value above a finite max_topic_size is refused. No effect without              tiered_storage"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::TopicType,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::Const(|| TopicType::default().encode()),
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would serve a geo topic as a normal one.
+        critical: true,
+        description: || {
+            "normal or geo, fixed at creation. A geo topic's messages also become readable in \
+             the other datacenters through the object store, and its geo_mode says how they \
+             get there. Geo needs an object store on every node of the cluster: while one is \
+             not ready, it is refused. A geo topic refuses tiered_storage and an encrypted \
+             stream, and keeps its name, options and partition count"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::GeoMode,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::CreateOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        // A node that ignored it would write a geo topic's batches the other
+        // way from its peers.
+        critical: true,
+        description: || {
+            "How a geo topic writes its messages: geo uploads a batch to the object store \
+             before it commits, geo_tiered replicates it first and uploads sealed segments \
+             later. Only on a geo topic, where it defaults to geo. Not available yet: \
+             geo_tiered is refused"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::FreshUploadInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        // Unset, each node applies its own server setting of the same name.
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        // It paces work that each node does on its own, so a node that
+        // ignored it would only apply its server setting.
+        critical: false,
+        description: || {
+            "The longest time a send waits for the upload of its fresh object to start, in \
+             microseconds or a humantime string (e.g. 50ms), up to 10 s. One object carries \
+             the sends of every partition a shard leads, so a send also goes with an \
+             earlier upload that a shorter interval of another topic starts. Overrides \
+             [tiered_storage] fresh_upload_interval. Only on a geo topic, where an update \
+             can change it but not reset it. Unset, each node applies its server setting of \
+             the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::ConsumerOffsetUploadInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "The shortest time between two uploads of the positions that the offsets its \
+             consumer groups store themselves wait for, in microseconds or a humantime \
+             string, up to 1 s. 0 or disabled answers such a store at its local commit. \
+             Overrides [geo] consumer_offset_upload_interval. Only on a geo topic, where an \
+             update can change it but not reset it. Unset, each node applies its server \
+             setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::PositionsPublishInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How often a node uploads the changed positions of its consumer groups, which \
+             carry the commits of polls with auto_commit, in microseconds or a humantime \
+             string, longer than zero. Overrides [geo] positions_publish_interval. Only on \
+             a geo topic, where an update can change it but not reset it. Unset, each node \
+             applies its server setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::TombstoneGrace,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How long the tombstone and the objects of the deleted topic stay in the object \
+             store, in microseconds or a humantime string, longer than zero. Overrides \
+             [geo] tombstone_grace. Only on a geo topic, where an update can change it but \
+             not reset it. Unset, each node applies its server setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::PositionsResumeTimeout,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "How long, after a node starts, the group polls of its partitions wait for the \
+             positions of the geo peers, in microseconds or a humantime string. Overrides \
+             [geo] positions_resume_timeout. Only on a geo topic, where an update can \
+             change it but not reset it. Unset, each node applies its server setting of the \
+             same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::LongTermRewriteMaxInterval,
+        scopes: TOPIC_ONLY,
+        kind: HeaderKind::Uint64,
+        storage: OptionStorage::Map,
+        mutability: OptionMutability::Updatable,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::Public,
+        critical: false,
+        description: || {
+            "The longest wait between two rewrites of the committed messages of a partition \
+             into long-term segments, in microseconds or a humantime string, at least 1 s. \
+             A quiet partition waits the longest, so its shadow topics in other datacenters \
+             are about this far behind. Overrides [geo] long_term_rewrite_max_interval. \
+             Only on a geo topic, where an update can change it but not reset it. Unset, \
+             each node applies its server setting of the same name"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
+        key: OptionKey::ShadowOrigin,
+        scopes: STREAM_ONLY,
+        kind: HeaderKind::String,
+        storage: OptionStorage::Computed,
+        mutability: OptionMutability::ReadOnly,
+        default: OptionDefault::None,
+        visibility: OptionVisibility::ReadOnly,
+        critical: false,
+        description: || {
+            "The geo origin of a shadow stream: the datacenter whose geo topics it serves,              read-only. Absent on every other stream"
+                .to_owned()
+        },
+    },
+    OptionDescriptor {
         key: OptionKey::CriticalKeys,
         scopes: ALL_SCOPES,
         kind: HeaderKind::String,
@@ -427,6 +663,8 @@ pub enum OptionStorage {
 pub enum OptionMutability {
     CreateOnly,
     Updatable,
+    /// A boolean that a create sets either way and an update only turns on.
+    EnableOnly,
     ReadOnly,
 }
 
@@ -548,14 +786,18 @@ impl OptionDescriptor {
 
     #[must_use]
     pub fn is_updatable(&self) -> bool {
-        self.mutability == OptionMutability::Updatable
+        matches!(
+            self.mutability,
+            OptionMutability::Updatable | OptionMutability::EnableOnly
+        )
     }
 
     /// An update may reset only a mutable map key with a default. A default
-    /// alone does not make a create-only setting resettable.
+    /// alone does not make a create-only setting resettable, and a reset of
+    /// an enable-only key would turn it off.
     #[must_use]
     pub fn is_resettable(&self) -> bool {
-        self.is_updatable()
+        self.mutability == OptionMutability::Updatable
             && self.storage == OptionStorage::Map
             && matches!(self.default, OptionDefault::Const(_))
     }
@@ -613,6 +855,11 @@ pub fn descriptors_for(scope: OptionsScope) -> impl Iterator<Item = &'static Opt
 /// The catalog default of every map key in `scope` that `explicit` does not
 /// set, as derived entries, so a create stores a concrete value for each.
 ///
+/// A geo topic's values differ from the catalog's: its partition count is
+/// `fixed`, it has the `geo` mode unless `explicit` names one, and its mode
+/// can fix its `durability`, which [`drop_options_fixed_by_type`] removed
+/// from `explicit`.
+///
 /// # Errors
 ///
 /// Propagates a default that does not fit a header value, which the catalog
@@ -622,6 +869,16 @@ pub fn derived_defaults(
     explicit: &ResourceOptions,
 ) -> Result<ResourceOptions, IggyError> {
     let mut derived = ResourceOptions::new();
+    let topic = if scope == OptionsScope::Topic {
+        TopicCreateOptions::from_resource_options(explicit)
+    } else {
+        TopicCreateOptions::default()
+    };
+    let geo = topic.is_geo();
+    let fixed_durability = topic
+        .fixed_durability()
+        .map(|durability| durability.encode())
+        .transpose()?;
     for descriptor in
         descriptors_for(scope).filter(|descriptor| descriptor.storage == OptionStorage::Map)
     {
@@ -629,11 +886,36 @@ pub fn derived_defaults(
         if explicit.contains_key(&key) {
             continue;
         }
-        if let Some(default) = descriptor.default_value()? {
+        let default = match descriptor.key {
+            OptionKey::PartitionResizePolicy if geo => Some(PartitionResizePolicy::Fixed.encode()?),
+            OptionKey::Durability if fixed_durability.is_some() => fixed_durability.clone(),
+            OptionKey::GeoMode if geo => Some(GeoMode::Geo.encode()?),
+            _ => descriptor.default_value()?,
+        };
+        if let Some(default) = default {
             derived.insert(key, OptionValue::derived(default));
         }
     }
     Ok(derived)
+}
+
+/// Remove from a topic create's explicit block the keys that the topic's type
+/// and mode fix, so [`derived_defaults`] stores their fixed values as derived.
+/// Returns whether it removed any.
+///
+/// A geo topic in the `geo` mode has no durability choice. Every client sends
+/// `durability` on a create, `replicated` unless told otherwise, so the key is
+/// ignored rather than refused.
+pub fn drop_options_fixed_by_type(explicit: &mut ResourceOptions) -> bool {
+    if TopicCreateOptions::from_resource_options(explicit)
+        .fixed_durability()
+        .is_none()
+    {
+        return false;
+    }
+    explicit
+        .remove(&HeaderKey::from(OptionKey::Durability))
+        .is_some()
 }
 
 /// Validate and canonicalize a create or update options block.
@@ -645,15 +927,24 @@ pub fn derived_defaults(
 ///    name, an update with nothing to change, a reset on a create.
 /// 2. `UnsupportedOptionKey`: a key outside the catalog or outside `scope`.
 /// 3. `ReadOnlyOption`: an internal or read-only key.
-/// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset.
+/// 4. `OptionNotUpdatable`: a create-only key in an update's set or reset, an
+///    enable-only key that an update resets or sets to false, or any key of an
+///    update to a geo topic other than its durations, as it keeps its name and
+///    its other options. The geo rule runs only when `context` holds the
+///    topic's stored options.
 /// 5. `OptionNotResettable`: a reset of a column or of a key without default.
 /// 6. Value errors: a column inside a create block is `InvalidOptionValue`,
 ///    column values keep their own errors, other keys `InvalidOptionValue`,
 ///    except a well-formed `replication_factor` out of range, which is
-///    `InvalidReplicationFactor`.
+///    `InvalidReplicationFactor`. A duration of a geo topic in an update to a
+///    normal topic is `InvalidOptionValue`, when `context` holds the stored
+///    options.
 /// 7. `InvalidCommand`: an update that changes nothing once its zero
 ///    sentinels are dropped.
 /// 8. `OptionsBlockTooLarge`: the resulting map exceeds the block limits.
+///
+/// A topic create's explicit block loses the keys its type fixes: see
+/// [`drop_options_fixed_by_type`].
 ///
 /// # Errors
 ///
@@ -712,6 +1003,23 @@ pub fn admit(
     {
         return Err(IggyError::OptionNotUpdatable(key.to_string()));
     }
+    // Only a caller that read the stored map knows the topic is geo. Apply
+    // refuses the patch again for a caller that did not.
+    let stored_geo = (operation == OptionOperation::Update && scope == OptionsScope::Topic)
+        .then_some(context.current.as_ref())
+        .flatten()
+        .map(|current| TopicCreateOptions::from_resource_options(current).is_geo());
+    if stored_geo == Some(true)
+        && let Some(key) = all_keys().find(|key| !key.is_geo_duration())
+    {
+        return Err(IggyError::OptionNotUpdatable(key.to_string()));
+    }
+    if let Some(key) = reset_keys
+        .iter()
+        .find(|key| key.descriptor().mutability == OptionMutability::EnableOnly)
+    {
+        return Err(IggyError::OptionNotUpdatable(key.to_string()));
+    }
     if let Some(key) = reset_keys
         .iter()
         .find(|key| !key.descriptor().is_resettable())
@@ -734,10 +1042,18 @@ pub fn admit(
     for (key, entry) in set_keys.iter().zip(&entries) {
         let decoded = match key.descriptor().storage {
             OptionStorage::Column => decode_column(scope, *key, entry, &mut columns),
-            OptionStorage::Map => canonical_value(*key, entry).map(|value| {
-                if let Some(value) = value {
-                    explicit.insert(HeaderKey::from(*key), OptionValue::explicit(value));
+            OptionStorage::Map => canonical_value(*key, entry).and_then(|value| {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                if operation == OptionOperation::Update
+                    && key.descriptor().mutability == OptionMutability::EnableOnly
+                    && value.as_bool().is_ok_and(|enabled| !enabled)
+                {
+                    return Err(IggyError::OptionNotUpdatable(key.to_string()));
                 }
+                explicit.insert(HeaderKey::from(*key), OptionValue::explicit(value));
+                Ok(())
             }),
             OptionStorage::Computed => Err(IggyError::ReadOnlyOption(key.to_string())),
         };
@@ -746,12 +1062,21 @@ pub fn admit(
             return Err(error);
         }
     }
+    if stored_geo == Some(false)
+        && let Some(key) = set_keys.iter().find(|key| key.is_geo_duration())
+    {
+        erase_options(explicit);
+        return Err(invalid(*key));
+    }
     if operation == OptionOperation::Update
         && explicit.is_empty()
         && reset_keys.is_empty()
         && columns == OptionColumns::default()
     {
         return Err(IggyError::InvalidCommand);
+    }
+    if operation == OptionOperation::Create && scope == OptionsScope::Topic {
+        drop_options_fixed_by_type(&mut explicit);
     }
     if let Err(error) = check_block_size(context.current.as_ref(), &reset_keys, &explicit) {
         erase_options(explicit);
@@ -763,6 +1088,27 @@ pub fn admit(
         reset: reset_keys,
         columns,
     })
+}
+
+impl AdmittedOptions {
+    /// The map `current` becomes once this update applies: each reset key at
+    /// its catalog default, each set key at its admitted value. For rules
+    /// that span keys, which need the values this update leaves alone.
+    ///
+    /// # Errors
+    ///
+    /// Propagates a default that does not fit a header value, which the
+    /// catalog tests rule out.
+    pub fn patched(&self, current: &ResourceOptions) -> Result<ResourceOptions, IggyError> {
+        let mut patched = current.clone();
+        for key in &self.reset {
+            if let Some(default) = key.descriptor().default_value()? {
+                patched.insert(HeaderKey::from(*key), OptionValue::derived(default));
+            }
+        }
+        patched.extend(self.explicit.clone());
+        Ok(patched)
+    }
 }
 
 /// The canonical value of one map key, or `None` for a zero sentinel that
@@ -779,14 +1125,14 @@ pub fn canonical_value(
 ) -> Result<Option<HeaderValue>, IggyError> {
     let value = match key {
         OptionKey::CompressionAlgorithm => CompressionAlgorithm::decode(key, entry)?.encode()?,
-        OptionKey::MessageExpiry => {
+        OptionKey::MessageExpiry | OptionKey::SegmentMaxAge | OptionKey::LocalRetentionAge => {
             let expiry = IggyExpiry::decode(key, entry)?;
             if expiry == IggyExpiry::ServerDefault {
                 return Ok(None);
             }
             expiry.encode()?
         }
-        OptionKey::MaxTopicSize => {
+        OptionKey::MaxTopicSize | OptionKey::LocalRetentionSize => {
             let size = MaxTopicSize::decode(key, entry)?;
             if size == MaxTopicSize::ServerDefault {
                 return Ok(None);
@@ -807,7 +1153,17 @@ pub fn canonical_value(
         OptionKey::MessagesRequiredToSave | OptionKey::ReplicationFactor => {
             u32::decode(key, entry)?.encode()?
         }
-        OptionKey::PreallocateSegments => bool::decode(key, entry)?.encode()?,
+        OptionKey::PreallocateSegments | OptionKey::TieredStorage => {
+            bool::decode(key, entry)?.encode()?
+        }
+        OptionKey::TopicType => TopicType::decode(key, entry)?.encode()?,
+        OptionKey::GeoMode => GeoMode::decode(key, entry)?.encode()?,
+        OptionKey::FreshUploadInterval
+        | OptionKey::ConsumerOffsetUploadInterval
+        | OptionKey::PositionsPublishInterval
+        | OptionKey::TombstoneGrace
+        | OptionKey::PositionsResumeTimeout
+        | OptionKey::LongTermRewriteMaxInterval => IggyDuration::decode(key, entry)?.encode()?,
         OptionKey::EncryptionKey => {
             HeaderValue::try_from(stream_key_from_entry(entry)?.as_bytes().as_slice())?
         }
@@ -818,6 +1174,7 @@ pub fn canonical_value(
         | OptionKey::EncryptionKeySource
         | OptionKey::EncryptionKeyFingerprint
         | OptionKey::EncryptionKekFingerprint
+        | OptionKey::ShadowOrigin
         | OptionKey::CriticalKeys => return Err(invalid(key)),
     };
     Ok(Some(value))
@@ -839,6 +1196,51 @@ pub fn stream_key_from_entry(
             .parse(),
         _ => Err(IggyError::InvalidEncryptionKey),
     }
+}
+
+/// Add the origin of a shadow stream to the options that a read of it
+/// returns, as a derived entry.
+///
+/// # Errors
+///
+/// `InvalidFormat` when `origin` is no header value, which no origin that
+/// the server accepts is.
+pub fn project_shadow_origin(public: &mut ResourceOptions, origin: &str) -> Result<(), IggyError> {
+    public.insert(
+        HeaderKey::from(OptionKey::ShadowOrigin),
+        OptionValue::derived(HeaderValue::try_from(origin)?),
+    );
+    Ok(())
+}
+
+/// Report a topic of a shadow stream as the geo topic it shadows, with the
+/// peer's `geo_mode` and the durability that mode fixes, as derived entries.
+/// The topic is stored as a normal topic, so this cluster runs none of a geo
+/// topic's write path for it.
+///
+/// # Errors
+///
+/// `InvalidFormat` when a value does not encode, which no topic type, mode
+/// or durability does.
+pub fn project_shadow_topic(
+    public: &mut ResourceOptions,
+    geo_mode: GeoMode,
+) -> Result<(), IggyError> {
+    public.insert(
+        HeaderKey::from(OptionKey::TopicType),
+        OptionValue::derived(TopicType::Geo.encode()?),
+    );
+    public.insert(
+        HeaderKey::from(OptionKey::GeoMode),
+        OptionValue::derived(geo_mode.encode()?),
+    );
+    if let Some(durability) = geo_mode.fixed_durability() {
+        public.insert(
+            HeaderKey::from(OptionKey::Durability),
+            OptionValue::derived(durability.encode()?),
+        );
+    }
+    Ok(())
 }
 
 /// The options a read returns: public map keys by provenance, unknown keys
@@ -1173,6 +1575,18 @@ mod tests {
                 topic_option_keys::REPLICATION_FACTOR,
                 OptionKey::ReplicationFactor,
             ),
+            (topic_option_keys::SEGMENT_MAX_AGE, OptionKey::SegmentMaxAge),
+            (topic_option_keys::TIERED_STORAGE, OptionKey::TieredStorage),
+            (
+                topic_option_keys::LOCAL_RETENTION_AGE,
+                OptionKey::LocalRetentionAge,
+            ),
+            (
+                topic_option_keys::LOCAL_RETENTION_SIZE,
+                OptionKey::LocalRetentionSize,
+            ),
+            (topic_option_keys::TOPIC_TYPE, OptionKey::TopicType),
+            (topic_option_keys::GEO_MODE, OptionKey::GeoMode),
         ] {
             assert_eq!(constant, key.to_string());
         }
@@ -1181,7 +1595,437 @@ mod tests {
             .collect();
         assert_eq!(
             resettable,
-            [OptionKey::MessageExpiry, OptionKey::MaxTopicSize]
+            [
+                OptionKey::MessageExpiry,
+                OptionKey::MaxTopicSize,
+                OptionKey::LocalRetentionAge,
+                OptionKey::LocalRetentionSize,
+            ]
+        );
+    }
+
+    #[test]
+    fn given_enable_only_option_when_creating_should_accept_on_and_off() {
+        let key = OptionKey::TieredStorage;
+        for enabled in [false, true] {
+            let admitted = admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&[(key, HeaderValue::from(enabled))]),
+                &[],
+                &OptionAdmissionContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                admitted.explicit.get(&HeaderKey::from(key)),
+                Some(&OptionValue::explicit(HeaderValue::from(enabled)))
+            );
+        }
+    }
+
+    #[test]
+    fn given_enable_only_option_when_updating_should_accept_on_and_refuse_off() {
+        let key = OptionKey::TieredStorage;
+        let update = |options: &WireOptions, reset: &[String]| {
+            admit(
+                OptionsScope::Topic,
+                OptionOperation::Update,
+                options,
+                reset,
+                &OptionAdmissionContext::default(),
+            )
+        };
+
+        let admitted = update(&block(&[(key, HeaderValue::from(true))]), &[]).unwrap();
+        assert_eq!(
+            admitted.explicit.get(&HeaderKey::from(key)),
+            Some(&OptionValue::explicit(HeaderValue::from(true)))
+        );
+        for off in [
+            HeaderValue::from(false),
+            HeaderValue::try_from("false").unwrap(),
+        ] {
+            assert_eq!(
+                update(&block(&[(key, off)]), &[]),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+        }
+        assert_eq!(
+            update(&WireOptions::empty(), &[key.to_string()]),
+            Err(IggyError::OptionNotUpdatable(key.to_string()))
+        );
+        let descriptor = key.descriptor();
+        assert!(descriptor.is_updatable());
+        assert!(!descriptor.is_resettable());
+        assert_eq!(
+            descriptor.flags(),
+            OPTION_FLAG_UPDATABLE | OPTION_FLAG_CRITICAL
+        );
+    }
+
+    #[test]
+    fn given_topic_type_and_geo_mode_when_admitted_should_store_canonical_names() {
+        for (key, sent, stored) in [
+            (OptionKey::TopicType, "normal", "normal"),
+            (OptionKey::TopicType, "GEO", "geo"),
+            (OptionKey::GeoMode, "geo", "geo"),
+            (OptionKey::GeoMode, "Geo_Tiered", "geo_tiered"),
+        ] {
+            let admitted = admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&[(key, HeaderValue::try_from(sent).unwrap())]),
+                &[],
+                &OptionAdmissionContext::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                admitted.explicit.get(&HeaderKey::from(key)),
+                Some(&OptionValue::explicit(
+                    HeaderValue::try_from(stored).unwrap()
+                ))
+            );
+        }
+        for (key, sent) in [
+            (
+                OptionKey::TopicType,
+                HeaderValue::try_from("tiered").unwrap(),
+            ),
+            (OptionKey::TopicType, HeaderValue::from(true)),
+            (OptionKey::GeoMode, HeaderValue::try_from("local").unwrap()),
+            (OptionKey::GeoMode, HeaderValue::from(1u8)),
+        ] {
+            assert_eq!(
+                canonical_value(key, &entry(key, &sent)),
+                Err(IggyError::InvalidOptionValue(key.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_type_and_geo_mode_when_updated_should_refuse_both() {
+        for (key, value) in [(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")] {
+            let descriptor = key.descriptor();
+            assert!(!descriptor.is_updatable());
+            assert!(!descriptor.is_resettable());
+            assert_eq!(descriptor.flags(), OPTION_FLAG_CRITICAL);
+            assert_eq!(
+                admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Update,
+                    &block(&[(key, HeaderValue::try_from(value).unwrap())]),
+                    &[],
+                    &OptionAdmissionContext::default(),
+                ),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+            assert_eq!(
+                admit(
+                    OptionsScope::Topic,
+                    OptionOperation::Update,
+                    &WireOptions::empty(),
+                    &[key.to_string()],
+                    &OptionAdmissionContext::default(),
+                ),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+        }
+    }
+
+    #[test]
+    fn given_topic_type_when_deriving_defaults_should_store_normal_and_no_geo_mode() {
+        let derived = derived_defaults(OptionsScope::Topic, &ResourceOptions::new()).unwrap();
+        assert_eq!(
+            derived.get(&HeaderKey::from(OptionKey::TopicType)),
+            Some(&OptionValue::derived(
+                HeaderValue::try_from("normal").unwrap()
+            ))
+        );
+        assert!(!derived.contains_key(&HeaderKey::from(OptionKey::GeoMode)));
+        for scope in [OptionsScope::Stream, OptionsScope::User] {
+            for key in [OptionKey::TopicType, OptionKey::GeoMode] {
+                assert!(!key.descriptor().applies_to(scope));
+            }
+        }
+    }
+
+    /// The defaults a topic create with the explicit `entries` derives.
+    fn derived_for(entries: &[(OptionKey, &str)]) -> ResourceOptions {
+        let explicit: ResourceOptions = entries
+            .iter()
+            .map(|(key, value)| {
+                (
+                    HeaderKey::from(*key),
+                    OptionValue::explicit(HeaderValue::try_from(*value).unwrap()),
+                )
+            })
+            .collect();
+        derived_defaults(OptionsScope::Topic, &explicit).unwrap()
+    }
+
+    fn derived_entry(value: &str) -> Option<OptionValue> {
+        Some(OptionValue::derived(HeaderValue::try_from(value).unwrap()))
+    }
+
+    #[test]
+    fn given_a_geo_topic_when_deriving_defaults_should_store_the_geo_mode_and_fixed_partitions() {
+        let mode = HeaderKey::from(OptionKey::GeoMode);
+        let policy = HeaderKey::from(OptionKey::PartitionResizePolicy);
+
+        let geo = derived_for(&[(OptionKey::TopicType, "geo")]);
+        assert_eq!(geo.get(&mode).cloned(), derived_entry("geo"));
+        assert_eq!(geo.get(&policy).cloned(), derived_entry("fixed"));
+        assert!(!geo.contains_key(&HeaderKey::from(OptionKey::TopicType)));
+        let named = derived_for(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::GeoMode, "geo_tiered"),
+            (OptionKey::PartitionResizePolicy, "fixed"),
+        ]);
+        assert!(!named.contains_key(&mode));
+        assert!(!named.contains_key(&policy));
+        let normal = derived_for(&[(OptionKey::TopicType, "normal")]);
+        assert!(!normal.contains_key(&mode));
+        assert_eq!(normal.get(&policy).cloned(), derived_entry("mutable"));
+    }
+
+    #[test]
+    fn given_a_topic_without_durability_when_deriving_defaults_should_derive_what_its_type_and_mode_set()
+     {
+        let durability = HeaderKey::from(OptionKey::Durability);
+        let offsets = HeaderKey::from(OptionKey::ConsumerOffsetDurability);
+
+        for geo in [
+            derived_for(&[(OptionKey::TopicType, "geo")]),
+            derived_for(&[(OptionKey::TopicType, "geo"), (OptionKey::GeoMode, "geo")]),
+        ] {
+            assert_eq!(geo.get(&durability).cloned(), derived_entry("persisted"));
+            assert_eq!(geo.get(&offsets).cloned(), derived_entry("replicated"));
+        }
+        let tiered = ResourceOptions::from([(
+            HeaderKey::from(OptionKey::TieredStorage),
+            OptionValue::explicit(HeaderValue::from(true)),
+        )]);
+        for (case, derived) in [
+            (
+                "geo_tiered",
+                derived_for(&[
+                    (OptionKey::TopicType, "geo"),
+                    (OptionKey::GeoMode, "geo_tiered"),
+                ]),
+            ),
+            ("no type", derived_for(&[])),
+            ("normal", derived_for(&[(OptionKey::TopicType, "normal")])),
+            (
+                "tiered",
+                derived_defaults(OptionsScope::Topic, &tiered).unwrap(),
+            ),
+        ] {
+            assert_eq!(
+                derived.get(&durability).cloned(),
+                derived_entry("replicated"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn given_a_create_naming_a_durability_when_admitted_should_ignore_it_only_on_a_geo_topic_in_the_geo_mode()
+     {
+        let durability = HeaderKey::from(OptionKey::Durability);
+        let admitted = |entries: &[(OptionKey, &str)]| {
+            let entries: Vec<(OptionKey, HeaderValue)> = entries
+                .iter()
+                .map(|(key, value)| (*key, HeaderValue::try_from(*value).unwrap()))
+                .collect();
+            admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&entries),
+                &[],
+                &OptionAdmissionContext::default(),
+            )
+            .unwrap()
+            .explicit
+        };
+
+        for named in ["replicated", "persisted"] {
+            for geo in [
+                admitted(&[
+                    (OptionKey::TopicType, "geo"),
+                    (OptionKey::Durability, named),
+                ]),
+                admitted(&[
+                    (OptionKey::TopicType, "geo"),
+                    (OptionKey::GeoMode, "geo"),
+                    (OptionKey::Durability, named),
+                ]),
+            ] {
+                assert!(!geo.contains_key(&durability), "{named} is ignored");
+                assert_eq!(
+                    derived_defaults(OptionsScope::Topic, &geo)
+                        .unwrap()
+                        .get(&durability)
+                        .cloned(),
+                    derived_entry("persisted"),
+                    "{named}"
+                );
+            }
+            for (case, kept) in [
+                (
+                    "geo_tiered",
+                    admitted(&[
+                        (OptionKey::TopicType, "geo"),
+                        (OptionKey::GeoMode, "geo_tiered"),
+                        (OptionKey::Durability, named),
+                    ]),
+                ),
+                ("no type", admitted(&[(OptionKey::Durability, named)])),
+                (
+                    "normal",
+                    admitted(&[
+                        (OptionKey::TopicType, "normal"),
+                        (OptionKey::Durability, named),
+                    ]),
+                ),
+            ] {
+                assert_eq!(
+                    kept.get(&durability),
+                    Some(&OptionValue::explicit(
+                        HeaderValue::try_from(named).unwrap()
+                    )),
+                    "{case} keeps {named}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn given_a_shadow_topic_when_projected_should_report_the_durability_its_mode_fixes() {
+        let durability = HeaderKey::from(OptionKey::Durability);
+        let stored = ResourceOptions::from([(
+            durability.clone(),
+            OptionValue::explicit(HeaderValue::try_from("replicated").unwrap()),
+        )]);
+
+        let mut geo = stored.clone();
+        project_shadow_topic(&mut geo, GeoMode::Geo).unwrap();
+        assert_eq!(geo.get(&durability).cloned(), derived_entry("persisted"));
+        let mut geo_tiered = stored.clone();
+        project_shadow_topic(&mut geo_tiered, GeoMode::GeoTiered).unwrap();
+        assert_eq!(geo_tiered.get(&durability), stored.get(&durability));
+    }
+
+    #[test]
+    fn given_a_stored_geo_topic_when_admitting_an_update_should_refuse_any_key() {
+        let stored = |topic_type: &str| OptionAdmissionContext {
+            current: Some(
+                [(
+                    HeaderKey::from(OptionKey::TopicType),
+                    OptionValue::explicit(HeaderValue::try_from(topic_type).unwrap()),
+                )]
+                .into(),
+            ),
+            create_columns: OptionColumns::default(),
+        };
+        let expiry = block(&[(OptionKey::MessageExpiry, HeaderValue::from(9u64))]);
+        let rename = block(&[(OptionKey::Name, HeaderValue::try_from("renamed").unwrap())]);
+        let reset = [OptionKey::MessageExpiry.to_string()];
+        let update = |set: &WireOptions, reset: &[String], context: &OptionAdmissionContext| {
+            admit(
+                OptionsScope::Topic,
+                OptionOperation::Update,
+                set,
+                reset,
+                context,
+            )
+            .map(|_| ())
+        };
+
+        let geo = stored("geo");
+        for (set, reset, key) in [
+            (&expiry, &[][..], OptionKey::MessageExpiry),
+            (&WireOptions::empty(), &reset[..], OptionKey::MessageExpiry),
+            (&rename, &[][..], OptionKey::Name),
+        ] {
+            assert_eq!(
+                update(set, reset, &geo),
+                Err(IggyError::OptionNotUpdatable(key.to_string()))
+            );
+        }
+        assert_eq!(update(&expiry, &[], &stored("normal")), Ok(()));
+        assert_eq!(
+            update(&expiry, &[], &OptionAdmissionContext::default()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn given_local_retention_sentinels_when_decoding_should_set_nothing() {
+        for key in [OptionKey::LocalRetentionAge, OptionKey::LocalRetentionSize] {
+            assert_eq!(
+                canonical_value(key, &entry(key, &HeaderValue::from(0u64))),
+                Ok(None)
+            );
+            assert_eq!(
+                canonical_value(key, &entry(key, &HeaderValue::from(u64::MAX))),
+                Ok(Some(HeaderValue::from(u64::MAX)))
+            );
+        }
+        assert_eq!(
+            canonical_value(
+                OptionKey::LocalRetentionAge,
+                &entry(
+                    OptionKey::LocalRetentionAge,
+                    &HeaderValue::try_from("6h").unwrap()
+                )
+            ),
+            Ok(Some(HeaderValue::from(6 * 3_600_000_000u64)))
+        );
+        assert_eq!(
+            canonical_value(
+                OptionKey::LocalRetentionSize,
+                &entry(
+                    OptionKey::LocalRetentionSize,
+                    &HeaderValue::try_from("10 GiB").unwrap()
+                )
+            ),
+            Ok(Some(HeaderValue::from(10u64 << 30)))
+        );
+    }
+
+    #[test]
+    fn given_an_update_when_patching_should_reset_then_set_over_the_stored_map() {
+        let stored: ResourceOptions = [
+            (
+                HeaderKey::from(OptionKey::MessageExpiry),
+                OptionValue::explicit(HeaderValue::from(7u64)),
+            ),
+            (
+                HeaderKey::from(OptionKey::LocalRetentionAge),
+                OptionValue::explicit(HeaderValue::from(5u64)),
+            ),
+        ]
+        .into();
+        let admitted = admit(
+            OptionsScope::Topic,
+            OptionOperation::Update,
+            &block(&[(OptionKey::MessageExpiry, HeaderValue::from(9u64))]),
+            &[OptionKey::LocalRetentionAge.to_string()],
+            &OptionAdmissionContext::default(),
+        )
+        .unwrap();
+
+        let patched = admitted.patched(&stored).unwrap();
+
+        assert_eq!(
+            patched.get(&HeaderKey::from(OptionKey::MessageExpiry)),
+            Some(&OptionValue::explicit(HeaderValue::from(9u64)))
+        );
+        assert_eq!(
+            patched.get(&HeaderKey::from(OptionKey::LocalRetentionAge)),
+            Some(&OptionValue::derived(HeaderValue::from(
+                DEFAULT_LOCAL_RETENTION_AGE
+            )))
         );
     }
 

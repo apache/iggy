@@ -90,6 +90,14 @@ impl Reply {
         }
     }
 
+    /// A body that is not the server's, as a proxy in front of it renders.
+    pub(super) fn text(status: u16, body: &str) -> Self {
+        Self {
+            body: body.to_owned(),
+            ..Self::empty(status)
+        }
+    }
+
     /// A server that fails after it read the request.
     pub(super) fn hang_up() -> Self {
         Self {

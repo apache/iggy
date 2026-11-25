@@ -27,11 +27,18 @@ import org.apache.iggy.identifier.TopicId;
 import org.apache.iggy.partition.Partition;
 import org.apache.iggy.topic.TopicDetails;
 import org.apache.pinot.spi.stream.OffsetCriteria;
+import org.apache.pinot.spi.stream.PartitionGroupConsumptionStatus;
+import org.apache.pinot.spi.stream.PartitionGroupMetadata;
+import org.apache.pinot.spi.stream.StreamConfig;
 import org.apache.pinot.spi.stream.StreamMetadataProvider;
 import org.apache.pinot.spi.stream.StreamPartitionMsgOffset;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -111,8 +118,43 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
     }
 
     /**
-     * Fetches the current offset for consumption.
-     * For Iggy, we rely on consumer group state, so this returns the earliest offset.
+     * Computes one partition group per Iggy partition.
+     * A partition that Pinot already consumes keeps the end offset of its latest segment.
+     * A new partition starts at the offset that the stream offset criteria selects.
+     *
+     * @param clientId unique identifier for this metadata provider instance
+     * @param streamConfig Pinot stream configuration
+     * @param partitionGroupConsumptionStatuses consumption status of the current partition groups
+     * @param timeoutMillis timeout for the operation
+     * @return metadata for every partition in the topic
+     */
+    @Override
+    public List<PartitionGroupMetadata> computePartitionGroupMetadata(
+            String clientId,
+            StreamConfig streamConfig,
+            List<PartitionGroupConsumptionStatus> partitionGroupConsumptionStatuses,
+            int timeoutMillis) {
+        Map<Integer, StreamPartitionMsgOffset> endOffsets = new HashMap<>(partitionGroupConsumptionStatuses.size());
+        for (PartitionGroupConsumptionStatus status : partitionGroupConsumptionStatuses) {
+            endOffsets.put(status.getStreamPartitionGroupId(), status.getEndOffset());
+        }
+
+        int partitionCount = fetchPartitionCount(timeoutMillis);
+        List<PartitionGroupMetadata> partitionGroups = new ArrayList<>(partitionCount);
+        for (int streamPartitionId = 0; streamPartitionId < partitionCount; streamPartitionId++) {
+            // Pinot passes a null end offset for a partition group that is still consuming, and expects it back as is.
+            StreamPartitionMsgOffset startOffset = endOffsets.containsKey(streamPartitionId)
+                    ? endOffsets.get(streamPartitionId)
+                    : resolveOffset(streamPartitionId, streamConfig.getOffsetCriteria());
+            partitionGroups.add(new PartitionGroupMetadata(streamPartitionId, startOffset));
+        }
+        return partitionGroups;
+    }
+
+    /**
+     * Fetches the offset that the offset criteria selects for this partition.
+     * The {@code largest} criteria gives the next offset to read. Every other criteria gives offset 0,
+     * where a poll starts at the first retained message.
      *
      * @param offsetCriteria offset criteria (earliest, latest, etc.)
      * @param timeoutMillis timeout for the operation
@@ -127,25 +169,37 @@ public class IggyStreamMetadataProvider implements StreamMetadataProvider {
                 throw new IllegalStateException("Partition ID must be set for offset queries");
             }
 
-            Partition partition = getPartitionInfo(partitionId);
-
-            // Handle offset criteria
-            if (offsetCriteria != null && offsetCriteria.isSmallest()) {
-                // Return earliest available offset (0 for Iggy)
-                return new IggyStreamPartitionMsgOffset(0);
-            } else if (offsetCriteria != null && offsetCriteria.isLargest()) {
-                // Return latest offset based on messages count
-                long latestOffset = partition.messagesCount().longValue();
-                return new IggyStreamPartitionMsgOffset(latestOffset);
-            } else {
-                // Default to consumer group managed offset (start from 0)
-                return new IggyStreamPartitionMsgOffset(0);
-            }
+            return resolveOffset(partitionId, offsetCriteria);
 
         } catch (RuntimeException e) {
             log.error("Error fetching partition offset: {}", e.getMessage(), e);
             throw new RuntimeException("Failed to fetch partition offset", e);
         }
+    }
+
+    /**
+     * Resolves the offset that the offset criteria selects for a partition.
+     */
+    private StreamPartitionMsgOffset resolveOffset(int streamPartitionId, OffsetCriteria offsetCriteria) {
+        Partition partition = getPartitionInfo(streamPartitionId);
+
+        if (offsetCriteria != null && offsetCriteria.isLargest()) {
+            return new IggyStreamPartitionMsgOffset(nextOffset(partition));
+        }
+        return new IggyStreamPartitionMsgOffset(0);
+    }
+
+    /**
+     * Returns the offset that the next message appended to the partition gets.
+     */
+    static long nextOffset(Partition partition) {
+        // The server reports the offset of the last message, and 0 also for an empty partition.
+        // The messages count cannot be the next offset, because retention lowers it.
+        long currentOffset = partition.currentOffset().longValue();
+        if (currentOffset == 0 && partition.messagesCount().signum() == 0) {
+            return 0;
+        }
+        return currentOffset + 1;
     }
 
     /**

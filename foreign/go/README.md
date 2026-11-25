@@ -92,9 +92,40 @@ if err := cli.UpdateTopic(ctx, streamId, topicId, iggcon.TopicUpdate{
 
 The sample is `Example_resourceOptions` in `client/example_resource_options_test.go`.
 
+A geo topic takes six durations of its own, in microseconds: `FreshUploadInterval`, `ConsumerOffsetUploadInterval`, `PositionsPublishInterval`, `TombstoneGrace`, `PositionsResumeTimeout` and `LongTermRewriteMaxInterval`. Each overrides the server setting of the same name, and nil leaves that setting. Zero is a value and is sent. `TopicUpdate` can set them, but not reset them, and they are the only keys an update may change on a geo topic. A normal topic refuses them.
+
 A stream encryption key is exactly 32 random bytes. Never derive it from a password: the fingerprint reads would then be an offline guessing oracle. The key travels inside the create request over the client's transport, so use TLS when the network between client and server is not trusted.
 
 The server stores the key wrapped under its own key and never returns it. Reads report only its source and fingerprints. Without a key, a server with encryption enabled generates one for the stream, and a server without it keeps the stream plaintext and refuses a client key.
+
+## List pages
+
+`GetStreams`, `GetTopics`, `GetConsumerGroups` and `GetUsers` return a whole list. Each of them reads the list in pages of at most 1,000 items, so the result is not one consistent read. Every page keeps the sign-in and the deadline that the call started with. An entity that someone creates or deletes during the walk can appear or not appear. If the `Next` of a page is the cursor that its request sent, the call fails with `ierror.ErrInvalidFormat`.
+
+`GetStreamsPage`, `GetTopicsPage`, `GetPartitionsPage`, `GetConsumerGroupsPage` and `GetUsersPage` return one page. To read the next page, send the same query with the `Next` of the page as its `Cursor`. A page can be empty and still have a `Next`.
+
+```go
+func printStreams(ctx context.Context, cli iggcon.Client) error {
+    query := iggcon.NamedPageQuery{PageQuery: iggcon.NewPageQuery()}
+    for {
+        page, err := cli.GetStreamsPage(ctx, query)
+        if err != nil {
+            return err
+        }
+        for _, stream := range page.Items {
+            log.Printf("%d %s", stream.Id, stream.Name)
+        }
+        if page.Next == nil {
+            return nil
+        }
+        query.Cursor = page.Next
+    }
+}
+```
+
+`Order` selects `PageOrderID` or `PageOrderCreated`, and `Descending` reverses it. The page methods of streams, topics, consumer groups and users take a `NamedPageQuery`: a `PageQuery` with a `Name`. `Name` keeps the entries whose name holds the text, case-sensitive. `GetPartitionsPage` takes a `PageQuery`, which has no name.
+
+The client refuses a query that breaks the page rules with `ierror.ErrInvalidCommand`, before it sends anything. Examples are a limit outside 1 to 1000 and a name that is empty or longer than 255 bytes. A cursor prints and parses as the `pg1_` text form that the HTTP API and the CLI use. The client does not read the bytes of a cursor. The server refuses a cursor that it cannot use, also with `ierror.ErrInvalidCommand`.
 
 ## Metadata changes
 
@@ -185,7 +216,7 @@ that operation.
 Each node counts the messages in its stream, topic and system stats. After a
 successful send, a node that is not the partition primary shows the new count
 only after the next prepare or commit broadcast. When no other write follows,
-this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
 See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 
 `SendMessages` returns any placements the server reports. Replicated mutations
@@ -291,9 +322,7 @@ roster discovery failure after Register succeeds, discards its tentative session
 and requires another explicit sign-in. The sign-in does not wait for a pending
 automatic registration, and late completion cannot replace a newer session.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 Crash durability follows the topic's `durability` policy: `replicated`
 confirms replication, while `persisted` also waits for the required replicas
@@ -396,6 +425,8 @@ err = partitionReader.Close(ctx)
 - `OnReadCommit`: the server stores each read, and the reader reads only for a waiting `Next`. After a read whose reply was lost, the reader abandons it, waits its retry interval, and its next read starts after what the lost read stored. The reader reads those messages again without a store and delivers them first.
   If the partition no longer holds some of them, for example after retention, `Next` returns a `reader.ReadError` in their place. It wraps `errors.FetchProgressUncertain` and names their range in its text and in `Lost`, a `reader.OffsetRange`. A forward jump without such a lost read is a store of the application or of another session, and the reader goes on from there.
 
+  If a partition stops while the reader reads those messages again, `Next` first returns such a `reader.ReadError` for the rest of them. It then returns the batch that the reader read after them, and then the error that stopped the partition. `errors.ErrHistoryUnavailable` for that read stops the partition too, because the read names the history of those messages. The error for a lost range does not stop its partition, so it needs no `Seek`.
+
   The start of `reader.WithStart` applies only to a partition without a stored offset. A partition with one resumes after it. A seek moves the stored offset.
 
   A partition that leaves the assignment still hands over the reads that the server stored for it. If a lost read of that partition stored a known range that the reader did not read again, `Next` first returns a `reader.ReadError` that wraps `errors.FetchProgressUncertain` and names that range the same way. `Close` does not move the offset of a partition that left, so its batches that `Next` did not return before `Close` are lost for the group.
@@ -435,6 +466,8 @@ err = partitionReader.Close(ctx)
   `iggcon.DefaultAutoCommit()` stores every 10,000 messages or 5 s after processing.
 
 A `*reader.ReadError` names its partition. `errors.ErrHistoryUnavailable` stops a partition until `Seek` when its position came from an earlier read of a history that is gone. A section that does not decode is read again one message at a time: every good message is delivered, and a message that does not decode stops its partition with `Skip`, the continuation after it.
+
+`errors.ErrTieredReadFailed` stops a partition until `Seek` at the first refusal: the object store refused the read of tiered data for good, so the reader does not send it again.
 
 `errors.ErrConsumerGroupPartitionNotOwned` on a read is no leave,
 because a new session and a move of the partition away and back look the same.

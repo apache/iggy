@@ -71,6 +71,7 @@ class GlobalPermissions;
 class Permissions;
 class StreamPermissions;
 class TopicPermissions;
+class PersonalAccessTokenInfo;
 class UserInfo;
 class UserInfoDetails;
 class ConsumerGroup;
@@ -84,6 +85,11 @@ class MetadataChanges;
 class MetadataChangesQuery;
 class MetadataCurrentItem;
 class MetadataCurrentPageToken;
+class StreamsPage;
+class TopicsPage;
+class PartitionsPage;
+class ConsumerGroupsPage;
+class UsersPage;
 
 namespace detail {
 /** @brief Internal base for string-backed option types. */
@@ -107,6 +113,24 @@ class StringTag {
 template <typename Operation>
 decltype(auto) RethrowAsIggyException(Operation &&operation);
 
+/** @brief The durations of a geo topic, each empty when the topic leaves it to the server setting. */
+struct GeoTopicDurations {
+    std::optional<std::chrono::microseconds> fresh_upload_interval;
+    std::optional<std::chrono::microseconds> consumer_offset_upload_interval;
+    std::optional<std::chrono::microseconds> positions_publish_interval;
+    std::optional<std::chrono::microseconds> tombstone_grace;
+    std::optional<std::chrono::microseconds> positions_resume_timeout;
+    std::optional<std::chrono::microseconds> long_term_rewrite_max_interval;
+};
+
+/** @brief Returns a geo topic duration, which can be zero but never negative. */
+inline std::chrono::microseconds GeoTopicDuration(std::chrono::microseconds duration) {
+    if (duration.count() < 0) {
+        throw std::invalid_argument("A geo topic duration cannot be negative");
+    }
+    return duration;
+}
+
 }  // namespace detail
 
 /**
@@ -115,8 +139,8 @@ decltype(auto) RethrowAsIggyException(Operation &&operation);
  * Code() and Kind() are available only when a call forwards a typed Rust SDK
  * error. IggyBlockingClient documents the covered methods. Other calls and
  * C++ or bridge-local argument errors leave Code() empty and Kind() empty,
- * except the metadata change calls, which report invalid input with the kind
- * each one documents.
+ * except the metadata change calls and the page calls, which report invalid
+ * input with the kind each one documents.
  * OperationId() is present only for operation_uncertain, lane_blocked,
  * operation_not_retained, partition_lane_blocked and fetch_progress_uncertain
  * errors and preserves the full unsigned 64-bit ID. BlockedPartitionId() is
@@ -1254,6 +1278,7 @@ class UserInfo final {
     static UserInfo FromFfi(ffi::UserInfo user);
 
     friend class IggyBlockingClient;
+    friend class UsersPage;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -1335,6 +1360,76 @@ class UserInfoDetails final {
 };
 
 /**
+ * @brief Snapshot of one personal access token's metadata.
+ *
+ * GetPersonalAccessTokens() returns one value for each token owned by the
+ * caller. The secret token string is never included. Expiry() is expressed
+ * in microseconds since the Unix epoch and is empty when the token never
+ * expires.
+ */
+class PersonalAccessTokenInfo final {
+  public:
+    /**
+     * @brief Returns the token name.
+     * @return The name the token was created with.
+     */
+    [[nodiscard]] const std::string &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Returns the expiry timestamp.
+     * @return Timestamp in microseconds since the Unix epoch, or empty when the token never expires.
+     */
+    [[nodiscard]] std::optional<std::uint64_t> Expiry() const noexcept { return expires_at_; }
+
+  private:
+    PersonalAccessTokenInfo(std::string name, std::optional<std::uint64_t> expires_at)
+        : name_(std::move(name)), expires_at_(expires_at) {}
+
+    static PersonalAccessTokenInfo FromFfi(ffi::PersonalAccessTokenInfo token);
+
+    friend class IggyBlockingClient;
+
+    std::string name_;
+    std::optional<std::uint64_t> expires_at_;
+};
+
+/**
+ * @brief What a topic is, fixed at creation.
+ */
+enum class TopicType : std::uint8_t {
+    Normal,  ///< Its messages stay in this cluster.
+    Geo,     ///< Its messages also become readable in the other datacenters.
+};
+
+constexpr std::string_view to_string(const TopicType topic_type) {
+    switch (topic_type) {
+        case TopicType::Normal:
+            return "normal";
+        case TopicType::Geo:
+            return "geo";
+    }
+    throw std::invalid_argument("Unknown topic type");
+}
+
+/**
+ * @brief How a geo topic writes its messages, fixed at creation.
+ */
+enum class GeoMode : std::uint8_t {
+    Geo,        ///< A batch goes to the object store before it commits.
+    GeoTiered,  ///< A batch is replicated first, and sealed segments are uploaded later.
+};
+
+constexpr std::string_view to_string(const GeoMode geo_mode) {
+    switch (geo_mode) {
+        case GeoMode::Geo:
+            return "geo";
+        case GeoMode::GeoTiered:
+            return "geo_tiered";
+    }
+    throw std::invalid_argument("Unknown geo mode");
+}
+
+/**
  * @brief Snapshot of one topic's metadata and aggregate statistics.
  *
  * GetStream() returns one of these values for each observed topic. It owns its
@@ -1397,6 +1492,84 @@ class Topic final {
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
+     * @brief Returns what the topic is, fixed at creation.
+     * @return TopicType::Geo for a geo topic, TopicType::Normal otherwise.
+     */
+    [[nodiscard]] ::iggy::TopicType TopicType() const noexcept { return topic_type_; }
+
+    /**
+     * @brief Returns how a geo topic writes its messages, fixed at creation.
+     * @return Geo mode, or `std::nullopt` for a normal topic.
+     */
+    [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
+
+    /**
+     * @brief Returns the longest time a send to this geo topic waits for the
+     *        upload of its fresh object to start.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[tiered_storage] fresh_upload_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Returns the shortest time between two uploads of the positions
+     *        that the offset stores of this geo topic's consumer groups wait
+     *        for.
+     * @return Duration the topic sets, zero when such a store answers at its
+     *         local commit, or `std::nullopt` when every node applies its
+     *         `[geo] consumer_offset_upload_interval`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Returns how often a node uploads the changed positions of this
+     *        geo topic's consumer groups.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] positions_publish_interval`, and on a normal
+     *         topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Returns how long the tombstone and the objects of this geo topic
+     *        stay in the object store after it is deleted.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] tombstone_grace`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Returns how long, after a node starts, the group polls of this
+     *        geo topic wait for the positions of the geo peers.
+     * @return Duration the topic sets, zero for no wait, or `std::nullopt`
+     *         when every node applies its `[geo] positions_resume_timeout`, and
+     *         on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Returns the longest wait between two long-term rewrites of a
+     *        partition of this geo topic.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] long_term_rewrite_max_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1422,6 +1595,9 @@ class Topic final {
           std::uint64_t message_expiry,
           std::string compression_algorithm,
           std::uint64_t max_topic_size,
+          ::iggy::TopicType topic_type,
+          std::optional<::iggy::GeoMode> geo_mode,
+          detail::GeoTopicDurations geo_durations,
           std::uint64_t messages_count,
           std::uint32_t partitions_count,
           ResourceOptions options)
@@ -1432,6 +1608,9 @@ class Topic final {
           message_expiry_(message_expiry),
           compression_algorithm_(std::move(compression_algorithm)),
           max_topic_size_(max_topic_size),
+          topic_type_(topic_type),
+          geo_mode_(geo_mode),
+          geo_durations_(geo_durations),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           options_(std::move(options)) {}
@@ -1440,6 +1619,9 @@ class Topic final {
 
     friend class IggyBlockingClient;
     friend class StreamDetails;
+    friend class TopicsPage;
+    // The unit tests have no server to read a topic from, so they build one through this class.
+    friend class TopicTestPeer;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -1448,6 +1630,9 @@ class Topic final {
     std::uint64_t message_expiry_;
     std::string compression_algorithm_;
     std::uint64_t max_topic_size_;
+    ::iggy::TopicType topic_type_;
+    std::optional<::iggy::GeoMode> geo_mode_;
+    detail::GeoTopicDurations geo_durations_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     ResourceOptions options_;
@@ -1600,6 +1785,7 @@ class Partition final {
     static Partition FromFfi(ffi::Partition partition);
 
     friend class TopicDetails;
+    friend class PartitionsPage;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -1673,6 +1859,84 @@ class TopicDetails final {
     [[nodiscard]] std::uint64_t MaxTopicSize() const noexcept { return max_topic_size_; }
 
     /**
+     * @brief Returns what the topic is, fixed at creation.
+     * @return TopicType::Geo for a geo topic, TopicType::Normal otherwise.
+     */
+    [[nodiscard]] ::iggy::TopicType TopicType() const noexcept { return topic_type_; }
+
+    /**
+     * @brief Returns how a geo topic writes its messages, fixed at creation.
+     * @return Geo mode, or `std::nullopt` for a normal topic.
+     */
+    [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
+
+    /**
+     * @brief Returns the longest time a send to this geo topic waits for the
+     *        upload of its fresh object to start.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[tiered_storage] fresh_upload_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Returns the shortest time between two uploads of the positions
+     *        that the offset stores of this geo topic's consumer groups wait
+     *        for.
+     * @return Duration the topic sets, zero when such a store answers at its
+     *         local commit, or `std::nullopt` when every node applies its
+     *         `[geo] consumer_offset_upload_interval`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Returns how often a node uploads the changed positions of this
+     *        geo topic's consumer groups.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] positions_publish_interval`, and on a normal
+     *         topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Returns how long the tombstone and the objects of this geo topic
+     *        stay in the object store after it is deleted.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] tombstone_grace`, and on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Returns how long, after a node starts, the group polls of this
+     *        geo topic wait for the positions of the geo peers.
+     * @return Duration the topic sets, zero for no wait, or `std::nullopt`
+     *         when every node applies its `[geo] positions_resume_timeout`, and
+     *         on a normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Returns the longest wait between two long-term rewrites of a
+     *        partition of this geo topic.
+     * @return Duration the topic sets, or `std::nullopt` when every node
+     *         applies its `[geo] long_term_rewrite_max_interval`, and on a
+     *         normal topic.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
      * @brief Returns the aggregate number of retained messages.
      * @return Message count.
      */
@@ -1707,6 +1971,9 @@ class TopicDetails final {
                  std::uint64_t message_expiry,
                  std::string compression_algorithm,
                  std::uint64_t max_topic_size,
+                 ::iggy::TopicType topic_type,
+                 std::optional<::iggy::GeoMode> geo_mode,
+                 detail::GeoTopicDurations geo_durations,
                  std::uint64_t messages_count,
                  std::uint32_t partitions_count,
                  std::vector<Partition> partitions,
@@ -1718,6 +1985,9 @@ class TopicDetails final {
           message_expiry_(message_expiry),
           compression_algorithm_(std::move(compression_algorithm)),
           max_topic_size_(max_topic_size),
+          topic_type_(topic_type),
+          geo_mode_(geo_mode),
+          geo_durations_(geo_durations),
           messages_count_(messages_count),
           partitions_count_(partitions_count),
           partitions_(std::move(partitions)),
@@ -1726,6 +1996,8 @@ class TopicDetails final {
     static TopicDetails FromFfi(ffi::TopicDetails topic);
 
     friend class IggyBlockingClient;
+    // The unit tests have no server to read a topic from, so they build one through this class.
+    friend class TopicTestPeer;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -1734,6 +2006,9 @@ class TopicDetails final {
     std::uint64_t message_expiry_;
     std::string compression_algorithm_;
     std::uint64_t max_topic_size_;
+    ::iggy::TopicType topic_type_;
+    std::optional<::iggy::GeoMode> geo_mode_;
+    detail::GeoTopicDurations geo_durations_;
     std::uint64_t messages_count_;
     std::uint32_t partitions_count_;
     std::vector<Partition> partitions_;
@@ -1873,6 +2148,16 @@ class StreamDetails final {
         return encryption_kek_fingerprints_;
     }
 
+    /**
+     * @brief Returns the geo origin whose topics this shadow stream serves.
+     *
+     * A shadow stream holds the geo topics of another datacenter and takes no
+     * writes: a write to it fails with Kind() shadow_stream_read_only (1021).
+     * @return Origin name such as `dc-a`, or `std::nullopt` for any stream
+     *         that is not a shadow stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &ShadowOrigin() const noexcept { return shadow_origin_; }
+
   private:
     StreamDetails(std::uint32_t id,
                   std::uint64_t created_at,
@@ -1884,7 +2169,8 @@ class StreamDetails final {
                   ResourceOptions options,
                   std::optional<StreamEncryptionSource> encryption_key_source,
                   std::optional<std::string> encryption_key_fingerprint,
-                  std::vector<std::string> encryption_kek_fingerprints)
+                  std::vector<std::string> encryption_kek_fingerprints,
+                  std::optional<std::string> shadow_origin)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
@@ -1895,7 +2181,8 @@ class StreamDetails final {
           options_(std::move(options)),
           encryption_key_source_(encryption_key_source),
           encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
-          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)),
+          shadow_origin_(std::move(shadow_origin)) {}
 
     static StreamDetails FromFfi(ffi::StreamDetails stream);
 
@@ -1912,6 +2199,7 @@ class StreamDetails final {
     std::optional<StreamEncryptionSource> encryption_key_source_;
     std::optional<std::string> encryption_key_fingerprint_;
     std::vector<std::string> encryption_kek_fingerprints_;
+    std::optional<std::string> shadow_origin_;
 };
 
 /**
@@ -2005,6 +2293,16 @@ class Stream final {
         return encryption_kek_fingerprints_;
     }
 
+    /**
+     * @brief Returns the geo origin whose topics this shadow stream serves.
+     *
+     * A shadow stream holds the geo topics of another datacenter and takes no
+     * writes: a write to it fails with Kind() shadow_stream_read_only (1021).
+     * @return Origin name such as `dc-a`, or `std::nullopt` for any stream
+     *         that is not a shadow stream.
+     */
+    [[nodiscard]] const std::optional<std::string> &ShadowOrigin() const noexcept { return shadow_origin_; }
+
   private:
     Stream(std::uint32_t id,
            std::uint64_t created_at,
@@ -2015,7 +2313,8 @@ class Stream final {
            ResourceOptions options,
            std::optional<StreamEncryptionSource> encryption_key_source,
            std::optional<std::string> encryption_key_fingerprint,
-           std::vector<std::string> encryption_kek_fingerprints)
+           std::vector<std::string> encryption_kek_fingerprints,
+           std::optional<std::string> shadow_origin)
         : id_(id),
           created_at_(created_at),
           name_(std::move(name)),
@@ -2025,11 +2324,13 @@ class Stream final {
           options_(std::move(options)),
           encryption_key_source_(encryption_key_source),
           encryption_key_fingerprint_(std::move(encryption_key_fingerprint)),
-          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)) {}
+          encryption_kek_fingerprints_(std::move(encryption_kek_fingerprints)),
+          shadow_origin_(std::move(shadow_origin)) {}
 
     static Stream FromFfi(ffi::Stream stream);
 
     friend class IggyBlockingClient;
+    friend class StreamsPage;
 
     std::uint32_t id_;
     std::uint64_t created_at_;
@@ -2041,6 +2342,7 @@ class Stream final {
     std::optional<StreamEncryptionSource> encryption_key_source_;
     std::optional<std::string> encryption_key_fingerprint_;
     std::vector<std::string> encryption_kek_fingerprints_;
+    std::optional<std::string> shadow_origin_;
 };
 
 /**
@@ -2124,6 +2426,7 @@ class ConsumerGroup final {
     static ConsumerGroup FromFfi(ffi::ConsumerGroup group);
 
     friend class IggyBlockingClient;
+    friend class ConsumerGroupsPage;
 
     std::uint32_t id_;
     std::string name_;
@@ -2975,8 +3278,9 @@ constexpr std::string_view to_string(const PartitionResizePolicy policy) {
 /**
  * @brief Option keys of the stream scope, in catalog order.
  *
- * Name is updatable. EncryptionKey is a create-only secret. The fingerprint
- * and source keys are read-only projections. No stream key is resettable.
+ * Name is updatable. EncryptionKey is a create-only secret. The fingerprint,
+ * source, and shadow origin keys are read-only projections. No stream key is
+ * resettable.
  */
 enum class StreamOptionKey : std::uint8_t {
     Name,
@@ -2984,6 +3288,7 @@ enum class StreamOptionKey : std::uint8_t {
     EncryptionKeySource,
     EncryptionKeyFingerprint,
     EncryptionKekFingerprint,
+    ShadowOrigin,
 };
 
 constexpr std::string_view to_string(const StreamOptionKey key) {
@@ -2998,6 +3303,8 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
             return "encryption_key_fingerprint";
         case StreamOptionKey::EncryptionKekFingerprint:
             return "encryption_kek_fingerprint";
+        case StreamOptionKey::ShadowOrigin:
+            return "shadow_origin";
     }
     throw std::invalid_argument("Unknown stream option key");
 }
@@ -3005,8 +3312,12 @@ constexpr std::string_view to_string(const StreamOptionKey key) {
 /**
  * @brief Option keys of the topic scope, in catalog order.
  *
- * Name, MessageExpiry, and MaxTopicSize are updatable, and MessageExpiry and
- * MaxTopicSize are also resettable. Every other key is create-only.
+ * Name, MessageExpiry, MaxTopicSize, LocalRetentionAge, and
+ * LocalRetentionSize are updatable, and all of them but Name are also
+ * resettable. An update can turn TieredStorage on, never off. The durations
+ * from FreshUploadInterval to LongTermRewriteMaxInterval are only on a geo
+ * topic, where an update can set them but not reset them. Every other key is
+ * create-only.
  */
 enum class TopicOptionKey : std::uint8_t {
     Name,
@@ -3021,6 +3332,18 @@ enum class TopicOptionKey : std::uint8_t {
     SizeOfMessagesRequiredToSave,
     PreallocateSegments,
     ReplicationFactor,
+    SegmentMaxAge,
+    TieredStorage,
+    LocalRetentionAge,
+    LocalRetentionSize,
+    TopicType,
+    GeoMode,
+    FreshUploadInterval,
+    ConsumerOffsetUploadInterval,
+    PositionsPublishInterval,
+    TombstoneGrace,
+    PositionsResumeTimeout,
+    LongTermRewriteMaxInterval,
 };
 
 constexpr std::string_view to_string(const TopicOptionKey key) {
@@ -3049,6 +3372,30 @@ constexpr std::string_view to_string(const TopicOptionKey key) {
             return "preallocate_segments";
         case TopicOptionKey::ReplicationFactor:
             return "replication_factor";
+        case TopicOptionKey::SegmentMaxAge:
+            return "segment_max_age";
+        case TopicOptionKey::TieredStorage:
+            return "tiered_storage";
+        case TopicOptionKey::LocalRetentionAge:
+            return "local_retention_age";
+        case TopicOptionKey::LocalRetentionSize:
+            return "local_retention_size";
+        case TopicOptionKey::TopicType:
+            return "topic_type";
+        case TopicOptionKey::GeoMode:
+            return "geo_mode";
+        case TopicOptionKey::FreshUploadInterval:
+            return "fresh_upload_interval";
+        case TopicOptionKey::ConsumerOffsetUploadInterval:
+            return "consumer_offset_upload_interval";
+        case TopicOptionKey::PositionsPublishInterval:
+            return "positions_publish_interval";
+        case TopicOptionKey::TombstoneGrace:
+            return "tombstone_grace";
+        case TopicOptionKey::PositionsResumeTimeout:
+            return "positions_resume_timeout";
+        case TopicOptionKey::LongTermRewriteMaxInterval:
+            return "long_term_rewrite_max_interval";
     }
     throw std::invalid_argument("Unknown topic option key");
 }
@@ -3080,6 +3427,12 @@ constexpr std::string_view to_string(const UserOptionKey key) {
  * unset to use the server default. Use SetRawEntries() for supported options
  * that do not yet have a typed setter. When both specify the same option, the
  * typed setting takes precedence.
+ *
+ * The durations from SetFreshUploadInterval() to
+ * SetLongTermRewriteMaxInterval() override the server settings of the same
+ * name on every node. Only a geo topic takes them: the server refuses one on
+ * a normal topic with InvalidOptionValue. Zero is a value, sent as zero, and
+ * an unset duration leaves the node to its own setting.
  */
 class TopicCreateOptions final {
   public:
@@ -3329,6 +3682,292 @@ class TopicCreateOptions final {
     }
 
     /**
+     * @brief Returns the age at which a partition's active segment rolls.
+     * @return Configured age, or `std::nullopt` to roll segments by size alone.
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &SegmentMaxAge() const noexcept { return segment_max_age_; }
+
+    /**
+     * @brief Sets the age at which a partition's active segment rolls.
+     *
+     * A batch stamped this long after the active segment's first batch starts
+     * the next segment. A fully idle partition keeps its segment open.
+     * @param segment_max_age Age to roll at, at least 10 minutes, or
+     *        Expiry::NeverExpire() to roll by size alone.
+     *        Expiry::ServerDefault() clears an explicitly configured age.
+     * @return Reference to this options object.
+     * @note The server refuses a duration together with
+     *       SetPreallocateSegments(true).
+     */
+    TopicCreateOptions &SetSegmentMaxAge(::iggy::Expiry segment_max_age) {
+        if (segment_max_age.Kind() == "server_default") {
+            segment_max_age_.reset();
+        } else {
+            segment_max_age_ = std::move(segment_max_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns whether sealed segments move to the object store.
+     * @return Configured setting, or `std::nullopt` to use the server default
+     *         (`false`).
+     */
+    [[nodiscard]] std::optional<bool> TieredStorage() const noexcept { return tiered_storage_; }
+
+    /**
+     * @brief Sets whether sealed segments move to the object store.
+     * @param tiered_storage `true` to tier the topic; `false` otherwise.
+     * @return Reference to this options object.
+     * @note The server refuses `true` with FeatureUnavailable until it tiers
+     *       topics.
+     */
+    TopicCreateOptions &SetTieredStorage(bool tiered_storage) noexcept {
+        tiered_storage_ = tiered_storage;
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long a tiered topic keeps an uploaded segment on
+     *        local disk.
+     * @return Configured age, or `std::nullopt` to use the server default
+     *         (one day).
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &LocalRetentionAge() const noexcept {
+        return local_retention_age_;
+    }
+
+    /**
+     * @brief Sets how long a tiered topic keeps an uploaded segment on local
+     *        disk.
+     * @param local_retention_age Age to keep an uploaded segment on local
+     *        disk. Expiry::ServerDefault() clears an explicitly configured
+     *        age.
+     * @return Reference to this options object.
+     * @note The server refuses an age above a finite message expiry.
+     */
+    TopicCreateOptions &SetLocalRetentionAge(::iggy::Expiry local_retention_age) {
+        if (local_retention_age.Kind() == "server_default") {
+            local_retention_age_.reset();
+        } else {
+            local_retention_age_ = std::move(local_retention_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @return Configured size limit, or `std::nullopt` to use the server
+     *         default (unlimited).
+     */
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &LocalRetentionSize() const noexcept {
+        return local_retention_size_;
+    }
+
+    /**
+     * @brief Sets the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @param local_retention_size Topic-wide size of uploaded segments to
+     *        keep on local disk. MaxTopicSize::ServerDefault() clears an
+     *        explicitly configured limit.
+     * @return Reference to this options object.
+     * @note The server refuses a size above a finite maximum topic size.
+     */
+    TopicCreateOptions &SetLocalRetentionSize(::iggy::MaxTopicSize local_retention_size) {
+        if (local_retention_size.Value() == "server_default") {
+            local_retention_size_.reset();
+        } else {
+            local_retention_size_ = std::move(local_retention_size);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns what the topic is.
+     * @return Configured type, or `std::nullopt` to use the server default
+     *         (`normal`).
+     */
+    [[nodiscard]] std::optional<::iggy::TopicType> TopicType() const noexcept { return topic_type_; }
+
+    /**
+     * @brief Sets what the topic is.
+     * @param topic_type TopicType::Geo also makes the topic's messages
+     *        readable in the other datacenters, through the object store.
+     * @return Reference to this options object.
+     * @note A geo topic needs an object store on every node of the cluster:
+     *       while one is not ready, the server refuses TopicType::Geo with
+     *       FeatureUnavailable. A geo topic refuses tiered storage and an
+     *       encrypted stream, and keeps its name, options and partition count.
+     */
+    TopicCreateOptions &SetTopicType(::iggy::TopicType topic_type) noexcept {
+        topic_type_ = topic_type;
+        return *this;
+    }
+
+    /**
+     * @brief Returns how a geo topic writes its messages.
+     * @return Configured mode, or `std::nullopt` to use `geo` on a geo topic.
+     */
+    [[nodiscard]] std::optional<::iggy::GeoMode> GeoMode() const noexcept { return geo_mode_; }
+
+    /**
+     * @brief Sets how a geo topic writes its messages.
+     * @param geo_mode GeoMode::Geo uploads a batch to the object store before
+     *        it commits. GeoMode::GeoTiered replicates it first and uploads
+     *        sealed segments later.
+     * @return Reference to this options object.
+     * @note The server refuses any mode on a normal topic.
+     */
+    TopicCreateOptions &SetGeoMode(::iggy::GeoMode geo_mode) noexcept {
+        geo_mode_ = geo_mode;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the longest time a send to the geo topic waits for the
+     *        upload of its fresh object to start.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[tiered_storage] fresh_upload_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Sets the longest time a send to the geo topic waits for the
+     *        upload of its fresh object to start.
+     *
+     * One object carries the sends of every partition a shard leads, so a
+     * send also goes with an earlier upload.
+     * @param fresh_upload_interval Duration from zero to 10 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p fresh_upload_interval is negative.
+     */
+    TopicCreateOptions &SetFreshUploadInterval(std::chrono::microseconds fresh_upload_interval) {
+        geo_durations_.fresh_upload_interval = detail::GeoTopicDuration(fresh_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the shortest time between two uploads of the positions
+     *        that the offset stores of the geo topic's consumer groups wait
+     *        for.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] consumer_offset_upload_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Sets the shortest time between two uploads of the positions that
+     *        the offset stores of the geo topic's consumer groups wait for.
+     * @param consumer_offset_upload_interval Duration from zero to 1 s. Zero
+     *        answers such a store at its local commit.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p consumer_offset_upload_interval is
+     *         negative.
+     */
+    TopicCreateOptions &SetConsumerOffsetUploadInterval(std::chrono::microseconds consumer_offset_upload_interval) {
+        geo_durations_.consumer_offset_upload_interval = detail::GeoTopicDuration(consumer_offset_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns how often a node uploads the changed positions of the
+     *        geo topic's consumer groups.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] positions_publish_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Sets how often a node uploads the changed positions of the geo
+     *        topic's consumer groups.
+     * @param positions_publish_interval Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_publish_interval is
+     *         negative.
+     */
+    TopicCreateOptions &SetPositionsPublishInterval(std::chrono::microseconds positions_publish_interval) {
+        geo_durations_.positions_publish_interval = detail::GeoTopicDuration(positions_publish_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long the tombstone and the objects of the geo topic
+     *        stay in the object store after it is deleted.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] tombstone_grace`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Sets how long the tombstone and the objects of the geo topic stay
+     *        in the object store after it is deleted.
+     * @param tombstone_grace Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p tombstone_grace is negative.
+     */
+    TopicCreateOptions &SetTombstoneGrace(std::chrono::microseconds tombstone_grace) {
+        geo_durations_.tombstone_grace = detail::GeoTopicDuration(tombstone_grace);
+        return *this;
+    }
+
+    /**
+     * @brief Returns how long, after a node starts, the group polls of the geo
+     *        topic wait for the positions of the geo peers.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] positions_resume_timeout`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Sets how long, after a node starts, the group polls of the geo
+     *        topic wait for the positions of the geo peers.
+     * @param positions_resume_timeout Duration to wait. Zero does not wait.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_resume_timeout is negative.
+     */
+    TopicCreateOptions &SetPositionsResumeTimeout(std::chrono::microseconds positions_resume_timeout) {
+        geo_durations_.positions_resume_timeout = detail::GeoTopicDuration(positions_resume_timeout);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the longest wait between two long-term rewrites of a
+     *        partition of the geo topic.
+     * @return Configured duration, or `std::nullopt` to apply each node's
+     *         `[geo] long_term_rewrite_max_interval`.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
+     * @brief Sets the longest wait between two long-term rewrites of a
+     *        partition of the geo topic.
+     *
+     * A quiet partition waits the longest, so its shadow topics in other
+     * datacenters are about this far behind.
+     * @param long_term_rewrite_max_interval Duration of at least 1 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p long_term_rewrite_max_interval is
+     *         negative.
+     */
+    TopicCreateOptions &SetLongTermRewriteMaxInterval(std::chrono::microseconds long_term_rewrite_max_interval) {
+        geo_durations_.long_term_rewrite_max_interval = detail::GeoTopicDuration(long_term_rewrite_max_interval);
+        return *this;
+    }
+
+    /**
      * @brief Returns additional topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3380,6 +4019,13 @@ class TopicCreateOptions final {
     std::optional<std::uint64_t> size_of_messages_required_to_save_;
     std::optional<bool> preallocate_segments_;
     std::optional<std::uint32_t> replication_factor_;
+    std::optional<::iggy::Expiry> segment_max_age_;
+    std::optional<bool> tiered_storage_;
+    std::optional<::iggy::Expiry> local_retention_age_;
+    std::optional<::iggy::MaxTopicSize> local_retention_size_;
+    std::optional<::iggy::TopicType> topic_type_;
+    std::optional<::iggy::GeoMode> geo_mode_;
+    detail::GeoTopicDurations geo_durations_;
     std::map<std::string, std::string> raw_;
 
     friend class IggyBlockingClient;
@@ -3398,6 +4044,13 @@ class TopicCreateOptions final {
  * other supported mutable settings. When both configure the same setting, the
  * typed setting takes precedence. An update must change at least one setting,
  * and must not both set and reset the same one.
+ *
+ * The durations from SetFreshUploadInterval() to
+ * SetLongTermRewriteMaxInterval() are the only settings an update can change
+ * on a geo topic. They have no default, so none of them can be reset: the
+ * server refuses one on a normal topic with InvalidOptionValue, and
+ * UpdateTopic() refuses a Reset() of one before sending with
+ * OptionNotResettable. Zero is a value, sent as zero.
  */
 class TopicUpdateOptions final {
   public:
@@ -3466,6 +4119,214 @@ class TopicUpdateOptions final {
     }
 
     /**
+     * @brief Returns whether sealed segments move to the object store.
+     * @return `true` when this update turns tiered storage on, or
+     *         `std::nullopt` when it leaves the setting unchanged.
+     */
+    [[nodiscard]] std::optional<bool> TieredStorage() const noexcept { return tiered_storage_; }
+
+    /**
+     * @brief Turns tiered storage on.
+     * @param tiered_storage `true` to move sealed segments to the object
+     *        store.
+     * @return Reference to this options object.
+     * @note The server refuses `false`: an update never turns tiered storage
+     *       off. It refuses `true` with FeatureUnavailable until it tiers
+     *       topics.
+     */
+    TopicUpdateOptions &SetTieredStorage(bool tiered_storage) noexcept {
+        tiered_storage_ = tiered_storage;
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested local retention age update.
+     * @return Age to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] const std::optional<::iggy::Expiry> &LocalRetentionAge() const noexcept {
+        return local_retention_age_;
+    }
+
+    /**
+     * @brief Sets how long a tiered topic keeps an uploaded segment on local
+     *        disk.
+     * @param local_retention_age Age to keep an uploaded segment on local
+     *        disk. Expiry::ServerDefault() leaves the current age unchanged.
+     *        Use Reset(TopicOptionKey::LocalRetentionAge) to return to the
+     *        default.
+     * @return Reference to this options object.
+     * @note The server refuses an age above a finite message expiry.
+     */
+    TopicUpdateOptions &SetLocalRetentionAge(::iggy::Expiry local_retention_age) {
+        if (local_retention_age.Kind() == "server_default") {
+            local_retention_age_.reset();
+        } else {
+            local_retention_age_ = std::move(local_retention_age);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested local retention size update.
+     * @return Size limit to apply, or `std::nullopt` when this update leaves
+     *         it unchanged.
+     */
+    [[nodiscard]] const std::optional<::iggy::MaxTopicSize> &LocalRetentionSize() const noexcept {
+        return local_retention_size_;
+    }
+
+    /**
+     * @brief Sets the cap on the uploaded segments a tiered topic keeps on
+     *        local disk.
+     * @param local_retention_size Size of uploaded segments to keep on local
+     *        disk. MaxTopicSize::ServerDefault() leaves the current limit
+     *        unchanged. Use Reset(TopicOptionKey::LocalRetentionSize) to
+     *        return to the default.
+     * @return Reference to this options object.
+     * @note The server refuses a size above a finite maximum topic size.
+     */
+    TopicUpdateOptions &SetLocalRetentionSize(::iggy::MaxTopicSize local_retention_size) {
+        if (local_retention_size.Value() == "server_default") {
+            local_retention_size_.reset();
+        } else {
+            local_retention_size_ = std::move(local_retention_size);
+        }
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested fresh upload interval of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> FreshUploadInterval() const noexcept {
+        return geo_durations_.fresh_upload_interval;
+    }
+
+    /**
+     * @brief Sets the longest time a send to the geo topic waits for the
+     *        upload of its fresh object to start.
+     * @param fresh_upload_interval Duration from zero to 10 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p fresh_upload_interval is negative.
+     */
+    TopicUpdateOptions &SetFreshUploadInterval(std::chrono::microseconds fresh_upload_interval) {
+        geo_durations_.fresh_upload_interval = detail::GeoTopicDuration(fresh_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested consumer offset upload interval of a geo
+     *        topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> ConsumerOffsetUploadInterval() const noexcept {
+        return geo_durations_.consumer_offset_upload_interval;
+    }
+
+    /**
+     * @brief Sets the shortest time between two uploads of the positions that
+     *        the offset stores of the geo topic's consumer groups wait for.
+     * @param consumer_offset_upload_interval Duration from zero to 1 s. Zero
+     *        answers such a store at its local commit.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p consumer_offset_upload_interval is
+     *         negative.
+     */
+    TopicUpdateOptions &SetConsumerOffsetUploadInterval(std::chrono::microseconds consumer_offset_upload_interval) {
+        geo_durations_.consumer_offset_upload_interval = detail::GeoTopicDuration(consumer_offset_upload_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested positions publish interval of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsPublishInterval() const noexcept {
+        return geo_durations_.positions_publish_interval;
+    }
+
+    /**
+     * @brief Sets how often a node uploads the changed positions of the geo
+     *        topic's consumer groups.
+     * @param positions_publish_interval Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_publish_interval is
+     *         negative.
+     */
+    TopicUpdateOptions &SetPositionsPublishInterval(std::chrono::microseconds positions_publish_interval) {
+        geo_durations_.positions_publish_interval = detail::GeoTopicDuration(positions_publish_interval);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested tombstone grace of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> TombstoneGrace() const noexcept {
+        return geo_durations_.tombstone_grace;
+    }
+
+    /**
+     * @brief Sets how long the tombstone and the objects of the geo topic stay
+     *        in the object store after it is deleted.
+     * @param tombstone_grace Duration longer than zero.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p tombstone_grace is negative.
+     */
+    TopicUpdateOptions &SetTombstoneGrace(std::chrono::microseconds tombstone_grace) {
+        geo_durations_.tombstone_grace = detail::GeoTopicDuration(tombstone_grace);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested positions resume timeout of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> PositionsResumeTimeout() const noexcept {
+        return geo_durations_.positions_resume_timeout;
+    }
+
+    /**
+     * @brief Sets how long, after a node starts, the group polls of the geo
+     *        topic wait for the positions of the geo peers.
+     * @param positions_resume_timeout Duration to wait. Zero does not wait.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p positions_resume_timeout is negative.
+     */
+    TopicUpdateOptions &SetPositionsResumeTimeout(std::chrono::microseconds positions_resume_timeout) {
+        geo_durations_.positions_resume_timeout = detail::GeoTopicDuration(positions_resume_timeout);
+        return *this;
+    }
+
+    /**
+     * @brief Returns the requested long-term rewrite interval of a geo topic.
+     * @return Duration to apply, or `std::nullopt` when this update leaves it
+     *         unchanged.
+     */
+    [[nodiscard]] std::optional<std::chrono::microseconds> LongTermRewriteMaxInterval() const noexcept {
+        return geo_durations_.long_term_rewrite_max_interval;
+    }
+
+    /**
+     * @brief Sets the longest wait between two long-term rewrites of a
+     *        partition of the geo topic.
+     * @param long_term_rewrite_max_interval Duration of at least 1 s.
+     * @return Reference to this options object.
+     * @throws std::invalid_argument if @p long_term_rewrite_max_interval is
+     *         negative.
+     */
+    TopicUpdateOptions &SetLongTermRewriteMaxInterval(std::chrono::microseconds long_term_rewrite_max_interval) {
+        geo_durations_.long_term_rewrite_max_interval = detail::GeoTopicDuration(long_term_rewrite_max_interval);
+        return *this;
+    }
+
+    /**
      * @brief Returns additional mutable topic settings as key-value pairs.
      *
      * Use this for supported settings that do not have a dedicated setter.
@@ -3511,9 +4372,10 @@ class TopicUpdateOptions final {
 
     /**
      * @brief Resets a setting to its server default.
-     * @param key Setting to reset. Only MessageExpiry and MaxTopicSize are
-     *        resettable. UpdateTopic() refuses any other key before sending
-     *        with the error the server would return.
+     * @param key Setting to reset. Only MessageExpiry, MaxTopicSize,
+     *        LocalRetentionAge, and LocalRetentionSize are resettable.
+     *        UpdateTopic() refuses any other key before sending with the
+     *        error the server would return.
      * @return Reference to this options object.
      */
     TopicUpdateOptions &Reset(TopicOptionKey key) {
@@ -3544,6 +4406,10 @@ class TopicUpdateOptions final {
     std::optional<std::string> name_;
     std::optional<::iggy::Expiry> message_expiry_;
     std::optional<::iggy::MaxTopicSize> max_topic_size_;
+    std::optional<bool> tiered_storage_;
+    std::optional<::iggy::Expiry> local_retention_age_;
+    std::optional<::iggy::MaxTopicSize> local_retention_size_;
+    detail::GeoTopicDurations geo_durations_;
     std::map<std::string, std::string> raw_;
     std::set<TopicOptionKey> reset_;
     std::set<std::string> raw_reset_;
@@ -4260,7 +5126,7 @@ constexpr std::string_view to_string(const MetadataTokenDeletedReason reason) {
 enum class MetadataSessionClosedReason : std::uint8_t {
     Logout  = 0,
     Expired = 1,
-    Revoked = 2,  ///< The user was deactivated or deleted.
+    Revoked = 2,  ///< A user delete, deactivation, password change, or delete of the session's token.
 };
 
 constexpr std::string_view to_string(const MetadataSessionClosedReason reason) {
@@ -5684,6 +6550,250 @@ class MetadataChanges final {
     std::optional<MetadataCurrentPageToken> current_page_token_;
 };
 
+/** @brief The order of a list page. The values are the wire codes. */
+enum class PageOrder : std::uint8_t {
+    Id      = 0,  ///< By numeric ID.
+    Created = 1,  ///< By creation. Entries with one creation time keep the order of their IDs.
+};
+
+/**
+ * @brief One page request of a list.
+ *
+ * A new query reads the first page of up to kDefaultLimit entries in
+ * ascending ID order. To read the next page, pass the Next() of the page to
+ * SetCursor() and keep the other settings.
+ *
+ * GetPartitionsPage() takes this query. The lists of named entities take a
+ * NamedPageQuery, which holds this query and adds a name filter.
+ *
+ * The page methods of IggyBlockingClient refuse a query with Kind()
+ * invalid_command before anything is sent when the limit is outside 1 to
+ * kMaxLimit or the cursor is not a text that Next() can return. Over TCP,
+ * QUIC, and WebSocket the server refuses with invalid_command a cursor of
+ * another order. HTTP reports this refusal as http_response_error (300).
+ */
+class PageQuery final {
+  public:
+    static constexpr std::uint32_t kDefaultLimit = 100;
+    static constexpr std::uint32_t kMaxLimit     = 1000;
+
+    /** @brief Returns the order of the entries. */
+    [[nodiscard]] PageOrder Order() const noexcept { return order_; }
+
+    /** @brief Returns whether the entries come in descending order. */
+    [[nodiscard]] bool Descending() const noexcept { return descending_; }
+
+    /** @brief Returns the most entries one page returns. */
+    [[nodiscard]] std::uint32_t Limit() const noexcept { return limit_; }
+
+    /** @brief Returns the cursor text of the page to read, absent for the first page. */
+    [[nodiscard]] const std::optional<std::string> &Cursor() const noexcept { return cursor_; }
+
+    /**
+     * @brief Sets the order of the entries.
+     * @param order The default is PageOrder::Id.
+     * @return Reference to this query.
+     */
+    PageQuery &SetOrder(PageOrder order) {
+        order_ = order;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the direction of the order.
+     * @param descending The default is false, ascending.
+     * @return Reference to this query.
+     */
+    PageQuery &SetDescending(bool descending) {
+        descending_ = descending;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the most entries one page returns.
+     * @param limit From 1 to kMaxLimit. The default is kDefaultLimit.
+     * @return Reference to this query.
+     */
+    PageQuery &SetLimit(std::uint32_t limit) {
+        limit_ = limit;
+        return *this;
+    }
+
+    /**
+     * @brief Sets the page to read.
+     * @param cursor The Next() text of the previous page, unchanged. It is
+     *        valid only with the order, direction, name filter, and parent of
+     *        the query that returned it.
+     * @return Reference to this query.
+     */
+    PageQuery &SetCursor(std::string cursor) {
+        cursor_ = std::move(cursor);
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::PageQuery ToFfi() const;
+
+    friend class IggyBlockingClient;
+    friend class NamedPageQuery;
+
+    PageOrder order_{PageOrder::Id};
+    bool descending_{};
+    std::uint32_t limit_{kDefaultLimit};
+    std::optional<std::string> cursor_;
+};
+
+/**
+ * @brief One page request of a list of named entities: streams, topics,
+ * consumer groups, and users.
+ *
+ * It holds a PageQuery and adds a name filter. To read the next page, pass
+ * the Next() of the page to Page().SetCursor() and keep the other settings.
+ *
+ * The page methods of IggyBlockingClient refuse it with Kind()
+ * invalid_command before anything is sent when they refuse its PageQuery,
+ * or when the name is empty, longer than 255 bytes, or not UTF-8.
+ */
+class NamedPageQuery final {
+  public:
+    NamedPageQuery() = default;
+
+    /** @brief Builds a query of the page that @p page describes, with no name filter. */
+    explicit NamedPageQuery(PageQuery page) : page_(std::move(page)) {}
+
+    /** @brief Returns the order, direction, limit, and cursor of the page. */
+    [[nodiscard]] const PageQuery &Page() const noexcept { return page_; }
+
+    /** @brief Returns the page settings to change, such as the cursor of the next page. */
+    [[nodiscard]] PageQuery &Page() noexcept { return page_; }
+
+    /** @brief Returns the text that the name of each entry holds, absent for no filter. */
+    [[nodiscard]] const std::optional<std::string> &Name() const noexcept { return name_; }
+
+    /**
+     * @brief Keeps only the entries whose name holds @p name, case-sensitive.
+     * @param name UTF-8 text of 1 to 255 bytes.
+     * @return Reference to this query.
+     */
+    NamedPageQuery &SetName(std::string name) {
+        name_ = std::move(name);
+        return *this;
+    }
+
+  private:
+    [[nodiscard]] ffi::NamedPageQuery ToFfi() const;
+
+    friend class IggyBlockingClient;
+
+    PageQuery page_;
+    std::optional<std::string> name_;
+};
+
+/**
+ * @brief One page of stream summaries.
+ *
+ * IggyBlockingClient::GetStreamsPage() returns this value. A page can be
+ * short or empty and still have a Next().
+ */
+class StreamsPage final {
+  public:
+    /** @brief Returns the streams of the page. */
+    [[nodiscard]] const std::vector<Stream> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the cursor text of the next page, absent on the last page. */
+    [[nodiscard]] const std::optional<std::string> &Next() const noexcept { return next_; }
+
+  private:
+    StreamsPage() = default;
+
+    static StreamsPage FromFfi(ffi::StreamsPage page);
+
+    friend class IggyBlockingClient;
+
+    std::vector<Stream> items_;
+    std::optional<std::string> next_;
+};
+
+/** @brief One page of topic summaries. See StreamsPage. */
+class TopicsPage final {
+  public:
+    /** @brief Returns the topics of the page. */
+    [[nodiscard]] const std::vector<Topic> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the cursor text of the next page, absent on the last page. */
+    [[nodiscard]] const std::optional<std::string> &Next() const noexcept { return next_; }
+
+  private:
+    TopicsPage() = default;
+
+    static TopicsPage FromFfi(ffi::TopicsPage page);
+
+    friend class IggyBlockingClient;
+
+    std::vector<Topic> items_;
+    std::optional<std::string> next_;
+};
+
+/** @brief One page of partition summaries. See StreamsPage. */
+class PartitionsPage final {
+  public:
+    /** @brief Returns the partitions of the page. */
+    [[nodiscard]] const std::vector<Partition> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the cursor text of the next page, absent on the last page. */
+    [[nodiscard]] const std::optional<std::string> &Next() const noexcept { return next_; }
+
+  private:
+    PartitionsPage() = default;
+
+    static PartitionsPage FromFfi(ffi::PartitionsPage page);
+
+    friend class IggyBlockingClient;
+
+    std::vector<Partition> items_;
+    std::optional<std::string> next_;
+};
+
+/** @brief One page of consumer group summaries. See StreamsPage. */
+class ConsumerGroupsPage final {
+  public:
+    /** @brief Returns the consumer groups of the page. */
+    [[nodiscard]] const std::vector<ConsumerGroup> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the cursor text of the next page, absent on the last page. */
+    [[nodiscard]] const std::optional<std::string> &Next() const noexcept { return next_; }
+
+  private:
+    ConsumerGroupsPage() = default;
+
+    static ConsumerGroupsPage FromFfi(ffi::ConsumerGroupsPage page);
+
+    friend class IggyBlockingClient;
+
+    std::vector<ConsumerGroup> items_;
+    std::optional<std::string> next_;
+};
+
+/** @brief One page of user summaries. See StreamsPage. */
+class UsersPage final {
+  public:
+    /** @brief Returns the users of the page. */
+    [[nodiscard]] const std::vector<UserInfo> &Items() const noexcept { return items_; }
+
+    /** @brief Returns the cursor text of the next page, absent on the last page. */
+    [[nodiscard]] const std::optional<std::string> &Next() const noexcept { return next_; }
+
+  private:
+    UsersPage() = default;
+
+    static UsersPage FromFfi(ffi::UsersPage page);
+
+    friend class IggyBlockingClient;
+
+    std::vector<UserInfo> items_;
+    std::optional<std::string> next_;
+};
+
 /**
  * @brief Starting position for polling messages.
  *
@@ -6045,15 +7155,28 @@ class ReadException final : public IggyException {
 
     /**
      * @return For a message that does not decode, the continuation after it,
-     *         to pass to PartitionReader::Seek(). For a lost range, the
-     *         continuation after the last offset of Lost(). Otherwise `nullptr`.
+     *         to pass to PartitionReader::Seek(). Otherwise `nullptr`.
      */
     [[nodiscard]] const ::iggy::Continuation *Skip() const noexcept { return skip_.get(); }
+
+    /**
+     * @return True when the reader stopped the partition after six refusals
+     *         in a row that a retry does not change, such as `unauthorized`.
+     *         Only a Seek() of the partition reads it again. While a lost
+     *         read is still pending, such a stop arrives as
+     *         `fetch_progress_uncertain` (14010) with an empty Lost(), and
+     *         this flag is then false.
+     */
+    [[nodiscard]] bool IsLastingRefusal() const noexcept { return lasting_refusal_; }
 
     /**
      * @return For messages that a lost read committed and that the reader
      *         could not read again, their first and last offset, with the
      *         error `fetch_progress_uncertain`. Otherwise `std::nullopt`.
+     *         This error stops nothing and needs no Seek(). A batch that the
+     *         reader holds after the range comes next, and a Seek() before
+     *         the application takes it drops it. If the reader stopped the
+     *         partition, the error that stopped it comes after that batch.
      */
     [[nodiscard]] std::optional<std::pair<std::uint64_t, std::uint64_t>> Lost() const noexcept { return lost_; }
 
@@ -6062,10 +7185,13 @@ class ReadException final : public IggyException {
 
     friend class PartitionReader;
     friend class IggyConsumer;
+    // The unit tests have no server to fail a read, so they build one through this class.
+    friend class ReadExceptionTestPeer;
 
     std::optional<std::uint32_t> partition_id_;
     // Shared, so that copying the exception cannot throw.
     std::shared_ptr<const ::iggy::Continuation> skip_;
+    bool lasting_refusal_;
     std::optional<std::pair<std::uint64_t, std::uint64_t>> lost_;
 };
 
@@ -6413,6 +7539,7 @@ class IggyConsumer final {
  *
  * - Login(), Logout(), ResolveOperation(), and AbandonOperation().
  * - CreateUser(), UpdateUser(), and DeleteUser().
+ * - DeletePersonalAccessToken().
  * - EncryptionKeyFingerprint() and invalid keys passed to CreateStream().
  * - CreateStream(), UpdateStream(), and DeleteStream().
  * - CreateTopic(), UpdateTopic(), and DeleteTopic().
@@ -6423,13 +7550,15 @@ class IggyConsumer final {
  *   DeleteConsumerPosition().
  * - PollMessages(), Reader(), StandaloneConsumer(), GroupConsumer(),
  *   PendingPoll::Wait(), and the calls of PartitionReader and IggyConsumer.
- * - GetMetadataChanges().
+ * - GetMetadataChanges() and RetireGeoOrigin().
+ * - GetStreamsPage(), GetTopicsPage(), GetPartitionsPage(),
+ *   GetConsumerGroupsPage(), and GetUsersPage().
  *
  * Other methods report errors through the exception message only. C++ and
  * bridge-local argument validation failures also have no structured error
- * details, even for the methods listed above. GetMetadataChanges() is the
- * exception: it reports every invalid query as invalid_command, including one
- * the bridge refuses.
+ * details, even for the methods listed above. GetMetadataChanges() and the
+ * page methods are the exception: they report every invalid query as
+ * invalid_command, including one the bridge refuses.
  *
  * @code{.cpp}
  * auto client{iggy::IggyBlockingClient::Builder()
@@ -6674,17 +7803,62 @@ class IggyBlockingClient final {
     UserInfoDetails GetUser(const Identifier &user);
 
     /**
-     * @brief Lists user summaries visible to the authenticated caller.
+     * @brief Lists user summaries visible to the authenticated caller, in ID order.
      *
      * The summaries omit permissions. Use GetUser() to retrieve one user's
      * permission assignment.
      *
+     * The list is read in pages, so it is not one consistent read: a user
+     * that someone creates or deletes during the read can appear or not
+     * appear. Over TCP, QUIC, and WebSocket the client reads pages of 1,000
+     * users. Over HTTP the server builds the list from its pages and sends one
+     * reply. GetUsersPage() reads one page.
+     *
      * @return User summaries observed by the server for this request.
      * @throws IggyException if the client is unavailable or unauthenticated;
      *         the caller lacks read-users or manage-users permission; or the
-     *         request fails.
+     *         request fails. Over TCP, QUIC, and WebSocket it also throws when
+     *         the server answers a page with the cursor it was sent.
      */
     std::vector<UserInfo> GetUsers();
+
+    /**
+     * @brief Reads one page of the user summaries.
+     *
+     * @param query Order, direction, limit, cursor, and name filter of the page.
+     * @return One page of user summaries.
+     * @throws IggyException with Kind() invalid_command before anything is
+     *         sent when NamedPageQuery refuses @p query. Also if the client is
+     *         unavailable or unauthenticated; the caller lacks read-users or
+     *         manage-users permission; the server refuses the query; or the
+     *         request fails.
+     */
+    UsersPage GetUsersPage(const NamedPageQuery &query);
+
+    /**
+     * @brief Lists the personal access tokens owned by the authenticated caller.
+     *
+     * The result carries token names and expiry only. The server shows a
+     * secret token string only when the token is created.
+     *
+     * @return One entry per token, empty when the caller has none.
+     * @throws IggyException if the client is unavailable or unauthenticated, or
+     *         the request fails.
+     */
+    std::vector<PersonalAccessTokenInfo> GetPersonalAccessTokens();
+
+    /**
+     * @brief Deletes one of the caller's personal access tokens.
+     *
+     * A failed or unknown transport outcome can leave the deletion committed;
+     * list the tokens before retrying.
+     *
+     * @param name Name of the token to delete.
+     * @throws IggyException if @p name is empty or exceeds 255 bytes; the
+     *         client is unavailable or unauthenticated; the token does not
+     *         exist; or the request fails.
+     */
+    void DeletePersonalAccessToken(std::string name);
 
     /**
      * @brief Creates a user account.
@@ -6821,14 +7995,35 @@ class IggyBlockingClient final {
     void UpdateStream(const Identifier &stream, const StreamUpdateOptions &options);
 
     /**
-     * @brief Lists stream summaries visible to the authenticated user.
+     * @brief Lists stream summaries visible to the authenticated user, in ID order.
      *
      * The summaries exclude per-topic details. Use GetStream() for those.
+     *
+     * The list is read in pages, so it is not one consistent read: a stream
+     * that someone creates or deletes during the read can appear or not
+     * appear. Over TCP, QUIC, and WebSocket the client reads pages of 1,000
+     * streams. Over HTTP the server builds the list from its pages and sends
+     * one reply. GetStreamsPage() reads one page.
+     *
      * @return Stream summaries visible to the authenticated user.
-     * @throws IggyException if the client is unavailable, the caller lacks
-     *         permission to read streams, or the request fails.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         or the request fails. Over TCP, QUIC, and WebSocket it also
+     *         throws when the server answers a page with the cursor it was
+     *         sent.
      */
     std::vector<Stream> GetStreams();
+
+    /**
+     * @brief Reads one page of the stream summaries.
+     *
+     * @param query Order, direction, limit, cursor, and name filter of the page.
+     * @return One page of the stream summaries the caller may read.
+     * @throws IggyException with Kind() invalid_command before anything is
+     *         sent when NamedPageQuery refuses @p query. Also if the client is
+     *         unavailable or unauthenticated; the server refuses the query; or
+     *         the request fails.
+     */
+    StreamsPage GetStreamsPage(const NamedPageQuery &query);
 
     /**
      * @brief Retrieves one stream by numeric ID or name.
@@ -6902,18 +8097,49 @@ class IggyBlockingClient final {
     void UpdateTopic(const Identifier &stream, const Identifier &topic, const TopicUpdateOptions &options);
 
     /**
-     * @brief Lists topic summaries in a stream.
+     * @brief Lists topic summaries in a stream, in ID order.
      *
      * The returned summaries do not include partition details. Use GetTopic()
      * when partition offsets, sizes, and segment counts are needed.
      *
+     * The list is read in pages, so it is not one consistent read: a topic
+     * that someone creates or deletes during the read can appear or not
+     * appear. Over TCP, QUIC, and WebSocket the client reads pages of 1,000
+     * topics. Over HTTP the server builds the list from its pages and sends
+     * one reply. GetTopicsPage() reads one page.
+     *
+     * A stream that does not exist, or one the caller may read no topic of,
+     * gives an empty list. If the stream goes missing after the first page,
+     * the read fails as GetTopicsPage() does.
+     *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @return Topic summaries visible to the authenticated user.
-     * @throws IggyException if the client is unavailable or unauthenticated;
-     *         the stream does not exist; the caller lacks read permission; or
-     *         the metadata read fails.
+     * @throws IggyException if the client is unavailable or unauthenticated,
+     *         or the metadata read fails. Over TCP, QUIC, and WebSocket it
+     *         also throws when the server answers a page with the cursor it
+     *         was sent.
      */
     std::vector<Topic> GetTopics(const Identifier &stream);
+
+    /**
+     * @brief Reads one page of the topic summaries in a stream.
+     *
+     * For a stream that does not exist, or one the caller may read no topic
+     * of, the first page is empty and has no Next(). For a caller with a
+     * global read grant, a page read with a cursor fails instead, because the
+     * stream was deleted during the walk. Over TCP, QUIC, and WebSocket the
+     * error is stream_id_not_found (1009). Over HTTP it is resource_not_found
+     * (20).
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param query Order, direction, limit, cursor, and name filter of the page.
+     * @return One page of the topic summaries the caller may read.
+     * @throws IggyException with Kind() invalid_command before anything is
+     *         sent when NamedPageQuery refuses @p query. Also if the client is
+     *         unavailable or unauthenticated; the identifier is invalid; the
+     *         server refuses the query; or the request fails.
+     */
+    TopicsPage GetTopicsPage(const Identifier &stream, const NamedPageQuery &query);
 
     /**
      * @brief Retrieves one topic and its partition summaries.
@@ -6926,7 +8152,9 @@ class IggyBlockingClient final {
      * @return Topic metadata and one summary per partition.
      * @throws IggyException if the client is unavailable or unauthenticated;
      *         the stream or topic does not exist; the caller lacks read
-     *         permission; or the metadata read fails.
+     *         permission; over TCP, QUIC, or WebSocket, the topic has more
+     *         partitions than one reply can hold (server error 97, read them
+     *         with GetPartitionsPage()); or the metadata read fails.
      */
     TopicDetails GetTopic(const Identifier &stream, const Identifier &topic);
 
@@ -6978,6 +8206,24 @@ class IggyBlockingClient final {
      *         request fails.
      */
     void DeletePartitions(const Identifier &stream, const Identifier &topic, std::uint32_t partitions_count);
+
+    /**
+     * @brief Reads one page of the partition summaries of a topic.
+     *
+     * Partition IDs follow creation, so PageOrder::Created reads in ID order
+     * too.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param query Order, direction, limit, and cursor of the page.
+     * @return One page of partition summaries.
+     * @throws IggyException with Kind() invalid_command before anything is
+     *         sent when PageQuery refuses @p query. Also if the client is
+     *         unavailable or unauthenticated; an identifier is invalid; the
+     *         stream or topic does not exist; the caller lacks read
+     *         permission; the server refuses the query; or the request fails.
+     */
+    PartitionsPage GetPartitionsPage(const Identifier &stream, const Identifier &topic, const PageQuery &query);
 
     /**
      * @brief Deletes the oldest sealed segments from one partition.
@@ -7044,7 +8290,7 @@ class IggyBlockingClient final {
     ConsumerGroupDetails GetConsumerGroup(const Identifier &stream, const Identifier &topic, const Identifier &group);
 
     /**
-     * @brief Lists consumer group summaries for a topic.
+     * @brief Lists consumer group summaries for a topic, in ID order.
      *
      * The summaries include member and partition counts but omit individual
      * member details. Use GetConsumerGroup() to retrieve those details.
@@ -7054,14 +8300,41 @@ class IggyBlockingClient final {
      * result does not establish whether the parent resources exist across
      * server implementations.
      *
+     * The list is read in pages, so it is not one consistent read: a group
+     * that someone creates or deletes during the read can appear or not
+     * appear. Over TCP, QUIC, and WebSocket the client reads pages of 1,000
+     * groups. Over HTTP the server builds the list from its pages and sends one
+     * reply. GetConsumerGroupsPage() reads one page.
+     *
      * @param stream Parent stream, addressed by numeric ID or name.
      * @param topic Parent topic, addressed by numeric ID or name.
      * @return Consumer group summaries for the requested topic.
      * @throws IggyException if the client is unavailable or unauthenticated;
      *         an identifier is invalid; the stream or topic does not exist;
      *         the caller lacks read permission; or the metadata read fails.
+     *         Over TCP, QUIC, and WebSocket it also throws when the server
+     *         answers a page with the cursor it was sent.
      */
     std::vector<ConsumerGroup> GetConsumerGroups(const Identifier &stream, const Identifier &topic);
+
+    /**
+     * @brief Reads one page of the consumer group summaries of a topic.
+     *
+     * Group IDs follow creation, so PageOrder::Created reads in ID order too.
+     *
+     * @param stream Parent stream, addressed by numeric ID or name.
+     * @param topic Parent topic, addressed by numeric ID or name.
+     * @param query Order, direction, limit, cursor, and name filter of the page.
+     * @return One page of consumer group summaries.
+     * @throws IggyException with Kind() invalid_command before anything is
+     *         sent when NamedPageQuery refuses @p query. Also if the client is
+     *         unavailable or unauthenticated; an identifier is invalid; the
+     *         stream or topic does not exist; the caller lacks read
+     *         permission; the server refuses the query; or the request fails.
+     */
+    ConsumerGroupsPage GetConsumerGroupsPage(const Identifier &stream,
+                                             const Identifier &topic,
+                                             const NamedPageQuery &query);
 
     /**
      * @brief Deletes a consumer group from a topic.
@@ -7454,6 +8727,22 @@ class IggyBlockingClient final {
      *         the request fails.
      */
     Stats GetStats();
+
+    /**
+     * @brief Retires the geo origin of a datacenter that never returns.
+     *
+     * The cluster then follows nothing more of the origin: its shadow topics
+     * serve what they hold until their retention removes it, and a client can
+     * delete them. Retiring an origin that is retired already changes nothing.
+     * A datacenter that comes back needs another origin name.
+     *
+     * @param origin Origin name of the lost datacenter, such as `dc-a`.
+     * @throws IggyException with Kind() unauthorized when the caller is
+     *         neither root nor holds the global manage_servers permission;
+     *         with Kind() invalid_format when no cluster can take @p origin as
+     *         its name; or when the request fails.
+     */
+    void RetireGeoOrigin(const std::string &origin);
 
     /**
      * @brief Replays a retained operation with its original identity and bytes.

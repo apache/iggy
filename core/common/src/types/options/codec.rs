@@ -17,12 +17,13 @@
 
 use super::key::OptionKey;
 use super::{
-    Durability, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_REPLICATION_FACTOR,
-    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, PartitionResizePolicy,
+    CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX, Durability, FRESH_UPLOAD_INTERVAL_MAX, GeoMode,
+    LONG_TERM_REWRITE_MAX_INTERVAL_MIN, MAX_MESSAGES_REQUIRED_TO_SAVE, MAX_REPLICATION_FACTOR,
+    MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE, MIN_SEGMENT_MAX_AGE, PartitionResizePolicy, TopicType,
 };
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
 use crate::types::message::{HeaderKind, HeaderValue};
-use crate::{IggyByteSize, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
+use crate::{IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, UserStatus};
 use iggy_binary_protocol::WireUserHeaderEntry;
 use std::str::FromStr;
 
@@ -77,7 +78,15 @@ impl OptionValueCodec for IggyExpiry {
     const KIND: HeaderKind = HeaderKind::Uint64;
 
     fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
-        decode_u64_or(key, entry, |text| Self::from_str(text).ok().map(u64::from)).map(Self::from)
+        let expiry = decode_u64_or(key, entry, |text| Self::from_str(text).ok().map(u64::from))
+            .map(Self::from)?;
+        if key == OptionKey::SegmentMaxAge
+            && let Self::ExpireDuration(age) = expiry
+            && age.as_micros() < MIN_SEGMENT_MAX_AGE
+        {
+            return Err(invalid(key));
+        }
+        Ok(expiry)
     }
 
     fn encode(&self) -> Result<HeaderValue, IggyError> {
@@ -86,6 +95,45 @@ impl OptionValueCodec for IggyExpiry {
 
     fn to_option_string(&self) -> String {
         u64::from(*self).to_string()
+    }
+}
+
+/// The durations of a geo topic, in microseconds. Zero is a value here, not
+/// a sentinel for the default: no upload interval and no resume wait. The
+/// keys that cannot be zero refuse it.
+impl OptionValueCodec for IggyDuration {
+    const KIND: HeaderKind = HeaderKind::Uint64;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        let duration = decode_u64_or(key, entry, |text| {
+            Self::from_str(text)
+                .ok()
+                .map(|duration| duration.as_micros())
+        })
+        .map(Self::from)?;
+        let bounded = match key {
+            OptionKey::FreshUploadInterval => duration.get_duration() <= FRESH_UPLOAD_INTERVAL_MAX,
+            OptionKey::ConsumerOffsetUploadInterval => {
+                duration.get_duration() <= CONSUMER_OFFSET_UPLOAD_INTERVAL_MAX
+            }
+            OptionKey::PositionsPublishInterval | OptionKey::TombstoneGrace => !duration.is_zero(),
+            OptionKey::LongTermRewriteMaxInterval => {
+                duration.get_duration() >= LONG_TERM_REWRITE_MAX_INTERVAL_MIN
+            }
+            _ => true,
+        };
+        if !bounded {
+            return Err(invalid(key));
+        }
+        Ok(duration)
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        Ok(HeaderValue::from(self.as_micros()))
+    }
+
+    fn to_option_string(&self) -> String {
+        self.as_micros().to_string()
     }
 }
 
@@ -146,6 +194,38 @@ impl OptionValueCodec for Durability {
 }
 
 impl OptionValueCodec for PartitionResizePolicy {
+    const KIND: HeaderKind = HeaderKind::String;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        parse_text(key, entry, |text| text.parse().ok())
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        HeaderValue::from_str(self.as_ref())
+    }
+
+    fn to_option_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl OptionValueCodec for TopicType {
+    const KIND: HeaderKind = HeaderKind::String;
+
+    fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        parse_text(key, entry, |text| text.parse().ok())
+    }
+
+    fn encode(&self) -> Result<HeaderValue, IggyError> {
+        HeaderValue::from_str(self.as_ref())
+    }
+
+    fn to_option_string(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl OptionValueCodec for GeoMode {
     const KIND: HeaderKind = HeaderKind::String;
 
     fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {

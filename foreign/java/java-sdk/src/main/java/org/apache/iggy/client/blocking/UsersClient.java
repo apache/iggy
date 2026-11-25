@@ -20,6 +20,8 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.identifier.UserId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 import org.apache.iggy.user.IdentityInfo;
 import org.apache.iggy.user.Permissions;
 import org.apache.iggy.user.UserInfo;
@@ -39,7 +41,20 @@ public interface UsersClient {
 
     Optional<UserInfoDetails> getUser(UserId userId);
 
+    /**
+     * Over TCP, reads the list in pages of up to 1000 users, so the list is not one consistent read. All pages share
+     * the sign-in and the request timeout of the call, so a new sign-in during the read fails it. Over TCP, the call
+     * fails with {@link org.apache.iggy.exception.IggyMalformedResponseException} when the server answers the page
+     * cursor it was sent. Over HTTP, reads the whole list in one reply, which the server builds from pages of 1000, so
+     * it is not one consistent read either.
+     */
     List<UserInfo> getUsers();
+
+    /**
+     * Gets one page of users. The name filter applies to the username. A query that breaks the page rules fails with
+     * an invalid command error.
+     */
+    Page<UserInfo> getUsersPage(NamedPageQuery query);
 
     default UserInfoDetails createUser(
             String username, String password, UserStatus status, Optional<Permissions> permissions) {

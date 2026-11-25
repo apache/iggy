@@ -30,6 +30,53 @@ std::optional<StreamEncryptionSource> EncryptionKeySourceFromFfi(bool has_source
     return static_cast<StreamEncryptionSource>(source);
 }
 
+TopicType TopicTypeFromFfi(ffi::TopicType topic_type) {
+    switch (topic_type) {
+        case ffi::TopicType::Normal:
+            return TopicType::Normal;
+        case ffi::TopicType::Geo:
+            return TopicType::Geo;
+    }
+    throw IggyException("Unknown topic type");
+}
+
+std::optional<GeoMode> GeoModeFromFfi(bool has_geo_mode, ffi::GeoMode geo_mode) {
+    if (!has_geo_mode) {
+        return std::nullopt;
+    }
+    switch (geo_mode) {
+        case ffi::GeoMode::Geo:
+            return GeoMode::Geo;
+        case ffi::GeoMode::GeoTiered:
+            return GeoMode::GeoTiered;
+    }
+    throw IggyException("Unknown geo mode");
+}
+
+std::optional<std::chrono::microseconds> GeoTopicDurationFromFfi(bool has_value, std::uint64_t micros) {
+    if (!has_value) {
+        return std::nullopt;
+    }
+    // The server takes any u64 for some of these durations. A value past the
+    // signed microseconds range, over 292,000 years, reads as the longest.
+    constexpr auto kLongest = static_cast<std::uint64_t>(std::chrono::microseconds::max().count());
+    return std::chrono::microseconds(
+        static_cast<std::chrono::microseconds::rep>(micros > kLongest ? kLongest : micros));
+}
+
+detail::GeoTopicDurations GeoTopicDurationsFromFfi(const ffi::GeoTopicDurations &durations) {
+    return detail::GeoTopicDurations{
+        GeoTopicDurationFromFfi(durations.has_fresh_upload_interval, durations.fresh_upload_interval_micros),
+        GeoTopicDurationFromFfi(durations.has_consumer_offset_upload_interval,
+                                durations.consumer_offset_upload_interval_micros),
+        GeoTopicDurationFromFfi(durations.has_positions_publish_interval, durations.positions_publish_interval_micros),
+        GeoTopicDurationFromFfi(durations.has_tombstone_grace, durations.tombstone_grace_micros),
+        GeoTopicDurationFromFfi(durations.has_positions_resume_timeout, durations.positions_resume_timeout_micros),
+        GeoTopicDurationFromFfi(durations.has_long_term_rewrite_max_interval,
+                                durations.long_term_rewrite_max_interval_micros),
+    };
+}
+
 std::optional<std::string> TextFromFfi(bool has_text, const rust::String &text) {
     if (!has_text) {
         return std::nullopt;
@@ -44,6 +91,16 @@ std::vector<std::string> TextsFromFfi(const rust::Vec<rust::String> &texts) {
         result.emplace_back(text.data(), text.size());
     }
     return result;
+}
+
+// Bytes, not rust::String, so the bridge refuses text that is not UTF-8 with invalid_command.
+rust::Vec<std::uint8_t> TextToFfiBytes(const std::string &text) {
+    rust::Vec<std::uint8_t> bytes;
+    bytes.reserve(text.size());
+    for (const char character : text) {
+        bytes.push_back(static_cast<std::uint8_t>(character));
+    }
+    return bytes;
 }
 
 }  // namespace
@@ -161,6 +218,14 @@ Permissions Permissions::FromFfi(const ffi::Permissions &permissions) {
     return result;
 }
 
+PersonalAccessTokenInfo PersonalAccessTokenInfo::FromFfi(ffi::PersonalAccessTokenInfo token) {
+    std::optional<std::uint64_t> expires_at;
+    if (token.has_expiry) {
+        expires_at = token.expiry;
+    }
+    return PersonalAccessTokenInfo(std::string(token.name.data(), token.name.size()), expires_at);
+}
+
 UserInfo UserInfo::FromFfi(ffi::UserInfo user) {
     return UserInfo(user.id, user.created_at, static_cast<UserStatus>(user.status),
                     std::string(user.username.c_str(), user.username.size()),
@@ -261,11 +326,12 @@ ResourceOptions ResourceOptions::FromFfi(rust::Vec<ffi::HeaderEntry> explicit_en
 }
 
 Topic Topic::FromFfi(ffi::Topic topic) {
-    return Topic(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
-                 topic.message_expiry,
-                 std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
-                 topic.max_topic_size, topic.messages_count, topic.partitions_count,
-                 ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+    return Topic(
+        topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
+        topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
+        topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
+        GeoTopicDurationsFromFfi(topic.geo_durations), topic.messages_count, topic.partitions_count,
+        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 PartitionContext PartitionContext::FromFfi(ffi::PartitionContext context) {
@@ -286,11 +352,12 @@ TopicDetails TopicDetails::FromFfi(ffi::TopicDetails topic) {
         partitions.push_back(Partition::FromFfi(partition));
     }
 
-    return TopicDetails(topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()),
-                        topic.size_bytes, topic.message_expiry,
-                        std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
-                        topic.max_topic_size, topic.messages_count, topic.partitions_count, std::move(partitions),
-                        ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
+    return TopicDetails(
+        topic.id, topic.created_at, std::string(topic.name.c_str(), topic.name.size()), topic.size_bytes,
+        topic.message_expiry, std::string(topic.compression_algorithm.c_str(), topic.compression_algorithm.size()),
+        topic.max_topic_size, TopicTypeFromFfi(topic.topic_type), GeoModeFromFfi(topic.has_geo_mode, topic.geo_mode),
+        GeoTopicDurationsFromFfi(topic.geo_durations), topic.messages_count, topic.partitions_count,
+        std::move(partitions), ResourceOptions::FromFfi(std::move(topic.options), std::move(topic.derived_options)));
 }
 
 StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {
@@ -305,7 +372,8 @@ StreamDetails StreamDetails::FromFfi(ffi::StreamDetails stream) {
                          ResourceOptions::FromFfi(std::move(stream.options), std::move(stream.derived_options)),
                          EncryptionKeySourceFromFfi(stream.has_encryption_key_source, stream.encryption_key_source),
                          TextFromFfi(stream.has_encryption_key_fingerprint, stream.encryption_key_fingerprint),
-                         TextsFromFfi(stream.encryption_kek_fingerprints));
+                         TextsFromFfi(stream.encryption_kek_fingerprints),
+                         TextFromFfi(stream.has_shadow_origin, stream.shadow_origin));
 }
 
 Stream Stream::FromFfi(ffi::Stream stream) {
@@ -314,7 +382,8 @@ Stream Stream::FromFfi(ffi::Stream stream) {
                   ResourceOptions::FromFfi(std::move(stream.options), std::move(stream.derived_options)),
                   EncryptionKeySourceFromFfi(stream.has_encryption_key_source, stream.encryption_key_source),
                   TextFromFfi(stream.has_encryption_key_fingerprint, stream.encryption_key_fingerprint),
-                  TextsFromFfi(stream.encryption_kek_fingerprints));
+                  TextsFromFfi(stream.encryption_kek_fingerprints),
+                  TextFromFfi(stream.has_shadow_origin, stream.shadow_origin));
 }
 
 OptionSpec OptionSpec::FromFfi(ffi::OptionSpec spec) {
@@ -846,6 +915,78 @@ MetadataChanges MetadataChanges::FromFfi(ffi::MetadataChanges changes) {
     if (changes.has_current_page_token) {
         result.current_page_token_ = MetadataCurrentPageToken::FromFfi(std::move(changes.current_page_token));
     }
+    return result;
+}
+
+ffi::PageQuery PageQuery::ToFfi() const {
+    ffi::PageQuery query{};
+    query.order      = static_cast<ffi::PageOrder>(order_);
+    query.descending = descending_;
+    query.limit      = limit_;
+    query.has_cursor = cursor_.has_value();
+    if (cursor_) {
+        query.cursor = TextToFfiBytes(*cursor_);
+    }
+    return query;
+}
+
+ffi::NamedPageQuery NamedPageQuery::ToFfi() const {
+    ffi::NamedPageQuery query{};
+    query.page     = page_.ToFfi();
+    query.has_name = name_.has_value();
+    if (name_) {
+        query.name = TextToFfiBytes(*name_);
+    }
+    return query;
+}
+
+StreamsPage StreamsPage::FromFfi(ffi::StreamsPage page) {
+    StreamsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &stream : page.items) {
+        result.items_.push_back(Stream::FromFfi(std::move(stream)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+TopicsPage TopicsPage::FromFfi(ffi::TopicsPage page) {
+    TopicsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &topic : page.items) {
+        result.items_.push_back(Topic::FromFfi(std::move(topic)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+PartitionsPage PartitionsPage::FromFfi(ffi::PartitionsPage page) {
+    PartitionsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &partition : page.items) {
+        result.items_.push_back(Partition::FromFfi(std::move(partition)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+ConsumerGroupsPage ConsumerGroupsPage::FromFfi(ffi::ConsumerGroupsPage page) {
+    ConsumerGroupsPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &group : page.items) {
+        result.items_.push_back(ConsumerGroup::FromFfi(std::move(group)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
+    return result;
+}
+
+UsersPage UsersPage::FromFfi(ffi::UsersPage page) {
+    UsersPage result;
+    result.items_.reserve(page.items.size());
+    for (auto &user : page.items) {
+        result.items_.push_back(UserInfo::FromFfi(std::move(user)));
+    }
+    result.next_ = TextFromFfi(page.has_next, page.next);
     return result;
 }
 

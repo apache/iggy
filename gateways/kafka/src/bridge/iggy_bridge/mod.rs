@@ -46,6 +46,7 @@ mod group_offsets;
 mod offsets;
 mod produce;
 mod producer_ids;
+mod reach;
 mod topics;
 
 pub use change_log::{DeletedTopic, PermissionBoard, TopicShape, TopicShapes, UserAccess};
@@ -65,6 +66,8 @@ pub(crate) use offsets::{LocatedRecord, RecordLookup};
 use produce::ProducePool;
 pub use produce::{PartitionBatch, ProduceTurn, Producer};
 pub use producer_ids::{iggy_producer_id, kafka_producer_id};
+pub use reach::Reach;
+use reach::ReachProbe;
 pub use topics::{
     DEFAULT_TOPIC_PARTITIONS, KafkaTopicMetadata, MAX_TOPIC_PARTITIONS, StreamTopicCache,
     TopicCreationOutcome, TopicLoad,
@@ -206,6 +209,8 @@ pub struct IggyBridge {
     id_client: LazyClient,
     /// The producer ids this gateway gave out, which Produce may key a session on.
     issued_producer_ids: producer_ids::IssuedProducerIds,
+    /// The pings that say whether the bridge reaches Iggy. See [`IggyBridge::reach`].
+    reach: ReachProbe,
 }
 
 /// The task that follows the change log. Dropping it stops the task.
@@ -301,6 +306,7 @@ impl IggyBridge {
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
             id_client: LazyClient::default(),
             issued_producer_ids: producer_ids::IssuedProducerIds::default(),
+            reach: ReachProbe::default(),
         };
         bridge.follow_change_log().await;
         Ok(bridge)
@@ -499,6 +505,8 @@ impl IggyBridge {
             self.follower.stop().await;
             self.change_client.close().await
         };
+        // The probe signs its own client out as it stops.
+        let reach = self.reach.stop();
         let (
             produce_clients,
             fetch_clients,
@@ -510,6 +518,7 @@ impl IggyBridge {
             change_client,
             id_client,
             shared_client,
+            (),
         ) = tokio::join!(
             self.produce_pool.close(),
             self.fetch_pool.close(),
@@ -521,6 +530,7 @@ impl IggyBridge {
             change_client,
             self.id_client.close(),
             sign_out_and_shut_down(&self.client),
+            reach,
         );
         produce_clients
             .and(fetch_clients)
@@ -646,6 +656,7 @@ impl IggyBridge {
             topic_deletions: broadcast::Sender::new(TOPIC_DELETIONS_CAPACITY),
             id_client: LazyClient::default(),
             issued_producer_ids: producer_ids::IssuedProducerIds::default(),
+            reach: ReachProbe::default(),
         }
     }
 }

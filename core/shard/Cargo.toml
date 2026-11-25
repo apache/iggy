@@ -34,6 +34,8 @@ poll-diagnostics = ["partitions/poll-diagnostics"]
 simulator = ["partitions/simulator"]
 
 [dependencies]
+bytemuck = { workspace = true }
+bytes = { workspace = true }
 compio = { workspace = true }
 consensus = { workspace = true }
 crossfire = { workspace = true }
@@ -41,6 +43,7 @@ futures = { workspace = true }
 hash32 = { workspace = true }
 iggy_binary_protocol = { workspace = true }
 iggy_common = { workspace = true }
+iggy_object_store = { workspace = true }
 journal = { workspace = true }
 message_bus = { workspace = true }
 metadata = { workspace = true }

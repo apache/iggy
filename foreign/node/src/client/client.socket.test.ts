@@ -33,6 +33,7 @@ import { SYNC_GROUP } from '../wire/consumer-group/sync-group.command.js';
 import { UPDATE_USER } from '../wire/user/update-user.command.js';
 import { UPDATE_TOPIC } from '../wire/topic/update-topic.command.js';
 import { UPDATE_STREAM } from '../wire/stream/update-stream.command.js';
+import { getStreams } from '../wire/stream/get-streams.command.js';
 import { OptionsScope } from '../wire/system/describe-options.command.js';
 import { MetadataChangeStart, getMetadataChanges } from '../wire/system/get-metadata-changes.command.js';
 import { CHANGE_PASSWORD } from '../wire/user/change-password.command.js';
@@ -86,6 +87,7 @@ const INVALID_SIZE_BYTES = 80;
 const HISTORY_UNAVAILABLE = 87;
 const LIFECYCLE_BUSY = 88;
 const NOT_PRIMARY = 89;
+const TIERED_READ_FAILED = 96;
 const TRANSIENT_NOT_COMMITTED = 57;
 const TRANSIENT_NOT_ACCEPTED = 58;
 const REQUEST_ALREADY_APPLIED = 59;
@@ -96,6 +98,7 @@ const UNAUTHENTICATED = 40;
 const UNAUTHORIZED = 41;
 const WAIT_LIMIT_MS = 2_000;
 const PARTITION_NOT_FOUND = 3007;
+const SHADOW_STREAM_READ_ONLY = 1021;
 /** How long a test server holds a logout reply while the client goes on. */
 const LOGOUT_DELAY_MS = 50;
 /** The error of a request whose link the server closed. */
@@ -1541,38 +1544,41 @@ describe('VSR client socket', () => {
     }
   });
 
-  it('replays the identical frame on a transient response', async () => {
-    let attempts = 0;
-    const server = await startVsrServer((frame, socket) => {
-      const operation = frame.readUInt8(REQUEST_OFFSET.operation);
-      if (operation !== Operation.NonReplicated ||
-          frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetStats)
-        return singleNodeHandler(server.port)(frame, socket);
-      attempts += 1;
-      socket.write(
-        attempts === 1
-          ? replyFrame(frame, operation, Buffer.alloc(0), 57)
-          : replyFrame(frame, operation, Buffer.from('done'))
-      );
+  for (const code of [COMMAND_CODE.GetStats, COMMAND_CODE.GetUsers, COMMAND_CODE.GetStreams,
+    COMMAND_CODE.GetTopics, COMMAND_CODE.GetPartitions, COMMAND_CODE.GetGroups]) {
+    it(`replays the identical frame of read ${code} on a transient response`, async () => {
+      let attempts = 0;
+      const server = await startVsrServer((frame, socket) => {
+        const operation = frame.readUInt8(REQUEST_OFFSET.operation);
+        if (operation !== Operation.NonReplicated ||
+            frame.readUInt32LE(REQUEST_OFFSET.reserved) !== code)
+          return singleNodeHandler(server.port)(frame, socket);
+        attempts += 1;
+        socket.write(
+          attempts === 1
+            ? replyFrame(frame, operation, Buffer.alloc(0), 57)
+            : replyFrame(frame, operation, Buffer.from('done'))
+        );
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      try {
+        const response = await client.sendCommand(
+          code,
+          Buffer.from('retry-me')
+        );
+        assert.equal(attempts, 2);
+        assert.deepEqual(response.data, Buffer.from('done'));
+        const sent = server.frames.filter(
+          (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === code
+        );
+        assert.equal(sent.length, 2);
+        assert.deepEqual(sent[0], sent[1]);
+      } finally {
+        client.destroy();
+        await server.close();
+      }
     });
-    const client = new CommandResponseStream(vsrConfig(server.port));
-    try {
-      const response = await client.sendCommand(
-        COMMAND_CODE.GetStats,
-        Buffer.from('retry-me')
-      );
-      assert.equal(attempts, 2);
-      assert.deepEqual(response.data, Buffer.from('done'));
-      const sent = server.frames.filter(
-        (frame) => frame.readUInt32LE(REQUEST_OFFSET.reserved) === COMMAND_CODE.GetStats
-      );
-      assert.equal(sent.length, 2);
-      assert.deepEqual(sent[0], sent[1]);
-    } finally {
-      client.destroy();
-      await server.close();
-    }
-  });
+  }
 
   it('resends a metadata changes read after an uncommitted response', async () => {
     // A behind answer before op 1: status 1, phase 0, no log id, zero ops, no cursor.
@@ -2695,6 +2701,26 @@ describe('VSR client socket', () => {
     }
   });
 
+  it('sends a batch once that the server refuses as a write to a shadow stream', async () => {
+    const cluster = await startPollCluster((frame, socket) => {
+      if (frame.readUInt8(REQUEST_OFFSET.operation) !== Operation.SendMessages)
+        return false;
+      socket.write(replyFrame(frame, Operation.SendMessages, Buffer.alloc(0), SHADOW_STREAM_READ_ONLY));
+      return true;
+    });
+    try {
+      await cluster.client.authenticate(vsrConfig(cluster.coordinator.port).credentials);
+      await assert.rejects(
+        () => cluster.client.sendCommand(COMMAND_CODE.SendMessages, explicitSend,
+          { deadline: Date.now() + WAIT_LIMIT_MS }),
+        (error: unknown) => error instanceof ResponseError && error.fromServer &&
+          error.commandCode === COMMAND_CODE.SendMessages && error.errorCode === SHADOW_STREAM_READ_ONLY);
+      assert.equal(framesOf(cluster.primary, Operation.SendMessages).length, 1, 'the batch went out again');
+    } finally {
+      await cluster.close();
+    }
+  });
+
   it('keeps a lifecycle restart ahead of later mutations in its lane', async () => {
     let refuse!: () => void;
     let received!: () => void;
@@ -3008,6 +3034,35 @@ describe('VSR client socket', () => {
       await server.close();
     }
   });
+
+  // A refused read returns no messages, so a committing poll stored nothing either.
+  for (const autocommit of [false, true]) {
+    it(`sends a poll once that the server fails with a tiered read failure (autocommit ${autocommit})`, async () => {
+      const server = await startVsrServer((frame, socket) => {
+        const code = frame.readUInt32LE(REQUEST_OFFSET.reserved);
+        if (code === COMMAND_CODE.GetPartitionRoute) {
+          socket.write(replyFrame(frame, Operation.NonReplicated, routingBody(1n, 1n, 0)));
+          return;
+        }
+        if (code === COMMAND_CODE.PollMessages) {
+          socket.write(replyFrame(frame, Operation.NonReplicated, Buffer.alloc(0), TIERED_READ_FAILED));
+          return;
+        }
+        singleNodeHandler(server.port)(frame, socket);
+      });
+      const client = new CommandResponseStream(vsrConfig(server.port));
+      try {
+        await assert.rejects(() => client.sendCommand(POLL_MESSAGES.code, groupPollPayload(autocommit)),
+          (error: unknown) => error instanceof ResponseError && error.fromServer &&
+            error.commandCode === COMMAND_CODE.PollMessages && error.errorCode === TIERED_READ_FAILED);
+        assert.equal(countCommand(server, COMMAND_CODE.PollMessages), 1, 'the poll went out again');
+        assert.equal(countCommand(server, COMMAND_CODE.GetPartitionRoute), 1, 'the refusal invalidated the route');
+      } finally {
+        client.destroy();
+        await server.close();
+      }
+    });
+  }
 
   it('rediscovers an evicted route when the partition cache is full', async () => {
     const server = await contextServer({ live: 1n, refuseAll: false, contextStatus: 0 });
@@ -3340,6 +3395,54 @@ describe('native mutation recovery', () => {
       await send;
       assert.equal(framesOf(server, Operation.SendMessages).length, 1);
     } finally { client.destroy(); await server.close(); }
+  });
+
+  /** A node whose stream list has `pages` empty pages. It runs `onPage` before it answers each one. */
+  const startStreamListServer = async (pages: number, onPage = () => {}): Promise<VsrTestServer> => {
+    const server = await startVsrServer((frame, socket) => {
+      if (frame.readUInt32LE(REQUEST_OFFSET.reserved) !== COMMAND_CODE.GetStreams) {
+        singleNodeHandler(server.port)(frame, socket);
+        return;
+      }
+      onPage();
+      const page = countCommand(server, COMMAND_CODE.GetStreams);
+      // `[next_len:u8][next][count:u32 = 0]`, with a one-byte next on each page but the last.
+      socket.write(replyFrame(frame, Operation.NonReplicated,
+        page < pages ? Buffer.from([1, page, 0, 0, 0, 0]) : Buffer.alloc(5)));
+    });
+    return server;
+  };
+
+  it('ends a whole list walk with 40 when the caller signs in as another user between its pages', async () => {
+    const server = await startStreamListServer(2);
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    try {
+      await client.sendCommand(LOGIN.code, LOGIN.serialize({ username: 'first', password: 'secret' }));
+      const sendCommand = client.sendCommand.bind(client);
+      let pages = 0;
+      client.sendCommand = async (code, payload, options) => {
+        if (code === COMMAND_CODE.GetStreams && ++pages === 2)
+          await sendCommand(LOGIN.code, LOGIN.serialize({ username: 'other', password: 'secret' }));
+        return sendCommand(code, payload, options);
+      };
+      await assert.rejects(getStreams(async () => client)(), (error: unknown) => error instanceof ResponseError &&
+        error.errorCode === UNAUTHENTICATED && error.commandCode === COMMAND_CODE.GetStreams);
+      assert.equal(readWireName(registerCredentialsBody(framesOf(server, Operation.Register).at(-1)!), 0).value, 'other');
+      assert.equal(countCommand(server, COMMAND_CODE.GetStreams), 1);
+    } finally { client.destroy(); await server.close(); }
+  });
+
+  it('ends a whole list walk with 58 at the deadline it started with and sends no later page', async (context) => {
+    // Each page takes 0.6 of the deadline, so the third page would start after it.
+    const server = await startStreamListServer(3, () => context.mock.timers.tick(0.6 * OPERATION_TIMEOUT_MS));
+    const client = new CommandResponseStream({ ...vsrConfig(server.port), heartbeatInterval: 0 });
+    try {
+      await client.authenticate(vsrConfig(server.port).credentials);
+      context.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+      await assert.rejects(getStreams(async () => client)(), (error: unknown) => error instanceof ResponseError &&
+        error.errorCode === TRANSIENT_NOT_ACCEPTED && error.commandCode === COMMAND_CODE.GetStreams);
+      assert.equal(countCommand(server, COMMAND_CODE.GetStreams), 2);
+    } finally { context.mock.timers.reset(); client.destroy(); await server.close(); }
   });
 
   it('ends a call that waits for its first sign-in with 58 at its deadline', async () => {

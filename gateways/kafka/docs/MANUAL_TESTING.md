@@ -24,8 +24,8 @@ See also: [SCOPE.md](SCOPE.md) (supported API keys), [TEST_SUITE.md](TEST_SUITE.
 # From iggy workspace root (or iggy-gateway-kafka subdir)
 cargo build -p iggy-gateway-kafka
 
-# Terminal 1 — start listener (default 127.0.0.1:9093)
-RUST_LOG=info cargo run -p iggy-gateway-kafka
+# Terminal 1 — start listener (default 127.0.0.1:9093) in stub mode, without Iggy
+IGGY_KAFKA_BRIDGE_ENABLED=false RUST_LOG=info cargo run -p iggy-gateway-kafka
 ```
 
 Expected log:
@@ -79,7 +79,7 @@ No host installs needed, both clients run from containers with `--network host`:
 IGGY_PATH=/tmp/iggy-sasl-data ./target/debug/iggy-server --fresh --with-default-root-credentials
 
 # Terminal 2 - gateway with SASL on
-IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
+IGGY_KAFKA_SASL_ENABLED=true IGGY_KAFKA_BRIDGE_ENABLED=false IGGY_KAFKA_IGGY_ADDR=127.0.0.1:8090 \
   IGGY_KAFKA_BIND_ADDR=127.0.0.1:9095 RUST_LOG=debug cargo run -p iggy-gateway-kafka
 ```
 
@@ -118,9 +118,8 @@ docker run --rm --network host -v /tmp/client.properties:/tmp/client.properties:
 
 S7 and S8 send `SaslHandshake` v0 and then the token in a bare frame with no request header
 (KIP-152). kafka-python 2.0.2 always does this, and Sarama does it by default up to 1.40.1. Both
-cases produce, so add `IGGY_KAFKA_BRIDGE_ENABLED=true IGGY_KAFKA_IGGY_USERNAME=iggy
-IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway in
-terminal 2. kafka-python 2.0.2 needs Python 3.11 or older:
+cases produce, so in terminal 2 drop `IGGY_KAFKA_BRIDGE_ENABLED=false` and add
+`IGGY_KAFKA_IGGY_PASSWORD=iggy IGGY_KAFKA_AUTO_CREATE_TOPICS_ENABLED=true` to the gateway. kafka-python 2.0.2 needs Python 3.11 or older:
 
 ```bash
 uv venv --python 3.11 /tmp/kafka-python-2.0.2
@@ -385,8 +384,8 @@ The gateway binds `:9093` by default; `kafka-message-gen`'s own default is `:909
 broker's usual port). Every command below passes `--host 127.0.0.1:9093` explicitly - omitting it
 connection-refuses before any assertion runs.
 
-Every case below describes a gateway started **without** a bridge (`IGGY_KAFKA_BRIDGE_ENABLED`
-unset). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
+Every case below describes a gateway started **without** a bridge
+(`IGGY_KAFKA_BRIDGE_ENABLED=false`). With a bridge, A5 writes one record to `test-topic`: `ec=0` if it exists, `ec=3` if not.
 `tests/produce_real_bridge_tests.rs` covers the bridge path.
 
 | ID | Test | Steps | Expected result | Pass criteria |
@@ -566,6 +565,10 @@ suite except `tests/phase1_e2e_tests.rs` does.
 | I4 | Read-back via Kafka Fetch | `kcat -b 127.0.0.1:9093 -C -t orders -o beginning -e` | The produced record's payload is printed - validates the actual Kafka Fetch path, not just Iggy's own side |
 | I5 | Volume persistence across a restart | `docker compose restart iggy-server`, wait for its health check to go healthy again, re-run I4's poll command | The same record is still readable after the container restarts against the same named volume |
 | I6 | Teardown | `docker compose down -v` | Both containers stop; volume removed |
+| I7 | Health check and readiness | After I1, run `docker compose ps`, then `curl -i 127.0.0.1:9096/ready` | The gateway shows `(healthy)`. `/ready` answers `200` and `ready` |
+| I8 | Metrics | After I4, run `curl -s 127.0.0.1:9096/metrics \| grep -E 'requests_total\|response_errors_total'` | `iggy_kafka_gateway_requests_total` has a line for `Produce` and for `Fetch`. A Fetch of a missing topic adds a `response_errors_total` line with `code="3"` |
+| I9 | Iggy lost | `docker compose stop iggy-server`, then run `curl -i 127.0.0.1:9096/ready` for about 10 s | `/ready` answers `503` with `Iggy is unreachable` within about 5 s. `curl 127.0.0.1:9096/live` still answers `200`. `docker compose start iggy-server` makes `/ready` answer `200` again |
+| I10 | Non-root image | `docker compose exec iggy-gateway-kafka id` | `uid=10001(iggy) gid=10001(iggy)` |
 
 I5 is a graceful restart (`docker compose restart` sends SIGTERM, which flushes on the way down) -
 it checks that the named volume actually persists data across a container restart, not that a
@@ -701,7 +704,7 @@ kcat version (if used): ___________
 [ ] F1–F6  TCP / connection behavior
 [ ] G1–G19  kcat / Java client / kafka-consumer-groups.sh (record errors for G2/G3)
 [ ] H1–H6  Adversarial input
-[ ] I1–I6  Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
+[ ] I1–I10 Docker Compose quick start (record wall-clock time to I3; I5 is restart durability)
 [ ] J1–J4  AKHQ ListOffsets by timestamp
 
 Automated regression:

@@ -41,6 +41,7 @@ use reqwest_retry::{
 use reqwest_tracing::{SpanBackendWithUrl, TracingMiddleware};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -612,6 +613,39 @@ impl HttpClient {
     where
         F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
     {
+        self.execute_with(method, url, may_commit, decorate, Self::handle_response)
+            .await
+    }
+
+    /// DELETE the session at `path`. Only the server's own unauthenticated refusal is
+    /// [`IggyError::Unauthenticated`], so a proxy 401 never reads as an ended session.
+    pub(crate) async fn delete_session(&self, path: &str) -> Result<Response, IggyError> {
+        let url = self.get_url(path)?;
+        self.fail_if_not_authenticated(path).await?;
+        self.execute_with(
+            Method::DELETE,
+            url,
+            true,
+            |request| request,
+            Self::handle_session_response,
+        )
+        .await
+    }
+
+    /// [`Self::execute`] with `handle` mapping each response.
+    async fn execute_with<F, H, R>(
+        &self,
+        method: Method,
+        url: Url,
+        may_commit: bool,
+        decorate: F,
+        handle: H,
+    ) -> Result<Response, IggyError>
+    where
+        F: Fn(RequestBuilder) -> RequestBuilder + Send + Sync,
+        H: Fn(Response) -> R + Send + Sync,
+        R: Future<Output = Result<Response, IggyError>> + Send,
+    {
         let outcome_unknown = Arc::new(AtomicBool::new(false));
         let client = self.retrying_client(may_commit, &outcome_unknown);
         let deadline = Instant::now() + LIFECYCLE_RETRY_DEADLINE;
@@ -632,7 +666,7 @@ impl HttpClient {
                 return Err(IggyError::TransientNotCommitted);
             }
             let response = response.map_err(|_| IggyError::InvalidHttpRequest)?;
-            match Self::handle_response(response).await {
+            match handle(response).await {
                 Ok(response) => return Ok(response),
                 Err(IggyError::LifecycleBusy) if Instant::now() + pause < deadline => {
                     sleep(pause).await;
@@ -671,6 +705,22 @@ impl HttpClient {
                 Err(Self::response_error(status, reason))
             }
         }
+    }
+
+    /// [`Self::handle_response`], except that a 401 is [`IggyError::Unauthenticated`] only
+    /// with the server's unauthenticated body.
+    async fn handle_session_response(response: Response) -> Result<Response, IggyError> {
+        if response.status() != StatusCode::UNAUTHORIZED {
+            return Self::handle_response(response).await;
+        }
+        let reason = response.text().await.unwrap_or("error".to_string());
+        if error_id(&reason) == Some(IggyError::Unauthenticated.as_code()) {
+            return Err(IggyError::Unauthenticated);
+        }
+        Err(IggyError::HttpResponseError(
+            StatusCode::UNAUTHORIZED.as_u16(),
+            reason,
+        ))
     }
 
     async fn fail_if_not_authenticated(&self, path: &str) -> Result<(), IggyError> {
@@ -858,7 +908,8 @@ fn deferred_reply_limit(max_bytes: u32) -> usize {
 /// refreshes its context once on `HistoryUnavailable`, `LifecycleBusy` is retried,
 /// non-admission and capacity refusals permit a retry without risking duplicate progress, a
 /// poll refused for its byte limit returns `InvalidSizeBytes`, and a topic refused for a factor
-/// above the node count returns `InvalidReplicationFactor`, as over the binary transports.
+/// above the node count returns `InvalidReplicationFactor`, and a read of tiered data that the
+/// object store refused for good returns `TieredReadFailed`, as over the binary transports.
 fn typed_refusal(body: &str) -> Option<IggyError> {
     let id = error_id(body)?;
     [
@@ -869,6 +920,7 @@ fn typed_refusal(body: &str) -> Option<IggyError> {
         IggyError::DeferredPollCapacityExceeded,
         IggyError::InvalidSizeBytes,
         IggyError::InvalidReplicationFactor,
+        IggyError::TieredReadFailed,
     ]
     .into_iter()
     .find(|error| error.as_code() == id)
@@ -1008,6 +1060,24 @@ mod tests {
         assert_eq!(server.requests().len(), 2);
     }
 
+    /// The object store failed for good, so the read is not sent again.
+    #[tokio::test(start_paused = true)]
+    async fn given_read_when_tiered_read_fails_should_report_it_without_a_resend() {
+        let server = ScriptedServer::start(vec![
+            Reply::error(424, &IggyError::TieredReadFailed),
+            Reply::stream(),
+        ])
+        .await;
+
+        let refused = server.client().get_stream(&stream_id()).await;
+
+        assert!(
+            matches!(refused, Err(IggyError::TieredReadFailed)),
+            "{refused:?}"
+        );
+        assert_eq!(server.requests().len(), 1);
+    }
+
     /// A read commits nothing, so the refusal of its resend is definitive.
     #[tokio::test(start_paused = true)]
     async fn given_resend_of_a_read_when_refused_should_report_the_refusal() {
@@ -1065,6 +1135,7 @@ mod tests {
             IggyError::DeferredPollCapacityExceeded,
             IggyError::InvalidSizeBytes,
             IggyError::InvalidReplicationFactor,
+            IggyError::TieredReadFailed,
         ] {
             let body = format!(r#"{{"id":{},"reason":"unavailable"}}"#, error.as_code());
             assert_eq!(typed_refusal(&body), Some(error));

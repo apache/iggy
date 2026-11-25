@@ -518,8 +518,114 @@ struct TopicOptionsTests {
         #expect(try TopicCreateOptions(messageExpiry: .after(.microseconds(1))).toResourceOptions()[key] == .explicit(.uint64(1)))
         #expect(try TopicCreateOptions(messageExpiry: .never).toResourceOptions()[key] == .explicit(.uint64(UInt64.max)))
         #expect(try TopicCreateOptions(messageExpiry: .serverDefault).toResourceOptions()[key] == nil)
+        let ageKey = TopicOptionKey.segmentMaxAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(segmentMaxAge: .after(.zero)).encode() }
+        #expect(try TopicCreateOptions(segmentMaxAge: .after(.seconds(3_600))).toResourceOptions()[ageKey] == .explicit(.uint64(3_600_000_000)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .never).toResourceOptions()[ageKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(segmentMaxAge: .serverDefault).toResourceOptions()[ageKey] == nil)
+        let localAgeKey = TopicOptionKey.localRetentionAge.rawValue
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(localRetentionAge: .after(.zero)).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(localRetentionAge: .after(.zero)).toPatch() }
+        #expect(try TopicCreateOptions(localRetentionAge: .after(.seconds(1_800))).toResourceOptions()[localAgeKey] == .explicit(.uint64(1_800_000_000)))
+        #expect(try TopicCreateOptions(localRetentionAge: .never).toResourceOptions()[localAgeKey] == .explicit(.uint64(UInt64.max)))
+        #expect(try TopicCreateOptions(localRetentionAge: .serverDefault).toResourceOptions()[localAgeKey] == nil)
         // On an update the server default changes nothing. A reset restores the default.
         #expect(
             try TopicUpdateOptions(name: "renamed", messageExpiry: .serverDefault, maxTopicSize: .serverDefault).toResourceOptions().keys.sorted() == ["name"])
+        #expect(
+            try TopicUpdateOptions(name: "renamed", localRetentionAge: .serverDefault, localRetentionSize: .serverDefault).toResourceOptions().keys.sorted()
+                == ["name"])
+    }
+
+    /// A tiered topic keeps nothing on local disk longer, or in a larger
+    /// amount, than it keeps at all, so a read bounds both by the topic's own.
+    @Test func localRetentionReadsYieldToTheTopicBounds() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "events", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let unreported = topic([:])
+        #expect(!unreported.tieredStorage)
+        #expect(unreported.localRetentionAge == .after(.seconds(86_400)))
+        #expect(unreported.localRetentionSize == .unlimited)
+        let bounded = topic([
+            TopicOptionKey.messageExpiry.rawValue: .explicit(.uint64(3_600_000_000)),
+            TopicOptionKey.maxTopicSize.rawValue: .explicit(.uint64(1 << 30)),
+            TopicOptionKey.tieredStorage.rawValue: .explicit(.bool(true)),
+        ])
+        #expect(bounded.tieredStorage)
+        #expect(bounded.localRetentionAge == .after(.seconds(3_600)))
+        #expect(bounded.localRetentionSize == .bytes(1 << 30))
+        let explicit = topic([
+            TopicOptionKey.messageExpiry.rawValue: .explicit(.uint64(3_600_000_000)),
+            TopicOptionKey.localRetentionAge.rawValue: .explicit(.uint64(1_800_000_000)),
+            TopicOptionKey.localRetentionSize.rawValue: .explicit(.uint64(1 << 20)),
+        ])
+        #expect(explicit.localRetentionAge == .after(.seconds(1_800)))
+        #expect(explicit.localRetentionSize == .bytes(1 << 20))
+    }
+
+    /// The type and mode travel as the server's canonical names. Both are
+    /// fixed at create, so an update refuses a reset before anything is sent.
+    @Test func topicTypeAndGeoModeAreCreateOnly() throws {
+        let typeKey = TopicOptionKey.topicType.rawValue
+        let modeKey = TopicOptionKey.geoMode.rawValue
+        let defaults = try TopicCreateOptions().toResourceOptions()
+        #expect(defaults[typeKey] == nil)
+        #expect(defaults[modeKey] == nil)
+        let geo = try TopicCreateOptions(topicType: .geo, geoMode: .geoTiered).toResourceOptions()
+        #expect(geo[typeKey] == .explicit("geo"))
+        #expect(geo[modeKey] == .explicit("geo_tiered"))
+        #expect(try TopicCreateOptions(topicType: .normal).toResourceOptions()[typeKey] == .explicit("normal"))
+        #expect(try TopicCreateOptions(topicType: .geo, geoMode: .geo).toResourceOptions()[modeKey] == .explicit("geo"))
+        for key in [TopicOptionKey.topicType, .geoMode] {
+            #expect(throws: IggyError(.optionNotUpdatable)) { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// The durations of a geo topic travel as whole microseconds. Zero is a
+    /// value, so it is sent, and an unset duration is left out. An update
+    /// sets them, zero included, but never resets them.
+    @Test func geoDurationsSendZeroAndAreNeverReset() throws {
+        let create = try TopicCreateOptions(topicType: .geo, consumerOffsetUploadInterval: .zero, tombstoneGrace: .seconds(3_600)).toResourceOptions()
+        #expect(create[TopicOptionKey.consumerOffsetUploadInterval.rawValue] == .explicit(.uint64(0)))
+        #expect(create[TopicOptionKey.tombstoneGrace.rawValue] == .explicit(.uint64(3_600_000_000)))
+        for key in [TopicOptionKey.freshUploadInterval, .positionsPublishInterval, .positionsResumeTimeout, .longTermRewriteMaxInterval] {
+            #expect(create[key.rawValue] == nil, "\(key)")
+        }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicCreateOptions(tombstoneGrace: .seconds(-1)).encode() }
+        #expect(throws: IggyError(.invalidOptionValue)) { try TopicUpdateOptions(positionsResumeTimeout: .milliseconds(-1)).toPatch() }
+
+        let patch = try TopicUpdateOptions(positionsResumeTimeout: .zero).toPatch()
+        #expect(patch.set == [TopicOptionKey.positionsResumeTimeout.rawValue: .explicit(.uint64(0))])
+        #expect(patch.reset.isEmpty)
+        let durations: [TopicOptionKey] = [
+            .freshUploadInterval, .consumerOffsetUploadInterval, .positionsPublishInterval, .tombstoneGrace, .positionsResumeTimeout,
+            .longTermRewriteMaxInterval,
+        ]
+        for key in durations {
+            #expect(throws: IggyError(.optionNotResettable), "\(key)") { try TopicUpdateOptions(reset: [key]).toPatch() }
+        }
+    }
+
+    /// Only a geo topic has durations. A read reports the ones it sets and
+    /// nil for the others, so each node applies its own server setting.
+    @Test func geoDurationReadsAreNilUnlessTheGeoTopicSetsThem() {
+        func topic(_ options: ResourceOptions) -> Topic {
+            Topic(
+                id: 1, createdAt: IggyTimestamp(microseconds: 0), name: "orders", sizeBytes: 0, messagesCount: 0, partitionsCount: 1,
+                options: options)
+        }
+        let geo = topic([
+            TopicOptionKey.topicType.rawValue: .explicit("geo"),
+            TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000)),
+            TopicOptionKey.positionsResumeTimeout.rawValue: .explicit(.uint64(0)),
+        ])
+        #expect(geo.freshUploadInterval == Duration.milliseconds(50))
+        #expect(geo.positionsResumeTimeout == Duration.zero)
+        #expect(geo.tombstoneGrace == nil)
+        let normal = topic([TopicOptionKey.freshUploadInterval.rawValue: .explicit(.uint64(50_000))])
+        #expect(normal.freshUploadInterval == nil)
     }
 }

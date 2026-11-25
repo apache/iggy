@@ -43,6 +43,10 @@ runs:
       uses: ./.github/actions/utils/setup-rust
       with:
         read-cache: "false"
+        # cargo-about reads `cargo metadata` and compiles nothing, so the job
+        # needs no native libraries and no extra disk.
+        install-system-dependencies: "false"
+        free-disk-space: "false"
 
     - name: Install cargo-about
       shell: bash

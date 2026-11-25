@@ -27,6 +27,7 @@ import org.apache.iggy.message.HeaderValue;
 import org.apache.iggy.serde.BytesDeserializer;
 import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.topic.Topic;
+import org.apache.iggy.topic.TopicOptions;
 import org.apache.iggy.user.UserInfo;
 import org.junit.jupiter.api.Test;
 import tools.jackson.core.type.TypeReference;
@@ -43,6 +44,7 @@ import static org.apache.iggy.ResourceOptionsFixture.bytes;
 import static org.apache.iggy.ResourceOptionsFixture.optionMap;
 import static org.apache.iggy.ResourceOptionsFixture.section;
 import static org.apache.iggy.ResourceOptionsFixture.streamUpdate;
+import static org.apache.iggy.ResourceOptionsFixture.topicOptions;
 import static org.apache.iggy.ResourceOptionsFixture.topicUpdate;
 import static org.apache.iggy.ResourceOptionsFixture.userUpdate;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -137,6 +139,41 @@ class HttpOptionValueTest {
             }
         }
         assertThat(matched).isEqualTo(3);
+    }
+
+    @Test
+    void givenTypedCreateOptionsWhenRenderingPostBodyShouldMatchHttpBody() {
+        for (JsonNode vector : section("create_topic")) {
+            JsonNode input = vector.get("input");
+            String name = vector.get("case").asString();
+            JsonNode expected = MAPPER.readTree(vector.get("http_body").asString());
+            var options =
+                    TopicOptions.withDurabilityDefaults(topicOptions(input).entries());
+            JsonNode body = MAPPER.readTree(MAPPER.writeValueAsString(new TopicsHttpClient.CreateTopic(
+                    input.get("partitions_count").asLong(),
+                    input.get("name").asString(),
+                    HttpOptionValue.requestValues(options))));
+
+            assertThat(body.get("name")).as(name).isEqualTo(expected.get("name"));
+            assertThat(body.get("partitions_count")).as(name).isEqualTo(expected.get("partitions_count"));
+            List<String> keys = new ArrayList<>();
+            body.get("options").properties().forEach(entry -> keys.add(entry.getKey()));
+            List<String> expectedKeys = new ArrayList<>();
+            expected.get("options").properties().forEach(entry -> expectedKeys.add(entry.getKey()));
+            assertThat(keys).as(name).containsExactlyInAnyOrderElementsOf(expectedKeys);
+            expected.get("options").properties().forEach(entry -> {
+                JsonNode actual = body.get("options").get(entry.getKey());
+                String description = name + " " + entry.getKey();
+                assertThat(actual.asString())
+                        .as(description)
+                        .isEqualTo(entry.getValue().asString());
+                // The fixture writes a u64 above 2^53 as a string, which this SDK sends as a number of the
+                // same digits. Every number there, a zero duration among them, must stay a number.
+                if (entry.getValue().isNumber()) {
+                    assertThat(actual.isNumber()).as(description).isTrue();
+                }
+            });
+        }
     }
 
     @Test

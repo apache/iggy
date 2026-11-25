@@ -15,35 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-import type { CommandResponse } from '../../client/client.type.js';
+import type { ClientProvider, CommandResponse } from '../../client/client.type.js';
 import { wrapCommand } from '../command.utils.js';
 import { COMMAND_CODE } from '../command.code.js';
+import {
+  deserializePage, readWholeList, serializeNamedPageQuery, type NamedPageQuery, type Page
+} from '../page.utils.js';
 import { deserializeToStream, type Stream } from './stream.utils.js';
 
 /**
  * Get streams command definition.
- * Retrieves all streams.
+ * Retrieves one page of the streams.
  */
 export const GET_STREAMS = {
   code: COMMAND_CODE.GetStreams,
 
-  serialize: () => Buffer.alloc(0),
+  serialize: (query: NamedPageQuery) => serializeNamedPageQuery(COMMAND_CODE.GetStreams, query),
 
-  deserialize: (r: CommandResponse) => {
-    const payloadSize = r.data.length;
-    const streams = [];
-    let pos = 0;
-    while (pos < payloadSize) {
-      const { bytesRead, data } = deserializeToStream(r.data, pos)
-      streams.push(data);
-      pos += bytesRead;
-    }
-    return streams;
-  }
+  deserialize: (r: CommandResponse) => deserializePage(r.data, deserializeToStream)
 };
 
+/**
+ * Executable get streams page command function.
+ */
+export const getStreamsPage = wrapCommand<NamedPageQuery, Page<Stream>>(GET_STREAMS);
 
 /**
- * Executable get streams command function.
+ * Executable get streams command function. Reads every stream the caller may
+ * read, page by page.
  */
-export const getStreams = wrapCommand<void, Stream[]>(GET_STREAMS);
+export const getStreams = (c: ClientProvider) =>
+  (): Promise<Stream[]> => readWholeList(c, GET_STREAMS, (query) => query);

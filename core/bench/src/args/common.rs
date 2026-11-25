@@ -31,7 +31,7 @@ use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use iggy::prelude::{
     DEFAULT_POLL_MAX_BYTES, DEFAULT_ROOT_PASSWORD, DEFAULT_ROOT_USERNAME, IggyByteSize,
-    IggyDuration, IggyError, IggyExpiry, PollOptions, TransportProtocol,
+    IggyDuration, IggyError, IggyExpiry, MaxTopicSize, PollOptions, TransportProtocol,
 };
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BATCH_MESSAGE_HEADER_SIZE};
 use iggy_binary_protocol::requests::messages::{
@@ -134,6 +134,19 @@ pub struct IggyBenchArgs {
     /// Topic option at creation, so it has no effect with `--reuse-streams`.
     #[arg(long)]
     pub messages_required_to_save: Option<NonZeroU32>,
+
+    /// Type of the newly created benchmark topics. A geo topic uploads each
+    /// send to the object store before it commits it, so the server needs
+    /// one. Topic option at creation, so it has no effect with
+    /// `--reuse-streams`.
+    #[arg(long, default_value_t = iggy::prelude::TopicType::Normal)]
+    pub topic_type: iggy::prelude::TopicType,
+
+    /// Create the benchmark topics with tiered storage, which moves sealed
+    /// segments to the object store. A geo topic cannot have it. Topic option
+    /// at creation, so it has no effect with `--reuse-streams`.
+    #[arg(long, default_value_t = false)]
+    pub tiered_storage: bool,
 }
 
 impl IggyBenchArgs {
@@ -183,8 +196,8 @@ impl IggyBenchArgs {
         }
     }
 
-    /// Producer-only kinds never poll, so their names leave out the poll options.
-    const fn polls(&self) -> bool {
+    /// Producer-only kinds never poll, so their names and reports leave out the poll options.
+    pub const fn polls(&self) -> bool {
         !matches!(
             self.benchmark_kind,
             BenchmarkKindCommand::PinnedProducer(_) | BenchmarkKindCommand::BalancedProducer(_)
@@ -241,6 +254,15 @@ impl IggyBenchArgs {
                 .error(
                     ErrorKind::ArgumentConflict,
                     "--git-ref, --git-ref-date, --identifier, --remark, --extra-info can only be used with --output-dir",
+                )
+                .exit();
+        }
+
+        if self.tiered_storage && self.topic_type == iggy::prelude::TopicType::Geo {
+            Self::command()
+                .error(
+                    ErrorKind::ArgumentConflict,
+                    "--tiered-storage cannot be used with --topic-type geo",
                 )
                 .exit();
         }
@@ -403,6 +425,28 @@ impl IggyBenchArgs {
             })
     }
 
+    pub fn suite(&self) -> Option<String> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => args.suite.clone(),
+            })
+    }
+
+    pub fn workload(&self) -> Option<String> {
+        self.benchmark_kind
+            .inner()
+            .transport_command()
+            .output_command()
+            .as_ref()
+            .and_then(|cmd| match cmd {
+                BenchmarkOutputCommand::Output(args) => args.workload.clone(),
+            })
+    }
+
     pub fn open_charts(&self) -> bool {
         self.benchmark_kind
             .inner()
@@ -418,12 +462,14 @@ impl IggyBenchArgs {
         self.benchmark_kind.inner().max_topic_size()
     }
 
-    pub fn message_expiry(&self) -> IggyExpiry {
-        self.benchmark_kind.inner().message_expiry()
+    /// The size limit that the bench creates topics with: no limit without `--max-topic-size`.
+    pub fn new_topic_max_size(&self) -> MaxTopicSize {
+        self.max_topic_size()
+            .map_or(MaxTopicSize::Unlimited, MaxTopicSize::Custom)
     }
 
-    pub fn read_amplification(&self) -> Option<f32> {
-        self.benchmark_kind.inner().read_amplification()
+    pub fn message_expiry(&self) -> IggyExpiry {
+        self.benchmark_kind.inner().message_expiry()
     }
 
     pub const fn high_level_api(&self) -> bool {
@@ -440,6 +486,22 @@ impl IggyBenchArgs {
 
     pub const fn consumer_offset_durability(&self) -> iggy::prelude::Durability {
         self.consumer_offset_durability
+    }
+
+    /// The type the benchmark topics are created with, `None` for the
+    /// server's own default.
+    pub fn topic_type(&self) -> Option<iggy::prelude::TopicType> {
+        (self.topic_type != iggy::prelude::TopicType::Normal).then_some(self.topic_type)
+    }
+
+    /// Whether the benchmark topics are created with tiered storage, `None`
+    /// for the server's own default.
+    pub const fn tiered_storage(&self) -> Option<bool> {
+        if self.tiered_storage {
+            Some(true)
+        } else {
+            None
+        }
     }
 
     pub const fn messages_required_to_save(&self) -> Option<NonZeroU32> {
@@ -624,6 +686,21 @@ mod tests {
             "--max-wait 11m must be at most 10m"
         );
         assert!(poll_error(&["--max-bytes", "1"]).starts_with("--max-bytes 1 "));
+    }
+
+    #[test]
+    fn given_topic_flags_when_parsed_should_set_only_the_options_they_name() {
+        let unset = parse(&[]);
+        assert_eq!(unset.topic_type(), None);
+        assert_eq!(unset.tiered_storage(), None);
+
+        let geo = parse(&["--topic-type", "geo"]);
+        assert_eq!(geo.topic_type(), Some(iggy::prelude::TopicType::Geo));
+        assert_eq!(geo.tiered_storage(), None);
+
+        let tiered = parse(&["--tiered-storage"]);
+        assert_eq!(tiered.topic_type(), None);
+        assert_eq!(tiered.tiered_storage(), Some(true));
     }
 
     #[test]

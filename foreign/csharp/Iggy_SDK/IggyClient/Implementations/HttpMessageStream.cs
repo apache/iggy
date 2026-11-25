@@ -169,6 +169,12 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public Task<Page<StreamResponse>> GetStreamsPageAsync(NamedPageQuery query, CancellationToken token = default)
+    {
+        return GetPageAsync<StreamResponse>("/streams", query, token);
+    }
+
+    /// <inheritdoc />
     public async Task<TopicResponse?> CreateTopicAsync(Identifier streamId, string name, uint partitionsCount,
         TopicOptions? options = null, CancellationToken token = default)
     {
@@ -221,6 +227,13 @@ public class HttpMessageStream : IIggyClient
 
         await HandleResponseAsync(response);
         return Array.Empty<TopicResponse>();
+    }
+
+    /// <inheritdoc />
+    public Task<Page<TopicResponse>> GetTopicsPageAsync(Identifier streamId, NamedPageQuery query,
+        CancellationToken token = default)
+    {
+        return GetPageAsync<TopicResponse>($"/streams/{streamId}/topics", query, token);
     }
 
     /// <inheritdoc />
@@ -777,6 +790,14 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public Task<Page<ConsumerGroupResponse>> GetConsumerGroupsPageAsync(Identifier streamId, Identifier topicId,
+        NamedPageQuery query, CancellationToken token = default)
+    {
+        return GetPageAsync<ConsumerGroupResponse>($"/streams/{streamId}/topics/{topicId}/consumer-groups", query,
+            token);
+    }
+
+    /// <inheritdoc />
     public async Task<ConsumerGroupResponse?> GetConsumerGroupByIdAsync(Identifier streamId, Identifier topicId,
         Identifier groupId, CancellationToken token = default)
     {
@@ -922,6 +943,26 @@ public class HttpMessageStream : IIggyClient
         await HandleResponseAsync(response);
 
         return null;
+    }
+
+    /// <inheritdoc />
+    public async Task RetireGeoOriginAsync(string origin, CancellationToken token = default)
+    {
+        ArgumentNullException.ThrowIfNull(origin);
+
+        // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
+        if (origin is "." or "..")
+        {
+            throw new ArgumentException("Geo origin must not be '.' or '..'.", nameof(origin));
+        }
+
+        using var content = new StringContent("{}", Encoding.UTF8, "application/json");
+        var response = await _httpClient.PostAsync($"/geo/origins/{Uri.EscapeDataString(origin)}/retire", content,
+            token);
+        if (!response.IsSuccessStatusCode)
+        {
+            await HandleResponseAsync(response);
+        }
     }
 
     /// <inheritdoc />
@@ -1120,6 +1161,14 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    public Task<Page<PartitionResponse>> GetPartitionsPageAsync(Identifier streamId, Identifier topicId,
+        PageQuery query, CancellationToken token = default)
+    {
+        return GetPageAsync<PartitionResponse>($"/streams/{streamId}/topics/{topicId}/partitions",
+            new NamedPageQuery { Page = query }, token);
+    }
+
+    /// <inheritdoc />
     public async Task<UserResponse?> GetUserAsync(Identifier userId, CancellationToken token = default)
     {
         //TODO - this doesn't work prob needs a custom json serializer
@@ -1145,6 +1194,12 @@ public class HttpMessageStream : IIggyClient
 
         await HandleResponseAsync(response);
         return Array.Empty<UserResponse>();
+    }
+
+    /// <inheritdoc />
+    public Task<Page<UserResponse>> GetUsersPageAsync(NamedPageQuery query, CancellationToken token = default)
+    {
+        return GetPageAsync<UserResponse>("/users", query, token);
     }
 
     /// <inheritdoc />
@@ -1241,10 +1296,16 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    ///     A token the server refuses as unauthenticated (code 40) has no session left to end, as after a password
+    ///     change, so the logout holds and the token is dropped too. Any other 401, such as one from a proxy, still
+    ///     fails. A client that holds no token still gets the refusal.
+    /// </remarks>
     public async Task LogoutUserAsync(CancellationToken token = default)
     {
+        var signedIn = _httpClient.DefaultRequestHeaders.Authorization is not null;
         var response = await _httpClient.DeleteAsync("users/logout", token);
-        if (!response.IsSuccessStatusCode)
+        if (!response.IsSuccessStatusCode && !(signedIn && await IsUnauthenticatedAsync(response, token)))
         {
             await HandleResponseAsync(response);
         }
@@ -1288,7 +1349,15 @@ public class HttpMessageStream : IIggyClient
     /// <inheritdoc />
     public async Task DeletePersonalAccessTokenAsync(string name, CancellationToken token = default)
     {
-        var response = await _httpClient.DeleteAsync($"/personal-access-tokens/{name}", token);
+        ArgumentNullException.ThrowIfNull(name);
+
+        // The URL parser resolves "." and ".." even when percent-encoded, so the request would hit another route.
+        if (name is "." or "..")
+        {
+            throw new ArgumentException("Personal access token name must not be '.' or '..'.", nameof(name));
+        }
+
+        var response = await _httpClient.DeleteAsync($"/personal-access-tokens/{Uri.EscapeDataString(name)}", token);
         if (!response.IsSuccessStatusCode)
         {
             await HandleResponseAsync(response);
@@ -1506,6 +1575,25 @@ public class HttpMessageStream : IIggyClient
         return plaintext;
     }
 
+    /// <summary>
+    ///     Reads one page of a list route, <c>{"items": [...], "next": "pg1_..."}</c>. The query always holds the limit,
+    ///     so the server answers one page and not the bare array of the whole list.
+    /// </summary>
+    private async Task<Page<T>> GetPageAsync<T>(string path, NamedPageQuery query, CancellationToken token)
+    {
+        ArgumentNullException.ThrowIfNull(query);
+        query.Validate();
+        var response = await _httpClient.GetAsync($"{path}?{query.ToHttpQuery()}", token);
+        if (!response.IsSuccessStatusCode)
+        {
+            // A 404 is the not-found error of a missing stream or topic, which TCP raises too. It is not an empty page.
+            await HandleResponseAsync(response, shouldThrowOnGetNotFound: true);
+        }
+
+        return await response.Content.ReadFromJsonAsync<Page<T>>(_jsonSerializerOptions, token)
+               ?? throw new InvalidResponseException("The list page answer is empty.");
+    }
+
     private async Task HandleResponseAsync(HttpResponseMessage response, bool shouldThrowOnGetNotFound = false)
     {
         if (response.IsSuccessStatusCode)
@@ -1539,6 +1627,25 @@ public class HttpMessageStream : IIggyClient
         }
 
         throw error;
+    }
+
+    private async Task<bool> IsUnauthenticatedAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        if (response.StatusCode != HttpStatusCode.Unauthorized)
+        {
+            return false;
+        }
+
+        var body = await response.Content.ReadAsStringAsync(token);
+        try
+        {
+            var error = JsonSerializer.Deserialize<ErrorResponse>(body, _jsonSerializerOptions);
+            return error?.Id == VsrError.UNAUTHENTICATED;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)

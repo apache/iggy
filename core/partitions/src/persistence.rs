@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::FILE_SYNC_CONCURRENCY;
+use crate::FreeSpaceReserve;
 use crate::offset_storage::{OffsetFilePermit, RetainedOffsetFile, RetainedOffsetFiles};
 use futures::future::Either;
 use futures::{FutureExt, TryStreamExt};
@@ -124,6 +125,10 @@ impl<S: DurableStorage> Logs<S> {
             .map(PartitionPrepareJournal::retained_bytes)
             .sum()
     }
+
+    fn reload_bytes(&self) -> u64 {
+        self.each().map(PartitionPrepareJournal::reload_bytes).sum()
+    }
 }
 
 impl<S: DurableStorage + Clone> Logs<S> {
@@ -196,8 +201,6 @@ pub struct PersistenceCompletion {
 
 #[derive(Default)]
 pub struct PersistenceMetrics {
-    pub disk_bytes: u64,
-    pub retained_bytes: u64,
     pub queued_bytes: u64,
     pub in_flight_bytes: u64,
     pub checkpoints_pending: u64,
@@ -250,6 +253,47 @@ impl FileSyncBarrier {
     }
 }
 
+/// Bytes this WAL accepted and has not finished writing. The node's free-space
+/// reserve counts them as pending, because the write sites charge the disk
+/// usage estimate only when a write starts.
+#[derive(Default)]
+struct PendingBytes {
+    bytes: Cell<u64>,
+    reserve: RefCell<Option<Arc<FreeSpaceReserve>>>,
+}
+
+impl PendingBytes {
+    const fn get(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    fn set(&self, bytes: u64) {
+        let previous = self.bytes.replace(bytes);
+        if let Some(reserve) = self.reserve.borrow().as_ref() {
+            if bytes > previous {
+                reserve.add_pending(bytes - previous);
+            } else if bytes < previous {
+                reserve.release_pending(previous - bytes);
+            }
+        }
+    }
+
+    fn report_to(&self, reserve: Option<Arc<FreeSpaceReserve>>) {
+        if let Some(reserve) = &reserve {
+            reserve.add_pending(self.bytes.get());
+        }
+        if let Some(previous) = self.reserve.replace(reserve) {
+            previous.release_pending(self.bytes.get());
+        }
+    }
+}
+
+impl Drop for PendingBytes {
+    fn drop(&mut self) {
+        self.report_to(None);
+    }
+}
+
 pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     group: u64,
     incarnation: u64,
@@ -285,9 +329,12 @@ pub struct PartitionPersistence<S: DurableStorage = crate::WalStorage> {
     capacity: u64,
     disk_bytes: Cell<u64>,
     retained_bytes: Cell<u64>,
+    /// The retained bytes above the checkpoint of either log, which a boot
+    /// loads again.
+    reload_bytes: Cell<u64>,
     segment_checkpoint: Cell<Option<SegmentPosition>>,
-    queued_bytes: Cell<u64>,
-    in_flight_bytes: Cell<u64>,
+    queued_bytes: PendingBytes,
+    in_flight_bytes: PendingBytes,
     waiters: RefCell<Vec<std::task::Waker>>,
     running: Cell<bool>,
     writer_active: Cell<bool>,
@@ -551,6 +598,9 @@ enum Mutation<S: DurableStorage> {
         epoch: u64,
         initial: SegmentPosition,
         max_size: u64,
+        max_age: Option<u64>,
+        /// Whether the segments hold placed batches.
+        placed: bool,
     },
     ReanchorSegments {
         epoch: u64,
@@ -605,7 +655,7 @@ enum Mutation<S: DurableStorage> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     },
 }
 
@@ -726,6 +776,7 @@ impl<S: DurableStorage + Clone> PartitionPersistence<S> {
         let certified_log_view = logs.certified_log_view();
         let disk_bytes = logs.size_bytes();
         let retained_bytes = logs.retained_bytes();
+        let reload_bytes = logs.reload_bytes();
         let segment_checkpoint = journal.segment_checkpoint();
         let segment_references = journal.written_segment_references(0).collect();
         let persistence = Rc::new(Self {
@@ -752,6 +803,7 @@ impl<S: DurableStorage + Clone> PartitionPersistence<S> {
             capacity,
             disk_bytes: Cell::new(disk_bytes),
             retained_bytes: Cell::new(retained_bytes),
+            reload_bytes: Cell::new(reload_bytes),
             segment_checkpoint: Cell::new(segment_checkpoint),
             segment_references: RefCell::new(segment_references),
             holds_commands: Cell::new(holds_commands),
@@ -760,8 +812,8 @@ impl<S: DurableStorage + Clone> PartitionPersistence<S> {
             queue: RefCell::new(VecDeque::new()),
             offset_files: RetainedOffsetFiles::default(),
             accepted: RefCell::new(accepted),
-            queued_bytes: Cell::new(0),
-            in_flight_bytes: Cell::new(0),
+            queued_bytes: PendingBytes::default(),
+            in_flight_bytes: PendingBytes::default(),
             waiters: RefCell::new(Vec::new()),
             running: Cell::new(false),
             writer_active: Cell::new(false),
@@ -890,11 +942,35 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             });
     }
 
-    pub fn enable_segment_storage(&self, initial: SegmentPosition, max_size: u64) {
+    pub fn enable_segment_storage(
+        &self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+    ) {
         self.queue.borrow_mut().push_back(Mutation::EnableSegments {
             epoch: self.epoch.get(),
             initial,
             max_size,
+            max_age,
+            placed: false,
+        });
+    }
+
+    /// [`Self::enable_segment_storage`] for a partition that places its
+    /// batches, whose segments hold placed batches.
+    pub fn enable_placed_segment_storage(
+        &self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+    ) {
+        self.queue.borrow_mut().push_back(Mutation::EnableSegments {
+            epoch: self.epoch.get(),
+            initial,
+            max_size,
+            max_age,
+            placed: true,
         });
     }
 
@@ -948,6 +1024,14 @@ impl<S: DurableStorage> PartitionPersistence<S> {
 
     pub fn is_durable_through(&self, op: u64) -> bool {
         self.is_written_through(op) && op <= self.durable_head.get()
+    }
+
+    /// Reports the queued and in-flight bytes of this WAL to `reserve` as
+    /// pending, whatever the role of the replica: a backup writes what it
+    /// journals to the same disk.
+    pub fn report_pending_bytes_to(&self, reserve: Option<&Arc<FreeSpaceReserve>>) {
+        self.queued_bytes.report_to(reserve.cloned());
+        self.in_flight_bytes.report_to(reserve.cloned());
     }
 
     pub fn has_capacity(&self, frame_bytes: usize) -> bool {
@@ -1245,7 +1329,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     ) {
         self.offset_files.clear();
         self.certified_log_view.set(None);
@@ -1299,10 +1383,23 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 && self.queued_bytes.get() + self.in_flight_bytes.get() < RUN_AHEAD_BYTES_MAX)
     }
 
+    /// Bytes of the WAL on disk and bytes that it retains. Unlike the levels
+    /// of [`Self::take_metrics`], both stay above zero while the writer is
+    /// idle.
+    #[must_use]
+    pub const fn disk_and_retained_bytes(&self) -> (u64, u64) {
+        (self.disk_bytes.get(), self.retained_bytes.get())
+    }
+
+    /// The retained bytes above the checkpoint, which a boot loads into
+    /// memory again.
+    #[must_use]
+    pub const fn reload_bytes(&self) -> u64 {
+        self.reload_bytes.get()
+    }
+
     pub fn take_metrics(&self) -> PersistenceMetrics {
         PersistenceMetrics {
-            disk_bytes: self.disk_bytes.get(),
-            retained_bytes: self.retained_bytes.get(),
             queued_bytes: self.queued_bytes.get(),
             in_flight_bytes: self.in_flight_bytes.get(),
             checkpoints_pending: u64::from(self.checkpoint_pending()),
@@ -1583,6 +1680,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         drop(references);
         self.disk_bytes.set(logs.size_bytes());
         self.retained_bytes.set(logs.retained_bytes());
+        self.reload_bytes.set(logs.reload_bytes());
         self.segment_checkpoint.set(journal.segment_checkpoint());
         let written_head = logs.written_head();
         let durable_head = logs.durable_head();
@@ -1622,8 +1720,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
     ) -> io::Result<()> {
         match mutation {
             Mutation::EnableSegments {
-                initial, max_size, ..
-            } => logs.data.enable_segment_storage(initial, max_size).await,
+                initial,
+                max_size,
+                max_age,
+                placed,
+                ..
+            } => {
+                logs.data
+                    .enable_segment_storage_of(initial, max_size, max_age, placed)
+                    .await
+            }
             Mutation::ReanchorSegments { next_offset, .. } => {
                 logs.data.reanchor_segment_storage(next_offset).await
             }
@@ -1775,7 +1881,7 @@ impl<S: DurableStorage> PartitionPersistence<S> {
         op: u64,
         checksum: Option<u128>,
         prepare: Option<Frozen<4096>>,
-        segments: Option<(SegmentPosition, u64)>,
+        segments: Option<(SegmentPosition, u64, Option<u64>)>,
     ) -> io::Result<()> {
         let (data_prepare, command_prepare) = match prepare {
             Some(prepare)
@@ -1785,9 +1891,16 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             }
             prepare => (prepare, None),
         };
-        if let Some((position, max_size)) = segments {
+        if let Some((position, max_size, max_age)) = segments {
             logs.data
-                .reset_with_segment_checkpoint(op, checksum, data_prepare, position, max_size)
+                .reset_with_segment_checkpoint(
+                    op,
+                    checksum,
+                    data_prepare,
+                    position,
+                    max_size,
+                    max_age,
+                )
                 .await?;
         } else if let Some(prepare) = data_prepare {
             logs.data.reset_with_prepare(prepare).await?;
@@ -2699,45 +2812,72 @@ mod tests {
         assert_eq!(persistence.certified_log_view(), Some(VIEW));
     }
 
-    /// A crash between the two barriers of a command can leave the command
-    /// durable above a data op the data log lost. Nothing from the lost op on
-    /// was acknowledged, so both logs drop it, and what stays is still the
-    /// certified view's history.
-    #[compio::test]
-    async fn given_a_data_op_lost_below_a_durable_command_when_reopened_should_drop_the_tail_and_keep_the_certificate()
-     {
-        const VIEW: u32 = 1;
-        let directory = tempdir().unwrap();
-        let wal = directory.path().join("prepares-7");
+    /// The view that [`crash_between_command_barriers`] certifies.
+    const COMMAND_CRASH_VIEW: u32 = 1;
+
+    /// A WAL certified through op 3, then a crash between the two barriers of
+    /// command 5, which left the command durable. The data op 4 below it is
+    /// in the data log, without a barrier, only if `data_op_written`.
+    async fn crash_between_command_barriers(wal: &Path, data_op_written: bool) {
         let first = prepare(1, 0);
         let second = command(2, first.header().checksum);
         let third = prepare(3, second.header().checksum);
-        let lost = prepare(4, third.header().checksum);
-        let durable = command(5, lost.header().checksum);
-        let (persistence, _) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+        let unsynced = prepare(4, third.header().checksum);
+        let durable = command(5, unsynced.header().checksum);
+        let (persistence, _) = PartitionPersistence::open(wal, 42, 7).await.unwrap();
         write(
             &persistence,
             &[(&first, true), (&second, true), (&third, true)],
         )
         .await;
         persistence.checkpoint(2);
-        assert!(!persistence.certify_log_view(VIEW, 3, third.header().checksum));
+        assert!(!persistence.certify_log_view(COMMAND_CRASH_VIEW, 3, third.header().checksum));
         assert!(persistence.start());
         Rc::clone(&persistence).run().await;
         assert_eq!(persistence.checkpoint_op(), 2);
-        assert_eq!(persistence.certified_log_view(), Some(VIEW));
+        assert_eq!(persistence.certified_log_view(), Some(COMMAND_CRASH_VIEW));
         drop(persistence);
 
-        let (mut data, mut commands) = open_raw_logs(&wal).await;
-        data.append_buffered(lost.into_frozen()).await.unwrap();
+        let (mut data, mut commands) = open_raw_logs(wal).await;
+        if data_op_written {
+            data.append_buffered(unsynced.into_frozen()).await.unwrap();
+        }
         commands.append(durable.into_frozen()).await.unwrap();
-        drop((data, commands));
+    }
+
+    /// A power loss between the two barriers of a command can leave the
+    /// command durable above a data op the data log lost. Nothing from the
+    /// lost op on was acknowledged, so both logs drop it, and what stays is
+    /// still the certified view's history.
+    #[compio::test]
+    async fn given_a_data_op_lost_below_a_durable_command_when_reopened_should_drop_the_tail_and_keep_the_certificate()
+     {
+        let directory = tempdir().unwrap();
+        let wal = directory.path().join("prepares-7");
+        crash_between_command_barriers(&wal, false).await;
 
         for _ in 0..2 {
             let (persistence, prepares) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
             assert_eq!(ops(&prepares), vec![2, 3]);
             assert_eq!(persistence.head(), 3);
-            assert_eq!(persistence.certified_log_view(), Some(VIEW));
+            assert_eq!(persistence.certified_log_view(), Some(COMMAND_CRASH_VIEW));
+        }
+    }
+
+    /// The same crash of the process alone: the OS still holds the data op,
+    /// so no gap opens below the command and both logs keep their records.
+    #[compio::test]
+    async fn given_an_unsynced_data_op_below_a_durable_command_when_reopened_should_keep_both_logs()
+    {
+        let directory = tempdir().unwrap();
+        let wal = directory.path().join("prepares-7");
+        crash_between_command_barriers(&wal, true).await;
+
+        for _ in 0..2 {
+            let (persistence, prepares) = PartitionPersistence::open(&wal, 42, 7).await.unwrap();
+            assert_eq!(ops(&prepares), vec![2, 3, 4, 5]);
+            assert_eq!(persistence.head(), 5);
+            assert_eq!(persistence.certified_log_view(), Some(COMMAND_CRASH_VIEW));
         }
     }
 

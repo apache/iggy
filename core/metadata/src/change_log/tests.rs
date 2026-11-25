@@ -23,10 +23,11 @@ use crate::stm::consumer_group::{
     CompleteConsumerGroupRevocationRequest, JoinConsumerGroupRequest, LeaveConsumerGroupRequest,
 };
 use crate::stm::lifecycle::{CompleteLifecycleRequest, LifecycleCompletion};
+use crate::stm::shadow::{ShadowStream, ShadowTopicRequest};
 use crate::stm::stream::Streams;
 use crate::stm::user::{
-    CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, PAT_TOKEN_HASH_BYTES,
-    ROOT_USER_CREATED_AT_MICROS, Users,
+    ChangePasswordRequest, CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest,
+    PAT_TOKEN_HASH_BYTES, ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS, Users,
 };
 use consensus::{CLIENTS_TABLE_MAX, ClientTable, EXPIRED_SESSION_REQUEST_ID};
 use iggy_binary_protocol::primitives::metadata_changes::{
@@ -55,10 +56,9 @@ use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest, DeleteTopicRequest,
     UpdateTopicResolvedRequest,
 };
-use iggy_binary_protocol::requests::users::login_register::RegisterRequest;
+use iggy_binary_protocol::requests::users::login_register::{CredentialProof, RegisterRequest};
 use iggy_binary_protocol::requests::users::{
-    ChangePasswordRequest, CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest,
-    UpdateUserResolvedRequest,
+    CreateUserRequest, DeleteUserRequest, UpdatePermissionsRequest, UpdateUserResolvedRequest,
 };
 use iggy_binary_protocol::responses::system::{GetMetadataChangesResponse, WireMetadataItem};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader, WireEncode, WireIdentifier};
@@ -110,6 +110,36 @@ fn given_created_stream_when_applying_should_record_its_identity_and_public_opti
             options: read_projection(OptionsScope::Stream, &stream.options),
         })]
     );
+}
+
+#[test]
+fn given_a_shadow_stream_when_created_should_record_its_origin_as_a_derived_option() {
+    let harness = Harness::new();
+    let committed = harness.commit(
+        SERVER,
+        Operation::ShadowTopic,
+        &ShadowTopicRequest::CreateStream {
+            source: ShadowStream {
+                origin: "dc-a".to_owned(),
+                cluster_uid: 0x0a0a,
+                stream_id: 7,
+            },
+            name: name("__shadow_dc-a_orders"),
+        },
+    );
+
+    let changes = decoded(&committed);
+    let [WireMetadataChange::StreamCreated(body)] = changes.as_slice() else {
+        panic!("one stream created: {changes:?}");
+    };
+    let WireChangeOptions::Readable { derived, .. } = &body.options else {
+        panic!("readable options: {:?}", body.options);
+    };
+    let origin = derived
+        .iter()
+        .find(|entry| entry.key == b"shadow_origin")
+        .expect("the origin is reported");
+    assert_eq!(origin.value, b"dc-a");
 }
 
 #[test]
@@ -1075,10 +1105,11 @@ fn given_deleted_user_and_changed_password_when_applying_should_record_identity_
         key: WireUserKey::from(&alice),
         username: name("alice"),
     };
-    let change_password = |new_password: &str| ChangePasswordRequest {
+    let change_password = |password_hash: &str| ChangePasswordRequest {
         user_id: WireIdentifier::numeric(ALICE),
-        current_password: String::new(),
-        new_password: new_password.to_owned(),
+        access_revision: alice.access_revision,
+        keep_session: true,
+        password_hash: password_hash.to_owned(),
     };
 
     let refused = harness.commit(ROOT_CALLER, Operation::ChangePassword, &change_password(""));
@@ -1236,7 +1267,11 @@ fn given_personal_access_tokens_when_created_and_deleted_should_record_names_wit
 fn given_first_registration_when_applying_should_record_session_with_its_epoch() {
     let harness = Harness::new();
 
-    let committed = harness.commit_register(CLIENT_A, ROOT, ROOT_USER_CREATED_AT_MICROS);
+    let committed = harness.commit_register(
+        CLIENT_A,
+        ROOT,
+        CredentialProof::account(ROOT_USER_CREATED_AT_MICROS, ROOT_USER_ACCESS_REVISION),
+    );
     let op = harness.last_op();
 
     assert_eq!(harness.client_table.borrow().get_epoch(CLIENT_A), Some(op));
@@ -1255,7 +1290,11 @@ fn given_first_registration_when_applying_should_record_session_with_its_epoch()
 fn given_unauthenticated_register_when_applying_should_record_nothing() {
     let harness = Harness::new();
 
-    let committed = harness.commit_register(CLIENT_A, ROOT, ROOT_USER_CREATED_AT_MICROS + 1);
+    let committed = harness.commit_register(
+        CLIENT_A,
+        ROOT,
+        CredentialProof::account(ROOT_USER_CREATED_AT_MICROS + 1, ROOT_USER_ACCESS_REVISION),
+    );
 
     assert_eq!(committed, NO_CHANGES);
     assert!(!harness.client_table.borrow().contains(CLIENT_A));
@@ -1266,7 +1305,11 @@ fn given_retried_register_when_applying_should_record_nothing_and_keep_epoch() {
     let harness = Harness::new();
     let epoch = harness.register(CLIENT_A, ROOT);
 
-    let retried = harness.commit_register(CLIENT_A, ROOT, ROOT_USER_CREATED_AT_MICROS);
+    let retried = harness.commit_register(
+        CLIENT_A,
+        ROOT,
+        CredentialProof::account(ROOT_USER_CREATED_AT_MICROS, ROOT_USER_ACCESS_REVISION),
+    );
 
     assert_eq!(retried, NO_CHANGES);
     assert_eq!(
@@ -1482,6 +1525,9 @@ fn given_state_when_paging_one_item_at_a_time_should_equal_one_page_in_group_and
     );
     let session = harness.register(CLIENT_A, ALICE);
     harness.join(CLIENT_A, session);
+    // A second member makes the walk continue inside the group of its cursor.
+    let second = harness.register(CLIENT_B, ALICE);
+    harness.join(CLIENT_B, second);
     harness.commit(
         ROOT_CALLER,
         Operation::CreatePersonalAccessToken,
@@ -1506,10 +1552,10 @@ fn given_state_when_paging_one_item_at_a_time_should_equal_one_page_in_group_and
     assert_eq!(count(WireMetadataChangeGroup::Topics), 1);
     assert_eq!(count(WireMetadataChangeGroup::Partitions), 1);
     assert_eq!(count(WireMetadataChangeGroup::ConsumerGroups), 2);
-    assert_eq!(count(WireMetadataChangeGroup::ConsumerGroupMembers), 1);
+    assert_eq!(count(WireMetadataChangeGroup::ConsumerGroupMembers), 2);
     assert_eq!(count(WireMetadataChangeGroup::Users), 2);
     assert_eq!(count(WireMetadataChangeGroup::PersonalAccessTokens), 1);
-    assert_eq!(count(WireMetadataChangeGroup::Sessions), 2);
+    assert_eq!(count(WireMetadataChangeGroup::Sessions), 3);
 }
 
 #[test]
@@ -1855,6 +1901,14 @@ impl Harness {
         self.op.get()
     }
 
+    /// The op that created the live token `token` of `user_id`.
+    fn token_id(&self, user_id: u32, token: &str) -> u64 {
+        self.mux
+            .users()
+            .read(|users| users.token_id_of(user_id, token))
+            .expect("live token")
+    }
+
     fn commit(
         &self,
         caller: Caller,
@@ -1959,7 +2013,7 @@ impl Harness {
         &self,
         client: u128,
         user_id: u32,
-        user_created_at: u64,
+        credential: CredentialProof,
     ) -> Vec<AppliedChange> {
         self.commit(
             Caller {
@@ -1969,16 +2023,21 @@ impl Harness {
             },
             Operation::Register,
             &RegisterRequest {
-                user_created_at,
+                credential,
                 bind_verifier: [0x5a; 32],
             },
         )
     }
 
-    /// Registers `client` for `user_id` and returns its session epoch.
+    /// Registers `client` for `user_id` with a password proof and returns its
+    /// session epoch.
     fn register(&self, client: u128, user_id: u32) -> u64 {
-        let user_created_at = self.user(user_id).created_at.as_micros();
-        self.commit_register(client, user_id, user_created_at);
+        let user = self.user(user_id);
+        self.commit_register(
+            client,
+            user_id,
+            CredentialProof::account(user.created_at.as_micros(), user.access_revision),
+        );
         self.client_table
             .borrow()
             .get_epoch(client)
@@ -2028,7 +2087,12 @@ impl Harness {
     fn stream(&self, stream_id: usize) -> Stream {
         self.mux
             .streams()
-            .read(|streams| streams.items.get(stream_id).cloned())
+            .read(|streams| {
+                streams
+                    .items
+                    .get(stream_id)
+                    .map(|stream| stream.as_ref().clone())
+            })
             .expect("stream exists")
     }
 
@@ -2214,5 +2278,711 @@ fn topic_grant(stream_id: u32, topic_id: u32) -> WirePermissions {
                 send_messages: false,
             }],
         }],
+    }
+}
+
+#[test]
+fn given_two_sessions_when_password_changes_should_end_both_sessions() {
+    let harness = Harness::new();
+    let root_session = harness
+        .client_table
+        .borrow()
+        .get_epoch(ROOT_CLIENT)
+        .expect("root session");
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let first = harness.register(CLIENT_A, ALICE);
+    let second = harness.register(CLIENT_B, ALICE);
+    let alice = harness.user(ALICE);
+    assert_eq!(harness.client_table.borrow().active_sessions().count(), 3);
+
+    let changed = harness.commit(
+        ROOT_CALLER,
+        Operation::ChangePassword,
+        &ChangePasswordRequest {
+            user_id: WireIdentifier::numeric(ALICE),
+            access_revision: alice.access_revision,
+            keep_session: true,
+            password_hash: "new-hash".to_owned(),
+        },
+    );
+
+    let key = WireUserKey::from(&alice);
+    assert_eq!(
+        decoded(&changed),
+        [
+            WireMetadataChange::UserPasswordChanged(WireUserIdentityBody {
+                key,
+                username: name("alice"),
+            }),
+            WireMetadataChange::SessionClosed(WireSessionClosedBody {
+                user: key,
+                client_id: CLIENT_A,
+                session: first,
+                reason: WireSessionClosedReason::Revoked,
+            }),
+            WireMetadataChange::SessionClosed(WireSessionClosedBody {
+                user: key,
+                client_id: CLIENT_B,
+                session: second,
+                reason: WireSessionClosedReason::Revoked,
+            }),
+        ]
+    );
+    assert_eq!(
+        harness
+            .client_table
+            .borrow()
+            .active_sessions()
+            .collect::<Vec<_>>(),
+        [(ROOT_CLIENT, ROOT, root_session)]
+    );
+    assert!(
+        harness.user(ALICE).access_revision > alice.access_revision,
+        "a password change is a credential boundary"
+    );
+}
+
+#[test]
+fn given_change_verified_at_an_older_revision_when_committed_should_refuse_without_ending_sessions()
+{
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let alice = harness.user(ALICE);
+    let change = |password_hash: &str| ChangePasswordRequest {
+        user_id: WireIdentifier::numeric(ALICE),
+        access_revision: alice.access_revision,
+        keep_session: true,
+        password_hash: password_hash.to_owned(),
+    };
+    harness.commit(
+        ROOT_CALLER,
+        Operation::ChangePassword,
+        &change("first-hash"),
+    );
+    let session = harness.register(CLIENT_A, ALICE);
+    let revised = harness.user(ALICE);
+
+    let stale = harness.commit(
+        ROOT_CALLER,
+        Operation::ChangePassword,
+        &change("stale-hash"),
+    );
+
+    assert_eq!(stale, NO_CHANGES);
+    let current = harness.user(ALICE);
+    assert_eq!(&*current.password_hash, "first-hash");
+    assert_eq!(current.access_revision, revised.access_revision);
+    assert_eq!(
+        harness
+            .client_table
+            .borrow()
+            .active_sessions()
+            .filter(|(_, user_id, _)| *user_id == ALICE)
+            .collect::<Vec<_>>(),
+        [(CLIENT_A, ALICE, session)]
+    );
+}
+
+#[test]
+fn given_session_proved_before_password_change_when_registering_should_refuse() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let before = harness.user(ALICE);
+    harness.commit(
+        ROOT_CALLER,
+        Operation::ChangePassword,
+        &ChangePasswordRequest {
+            user_id: WireIdentifier::numeric(ALICE),
+            access_revision: before.access_revision,
+            keep_session: true,
+            password_hash: "new-hash".to_owned(),
+        },
+    );
+
+    let stale = harness.commit_register(
+        CLIENT_A,
+        ALICE,
+        CredentialProof::account(before.created_at.as_micros(), before.access_revision),
+    );
+
+    assert_eq!(stale, NO_CHANGES);
+    assert!(!harness.client_table.borrow().contains(CLIENT_A));
+    harness.register(CLIENT_A, ALICE);
+    assert!(harness.client_table.borrow().contains(CLIENT_A));
+}
+
+#[test]
+fn given_sessions_of_two_tokens_and_a_password_when_one_token_is_deleted_should_end_only_its_sessions()
+ {
+    const CLIENT_C: u128 = 103;
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    for (token, hash) in [("ci", b'c'), ("deploy", b'd')] {
+        harness.commit(
+            ROOT_CALLER,
+            Operation::CreatePersonalAccessToken,
+            &CreatePersonalAccessTokenRequest {
+                user_id: ALICE,
+                name: name(token),
+                expiry: 0,
+                token_hash: [hash; PAT_TOKEN_HASH_BYTES],
+            },
+        );
+    }
+    let alice = harness.user(ALICE);
+    let created_at = alice.created_at.as_micros();
+    let ci = harness.token_id(ALICE, "ci");
+    let deploy = harness.token_id(ALICE, "deploy");
+    harness.commit_register(CLIENT_A, ALICE, CredentialProof::token(created_at, ci));
+    harness.commit_register(CLIENT_B, ALICE, CredentialProof::token(created_at, deploy));
+    let password = harness.register(CLIENT_C, ALICE);
+    let ci_session = harness
+        .client_table
+        .borrow()
+        .get_epoch(CLIENT_A)
+        .expect("ci");
+    let deploy_session = harness
+        .client_table
+        .borrow()
+        .get_epoch(CLIENT_B)
+        .expect("deploy");
+
+    let deleted = harness.commit(
+        ROOT_CALLER,
+        Operation::DeletePersonalAccessToken,
+        &DeletePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("ci"),
+            only_if_expired: false,
+        },
+    );
+
+    let key = WireUserKey::from(&alice);
+    assert_eq!(
+        decoded(&deleted),
+        [
+            WireMetadataChange::PersonalAccessTokenDeleted(WireTokenDeletedBody {
+                user: key,
+                name: name("ci"),
+                reason: WireTokenDeletedReason::Deleted,
+            }),
+            WireMetadataChange::SessionClosed(WireSessionClosedBody {
+                user: key,
+                client_id: CLIENT_A,
+                session: ci_session,
+                reason: WireSessionClosedReason::Revoked,
+            }),
+        ]
+    );
+    assert_eq!(
+        harness
+            .client_table
+            .borrow()
+            .active_sessions()
+            .filter(|(_, user_id, _)| *user_id == ALICE)
+            .collect::<Vec<_>>(),
+        [
+            (CLIENT_B, ALICE, deploy_session),
+            (CLIENT_C, ALICE, password)
+        ]
+    );
+}
+
+#[test]
+fn given_deleted_token_when_a_same_name_replacement_exists_should_refuse_only_the_old_proof() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let create = |hash: u8| CreatePersonalAccessTokenRequest {
+        user_id: ALICE,
+        name: name("ci"),
+        expiry: 0,
+        token_hash: [hash; PAT_TOKEN_HASH_BYTES],
+    };
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &create(b'o'),
+    );
+    let old = harness.token_id(ALICE, "ci");
+    harness.commit(
+        ROOT_CALLER,
+        Operation::DeletePersonalAccessToken,
+        &DeletePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("ci"),
+            only_if_expired: false,
+        },
+    );
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &create(b'n'),
+    );
+    let replacement = harness.token_id(ALICE, "ci");
+    let created_at = harness.user(ALICE).created_at.as_micros();
+
+    let refused = harness.commit_register(CLIENT_A, ALICE, CredentialProof::token(created_at, old));
+    harness.commit_register(
+        CLIENT_B,
+        ALICE,
+        CredentialProof::token(created_at, replacement),
+    );
+
+    assert_ne!(old, replacement);
+    assert_eq!(refused, NO_CHANGES);
+    assert!(!harness.client_table.borrow().contains(CLIENT_A));
+    assert!(harness.client_table.borrow().contains(CLIENT_B));
+}
+
+#[test]
+fn given_token_session_write_prepared_after_the_token_expired_when_committing_should_refuse_it() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    // Each op is stamped op * 1000 micros, so the token expires between the two writes.
+    let token = |token_name: &str, expiry| CreatePersonalAccessTokenRequest {
+        user_id: ALICE,
+        name: name(token_name),
+        expiry,
+        token_hash: [token_name.as_bytes()[0]; PAT_TOKEN_HASH_BYTES],
+    };
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &token("ci", 2_500),
+    );
+    let created_at = harness.user(ALICE).created_at.as_micros();
+    let token_id = harness.token_id(ALICE, "ci");
+    harness.commit_register(
+        CLIENT_A,
+        ALICE,
+        CredentialProof::token(created_at, token_id),
+    );
+    let token_session = harness
+        .client_table
+        .borrow()
+        .get_epoch(CLIENT_A)
+        .expect("live");
+    let caller = |client, session| Caller {
+        client,
+        user_id: ALICE,
+        session,
+    };
+
+    harness.commit(
+        caller(CLIENT_A, token_session),
+        Operation::CreatePersonalAccessToken,
+        &token("before", 0),
+    );
+    let password_session = harness.register(CLIENT_B, ALICE);
+    harness.commit(
+        caller(CLIENT_A, token_session),
+        Operation::CreatePersonalAccessToken,
+        &token("after", 0),
+    );
+    harness.commit(
+        caller(CLIENT_B, password_session),
+        Operation::CreatePersonalAccessToken,
+        &token("password", 0),
+    );
+
+    let live = |token_name| {
+        harness
+            .mux
+            .users()
+            .read(|users| users.token_id_of(ALICE, token_name))
+            .is_some()
+    };
+    assert!(
+        live("before"),
+        "a write prepared while the token lived commits"
+    );
+    assert!(
+        !live("after"),
+        "a write prepared after the token expired is refused"
+    );
+    assert!(
+        live("password"),
+        "a password session of the same user is untouched"
+    );
+}
+
+#[test]
+fn given_token_expired_at_the_prepare_timestamp_when_registering_should_refuse_and_cleaner_should_end_sessions()
+ {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    // Each op is stamped op * 1000 micros, so these tokens expire between ops.
+    for (token, expiry) in [("short", 500), ("hour", 2_500)] {
+        harness.commit(
+            ROOT_CALLER,
+            Operation::CreatePersonalAccessToken,
+            &CreatePersonalAccessTokenRequest {
+                user_id: ALICE,
+                name: name(token),
+                expiry,
+                token_hash: [token.as_bytes()[0]; PAT_TOKEN_HASH_BYTES],
+            },
+        );
+    }
+    let created_at = harness.user(ALICE).created_at.as_micros();
+    let short = harness.token_id(ALICE, "short");
+    let hour = harness.token_id(ALICE, "hour");
+
+    let expired =
+        harness.commit_register(CLIENT_A, ALICE, CredentialProof::token(created_at, short));
+    harness.commit_register(CLIENT_B, ALICE, CredentialProof::token(created_at, hour));
+    let session = harness
+        .client_table
+        .borrow()
+        .get_epoch(CLIENT_B)
+        .expect("live");
+    let cleaned = harness.commit(
+        SERVER,
+        Operation::DeletePersonalAccessToken,
+        &DeletePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("hour"),
+            only_if_expired: true,
+        },
+    );
+
+    assert_eq!(expired, NO_CHANGES);
+    assert!(!harness.client_table.borrow().contains(CLIENT_A));
+    let key = WireUserKey::from(&harness.user(ALICE));
+    assert_eq!(
+        decoded(&cleaned),
+        [
+            WireMetadataChange::PersonalAccessTokenDeleted(WireTokenDeletedBody {
+                user: key,
+                name: name("hour"),
+                reason: WireTokenDeletedReason::Expired,
+            }),
+            WireMetadataChange::SessionClosed(WireSessionClosedBody {
+                user: key,
+                client_id: CLIENT_B,
+                session,
+                reason: WireSessionClosedReason::Revoked,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn given_password_proof_from_before_deactivation_when_reactivated_should_refuse_it() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let before = harness.user(ALICE);
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &CreatePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("build"),
+            expiry: 0,
+            token_hash: [b'a'; PAT_TOKEN_HASH_BYTES],
+        },
+    );
+    let token_id = harness.token_id(ALICE, "build");
+    let status = |status: UserStatus| UpdateUserResolvedRequest {
+        user_id: WireIdentifier::numeric(ALICE),
+        username: None,
+        status: Some(status.as_code()),
+        explicit_options: WireOptions::empty(),
+        derived_options: WireOptions::empty(),
+    };
+    let unrelated = UpdateUserResolvedRequest {
+        username: Some(name("alicia")),
+        status: None,
+        ..status(UserStatus::Active)
+    };
+
+    harness.commit(ROOT_CALLER, Operation::UpdateUserResolved, &unrelated);
+    let renamed = harness.user(ALICE);
+    let deactivation = harness.commit(
+        ROOT_CALLER,
+        Operation::UpdateUserResolved,
+        &status(UserStatus::Inactive),
+    );
+    let deactivated_at = harness.last_op();
+    let inactive_rename = UpdateUserResolvedRequest {
+        username: Some(name("alicja")),
+        status: None,
+        ..status(UserStatus::Active)
+    };
+    let inactive_patch =
+        harness.commit(ROOT_CALLER, Operation::UpdateUserResolved, &inactive_rename);
+    let inactive_revision = harness.user(ALICE).access_revision;
+    harness.commit(
+        ROOT_CALLER,
+        Operation::UpdateUserResolved,
+        &status(UserStatus::Active),
+    );
+    let reactivated_at = harness.last_op();
+    let stale = harness.commit_register(
+        CLIENT_A,
+        ALICE,
+        CredentialProof::account(before.created_at.as_micros(), before.access_revision),
+    );
+
+    assert!(decoded(&deactivation).iter().any(|record| matches!(record, WireMetadataChange::PersonalAccessTokenDeleted(body) if body.name == name("build"))));
+    let token = harness.commit_register(
+        CLIENT_B,
+        ALICE,
+        CredentialProof::token(before.created_at.as_micros(), token_id),
+    );
+    assert_eq!(token, NO_CHANGES);
+    assert!(!harness.client_table.borrow().contains(CLIENT_B));
+    assert_eq!(renamed.access_revision, before.access_revision);
+    assert_eq!(inactive_revision, deactivated_at);
+    assert!(
+        !decoded(&inactive_patch).iter().any(|record| matches!(
+            record,
+            WireMetadataChange::SessionClosed(_)
+                | WireMetadataChange::PersonalAccessTokenDeleted(_)
+        )),
+        "a patch of an inactive user revokes nothing"
+    );
+    assert_eq!(harness.user(ALICE).access_revision, reactivated_at);
+    assert_eq!(stale, NO_CHANGES);
+    assert!(!harness.client_table.borrow().contains(CLIENT_A));
+}
+
+#[test]
+fn given_session_deleting_its_own_token_when_restoring_the_table_should_keep_the_receipt() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &CreatePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("ci"),
+            expiry: 0,
+            token_hash: [b'c'; PAT_TOKEN_HASH_BYTES],
+        },
+    );
+    let alice = harness.user(ALICE);
+    let token = harness.token_id(ALICE, "ci");
+    harness.commit_register(
+        CLIENT_A,
+        ALICE,
+        CredentialProof::token(alice.created_at.as_micros(), token),
+    );
+    let session = harness
+        .client_table
+        .borrow()
+        .get_epoch(CLIENT_A)
+        .expect("live");
+    let caller = Caller {
+        client: CLIENT_A,
+        user_id: ALICE,
+        session,
+    };
+
+    harness.commit(
+        caller,
+        Operation::DeletePersonalAccessToken,
+        &DeletePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("ci"),
+            only_if_expired: false,
+        },
+    );
+
+    let ended_at = harness.last_op();
+    let table = harness.client_table.borrow();
+    assert_eq!(
+        table
+            .active_sessions()
+            .filter(|(client, ..)| *client == CLIENT_A)
+            .count(),
+        0
+    );
+    let reply = table
+        .get_reply(CLIENT_A)
+        .expect("receipt retained")
+        .header();
+    assert_eq!(
+        (reply.operation, reply.commit),
+        (Operation::DeletePersonalAccessToken, ended_at)
+    );
+    let restored = ClientTable::from_snapshot(table.to_snapshot()).expect("the receipt restores");
+    assert_eq!(restored.token_id(CLIENT_A), token);
+    let transferred = ClientTable::decode(&table.encode()).expect("the receipt transfers");
+    assert_eq!(transferred.token_id(CLIENT_A), token);
+}
+
+#[test]
+fn given_two_sessions_when_one_changes_its_own_password_should_keep_it_and_end_the_other() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let submitter = harness.register(CLIENT_A, ALICE);
+    let other = harness.register(CLIENT_B, ALICE);
+    let alice = harness.user(ALICE);
+    let caller = Caller {
+        client: CLIENT_A,
+        user_id: ALICE,
+        session: submitter,
+    };
+
+    let changed = harness.commit(
+        caller,
+        Operation::ChangePassword,
+        &ChangePasswordRequest {
+            user_id: WireIdentifier::numeric(ALICE),
+            access_revision: alice.access_revision,
+            keep_session: true,
+            password_hash: "new-hash".to_owned(),
+        },
+    );
+
+    let key = WireUserKey::from(&alice);
+    assert_eq!(
+        decoded(&changed),
+        [
+            WireMetadataChange::UserPasswordChanged(WireUserIdentityBody {
+                key,
+                username: name("alice"),
+            }),
+            WireMetadataChange::SessionClosed(WireSessionClosedBody {
+                user: key,
+                client_id: CLIENT_B,
+                session: other,
+                reason: WireSessionClosedReason::Revoked,
+            }),
+        ]
+    );
+    assert_eq!(
+        harness
+            .client_table
+            .borrow()
+            .active_sessions()
+            .filter(|(_, user_id, _)| *user_id == ALICE)
+            .collect::<Vec<_>>(),
+        [(CLIENT_A, ALICE, submitter)]
+    );
+}
+
+#[test]
+fn given_a_token_session_when_the_password_changes_should_end_it_and_keep_the_token() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreatePersonalAccessToken,
+        &CreatePersonalAccessTokenRequest {
+            user_id: ALICE,
+            name: name("ci"),
+            expiry: 0,
+            token_hash: [b'c'; PAT_TOKEN_HASH_BYTES],
+        },
+    );
+    let alice = harness.user(ALICE);
+    let token = CredentialProof::token(alice.created_at.as_micros(), harness.token_id(ALICE, "ci"));
+    harness.commit_register(CLIENT_A, ALICE, token);
+
+    harness.commit(
+        ROOT_CALLER,
+        Operation::ChangePassword,
+        &ChangePasswordRequest {
+            user_id: WireIdentifier::numeric(ALICE),
+            access_revision: alice.access_revision,
+            keep_session: true,
+            password_hash: "new-hash".to_owned(),
+        },
+    );
+
+    assert_eq!(harness.client_table.borrow().get_epoch(CLIENT_A), None);
+    assert_eq!(harness.token_id(ALICE, "ci"), token.token_id);
+    harness.commit_register(CLIENT_B, ALICE, token);
+    assert!(
+        harness.client_table.borrow().get_epoch(CLIENT_B).is_some(),
+        "the token opens a new session after the change"
+    );
+}
+
+#[test]
+fn given_http_self_rotation_when_checkpointing_should_retain_its_receipt_and_end_its_session() {
+    let harness = Harness::new();
+    harness.commit(
+        ROOT_CALLER,
+        Operation::CreateUser,
+        &create_user("alice", None),
+    );
+    let session = harness.register(CLIENT_A, ALICE);
+    let caller = Caller {
+        client: CLIENT_A,
+        user_id: ALICE,
+        session,
+    };
+    let account = harness.user(ALICE);
+    harness.commit(
+        caller,
+        Operation::ChangePassword,
+        &ChangePasswordRequest {
+            user_id: WireIdentifier::numeric(ALICE),
+            access_revision: account.access_revision,
+            keep_session: false,
+            password_hash: "new-hash".to_owned(),
+        },
+    );
+    let table = harness.client_table.borrow();
+    for restored in [
+        ClientTable::from_snapshot(table.to_snapshot()).expect("the checkpoint restores"),
+        ClientTable::decode(&table.encode()).expect("the transfer decodes"),
+    ] {
+        assert_eq!(restored.get_epoch(CLIENT_A), None);
+        assert_eq!(
+            restored
+                .get_reply(CLIENT_A)
+                .expect("the receipt of the change")
+                .header()
+                .operation,
+            Operation::ChangePassword
+        );
     }
 }

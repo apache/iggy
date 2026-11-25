@@ -28,6 +28,7 @@ use ext_php_rs::{
     zend::{ClassEntry, ExecutorGlobals, ce},
 };
 use iggy::prelude::{IggyError, ReadError};
+use serde_json::Value;
 
 use crate::receive_message::PollingStrategy;
 
@@ -136,15 +137,16 @@ impl ReadException {
     }
 
     /// For a message that does not decode: the continuation after it. The reader reads the
-    /// message again until a seek of its partition to this continuation skips it. For a lost
-    /// range: the continuation after the last offset of `lost`. Null for every other error.
+    /// message again until a seek of its partition to this continuation skips it. Null for
+    /// every other error.
     #[php(getter)]
     pub fn skip(&self) -> Option<PollingStrategy> {
         self.skip.clone()
     }
 
     /// Whether the reader stopped the partition after six refusals in a row that a retry does
-    /// not change, such as Unauthorized (41). A seek of the partition reads it again.
+    /// not change, such as Unauthorized (41), or after one TieredReadFailed (96). A seek of the
+    /// partition reads it again.
     #[php(getter, change_case = "snake_case")]
     pub fn is_lasting_refusal(&self) -> bool {
         self.lasting_refusal
@@ -152,7 +154,10 @@ impl ReadException {
 
     /// For messages that a lost read committed and that the reader could not read again: their
     /// first and last offset, as [first, last]. The code is then FetchProgressUncertain
-    /// (14010). Null for every other error.
+    /// (14010). Null for every other error. This error stops nothing and needs no seek. A
+    /// batch that the reader holds after the range comes next, and a seek before the
+    /// application takes it drops it. If the reader stopped the partition, the error that
+    /// stopped it comes after that batch.
     #[php(getter)]
     pub fn lost(&self) -> Option<Vec<u64>> {
         self.lost.map(|(first, last)| vec![first, last])
@@ -180,6 +185,9 @@ pub(crate) fn to_php_exception(error: impl IntoPhpException) -> PhpException {
 
 impl IntoPhpException for IggyError {
     fn into_php_exception(self) -> PhpException {
+        if let Some(refusal) = HttpOptionRefusal::from_error(&self) {
+            return refusal.into_php_exception();
+        }
         let message = self.to_string();
         let code = self.as_code() as i32;
 
@@ -220,6 +228,52 @@ impl IntoPhpException for String {
 impl IntoPhpException for &str {
     fn into_php_exception(self) -> PhpException {
         PhpException::from_class::<IggyException>(self.to_string())
+    }
+}
+
+/// An option refusal read from the JSON error body of the HTTP API, so that HTTP throws it with
+/// the code a binary transport throws.
+struct HttpOptionRefusal {
+    error: IggyError,
+    reason: String,
+}
+
+impl HttpOptionRefusal {
+    fn from_error(error: &IggyError) -> Option<Self> {
+        let IggyError::HttpResponseError(_, body) = error else {
+            return None;
+        };
+        let body: Value = serde_json::from_str(body).ok()?;
+        let id = u32::try_from(body.get("id")?.as_u64()?).ok()?;
+        let refused = IggyError::from_code(id);
+        let is_option_refusal = matches!(
+            refused,
+            IggyError::UnsupportedOptionKey(_)
+                | IggyError::InvalidOptionValue(_)
+                | IggyError::OptionsBlockTooLarge(_)
+                | IggyError::OptionNotUpdatable(_)
+                | IggyError::OptionNotResettable(_)
+                | IggyError::ReadOnlyOption(_)
+                | IggyError::StreamEncryptionUnavailable
+                | IggyError::UnsupportedCriticalOption(_)
+                | IggyError::CannotModifyRootUser
+                | IggyError::InvalidReplicationFactor
+        );
+        if !is_option_refusal {
+            return None;
+        }
+        let reason = body.get("reason")?.as_str()?.to_owned();
+        Some(Self {
+            error: refused,
+            reason,
+        })
+    }
+}
+
+impl IntoPhpException for HttpOptionRefusal {
+    fn into_php_exception(self) -> PhpException {
+        let code = self.error.as_code() as i32;
+        PhpException::new(self.reason, code, exception_class(&self.error))
     }
 }
 
@@ -378,6 +432,50 @@ impl From<&IggyError> for PhpExceptionKind {
 mod tests {
     use super::*;
     use iggy::prelude::PollingStrategy as RustPollingStrategy;
+    use serde_json::json;
+
+    /// `error` as the HTTP client returns it, rendered into the JSON error body.
+    fn http_error(status: u16, error: &IggyError) -> IggyError {
+        let body = json!({
+            "id": error.as_code(),
+            "code": error.as_string(),
+            "reason": error.to_string(),
+            "field": null,
+        });
+        IggyError::HttpResponseError(status, body.to_string())
+    }
+
+    #[test]
+    fn given_an_option_refusal_over_http_when_converting_should_take_its_code_and_reason() {
+        let refused = IggyError::InvalidOptionValue("tombstone_grace".to_owned());
+
+        let refusal = HttpOptionRefusal::from_error(&http_error(400, &refused))
+            .expect("an option refusal in the body");
+
+        assert_eq!(refusal.error.as_code(), refused.as_code());
+        assert_eq!(refusal.reason, refused.to_string());
+        let root =
+            HttpOptionRefusal::from_error(&http_error(400, &IggyError::CannotModifyRootUser))
+                .expect("a root refusal in the body");
+        assert!(matches!(
+            PhpExceptionKind::from(&root.error),
+            PhpExceptionKind::Authentication
+        ));
+    }
+
+    #[test]
+    fn given_another_http_error_when_converting_should_keep_the_http_error() {
+        for error in [
+            http_error(400, &IggyError::InvalidCommand),
+            http_error(400, &IggyError::FeatureUnavailable),
+            IggyError::HttpResponseError(400, "not json".to_owned()),
+            IggyError::HttpResponseError(400, json!({ "id": 4042 }).to_string()),
+            IggyError::HttpResponseError(400, json!({ "id": -1, "reason": "x" }).to_string()),
+            IggyError::InvalidOptionValue(String::new()),
+        ] {
+            assert!(HttpOptionRefusal::from_error(&error).is_none(), "{error:?}");
+        }
+    }
 
     #[test]
     fn pending_operation_errors_preserve_exact_identity_and_kind() {
@@ -415,6 +513,49 @@ mod tests {
     }
 
     #[test]
+    fn given_tiered_read_failure_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::TieredReadFailed;
+        assert_eq!(error.as_code(), 96);
+        assert_eq!(error.as_string(), "tiered_read_failed");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+
+        let read = ReadError::new(Some(1), error);
+        assert_eq!(read.error.as_code(), 96);
+        assert!(
+            read.is_lasting_refusal(),
+            "the first tiered read failure stops its partition"
+        );
+    }
+
+    #[test]
+    fn given_reply_too_large_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::ReplyTooLarge;
+        assert_eq!(error.as_code(), 97);
+        assert_eq!(error.as_string(), "reply_too_large");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+    }
+
+    // The Rust SDK returns 1021 without a retry, so the binding only has to keep its code and
+    // keep it out of the transient class that invites one.
+    #[test]
+    fn given_shadow_stream_refusal_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::ShadowStreamReadOnly;
+        assert_eq!(error.as_code(), 1021);
+        assert_eq!(error.as_string(), "shadow_stream_read_only");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+        assert!(PendingOperationException::from_error(&error).is_none());
+    }
+
+    #[test]
     fn given_a_lost_range_when_mapping_read_error_should_expose_its_first_and_last_offset() {
         const PARTITION_ID: u32 = 7;
         const OPERATION_ID: u64 = 42;
@@ -424,15 +565,17 @@ mod tests {
             Some(PARTITION_ID),
             IggyError::FetchProgressUncertain(OPERATION_ID),
         );
-        error.skip = Some(RustPollingStrategy::offset(LAST + 1));
         error.lost = Some(FIRST..=LAST);
 
         let exception = ReadException::from(&error);
 
         assert_eq!(exception.partition_id(), Some(PARTITION_ID));
-        assert!(exception.skip().is_some());
+        assert!(exception.skip().is_none());
         assert_eq!(exception.lost(), Some(vec![FIRST, LAST]));
-        let other = ReadException::from(&ReadError::new(None, IggyError::Disconnected));
+        let mut undecoded = ReadError::new(Some(PARTITION_ID), IggyError::CannotReadMessage);
+        undecoded.skip = Some(RustPollingStrategy::offset(LAST + 1));
+        let other = ReadException::from(&undecoded);
+        assert!(other.skip().is_some());
         assert_eq!(other.lost(), None, "only a lost range carries offsets");
     }
 }

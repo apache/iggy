@@ -118,6 +118,18 @@ impl SegmentStorage {
         })
     }
 
+    /// The files of a segment whose `.log` left the local disk: at most the
+    /// `.index` it kept.
+    #[must_use]
+    pub fn without_messages(index_path: Option<&str>) -> Self {
+        Self {
+            messages_size: None,
+            messages_reader: None,
+            index_size: None,
+            index_reader: index_path.map(|path| Rc::new(IndexReader::from_validated_path(path))),
+        }
+    }
+
     /// Drop the write cursors of a segment that takes no more writes.
     pub fn seal(&mut self) {
         self.messages_size = None;

@@ -49,6 +49,12 @@ leaves it behind.
   topic it does not show yet gets `UNKNOWN_TOPIC_OR_PARTITION` (3), which clients retry. On a
   listener that authenticates no one, any client commits.
 - The prefix keeps a Kafka group apart from a native Iggy group with the same name.
+- On a geo topic, and on a shadow topic of another datacenter's geo topic, Iggy carries the
+  offsets to the other datacenters
+  ([`GEO_TOPICS.md`](../../../core/server/docs/GEO_TOPICS.md#plain-consumers-and-kafka-groups)).
+  Iggy answers a commit there once the node's bucket holds the offset, about one upload later.
+  In another datacenter, a read finds the offsets by the group's name before the gateway creates
+  the Iggy group there.
 - Group id: 1 to 246 bytes, else `INVALID_GROUP_ID` (24). Iggy names stop at 255. Unlike Kafka,
   an empty id is refused in OffsetCommit and OffsetFetch too.
 - Negative offset: delete the key. A missing key or group counts as success. Kafka consumers read any
@@ -140,6 +146,11 @@ log decides each offset:
 - `OffsetFetch` answers each partition the log holds an offset or a deletion for from the log,
   with the commit metadata. Iggy answers the other partitions, which hold offsets from before the
   log. After `DeleteGroups`, the log holds every offset of the group, so Iggy answers none.
+- Iggy answers every partition of a geo topic, which a shadow topic reads as, because another
+  datacenter can move the group's offsets there and only Iggy holds what it moved. The change log
+  tells the gateway which topics are geo. The log adds its commit metadata and leader epoch where
+  it holds the offset that Iggy answers. So a late Iggy write of a coordinator that lost the log
+  partition can win on a geo topic, as it can without the log.
 - `DeleteGroups` and `OffsetDelete` delete in Iggy and in the log, while the group's commits wait.
 - When Iggy deletes a topic, each owner removes the offsets of that incarnation from the log. A
   topic created again under the name keeps its own, as Kafka keeps offsets by topic id. The
@@ -166,6 +177,12 @@ log decides each offset:
   commit stores it in Iggy again.
 - Only the coordinator answers offset requests for a group, so a commit made through another
   gateway answers `NOT_COORDINATOR`, and the client asks the coordinator.
+
+A gateway that runs without the log stores its commits in Iggy only. Two cases do that:
+`IGGY_KAFKA_COORDINATOR_LOG=false`, and a gateway that falls back to running without the log. Once
+the log is on again, it answers the older offsets that it holds for those groups. It also counts
+their retention from its own older commit times. So a group without members can lose its newer
+offsets at the next check. Do not run gateways without the log on a stream whose log holds groups.
 
 Without the coordinator log, offsets are shared, since the key depends only on the Kafka group id.
 Membership is not. With `IGGY_KAFKA_BROKERS`, `FindCoordinator` names one gateway for every group,

@@ -16,11 +16,28 @@
 // under the License.
 
 use iggy_common::{IggyByteSize, IggyExpiry, IggyTimestamp};
+use iggy_object_store::ManifestSegment;
 use std::fmt::Display;
+
+/// Where a segment's bytes live.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentLocation {
+    /// Only in the local `.log`.
+    #[default]
+    Local,
+    /// In the local `.log` and in the object store.
+    Uploaded,
+    /// Only in the object store: the local `.log` is gone, and the chain's
+    /// marker stands in for it.
+    Remote,
+}
 
 #[derive(Default, Debug, Clone)]
 pub struct Segment {
     pub sealed: bool,
+    /// A tiered segment stays in the segment list wherever its bytes live, so
+    /// resolving an offset or a timestamp never depends on the location.
+    pub location: SegmentLocation,
     pub start_timestamp: u64,
     pub end_timestamp: u64,
     pub max_timestamp: u64,
@@ -35,8 +52,9 @@ impl Display for Segment {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Segment {{ sealed: {}, max_size: {}, start_timestamp: {}, end_timestamp: {}, max_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
+            "Segment {{ sealed: {}, location: {:?}, max_size: {}, start_timestamp: {}, end_timestamp: {}, max_timestamp: {}, start_offset: {}, end_offset: {}, size: {} }}",
             self.sealed,
+            self.location,
             self.max_size,
             self.start_timestamp,
             self.end_timestamp,
@@ -53,6 +71,7 @@ impl Segment {
     pub fn new(start_offset: u64, max_size_bytes: IggyByteSize) -> Self {
         Self {
             sealed: false,
+            location: SegmentLocation::Local,
             max_size: max_size_bytes,
             start_timestamp: 0,
             end_timestamp: 0,
@@ -78,13 +97,71 @@ impl Segment {
         if !self.sealed || self.max_timestamp == 0 {
             return false;
         }
+        outlived(self.max_timestamp, now, expiry)
+    }
+}
 
-        match expiry {
-            IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
-            IggyExpiry::ExpireDuration(duration) => {
-                self.max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
-            }
+/// Whether a message stamped `max_timestamp` is older than `expiry` allows
+/// at `now`. `expiry` must be resolved: a `ServerDefault` expires nothing.
+fn outlived(max_timestamp: u64, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
+    match expiry {
+        IggyExpiry::NeverExpire | IggyExpiry::ServerDefault => false,
+        IggyExpiry::ExpireDuration(duration) => {
+            max_timestamp.saturating_add(duration.as_micros()) <= now.as_micros()
         }
+    }
+}
+
+/// What retention reads of a segment. The segments on a replica's disk and
+/// the long-term segments in the object store are judged by the one rule
+/// written over this.
+pub trait RetainedSegment {
+    fn last_offset(&self) -> u64;
+
+    fn stored_bytes(&self) -> u64;
+
+    /// Whether the segment takes no more messages. One that still does is
+    /// never removed.
+    fn is_closed(&self) -> bool;
+
+    /// Whether its newest message is older than `expiry` allows at `now`.
+    fn has_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool;
+}
+
+impl RetainedSegment for Segment {
+    fn last_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    fn stored_bytes(&self) -> u64 {
+        self.size.as_bytes_u64()
+    }
+
+    fn is_closed(&self) -> bool {
+        self.sealed
+    }
+
+    fn has_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
+        self.is_expired(now, expiry)
+    }
+}
+
+impl RetainedSegment for ManifestSegment {
+    fn last_offset(&self) -> u64 {
+        self.end_offset
+    }
+
+    fn stored_bytes(&self) -> u64 {
+        self.size
+    }
+
+    fn is_closed(&self) -> bool {
+        true
+    }
+
+    fn has_expired(&self, now: IggyTimestamp, expiry: IggyExpiry) -> bool {
+        // A segment without a timestamp would have expired at any `now`.
+        self.max_timestamp != 0 && outlived(self.max_timestamp, now, expiry)
     }
 }
 

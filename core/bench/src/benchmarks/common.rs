@@ -24,7 +24,10 @@ use crate::{
         producing_consumer::typed_benchmark_producing_consumer::TypedBenchmarkProducingConsumer,
     },
     args::common::IggyBenchArgs,
-    utils::finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
+    utils::{
+        finish_condition::{BenchmarkFinishCondition, BenchmarkFinishConditionMode},
+        warmup::BenchmarkWarmup,
+    },
 };
 use bench_report::{benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics};
 use iggy::prelude::*;
@@ -101,12 +104,12 @@ pub async fn init_consumer_groups(
 pub fn build_producer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
+    warmup: BenchmarkWarmup,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let streams = args.streams();
     let partitions = args.number_of_partitions();
     let producers = args.producers();
     let actors = args.producers() + args.consumers();
-    let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
     let sampling_time = args.sampling_time();
@@ -115,6 +118,8 @@ pub fn build_producer_futures(
     let pretty = args.pretty;
     let shared_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
+    // The total covers the polled bytes too, so the consumers count toward the split even though
+    // they have no limit of their own.
     let rate_limit = rate_limit_per_actor(args.rate_limit(), actors);
     let use_high_level_api = args.high_level_api();
 
@@ -142,7 +147,7 @@ pub fn build_producer_futures(
                     messages_per_batch,
                     message_size,
                     finish_condition,
-                    warmup_time,
+                    warmup,
                     sampling_time,
                     moving_average_window,
                     rate_limit,
@@ -157,11 +162,11 @@ pub fn build_producer_futures(
 pub fn build_consumer_futures(
     client_factory: &Arc<dyn ClientFactory>,
     args: &IggyBenchArgs,
+    warmup: BenchmarkWarmup,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send + use<>> {
     let cg_count = args.number_of_consumer_groups();
     let consumers = args.consumers();
     let actors = args.producers() + args.consumers();
-    let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let sampling_time = args.sampling_time();
     let moving_average_window = args.moving_average_window();
@@ -182,22 +187,14 @@ pub fn build_consumer_futures(
 
     let global_finish_condition =
         BenchmarkFinishCondition::new(args, BenchmarkFinishConditionMode::Shared);
-    // When measuring true E2E latency, apply read_amplification multiplier to consumer rate
-    // to ensure they can keep up with producers and not inflate latency due to queue buildup
-    let read_amplification = args.read_amplification().unwrap_or(1.0);
-    let rate_limit = rate_limit_per_actor(args.rate_limit(), actors).map(|rl| {
-        if origin_timestamp_latency_calculation {
-            #[allow(
-                clippy::cast_sign_loss,
-                clippy::cast_possible_truncation,
-                clippy::cast_precision_loss
-            )]
-            let amplified = (rl.as_bytes_u64() as f64 * f64::from(read_amplification)) as u64;
-            IggyByteSize::from(amplified)
-        } else {
-            rl
-        }
-    });
+    // A consumer that reports message age polls what its producers send, and a deferred poll
+    // waits at the server for new data. A limit could only hold it back after a stall, and the
+    // backlog would count as latency.
+    let rate_limit = if origin_timestamp_latency_calculation {
+        None
+    } else {
+        rate_limit_per_actor(args.rate_limit(), actors)
+    };
     let use_high_level_api = args.high_level_api();
 
     (1..=consumers)
@@ -232,7 +229,7 @@ pub fn build_consumer_futures(
                     stream_id,
                     messages_per_batch,
                     finish_condition,
-                    warmup_time,
+                    warmup,
                     sampling_time,
                     moving_average_window,
                     polling_kind,
@@ -251,11 +248,11 @@ pub fn build_consumer_futures(
 pub fn build_producing_consumers_futures(
     client_factory: Arc<dyn ClientFactory>,
     args: Arc<IggyBenchArgs>,
+    warmup: BenchmarkWarmup,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
     let producing_consumers = args.producers();
     let streams = args.streams();
     let partitions = args.number_of_partitions();
-    let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
     let polling_kind = PollingKind::Offset;
@@ -296,7 +293,7 @@ pub fn build_producing_consumers_futures(
                     message_size,
                     send_finish_condition.clone(),
                     poll_finish_condition.clone(),
-                    warmup_time,
+                    warmup,
                     args_clone.sampling_time(),
                     args_clone.moving_average_window(),
                     rate_limit,
@@ -315,13 +312,13 @@ pub fn build_producing_consumers_futures(
 pub fn build_producing_consumer_groups_futures(
     client_factory: Arc<dyn ClientFactory>,
     args: Arc<IggyBenchArgs>,
+    warmup: BenchmarkWarmup,
 ) -> Vec<impl Future<Output = Result<BenchmarkIndividualMetrics, IggyError>> + Send> {
     let producers = args.producers();
     let consumers = args.consumers();
     let total_actors = producers.max(consumers);
     let partitions = args.number_of_partitions();
     let cg_count = args.number_of_consumer_groups();
-    let warmup_time = args.warmup_time();
     let messages_per_batch = args.messages_per_batch();
     let message_size = args.message_size();
     let start_consumer_group_id = CONSUMER_GROUP_BASE_ID;
@@ -400,7 +397,7 @@ pub fn build_producing_consumer_groups_futures(
                     message_size,
                     send_finish_condition,
                     poll_finish_condition,
-                    warmup_time,
+                    warmup,
                     args_clone.sampling_time(),
                     args_clone.moving_average_window(),
                     rate_limit,

@@ -17,6 +17,8 @@
  * under the License.
  */
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -57,6 +59,7 @@ constexpr iggy::StreamOptionKey kStreamOptionKeys[] = {
     iggy::StreamOptionKey::EncryptionKeySource,
     iggy::StreamOptionKey::EncryptionKeyFingerprint,
     iggy::StreamOptionKey::EncryptionKekFingerprint,
+    iggy::StreamOptionKey::ShadowOrigin,
 };
 
 constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
@@ -72,6 +75,18 @@ constexpr iggy::TopicOptionKey kTopicOptionKeys[] = {
     iggy::TopicOptionKey::SizeOfMessagesRequiredToSave,
     iggy::TopicOptionKey::PreallocateSegments,
     iggy::TopicOptionKey::ReplicationFactor,
+    iggy::TopicOptionKey::SegmentMaxAge,
+    iggy::TopicOptionKey::TieredStorage,
+    iggy::TopicOptionKey::LocalRetentionAge,
+    iggy::TopicOptionKey::LocalRetentionSize,
+    iggy::TopicOptionKey::TopicType,
+    iggy::TopicOptionKey::GeoMode,
+    iggy::TopicOptionKey::FreshUploadInterval,
+    iggy::TopicOptionKey::ConsumerOffsetUploadInterval,
+    iggy::TopicOptionKey::PositionsPublishInterval,
+    iggy::TopicOptionKey::TombstoneGrace,
+    iggy::TopicOptionKey::PositionsResumeTimeout,
+    iggy::TopicOptionKey::LongTermRewriteMaxInterval,
 };
 
 constexpr iggy::UserOptionKey kUserOptionKeys[] = {
@@ -470,6 +485,46 @@ TEST_P(E2E_ResourceOptionsTransport, GivenPatchAdmissionRefusesWhenUpdatingTopic
     EXPECT_EQ(topic.Options().Explicit().count("max_topic_size"), 1u);
 }
 
+TEST_P(E2E_ResourceOptionsTransport, GivenGeoDurationOnNormalTopicWhenCreatingOrUpdatingShouldRefuseIt) {
+    RecordProperty("description",
+                   "Refuses a geo topic duration on a normal topic as invalid_option_value on create and update, "
+                   "refuses a reset of one as option_not_resettable before sending, and leaves the topic unchanged.");
+    const nlohmann::json invalid_option_value  = {{"name", "invalid_option_value"}, {"code", 4042}};
+    const nlohmann::json option_not_resettable = {{"name", "option_not_resettable"}, {"code", 4104}};
+    auto client                                = GetTransportClient();
+    const auto stream_name                     = GetRandomName(40);
+    const auto stream                          = client.CreateStream(stream_name);
+    TrackStream(stream_name);
+    const auto stream_id = iggy::Identifier::Numeric(stream.Id());
+
+    // Zero is a value, so even a zero duration makes the create refused.
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] {
+            client.CreateTopic(stream_id, "never-created",
+                               iggy::TopicCreateOptions().SetPositionsResumeTimeout(std::chrono::microseconds::zero()));
+        },
+        invalid_option_value));
+    const auto created  = client.CreateTopic(stream_id, "normal");
+    const auto topic_id = iggy::Identifier::Numeric(created.Id());
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] {
+            client.UpdateTopic(stream_id, topic_id,
+                               iggy::TopicUpdateOptions().SetTombstoneGrace(std::chrono::hours(1)));
+        },
+        invalid_option_value));
+    EXPECT_TRUE(ThrowsIggyError(
+        [&] {
+            client.UpdateTopic(stream_id, topic_id,
+                               iggy::TopicUpdateOptions().Reset(iggy::TopicOptionKey::TombstoneGrace));
+        },
+        option_not_resettable));
+
+    const auto topic = client.GetTopic(stream_id, topic_id);
+    EXPECT_FALSE(topic.TombstoneGrace().has_value());
+    EXPECT_EQ(topic.Options().Explicit().count("tombstone_grace"), 0u);
+    EXPECT_EQ(client.GetTopics(stream_id).size(), 1u);
+}
+
 TEST_P(E2E_ResourceOptionsTransport, GivenUserOptionsWhenCreatingAndUpdatingShouldPreserveUserBehavior) {
     RecordProperty("description",
                    "Creates a user with typed empty options, patches its username and status, reads its options with "
@@ -743,4 +798,22 @@ TEST_P(E2E_ResourceOptionsTransport, GivenPublicDescribeOptionsWhenCalledShouldR
     EXPECT_TRUE(!key.Updatable() && !key.Resettable() && key.Secret() && key.Critical() && !key.ReadOnly());
     const auto fingerprint = spec_of(iggy::StreamOptionKey::EncryptionKeyFingerprint);
     EXPECT_TRUE(fingerprint.ReadOnly() && !fingerprint.Updatable() && !fingerprint.Secret());
+    const auto shadow_origin = spec_of(iggy::StreamOptionKey::ShadowOrigin);
+    EXPECT_TRUE(shadow_origin.ReadOnly() && !shadow_origin.Updatable() && !shadow_origin.Critical());
+
+    // The durations of a geo topic are set-only: they have no default to reset to.
+    const auto topic_specs = client.DescribeOptions(iggy::OptionsScope::Topic);
+    for (const auto key :
+         {iggy::TopicOptionKey::FreshUploadInterval, iggy::TopicOptionKey::ConsumerOffsetUploadInterval,
+          iggy::TopicOptionKey::PositionsPublishInterval, iggy::TopicOptionKey::TombstoneGrace,
+          iggy::TopicOptionKey::PositionsResumeTimeout, iggy::TopicOptionKey::LongTermRewriteMaxInterval}) {
+        SCOPED_TRACE(std::string(iggy::to_string(key)));
+        const auto spec = std::find_if(topic_specs.begin(), topic_specs.end(), [key](const iggy::OptionSpec &spec) {
+            return spec.Key() == iggy::to_string(key);
+        });
+        ASSERT_NE(spec, topic_specs.end());
+        EXPECT_TRUE(spec->Updatable() && !spec->Resettable() && !spec->ReadOnly() && !spec->Critical());
+        EXPECT_EQ(spec->Kind(), iggy::HeaderKind::Uint64);
+        EXPECT_FALSE(DefaultText(*spec).has_value());
+    }
 }

@@ -25,6 +25,8 @@ import org.apache.iggy.stream.StreamBase;
 import org.apache.iggy.stream.StreamDetails;
 import org.apache.iggy.stream.StreamOptions;
 import org.apache.iggy.stream.StreamUpdate;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
 import java.util.List;
 import java.util.Map;
@@ -38,7 +40,20 @@ public interface StreamsClient {
 
     Optional<StreamDetails> getStream(StreamId streamId);
 
+    /**
+     * Gets the streams the caller may read. Over TCP, reads the list in pages of up to 1000 streams, so the list is not
+     * one consistent read. All pages share the sign-in and the request timeout of the call, so a new sign-in during the
+     * read fails it. Over TCP, the call fails with {@link org.apache.iggy.exception.IggyMalformedResponseException}
+     * when the server answers the page cursor it was sent. Over HTTP, reads the whole list in one reply, which the
+     * server builds from pages of 1000, so it is not one consistent read either.
+     */
     List<StreamBase> getStreams();
+
+    /**
+     * Gets one page of the streams the caller may read. A query that breaks the page rules fails with an invalid
+     * command error.
+     */
+    Page<StreamBase> getStreamsPage(NamedPageQuery query);
 
     /** Creates a stream without options. A server with encryption enabled generates the stream's own data key. */
     default StreamDetails createStream(String name) {

@@ -524,7 +524,130 @@ func TestDeserializeToTopic_ResolvesMissingSettingsToTheCatalogDefaults(t *testi
 	require.NoError(t, err)
 	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.MessageExpiry)
 	assert.Equal(t, uint64(math.MaxUint64), topic.MaxTopicSize)
+	assert.Equal(t, iggcon.IggyExpiryNeverExpire, topic.SegmentMaxAge)
+	assert.False(t, topic.TieredStorage)
+	assert.Equal(t, iggcon.Duration(86_400_000_000), topic.LocalRetentionAge)
+	assert.Equal(t, uint64(math.MaxUint64), topic.LocalRetentionSize)
 	assert.Equal(t, uint8(iggcon.CompressionAlgorithmNone), topic.CompressionAlgorithm)
+	assert.Equal(t, iggcon.TopicTypeNormal, topic.TopicType)
+	assert.Nil(t, topic.GeoMode)
+	assert.Nil(t, topic.FreshUploadInterval)
+	assert.Nil(t, topic.ConsumerOffsetUploadInterval)
+	assert.Nil(t, topic.PositionsPublishInterval)
+	assert.Nil(t, topic.TombstoneGrace)
+	assert.Nil(t, topic.PositionsResumeTimeout)
+	assert.Nil(t, topic.LongTermRewriteMaxInterval)
+}
+
+func TestDeserializeToTopic_ReadsTheDurationsOfAGeoTopic(t *testing.T) {
+	const nameLenOffset = 32
+	stringEntry := func(key, value string) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+		}
+	}
+	uint64Entry := func(key string, value uint64) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.Uint64, Value: binary.LittleEndian.AppendUint64(nil, value)},
+		}
+	}
+	topic := func(topicType string) iggcon.Topic {
+		t.Helper()
+		payload := make([]byte, nameLenOffset+2)
+		payload[nameLenOffset] = 1
+		payload[nameLenOffset+1] = 't'
+		explicit := iggcon.GetHeadersBytes([]iggcon.HeaderEntry{
+			uint64Entry("consumer_offset_upload_interval", 0),
+			uint64Entry("tombstone_grace", 3_600_000_000),
+			stringEntry("topic_type", topicType),
+		})
+		payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicit)))
+		payload = append(payload, explicit...)
+		payload = binary.LittleEndian.AppendUint32(payload, 0)
+		topic, readBytes, err := DeserializeToTopic(payload, 0)
+		require.NoError(t, err)
+		require.Equal(t, len(payload), readBytes)
+		return topic
+	}
+
+	geo := topic("geo")
+	require.NotNil(t, geo.ConsumerOffsetUploadInterval, "a zero duration is a value")
+	assert.Equal(t, iggcon.Duration(0), *geo.ConsumerOffsetUploadInterval)
+	require.NotNil(t, geo.TombstoneGrace)
+	assert.Equal(t, iggcon.Hour, *geo.TombstoneGrace)
+	assert.Nil(t, geo.FreshUploadInterval, "an unset duration leaves the server setting")
+	assert.Nil(t, geo.PositionsPublishInterval)
+	assert.Nil(t, geo.PositionsResumeTimeout)
+	assert.Nil(t, geo.LongTermRewriteMaxInterval)
+
+	normal := topic("normal")
+	assert.Nil(t, normal.ConsumerOffsetUploadInterval, "a normal topic has no durations")
+	assert.Nil(t, normal.TombstoneGrace)
+}
+
+func TestDeserializeToTopic_ReadsTheTopicTypeAndGeoMode(t *testing.T) {
+	const nameLenOffset = 32
+	stringEntry := func(key, value string) iggcon.HeaderEntry {
+		return iggcon.HeaderEntry{
+			Key:   iggcon.HeaderKey{Kind: iggcon.String, Value: []byte(key)},
+			Value: iggcon.HeaderValue{Kind: iggcon.String, Value: []byte(value)},
+		}
+	}
+	geo := iggcon.GeoModeGeo
+	geoTiered := iggcon.GeoModeGeoTiered
+	for _, tc := range []struct {
+		name              string
+		explicit, derived []iggcon.HeaderEntry
+		topicType         iggcon.TopicType
+		geoMode           *iggcon.GeoMode
+	}{
+		{
+			name:      "a geo topic with an explicit mode",
+			explicit:  []iggcon.HeaderEntry{stringEntry("topic_type", "geo"), stringEntry("geo_mode", "geo_tiered")},
+			topicType: iggcon.TopicTypeGeo,
+			geoMode:   &geoTiered,
+		},
+		{
+			name:      "a geo topic with the derived mode",
+			explicit:  []iggcon.HeaderEntry{stringEntry("topic_type", "geo")},
+			derived:   []iggcon.HeaderEntry{stringEntry("geo_mode", "geo")},
+			topicType: iggcon.TopicTypeGeo,
+			geoMode:   &geo,
+		},
+		{
+			name:      "a geo topic with a mode this build cannot read",
+			explicit:  []iggcon.HeaderEntry{stringEntry("topic_type", "geo"), stringEntry("geo_mode", "geo_future")},
+			topicType: iggcon.TopicTypeGeo,
+			geoMode:   &geo,
+		},
+		{
+			name:      "a normal topic with a stored mode",
+			explicit:  []iggcon.HeaderEntry{stringEntry("geo_mode", "geo")},
+			derived:   []iggcon.HeaderEntry{stringEntry("topic_type", "normal")},
+			topicType: iggcon.TopicTypeNormal,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := make([]byte, nameLenOffset+2)
+			payload[nameLenOffset] = 1
+			payload[nameLenOffset+1] = 't'
+			explicit := iggcon.GetHeadersBytes(tc.explicit)
+			payload = binary.LittleEndian.AppendUint32(payload, uint32(len(explicit)))
+			payload = append(payload, explicit...)
+			derived := iggcon.GetHeadersBytes(tc.derived)
+			payload = binary.LittleEndian.AppendUint32(payload, uint32(len(derived)))
+			payload = append(payload, derived...)
+
+			topic, readBytes, err := DeserializeToTopic(payload, 0)
+
+			require.NoError(t, err)
+			assert.Equal(t, len(payload), readBytes)
+			assert.Equal(t, tc.topicType, topic.TopicType)
+			assert.Equal(t, tc.geoMode, topic.GeoMode)
+		})
+	}
 }
 
 func TestDeserializeToTopic_RejectsEveryTruncationOfTheOptionsBlocks(t *testing.T) {

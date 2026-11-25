@@ -20,9 +20,17 @@ use async_trait::async_trait;
 
 /// This trait defines the methods to interact with the cluster module.
 #[async_trait]
+#[whichever::dispatchable]
 pub trait ClusterClient {
     /// Get the metadata of the cluster including node information, roles, and status.
     ///
     /// Requires authentication; leader placement happens after login.
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError>;
+    /// Retire the geo peer `origin`, a datacenter that never returns. This
+    /// cluster then follows nothing of it again: its shadow topics serve what
+    /// they hold until their retention removes it, and a client may delete
+    /// them. A datacenter that comes back needs another origin name.
+    ///
+    /// Requires root or the global `manage_servers` permission.
+    async fn retire_geo_origin(&self, origin: &str) -> Result<(), IggyError>;
 }

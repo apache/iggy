@@ -1,0 +1,68 @@
+---
+title: Serialising messages
+description: "Choose a format for your message payloads, and send more than one kind of message to the same topic."
+---
+
+The server stores each message payload as bytes without interpreting it, so you choose the format: plain text, JSON, Protobuf or anything else. This page shows how to send more than one kind of message to the same topic, so the consumer knows how to decode each one.
+
+The examples are in Rust and come from the [examples](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust) in the Apache Iggy repository.
+
+## One kind of message
+
+If every message on a topic has the same shape, send the encoded value as the payload and decode it the same way on the other side. [Getting started](/docs/introduction/getting-started) does this with plain strings.
+
+## A type field in the payload
+
+Wrap each message in an envelope that names its type, and send the envelope as JSON:
+
+```json
+{ "message_type": "order_confirmed", "payload": "{\"order_id\":42,\"price\":99.5}" }
+```
+
+The consumer decodes the envelope, reads `message_type`, then decodes the inner payload as that type. This works with any client, but every message is decoded twice, and the inner payload is a JSON string inside the envelope. See the [message-envelope example](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-envelope).
+
+## A type field in a header
+
+Messages can carry user headers, which are key and value pairs kept separate from the payload. Put the type in a header and send the payload as it is:
+
+```rust
+let mut headers = BTreeMap::new();
+headers.insert(
+    HeaderKey::try_from("message_type").unwrap(),
+    HeaderValue::try_from(message_type).unwrap(),
+);
+
+let message = IggyMessage::builder()
+    .payload(Bytes::from(json))
+    .user_headers(headers)
+    .build()
+    .unwrap();
+```
+
+The consumer reads the header and decodes the payload once:
+
+```rust
+let payload = std::str::from_utf8(&message.payload)?;
+let header_key = HeaderKey::try_from("message_type").unwrap();
+let headers_map = message.user_headers_map()?.unwrap();
+let message_type = headers_map.get(&header_key).unwrap().as_str()?;
+
+match message_type {
+    ORDER_CREATED_TYPE => {
+        let order_created = serde_json::from_str::<OrderCreated>(payload)?;
+        info!("{:#?}", order_created);
+    }
+    // One arm for each message type.
+    _ => {
+        warn!("Received unknown message type: {}", message_type);
+    }
+}
+```
+
+This is the better choice for Protobuf or any other binary format, because the payload doesn't have to fit inside JSON. See the [message-type example](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-headers/message-type).
+
+Header values don't have to be strings. They can also be numbers, booleans or raw bytes, so you can add things like a trace ID next to the type, as the [typed-headers example](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-headers/typed-headers) shows. The [message-compression example](https://github.com/apache/iggy/tree/server-0.10.0/examples/rust/src/message-headers/message-compression) uses a header in the same way to record how the payload was compressed.
+
+## Size limits
+
+A payload can be up to 64 MB, and a message's user headers up to 100 KB in total. The whole send request also has to fit the server's request limit, which by default is 64 MiB over TCP and 2 MB over HTTP.

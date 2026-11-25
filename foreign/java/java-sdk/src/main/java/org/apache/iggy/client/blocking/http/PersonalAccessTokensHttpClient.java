@@ -53,7 +53,8 @@ class PersonalAccessTokensHttpClient implements PersonalAccessTokensClient {
 
     @Override
     public void deletePersonalAccessToken(String name) {
-        var request = httpClient.prepareDeleteRequest(PERSONAL_ACCESS_TOKENS + "/" + name);
+        var segment = PathSegment.encode(name, "Personal access token name");
+        var request = httpClient.prepareDeleteRequest(PERSONAL_ACCESS_TOKENS + "/" + segment);
         httpClient.execute(request);
     }
 

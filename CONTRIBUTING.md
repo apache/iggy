@@ -107,6 +107,30 @@ for review.
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
 
+### Docs
+
+The pages of [iggy.apache.org/docs](https://iggy.apache.org/docs/) live in `docs/` as MDX
+files. MDX is Markdown that can contain React components. If your change is visible to
+users, for example a new config key, CLI argument or SDK method, update `docs/` in the
+same PR. The connectors docs live in `docs/` of
+[apache/iggy-connectors](https://github.com/apache/iggy-connectors).
+
+[apache/iggy-website](https://github.com/apache/iggy-website) builds the site. It holds the
+components and the images that the pages use. To preview your pages, check it out next to
+this repository. Then run these commands in it, and the last two each in its own terminal:
+
+```bash
+npm ci
+IGGY_DOCS_DIR=../iggy/docs npm run docs:watch
+IGGY_DOCS_DIR=../iggy/docs npm run dev
+```
+
+The `docs:watch` command copies each saved page into the site. List each new page in the
+`meta.json` of its folder. Images live in `public/img/` of apache/iggy-website, so add a new
+image there in a website PR and wait until it merges. The `Docs` CI job builds the site with
+your pages. It fails on a broken link, on a missing image and on a page that its `meta.json`
+does not list.
+
 ### Review Comments
 
 Respond to every review comment, so that the reviewer knows you read it. Any one of these
@@ -123,6 +147,27 @@ runs CI again on GitHub Actions runners that all Apache projects share. A mainta
 updates the branch before the merge.
 
 If GitHub reports a merge conflict, or if a maintainer asks you to, update your branch.
+
+### Stacked PRs
+
+These rules apply to a GitHub native stack, for example one made with `gh stack`. Each PR
+in a stack builds on the one below it. CI runs for every PR in a stack, and the position
+decides what a run does:
+
+- The lowest unmerged PR runs the full CI for its own changes.
+- The top PR runs the full CI for its own changes and for the changes of the PRs between.
+- Each PR between them runs only `Common checks` and the Rust `fmt`, `sort`, `machete`
+  and `clippy` tasks. Its run shows a notice that says so.
+
+Merge the lowest PR alone, or merge the whole stack from the top PR. Do not merge a group
+that ends at a PR between them. GitHub permits that merge, but only lint ran for those
+PRs. To land only the lower part of a stack, merge its PRs one at a time from the bottom.
+
+GitHub keeps a closed PR in the stack count, so the PR below a closed top PR does not
+become the top. In that case, merge the remaining PRs one at a time from the bottom.
+
+To merge the whole stack, use the merge box of the top PR, or run `gh stack merge` from
+the `github/gh-stack` extension.
 
 ### Quality Checks
 

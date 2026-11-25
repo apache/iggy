@@ -572,6 +572,28 @@ struct ClientTransportTests {
         await client.shutdown()
     }
 
+    /// The origin travels as a wire name under its replicated operation. An
+    /// origin no wire name can carry is refused before anything is sent.
+    @Test func retiringAGeoOriginSendsItsNameAsAMetadataWrite() async throws {
+        let encoded: [UInt8] = [4] + Array("dc-a".utf8)
+        #expect(try Requests.retireGeoOrigin(origin: "dc-a") == encoded)
+        for invalid in ["", String(repeating: "o", count: 256)] {
+            #expect(throws: IggyError(.invalidFormat)) { try Requests.retireGeoOrigin(origin: invalid) }
+        }
+
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        let client = makeClient(server)
+        try await client.connect()
+        try await client.retireGeoOrigin(origin: "dc-a")
+        let retired = await server.requests.filter { $0.code == CommandCode.retireGeoOrigin.rawValue }
+        #expect(retired.map(\.operation) == [.retireGeoOrigin])
+        #expect(retired.map(\.payload) == [encoded])
+        await expectCode(.invalidFormat) { try await client.retireGeoOrigin(origin: "") }
+        #expect(await server.requests.filter { $0.code == CommandCode.retireGeoOrigin.rawValue }.count == 1)
+        await client.shutdown()
+    }
+
     @Test func anUncommittedMetadataWriteFollowsTheNewPrimaryWithItsFrame() async throws {
         let first = try await FakeVSRServer.started()
         let second = try await FakeVSRServer.started()

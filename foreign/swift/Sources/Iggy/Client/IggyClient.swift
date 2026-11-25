@@ -274,9 +274,10 @@ public final class IggyClient: Sendable {
     // MARK: Internals shared by the domain extensions
 
     /// One request of a call that started under `lineage`, or, for a call
-    /// of this one request, under the lineage it is sent in.
-    func send(_ code: CommandCode, _ payload: [UInt8] = [], lineage: UInt64? = nil) async throws -> [UInt8] {
-        try await core.exchange(code: code.rawValue, payload: payload, lineage: lineage)
+    /// of this one request, under the lineage it is sent in. `deadline` caps
+    /// the request timeout for a call with a budget of its own.
+    func send(_ code: CommandCode, _ payload: [UInt8] = [], lineage: UInt64? = nil, deadline: ContinuousClock.Instant? = nil) async throws -> [UInt8] {
+        try await core.exchange(code: code.rawValue, payload: payload, deadline: deadline, lineage: lineage)
     }
 
     /// Fails unless the client is signed in, and returns the lineage the
@@ -291,8 +292,8 @@ public final class IggyClient: Sendable {
     /// `captured`, such as a producer send: once the caller signed in or out
     /// since, the call is refused as unauthenticated before anything of it is
     /// written.
-    func requireAuthenticated(under captured: UInt64?) async throws -> UInt64 {
-        let started = try await requireAuthenticated()
+    func requireAuthenticated(under captured: UInt64?, within limit: ContinuousClock.Instant? = nil) async throws -> UInt64 {
+        let started = try await requireAuthenticated(within: limit)
         guard let captured else {
             return started
         }
@@ -385,5 +386,18 @@ extension IggyClient {
     /// a signed-in session.
     public func getClusterMetadata() async throws -> ClusterMetadata {
         try Responses.clusterMetadata(try await send(.getClusterMetadata)[...])
+    }
+
+    /// Retires the geo peer `origin`, a datacenter that never returns. The
+    /// cluster then follows nothing of it again: its shadow topics serve
+    /// what they hold until their retention removes it, and a client may
+    /// delete them. A datacenter that comes back needs another origin name.
+    /// Needs root or the global `manageServers` permission. An origin that
+    /// is not 1 to 255 bytes fails with ``IggyErrorCode/invalidFormat``
+    /// before anything is sent.
+    public func retireGeoOrigin(origin: String) async throws {
+        let payload = try Requests.retireGeoOrigin(origin: origin)
+        let lineage = try await requireAuthenticated()
+        _ = try await send(.retireGeoOrigin, payload, lineage: lineage)
     }
 }

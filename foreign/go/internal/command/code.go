@@ -28,6 +28,7 @@ const (
 	BindSessionCode          Code = 15
 	UpdateResourceCode       Code = 16
 	GetMetadataChangesCode   Code = 17
+	RetireGeoOriginCode      Code = 18
 	GetMeCode                Code = 20
 	GetClientCode            Code = 21
 	GetClientsCode           Code = 22
@@ -65,6 +66,7 @@ const (
 	DeleteTopicCode           Code = 303
 	CreatePartitionsCode      Code = 402
 	DeletePartitionsCode      Code = 403
+	GetPartitionsCode         Code = 404
 	DeleteSegmentsCode        Code = 503
 	GetGroupCode              Code = 600
 	GetGroupsCode             Code = 601

@@ -19,6 +19,7 @@ use bench_report::numeric_parameter::BenchmarkNumericParameter;
 use iggy::prelude::*;
 
 use crate::actors::{ApiLabel, BatchMetrics, BenchmarkInit};
+use crate::utils::warmup::BenchmarkWarmup;
 
 #[derive(Debug, Clone)]
 pub struct BenchmarkConsumerConfig {
@@ -26,7 +27,7 @@ pub struct BenchmarkConsumerConfig {
     pub consumer_group_id: Option<u32>,
     pub stream_id: String,
     pub messages_per_batch: BenchmarkNumericParameter,
-    pub warmup_time: IggyDuration,
+    pub warmup: BenchmarkWarmup,
     pub polling_kind: PollingKind,
     pub poll_options: PollOptions,
     pub origin_timestamp_latency_calculation: bool,

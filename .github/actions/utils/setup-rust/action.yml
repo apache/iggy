@@ -46,8 +46,9 @@ inputs:
   free-disk-space:
     description: >-
       Whether to reclaim runner disk before the build. Default "true".
-      Artifact builders, Rust test shards, Miri and lightweight checks
-      disable cleanup when they fit within the runner's available disk space.
+      Artifact builders, Rust test shards, Miri, lightweight checks and the
+      SDK jobs disable cleanup: they build less than the Rust test shards,
+      which fit within the runner's available disk space.
     required: false
     default: "true"
 

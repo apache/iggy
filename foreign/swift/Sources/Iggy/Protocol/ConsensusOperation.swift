@@ -39,6 +39,8 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case updateUserResolved = 74
     /// A replicated rewrap of stream keys the server proposes itself.
     case rewrapStreamKeys = 75
+    /// A replicated shadow topic change the server proposes itself.
+    case shadowTopic = 76
 
     case createStream = 128
     // 129 was updateStream. The server keeps the code retired.
@@ -63,6 +65,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
     case joinConsumerGroup = 148
     case leaveConsumerGroup = 149
     case updateResource = 150
+    case retireGeoOrigin = 151
 
     case sendMessages = 160
     case storeConsumerOffset = 161
@@ -98,7 +101,8 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
         case .createStream, .deleteStream, .createTopic, .deleteTopic, .createPartitions,
             .deletePartitions, .createConsumerGroup, .deleteConsumerGroup, .createUser,
             .deleteUser, .changePassword, .updatePermissions, .createPersonalAccessToken,
-            .deletePersonalAccessToken, .joinConsumerGroup, .leaveConsumerGroup, .updateResource:
+            .deletePersonalAccessToken, .joinConsumerGroup, .leaveConsumerGroup, .updateResource,
+            .retireGeoOrigin:
             return true
         default:
             return false
@@ -139,6 +143,7 @@ enum ConsensusOperation: UInt8, Sendable, Hashable {
         case .joinConsumerGroup: .joinConsumerGroup
         case .leaveConsumerGroup: .leaveConsumerGroup
         case .updateResource: .updateResource
+        case .retireGeoOrigin: .retireGeoOrigin
         default: nil
         }
     }

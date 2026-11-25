@@ -15,26 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::commands::cli_command::{CliCommand, PRINT_TARGET};
-use anyhow::Context;
+use crate::commands::binary_partitions::get_partitions::partitions_table;
+use crate::commands::cli_command::{CliCommand, PRINT_TARGET, print_json};
+use anyhow::{Context, bail};
 use async_trait::async_trait;
 use comfy_table::{Table, presets::ASCII_NO_BORDERS};
 use iggy_common::Client;
+use iggy_common::GeoTopicDurations;
 use iggy_common::Identifier;
 use iggy_common::IggyExpiry;
+use iggy_common::OptionKey;
 use iggy_common::TopicDetails;
 use tracing::{Level, event};
+
+pub enum GetTopicOutput {
+    Table,
+    Json,
+}
 
 pub struct GetTopicCmd {
     stream_id: Identifier,
     topic_id: Identifier,
+    output: GetTopicOutput,
 }
 
 impl GetTopicCmd {
-    pub fn new(stream_id: Identifier, topic_id: Identifier) -> Self {
+    pub fn new(stream_id: Identifier, topic_id: Identifier, output: GetTopicOutput) -> Self {
         Self {
             stream_id,
             topic_id,
+            output,
         }
     }
 }
@@ -48,6 +58,10 @@ impl CliCommand for GetTopicCmd {
         )
     }
 
+    fn stdout_is_data(&self) -> bool {
+        matches!(self.output, GetTopicOutput::Json)
+    }
+
     async fn execute_cmd(&mut self, client: &dyn Client) -> anyhow::Result<(), anyhow::Error> {
         let topic = client
             .get_topic(&self.stream_id, &self.topic_id)
@@ -59,13 +73,30 @@ impl CliCommand for GetTopicCmd {
                 )
             })?;
 
-        if topic.is_none() {
+        let Some(topic) = topic else {
+            if self.stdout_is_data() {
+                bail!(
+                    "Topic with ID: {} in stream {} was not found",
+                    self.topic_id,
+                    self.stream_id
+                );
+            }
             event!(target: PRINT_TARGET, Level::INFO, "Topic with ID: {} in stream {} was not found", self.topic_id, self.stream_id);
             return Ok(());
+        };
+
+        if self.stdout_is_data() {
+            return print_json(&topic);
         }
 
-        let topic = topic.unwrap();
-        let table = topic_table(&topic);
+        // A topic in a shadow stream comes from the stream's geo origin.
+        let origin = client
+            .get_stream(&self.stream_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|stream| stream.shadow_origin());
+        let table = topic_table(&topic, origin.as_deref());
 
         event!(target: PRINT_TARGET, Level::INFO,"{table}");
 
@@ -73,7 +104,9 @@ impl CliCommand for GetTopicCmd {
     }
 }
 
-fn topic_table(topic: &TopicDetails) -> Table {
+/// The table of `topic`, with the geo `origin` of its stream when it is a
+/// shadow stream.
+fn topic_table(topic: &TopicDetails, origin: Option<&str>) -> Table {
     let mut table = Table::new();
 
     table.set_header(vec!["Property", "Value"]);
@@ -84,6 +117,16 @@ fn topic_table(topic: &TopicDetails) -> Table {
         topic.created_at.to_utc_string("%Y-%m-%d %H:%M:%S").as_str(),
     ]);
     table.add_row(vec!["Topic name", topic.name.as_str()]);
+    table.add_row(vec!["Topic type", resolved.topic_type.as_ref()]);
+    if let Some(geo_mode) = resolved.geo_mode {
+        table.add_row(vec!["Geo mode", geo_mode.as_ref()]);
+    }
+    if let Some(origin) = origin {
+        table.add_row(vec!["Origin", origin]);
+    }
+    for (label, duration) in geo_duration_rows(&resolved.geo_durations) {
+        table.add_row(vec![label, duration.as_str()]);
+    }
     table.add_row(vec!["Topic size", format!("{}", topic.size).as_str()]);
     table.add_row(vec![
         "Compression",
@@ -112,32 +155,9 @@ fn topic_table(topic: &TopicDetails) -> Table {
     ]);
 
     if !topic.partitions.is_empty() {
-        let mut partitions_table = Table::new();
-        partitions_table.load_style(ASCII_NO_BORDERS);
-        partitions_table.set_header(vec![
-            "Partition id",
-            "Created",
-            "Segments count",
-            "Current offset",
-            "Size",
-            "Messages count",
-            "Members",
-            "In sync",
-        ]);
-
-        for partition in &topic.partitions {
-            partitions_table.add_row(vec![
-                partition.id.to_string(),
-                partition.created_at.to_utc_string("%Y-%m-%d %H:%M:%S"),
-                partition.segments_count.to_string(),
-                partition.current_offset.to_string(),
-                partition.size.to_string(),
-                partition.messages_count.to_string(),
-                node_list(&partition.members),
-                node_list(&partition.in_sync_members),
-            ]);
-        }
-        table.add_row(vec!["Partitions", partitions_table.to_string().as_str()]);
+        let mut partitions = partitions_table(&topic.partitions);
+        partitions.load_style(ASCII_NO_BORDERS);
+        table.add_row(vec!["Partitions", partitions.to_string().as_str()]);
     }
 
     if !topic.options.is_empty() {
@@ -162,16 +182,29 @@ fn topic_table(topic: &TopicDetails) -> Table {
     table
 }
 
-/// Node ids as `0,2,4`, or `-` for none.
-fn node_list(nodes: &[u8]) -> String {
-    if nodes.is_empty() {
-        return "-".to_owned();
-    }
-    nodes
-        .iter()
-        .map(u8::to_string)
-        .collect::<Vec<_>>()
-        .join(",")
+/// The durations that a geo topic sets for itself, each with its label. The
+/// node's settings apply to the ones it does not set, so they have no row.
+fn geo_duration_rows(durations: &GeoTopicDurations) -> Vec<(&'static str, String)> {
+    GeoTopicDurations::KEYS
+        .into_iter()
+        .filter_map(|key| {
+            let duration = durations.get(key)?;
+            let label = match key {
+                OptionKey::FreshUploadInterval => "Fresh upload interval",
+                OptionKey::ConsumerOffsetUploadInterval => "Offset upload interval",
+                OptionKey::PositionsPublishInterval => "Positions publish interval",
+                OptionKey::TombstoneGrace => "Tombstone grace",
+                OptionKey::PositionsResumeTimeout => "Positions resume timeout",
+                _ => "Rewrite max interval",
+            };
+            let shown = match (key, duration.is_zero()) {
+                (OptionKey::ConsumerOffsetUploadInterval, true) => "disabled".to_owned(),
+                (_, true) => "0".to_owned(),
+                (_, false) => duration.to_string(),
+            };
+            Some((label, shown))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -197,7 +230,7 @@ mod tests {
 
     #[test]
     fn empty_collections_keep_topic_properties_without_nested_tables() {
-        let output = topic_table(&topic()).to_string();
+        let output = topic_table(&topic(), None).to_string();
         assert!(output.contains("Topic name          | test-topic"));
         assert!(output.contains("Partitions count    | 0"));
         assert!(!output.contains("Partition id"));
@@ -233,7 +266,7 @@ mod tests {
                 in_sync_members: Vec::new(),
             },
         ];
-        let output = topic_table(&topic).to_string();
+        let output = topic_table(&topic, None).to_string();
         let rows = output
             .lines()
             .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -268,7 +301,7 @@ mod tests {
                 OptionValue::explicit(HeaderValue::from(17_u32)),
             ),
         ]);
-        let output = topic_table(&topic).to_string();
+        let output = topic_table(&topic, None).to_string();
         let rows = output
             .lines()
             .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -300,6 +333,73 @@ mod tests {
     }
 
     #[test]
+    fn given_a_geo_topic_in_a_shadow_stream_should_show_its_type_mode_and_origin() {
+        let mut fixture = topic();
+        fixture.options = ResourceOptions::from([
+            (
+                HeaderKey::try_from("topic_type").unwrap(),
+                OptionValue::explicit(HeaderValue::try_from("geo").unwrap()),
+            ),
+            (
+                HeaderKey::try_from("geo_mode").unwrap(),
+                OptionValue::derived(HeaderValue::try_from("geo").unwrap()),
+            ),
+        ]);
+
+        let shadow = topic_table(&fixture, Some("dc-a")).to_string();
+        let normal = topic_table(&topic(), None).to_string();
+
+        for expected in [
+            "Topic type          | geo",
+            "Geo mode            | geo",
+            "Origin              | dc-a",
+        ] {
+            assert!(shadow.contains(expected), "{expected:?} in {shadow}");
+        }
+        assert!(normal.contains("Topic type          | normal"));
+        assert!(!normal.contains("Geo mode"));
+        assert!(!normal.contains("Origin"));
+    }
+
+    #[test]
+    fn given_a_geo_topic_with_its_own_durations_should_show_the_ones_it_sets() {
+        let mut fixture = topic();
+        fixture.options = ResourceOptions::from([
+            (
+                HeaderKey::try_from("topic_type").unwrap(),
+                OptionValue::explicit(HeaderValue::try_from("geo").unwrap()),
+            ),
+            (
+                HeaderKey::try_from("tombstone_grace").unwrap(),
+                OptionValue::explicit(HeaderValue::from(3_600_000_000u64)),
+            ),
+            (
+                HeaderKey::try_from("consumer_offset_upload_interval").unwrap(),
+                OptionValue::explicit(HeaderValue::from(0u64)),
+            ),
+        ]);
+
+        let table = topic_table(&fixture, None).to_string();
+        let row = |label: &str| {
+            table
+                .lines()
+                .find(|line| line.contains(label))
+                .map(|line| line.split('|').nth(2).unwrap_or_default().trim().to_owned())
+        };
+
+        assert_eq!(row("Tombstone grace").as_deref(), Some("1h"));
+        assert_eq!(row("Offset upload interval").as_deref(), Some("disabled"));
+        for unset in [
+            "Fresh upload interval",
+            "Positions publish interval",
+            "Positions resume timeout",
+            "Rewrite max interval",
+        ] {
+            assert_eq!(row(unset), None, "{unset} in {table}");
+        }
+    }
+
+    #[test]
     fn resolved_options_keep_full_width_values_and_sources() {
         let mut fixture = topic();
         fixture.options = ResourceOptions::from([
@@ -328,7 +428,7 @@ mod tests {
                 OptionValue::explicit(HeaderValue::try_from("replicated").unwrap()),
             ),
         ]);
-        let output = topic_table(&fixture).to_string();
+        let output = topic_table(&fixture, None).to_string();
         for expected in [
             "Option                            | Value",
             "preallocate_segments              | false                | explicit",

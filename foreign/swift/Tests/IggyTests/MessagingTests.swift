@@ -307,6 +307,25 @@ struct MessagingTests {
         await client.shutdown()
     }
 
+    /// The object store refused the tiered data for good, so the poll is
+    /// sent once and its refusal is the answer.
+    @Test func aPollRefusedWithTieredReadFailedIsNotSentAgain() async throws {
+        let server = try await FakeVSRServer.started()
+        defer { Task { await server.stop() } }
+        await server.respond { request in
+            if request.code == CommandCode.pollMessages.rawValue {
+                return .status(IggyErrorCode.tieredReadFailed.rawValue)
+            }
+            return FakeVSRServer.defaultReply(request, address: server.address)
+        }
+        let client = try await connectedClient(server)
+        await expectCode(.tieredReadFailed) {
+            _ = try await client.pollMessages(streamID: 1, topicID: 2, partitionID: 0, strategy: .first, count: 1, autoCommit: false)
+        }
+        #expect(await requests(server, .pollMessages).count == 1)
+        await client.shutdown()
+    }
+
     /// The poll may have been applied, with auto-commit, before the
     /// connection went: its outcome is unknown, as on a data connection.
     @Test func aSingleNodePollLostAfterItWasWrittenIsAnUnknownOutcome() async throws {

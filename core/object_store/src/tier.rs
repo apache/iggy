@@ -30,11 +30,11 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::mem;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
-use futures::future::{self, FutureExt, LocalBoxFuture};
+use futures::future::{self, Either, FutureExt, LocalBoxFuture};
 
 use crate::store::ObjectStore;
 
@@ -47,6 +47,9 @@ pub enum TierJobClass {
     DemandFetch,
     /// The upload of a sealed segment.
     Upload,
+    /// The upload of a fresh object, which producers wait for. It has slots
+    /// of its own, so it never waits behind an [`Self::Upload`].
+    FreshUpload,
     /// Readahead and chunk hydration that no poll waits for yet.
     SpeculativeFetch,
     /// Object deletes, on their own quota so that deletion keeps pace with
@@ -58,9 +61,10 @@ pub enum TierJobClass {
 }
 
 impl TierJobClass {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::DemandFetch,
         Self::Upload,
+        Self::FreshUpload,
         Self::SpeculativeFetch,
         Self::Delete,
         Self::Housekeeping,
@@ -127,6 +131,25 @@ impl TierScopeToken {
         ScopeCancelled {
             state: Rc::clone(&self.state),
             waiter: None,
+        }
+    }
+
+    /// Runs `job` until it ends, or until the scope is cancelled.
+    ///
+    /// Cancellation is polled first, so `job` is never polled again once the
+    /// scope is cancelled before a poll.
+    ///
+    /// # Errors
+    /// [`TierJobCancelled`] when the scope is cancelled before `job` ends.
+    pub async fn run_until_cancelled<T>(
+        &self,
+        job: impl Future<Output = T>,
+    ) -> Result<T, TierJobCancelled> {
+        let cancelled = pin!(self.cancelled());
+        let job = pin!(job);
+        match future::select(cancelled, job).await {
+            Either::Left(((), _)) => Err(TierJobCancelled),
+            Either::Right((output, _)) => Ok(output),
         }
     }
 }
@@ -225,6 +248,8 @@ impl TierJobRequest {
     /// - An upload streams its segment and holds only a few pieces at once.
     ///   Its bytes are the length of the segment, and the cap bounds the
     ///   bytes in flight to the store.
+    /// - The upload of a fresh object holds the whole object in memory. Its
+    ///   bytes are the length of the object.
     /// - Deletes and housekeeping count only jobs, and keep 0 bytes.
     ///
     /// A job with more bytes than the cap of its class runs alone, once no
@@ -267,10 +292,9 @@ pub trait TierExecutor {
     /// finishes. Dropping the handle does not cancel the job, so a fetch
     /// that a poll stopped waiting for still warms the cache.
     ///
-    /// Reusable cases for these promises come with the tier service, which
-    /// has the queue and the caps that they test.
-    /// [`crate::InlineTierExecutor`] has neither, and its own tests cover
-    /// only what it models.
+    /// The tests of the tier service in `shard::tier_service` cover these
+    /// promises with its queue and its caps. [`crate::InlineTierExecutor`]
+    /// has neither, and its own tests cover only what it models.
     #[must_use = "await the handle, or detach it to let the job run on"]
     fn submit<T, F, Fut>(&self, request: TierJobRequest, job: F) -> TierJobHandle<T>
     where
