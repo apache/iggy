@@ -98,7 +98,7 @@ impl ObjectStore for MemoryStore {
         let crc32c = checked_crc32c(key, &bytes, options)?;
         self.objects
             .borrow_mut()
-            .insert(key, bytes, crc32c, options)
+            .insert(key, bytes, crc32c, options, SystemTime::now())
     }
 
     async fn get_range(
@@ -129,6 +129,9 @@ impl ObjectStore for MemoryStore {
 
 /// The whole body of a put. A body of one piece is kept as it came, without
 /// a copy.
+///
+/// # Errors
+/// [`ObjectStoreError::Body`] when a piece of the body fails.
 pub async fn read_body(body: PutBody) -> Result<Bytes, ObjectStoreError> {
     let reservation = usize::try_from(body.len())
         .unwrap_or(usize::MAX)
@@ -156,6 +159,9 @@ pub async fn read_body(body: PutBody) -> Result<Bytes, ObjectStoreError> {
 }
 
 /// The CRC32C of `bytes`, which must equal the one that `options` declares.
+///
+/// # Errors
+/// [`ObjectStoreError::ChecksumMismatch`] when it does not.
 pub fn checked_crc32c(
     key: &str,
     bytes: &[u8],
@@ -171,27 +177,50 @@ pub fn checked_crc32c(
 }
 
 impl Objects {
+    #[must_use]
     pub fn keys(&self) -> Vec<String> {
         self.objects.keys().cloned().collect()
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.objects.len()
     }
 
-    /// Commits a put whose body arrived whole, and decides
-    /// [`PutMode::IfAbsent`] now.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
+    /// The bytes under `key`.
+    #[must_use]
+    pub fn bytes(&self, key: &str) -> Option<Bytes> {
+        self.objects.get(key).map(|object| object.bytes.clone())
+    }
+
+    /// Commits a put whose body arrived whole, as modified at
+    /// `last_modified`, and decides [`PutMode::IfAbsent`] now.
+    ///
+    /// # Errors
+    /// [`ObjectStoreError::PreconditionFailed`] for a [`PutMode::IfAbsent`]
+    /// put over an object.
     pub fn insert(
         &mut self,
         key: &str,
         bytes: Bytes,
         crc32c: u32,
         options: &PutOptions,
+        last_modified: SystemTime,
     ) -> Result<(), ObjectStoreError> {
-        if options.mode == PutMode::IfAbsent && self.objects.contains_key(key) {
-            return Err(ObjectStoreError::PreconditionFailed {
-                key: key.to_owned(),
-            });
+        // No wildcard: a new mode must decide here, and never falls back to
+        // an overwrite.
+        match options.mode {
+            PutMode::IfAbsent if self.objects.contains_key(key) => {
+                return Err(ObjectStoreError::PreconditionFailed {
+                    key: key.to_owned(),
+                });
+            }
+            PutMode::Overwrite | PutMode::IfAbsent => {}
         }
         self.puts += 1;
         self.objects.insert(
@@ -200,13 +229,17 @@ impl Objects {
                 bytes,
                 metadata: options.metadata.clone(),
                 etag: format!("{:016x}", self.puts),
-                last_modified: SystemTime::now(),
+                last_modified,
                 crc32c,
             },
         );
         Ok(())
     }
 
+    /// # Errors
+    /// [`ObjectStoreError::NotFound`] for a missing key, and
+    /// [`ObjectStoreError::InvalidRange`] for a range that starts past the
+    /// object.
     pub fn get_range(
         &self,
         key: &str,
@@ -230,6 +263,8 @@ impl Objects {
         })
     }
 
+    /// # Errors
+    /// [`ObjectStoreError::NotFound`] for a missing key.
     pub fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
         let object = self.objects.get(key).ok_or_else(|| not_found(key))?;
         Ok(ObjectMeta {
@@ -257,6 +292,7 @@ impl Objects {
         outcome
     }
 
+    #[must_use]
     pub fn list(&self, request: &ListRequest<'_>) -> ListPage {
         // A continuation from another listing can sort before the prefix,
         // and the scan must still start inside it.

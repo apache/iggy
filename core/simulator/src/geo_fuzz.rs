@@ -25,26 +25,35 @@
 //! every send drains, and every shadow catches up.
 //!
 //! Checked as the run goes: no cluster writes to a bucket that it does not
-//! own (G3), and the offset that a replica committed for a shadow never
-//! moves back (G5). Every poll of a shadow during the run is kept and checked
-//! at the end against its origin's log: a shadow serves a prefix of it (G2).
-//! At the end, every acknowledged send is read once and each client's in the
-//! order it sent them (G1), each is in its origin's bucket (G8), and each
+//! own (G3), the offset that a replica committed for a shadow never moves
+//! back (G5), and a send is in its origin's bucket when its success answer
+//! arrives (G8). Every poll of a shadow during the run must decode, start at
+//! offset 0 and agree with every earlier poll of that shadow, so the run
+//! keeps only the longest. At the end, the longest is checked against its
+//! origin's log: a shadow serves a prefix of it, at the same offsets (G2).
+//! Every acknowledged send is read once and each client's in the order it
+//! sent them (G1), each is still in its origin's bucket (G8), and each
 //! shadow serves its origin's whole log within a bound of steps once the
-//! faults healed (G6).
+//! faults healed (G6). Every step of the run, the steps of its reads
+//! included, goes through [`Run::tick`], so each check sees each step and the
+//! bound counts every one.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::time::Duration;
 
+use bytes::Bytes;
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
 use iggy_common::IggyError;
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
 use rand_xoshiro::rand_core::SeedableRng;
 use server_common::Message;
+use server_common::send_messages::decode_batch_slice;
 use server_common::sharding::IggyNamespace;
-use std::time::Duration;
 
-use crate::bucket::{BucketFaults, ClusterId};
+use crate::bucket::{BucketFaults, ClusterId, SimBucket};
 use crate::client::SimClient;
 use crate::geo_world::{GeoSeeds, GeoWorld, GeoWorldOptions, ORIGINS, POLL_COUNT, PollOutput};
 use crate::packet::PacketSimulatorOptions;
@@ -53,8 +62,8 @@ use crate::packet::PacketSimulatorOptions;
 const STREAM: &str = "geo";
 const TOPIC: &str = "orders";
 /// The start of every payload. The rest names the origin, the client and
-/// the client's sequence number, so a payload is found in any bytes by a
-/// scan.
+/// the client's sequence number, so a payload is found in the bytes of any
+/// bucket object by a scan.
 const PAYLOAD_MARK: &[u8] = b"geo-payload-";
 const PAYLOAD_END: &[u8] = b"-end";
 /// Below [`POLL_COUNT`], so one poll reads a whole log.
@@ -71,12 +80,13 @@ const FOREIGN_WRITE_STEPS: u64 = 500;
 /// Steps every send gets to end once the faults healed.
 const DRAIN_STEPS: u64 = 20_000;
 /// Steps every shadow gets to serve its origin's whole log once the sends
-/// drained: a rewrite, a manifest, and the peer's listings of both.
+/// drained: a rewrite, a manifest, and the peer's listings of both. The
+/// steps of the reads that look count too.
 const CONVERGE_STEPS: u64 = 30_000;
-/// How often the convergence wait polls.
+/// How often the convergence wait reads the logs.
 const CONVERGE_POLL_STEPS: u64 = 200;
-/// Steps a poll at the end gets.
-const FINAL_POLL_STEPS: usize = 3_000;
+/// Steps a read of a log at the end gets.
+const FINAL_READ_STEPS: u64 = 3_000;
 
 /// How a run is built.
 #[derive(Debug, Clone)]
@@ -207,7 +217,8 @@ pub struct GeoFuzzReport {
     /// Polls of a shadow during the run that held at least one message, all
     /// of them checked against the origin's log.
     pub shadow_reads: u64,
-    /// Steps of the drain and of the convergence wait.
+    /// Steps of the drain and of the convergence wait, the steps of its
+    /// reads included.
     pub drain_steps: u64,
     pub converge_steps: u64,
     pub schedule_hashes: [u64; 2],
@@ -287,6 +298,121 @@ struct Partition {
     unknown: BTreeSet<String>,
 }
 
+/// A message as a poll served it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Served {
+    offset: u64,
+    payload: Bytes,
+}
+
+/// The payloads in each object of a bucket, as the run last read them. A
+/// refresh reads only the objects that changed since the one before.
+#[derive(Debug, Default)]
+struct BucketPayloads {
+    /// The changes of the bucket that the run read.
+    read: usize,
+    objects: BTreeMap<String, Vec<String>>,
+    /// The number of objects that hold each payload.
+    holders: BTreeMap<String, usize>,
+}
+
+impl BucketPayloads {
+    fn refresh(&mut self, bucket: &SimBucket) {
+        let changes = bucket.changes_since(self.read);
+        self.read += changes.len();
+        for key in changes {
+            for payload in self.objects.remove(&key).unwrap_or_default() {
+                if let Entry::Occupied(mut holders) = self.holders.entry(payload) {
+                    *holders.get_mut() -= 1;
+                    if *holders.get() == 0 {
+                        holders.remove();
+                    }
+                }
+            }
+            let Some(bytes) = bucket.object(&key) else {
+                continue;
+            };
+            let payloads = payloads_in(&bytes);
+            for payload in &payloads {
+                *self.holders.entry(payload.clone()).or_default() += 1;
+            }
+            self.objects.insert(key, payloads);
+        }
+    }
+
+    fn holds(&self, payload: &str) -> bool {
+        self.holders.contains_key(payload)
+    }
+}
+
+/// A shadow that does not serve its origin's whole log yet.
+struct Lag {
+    origin: usize,
+    partition: usize,
+    /// `None` when the origin served no log in time.
+    log: Option<Vec<Served>>,
+    /// `None` while the peer has no shadow that serves.
+    shadow: Option<Vec<Served>>,
+}
+
+impl fmt::Display for Lag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} partition {}: ",
+            ORIGINS[self.origin], self.partition
+        )?;
+        match (&self.log, &self.shadow) {
+            (None, _) => write!(formatter, "the origin served no log in time"),
+            (Some(log), None) => write!(formatter, "origin {} messages, shadow none", log.len()),
+            (Some(log), Some(shadow)) => write!(
+                formatter,
+                "origin {} messages, shadow {}",
+                log.len(),
+                Difference { log, shadow }
+            ),
+        }
+    }
+}
+
+/// How a shadow's messages differ from the origin's log.
+struct Difference<'a> {
+    log: &'a [Served],
+    shadow: &'a [Served],
+}
+
+impl fmt::Display for Difference<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { log, shadow } = *self;
+        let first = log
+            .iter()
+            .zip(shadow)
+            .position(|(logged, served)| logged != served)
+            .unwrap_or_else(|| log.len().min(shadow.len()));
+        let logged: BTreeSet<&[u8]> = log.iter().map(|message| message.payload.as_ref()).collect();
+        let served: BTreeSet<&[u8]> = shadow
+            .iter()
+            .map(|message| message.payload.as_ref())
+            .collect();
+        let extra: Vec<_> = served
+            .difference(&logged)
+            .map(|payload| String::from_utf8_lossy(payload))
+            .collect();
+        let missing: Vec<_> = logged
+            .difference(&served)
+            .map(|payload| String::from_utf8_lossy(payload))
+            .collect();
+        write!(
+            formatter,
+            "{} messages, first differing at {first} (origin {:?}, shadow {:?}), not in the \
+             origin {extra:?}, missing {missing:?}",
+            shadow.len(),
+            log.get(first),
+            shadow.get(first)
+        )
+    }
+}
+
 struct Run {
     world: GeoWorld,
     producers: Vec<Producer>,
@@ -306,8 +432,11 @@ struct Run {
     shadow_floors: BTreeMap<(usize, IggyNamespace, u8), u64>,
     /// Polls of shadows in flight: the origin, the partition and the poll.
     shadow_polls: Vec<(usize, usize, PollOutput)>,
-    /// What each poll of a shadow served, by origin and partition.
-    shadow_reads: Vec<(usize, usize, Vec<String>)>,
+    /// The longest read of each shadow during the run, by origin and
+    /// partition. Every other read of the shadow is a prefix of it.
+    shadow_reads: BTreeMap<(usize, usize), Vec<Served>>,
+    /// What each cluster's bucket holds, as the run last read it.
+    buckets: [BucketPayloads; 2],
     report: GeoFuzzReport,
 }
 
@@ -324,7 +453,7 @@ impl Run {
         for (cluster, namespaces) in namespaces.iter_mut().enumerate() {
             let clients: Vec<SimClient> = client_ids.iter().map(|id| SimClient::new(*id)).collect();
             for client in &clients {
-                world.sim_mut(cluster).shell_login(client);
+                world.shell_login(cluster, client);
             }
             *namespaces =
                 world.create_geo_topic(cluster, &clients[0], STREAM, TOPIC, options.partitions);
@@ -365,7 +494,8 @@ impl Run {
             dc_down: None,
             shadow_floors: BTreeMap::new(),
             shadow_polls: Vec::new(),
-            shadow_reads: Vec::new(),
+            shadow_reads: BTreeMap::new(),
+            buckets: Default::default(),
             report: GeoFuzzReport::default(),
         }
     }
@@ -504,6 +634,7 @@ impl Run {
             else {
                 unreachable!("the producer is sending");
             };
+            self.check_in_bucket(cluster, &send.payload);
             let client = self.producers[index].client.client_id();
             self.partitions[cluster][send.partition]
                 .acknowledged
@@ -521,6 +652,20 @@ impl Run {
             *self.report.refusals.entry(status).or_default() += 1;
             self.abandon(index);
         }
+    }
+
+    /// G8 when the success answer of a send arrives: a geo send goes to its
+    /// origin's bucket before the partition commits it, so the bucket holds
+    /// it already.
+    fn check_in_bucket(&mut self, cluster: usize, payload: &str) {
+        let bucket = &mut self.buckets[cluster];
+        bucket.refresh(self.world.bucket(cluster));
+        assert!(
+            bucket.holds(payload),
+            "G8: {} acknowledged {payload} at step {}, and its bucket does not hold it",
+            ORIGINS[cluster],
+            self.step
+        );
     }
 
     /// Give up the send of producer `index`, whose outcome is unknown, and
@@ -709,90 +854,150 @@ impl Run {
             .join("; ")
     }
 
-    /// G6: step until every shadow serves its origin's whole log.
+    /// G6: step until every shadow serves its origin's whole log, within
+    /// [`CONVERGE_STEPS`] steps of the run. The steps of the reads and of
+    /// their retries count, and no read goes past the deadline.
     fn converge(&mut self) {
+        let start = self.step;
+        let deadline = start + CONVERGE_STEPS;
         loop {
             let mut behind = Vec::new();
             for origin in 0..2 {
                 for partition in 0..self.namespaces[origin].len() {
-                    let log = self.origin_log(origin, partition);
-                    let shadow = self.shadow_log(origin, partition);
-                    if shadow.as_ref() != Some(&log) {
-                        behind.push(format!(
-                            "{} partition {partition}: origin {} messages, shadow {}",
-                            ORIGINS[origin],
-                            log.len(),
-                            shadow.map_or_else(
-                                || "none".to_owned(),
-                                |shadow| describe_difference(&log, &shadow)
-                            )
-                        ));
+                    let log = self.origin_log(origin, partition, deadline);
+                    let shadow = self.shadow_log(origin, partition, deadline);
+                    if log.is_none() || shadow != log {
+                        behind.push(Lag {
+                            origin,
+                            partition,
+                            log,
+                            shadow,
+                        });
                     }
                 }
             }
+            self.report.converge_steps = self.step - start;
             if behind.is_empty() {
                 return;
             }
             assert!(
-                self.report.converge_steps < CONVERGE_STEPS,
+                self.step < deadline,
                 "G6: the shadows did not catch up in {CONVERGE_STEPS} steps once every fault \
                  healed: {}",
-                behind.join("; ")
+                behind
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
             );
-            for _ in 0..CONVERGE_POLL_STEPS {
+            let until = deadline.min(self.step + CONVERGE_POLL_STEPS);
+            while self.step < until {
                 self.tick(false);
-                self.report.converge_steps += 1;
             }
         }
     }
 
-    /// The payloads of `partition` of `origin`'s geo topic, in log order, as
-    /// its primary serves them.
-    fn origin_log(&mut self, origin: usize, partition: usize) -> Vec<String> {
+    /// The messages of `partition` of `origin`'s geo topic, in log order, as
+    /// its primary serves them, or `None` when it serves none by step
+    /// `until`.
+    fn origin_log(&mut self, origin: usize, partition: usize, until: u64) -> Option<Vec<Served>> {
         let namespace = self.namespaces[origin][partition];
-        let log = (0..FINAL_POLL_STEPS).find_map(|_| {
-            let log = self.read_log(origin, namespace);
-            if log.is_none() {
-                self.tick(false);
+        let label = format!("G1: {} partition {partition}", ORIGINS[origin]);
+        loop {
+            if let Some(log) = self.read_log(origin, namespace, until, &label) {
+                return Some(log);
             }
-            log
-        });
-        log.unwrap_or_else(|| {
-            panic!(
-                "{} partition {partition} serves its log once every fault healed",
-                ORIGINS[origin]
-            )
-        })
+            if self.step >= until {
+                return None;
+            }
+            self.tick(false);
+        }
     }
 
     /// What the shadow of `partition` of `origin`'s geo topic serves, in log
-    /// order, or `None` while the peer has no shadow that serves it.
-    fn shadow_log(&mut self, origin: usize, partition: usize) -> Option<Vec<String>> {
+    /// order, or `None` while the peer has no shadow that serves it by step
+    /// `until`.
+    fn shadow_log(&mut self, origin: usize, partition: usize, until: u64) -> Option<Vec<Served>> {
         let peer = 1 - origin;
         let shadow =
             self.world
                 .shadow_of(peer, origin, STREAM, TOPIC, u32::try_from(partition).ok()?)?;
-        self.read_log(peer, shadow)
+        let label = format!(
+            "G2: the shadow of {} partition {partition}",
+            ORIGINS[origin]
+        );
+        self.read_log(peer, shadow, until, &label)
     }
 
-    /// Every payload that the primary of `namespace` on `cluster` serves, a
-    /// page at a time, or `None` while it has no primary or refuses a poll.
-    /// Each send holds one message, so the next page starts at the number of
-    /// messages read so far.
-    fn read_log(&mut self, cluster: usize, namespace: IggyNamespace) -> Option<Vec<String>> {
-        let mut log = Vec::new();
+    /// Every message that the primary of `namespace` on `cluster` serves, a
+    /// page at a time, or `None` while it has no primary, refuses a poll, or
+    /// leaves one unanswered at step `until`.
+    ///
+    /// # Panics
+    /// When a page does not decode or does not go on from the offset that
+    /// the log reached. `label` names the check.
+    fn read_log(
+        &mut self,
+        cluster: usize,
+        namespace: IggyNamespace,
+        until: u64,
+        label: &str,
+    ) -> Option<Vec<Served>> {
+        let mut log: Vec<Served> = Vec::new();
         loop {
             let primary = self.world.primary(cluster, namespace)?;
-            let offset = u64::try_from(log.len()).ok()?;
-            let bytes = self
-                .world
-                .poll(cluster, primary, namespace, offset, FINAL_POLL_STEPS)
-                .ok()?;
-            let page = payloads_in(&bytes);
-            if page.is_empty() {
+            let read = log.len();
+            let from = u64::try_from(read).ok()?;
+            let bytes = Bytes::from(self.poll(cluster, primary, namespace, from, until)?.ok()?);
+            let page = served_messages(&bytes).unwrap_or_else(|error| {
+                panic!(
+                    "{label}: a poll from offset {from} served batches that do not decode: {error}"
+                )
+            });
+            for message in page {
+                let at = usize::try_from(message.offset).unwrap_or(usize::MAX);
+                if at < read {
+                    assert_eq!(
+                        log[at], message,
+                        "{label}: two polls served different messages at offset {at}"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    at,
+                    log.len(),
+                    "{label}: a poll from offset {from} served offset {at} where offset {} \
+                     comes next",
+                    log.len()
+                );
+                log.push(message);
+            }
+            if log.len() == read {
                 return Some(log);
             }
-            log.extend(page);
+        }
+    }
+
+    /// Poll `namespace` on `replica` of `cluster` from `offset`, and tick
+    /// until the poll ends, or `None` when it does not end by step `until`.
+    fn poll(
+        &mut self,
+        cluster: usize,
+        replica: u8,
+        namespace: IggyNamespace,
+        offset: u64,
+        until: u64,
+    ) -> Option<Result<Vec<u8>, IggyError>> {
+        if self.step >= until {
+            return None;
+        }
+        let output = self.world.start_poll(cluster, replica, namespace, offset);
+        loop {
+            self.tick(false);
+            let polled = output.borrow_mut().take();
+            if polled.is_some() || self.step >= until {
+                return polled;
+            }
         }
     }
 
@@ -850,10 +1055,16 @@ impl Run {
             match polled {
                 None => pending.push((origin, partition, poll)),
                 Some(Ok(bytes)) => {
-                    let read = payloads_in(&bytes);
+                    let read = served_messages(&Bytes::from(bytes)).unwrap_or_else(|error| {
+                        panic!(
+                            "G2: a poll of the shadow of {} partition {partition} served batches \
+                             that do not decode: {error}",
+                            ORIGINS[origin]
+                        )
+                    });
                     if !read.is_empty() {
                         self.report.shadow_reads += 1;
-                        self.shadow_reads.push((origin, partition, read));
+                        self.keep_shadow_read(origin, partition, read);
                     }
                 }
                 // A shadow whose primary moved or stopped refuses the poll.
@@ -861,6 +1072,50 @@ impl Run {
             }
         }
         self.shadow_polls = pending;
+    }
+
+    /// G2 as the run goes: a read of a shadow from offset 0 serves offsets
+    /// 0, 1, 2 and on, and two reads of one shadow agree where they overlap.
+    /// Each read is then a prefix of the longest, which alone stays for the
+    /// check against the origin's log at the end.
+    fn keep_shadow_read(&mut self, origin: usize, partition: usize, read: Vec<Served>) {
+        let label = || {
+            format!(
+                "G2: the shadow of {} partition {partition}",
+                ORIGINS[origin]
+            )
+        };
+        for (position, message) in (0u64..).zip(&read) {
+            assert_eq!(
+                message.offset,
+                position,
+                "{}: a poll from offset 0 served offset {} at position {position}",
+                label(),
+                message.offset
+            );
+        }
+        match self.shadow_reads.entry((origin, partition)) {
+            Entry::Vacant(entry) => {
+                entry.insert(read);
+            }
+            Entry::Occupied(mut entry) => {
+                let longest = entry.get();
+                let (shorter, longer) = if read.len() > longest.len() {
+                    (longest.as_slice(), read.as_slice())
+                } else {
+                    (read.as_slice(), longest.as_slice())
+                };
+                assert!(
+                    longer.starts_with(shorter),
+                    "{}: two polls disagree, first at {:?}",
+                    label(),
+                    shorter.iter().zip(longer).find(|(read, kept)| read != kept)
+                );
+                if read.len() > longest.len() {
+                    entry.insert(read);
+                }
+            }
+        }
     }
 
     /// G3: no cluster wrote to a bucket that it does not own.
@@ -878,108 +1133,101 @@ impl Run {
     fn check_logs(&mut self) {
         self.check_foreign_writes();
         for origin in 0..2 {
-            let in_bucket = self.payloads_in_bucket(origin);
+            self.buckets[origin].refresh(self.world.bucket(origin));
             for partition in 0..self.namespaces[origin].len() {
-                let log = self.origin_log(origin, partition);
+                let until = self.step + FINAL_READ_STEPS;
+                let log = self
+                    .origin_log(origin, partition, until)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} partition {partition} serves its log once every fault healed",
+                            ORIGINS[origin]
+                        )
+                    });
                 let sends = &self.partitions[origin][partition];
-                let mut at: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-                for (position, payload) in log.iter().enumerate() {
-                    at.entry(payload.as_str()).or_default().push(position);
+                let mut at: BTreeMap<&[u8], Vec<u64>> = BTreeMap::new();
+                for message in &log {
+                    at.entry(message.payload.as_ref())
+                        .or_default()
+                        .push(message.offset);
                 }
                 let label = format!("{} partition {partition}", ORIGINS[origin]);
                 for (client, acknowledged) in &sends.acknowledged {
                     let mut previous = None;
                     for payload in acknowledged {
-                        let positions = at.get(payload.as_str()).map_or(&[][..], Vec::as_slice);
+                        let offsets = at.get(payload.as_bytes()).map_or(&[][..], Vec::as_slice);
                         assert_eq!(
-                            positions.len(),
+                            offsets.len(),
                             1,
                             "G1: {label} holds the acknowledged {payload} {} times",
-                            positions.len()
+                            offsets.len()
                         );
                         assert!(
-                            previous < Some(positions[0]),
+                            previous < Some(offsets[0]),
                             "G1: {label} holds client {client}'s {payload} before an \
                              earlier send of the client"
                         );
-                        previous = Some(positions[0]);
+                        previous = Some(offsets[0]);
                         assert!(
-                            in_bucket.contains(payload),
+                            self.buckets[origin].holds(payload),
                             "G8: the bucket of {} holds no {payload}",
                             ORIGINS[origin]
                         );
                     }
                 }
-                for (payload, positions) in &at {
+                for (payload, offsets) in &at {
+                    let held = String::from_utf8_lossy(payload);
                     let acknowledged = sends
                         .acknowledged
                         .values()
-                        .any(|sent| sent.iter().any(|sent| sent == payload));
+                        .any(|sent| sent.iter().any(|sent| sent.as_bytes() == *payload));
                     assert!(
-                        acknowledged || sends.unknown.contains(*payload),
-                        "G1: {label} holds {payload}, which no client sent there"
+                        acknowledged || sends.unknown.contains(held.as_ref()),
+                        "G1: {label} holds {held}, which no client sent there"
                     );
                     assert_eq!(
-                        positions.len(),
+                        offsets.len(),
                         1,
-                        "G1: {label} holds {payload} {} times",
-                        positions.len()
+                        "G1: {label} holds {held} {} times",
+                        offsets.len()
                     );
                 }
-                for (_, _, read) in
-                    self.shadow_reads
-                        .iter()
-                        .filter(|(read_origin, read_partition, _)| {
-                            *read_origin == origin && *read_partition == partition
-                        })
-                {
+                if let Some(read) = self.shadow_reads.get(&(origin, partition)) {
                     assert!(
                         log.starts_with(read),
                         "G2: a shadow of {label} served {} messages that are not a prefix of \
-                         the origin's {}: {:?}",
+                         the origin's {}: {}",
                         read.len(),
                         log.len(),
-                        read.iter().zip(&log).find(|(read, logged)| read != logged)
+                        Difference {
+                            log: &log,
+                            shadow: read
+                        }
                     );
                 }
             }
         }
     }
-
-    /// Every payload that an object of `cluster`'s bucket holds.
-    fn payloads_in_bucket(&self, cluster: usize) -> BTreeSet<String> {
-        let bucket = self.world.bucket(cluster);
-        bucket
-            .keys()
-            .iter()
-            .filter_map(|key| bucket.object(key))
-            .flat_map(|object| payloads_in(&object))
-            .collect()
-    }
 }
 
-/// How `shadow` differs from the origin's `log`.
-fn describe_difference(log: &[String], shadow: &[String]) -> String {
-    let first = log
-        .iter()
-        .zip(shadow)
-        .position(|(logged, served)| logged != served)
-        .unwrap_or_else(|| log.len().min(shadow.len()));
-    let extra: Vec<&String> = shadow
-        .iter()
-        .filter(|served| !log.contains(served))
-        .collect();
-    let missing: Vec<&String> = log
-        .iter()
-        .filter(|logged| !shadow.contains(logged))
-        .collect();
-    format!(
-        "{} messages, first differing at {first} (origin {:?}, shadow {:?}), not in the \
-         origin {extra:?}, missing {missing:?}",
-        shadow.len(),
-        log.get(first),
-        shadow.get(first)
-    )
+/// Every message of the batches in `bytes`, with its offset.
+///
+/// # Errors
+/// When a batch does not decode, or does not match its checksums.
+fn served_messages(bytes: &Bytes) -> Result<Vec<Served>, IggyError> {
+    let mut served = Vec::new();
+    let mut rest: &[u8] = bytes;
+    while !rest.is_empty() {
+        let batch = decode_batch_slice(rest)?;
+        for message in &batch {
+            served.push(Served {
+                offset: batch.header.base_offset + u64::from(message.header.offset_delta),
+                payload: bytes.slice_ref(message.payload),
+            });
+        }
+        rest = &rest[batch.header.total_size()..];
+    }
+    Ok(served)
 }
 
 /// Every payload in `bytes`, in the order they appear.

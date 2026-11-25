@@ -28,7 +28,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use consensus::{Consensus, MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::{ReplyHeader, RoutedRequestHeader, WireIdentifier};
+use iggy_binary_protocol::{Operation, ReplyHeader, RoutedRequestHeader, WireIdentifier};
 use iggy_common::{IggyError, PollingStrategy};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::shadow::shadow_stream_name;
@@ -264,6 +264,53 @@ impl GeoWorld {
         }
     }
 
+    /// Log `client` in to replica 0 of `cluster`, as
+    /// [`Simulator::shell_login`] does, while every cluster steps.
+    ///
+    /// # Panics
+    /// As [`Self::shell_login_via`].
+    pub fn shell_login(&mut self, cluster: usize, client: &SimClient) {
+        self.shell_login_via(cluster, client, 0);
+    }
+
+    /// Log `client` in to `target` of `cluster`, as
+    /// [`Simulator::shell_login_via`] does, but step the world and not the
+    /// one cluster. Every cluster's clock then moves with the login, so the
+    /// skews between the clocks stay the ones the world set.
+    ///
+    /// # Panics
+    /// When no answer with a session arrives within the setup steps of a
+    /// login.
+    pub fn shell_login_via(&mut self, cluster: usize, client: &SimClient, target: u8) {
+        self.sim(cluster).admit_shell_client(client);
+        let replicas = self.sim(cluster).replica_count.max(1);
+        let mut target = target;
+        for step in 0..crate::SETUP_TOTAL_STEPS {
+            if step % crate::SETUP_RETRY_STEPS == 0 {
+                self.sim_mut(cluster).submit_handshake(client, target);
+                target = (target + 1) % replicas;
+            }
+            let replies = self.step();
+            let sim = self.sim(cluster);
+            let session = replies[cluster].iter().find_map(|reply| {
+                let header = reply.header();
+                (header.client == client.client_id() && header.operation == Operation::Register)
+                    .then(|| sim.handshake_session(reply))
+                    .flatten()
+            });
+            if let Some(session) = session {
+                client.bind_session(session);
+                sim.discover_partition_contexts(client);
+                return;
+            }
+        }
+        panic!(
+            "client {} logs in to cluster {cluster} within {} steps",
+            client.client_id(),
+            crate::SETUP_TOTAL_STEPS
+        );
+    }
+
     /// The namespace of `partition` of `topic` in `stream`, once `cluster`
     /// committed it.
     #[must_use]
@@ -359,7 +406,7 @@ impl GeoWorld {
             let polled = poll.await.map(|fragments| {
                 fragments
                     .iter()
-                    .flat_map(|fragment| fragment.as_slice().to_vec())
+                    .flat_map(|fragment| fragment.as_slice().iter().copied())
                     .collect()
             });
             *ready.borrow_mut() = Some(polled);

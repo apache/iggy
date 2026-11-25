@@ -29,7 +29,6 @@ clap = { workspace = true }
 clock = { workspace = true }
 configs = { workspace = true }
 consensus = { workspace = true }
-crc32c = { workspace = true }
 enumset = { workspace = true }
 futures = { workspace = true }
 iggy_binary_protocol = { workspace = true }

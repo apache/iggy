@@ -851,18 +851,7 @@ impl Simulator {
         username: &str,
         password: &str,
     ) {
-        // Connection metadata on every replica, as `install_client_fd` does in
-        // production. `ensure_transport_connection` reads it to admit the connection
-        // into the SessionManager, which the login's bind
-        // (Connected, Authenticated, Bound) requires.
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        for outbox in &self.outboxes {
-            outbox.insert_client_meta(ClientConnMeta::new(
-                client.client_id(),
-                addr,
-                ClientTransportKind::Tcp,
-            ));
-        }
+        self.admit_shell_client(client);
 
         // From here this client talks the real client protocol. See
         // `SimClient::shell_wire`.
@@ -882,6 +871,21 @@ impl Simulator {
         assert!(session > 0, "shell_login: login reply carried no session");
         client.bind_session(session);
         self.discover_partition_contexts(client);
+    }
+
+    /// Put `client`'s connection metadata on every replica, as
+    /// `install_client_fd` does in production. `ensure_transport_connection`
+    /// reads it to admit the connection into the `SessionManager`, which a
+    /// login's bind (Connected, Authenticated, Bound) requires.
+    pub(crate) fn admit_shell_client(&self, client: &SimClient) {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        for outbox in &self.outboxes {
+            outbox.insert_client_meta(ClientConnMeta::new(
+                client.client_id(),
+                addr,
+                ClientTransportKind::Tcp,
+            ));
+        }
     }
 
     /// Submit `message` to `target` and step until a client reply arrives,

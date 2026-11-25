@@ -26,6 +26,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use iggy_common::IggyError;
 use server_common::sharding::IggyNamespace;
 
 use crate::bucket::BucketFaults;
@@ -72,7 +73,7 @@ fn skewed_geo_world(
     let mut world = GeoWorld::new(&options);
     let client = SimClient::new(CLIENT_ID);
     for cluster in 0..world.cluster_count() {
-        world.sim_mut(cluster).shell_login(&client);
+        world.shell_login(cluster, &client);
     }
     (world, client)
 }
@@ -134,7 +135,7 @@ fn send(
             .iter()
             .any(|(evicted, from)| *evicted == client.client_id() && *from == target)
         {
-            world.sim_mut(cluster).shell_login_via(client, target);
+            world.shell_login_via(cluster, client, target);
             request = new_request();
         }
     }
@@ -381,9 +382,10 @@ fn given_a_shadow_when_a_client_sends_to_it_should_refuse_and_store_nothing() {
     });
     let after = await_shadow_serving(&mut world, &payloads, ANSWER_STEPS);
 
-    assert!(
-        status.is_some_and(|status| status != 0),
-        "the shadow refuses the send: {status:?}"
+    assert_eq!(
+        status,
+        Some(IggyError::ShadowStreamReadOnly.as_code()),
+        "the shadow refuses the send as read-only"
     );
     assert_eq!(
         after,
@@ -544,14 +546,37 @@ fn given_a_deleted_geo_topic_when_its_grace_passes_should_retire_the_shadow() {
     }
     await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS).expect("the peer serves the log");
 
+    let deleted_after = world.sim(ORIGIN).realtime_micros();
     world.complete(ORIGIN, &client, &client.delete_topic(STREAM, TOPIC));
-    let retired = (0..RETIRE_STEPS).any(|_| {
-        world.step();
-        shadow_of(&world).is_none()
-    });
+    let retired = await_retired_after_grace(&mut world, deleted_after, RETIRE_STEPS);
 
     assert!(retired, "the peer retires the shadow after the grace");
     assert_no_foreign_writes(&world);
+}
+
+/// Step until the peer retires the shadow, at most `steps` steps, and return
+/// whether it did. The origin stamps `deleted_at` once it applies the delete,
+/// so `deleted_at` is at least `deleted_after`, the origin's clock before the
+/// delete went out. The peer must keep the shadow until its own clock reaches
+/// `deleted_at` plus the grace, which this asserts from the delete's answer
+/// on.
+fn await_retired_after_grace(world: &mut GeoWorld, deleted_after: u64, steps: usize) -> bool {
+    let grace = u64::try_from(TOMBSTONE_GRACE.as_micros()).expect("the grace fits u64");
+    let mut left = steps;
+    while shadow_of(world).is_some() {
+        if left == 0 {
+            return false;
+        }
+        world.step();
+        left -= 1;
+    }
+    let now = world.sim(PEER).realtime_micros();
+    assert!(
+        now >= deleted_after + grace,
+        "the peer retired the shadow at {now}, before its clock reached the deletion at \
+         {deleted_after} or later plus the grace of {grace}"
+    );
+    true
 }
 
 #[test]
@@ -571,14 +596,31 @@ fn given_clusters_whose_clocks_disagree_when_the_origin_publishes_and_deletes_sh
         }
 
         let served = await_shadow_serving(&mut world, &payloads, FOLLOW_STEPS);
+        let deleted_after = world.sim(ORIGIN).realtime_micros();
         world.complete(ORIGIN, &client, &client.delete_topic(STREAM, TOPIC));
-        let retired = (0..RETIRE_STEPS).any(|_| {
-            world.step();
-            shadow_of(&world).is_none()
-        });
+        let retired = await_retired_after_grace(&mut world, deleted_after, RETIRE_STEPS);
 
         assert!(served.is_some(), "skews {skews:?}: the peer serves the log");
         assert!(retired, "skews {skews:?}: the peer retires the shadow");
         assert_no_foreign_writes(&world);
     }
+}
+
+#[test]
+fn given_a_login_to_one_cluster_when_it_waits_for_the_answer_should_keep_the_clocks_together() {
+    let mut world = GeoWorld::new(&GeoWorldOptions::new(
+        0x6745_4F49,
+        2,
+        REPLICAS,
+        &[CLIENT_ID],
+    ));
+    let client = SimClient::new(CLIENT_ID);
+
+    world.shell_login(ORIGIN, &client);
+
+    assert_eq!(
+        world.sim(ORIGIN).realtime_micros(),
+        world.sim(PEER).realtime_micros(),
+        "a login steps every cluster, so clocks that agreed still agree"
+    );
 }

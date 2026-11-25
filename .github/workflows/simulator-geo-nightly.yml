@@ -18,11 +18,12 @@
 name: Simulator geo nightly
 
 # Runs `workload-fuzz --geo --faults swarm` over a range of seeds that moves
-# on with every run, so each night tries seeds that no run tried before. The
+# on with every run, so each night tries seeds that no run tried before. Each
+# run owns the next SEED_RANGE seeds, whatever number of seeds it runs. The
 # logs of failed seeds are kept as an artifact, and a failed run opens an
 # issue, or comments on the issue that an earlier failed run opened. A seed
-# replays its run with
-# `cargo run --profile fuzz -p simulator --bin workload-fuzz -- --geo --faults swarm --seed SEED`.
+# replays its run with the options of scripts/simulator-geo-campaign.sh:
+# `cargo run --profile fuzz -p simulator --bin workload-fuzz -- --geo --faults swarm --seed SEED --ticks 8000 --clients 2 --replicas 3 --geo-partitions 2`.
 
 on:
   schedule:
@@ -30,7 +31,7 @@ on:
   workflow_dispatch:
     inputs:
       seeds:
-        description: "Seeds to run"
+        description: "Seeds to run, at most 2000"
         type: number
         default: 2000
 
@@ -58,13 +59,18 @@ jobs:
       - name: Run the geo campaign
         env:
           SEEDS: ${{ inputs.seeds || '2000' }}
+          SEED_RANGE: 2000
           RUN_NUMBER: ${{ github.run_number }}
         run: |
           if [[ ! $SEEDS =~ ^[0-9]+$ ]]; then
             echo "seeds must be a whole number, got $SEEDS" >&2
             exit 1
           fi
-          first=$(( (RUN_NUMBER - 1) * SEEDS + 1 ))
+          if (( SEEDS > SEED_RANGE )); then
+            echo "::notice::a run owns $SEED_RANGE seeds, so it runs $SEED_RANGE of the $SEEDS asked"
+            SEEDS=$SEED_RANGE
+          fi
+          first=$(( (RUN_NUMBER - 1) * SEED_RANGE + 1 ))
           last=$(( first + SEEDS - 1 ))
           scripts/simulator-geo-campaign.sh "$first" "$last" geo-campaign
 

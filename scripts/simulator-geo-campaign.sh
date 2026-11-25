@@ -24,7 +24,8 @@
 # The log of a failed run stays in OUT_DIR as SEED.log. The logs of the other
 # runs are removed. OUT_DIR/results.txt has one line per seed, and the script
 # prints a summary with the first panic of each failed run. It exits with 1
-# when a run failed.
+# when a run failed, or when no run passed: a campaign of vacuous runs
+# compared nothing.
 #
 # Environment:
 #   BIN         the workload-fuzz binary (target/fuzz/workload-fuzz)
@@ -122,4 +123,8 @@ while read -r seed _ code; do
     echo "  seed $seed ($code): $reason"
 done < <(grep ' FAIL ' "$OUT_DIR/results.txt" || true)
 
+if [[ $passed -eq 0 ]]; then
+    echo "no seed passed, so the campaign compared nothing" >&2
+    exit 1
+fi
 [[ $failed -eq 0 ]]

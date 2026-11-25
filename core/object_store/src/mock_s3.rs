@@ -17,7 +17,7 @@
 
 use std::ops::Range;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::error::ObjectStoreError;
 use crate::memory::{Objects, checked_crc32c, read_body};
@@ -127,7 +127,7 @@ impl ObjectStore for MockS3Store {
         let crc32c = checked_crc32c(key, &bytes, options);
         wait(self.latency.of(self.latency.put, bytes.len() as u64)).await;
         let crc32c = crc32c?;
-        self.write(|objects| objects.insert(key, bytes, crc32c, options))
+        self.write(|objects| objects.insert(key, bytes, crc32c, options, SystemTime::now()))
     }
 
     async fn get_range(

@@ -17,8 +17,9 @@
 
 //! An object store bucket that the simulated clusters share.
 //!
-//! The bucket keeps its objects in memory and answers on the virtual clock of
-//! the cluster that calls, so a run with store faults replays from its seed.
+//! The bucket keeps its objects in memory, as [`iggy_object_store::MemoryStore`]
+//! does, and answers on the virtual clock of the cluster that calls, so a run
+//! with store faults replays from its seed.
 //! Each cluster reaches the bucket through a [`BucketHandle`] of its own. The
 //! owner writes through its handle. A peer wraps its handle in
 //! [`iggy_object_store::ReadOnlyStore`], as a server does with the store of a
@@ -28,27 +29,27 @@
 //! a transient error before the call reaches the objects, and a put or delete
 //! that takes effect but answers as failed. The harness can also stall the
 //! bucket until it heals, take it down, and cut one cluster off from it. The
-//! access log keeps every call with the cluster that made it.
+//! access log keeps every call with the cluster that made it, and the change
+//! log keeps the key of every put and delete that committed.
 
 // The clusters of a run share one thread, as the shards of a node do.
 #![allow(clippy::future_not_send)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::future::poll_fn;
 use std::mem;
-use std::ops::{Bound, Range};
+use std::ops::Range;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use clock::Clock;
-use futures::StreamExt;
 use iggy_object_store::{
-    DeleteFailure, DeleteOutcome, ListPage, ListRequest, ListedObject, ObjectMeta, ObjectRange,
-    ObjectStore, ObjectStoreError, PutBody, PutMode, PutOptions, StoreCall, UserMetadata,
-    validate_delete, validate_key, validate_metadata, validate_prefix, validate_range,
+    DeleteOutcome, ListPage, ListRequest, ObjectMeta, ObjectRange, ObjectStore, ObjectStoreError,
+    Objects, PutBody, PutOptions, StoreCall, checked_crc32c, read_body, validate_delete,
+    validate_key, validate_metadata, validate_prefix, validate_range,
 };
 use rand::RngExt;
 use rand_xoshiro::Xoshiro256PlusPlus;
@@ -103,24 +104,15 @@ pub struct BucketHandle {
 #[derive(Debug)]
 struct Shared {
     owner: ClusterId,
-    objects: RefCell<BTreeMap<String, StoredObject>>,
-    /// Puts that committed, which number the etags.
-    puts: Cell<u64>,
+    objects: RefCell<Objects>,
+    /// The key of each put and delete that committed, in commit order.
+    changes: RefCell<Vec<String>>,
     prng: RefCell<Xoshiro256PlusPlus>,
     faults: Cell<BucketFaults>,
     down: Cell<bool>,
     cut: RefCell<BTreeSet<ClusterId>>,
     stall: RefCell<Stall>,
     accesses: RefCell<Vec<Access>>,
-}
-
-#[derive(Debug)]
-struct StoredObject {
-    bytes: Bytes,
-    metadata: UserMetadata,
-    etag: String,
-    last_modified: SystemTime,
-    crc32c: u32,
 }
 
 /// The calls that wait for the bucket to heal.
@@ -147,7 +139,7 @@ impl SimBucket {
             shared: Rc::new(Shared {
                 owner,
                 objects: RefCell::default(),
-                puts: Cell::new(0),
+                changes: RefCell::default(),
                 prng: RefCell::new(Xoshiro256PlusPlus::seed_from_u64(seed)),
                 faults: Cell::new(faults),
                 down: Cell::new(false),
@@ -215,18 +207,26 @@ impl SimBucket {
     /// Every key, in byte order.
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
-        self.shared.objects.borrow().keys().cloned().collect()
+        self.shared.objects.borrow().keys()
     }
 
     /// The bytes under `key`, read past every fault and outside the access
     /// log.
     #[must_use]
     pub fn object(&self, key: &str) -> Option<Bytes> {
+        self.shared.objects.borrow().bytes(key)
+    }
+
+    /// The keys of the puts and deletes that committed, from change `from`
+    /// on, in commit order. A key that changed twice is there twice.
+    #[must_use]
+    pub fn changes_since(&self, from: usize) -> Vec<String> {
         self.shared
-            .objects
+            .changes
             .borrow()
-            .get(key)
-            .map(|object| object.bytes.clone())
+            .get(from..)
+            .unwrap_or_default()
+            .to_vec()
     }
 
     /// Every call so far, in the order the calls arrived.
@@ -344,23 +344,16 @@ impl ObjectStore for BucketHandle {
                 mode: options.mode.clone(),
             })
             .await?;
-        let crc32c = crc32c::crc32c(&bytes);
-        if options.crc32c.is_some_and(|expected| expected != crc32c) {
-            return Err(ObjectStoreError::ChecksumMismatch {
-                key: key.to_owned(),
-            });
+        let crc32c = checked_crc32c(key, &bytes, options)?;
+        let shared = &self.bucket.shared;
+        let committed =
+            shared
+                .objects
+                .borrow_mut()
+                .insert(key, bytes, crc32c, options, self.commit_time());
+        if committed.is_ok() {
+            shared.changes.borrow_mut().push(key.to_owned());
         }
-        let committed = self.bucket.shared.insert(
-            key,
-            StoredObject {
-                bytes,
-                metadata: options.metadata.clone(),
-                etag: String::new(),
-                last_modified: self.commit_time(),
-                crc32c,
-            },
-            &options.mode,
-        );
         if draws.loses_answer {
             return Err(unavailable());
         }
@@ -379,7 +372,7 @@ impl ObjectStore for BucketHandle {
             range: range.clone(),
         })
         .await?;
-        self.bucket.shared.get_range(key, &range)
+        self.bucket.shared.objects.borrow().get_range(key, &range)
     }
 
     async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
@@ -388,7 +381,7 @@ impl ObjectStore for BucketHandle {
             key: key.to_owned(),
         })
         .await?;
-        self.bucket.shared.head(key)
+        self.bucket.shared.objects.borrow().head(key)
     }
 
     async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
@@ -398,7 +391,9 @@ impl ObjectStore for BucketHandle {
                 keys: keys.to_vec(),
             })
             .await?;
-        let deleted = self.bucket.shared.delete(keys);
+        let shared = &self.bucket.shared;
+        let deleted = shared.objects.borrow_mut().delete(keys);
+        shared.changes.borrow_mut().extend_from_slice(keys);
         if draws.loses_answer {
             return Err(unavailable());
         }
@@ -411,136 +406,12 @@ impl ObjectStore for BucketHandle {
             prefix: request.prefix.to_owned(),
         })
         .await?;
-        Ok(self.bucket.shared.list(request))
+        Ok(self.bucket.shared.objects.borrow().list(request))
     }
-}
-
-impl Shared {
-    /// Commit `object` under `key`, and decide [`PutMode::IfAbsent`] now.
-    fn insert(
-        &self,
-        key: &str,
-        mut object: StoredObject,
-        mode: &PutMode,
-    ) -> Result<(), ObjectStoreError> {
-        let mut objects = self.objects.borrow_mut();
-        match mode {
-            PutMode::IfAbsent if objects.contains_key(key) => {
-                return Err(ObjectStoreError::PreconditionFailed {
-                    key: key.to_owned(),
-                });
-            }
-            PutMode::Overwrite | PutMode::IfAbsent => {}
-            // The trait asks a provider to refuse a mode that it does not
-            // know, and never to fall back to an overwrite.
-            unknown => return Err(ObjectStoreError::Unsupported(format!("{unknown:?}"))),
-        }
-        let puts = self.puts.get() + 1;
-        self.puts.set(puts);
-        object.etag = format!("{puts:016x}");
-        objects.insert(key.to_owned(), object);
-        Ok(())
-    }
-
-    fn get_range(&self, key: &str, range: &Range<u64>) -> Result<ObjectRange, ObjectStoreError> {
-        let objects = self.objects.borrow();
-        let object = objects.get(key).ok_or_else(|| not_found(key))?;
-        let bytes = &object.bytes;
-        let start = usize::try_from(range.start)
-            .ok()
-            .filter(|&start| start < bytes.len())
-            .ok_or_else(|| ObjectStoreError::InvalidRange {
-                key: key.to_owned(),
-                start: range.start,
-                end: range.end,
-            })?;
-        let end = usize::try_from(range.end).map_or(bytes.len(), |end| end.min(bytes.len()));
-        Ok(ObjectRange {
-            bytes: bytes.slice(start..end),
-            etag: object.etag.clone(),
-            size: bytes.len() as u64,
-        })
-    }
-
-    fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
-        let objects = self.objects.borrow();
-        let object = objects.get(key).ok_or_else(|| not_found(key))?;
-        Ok(ObjectMeta {
-            size: object.bytes.len() as u64,
-            etag: object.etag.clone(),
-            last_modified: object.last_modified,
-            metadata: object.metadata.clone(),
-            crc32c: Some(object.crc32c),
-        })
-    }
-
-    fn delete(&self, keys: &[String]) -> DeleteOutcome {
-        let mut objects = self.objects.borrow_mut();
-        let mut outcome = DeleteOutcome::default();
-        for key in keys {
-            match validate_key(key) {
-                Ok(()) => {
-                    objects.remove(key);
-                }
-                Err(error) => outcome.failed.push(DeleteFailure {
-                    key: key.clone(),
-                    error,
-                }),
-            }
-        }
-        outcome
-    }
-
-    fn list(&self, request: &ListRequest<'_>) -> ListPage {
-        // A continuation from another listing can sort before the prefix,
-        // and the scan must still start inside it.
-        let start = match request.continuation {
-            Some(after) if after >= request.prefix => Bound::Excluded(after),
-            _ => Bound::Included(request.prefix),
-        };
-        let objects = self.objects.borrow();
-        let mut matching = objects
-            .range::<str, _>((start, Bound::Unbounded))
-            .take_while(|(key, _)| key.starts_with(request.prefix));
-        let listed: Vec<ListedObject> = matching
-            .by_ref()
-            .take(request.page_len())
-            .map(|(key, object)| ListedObject {
-                key: key.clone(),
-                size: object.bytes.len() as u64,
-                etag: object.etag.clone(),
-                last_modified: object.last_modified,
-            })
-            .collect();
-        let next = matching
-            .next()
-            .and_then(|_| listed.last())
-            .map(|last| last.key.clone());
-        ListPage {
-            objects: listed,
-            next,
-        }
-    }
-}
-
-/// The whole body of a put, or the error of the body.
-async fn read_body(body: PutBody) -> Result<Bytes, ObjectStoreError> {
-    let mut pieces = body.into_pieces();
-    let mut joined = BytesMut::new();
-    while let Some(piece) = pieces.next().await {
-        joined.extend_from_slice(&piece.map_err(ObjectStoreError::Body)?);
-    }
-    Ok(joined.freeze())
 }
 
 fn unavailable() -> ObjectStoreError {
     ObjectStoreError::Unavailable("simulated: the bucket failed the call".to_owned())
-}
-
-fn not_found(key: &str) -> ObjectStoreError {
-    ObjectStoreError::NotFound {
-        key: key.to_owned(),
-    }
 }
 
 #[cfg(test)]

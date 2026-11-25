@@ -1020,11 +1020,6 @@ fn run_geo(args: &Args, seed: u64) {
         println!("network {cluster}: {network:?}");
     }
     println!("geo faults: {faults:?}");
-    MemoryPool::init_pool(&MemoryPoolSettings {
-        enabled: false,
-        size: IggyByteSize::from(0u64),
-        bucket_capacity: 1,
-    });
     let report = geo_fuzz::run(&GeoFuzzOptions {
         seed,
         ticks: args.ticks,
