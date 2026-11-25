@@ -1714,6 +1714,12 @@ public class AsyncIggyTcpClient {
         return rememberedLogin != null;
     }
 
+    /** Whether the link of the sign-in is open, for tests in this package that drop it. */
+    boolean hasOpenSignInLink() {
+        AsyncTcpConnection current = connection.get();
+        return current != null && current.hasOpenChannel();
+    }
+
     /**
      * Endpoints a redial rotates through, likeliest first: where the client
      * currently is, the last known metadata primary, the address it was
