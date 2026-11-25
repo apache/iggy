@@ -688,15 +688,19 @@ class AsyncTcpConnectionConcurrencyTest {
             try {
                 connection.connect().get(5, TimeUnit.SECONDS);
                 // The reply callback holds the event loop, so the close that the discard queues waits behind it,
-                // as it waits behind the reply that ends one sign-in and starts the queued one.
+                // as it waits behind the reply that ends one sign-in and starts the queued one. It goes to the event
+                // loop also when the reply is already in, since this thread would otherwise run it and wait for its
+                // own discard.
                 CompletableFuture<ByteBuf> register = connection
                         .send(PING_CODE, Unpooled.EMPTY_BUFFER)
-                        .thenCompose(pong -> {
-                            pong.release();
-                            replyCallback.complete(null);
-                            discarded.join();
-                            return connection.send(LOGIN_CODE, loginPayload());
-                        });
+                        .thenComposeAsync(
+                                pong -> {
+                                    pong.release();
+                                    replyCallback.complete(null);
+                                    discarded.join();
+                                    return connection.send(LOGIN_CODE, loginPayload());
+                                },
+                                connection.eventLoop());
                 replyCallback.get(5, TimeUnit.SECONDS);
                 connection.discardAuthentication();
                 discarded.complete(null);
