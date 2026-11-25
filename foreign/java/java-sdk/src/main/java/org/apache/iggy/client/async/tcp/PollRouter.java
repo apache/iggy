@@ -1622,12 +1622,13 @@ final class PollRouter {
                         .handle((ignored, error) -> null)
                         .thenCompose(ignored -> attach(route, deadline));
             }
+            AsyncTcpConnection.TransientFailoverState bindState = new AsyncTcpConnection.TransientFailoverState();
             data.sendRouted(
                             CommandCode.System.BIND_SESSION.getValue(),
                             required.encode(route.bindSecret),
                             0,
                             deadline,
-                            new AsyncTcpConnection.TransientFailoverState())
+                            bindState)
                     .whenComplete((response, error) -> {
                         if (response != null) {
                             response.release();
@@ -1644,9 +1645,12 @@ final class PollRouter {
                             gate.complete(null);
                         } else {
                             // The bind decides: an unauthenticated reply ended the session that the attach named,
-                            // and a failed link says nothing about the session.
-                            IggyServerException refusal =
-                                    connectionFailed(error) ? null : AsyncTcpConnection.findServerError(error);
+                            // and a failed link says nothing about the session. Neither does a bind that a sign-in
+                            // or a sign-out of the caller ended: its 40 is local, and the server still holds the
+                            // session, which that sign-in or sign-out replaces itself.
+                            IggyServerException refusal = connectionFailed(error) || bindState.signedOut()
+                                    ? null
+                                    : AsyncTcpConnection.findServerError(error);
                             if (refusal != null
                                     && refusal.getRawErrorCode() == IggyErrorCode.UNAUTHENTICATED.getCode()) {
                                 coordinator
