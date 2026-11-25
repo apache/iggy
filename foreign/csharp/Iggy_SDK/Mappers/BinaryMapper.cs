@@ -553,32 +553,31 @@ internal static partial class BinaryMapper
 
     internal static PolledMessagesRental ToRentedMessages(PolledMessages messages)
     {
-        var rentedMessages = new List<RentedMessageResponse>(messages.Messages.Count);
-        foreach (var message in messages.Messages)
-        {
-            // Raw headers decode on first access, so only headers that came decoded are copied.
-            rentedMessages.Add(message.RawUserHeaders is { } raw
-                ? new RentedMessageResponse
-                {
-                    Header = message.Header,
-                    Payload = message.Payload,
-                    RawUserHeaders = raw
-                }
-                : new RentedMessageResponse
-                {
-                    Header = message.Header,
-                    Payload = message.Payload,
-                    UserHeaders = message.UserHeaders
-                });
-        }
-
         return new PolledMessagesRental(EmptyMemoryOwner.Instance)
         {
             PartitionId = messages.PartitionId,
             Context = messages.Context,
             CurrentOffset = messages.CurrentOffset,
-            Messages = rentedMessages
+            Messages = [.. messages.Messages.Select(ToRentedMessage)]
         };
+    }
+
+    internal static RentedMessageResponse ToRentedMessage(MessageResponse message)
+    {
+        // Raw headers decode on first access, so only headers that came decoded are copied.
+        return message.RawUserHeaders is { } raw
+            ? new RentedMessageResponse
+            {
+                Header = message.Header,
+                Payload = message.Payload,
+                RawUserHeaders = raw
+            }
+            : new RentedMessageResponse
+            {
+                Header = message.Header,
+                Payload = message.Payload,
+                UserHeaders = message.UserHeaders
+            };
     }
 
     internal static Dictionary<HeaderKey, HeaderValue> MapHeaders(ReadOnlySpan<byte> payload)

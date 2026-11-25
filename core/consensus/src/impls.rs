@@ -699,6 +699,17 @@ impl LocalPipeline {
         self.request_queue.iter()
     }
 
+    /// The last queued request that `matches`, to update in place.
+    pub fn last_request_mut(
+        &mut self,
+        mut matches: impl FnMut(&RequestEntry) -> bool,
+    ) -> Option<&mut RequestEntry> {
+        self.request_queue
+            .iter_mut()
+            .rev()
+            .find(|request| matches(request))
+    }
+
     #[must_use]
     pub fn request_head(&self) -> Option<&RequestEntry> {
         self.request_queue.front()
