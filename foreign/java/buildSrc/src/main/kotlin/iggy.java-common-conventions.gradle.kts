@@ -18,6 +18,8 @@
  */
 
 import org.gradle.api.artifacts.VersionCatalogsExtension
+import org.gradle.api.tasks.testing.logging.TestExceptionFormat
+import org.gradle.api.tasks.testing.logging.TestLogEvent
 
 plugins {
     java
@@ -64,6 +66,14 @@ tasks.withType<Test> {
     // Most tests close the clients they create, and Netty's default 2 second
     // quiet period would hold every such close for that long.
     systemProperty("iggy.tcp.shutdownQuietPeriodMillis", "0")
+    // The default prints one line per failure, which hides the cause and the
+    // stack of a failure that only the CI console shows.
+    testLogging {
+        events(TestLogEvent.FAILED)
+        exceptionFormat = TestExceptionFormat.FULL
+        showCauses = true
+        showStackTraces = true
+    }
     finalizedBy(tasks.jacocoTestReport)
 }
 

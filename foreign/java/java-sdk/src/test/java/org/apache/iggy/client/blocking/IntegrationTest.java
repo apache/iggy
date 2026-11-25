@@ -20,9 +20,13 @@
 package org.apache.iggy.client.blocking;
 
 import org.apache.iggy.client.BaseIntegrationTest;
+import org.apache.iggy.exception.IggyResourceNotFoundException;
 import org.apache.iggy.stream.StreamDetails;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.TestInfo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -32,6 +36,8 @@ import static org.apache.iggy.TestConstants.STREAM_NAME;
 import static org.apache.iggy.TestConstants.TOPIC_NAME;
 
 public abstract class IntegrationTest extends BaseIntegrationTest {
+
+    private static final Logger log = LoggerFactory.getLogger(IntegrationTest.class);
 
     // Track created resources for cleanup
     protected List<Long> createdStreamIds = new ArrayList<>();
@@ -47,7 +53,8 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
     }
 
     @AfterEach
-    void cleanupTestResources() {
+    void cleanupTestResources(TestInfo testInfo) {
+        String test = testInfo.getDisplayName();
         if (client == null) {
             return;
         }
@@ -56,15 +63,17 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
         try {
             login();
         } catch (RuntimeException e) {
-            // Already logged in or login failed - continue with cleanup anyway
+            log.warn("Cleanup after {} could not sign in as root", test, e);
         }
 
         // Delete all created streams (which also deletes topics within them)
         for (Long streamId : createdStreamIds) {
             try {
                 client.streams().deleteStream(streamId);
+            } catch (IggyResourceNotFoundException e) {
+                // The test deleted it itself.
             } catch (RuntimeException e) {
-                // Stream might already be deleted or doesn't exist - ignore
+                log.warn("Cleanup after {} could not delete stream {}", test, streamId, e);
             }
         }
 
@@ -74,8 +83,10 @@ public abstract class IntegrationTest extends BaseIntegrationTest {
                 if (userId != 0) { // Don't try to delete root user
                     client.users().deleteUser(userId);
                 }
+            } catch (IggyResourceNotFoundException e) {
+                // The test deleted it itself.
             } catch (RuntimeException e) {
-                // User might already be deleted or doesn't exist - ignore
+                log.warn("Cleanup after {} could not delete user {}", test, userId, e);
             }
         }
     }
