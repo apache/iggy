@@ -24,7 +24,7 @@ use crate::embed::PngSize;
 use crate::labels::{
     CONDITION_SEPARATOR, DAY_FORMAT, MachineName, durability_text, message_size_text,
     messages_text, metric_name, metric_value_text, milliseconds, nodes_text, rate_limit_text,
-    topic_durability,
+    topic_durability, version_tag,
 };
 use crate::omb::labels::{
     actors_text, environment_text, length_text, mebibytes_text,
@@ -103,7 +103,7 @@ impl RunCard {
             })
             .unwrap_or_default();
         let mut footer = vec![
-            format!("{PRODUCT} {}", summary.version),
+            format!("{PRODUCT} {}", version_tag(summary)),
             MachineName(&summary.machine).to_string(),
         ];
         footer.extend(
@@ -236,6 +236,21 @@ mod tests {
             "replicated · no rate limit · 1,000 B messages"
         );
         assert!(!card.alt().contains("P99"), "{}", card.alt());
+    }
+
+    #[test]
+    fn given_build_at_commit_when_building_card_should_name_version_without_commit() {
+        let build = summary(LIVE_UNCAPPED_RUN);
+
+        let card = RunCard::run(&build);
+
+        assert_eq!(build.commit.as_deref(), Some("71f29618b"));
+        assert!(
+            card.footer.starts_with("Apache Iggy 0.9.0 · "),
+            "{}",
+            card.footer
+        );
+        assert!(!card.footer.contains("71f29618b"), "{}", card.footer);
     }
 
     #[test]

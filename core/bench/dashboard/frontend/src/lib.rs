@@ -33,7 +33,7 @@ mod test_support;
 
 pub use state::start::StartData;
 
-use components::page_title::PageTitle;
+use components::document_head::DocumentHead;
 use components::theme::theme_provider::ThemeProvider;
 use gloo::console::error;
 use pages::compare::releases::ReleasesPage;
@@ -126,7 +126,7 @@ fn shell(start: Option<Rc<StartData>>) -> Html {
                     <OmbDataProvider {start}>
                         <SelectionProvider>
                             <OmbSelectionProvider>
-                                <PageTitle />
+                                <DocumentHead />
                                 <Switch<AppRoute> render={switch} />
                             </OmbSelectionProvider>
                         </SelectionProvider>

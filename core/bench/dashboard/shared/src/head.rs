@@ -17,8 +17,8 @@
 
 //! The head of each page: its title, description, canonical link, link preview and structured
 //! data. The server writes the tags into the page that it sends, because link previews and most
-//! crawlers do not run the app. The app sets the document title from the same [`PageHead`] when the
-//! reader moves to another page, so both titles are always the same.
+//! crawlers do not run the app. The app writes the tags of the same [`PageHead`] when the reader
+//! moves to another page, so the head of a page does not depend on how the reader got there.
 
 use crate::card::{CARD_FILE, RunCard};
 use crate::config::DashboardConfig;
@@ -30,7 +30,7 @@ use crate::html::{escape, json_script_safe};
 use crate::labels::{
     CpuName, DAY_FORMAT, MachineName, conditions, count_text, durability_text, messages_text,
     metric_name, metric_value_text, milliseconds, nodes_text, rate_limit_text, short_id,
-    topic_durability,
+    topic_durability, version_tag,
 };
 use crate::omb::labels::{
     actors_text, environment_text, length_text, mebibytes_text, message_size_text,
@@ -45,6 +45,14 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 pub const SITE_NAME: &str = "Apache Iggy Benchmarks";
+/// The comments around the head tags of the page. The server writes the tags of the page between
+/// them, and the app replaces the tags between them when the reader moves to another page.
+pub const HEAD_START: &str = "<!-- page-head-start -->";
+pub const HEAD_END: &str = "<!-- page-head-end -->";
+/// The name of the meta element that holds the public address of the dashboard, from
+/// `--public-url`. The server writes it in front of [`HEAD_START`], so the app writes absolute
+/// links on the same origin as the server, and none when the server has no public address.
+pub const PUBLIC_URL_META: &str = "dashboard-public-url";
 /// For the pages whose query picks the runs. Their links repeat each other, but they link to the
 /// run pages.
 pub const NOINDEX_FOLLOW: &str = "noindex, follow";
@@ -66,19 +74,13 @@ const ISO_DAY_FORMAT: &str = "%Y-%m-%d";
 const OVERVIEW_FALLBACK: &str = "Throughput and latency of Apache Iggy, measured with iggy-bench \
                                  and the OpenMessaging Benchmark, with the full report of every \
                                  run.";
-const IGGY_BENCH_VARIABLES: [&str; 5] = [
-    "Throughput",
-    "P50 latency",
-    "P90 latency",
-    "P99 latency",
-    "P99.9 latency",
-];
-const OMB_VARIABLES: [&str; 4] = [
-    "Publish rate",
-    "Consume rate",
-    "Publish latency",
-    "End-to-end latency",
-];
+const THROUGHPUT_VARIABLE: &str = "Throughput";
+/// The latency of a run with a rate limit. A run without one measures its throughput only.
+const LATENCY_VARIABLES: [&str; 4] = ["P50 latency", "P90 latency", "P99 latency", "P99.9 latency"];
+const PUBLISH_RATE_VARIABLE: &str = "Publish rate";
+const CONSUME_RATE_VARIABLE: &str = "Consume rate";
+const PUBLISH_LATENCY_VARIABLE: &str = "Publish latency";
+const END_TO_END_LATENCY_VARIABLE: &str = "End-to-end latency";
 
 /// The head of one page.
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +128,8 @@ pub enum Schema {
 pub struct Dataset {
     /// The day of the run, for example `2026-11-13`.
     pub created: Option<String>,
-    pub variables: &'static [&'static str],
+    /// What the run measured, as the run page shows it.
+    pub variables: Vec<&'static str>,
     /// The path of the result file of the run.
     pub download: String,
 }
@@ -148,7 +151,7 @@ impl PageHead {
         let title = match release {
             Some(release) => format!(
                 "Apache Iggy benchmarks: throughput and latency of {}",
-                release.version
+                version_tag(release)
             ),
             None => "Apache Iggy benchmarks: throughput and latency".to_owned(),
         };
@@ -185,7 +188,7 @@ impl PageHead {
                 summaries.iter().collect(),
             ),
         };
-        let versions: BTreeSet<_> = runs.iter().map(|run| run.version.as_str()).collect();
+        let versions: BTreeSet<_> = runs.iter().map(|run| version_tag(run)).collect();
         let machines: BTreeSet<_> = runs.iter().map(|run| run.machine.as_str()).collect();
         let description = format!(
             "{} {source} on {} of Apache Iggy and {}. Filter them, open the report of each run, \
@@ -235,9 +238,10 @@ impl PageHead {
     }
 
     /// The title names the durability and the rate limit, which tell apart the workloads of one
-    /// kind on one machine. Repeated runs of one workload keep one title. The image is the preview
-    /// card of the run. A run without a rate limit leads with its throughput alone, in the
-    /// description as on the card.
+    /// kind on one machine. Repeated runs of one workload keep one title. The version is the one of
+    /// the build, without its commit, so builds at several commits of one version share a title, as
+    /// on the OMB pages. The image is the preview card of the run. A run without a rate limit leads
+    /// with its throughput alone, in the description as on the card.
     pub fn run(summary: &BenchmarkSummary) -> Self {
         let path = run_path(&summary.uuid);
         let mut workload = vec![summary.title.clone(), nodes_text(summary.nodes)];
@@ -254,17 +258,18 @@ impl PageHead {
         let title = format!(
             "{}: Apache Iggy {} on {}",
             workload.join(", "),
-            summary.version,
+            version_tag(summary),
             MachineName(&summary.machine)
         );
         let start = summary
             .version_order
             .timestamp_us
             .and_then(DateTime::from_timestamp_micros);
+        let latency = summary.headline_metrics().contains(&Metric::P99);
         let mut sentences = Vec::new();
         if let Some(group) = summary.group(summary.kind_family.primary_group()) {
             let throughput = format_throughput_mb_s(group.throughput_megabytes_per_second);
-            sentences.push(if summary.headline_metrics().contains(&Metric::P99) {
+            sentences.push(if latency {
                 format!(
                     "{throughput} at P99 {}.",
                     milliseconds(group.p99_latency_ms)
@@ -284,6 +289,10 @@ impl PageHead {
         if let Some(cpu) = CpuName::of(&summary.hardware) {
             sentences.push(format!("Bench host: {cpu}."));
         }
+        let mut variables = vec![THROUGHPUT_VARIABLE];
+        if latency {
+            variables.extend(LATENCY_VARIABLES);
+        }
         Self {
             title,
             description: Some(sentences.join(" ")),
@@ -299,7 +308,7 @@ impl PageHead {
             ],
             schema: Some(Schema::Dataset(Dataset {
                 created: start.map(iso_day),
-                variables: &IGGY_BENCH_VARIABLES,
+                variables,
                 download: format!("/api/benchmark/full/{}", summary.uuid),
             })),
             path: Some(path),
@@ -335,6 +344,14 @@ impl PageHead {
             summary.driver,
             summary.time.instant.format(DAY_FORMAT)
         );
+        let mut variables = vec![PUBLISH_RATE_VARIABLE];
+        if summary.workload.consumers_per_topic > 0 {
+            variables.push(CONSUME_RATE_VARIABLE);
+        }
+        variables.push(PUBLISH_LATENCY_VARIABLE);
+        if summary.end_to_end_latency_ms.is_some() {
+            variables.push(END_TO_END_LATENCY_VARIABLE);
+        }
         Self {
             title,
             description: Some(description),
@@ -350,7 +367,7 @@ impl PageHead {
             ],
             schema: Some(Schema::Dataset(Dataset {
                 created: Some(iso_day(summary.time.instant)),
-                variables: &OMB_VARIABLES,
+                variables,
                 download: format!("/api/omb/runs/{}/result.json", summary.id),
             })),
             path: Some(path),
@@ -653,7 +670,7 @@ mod tests {
     use super::*;
     use crate::config::{HeadlineConfig, SuiteConfig};
     use crate::identity::KindFamily;
-    use crate::omb::test_fixtures::{RC1_DEFAULT, RC1_PERSISTED};
+    use crate::omb::test_fixtures::{NO_CONSUMERS, RC1_DEFAULT, RC1_PERSISTED};
     use crate::test_fixtures::{CLUSTER_RUN, LIVE_UNCAPPED_RUN, THRESHOLDS, report};
     use bench_report::options::BenchmarkDurability;
 
@@ -735,9 +752,10 @@ mod tests {
         );
         assert_eq!(
             uncapped.title,
-            "Pinned producer, 20 producers, 1 node, replicated: Apache Iggy 0.9.0 at 71f29618b on \
-             ip-10-0-0-236"
+            "Pinned producer, 20 producers, 1 node, replicated: Apache Iggy 0.9.0 on ip-10-0-0-236"
         );
+        let tags = uncapped.tags(Some(ORIGIN)).to_string();
+        assert!(!tags.contains("71f29618b"), "a build at a commit: {tags}");
     }
 
     #[test]
@@ -861,6 +879,57 @@ mod tests {
             format!("{ORIGIN}/api/benchmark/full/{CLUSTER_UUID}")
         );
         assert_eq!(data[1].get("license"), None);
+    }
+
+    /// The `variableMeasured` of the Dataset of `head`.
+    fn variables(head: &PageHead) -> Value {
+        let tags = head.tags(Some(ORIGIN)).to_string();
+        let data = structured_data(&tags);
+        let dataset = data
+            .iter()
+            .find(|value| value["@type"] == "Dataset")
+            .expect("a run page has a Dataset");
+        dataset["variableMeasured"].clone()
+    }
+
+    #[test]
+    fn given_runs_when_writing_dataset_should_name_only_what_each_run_page_shows() {
+        let rate_limited = PageHead::run(&summary(CLUSTER_RUN));
+        let uncapped = PageHead::run(&summary(LIVE_UNCAPPED_RUN));
+        let consumers = PageHead::omb_run(&RC1_DEFAULT.summary());
+        let no_consumers = NO_CONSUMERS.summary();
+        let mut not_in_file = RC1_DEFAULT.summary();
+        not_in_file.end_to_end_latency_ms = None;
+
+        assert_eq!(
+            variables(&rate_limited),
+            json!([
+                "Throughput",
+                "P50 latency",
+                "P90 latency",
+                "P99 latency",
+                "P99.9 latency"
+            ])
+        );
+        assert_eq!(variables(&uncapped), json!(["Throughput"]));
+        assert_eq!(
+            variables(&consumers),
+            json!([
+                "Publish rate",
+                "Consume rate",
+                "Publish latency",
+                "End-to-end latency"
+            ])
+        );
+        assert_eq!(no_consumers.workload.consumers_per_topic, 0);
+        assert_eq!(
+            variables(&PageHead::omb_run(&no_consumers)),
+            json!(["Publish rate", "Publish latency"])
+        );
+        assert_eq!(
+            variables(&PageHead::omb_run(&not_in_file)),
+            json!(["Publish rate", "Consume rate", "Publish latency"])
+        );
     }
 
     #[test]

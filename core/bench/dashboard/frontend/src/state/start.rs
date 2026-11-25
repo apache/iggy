@@ -20,22 +20,81 @@
 //! needs that match.
 
 use bench_dashboard_shared::config::DashboardConfig;
-use bench_dashboard_shared::omb::summary::OmbRunList;
+use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::summary::{OmbRunList, OmbRunSummary};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::pages;
 
 /// API answers at the time of the render. A page gets only the parts that it reads, so an OMB page
 /// does not carry the iggy-bench runs. The browser fetches a part that is `None` when a page needs
 /// it, as it does on a page that the browser renders alone.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StartData {
-    /// The answer of `/api/benchmarks`.
+    /// The answer of `/api/benchmarks`, on a page that reads every run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summaries: Option<Vec<BenchmarkSummary>>,
     /// The answer of `/api/config`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config: Option<DashboardConfig>,
-    /// The answer of `/api/omb/runs`.
+    /// The answer of `/api/omb/runs`, on a page that reads every OMB run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omb_runs: Option<OmbRunList>,
+    /// On the page of one iggy-bench run, the runs that the page reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<PageRuns<Uuid, Vec<BenchmarkSummary>>>,
+    /// On the page of one OMB run, the OMB runs that the page reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omb_run: Option<PageRuns<OmbRunId, OmbRunList>>,
+}
+
+/// The runs that the page of the run `id` reads: the run, the runs of its history and its related
+/// runs. A run page carries these instead of every run, so its size does not grow with the number
+/// of runs. The browser fetches every run when the reader moves to a page that needs them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PageRuns<Id, Runs> {
+    pub id: Id,
+    pub runs: Runs,
+}
+
+impl StartData {
+    /// The start data of the page of `run`, one of `summaries`.
+    pub fn run_page(
+        run: &BenchmarkSummary,
+        summaries: &[BenchmarkSummary],
+        config: &DashboardConfig,
+    ) -> Self {
+        let runs = summaries
+            .iter()
+            .filter(|other| pages::run::reads(run, other))
+            .cloned()
+            .collect();
+        Self {
+            config: Some(config.clone()),
+            run: Some(PageRuns { id: run.uuid, runs }),
+            ..Self::default()
+        }
+    }
+
+    /// The start data of the page of `run`, one of the runs of `list`.
+    pub fn omb_run_page(run: &OmbRunSummary, list: &OmbRunList) -> Self {
+        let runs = list
+            .runs
+            .iter()
+            .filter(|other| pages::omb::run::reads(run, other))
+            .cloned()
+            .collect();
+        Self {
+            omb_run: Some(PageRuns {
+                id: run.id,
+                runs: OmbRunList {
+                    enabled: list.enabled,
+                    runs,
+                },
+            }),
+            ..Self::default()
+        }
+    }
 }

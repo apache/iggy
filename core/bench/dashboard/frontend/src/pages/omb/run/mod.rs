@@ -51,7 +51,7 @@ use self::facts::{
     environment_groups, estimated_start, ladder, property_groups, publish_side, workload_facts,
 };
 use self::history::{Baseline, History, Machines, history_view};
-use self::related::{related_runs, related_view};
+use self::related::{is_related, related_runs, related_view};
 use crate::api::{fetch_omb_run, omb_result_url, omb_setup_url};
 use crate::components::chart::series_color;
 use crate::components::embed::{EmbedButton, EmbedCard, EmbedChart, EmbedProvider, EmbedRun};
@@ -64,12 +64,14 @@ use crate::pages::omb::common::{
     CONSUME_HINT, EndToEnd, LineOrder, MESSAGES_HINT, NOT_MEASURED, PUBLISH_THROUGHPUT_HINT,
     driver_tag, omb_crumb, omb_page_head, runs_status, time_view, version_view,
 };
+use crate::pages::omb::list::workload_query;
 use crate::pages::run::chart::SERIES_COLOR_VARS;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, fetch_into};
-use crate::state::omb::{OmbData, use_omb_data};
+use crate::state::omb::{OmbData, use_omb_run_data};
 
 const RUN_CRUMB: &str = "Run";
+const WORKLOAD_RUNS_LINK: &str = "Runs with this workload";
 const DETAIL_WHAT: &str = "the OMB result of the run";
 const ESTIMATE_HINT: &str = "The end of the run from the file name, minus the measured length. The \
                              warm-up ran before it.";
@@ -174,9 +176,9 @@ pub struct OmbRunPageProps {
 
 #[function_component(OmbRunPage)]
 pub fn omb_run_page(props: &OmbRunPageProps) -> Html {
-    let data = use_omb_data();
-    let scroll_ref = use_node_ref();
     let id = props.id.parse::<OmbRunId>().ok();
+    let data = use_omb_run_data(id);
+    let scroll_ref = use_node_ref();
     let detail = use_state_eq(|| Loadable::Loading);
     let load_detail = {
         let detail = detail.clone();
@@ -198,6 +200,12 @@ pub fn omb_run_page(props: &OmbRunPageProps) -> Html {
         Lookup::Found(view) => found_view(view, &detail, &load_detail, &scroll_ref),
     };
     page_shell(&scroll_ref, content)
+}
+
+/// Whether the page of `run` reads `other`: a run of its history, or a related run. The server sends
+/// only these runs with the page, so this covers every run that [`RunView::new`] reads.
+pub fn reads(run: &OmbRunSummary, other: &OmbRunSummary) -> bool {
+    other.history_key() == run.history_key() || is_related(run, other)
 }
 
 /// The URL's run in the loaded list.
@@ -461,7 +469,8 @@ fn embed_charts(run: &OmbRunSummary) -> Vec<EmbedChart> {
 }
 
 /// The heading names the run by its workload values, not by the workload `name`. A crawler indexes
-/// the heading, and the name is free text from the workload file.
+/// the heading, and the name is free text from the workload file. A link next to it leads to the
+/// run list narrowed to the workload, so a reader can compare repeated runs.
 fn head(run: &OmbRunSummary) -> Html {
     let environment = run.environment().and_then(environment_text);
     let detail = run
@@ -492,12 +501,24 @@ fn head(run: &OmbRunSummary) -> Html {
             </p>
         </>
     };
+    let actions = html! {
+        <div class="page-head-actions">
+            <Link<AppRoute, Vec<(&'static str, String)>>
+                to={AppRoute::OmbRuns}
+                query={Some(workload_query(&run.workload.name))}
+                classes={classes!("run-action")}
+            >
+                { WORKLOAD_RUNS_LINK }
+            </Link<AppRoute, Vec<(&'static str, String)>>>
+            <ShareButton class={classes!("run-action")} labeled={true} />
+        </div>
+    };
     omb_page_head(
         above,
         None,
         &workload_heading(&run.workload),
         &size_and_length(run),
-        html! { <ShareButton class={classes!("run-action")} labeled={true} /> },
+        actions,
     )
 }
 

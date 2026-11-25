@@ -254,29 +254,36 @@ crawlers whether the page exists:
 
 The page answers send `Cache-Control: no-cache`, because each frontend build changes the script names in
 `index.html`. The compare pages send `X-Robots-Tag: noindex, follow`, because their query picks the runs. Every
-answer under `/api` and `/embed` sends `X-Robots-Tag: noindex`.
+answer under `/api` and `/embed` sends `X-Robots-Tag: noindex`. A `HEAD` request gets the status and the headers of
+`GET` without a render. Its answer has no `Content-Length`, because only the render gives the length of the page.
 
 Each page answer also has the head of its page. Link previews and most crawlers do not run the app, so the server
-writes the head into the page. The server replaces the part of `index.html` from the comment `page-head-start` to
-the comment `page-head-end` with these tags:
+writes the head into the page. The server replaces the part of `index.html` between the comments `page-head-start`
+and `page-head-end` with these tags, and keeps the comments:
 
 - `<title>` and the description. A run page names the run, the version, the machine, its main numbers and its
-  conditions. The main numbers of an iggy-bench run without a rate limit are its throughput and its message
+  conditions. The version of a build at a commit has no commit, as on the card, so the builds of one version share
+  a title. The main numbers of an iggy-bench run without a rate limit are its throughput and its message
   rate, without a latency, as on its card. The title also names what tells apart the workloads of one kind. For an iggy-bench run, this is the
   durability and the rate limit. For an OMB run, it is the message size, the measured publish rate and the driver.
   The Overview names the numbers of its headline cards
 - `<meta name="robots" content="noindex, follow">` on the compare pages
 - the canonical link, and the Open Graph and Twitter card tags. The image of a run page is its preview card,
   from `card.png` below the embed path of the run. Every other page shows `assets/og-image.png`
-- JSON-LD structured data: the breadcrumbs, `WebSite` on the Overview, and `Dataset` on each run page
+- JSON-LD structured data: the breadcrumbs, `WebSite` on the Overview, and `Dataset` on each run page. The
+  `variableMeasured` of a `Dataset` names only what the run page shows: no latency for an iggy-bench run without
+  a rate limit, and no consume rate or end-to-end latency for an OMB run that did not measure them
 
 Explore has two lists: the official runs at `/explore` and all runs at `/explore?scope=all`. Each list is a page
 of its own. A search or a filter only narrows a list, so the canonical link of a view is the list of its scope.
 
 The canonical link, `og:url`, `og:image` and the structured data need absolute links, so they need `--public-url`.
-Without it, the head has the title, the description and the other Open Graph tags only. When the reader moves to
-another page, the app sets the title from the same text in the `shared` crate. `trunk serve` on port 8060 serves
-`index.html` itself, so the head tags show only on the port of the server.
+Without it, the head has the title, the description and the other Open Graph tags only. With it, the server also
+writes `<meta name="dashboard-public-url">` in front of `page-head-start`. When the reader moves to another page,
+the app replaces the tags between the comments with the tags of that page, from the same code in the `shared`
+crate and on the address of that meta element. Until the data of the page loads, the head keeps only the
+previous title. `trunk serve` on port 8060 serves `index.html` itself, so the head tags show only on the port of
+the server.
 
 ### Server Rendering
 
@@ -289,12 +296,17 @@ pages and the not-found pages show the splash until the app starts.
 - It replaces the part of `index.html` from the comment `page-body-start` to the comment `page-body-end` with
   `<div id="app">` and the rendered HTML
 - After the app root, the page gets `<script id="start-data" type="application/json">` with the API answers that
-  the render used. These are the run summaries and the configuration on the iggy-bench pages, and the OMB run
-  list on the OMB pages. The browser starts from this data and does not request it, so its first render gives
-  the same HTML. Then the app hydrates the page, which means that it takes over the HTML instead of building it
-  again. The Trunk build turns on the `hydration` feature for this
-- A render takes about 1 ms for 365 runs. If a render panics or takes longer than 5 seconds, the answer is the
-  page with the splash and without start data. Then the browser renders the page
+  the render used. The Overview, Explore and Methodology get every run summary and the configuration, and the
+  OMB run list gets every OMB run. A run page gets only the runs that it shows: the run, the runs of its history
+  and its related runs. So its size does not grow with the number of runs. The browser starts from this data and
+  does not request it, so its first render gives the same HTML. Then the app hydrates the page, which means that
+  it takes over the HTML instead of building it again. The Trunk build turns on the `hydration` feature for this
+- The browser requests every run when the reader moves to a page that needs them, for example from a run page to
+  Explore or to another run
+- The server runs one render for each CPU at a time. A request waits for a free render slot. If it gets no slot,
+  or the render panics or does not end within 5 seconds of the request, the answer is the page with the splash and
+  without start data. Then the browser renders the page. A render that ends after the 5 seconds keeps its slot
+  until it ends. A render takes about 1 ms for 365 runs
 - Charts and the parts that need the run report or the OMB result show their loading state in the rendered
   HTML. The browser draws them after it hydrates the page
 - Build the server and `frontend/dist` from the same commit. The browser hydrates a page only with the

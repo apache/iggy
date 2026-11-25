@@ -52,7 +52,7 @@ use self::facts::{
     option_groups, parameters, topic_note,
 };
 use self::history::{History, history_view};
-use self::related::{RelatedGroup, related_runs, related_view};
+use self::related::{RelatedGroup, related_field, related_runs, related_view};
 use crate::api::{artifacts_url, fetch_benchmark_by_uuid, report_url};
 use crate::components::chart::series_color;
 use crate::components::command_block::CommandBlock;
@@ -70,7 +70,7 @@ use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
 use crate::pages::explore::family_query;
 use crate::router::AppRoute;
-use crate::state::data::{DashboardData, Loadable, fetch_into, use_dashboard_data};
+use crate::state::data::{DashboardData, Loadable, fetch_into, use_run_data};
 
 const RUN_CRUMB: &str = "Run";
 const REBUILT_LABEL: &str = "rebuilt";
@@ -160,9 +160,9 @@ pub struct RunPageProps {
 
 #[function_component(RunPage)]
 pub fn run_page(props: &RunPageProps) -> Html {
-    let data = use_dashboard_data();
-    let scroll_ref = use_node_ref();
     let id = Uuid::parse_str(&props.uuid).ok();
+    let data = use_run_data(id);
+    let scroll_ref = use_node_ref();
     let report = use_state_eq(|| Loadable::Loading);
     let load_report = {
         let report = report.clone();
@@ -189,6 +189,12 @@ pub fn run_page(props: &RunPageProps) -> Html {
         Lookup::Found(view) => found_view(view, &report, &load_report, &scroll_ref),
     };
     page_shell(&scroll_ref, content)
+}
+
+/// Whether the page of `run` reads `other`: a run of its history, or a related run. The server sends
+/// only these runs with the page, so this covers every run that [`RunView::new`] reads.
+pub fn reads(run: &BenchmarkSummary, other: &BenchmarkSummary) -> bool {
+    other.history_key() == run.history_key() || related_field(run, other).is_some()
 }
 
 /// The URL's run in the loaded list.

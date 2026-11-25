@@ -19,20 +19,22 @@
 //! OMB page asks for them, so the iggy-bench pages never wait for them. The list then stays for the
 //! session. After a failure, the next page that asks, or the "Try again" button, fetches it again.
 
-use std::cell::RefCell;
 use std::rc::Rc;
 
+use bench_dashboard_shared::omb::id::OmbRunId;
 use bench_dashboard_shared::omb::summary::OmbRunList;
 use yew::prelude::*;
 
 use crate::api;
-use crate::state::data::{Loadable, fetch_into, start_value};
-use crate::state::start::StartData;
+use crate::state::data::{Loadable, fetch_once, start_value};
+use crate::state::start::{PageRuns, StartData};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OmbData {
     /// `Loading` until the list arrives, and also before any OMB page asked for it.
     pub runs: Loadable<OmbRunList>,
+    /// The runs that came with the page of one OMB run. Only that page reads them.
+    pub page_runs: Option<PageRuns<OmbRunId, Rc<OmbRunList>>>,
     /// Fetches the list unless it's loaded or on its way.
     pub reload: Callback<()>,
 }
@@ -48,29 +50,54 @@ pub struct OmbDataProviderProps {
 
 #[function_component(OmbDataProvider)]
 pub fn omb_data_provider(props: &OmbDataProviderProps) -> Html {
-    let runs = use_state_eq(|| {
-        start_value(
-            props
-                .start
-                .as_ref()
-                .and_then(|start| start.omb_runs.clone()),
-        )
+    let start = props.start.as_deref();
+    let runs = use_state_eq(|| start_value(start.and_then(|start| start.omb_runs.clone())));
+    let page_runs = use_memo((), |()| {
+        start
+            .and_then(|start| start.omb_run.as_ref())
+            .map(|page| PageRuns {
+                id: page.id,
+                runs: Rc::new(page.runs.clone()),
+            })
     });
     // Set while a fetch is on its way or has succeeded, or when the list came with the page. A ref
     // and not a state, so two pages that ask in the same moment start one fetch.
     let asked = use_mut_ref(|| matches!(*runs, Loadable::Ready(_)));
     let reload = {
         let runs = runs.clone();
-        use_callback((), move |(), _| fetch_once(runs.clone(), Rc::clone(&asked)))
+        use_callback((), move |(), _| {
+            fetch_once(runs.clone(), Rc::clone(&asked), api::fetch_omb_runs);
+        })
     };
     let data = OmbData {
         runs: (*runs).clone(),
+        page_runs: (*page_runs).clone(),
         reload,
     };
     html! {
         <ContextProvider<OmbData> context={data}>
             { props.children.clone() }
         </ContextProvider<OmbData>>
+    }
+}
+
+impl OmbData {
+    /// The runs that the page of the run `id` reads: every run once the list arrived, else the
+    /// runs that came with the page of that run.
+    pub fn runs_of(&self, id: Option<OmbRunId>) -> Loadable<OmbRunList> {
+        match &self.page_runs {
+            Some(page) if Some(page.id) == id && !matches!(self.runs, Loadable::Ready(_)) => {
+                Loadable::Ready(Rc::clone(&page.runs))
+            }
+            _ => self.runs.clone(),
+        }
+    }
+
+    /// Whether the runs of the page of `id` came with the page.
+    fn has_page_runs(&self, id: Option<OmbRunId>) -> bool {
+        self.page_runs
+            .as_ref()
+            .is_some_and(|page| Some(page.id) == id)
     }
 }
 
@@ -85,15 +112,22 @@ pub fn use_omb_data() -> OmbData {
     data
 }
 
-fn fetch_once(runs: UseStateHandle<Loadable<OmbRunList>>, asked: Rc<RefCell<bool>>) {
-    if asked.replace(true) {
-        return;
+/// The data of the page of the OMB run `id`, with the runs of [`OmbData::runs_of`]. Fetches the
+/// list only when the runs of this page did not come with it.
+#[hook]
+pub fn use_omb_run_data(id: Option<OmbRunId>) -> OmbData {
+    let data = use_context::<OmbData>().expect("OmbDataProvider wraps the router");
+    {
+        let reload = data.reload.clone();
+        let fetch = !data.has_page_runs(id);
+        use_effect_with(fetch, move |fetch| {
+            if *fetch {
+                reload.emit(());
+            }
+        });
     }
-    fetch_into(runs, async move {
-        let list = api::fetch_omb_runs().await;
-        if list.is_err() {
-            asked.replace(false);
-        }
-        list
-    });
+    OmbData {
+        runs: data.runs_of(id),
+        ..data
+    }
 }

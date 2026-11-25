@@ -143,6 +143,13 @@ pub fn omb_runs_page() -> Html {
     page_shell(&scroll_ref, content)
 }
 
+/// The query of the run list narrowed to the workload named `workload_name`.
+pub fn workload_query(workload_name: &str) -> Vec<(&'static str, String)> {
+    let mut query = OmbQuery::default();
+    query.set_facet(Facet::Workload, Some(workload_name.to_owned()));
+    query.to_pairs()
+}
+
 #[function_component(RunRowView)]
 fn run_row_view(props: &RunRowProps) -> Html {
     let row = &props.row;

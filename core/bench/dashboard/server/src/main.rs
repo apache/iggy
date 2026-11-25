@@ -52,6 +52,7 @@ use public_url::PublicUrl;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::{
     EnvFilter,
@@ -76,6 +77,8 @@ struct ServerState {
     _omb_watcher: Option<Arc<CacheWatcher>>,
     github_stars: Arc<StarCount>,
     public_url: Option<PublicUrl>,
+    /// Built once, outside the factory of the app, so the workers share one bound.
+    render_slots: Arc<Semaphore>,
 }
 
 #[actix_web::main]
@@ -176,6 +179,7 @@ async fn main() -> Result<(), std::io::Error> {
         _omb_watcher: omb_watcher,
         github_stars,
         public_url: args.public_url.clone(),
+        render_slots: pages::render_slots(),
     };
 
     info!("Starting server on {}", addr);
@@ -246,6 +250,7 @@ async fn main() -> Result<(), std::io::Error> {
                 config: Arc::clone(&state.config),
                 runs: Arc::clone(&state.cache),
                 omb_runs: state.omb_cache.clone(),
+                render_slots: Arc::clone(&state.render_slots),
             }))
             .service(handlers::health_check)
             .service(handlers::list_benchmark_summaries)

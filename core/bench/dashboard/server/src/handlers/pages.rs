@@ -24,28 +24,29 @@
 use crate::cache::BenchmarkCache;
 use crate::omb::OmbCache;
 use crate::public_url::PublicUrl;
+use actix_web::body;
 use actix_web::http::header::{CacheControl, CacheDirective, ContentType, HeaderName, LOCATION};
 use actix_web::http::{Method, StatusCode};
 use actix_web::{HttpRequest, HttpResponse, Route, guard, web};
 use bench_dashboard_frontend::{START_DATA_ID, StartData, ssr};
 use bench_dashboard_shared::config::DashboardConfig;
-use bench_dashboard_shared::head::PageHead;
-use bench_dashboard_shared::html::json_script_safe;
+use bench_dashboard_shared::head::{HEAD_END, HEAD_START, PUBLIC_URL_META, PageHead};
+use bench_dashboard_shared::html::{escape, json_script_safe};
 use bench_dashboard_shared::omb::id::OmbRunId;
 use bench_dashboard_shared::omb::summary::OmbRunList;
 use bench_dashboard_shared::pages::{ExploreScope, is_page_path, run_path};
+use bench_dashboard_shared::summary::BenchmarkSummary;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, timeout_at};
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 pub const X_ROBOTS_TAG: HeaderName = HeaderName::from_static("x-robots-tag");
-/// The comments around the head of `index.html`. The server replaces both and everything between
-/// them with the head of the page that it sends.
-const HEAD_START: &str = "<!-- page-head-start -->";
-const HEAD_END: &str = "<!-- page-head-end -->";
 /// The comments around the app root of `index.html`, which holds the splash. For a page that the
 /// server renders, it replaces both and everything between them with the root and the HTML of the
 /// page.
@@ -67,6 +68,17 @@ pub struct SiteState {
     pub runs: Arc<BenchmarkCache>,
     /// `None` without `--omb-results-dir`.
     pub omb_runs: Option<Arc<OmbCache>>,
+    /// One permit for each render on its way. Every worker of the app shares it, so it bounds the
+    /// renders of the whole server.
+    pub render_slots: Arc<Semaphore>,
+}
+
+/// The render slots of [`SiteState`]: one for each thread of the render pool of Yew, which has a
+/// thread for each CPU. A request that finds every slot taken waits for one until the deadline of
+/// its render.
+pub fn render_slots() -> Arc<Semaphore> {
+    let threads = thread::available_parallelism().map_or(1, |threads| threads.get());
+    Arc::new(Semaphore::new(threads))
 }
 
 /// Registers the page routes. Register them before the static files, because the static files
@@ -107,8 +119,9 @@ fn get_or_head() -> Route {
 }
 
 async fn overview_page(state: web::Data<SiteState>, req: HttpRequest) -> HttpResponse {
-    let head = PageHead::overview(&state.runs.get_summaries(), &state.config);
-    rendered_page(&state, &req, &head, || bench_start(&state)).await
+    let summaries = state.runs.get_summaries();
+    let head = PageHead::overview(&summaries, &state.config);
+    rendered_page(&state, &req, &head, || bench_start(&state, &summaries)).await
 }
 
 /// Each scope is a page of its own, with its own head. A search or a filter only narrows the
@@ -118,13 +131,16 @@ async fn explore_page(state: web::Data<SiteState>, req: HttpRequest) -> HttpResp
         .map(web::Query::into_inner)
         .unwrap_or_default();
     let scope = ExploreScope::of_query(pairs);
-    let head = PageHead::explore(&state.runs.get_summaries(), &state.config, scope);
-    rendered_page(&state, &req, &head, || bench_start(&state)).await
+    let summaries = state.runs.get_summaries();
+    let head = PageHead::explore(&summaries, &state.config, scope);
+    rendered_page(&state, &req, &head, || bench_start(&state, &summaries)).await
 }
 
+/// The page counts the runs of each suite, so it reads every run.
 async fn methodology_page(state: web::Data<SiteState>, req: HttpRequest) -> HttpResponse {
+    let summaries = state.runs.get_summaries();
     rendered_page(&state, &req, &PageHead::methodology(), || {
-        bench_start(&state)
+        bench_start(&state, &summaries)
     })
     .await
 }
@@ -157,7 +173,8 @@ async fn omb_compare_page(state: web::Data<SiteState>) -> HttpResponse {
 }
 
 /// A run id in another form, for example in uppercase, moves to the hyphenated lowercase form, so
-/// that each run has one link.
+/// that each run has one link. The head and the start data come from one snapshot of the runs, so
+/// a run that the watcher removes meanwhile does not give a found head with a missing-run body.
 async fn run_page(
     state: web::Data<SiteState>,
     text: web::Path<String>,
@@ -170,32 +187,30 @@ async fn run_page(
     match run {
         Some(run) if run.uuid.to_string() == *text => {
             let head = PageHead::run(run);
-            rendered_page(&state, &req, &head, || bench_start(&state)).await
+            let start = || StartData::run_page(run, &summaries, &state.config);
+            rendered_page(&state, &req, &head, start).await
         }
         Some(run) => moved_permanently(&run_path(&run.uuid), req.query_string()),
         None => app_page(&state, StatusCode::NOT_FOUND, &PageHead::not_found()).await,
     }
 }
 
-/// An OMB run id has one form only, so no link moves. The page finds the run in the list that it
-/// sends as start data, so the browser finds it too.
+/// An OMB run id has one form only, so no link moves. The start data holds the run, so the browser
+/// finds it too.
 async fn omb_run_page(
     state: web::Data<SiteState>,
     text: web::Path<String>,
     req: HttpRequest,
 ) -> HttpResponse {
     let list = state.omb_runs.as_ref().map(|omb_runs| omb_runs.run_list());
-    let run = text.parse::<OmbRunId>().ok().and_then(|id| {
-        list.as_deref()
-            .and_then(|list| list.runs.iter().find(|run| run.id == id))
-    });
-    match run {
-        Some(run) => {
+    let found = list
+        .as_deref()
+        .zip(text.parse::<OmbRunId>().ok())
+        .and_then(|(list, id)| Some((list, list.runs.iter().find(|run| run.id == id)?)));
+    match found {
+        Some((list, run)) => {
             let head = PageHead::omb_run(run);
-            let start = || StartData {
-                omb_runs: list.as_deref().cloned(),
-                ..StartData::default()
-            };
+            let start = || StartData::omb_run_page(run, list);
             rendered_page(&state, &req, &head, start).await
         }
         None => app_page(&state, StatusCode::NOT_FOUND, &PageHead::not_found()).await,
@@ -250,8 +265,8 @@ async fn app_page(state: &SiteState, status: StatusCode, head: &PageHead) -> Htt
 
 /// The page at the path of `req`, rendered to HTML from `start`, the data that the page reads. The
 /// browser hydrates it. If the render fails or takes too long, the answer is the page of
-/// [`app_page`]. A HEAD request gets that page at once, because actix drops the body, so `start`
-/// runs for GET only.
+/// [`app_page`]. A HEAD request gets the headers of that page at once, so `start` runs for GET
+/// only.
 async fn rendered_page(
     state: &SiteState,
     req: &HttpRequest,
@@ -259,31 +274,54 @@ async fn rendered_page(
     start: impl FnOnce() -> StartData,
 ) -> HttpResponse {
     if req.method() == Method::HEAD {
-        return app_page(state, StatusCode::OK, head).await;
+        return without_length(app_page(state, StatusCode::OK, head).await);
     }
     let Some(html) = read_index(state).await else {
         return HttpResponse::InternalServerError().finish();
     };
     let body = render(
-        req.path().to_owned(),
-        req.query_string().to_owned(),
-        start(),
+        &state.render_slots,
+        RENDER_TIMEOUT,
+        req.path(),
+        req.query_string(),
+        start,
     )
     .await;
     page_response(state, StatusCode::OK, head, html, body)
 }
 
-/// The start data of the iggy-bench pages: the runs and the headline configuration.
-fn bench_start(state: &SiteState) -> StartData {
+/// `response` without its body and its length. The length of the splash page is not the length
+/// that a GET answer with the rendered page has, so a HEAD answer must not name it.
+fn without_length(response: HttpResponse) -> HttpResponse {
+    response.set_body(body::None::new()).map_into_boxed_body()
+}
+
+/// The start data of the iggy-bench pages that read every run: `summaries` and the headline
+/// configuration.
+fn bench_start(state: &SiteState, summaries: &[BenchmarkSummary]) -> StartData {
     StartData {
-        summaries: Some(state.runs.get_summaries().as_ref().clone()),
+        summaries: Some(summaries.to_vec()),
         config: Some(state.config.as_ref().clone()),
         ..StartData::default()
     }
 }
 
-/// The app HTML at `path` and the start data JSON. `None` when the render fails or times out.
-async fn render(path: String, query: String, start: StartData) -> Option<RenderedBody> {
+/// The app HTML at `path` and the start data JSON. `None` when no render slot frees up within
+/// `timeout`, or when the render fails or does not end in that time. `start` runs only after the
+/// render has a slot.
+async fn render(
+    slots: &Arc<Semaphore>,
+    timeout: Duration,
+    path: &str,
+    query: &str,
+    start: impl FnOnce() -> StartData,
+) -> Option<RenderedBody> {
+    let deadline = Instant::now() + timeout;
+    let Ok(Ok(slot)) = timeout_at(deadline, Arc::clone(slots).acquire_owned()).await else {
+        warn!("No render slot was free for '{path}' within {timeout:?}, so the browser renders it");
+        return None;
+    };
+    let start = start();
     let start_json = match serde_json::to_string(&start) {
         Ok(json) => json,
         Err(e) => {
@@ -291,20 +329,28 @@ async fn render(path: String, query: String, start: StartData) -> Option<Rendere
             return None;
         }
     };
-    let render = ssr::render(path.clone(), query, start);
-    let app = within(RENDER_TIMEOUT, &path, render).await?;
+    let render = ssr::render(path.to_owned(), query.to_owned(), start);
+    let app = within(deadline, path, slot, render).await?;
     Some(RenderedBody { app, start_json })
 }
 
-/// The output of `render`, or `None` after logging why not: a panic, or no output within
-/// `timeout`. The render runs as a task of its own, so its panic does not reach the request.
+/// The output of `render`, or `None` after logging why not: a panic, or no output by `deadline`.
+/// The render runs as a task of its own, so its panic does not reach the request. The task holds
+/// `slot` until the render ends, also after the deadline, because a late render still takes a
+/// thread of the render pool.
 async fn within(
-    timeout: Duration,
+    deadline: Instant,
     path: &str,
+    slot: OwnedSemaphorePermit,
     render: impl Future<Output = String> + Send + 'static,
 ) -> Option<String> {
     let began = Instant::now();
-    match tokio::time::timeout(timeout, tokio::spawn(render)).await {
+    let task = tokio::spawn(async move {
+        let app = render.await;
+        drop(slot);
+        app
+    });
+    match timeout_at(deadline, task).await {
         Ok(Ok(app)) => {
             debug!("Rendered '{path}' in {:.2?}", began.elapsed());
             Some(app)
@@ -314,7 +360,11 @@ async fn within(
             None
         }
         Err(_) => {
-            warn!("The render of '{path}' took over {timeout:?}, so the browser renders it");
+            warn!(
+                "The render of '{path}' did not end by its deadline, {:.2?} after it started, so \
+                 the browser renders it",
+                began.elapsed()
+            );
             None
         }
     }
@@ -355,7 +405,7 @@ fn page_response(
     body: Option<RenderedBody>,
 ) -> HttpResponse {
     let origin = state.public_url.as_ref().map(PublicUrl::as_str);
-    let html = fill_page(html, &head.tags(origin).to_string(), body);
+    let html = fill_page(html, origin, &head.tags(origin).to_string(), body);
     let mut response = HttpResponse::build(status);
     response
         .insert_header(ContentType::html())
@@ -366,12 +416,18 @@ fn page_response(
     response.body(html)
 }
 
-/// `html` with the part from [`HEAD_START`] to [`HEAD_END`] replaced by `tags`, and the part from
-/// [`BODY_START`] to [`BODY_END`] by the app of `body` and its start data. The start data follows the
-/// HTML of the page, so the content arrives first, and the app script, a module, runs after the
-/// parser read both. A frontend build without the comments keeps its own head and its splash, and
-/// gets no start data, because the browser hydrates a page that has start data.
-fn fill_page(html: Vec<u8>, tags: &str, body: Option<RenderedBody>) -> Vec<u8> {
+/// `html` with `tags` between [`HEAD_START`] and [`HEAD_END`], and the part from [`BODY_START`] to
+/// [`BODY_END`] replaced by the app of `body` and its start data. The head comments stay, because
+/// the app finds the tags of the page between them, and `origin` goes in front of them. The start
+/// data follows the HTML of the page, so the content arrives first, and the app script, a module,
+/// runs after the parser read both. A frontend build without the comments keeps its own head and
+/// its splash, and gets no start data, because the browser hydrates a page that has start data.
+fn fill_page(
+    html: Vec<u8>,
+    origin: Option<&str>,
+    tags: &str,
+    body: Option<RenderedBody>,
+) -> Vec<u8> {
     let page = match String::from_utf8(html) {
         Ok(page) => page,
         Err(e) => {
@@ -395,7 +451,14 @@ fn fill_page(html: Vec<u8>, tags: &str, body: Option<RenderedBody>) -> Vec<u8> {
         }
         None => page,
     };
-    match replace_between(&page, HEAD_START, HEAD_END, tags.trim_end()) {
+    let origin = origin.map_or_else(String::new, |origin| {
+        format!(
+            "<meta name=\"{PUBLIC_URL_META}\" content=\"{}\" />\n",
+            escape(origin)
+        )
+    });
+    let head = format!("{origin}{HEAD_START}\n{}\n{HEAD_END}", tags.trim_end());
+    match replace_between(&page, HEAD_START, HEAD_END, &head) {
         Some(page) => page.into_bytes(),
         None => {
             warn!("The frontend page has no {HEAD_START} and {HEAD_END}, so it keeps its own head");
@@ -424,12 +487,18 @@ pub(crate) mod tests {
     use actix_files::Files;
     use actix_web::dev::ServiceResponse;
     use actix_web::http::header::{CACHE_CONTROL, CONTENT_TYPE, IF_MODIFIED_SINCE};
-    use actix_web::{App, test};
+    use actix_web::middleware::Compress;
+    use actix_web::{App, HttpServer, test};
     use bench_dashboard_shared::head::NOINDEX_FOLLOW;
     use bench_dashboard_shared::omb::labels::workload_heading;
     use bench_dashboard_shared::pages::{PAGE_PATHS, omb_run_path};
+    use std::net::{SocketAddr, TcpListener as StdTcpListener};
     use std::path::Path;
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::sync::oneshot;
+    use url::form_urlencoded;
 
     const FIXTURE_RESULTS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../fixtures/results");
     pub(crate) const SHIPPED_CONFIG: &str =
@@ -493,6 +562,7 @@ pub(crate) mod tests {
             config: Arc::new(config),
             runs: Arc::new(runs),
             omb_runs,
+            render_slots: render_slots(),
         }
     }
 
@@ -539,6 +609,19 @@ pub(crate) mod tests {
             .strip_prefix(APP_START)
             .and_then(|rest| rest.strip_suffix(APP_END))
             .unwrap_or_else(|| panic!("{uri}: the app around a head: {body}"));
+        let head = match head.split_once(&format!("{HEAD_START}\n")) {
+            Some((origin, rest)) => {
+                assert!(
+                    origin.is_empty() || origin.starts_with(r#"<meta name="dashboard-public-url""#),
+                    "{uri}: {origin}"
+                );
+                rest
+            }
+            None => panic!("{uri}: no {HEAD_START} in {head}"),
+        };
+        let head = head
+            .strip_suffix(&format!("\n{HEAD_END}"))
+            .unwrap_or_else(|| panic!("{uri}: no {HEAD_END} after {head}"));
         assert!(head.starts_with("<title>"), "{uri}: {head}");
         assert!(!head.contains("page-head"), "{uri}: {head}");
         head.to_owned()
@@ -642,6 +725,32 @@ pub(crate) mod tests {
             r#"<meta property="og:image" content="{ORIGIN}/embed/{CLUSTER_RUN}/card.png" />"#
         )));
         assert!(head.contains(r#"<script type="application/ld+json">"#));
+    }
+
+    #[actix_web::test]
+    async fn given_public_url_or_none_when_requesting_page_should_tell_app_that_address_or_none() {
+        for (public_url, meta) in [
+            (
+                Some(ORIGIN),
+                Some(format!(
+                    r#"<meta name="{PUBLIC_URL_META}" content="{ORIGIN}" />"#
+                )),
+            ),
+            (None, None),
+        ] {
+            let dist = FrontendDist::new();
+            let app = site!(site_state(&dist, public_url, true), &dist);
+
+            let response = test::call_service(&app, request(Method::GET, "/").to_request()).await;
+
+            let body = String::from_utf8(test::read_body(response).await.to_vec()).expect("UTF-8");
+            let expected = match &meta {
+                Some(meta) => format!("{APP_START}{meta}\n{HEAD_START}\n"),
+                None => format!("{APP_START}{HEAD_START}\n"),
+            };
+            assert!(body.starts_with(&expected), "{body}");
+            assert_eq!(body.contains(PUBLIC_URL_META), meta.is_some(), "{body}");
+        }
     }
 
     #[actix_web::test]
@@ -879,34 +988,40 @@ pub(crate) mod tests {
     async fn given_rendered_pages_when_requested_should_answer_with_app_html_and_its_start_data() {
         let dist = FrontendDist::with_app_root();
         let state = site_state(&dist, Some(ORIGIN), true);
-        let expected = StartData {
-            summaries: Some(state.runs.get_summaries().as_ref().clone()),
+        let summaries = state.runs.get_summaries();
+        let every_run = StartData {
+            summaries: Some(summaries.as_ref().clone()),
             config: Some(state.config.as_ref().clone()),
-            omb_runs: None,
+            ..StartData::default()
         };
-        let run_paths: Vec<_> = expected
-            .summaries
+        let cluster_run = summaries
             .iter()
-            .flatten()
-            .map(|run| run_path(&run.uuid))
-            .collect();
+            .find(|run| run.uuid.to_string() == CLUSTER_RUN)
+            .expect("the fixtures have the cluster run");
+        // A query goes to the router of the render too, which takes it apart from the path.
+        let mut pages = vec![
+            ("/".to_owned(), every_run.clone()),
+            ("/methodology".to_owned(), every_run.clone()),
+            ("/explore".to_owned(), every_run.clone()),
+            ("/?utm_source=example".to_owned(), every_run.clone()),
+            (
+                "/explore?scope=all&q=pinned%20producer".to_owned(),
+                every_run.clone(),
+            ),
+            (
+                format!("/runs/{CLUSTER_RUN}?x=1&y=2"),
+                StartData::run_page(cluster_run, &summaries, &state.config),
+            ),
+        ];
+        pages.extend(summaries.iter().map(|run| {
+            (
+                run_path(&run.uuid),
+                StartData::run_page(run, &summaries, &state.config),
+            )
+        }));
         let app = site!(state, &dist);
 
-        // A query goes to the router of the render too, which takes it apart from the path.
-        let with_query = [
-            "/?utm_source=example".to_owned(),
-            format!("/runs/{CLUSTER_RUN}?x=1&y=2"),
-            "/explore?scope=all&q=pinned%20producer".to_owned(),
-        ];
-        for uri in [
-            "/".to_owned(),
-            "/methodology".to_owned(),
-            "/explore".to_owned(),
-        ]
-        .into_iter()
-        .chain(with_query)
-        .chain(run_paths)
-        {
+        for (uri, expected) in pages {
             let response = test::call_service(&app, request(Method::GET, &uri).to_request()).await;
 
             assert_eq!(response.status(), StatusCode::OK, "{uri}");
@@ -917,6 +1032,135 @@ pub(crate) mod tests {
             assert!(!app_html.contains("boot-splash"), "{uri}");
             assert_eq!(start.as_ref(), Some(&expected), "{uri}");
         }
+    }
+
+    /// The HTML of the app at `path`, rendered from `start`.
+    async fn rendered_html(path: &str, start: StartData) -> String {
+        ssr::render(path.to_owned(), String::new(), start).await
+    }
+
+    /// The fixture runs, plus runs around the cluster run: an older version of its workload on its
+    /// machine, its workload without the rate limit, and its workload on another machine. The
+    /// fixture runs alone share no machine, so their pages have no history and no related runs.
+    fn runs_around_cluster_run(state: &SiteState) -> Vec<BenchmarkSummary> {
+        let mut summaries = state.runs.get_summaries().as_ref().clone();
+        let cluster = summaries
+            .iter()
+            .find(|run| run.uuid.to_string() == CLUSTER_RUN)
+            .expect("the fixtures have the cluster run")
+            .clone();
+        let mut older = summaries
+            .iter()
+            .find(|run| run.version_order < cluster.version_order)
+            .expect("the fixtures have an older version")
+            .clone();
+        older.uuid = Uuid::from_u128(1);
+        older.machine.clone_from(&cluster.machine);
+        older.nodes = cluster.nodes;
+        older.workload_key = cluster.workload_key.clone();
+        let mut uncapped = cluster.clone();
+        uncapped.uuid = Uuid::from_u128(2);
+        uncapped.workload_key.rate_limit = None;
+        let mut elsewhere = cluster;
+        elsewhere.uuid = Uuid::from_u128(3);
+        elsewhere.machine = "elsewhere".to_owned();
+        summaries.extend([older, uncapped, elsewhere]);
+        summaries
+    }
+
+    #[actix_web::test]
+    async fn given_run_page_when_rendered_from_its_runs_should_give_html_of_render_from_every_run()
+    {
+        let dist = FrontendDist::new();
+        let state = site_state(&dist, None, true);
+        let summaries = runs_around_cluster_run(&state);
+        let config = state.config.as_ref();
+        let every_run = StartData {
+            summaries: Some(summaries.clone()),
+            config: Some(config.clone()),
+            ..StartData::default()
+        };
+
+        for run in &summaries {
+            let start = StartData::run_page(run, &summaries, config);
+            let page_runs: Vec<_> = start
+                .run
+                .as_ref()
+                .expect("the start data has the page runs")
+                .runs
+                .iter()
+                .map(|run| run.uuid)
+                .collect();
+            if run.uuid.to_string() == CLUSTER_RUN {
+                assert_eq!(
+                    page_runs,
+                    [run.uuid, Uuid::from_u128(1), Uuid::from_u128(2)],
+                    "the run, its older version and its run without the rate limit"
+                );
+            }
+            let path = run_path(&run.uuid);
+
+            let from_page_runs = rendered_html(&path, start).await;
+            let from_every_run = rendered_html(&path, every_run.clone()).await;
+
+            assert_eq!(from_page_runs, from_every_run, "{path}");
+            assert!(!from_page_runs.contains("Run not found"), "{path}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_page_runs_of_one_run_when_rendering_another_run_should_wait_for_every_run() {
+        let dist = FrontendDist::new();
+        let state = site_state(&dist, None, true);
+        let summaries = runs_around_cluster_run(&state);
+        let cluster = summaries
+            .iter()
+            .find(|run| run.uuid.to_string() == CLUSTER_RUN)
+            .expect("the fixtures have the cluster run");
+        let start = StartData::run_page(cluster, &summaries, &state.config);
+
+        for other in [Uuid::from_u128(1), Uuid::from_u128(3)] {
+            let html = rendered_html(&run_path(&other), start.clone()).await;
+
+            assert!(!html.contains("Run not found"), "{other}: {html}");
+            assert!(html.contains("Loading the runs"), "{other}: {html}");
+        }
+    }
+
+    #[actix_web::test]
+    async fn given_omb_run_page_when_rendered_from_its_runs_should_give_html_of_render_from_every_run()
+     {
+        let dist = FrontendDist::new();
+        let state = site_state(&dist, None, true);
+        let list = state
+            .omb_runs
+            .as_ref()
+            .expect("the OMB runs load")
+            .run_list();
+        let every_run = StartData {
+            omb_runs: Some(list.as_ref().clone()),
+            ..StartData::default()
+        };
+        let mut left_out = 0;
+        let mut most = 0;
+
+        for run in &list.runs {
+            let start = StartData::omb_run_page(run, &list);
+            let page_runs = start
+                .omb_run
+                .as_ref()
+                .expect("the start data has the page runs");
+            left_out += list.runs.len() - page_runs.runs.runs.len();
+            most = most.max(page_runs.runs.runs.len());
+            let path = omb_run_path(run.id);
+
+            let from_page_runs = rendered_html(&path, start).await;
+            let from_every_run = rendered_html(&path, every_run.clone()).await;
+
+            assert_eq!(from_page_runs, from_every_run, "{path}");
+        }
+        assert!(left_out > 0, "some OMB run page leaves out a run");
+        assert!(most >= 3, "some OMB run page has history and related runs");
     }
 
     #[actix_web::test]
@@ -967,10 +1211,6 @@ pub(crate) mod tests {
             .as_ref()
             .expect("the OMB runs load")
             .run_list();
-        let expected = StartData {
-            omb_runs: Some(list.as_ref().clone()),
-            ..StartData::default()
-        };
         let app = site!(state, &dist);
 
         for run in &list.runs {
@@ -982,7 +1222,11 @@ pub(crate) mod tests {
             let (app_html, start) = rendered_parts(response).await;
             let app_html = app_html.expect("the page has the app root");
             assert!(!app_html.contains("boot-splash"), "{uri}");
-            assert_eq!(start.as_ref(), Some(&expected), "{uri}");
+            assert_eq!(
+                start.as_ref(),
+                Some(&StartData::omb_run_page(run, &list)),
+                "{uri}"
+            );
             let heading = element(&app_html, "<h1", "</h1>");
             let trail = element(&app_html, r#"<nav aria-label="Breadcrumb""#, "</nav>");
             assert!(
@@ -992,6 +1236,11 @@ pub(crate) mod tests {
             for part in [heading, trail] {
                 assert!(!part.contains(&run.workload.name), "{uri}: {part}");
             }
+            let query = form_urlencoded::Serializer::new(String::new())
+                .append_pair("workload", &run.workload.name)
+                .finish();
+            let workload_runs = format!(r#"href="/omb?{query}""#);
+            assert!(app_html.contains(&workload_runs), "{uri}: {workload_runs}");
         }
     }
 
@@ -1089,17 +1338,71 @@ pub(crate) mod tests {
                 assert_eq!(header(&head, name), header(&get, name), "{uri}: {name}");
             }
             let (get_html, _) = rendered_parts(get).await;
-            let (head_html, head_start) = rendered_parts(head).await;
             assert!(
                 get_html.is_some_and(|html| !html.contains("boot-splash")),
                 "{uri}"
             );
-            assert!(
-                head_html.is_some_and(|html| html.starts_with(r#"<div class="boot-splash">"#)),
-                "{uri}"
-            );
-            assert_eq!(head_start, None, "{uri}");
+            assert!(test::read_body(head).await.is_empty(), "{uri}");
         }
+    }
+
+    /// The status line and the headers of the answer to `method` on `uri`, in lowercase, read from a
+    /// connection to `address`. The test service of actix skips the encoder, which writes the
+    /// `Content-Length` header, so only a connection shows it.
+    async fn headers_on_wire(address: SocketAddr, method: &str, uri: &str) -> String {
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        let request = format!(
+            "{method} {uri} HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: identity\r\n\
+             Connection: close\r\n\r\n"
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("send the request");
+        let mut answer = Vec::new();
+        stream
+            .read_to_end(&mut answer)
+            .await
+            .expect("read the answer");
+        let answer = String::from_utf8_lossy(&answer).to_lowercase();
+        let (headers, _) = answer.split_once("\r\n\r\n").expect("the headers end");
+        headers.to_owned()
+    }
+
+    #[actix_web::test]
+    async fn given_connection_when_heading_rendered_page_should_name_no_length_and_get_should() {
+        let dist = FrontendDist::with_app_root();
+        let state = web::Data::new(site_state(&dist, Some(ORIGIN), true));
+        let files = dist.path().to_owned();
+        let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind a free port");
+        let address = listener.local_addr().expect("the bound address");
+        let server = HttpServer::new(move || {
+            App::new()
+                .wrap(Compress::default())
+                .app_data(state.clone())
+                .configure(configure)
+                .service(Files::new("/", &files).index_file("index.html"))
+                .default_service(web::to(not_found))
+        })
+        .workers(1)
+        .disable_signals()
+        .listen(listener)
+        .expect("listen")
+        .run();
+        let handle = server.handle();
+        actix_web::rt::spawn(server);
+
+        for uri in ["/".to_owned(), format!("/runs/{CLUSTER_RUN}")] {
+            let get = headers_on_wire(address, "GET", &uri).await;
+            let head = headers_on_wire(address, "HEAD", &uri).await;
+
+            assert!(get.starts_with("http/1.1 200"), "{uri}: {get}");
+            assert!(get.contains("\r\ncontent-length: "), "{uri}: {get}");
+            assert!(head.starts_with("http/1.1 200"), "{uri}: {head}");
+            assert!(!head.contains("content-length"), "{uri}: {head}");
+            assert!(!head.contains("transfer-encoding"), "{uri}: {head}");
+        }
+        handle.stop(true).await;
     }
 
     #[actix_web::test]
@@ -1114,16 +1417,65 @@ pub(crate) mod tests {
         assert!(!head.contains(START_DATA_ID), "{head}");
     }
 
+    fn soon() -> Instant {
+        Instant::now() + Duration::from_millis(50)
+    }
+
     #[actix_web::test]
     async fn given_render_that_panics_or_hangs_when_waiting_should_give_nothing() {
-        let short = Duration::from_millis(50);
+        let slots = Arc::new(Semaphore::new(3));
+        let slot = || Arc::clone(&slots).try_acquire_owned().expect("a free slot");
 
-        let finished = within(short, "/", async { "app".to_owned() }).await;
-        let panicked = within(short, "/", async { panic!("the render broke") }).await;
-        let hung = within(short, "/", std::future::pending::<String>()).await;
+        let finished = within(soon(), "/", slot(), async { "app".to_owned() }).await;
+        let panicked = within(soon(), "/", slot(), async { panic!("the render broke") }).await;
+        let hung = within(soon(), "/", slot(), std::future::pending::<String>()).await;
 
         assert_eq!(finished.as_deref(), Some("app"));
         assert_eq!(panicked, None);
         assert_eq!(hung, None);
+    }
+
+    #[actix_web::test]
+    async fn given_render_past_deadline_when_it_ends_later_should_free_its_slot_only_then() {
+        let slots = Arc::new(Semaphore::new(1));
+        let slot = Arc::clone(&slots).try_acquire_owned().expect("a free slot");
+        let (finish, finished) = oneshot::channel::<()>();
+        let render = async move {
+            finished.await.ok();
+            "app".to_owned()
+        };
+
+        let app = within(soon(), "/", slot, render).await;
+
+        assert_eq!(app, None);
+        assert_eq!(
+            slots.available_permits(),
+            0,
+            "the late render keeps its slot"
+        );
+        finish.send(()).expect("the render waits");
+        let freed = timeout_at(
+            Instant::now() + Duration::from_secs(5),
+            Arc::clone(&slots).acquire_owned(),
+        )
+        .await;
+        assert!(freed.is_ok(), "the slot frees once the render ends");
+    }
+
+    #[actix_web::test]
+    async fn given_every_render_slot_taken_when_rendering_should_give_nothing_without_start_data() {
+        let slots = Arc::new(Semaphore::new(1));
+        let _taken = Arc::clone(&slots).try_acquire_owned().expect("a free slot");
+
+        let body = render(
+            &slots,
+            Duration::from_millis(50),
+            "/",
+            "",
+            || -> StartData { unreachable!("the start data waits for a slot") },
+        )
+        .await;
+
+        assert!(body.is_none());
     }
 }

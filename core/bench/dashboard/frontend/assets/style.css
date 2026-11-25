@@ -1232,6 +1232,12 @@ code.flag {
     min-width: 0;
 }
 
+.page-head-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
 .explore-stats {
     flex: 0 1 440px;
     display: grid;
