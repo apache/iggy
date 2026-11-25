@@ -303,6 +303,7 @@ public sealed partial class NativeRecoveryTests
         using var cluster = new RecoveryCluster(TimeSpan.FromSeconds(45));
         using var client = ConfiguredClient(cluster);
         await client.ConnectAsync(cluster.Token);
+        await cluster.UntilAsync(() => Binds(cluster) == 1);
         var register = Signal();
         var release = Signal();
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cluster.Token);
