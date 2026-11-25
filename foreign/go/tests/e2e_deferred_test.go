@@ -69,6 +69,7 @@ func TestE2E_ReaderReadsThePartitionThatHoldsMessages(t *testing.T) {
 		reader.WithPollOptions(longWaitOptions(10)))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = partitionReader.Close(context.Background()) })
+	waitForGroupAssignment(t, connected, streamId, topicId, group)
 	require.Eventually(t, func() bool { return len(partitionReader.Partitions()) == 3 }, promptReply, 10*time.Millisecond)
 
 	for round := range 3 {

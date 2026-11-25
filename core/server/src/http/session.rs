@@ -28,6 +28,7 @@ use crate::consumer_group::lease::SessionActivity;
 use consensus::CLIENTS_TABLE_MAX;
 use consensus::client_table::SessionAttachment;
 use futures::channel::oneshot;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use message_bus::InstanceToken;
 use tokio::sync::Mutex;
 
@@ -79,7 +80,7 @@ pub(in crate::http) struct HttpSession {
     pub(in crate::http) attachment: RefCell<SessionAttachment>,
     pub(in crate::http) activity: Rc<SessionActivity>,
     /// Session-table key this entry lives under
-    /// (`jwt:{user_id}:{created_at}:{jti}` / `pat:{sha}`).
+    /// (the JWT identity and proof, or the PAT hash).
     /// Held so an eviction observed on the write path can remove exactly this
     /// entry (see [`HttpInner::forget_session`]) without threading the key
     /// through the whole write chain.
@@ -94,7 +95,8 @@ pub(in crate::http) struct HttpSession {
     /// User the credential authenticated as. Consumed by the write path for
     /// authorization.
     pub(in crate::http) user_id: u32,
-    /// Credential expiry in unix seconds (`u64::MAX` = never). Drives lazy
+    pub(in crate::http) credential: CredentialProof,
+    /// Credential expiry in Unix microseconds (`u64::MAX` = never). Drives lazy
     /// eviction of stale table entries.
     pub(in crate::http) expiry: u64,
     /// Serializes this session's writes: the guarded value is the NEXT request
@@ -142,7 +144,7 @@ impl HttpSession {
         if let Some(attachment) =
             registry.attach_session(self.client_id, self.session, self.user_id)
         {
-            *self.attachment.borrow_mut() = attachment;
+            *self.attachment.borrow_mut() = attachment.expiring_at(self.activity.source_deadline);
         }
     }
 }
@@ -221,11 +223,11 @@ impl Drop for RegistrationGuard<'_> {
 /// unit-testable without a live consensus.
 pub(in crate::http) fn sweep_expired(
     table: &mut HashMap<String, Rc<HttpSession>>,
-    now_secs: u64,
+    now_micros: u64,
 ) -> Vec<(u128, InstanceToken)> {
     let mut torn = Vec::new();
     table.retain(|_, session| {
-        if session.expiry > now_secs && session.attachment.borrow().is_valid() {
+        if session.expiry > now_micros && session.attachment.borrow().is_valid() {
             return true;
         }
         if let Some(token) = session.registry_token.get() {
@@ -262,11 +264,11 @@ pub(in crate::http) fn forget_if_same(
 pub(in crate::http) fn live_entry(
     table: &HashMap<String, Rc<HttpSession>>,
     key: &str,
-    now_secs: u64,
+    now_micros: u64,
 ) -> Option<Rc<HttpSession>> {
     table
         .get(key)
-        .filter(|session| session.expiry > now_secs && session.attachment.borrow().is_valid())
+        .filter(|session| session.expiry > now_micros && session.attachment.borrow().is_valid())
         .map(Rc::clone)
 }
 
@@ -274,7 +276,48 @@ pub(in crate::http) fn live_entry(
 mod tests {
     use super::*;
 
+    use crate::http::error::WriteError;
+    use crate::http::reads::tests::{commit_user_request, read_state};
+    use crate::http::submit::submit_committed;
+    use iggy_binary_protocol::{Operation, WireEncode, WireIdentifier};
+    use iggy_common::IggyError;
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use metadata::stm::user::{
+        ChangePasswordRequest, ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS,
+    };
+
+    #[compio::test]
+    async fn given_queued_http_write_when_the_account_revision_moves_should_refuse_before_submission()
+     {
+        let state = read_state();
+        let (_registry, session) = fake_session("jwt:test", 7, u64::MAX);
+        let gate = session.gate.lock().await;
+        let mut write = Box::pin(submit_committed(
+            &state,
+            &session,
+            Operation::CreateUser,
+            bytes::Bytes::new(),
+        ));
+        assert!(futures::poll!(&mut write).is_pending());
+        commit_user_request(
+            &state,
+            10,
+            Operation::ChangePassword,
+            &ChangePasswordRequest {
+                user_id: WireIdentifier::numeric(DEFAULT_ROOT_USER_ID),
+                access_revision: ROOT_USER_ACCESS_REVISION,
+                keep_session: true,
+                password_hash: "replacement".to_owned(),
+            }
+            .to_bytes(),
+        );
+        drop(gate);
+        assert!(matches!(
+            write.await,
+            Err(WriteError::Rejected(IggyError::Unauthenticated))
+        ));
+        assert_eq!(*session.gate.lock().await, FIRST_REQUEST_ID);
+    }
 
     /// Pins the platform contract `submit_committed`'s cancellation safety
     /// rests on: a detached compio task keeps running after the handler side
@@ -378,11 +421,16 @@ mod tests {
                         client_id,
                         session: 1,
                     },
+                    u64::MAX,
                 )),
                 key: key.to_owned(),
                 client_id,
                 session: 1,
                 user_id: DEFAULT_ROOT_USER_ID,
+                credential: CredentialProof::account(
+                    ROOT_USER_CREATED_AT_MICROS,
+                    ROOT_USER_ACCESS_REVISION,
+                ),
                 expiry,
                 gate: Mutex::new(FIRST_REQUEST_ID),
                 data_gate: Mutex::new(FIRST_REQUEST_ID),

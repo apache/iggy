@@ -22,6 +22,7 @@
 use iggy::http::http_client::HttpClient;
 use iggy::prelude::*;
 use integration::iggy_harness;
+use std::time::Duration;
 
 #[iggy_harness]
 async fn given_logged_in_http_client_when_refreshing_should_swap_to_a_working_token(
@@ -60,4 +61,66 @@ async fn given_logged_in_http_client_when_refreshing_should_swap_to_a_working_to
         .get_stats()
         .await
         .expect("authed call after refresh must use the reissued token");
+}
+
+#[iggy_harness]
+async fn given_a_personal_access_token_exchange_when_refreshed_should_keep_the_source_expiry_and_revocation(
+    harness: &TestHarness,
+) {
+    let owner = harness.tcp_root_client().await.expect("root");
+    let source = owner
+        .create_personal_access_token(
+            "refresh-source",
+            PersonalAccessTokenExpiry::ExpireDuration(IggyDuration::from(Duration::from_secs(120))),
+        )
+        .await
+        .expect("create an expiring PAT");
+    let expiry = owner
+        .get_personal_access_tokens()
+        .await
+        .expect("list tokens")
+        .into_iter()
+        .find(|token| token.name == "refresh-source")
+        .expect("source PAT")
+        .expiry_at
+        .expect("source deadline")
+        .to_secs();
+    let address = harness.server().http_addr().expect("HTTP endpoint");
+    let client = HttpClient::new(&format!("http://{address}")).expect("HTTP client");
+    let exchanged = client
+        .login_with_personal_access_token(&source.token)
+        .await
+        .expect("exchange the PAT")
+        .access_token
+        .expect("access token");
+    assert_eq!(exchanged.expiry, expiry);
+    let refreshed = client
+        .refresh_access_token()
+        .await
+        .expect("refresh")
+        .access_token
+        .expect("access token");
+    assert_eq!(refreshed.expiry, expiry);
+    assert!(
+        refreshed.token != exchanged.token,
+        "refresh issues a new token"
+    );
+    client.get_stats().await.expect("refreshed token is usable");
+
+    owner
+        .delete_personal_access_token("refresh-source")
+        .await
+        .expect("delete the source PAT");
+    assert!(matches!(
+        client.refresh_access_token().await,
+        Err(IggyError::Unauthenticated)
+    ));
+    assert!(matches!(
+        client.get_stats().await,
+        Err(IggyError::Unauthenticated)
+    ));
+    owner
+        .get_stats()
+        .await
+        .expect("the password session stays usable");
 }

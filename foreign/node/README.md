@@ -22,7 +22,7 @@ note: previous works on node.js http client has been moved to [iggy-node-http-cl
 npm i --save apache-iggy@edge
 ```
 
-Use matching SDK and server builds from the coordinated VSR release, with a minimum binary protocol version of 0.12.1. Older builds are incompatible. This release requires fresh server storage (`IGGY-TIERED-SEGMENT-CHAIN-1`). Existing incompatible data is refused unchanged. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
+This SDK uses binary client protocol 0.12.3. Server 0.10.1-edge.2 accepts that protocol and requires fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. For a local server with the example credentials, follow the [example setup](../../examples/node/README.md#running-examples).
 
 ## basic usage
 
@@ -415,6 +415,12 @@ try {
 a partition reader, as an async iterable, with a handler loop, or as a
 `Readable`.
 
+Breaking out of an iteration keeps the unread remainder of its batch. A later
+iteration or `consume()` continues with the next message. A seek discards the
+unread remainder for that partition. Group revocation also discards it under
+`CommitPolicy.Manual` and `CommitPolicy.Auto`. Use one iterator or handler loop
+at a time.
+
 ```typescript
 import { CommitAfter, CommitPolicy } from "apache-iggy";
 
@@ -555,9 +561,7 @@ sign-in succeeds. This also discards a session whose Register succeeded when a
 later step of the explicit sign-in fails. Earlier calls keep their original
 lineage. Only SDK recovery continues them under a replacement session.
 
-An established session has its own lifetime. Password or PAT changes and PAT
-expiry do not end it. Logout, session lease expiry, or user deactivation end the
-session and prevent its bind proof from restoring it.
+With server 0.10.1-edge.2, a password change keeps the binary session that submitted it and ends the account's other sessions. Deleting or expiring a personal access token ends access for the sessions opened with it. A valid personal access token can open a new session after a password change. Logout, lease expiry and account deactivation also end session access.
 
 The client pings every `heartbeatInterval` milliseconds, 5000 by default, which
 keeps an idle session alive when the server's `[heartbeat]` eviction is enabled.

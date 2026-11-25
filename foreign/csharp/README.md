@@ -237,7 +237,8 @@ await client.ConnectAsync();
 
 - **Login registers a shared session in this checkout.** `LoginUserAsync` / `LoginWithPersonalAccessTokenAsync`
   authenticate Register. Auxiliary and reconnected transports bind the retained identity and proof without another Register.
-  Disconnecting removes only that binding. Logout, committed lease expiry or user deactivation ends the session.
+  Disconnecting removes only that binding. Logout, committed lease expiry, a user delete or deactivation, a password
+  change from another session, or a delete of the token the session was opened with ends the session.
   A `StaleClient` eviction also removes only the binding of that link. The reconnect binds the same session
   again, so its consumer-group memberships stay.
   A committed `StaleClient` result means that the server ended the session, for example because the user was
@@ -247,7 +248,7 @@ await client.ConnectAsync();
   table. The client closes that link and binds the session again on a new link. If the session ended, that bind
   fails with `Unauthenticated` and the client signs in again. Otherwise the session, its retained operations and
   its consumer-group memberships stay.
-  Password changes and PAT changes or expiry do not end an established session.
+  With server 0.10.1-edge.2, a password change keeps only the binary session that submitted it. A valid PAT can open a new session after a password change. Deleting or expiring it ends access for sessions opened with it.
   A terminal BindSession refusal (`Unauthenticated` or `StaleClient`) permits a fresh login. A transient refusal
   retains the identity while that replica's background reconnect retries the bind. An unresolved mutation
   cannot be replayed under a fresh session. The older 0.9.0 connection-lifetime rule does not apply to this checkout.
@@ -1288,6 +1289,11 @@ await consumer.ConsumeAsync(async (message, token) =>
 });
 ```
 
+Breaking out of a receive loop keeps the unread remainder of its batch. A later receive loop or `ConsumeAsync`
+continues with the next message. This also applies to typed and rented messages. Use one receive or handler loop
+at a time. An overlapping loop throws `InvalidOperationException`. A successful seek discards the remainder of the sought
+partition's batch.
+
 If the create of the group or the join has an unknown outcome, the consumer abandons it in the client at once.
 Then `InitAsync` throws `VsrRequestOutcomeUnknownException`, and the next `InitAsync` can create the group and join.
 A join that landed keeps the member in the group until the session ends.
@@ -1305,8 +1311,8 @@ A join that landed keeps the member in the group until the session ends.
 - `CommitPolicy.Auto`: the consumer counts each message and stores the latest counted position at the interval
   or the event of the policy, before a rebalance takes a partition away, and on shutdown. With
   `CommitAfter.Delivery` a message counts when it is handed over. With `CommitAfter.Processing` it counts once
-  `ReceiveAsync` is read again, or once the handler of `ConsumeAsync` returns with success. A handler that throws
-  ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
+  the receive stream advances, a later loop starts, or the handler of `ConsumeAsync` returns with success. A handler
+  that throws ends `ConsumeAsync` with its error, and its message does not count, so it is delivered again. With
   `CommitAfter.Marked` only `Mark(checkpoint)` counts.
 
 A read error that the reader retries by itself does not end the loop, it reaches `SubscribeToErrorEvents`. An error

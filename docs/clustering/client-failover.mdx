@@ -17,7 +17,9 @@ The SDK retains this context with a request. A route refresh does not replace th
 
 Binary login registers a logical session and a binding secret. Additional connections and reconnects bind that session. The client can therefore keep connections to several partition primaries without creating an unrelated identity for every link.
 
-A stale link does not always mean the logical session ended. The SDK closes that link and tries to bind again. A terminal session refusal requires new registration. Logout, session expiry and account deactivation end the session. A password or PAT change does not revoke a session already established with those credentials.
+A stale link does not always mean the logical session ended. The SDK closes that link and tries to bind again. A terminal session refusal requires new registration. Logout, session expiry and account deactivation end the session.
+
+With server 0.10.1-edge.2, a password change keeps only the submitting binary session of the account. A valid personal access token can open a new session after a password change. Deleting or expiring the token ends access for sessions opened with it.
 
 Advertised endpoints must be reachable from the client network. The SDK uses the endpoints returned by cluster metadata. See [Configuration](/docs/clustering/configuration) for network selectors and TLS names.
 

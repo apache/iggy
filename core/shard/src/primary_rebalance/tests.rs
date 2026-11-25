@@ -53,6 +53,10 @@ const COMMITTED: u64 = 13;
 const SOURCE: u8 = 1;
 const TARGET: u8 = 2;
 const NONCE: u128 = 17;
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one credit of fresh evidence keeps partition admission open.
+const FRESHNESS_WINDOW: Duration =
+    HEARTBEAT_TIMEOUT.saturating_add(metadata::AppliedFrontier::PARTITION_FRESHNESS_MARGIN);
 
 #[derive(Debug, Default)]
 struct RecordingBus {
@@ -164,7 +168,7 @@ fn owner_at<SB: SuperblockStore>(
     )
     .with_applied_frontier(Arc::new(
         metadata::AppliedFrontier::default()
-            .with_partition_freshness(bus.monotonic_now(), Duration::from_secs(5)),
+            .with_partition_freshness(bus.monotonic_now(), HEARTBEAT_TIMEOUT),
     ));
     let mut shard = TestShard::<SB>::without_inbox(
         ShardIdentity::new(0, "primary-rebalance-test".to_owned()),
@@ -2036,6 +2040,148 @@ async fn given_backup_credit_when_probes_are_stale_replayed_or_lack_evidence_sho
     assert!(!frontier.partition_requests_allowed(epoch + Duration::from_secs(9)));
 }
 
+/// Under a steady metadata load a probe names a commit that reaches the
+/// backup a moment later. Its credit waits for that commit. The wait does not
+/// make the evidence younger.
+#[compio::test]
+async fn given_a_probe_ahead_of_the_applied_frontier_when_the_backup_applies_its_commit_should_credit_it()
+ {
+    const APPLY_DELAY: Duration = Duration::from_secs(2);
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let epoch = shard.bus.monotonic_now();
+    let mut probe = probe_header(consensus, 100);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    let mut previous = probe;
+    previous.nonce -= 1;
+    probe.commit = COMMITTED;
+    shard.on_primary_rebalance(previous, Vec::new()).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+    shard.tick_primary_rebalance().await;
+    assert!(
+        !frontier.partition_requests_allowed(epoch),
+        "no credit before the commit of the probe is applied"
+    );
+
+    shard.bus.now.set(Some(epoch + APPLY_DELAY));
+    frontier.advance(COMMITTED);
+    shard.tick_primary_rebalance().await;
+
+    let last_fresh = epoch + FRESHNESS_WINDOW.saturating_sub(Duration::from_secs(1));
+    assert!(frontier.partition_requests_allowed(last_fresh));
+    assert!(
+        !frontier.partition_requests_allowed(epoch + FRESHNESS_WINDOW),
+        "the credit ends where that of a probe applied on arrival ends"
+    );
+}
+
+/// A backup that applies a commit later than the next probe arrives never
+/// reaches the commit of the newest probe. The earlier probe keeps its place.
+#[compio::test]
+async fn given_a_held_probe_when_a_later_probe_arrives_before_its_commit_is_applied_should_credit_it()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let epoch = shard.bus.monotonic_now();
+    let mut probe = probe_header(consensus, 100);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    let mut previous = probe;
+    previous.nonce -= 1;
+    probe.commit = COMMITTED;
+    shard.on_primary_rebalance(previous, Vec::new()).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+
+    shard.bus.now.set(Some(epoch + PROBE_INTERVAL));
+    probe.nonce += 1;
+    probe.commit = COMMITTED + 1;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+    frontier.advance(COMMITTED);
+    shard.tick_primary_rebalance().await;
+
+    let last_fresh = epoch + FRESHNESS_WINDOW.saturating_sub(Duration::from_secs(1));
+    assert!(frontier.partition_requests_allowed(last_fresh));
+    assert!(
+        !frontier.partition_requests_allowed(epoch + FRESHNESS_WINDOW),
+        "the credit is that of the earlier probe"
+    );
+}
+
+/// An idle primary repeats the commit that a slow backup has not applied.
+/// Each of those probes proves a later contact with the quorum, so the credit
+/// must be that of the newest one, or it ends early for no reason.
+#[compio::test]
+async fn given_a_held_probe_when_a_later_probe_of_the_same_commit_arrives_should_credit_the_younger_evidence()
+ {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let epoch = shard.bus.monotonic_now();
+    let mut probe = probe_header(consensus, 100);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    let mut previous = probe;
+    previous.nonce -= 1;
+    probe.commit = COMMITTED;
+    shard.on_primary_rebalance(previous, Vec::new()).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+
+    // The evidence of a probe is as old as the receipt of the one before
+    // it, so the second repeat is the first that is younger than the held one.
+    for repeat in 1..=2 {
+        shard.bus.now.set(Some(epoch + PROBE_INTERVAL * repeat));
+        probe.nonce += 1;
+        shard.on_primary_rebalance(probe, Vec::new()).await;
+    }
+    frontier.advance(COMMITTED);
+    shard.tick_primary_rebalance().await;
+
+    assert!(
+        frontier.partition_requests_allowed(epoch + FRESHNESS_WINDOW),
+        "the credit is that of the newest probe"
+    );
+    assert!(!frontier.partition_requests_allowed(epoch + PROBE_INTERVAL + FRESHNESS_WINDOW));
+}
+
+/// A probe held across a view change stands for the old view.
+#[compio::test]
+async fn given_a_held_probe_when_the_view_changes_before_its_commit_is_applied_should_drop_it() {
+    let (shard, _inbox) = owner_at::<PingPongSuperblock>(None, 1, 3, 0);
+    let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
+    let frontier = shard.plane.metadata().applied_frontier();
+    let epoch = shard.bus.monotonic_now();
+    let mut probe = probe_header(consensus, 100);
+    probe.replica = 0;
+    probe.quorum_age_ns = 0;
+    let mut previous = probe;
+    previous.nonce -= 1;
+    probe.commit = COMMITTED;
+    shard.on_primary_rebalance(previous, Vec::new()).await;
+    shard.on_primary_rebalance(probe, Vec::new()).await;
+    let start = Message::<StartViewHeader>::new(HEADER_SIZE).transmute_header(
+        |_, header: &mut StartViewHeader| {
+            header.cluster = CLUSTER;
+            header.command = Command::StartView;
+            header.size = u32::try_from(HEADER_SIZE).unwrap();
+            header.group = METADATA_GROUP;
+            header.view = 3;
+            header.replica = 0;
+            header.op = COMMITTED;
+            header.commit = COMMITTED;
+        },
+    );
+    consensus.handle_start_view(PlaneKind::Metadata, start.header(), &[]);
+    assert_eq!(consensus.view(), 3);
+
+    frontier.advance(COMMITTED);
+    shard.tick_primary_rebalance().await;
+
+    assert!(!frontier.partition_requests_allowed(epoch));
+}
+
 #[compio::test]
 async fn given_an_adopted_view_when_its_head_is_not_applied_and_advertised_should_not_credit_a_probe()
  {
@@ -2127,7 +2273,7 @@ async fn given_a_delayed_probe_when_crediting_a_backup_should_age_its_evidence_f
     let consensus = shard.plane.metadata().consensus.as_ref().unwrap();
     let frontier = shard.plane.metadata().applied_frontier();
     let epoch = shard.bus.monotonic_now();
-    let window = Duration::from_secs(5) + metadata::AppliedFrontier::PARTITION_FRESHNESS_MARGIN;
+    let window = FRESHNESS_WINDOW;
     let mut probe = probe_header(consensus, NONCE);
     probe.replica = 0;
     probe.quorum_age_ns = 0;

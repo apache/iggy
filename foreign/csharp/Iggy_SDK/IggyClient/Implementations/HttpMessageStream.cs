@@ -1296,10 +1296,16 @@ public class HttpMessageStream : IIggyClient
     }
 
     /// <inheritdoc />
+    /// <remarks>
+    ///     A token the server refuses as unauthenticated (code 40) has no session left to end, as after a password
+    ///     change, so the logout holds and the token is dropped too. Any other 401, such as one from a proxy, still
+    ///     fails. A client that holds no token still gets the refusal.
+    /// </remarks>
     public async Task LogoutUserAsync(CancellationToken token = default)
     {
+        var signedIn = _httpClient.DefaultRequestHeaders.Authorization is not null;
         var response = await _httpClient.DeleteAsync("users/logout", token);
-        if (!response.IsSuccessStatusCode)
+        if (!response.IsSuccessStatusCode && !(signedIn && await IsUnauthenticatedAsync(response, token)))
         {
             await HandleResponseAsync(response);
         }
@@ -1621,6 +1627,25 @@ public class HttpMessageStream : IIggyClient
         }
 
         throw error;
+    }
+
+    private async Task<bool> IsUnauthenticatedAsync(HttpResponseMessage response, CancellationToken token)
+    {
+        if (response.StatusCode != HttpStatusCode.Unauthorized)
+        {
+            return false;
+        }
+
+        var body = await response.Content.ReadAsStringAsync(token);
+        try
+        {
+            var error = JsonSerializer.Deserialize<ErrorResponse>(body, _jsonSerializerOptions);
+            return error?.Id == VsrError.UNAUTHENTICATED;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     private static string CreateUrl(ref MessageRequestInterpolationHandler message)

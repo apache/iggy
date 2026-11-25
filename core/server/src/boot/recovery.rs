@@ -48,7 +48,7 @@ use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
 use shard::metrics::ShardMetrics;
-use shard::shards_table::{PapayaShardsTable, ShardsTable, calculate_shard_assignment};
+use shard::shards_table::{PapayaShardsTable, PartitionShards, ShardsTable};
 use shard::{
     CoordinatorConfig, PartitionConsensusConfig, Receiver as ShardReceiver, ShardFrame,
     ShardIdentity, TaggedSender,
@@ -150,15 +150,23 @@ pub(in crate::boot) async fn build_shard_for_thread(
             .sum::<usize>()
     });
 
+    let partition_shards = PartitionShards::new(
+        total_shards,
+        config.cluster.coordinator.skip_shard_zero_for_partitions,
+    );
     // IggyPartitions holds only the partitions owned by this shard
     // (see the filter below at insert time), so the server-wide total
-    // is an N-fold overshoot. `ceil(total / shards) * 2` is a coarse
+    // is an N-fold overshoot. `ceil(total / owning shards) * 2` is a coarse
     // upper bound that absorbs hash skew without paying the full
     // multiplier. PapayaShardsTable below stays sized to the server-wide
     // total because every shard routes every namespace.
-    let owned_partitions_capacity = total_partitions
-        .div_ceil(usize::from(total_shards).max(1))
-        .saturating_mul(2);
+    let owned_partitions_capacity = if shard_id < partition_shards.first_owner() {
+        0
+    } else {
+        total_partitions
+            .div_ceil(usize::from(partition_shards.owner_count()))
+            .saturating_mul(2)
+    };
     // Each encrypted stream holds its own key, wrapped under the server key.
     // The shards owning its partitions open it below, shard 0 opens the keys of
     // streams that own no partition.
@@ -193,20 +201,16 @@ pub(in crate::boot) async fn build_shard_for_thread(
         owned_partitions_capacity,
     )
     .with_repair_memory(repair_memory)
-    .with_repair_rings(Rc::new(RepairRingBudget::new(
-        // A share past the address space bounds nothing, as `usize::MAX` does.
-        usize::try_from(
-            config
-                .partition
-                .journal_memory_shard_bytes_max(total_shards),
-        )
-        .unwrap_or(usize::MAX),
-    )))
     .with_checkpoint_delays(partitions::CheckpointDelays::new(
         config.partition.checkpoint_idle_delay.get_duration(),
         config.partition.checkpoint_max_delay.get_duration(),
-    ))
-    .with_wal_reload_budget(config.partition.wal_reload_shard_bytes_max(total_shards));
+    ));
+    let partitions = match partition_budget_shares(config, partition_shards, shard_id) {
+        Some((repair_ring_bytes, wal_reload_bytes)) => partitions
+            .with_repair_rings(Rc::new(RepairRingBudget::new(repair_ring_bytes)))
+            .with_wal_reload_budget(wal_reload_bytes),
+        None => partitions,
+    };
     let shards_table = PapayaShardsTable::with_capacity(total_partitions);
 
     // Stream-filter inside the `read()` closure: only partitions owned by
@@ -232,8 +236,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
                         continue;
                     }
                     let namespace = IggyNamespace::new(stream.id, topic_id, partition.id);
-                    let owning_shard =
-                        calculate_shard_assignment(&namespace, u32::from(total_shards));
+                    let owning_shard = partition_shards.shard_for(&namespace);
                     if owning_shard == shard_id {
                         // Shared per-partition stats from the registry: the
                         // same `Arc` backs every shard's `get_topic` reply.
@@ -400,6 +403,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         CoordinatorConfig {
             skip_shard_zero_for_clients: config.cluster.coordinator.skip_shard_zero_for_clients,
         },
+        partition_shards.skip_shard_zero(),
         metrics,
     )
     .with_partition_io_limits(super::threads::partition_io_limits(&config.sharding)?)
@@ -647,6 +651,26 @@ fn refuse_unreadable_topics(streams: &Streams) -> Result<(), ServerError> {
         }),
         None => Ok(()),
     }
+}
+
+/// The shares of `shard_id` in the repair ring budget and in the WAL reload
+/// budget of the node. The shards that own partitions divide both, so a shard
+/// that owns none takes no share: it has nothing to charge, and its gauges
+/// would add a share that the node budget does not hold.
+fn partition_budget_shares(
+    config: &ServerConfig,
+    partition_shards: PartitionShards,
+    shard_id: u16,
+) -> Option<(usize, u64)> {
+    (shard_id >= partition_shards.first_owner()).then(|| {
+        let owners = partition_shards.owner_count();
+        (
+            // A share past the address space bounds nothing, as `usize::MAX` does.
+            usize::try_from(config.partition.journal_memory_shard_bytes_max(owners))
+                .unwrap_or(usize::MAX),
+            config.partition.wal_reload_shard_bytes_max(owners),
+        )
+    })
 }
 
 /// The `[sharding]` deferred poll limits in the units the shard compares.
@@ -983,6 +1007,41 @@ mod tests {
         );
     }
     const OTHER_CONFIG_KEY: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+
+    #[test]
+    fn given_a_shard_that_owns_no_partition_when_dividing_the_partition_budgets_should_take_no_share()
+     {
+        const SHARDS: u16 = 4;
+        let config = ServerConfig::default();
+        let node_budgets = (
+            config
+                .partition
+                .journal_memory_node_bytes_max
+                .as_bytes_u64(),
+            config.partition.wal_reload_node_bytes_max.as_bytes_u64(),
+        );
+        for skip_shard_zero in [false, true] {
+            let partition_shards = PartitionShards::new(SHARDS, skip_shard_zero);
+            let shares: Vec<_> = (0..SHARDS)
+                .map(|shard_id| partition_budget_shares(&config, partition_shards, shard_id))
+                .collect();
+            assert_eq!(shares[0].is_none(), skip_shard_zero);
+            let taken = shares.iter().flatten().fold((0, 0), |taken, share| {
+                (taken.0 + u64::try_from(share.0).unwrap(), taken.1 + share.1)
+            });
+            let owners = partition_shards.owner_count();
+            assert_eq!(shares.iter().flatten().count(), usize::from(owners));
+            let owners = u64::from(owners);
+            assert!(
+                taken.0 <= node_budgets.0 && taken.0 + owners > node_budgets.0,
+                "the repair ring shares add up to the node budget: {taken:?}"
+            );
+            assert!(
+                taken.1 <= node_budgets.1 && taken.1 + owners > node_budgets.1,
+                "the WAL reload shares add up to the node budget: {taken:?}"
+            );
+        }
+    }
 
     #[test]
     fn given_topic_with_unknown_critical_option_when_booting_should_refuse_it() {

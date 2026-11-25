@@ -38,6 +38,7 @@ use iggy_object_store::PositionHolder;
 use journal::superblock::{PingPongSuperblock, SuperblockStore};
 use message_bus::MessageBus;
 use server_common::Message;
+use server_common::diagnostics::PARTITION_REFUSED_MARKER;
 use server_common::send_messages::{ChecksumMode, convert_request_message, encrypt_batch_request};
 use server_common::sharding::{IggyNamespace, LocalIdx, ShardId};
 use std::cell::Cell;
@@ -47,7 +48,7 @@ use std::num::NonZeroU64;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// RAII counter for live [`IggyPartitions::with_partition`] borrows. The
 /// decrement runs on `Drop`, so a panic inside the closure still restores the
@@ -1583,13 +1584,33 @@ where
         self.wake_namespace(namespace);
     }
 
-    /// A permanent recovery failure, unlike a temporary teardown tombstone.
-    /// Retirement must persist this incarnation's fence before reporting success.
+    /// Keep this incarnation of the partition offline for good, unlike a
+    /// temporary teardown tombstone. Retirement must persist this
+    /// incarnation's fence before reporting success.
+    ///
+    /// A partition that recovery could not read goes through
+    /// [`Self::refuse`], which also says so in the log.
     pub fn fence(&self, namespace: IggyNamespace, created_revision: u64) {
         self.tombstoned
             .borrow_mut()
             .insert(namespace, Some(created_revision));
         self.wake_namespace(namespace);
+    }
+
+    /// Fence a partition that recovery refused to serve: its durable state
+    /// is unreadable, untrusted or lost. The caller logs the reason. This
+    /// adds the one line that is the same for every reason.
+    pub fn refuse(&self, namespace: IggyNamespace, created_revision: u64) {
+        error!(
+            namespace_raw = namespace.inner(),
+            stream_id = namespace.stream_id(),
+            topic_id = namespace.topic_id(),
+            partition_id = namespace.partition_id(),
+            created_revision,
+            "{PARTITION_REFUSED_MARKER}: recovery refused this partition, so this node does \
+             not serve it"
+        );
+        self.fence(namespace, created_revision);
     }
 
     #[must_use]
@@ -2026,8 +2047,12 @@ mod tests {
         Message, SegmentStorage,
         iobuf::{Frozen, Owned},
     };
+    use std::fmt::Debug;
     use std::ops::RangeInclusive;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Metadata, Subscriber};
 
     const TEST_CLUSTER: u128 = 1;
     const RING_OPS: RangeInclusive<u64> = 1..=4;
@@ -3182,5 +3207,76 @@ mod tests {
         assert_eq!(partitions.gauge_sums(), first_share);
         drop(partitions.remove(&first));
         assert_eq!(partitions.gauge_sums(), GaugeShare::default());
+    }
+
+    /// The marker is the only sign of a refused partition that a node which
+    /// boots and exits 0 leaves, so the refusal itself has to write it.
+    #[test]
+    fn given_a_partition_when_recovery_refuses_it_should_fence_it_and_log_the_marker() {
+        let namespace = IggyNamespace::new(1, 1, 0);
+        // Another test thread that registers the log line while this test
+        // installs its subscriber can cache that no one listens to it. The
+        // next attempt, after a rebuild of the interest cache, sees the line.
+        for _ in 0..3 {
+            let partitions = shard_with(&[namespace]);
+            let messages = LogMessages::default();
+            let _collecting = tracing::subscriber::set_default(messages.clone());
+            tracing::callsite::rebuild_interest_cache();
+
+            partitions.refuse(namespace, 7);
+
+            assert_eq!(partitions.failed_revision(&namespace), Some(7));
+            let logged = messages.0.lock().unwrap().clone();
+            if logged.is_empty() {
+                continue;
+            }
+            assert!(
+                logged
+                    .iter()
+                    .any(|message| message.starts_with(PARTITION_REFUSED_MARKER)),
+                "{logged:?}"
+            );
+            return;
+        }
+        panic!("the log line of the refusal never reached the subscriber");
+    }
+
+    /// Keeps the message of every event.
+    #[derive(Clone, Default)]
+    struct LogMessages(Arc<Mutex<Vec<String>>>);
+
+    impl Subscriber for LogMessages {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attributes: &Attributes<'_>) -> Id {
+            Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &Id, _values: &Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut message = LogMessage::default();
+            event.record(&mut message);
+            self.0.lock().unwrap().push(message.0);
+        }
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[derive(Default)]
+    struct LogMessage(String);
+
+    impl Visit for LogMessage {
+        fn record_debug(&mut self, field: &Field, value: &dyn Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
     }
 }
