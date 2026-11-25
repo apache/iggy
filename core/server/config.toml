@@ -1595,8 +1595,8 @@ handshake_grace = "10 s"
 #second_attempt_after_per_mib = "60 ms"
 # A long-term segment of at least twice 'part_size' goes up in parts on "s3"
 # and "gcs": up to 'jobs.parts_in_flight' parts side by side, each sent again
-# and given a second attempt as a put is, and then one request creates the
-# object whole and create-only, with a CRC32C of all of it that the store
+# after a failure as a put is but without a second attempt, and then one
+# request creates the object whole and create-only, with a CRC32C of all of it that the store
 # checks. Every other put goes whole, such as a fresh object that producers
 # wait for. On s3 it is a multipart upload with a full object CRC32C. On gcs
 # each part is a temporary object under "<prefix>/meta/uploads/", which a
