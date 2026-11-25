@@ -15,7 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod crawl;
 pub mod omb;
+pub mod pages;
 
 use crate::artifacts;
 use crate::cache::{SeriesBuilder, SeriesKey};
