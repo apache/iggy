@@ -198,6 +198,7 @@ runs:
         IGGY_PATH: ${{ runner.temp }}/iggy-java-cluster-1-data
 
     - name: Test (cluster)
+      id: test-cluster
       if: inputs.task == 'test'
       shell: bash
       working-directory: foreign/java
@@ -206,6 +207,17 @@ runs:
       run: |
         TIMEFORMAT='Java tests against a two-node cluster: %3R seconds'
         time ./gradlew :iggy:test --rerun
+
+    # The cluster run writes over the reports of the single node run, so each
+    # run keeps its own copy.
+    - name: Copy test reports (cluster)
+      if: ${{ !cancelled() && inputs.task == 'test' && steps.test-cluster.outcome != 'skipped' }}
+      shell: bash
+      run: |
+        if [ -d "foreign/java/java-sdk/build/test-results" ]; then
+          mkdir -p reports/java-tests/cluster
+          cp -r foreign/java/java-sdk/build/test-results reports/java-tests/cluster/sdk
+        fi
 
     - name: Stop Iggy VSR cluster node 1
       if: always() && inputs.task == 'test'
@@ -239,6 +251,7 @@ runs:
         IGGY_TCP_TLS_KEY_FILE: core/certs/iggy_key.pem
 
     - name: TLS integration tests
+      id: test-tls
       if: inputs.task == 'test'
       shell: bash
       working-directory: foreign/java
@@ -249,12 +262,56 @@ runs:
         TIMEFORMAT='Java TLS tests: %3R seconds'
         time ./gradlew :iggy:test --tests "*TlsConnectionTest*"
 
+    - name: Copy test reports (TLS)
+      if: ${{ !cancelled() && inputs.task == 'test' && steps.test-tls.outcome != 'skipped' }}
+      shell: bash
+      run: |
+        if [ -d "foreign/java/java-sdk/build/test-results" ]; then
+          mkdir -p reports/java-tests/tls
+          cp -r foreign/java/java-sdk/build/test-results reports/java-tests/tls/sdk
+        fi
+
+    # The leak check above sees only the single node run, so the copies of the
+    # cluster and TLS runs get their own. A run that did not start has no copy.
+    - name: Check for ByteBuf leaks (cluster and TLS)
+      if: ${{ !cancelled() && inputs.task == 'test' }}
+      shell: bash
+      run: |
+        leaks=false
+        for results in reports/java-tests/cluster/sdk reports/java-tests/tls/sdk; do
+          if [ -d "$results" ] && grep -r "LEAK:" "$results"; then
+            leaks=true
+          fi
+        done
+        if [ "$leaks" = true ]; then
+          echo "::error::Netty ByteBuf memory leaks detected in test output!"
+          exit 1
+        fi
+        echo "No ByteBuf leaks detected"
+
     - name: Stop Iggy server (TLS)
       if: always() && inputs.task == 'test'
       uses: ./.github/actions/utils/server-stop
       with:
         pid-file: ${{ steps.iggy-tls.outputs.pid_file }}
         log-file: ${{ steps.iggy-tls.outputs.log_file }}
+
+    # The single node, both cluster nodes and the TLS server each log to
+    # their own iggy-*.log in the runner temp directory. The reports upload
+    # carries them with the test results.
+    - name: Collect server logs
+      if: always() && inputs.task == 'test'
+      shell: bash
+      run: |
+        shopt -s nullglob
+        logs=("$RUNNER_TEMP"/iggy-*.log)
+        if [ ${#logs[@]} -eq 0 ]; then
+          echo "No server logs found"
+          exit 0
+        fi
+        mkdir -p reports/java-server-logs
+        cp "${logs[@]}" reports/java-server-logs/
+        ls -l reports/java-server-logs
 
     - name: Test Summary
       uses: test-summary/action@v2

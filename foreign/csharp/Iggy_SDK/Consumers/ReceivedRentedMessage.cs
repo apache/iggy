@@ -88,10 +88,7 @@ public sealed class ReceivedRentedMessage : IDisposable
 /// </summary>
 public sealed class RentedBatchHandle : IDisposable
 {
-    private readonly PolledMessagesRental _rental;
-
-    /// <summary>The rented batch.</summary>
-    internal PolledMessagesRental Rental => _rental;
+    private readonly PolledMessagesRental? _rental;
     private int _refCount = 1;
 
     /// <summary>
@@ -103,10 +100,17 @@ public sealed class RentedBatchHandle : IDisposable
     public RentedBatchHandle(PolledMessagesRental rental)
     {
         _rental = rental;
+        Context = rental.Context;
+    }
+
+    // The reader already owns managed message buffers. They need no pool return.
+    internal RentedBatchHandle(PartitionContext context)
+    {
+        Context = context;
     }
 
     /// <summary>The partition incarnation and owner of the poll that produced the batch.</summary>
-    public PartitionContext Context => _rental.Context;
+    public PartitionContext Context { get; }
 
     /// <summary>
     ///     Releases one reference on the underlying rental. Equivalent to <see cref="Release" />.
@@ -133,7 +137,7 @@ public sealed class RentedBatchHandle : IDisposable
         var remaining = Interlocked.Decrement(ref _refCount);
         if (remaining <= 0)
         {
-            _rental.Dispose();
+            _rental?.Dispose();
         }
     }
 }
