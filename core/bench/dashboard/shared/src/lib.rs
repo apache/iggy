@@ -22,6 +22,7 @@ pub mod github;
 pub mod identity;
 pub mod metrics;
 pub mod omb;
+pub mod pages;
 pub mod series;
 pub mod subtext;
 pub mod summary;
