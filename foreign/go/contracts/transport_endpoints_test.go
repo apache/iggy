@@ -1,9 +1,29 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
 package iggcon
 
 import (
 	"bytes"
+	"errors"
 	"reflect"
 	"testing"
+
+	ierror "github.com/apache/iggy/foreign/go/errors"
 )
 
 func TestTransportEndpoints_MatchLittleEndian(t *testing.T) {
@@ -19,16 +39,12 @@ func TestTransportEndpoints_MatchLittleEndian(t *testing.T) {
 }
 
 func TestTransportEndpoints_UnmarshalBinaryLengthShouldNotBeSmallerThanEight(t *testing.T) {
-	tsep := NewTransportEndpoints(8090, 8080, 3000, 8092)
-	ans1 := []byte{0x11, 0x45, 0x14, 0x19, 0x19, 0x81, 0x9C} // having length of seven, expected to return error, so we can pass the Errorf below, which is anticipated
-	ans2 := []byte{}                                         // a zero-length byte slice, expected to return error, so we can pass the Errorf below, which is anticipated
-	err1 := tsep.UnmarshalBinary(ans1)
-	if err1 == nil {
-		t.Errorf("UnmarshalBinary() expected an error for 7-byte input, got nil")
-	}
-	err2 := tsep.UnmarshalBinary(ans2)
-	if err2 == nil {
-		t.Errorf("UnmarshalBinary() expected an error for 0-byte input, got nil")
+	for _, length := range []int{0, 7} {
+		var endpoints TransportEndpoints
+		err := endpoints.UnmarshalBinary(make([]byte, length))
+		if !errors.Is(err, ierror.ErrInvalidCommand) {
+			t.Errorf("UnmarshalBinary() for %d-byte input returned %v, want %v", length, err, ierror.ErrInvalidCommand)
+		}
 	}
 }
 
