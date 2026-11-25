@@ -323,7 +323,10 @@ async fn acceptor_answers_a_release_it_lists_under_the_identity_of_that_release(
         auth::read_status(&challenge.header().reserved_command),
         HandshakeStatus::Ok
     );
-    assert_eq!(identity_of(&challenge), release_identity(OLDER_RELEASE));
+    assert_eq!(
+        auth::read_identity(&challenge.header().reserved_command),
+        release_identity(OLDER_RELEASE)
+    );
     wait_until(|| acceptor.replicas().contains(0), Duration::from_secs(2)).await;
     acceptor.shutdown(Duration::from_secs(2)).await;
 }
@@ -357,7 +360,10 @@ async fn acceptor_answers_under_its_own_identity_when_the_hello_lists_its_releas
         auth::read_status(&challenge.header().reserved_command),
         HandshakeStatus::Ok
     );
-    assert_eq!(identity_of(&challenge), release_identity(OLDER_RELEASE));
+    assert_eq!(
+        auth::read_identity(&challenge.header().reserved_command),
+        release_identity(OLDER_RELEASE)
+    );
     wait_until(|| acceptor.replicas().contains(0), Duration::from_secs(2)).await;
     acceptor.shutdown(Duration::from_secs(2)).await;
 }
@@ -411,7 +417,10 @@ async fn acceptor_enforces_the_hello_identity_limit() {
                 auth::read_status(&challenge.header().reserved_command),
                 HandshakeStatus::Ok
             );
-            assert_eq!(identity_of(&challenge), release_identity(OLDER_RELEASE));
+            assert_eq!(
+                auth::read_identity(&challenge.header().reserved_command),
+                release_identity(OLDER_RELEASE)
+            );
         } else {
             assert!(response.is_err());
             assert!(!acceptor.replicas().contains(0));
@@ -460,7 +469,10 @@ async fn dialer_sends_the_identities_it_lists_and_links_under_one_of_them() {
 
         let (hello, _held_link) = peer.await.expect("peer task");
 
-        assert_eq!(identity_of(&hello), release_identity(NEWER_RELEASE));
+        assert_eq!(
+            auth::read_identity(&hello.header().reserved_command),
+            release_identity(NEWER_RELEASE)
+        );
         assert_eq!(
             hello.body(),
             [
@@ -483,33 +495,89 @@ async fn dialer_sends_the_identities_it_lists_and_links_under_one_of_them() {
     }
 }
 
-/// A row longer than a hello carries is never sent, because every acceptor
-/// would refuse the frame unread.
 #[compio::test]
-async fn dialer_sends_no_hello_for_a_row_past_the_identity_limit() {
-    let (listener, addr) = bind(loopback()).await.expect("bind");
-    let peer = compio::runtime::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept");
-        read_preamble(&mut stream, PREAMBLE_WAIT)
-            .await
-            .expect("read preamble");
-        framing::read_message(&mut stream, MAX_MESSAGE_SIZE).await
-    });
-    let releases: Vec<String> = (0..=MAX_COMPATIBLE_RELEASES)
-        .map(|patch| format!("0.8.{patch}"))
-        .collect();
-    let listed: Vec<&str> = releases.iter().map(String::as_str).collect();
+async fn dialer_rejects_a_challenge_with_a_body() {
+    let (listener, addr) = bind(loopback()).await.unwrap();
     let dialer = Rc::new(IggyMessageBus::new(0));
-    spawn_dialer_of_release(&dialer, None, addr, NEWER_RELEASE, &listed).await;
+    spawn_dialer(&dialer, None, addr).await;
+    let (mut stream, _) = listener.accept().await.unwrap();
+    read_preamble(&mut stream, PREAMBLE_WAIT).await.unwrap();
+    let hello = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+        .await
+        .unwrap();
+    assert_eq!(hello.header().command, Command::ReplicaHello);
+    let mut fields = [0; iggy_binary_protocol::RESERVED_COMMAND_LEN];
+    fields[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+        .copy_from_slice(&auth::read_identity(&hello.header().reserved_command));
+    let challenge = handshake_frame_with_body(Command::ReplicaChallenge, 1, fields);
+    framing::write_message(&mut stream, challenge)
+        .await
+        .unwrap();
 
-    let hello = peer.await.expect("peer task");
-
-    assert!(
-        matches!(hello, Err(IggyError::ConnectionClosed)),
-        "expected a close without a hello"
-    );
+    wait_until(
+        || dialer.take_replica_link_stats().handshake_failures > 0,
+        PREAMBLE_WAIT,
+    )
+    .await;
+    assert_handshake_closed(&mut stream).await;
     assert!(!dialer.replicas().contains(1));
-    dialer.shutdown(Duration::from_secs(2)).await;
+    dialer.shutdown(PREAMBLE_WAIT).await;
+}
+
+#[compio::test]
+async fn acceptor_rejects_an_authenticated_finish_with_a_body() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor(&acceptor, Some(ReplicaAuth::new(SECRET_A))).await;
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+    let nonce_d = auth::random_nonce().unwrap();
+    let hello = build_hello(CLUSTER, 0, Some(&nonce_d));
+    let hello_hash = blake3::hash(hello.as_slice());
+    framing::write_message(&mut stream, hello).await.unwrap();
+    let challenge = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+        .await
+        .unwrap();
+    let reserved = &challenge.header().reserved_command;
+    assert_eq!(auth::read_status(reserved), HandshakeStatus::Ok);
+    let transcript = auth::Transcript {
+        hello_hash,
+        binary_identity: auth::read_identity(reserved),
+        placement: PLACEMENT,
+        cluster_id: CLUSTER,
+        dialer_id: 0,
+        acceptor_id: 1,
+        nonce_d,
+        nonce_a: auth::read_nonce(reserved),
+        binding: auth::ChannelBinding::Plaintext,
+    };
+    let mut finish_fields = [0; iggy_binary_protocol::RESERVED_COMMAND_LEN];
+    finish_fields[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+        .copy_from_slice(&transcript.binary_identity);
+    finish_fields[auth::NONCE_LEN..auth::NONCE_LEN + auth::MAC_LEN]
+        .copy_from_slice(&ReplicaAuth::new(SECRET_A).dialer_mac(&transcript));
+    let finish = handshake_frame_with_body(Command::ReplicaFinish, 0, finish_fields);
+    framing::write_message(&mut stream, finish).await.unwrap();
+
+    assert_handshake_closed(&mut stream).await;
+    assert!(!acceptor.replicas().contains(0));
+    acceptor.shutdown(PREAMBLE_WAIT).await;
+}
+
+#[test]
+#[should_panic(expected = "release compatibility row exceeds the replica hello limit")]
+fn oversized_release_row_is_rejected_at_installation() {
+    let bus = IggyMessageBus::new(0);
+    set_replica_ctx_of_release(
+        &bus,
+        CLUSTER,
+        1,
+        2,
+        None,
+        None,
+        TestRelease {
+            release: NEWER_RELEASE,
+            compatible_with: &[OLDER_RELEASE; MAX_COMPATIBLE_RELEASES + 1],
+        },
+    );
 }
 
 /// A relay between two authenticated nodes drops one of the identities the
@@ -1065,16 +1133,6 @@ fn build_hello_of_release(
     hello
 }
 
-/// The build identity a handshake frame carries.
-fn identity_of(message: &Message<GenericHeader>) -> [u8; auth::IDENTITY_LEN] {
-    let mut identity = [0; auth::IDENTITY_LEN];
-    identity.copy_from_slice(
-        &message.header().reserved_command
-            [auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN],
-    );
-    identity
-}
-
 /// Build a raw frame with an arbitrary command for the wire-level tests (used to
 /// send a wrong-command third frame in place of a `ReplicaFinish`).
 #[allow(clippy::cast_possible_truncation)]
@@ -1085,6 +1143,35 @@ fn build_raw(cluster_id: u128, replica_id: u8, command: Command) -> Message<Gene
         h.replica = replica_id;
         h.size = HEADER_SIZE as u32;
     })
+}
+
+fn handshake_frame_with_body(
+    command: Command,
+    replica: u8,
+    reserved: [u8; iggy_binary_protocol::RESERVED_COMMAND_LEN],
+) -> Message<GenericHeader> {
+    let size = HEADER_SIZE + 32;
+    Message::<GenericHeader>::new(size).transmute_header(|_, header: &mut GenericHeader| {
+        header.command = command;
+        header.replica = replica;
+        header.cluster = CLUSTER;
+        header.size = u32::try_from(size).unwrap();
+        header.reserved_command = reserved;
+    })
+}
+
+#[allow(clippy::future_not_send)]
+async fn assert_handshake_closed(stream: &mut TcpStream) {
+    let response = compio::time::timeout(
+        PREAMBLE_WAIT,
+        framing::read_message(stream, MAX_MESSAGE_SIZE),
+    )
+    .await
+    .expect("peer closed before deadline");
+    assert!(matches!(
+        response,
+        Err(IggyError::ConnectionClosed | IggyError::TcpError)
+    ));
 }
 
 /// Let an in-flight (failing) handshake run to completion on loopback.

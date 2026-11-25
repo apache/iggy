@@ -120,13 +120,9 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
 
 /// Revision of what replicas send each other, which clients never see.
 ///
-/// Peers refuse each other at the replica handshake unless it matches, so bump
-/// it whenever a build stops decoding what another build sends. That includes
-/// the artifacts of state transfer: the metadata snapshot, the client table,
-/// the state manifest and the partition transfer formats. The release
-/// compatibility table can pair two releases only while this number is equal,
-/// so it is what keeps a pair with unreadable artifacts apart. Revision 1 adds
-/// partition member lists, partition status bodies on metadata probes and
+/// Bump this revision when replicas can no longer read each other's frames or state transfer artifacts, including metadata snapshots, client tables, state manifests and partition transfers. The same rule applies to incompatible changes to the HTTP relay between nodes or configuration defaults required for interoperability. If a shared setting supports both releases, pin it on every node before upgrading the first binary and switch to the new default only after the last node rejoins. For a metadata journal capacity increase, raise the backups first and the metadata primary last.
+///
+/// Revision 1 adds partition member lists, partition status bodies on metadata probes and
 /// replies, retirement debt on session finalization and the paid-through mark
 /// on session retirement. Revision 2 batches `Commit` and `CommitReply`
 /// frames, one entry per group. Revision 3 retires ended sessions in batches:

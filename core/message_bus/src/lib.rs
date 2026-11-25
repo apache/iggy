@@ -1026,8 +1026,12 @@ impl IggyMessageBus {
     ///
     /// # Panics
     ///
-    /// Panics if called more than once on the same bus.
+    /// Panics if the compiled release row exceeds the replica hello limit or the context was already installed.
     pub fn set_replica_handshake_ctx(&self, ctx: replica::handshake::ReplicaHandshakeCtx) {
+        assert!(
+            ctx.compatible_releases.len() <= replica::handshake::MAX_COMPATIBLE_RELEASES,
+            "release compatibility row exceeds the replica hello limit"
+        );
         assert!(
             self.replica_handshake_ctx.set(ctx).is_ok(),
             "replica_handshake_ctx installed twice (bootstrap invariant)"

@@ -127,7 +127,7 @@ Rules and caveats:
 - Matching sees the transport-level peer address, so clients behind a proxy or load balancer match the proxy's network, not their own.
 - Every `address` must be routable from inside its own `client_cidr`: leader-aware clients redial whatever address metadata advertises, and a selector pointing at an unreachable host strands them mid-redirect.
 - Prefer literal IPs over hostnames. SDKs differ in how they compare an advertised hostname against the address they dialed, and a mismatch costs a reconnect on every fresh connect.
-- Every node must run the same server version, or versions that the [release compatibility table](/docs/server/upgrading#release-compatibility) lists. Do not mix 0.9 and 0.10 nodes during an upgrade.
+- Every node must run the same server build, or stable releases that the [release compatibility table](/docs/server/upgrading#release-compatibility) lists. Do not mix 0.9 and 0.10 nodes during an upgrade.
 
 ## Authentication and TLS
 

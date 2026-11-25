@@ -43,6 +43,6 @@ HTTP can forward a request to the correct primary in one hop. It needs the clust
 
 ## Operate the cluster
 
-Every node must run the same server version, or versions that the [release compatibility table](/docs/server/upgrading#release-compatibility) lists, and the same `cluster.coordinator.replica_connections_per_peer`. There is no rolling upgrade between 0.9 and 0.10. The roster supports at most 32 nodes.
+Every node must run the same server build, or stable releases that the [release compatibility table](/docs/server/upgrading#release-compatibility) lists, and the same `cluster.coordinator.replica_connections_per_peer`. There is no rolling upgrade between 0.9 and 0.10. The roster supports at most 32 nodes.
 
 More replica connections per peer can spread replication traffic across shards. This does not change the replication factor or quorum. Retain separate data directories for nodes and advertise addresses reachable by clients.

@@ -18,6 +18,22 @@
 use super::*;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 
+#[test]
+fn partition_transfer_formats_match_replica_wire_revision() {
+    let mut snapshot = Vec::new();
+    StateMachineSnapshot::default().encode_into(&mut snapshot);
+    assert_eq!(
+        (
+            iggy_binary_protocol::REPLICA_WIRE_REVISION,
+            CONSUMER_OFFSETS_MAGIC,
+            CONSUMER_OFFSETS_VERSION_MIN,
+            CONSUMER_OFFSETS_VERSION,
+            &snapshot[..8]
+        ),
+        (5, *b"ICO1", 8, 9, b"IGGYSMS1".as_slice())
+    );
+}
+
 /// A producer entry with `(first_sequence, last_sequence, base_offset)`
 /// batches, oldest first.
 fn producer_entry(producer_id: u64, batches: &[(u32, u32, u64)]) -> (u64, ProducerEntry) {

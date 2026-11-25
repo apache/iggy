@@ -81,12 +81,11 @@ The preceding storage format, `IGGY-METADATA-CHANGE-LOG-2`, used replica wire re
 
 Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Replica wire revision 4 introduced its replicated registration and password-change requests. State transfer uses client table format `ICT6` and metadata snapshot format 21.
 
-Replica wire revision 5 lets a ReplicaHello carry the identities of the releases its sender lists as compatible, see [Upgrade recovery](#upgrade-recovery). It changes no storage format. Stop every node and start them all on the new build.
+When moving from a storage marker older than `IGGY-TIERED-SEGMENT-CHAIN-2`, start each replica with fresh storage. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. After upgrading from a build that predates the credential change, sign in again over HTTP or in the web UI.
 
-Every replica needs fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. Sign in again over HTTP or in the web UI to obtain an access token carrying the account revision.
+Replica wire revision 5 lets a ReplicaHello carry the identities of the releases its sender lists as compatible. To move from revision 4 to 5 on `IGGY-TIERED-SEGMENT-CHAIN-2`, stop every node, keep its data directory and restart all nodes on the new build. See [Upgrade recovery](#upgrade-recovery).
 
-No in-place upgrade, storage conversion tool or retained-data migration is
-provided. Use an offline cutover with logical re-ingestion:
+For an older storage marker, use an offline cutover with logical re-ingestion:
 
 1. Stop application writes, consumers that advance offsets, and administrative
    changes. While the old cluster is still readable, export the required messages

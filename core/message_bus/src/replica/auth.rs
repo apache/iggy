@@ -136,6 +136,13 @@ pub fn read_mac(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> [u8; MAC_LEN] 
     mac
 }
 
+#[must_use]
+pub fn read_identity(reserved_command: &[u8; RESERVED_COMMAND_LEN]) -> [u8; IDENTITY_LEN] {
+    let mut identity = [0; IDENTITY_LEN];
+    identity.copy_from_slice(&reserved_command[IDENTITY_OFFSET..IDENTITY_OFFSET + IDENTITY_LEN]);
+    identity
+}
+
 /// Whether a frame's `reserved_command` carries a handshake nonce (i.e. the
 /// peer speaks the authenticated protocol) versus an all-zero legacy frame.
 #[must_use]

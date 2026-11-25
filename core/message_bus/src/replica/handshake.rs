@@ -41,11 +41,7 @@
 //! no anti-Sybil guarantee. With auth disabled the `ReplicaHello` id is
 //! trusted unverified after the build-identity check.
 //!
-//! Enabling auth is a coordinated-restart change, and not the only one:
-//! the consensus `cluster_id` is derived from the cluster name
-//! unconditionally (`auth::cluster_domain_id`, was a constant), so a
-//! mixed-version roster fails to connect regardless of the auth setting.
-//! Flip every node in one restart.
+//! Enabling auth requires restarting every node together. The earlier change from a constant cluster ID to one derived from the cluster name also required a coordinated restart.
 //!
 //! Because the PSK gates membership and not identity, an on-wire
 //! attacker who learns the cluster id (auth off) OR an insider
@@ -59,9 +55,7 @@
 //!
 //! # Release compatibility
 //!
-//! A node links with a peer on its own release, and with a peer on another
-//! release when the release compatibility table of either one lists the
-//! other. Each node hashes one identity per release its row lists
+//! A node accepts its own build identity. Across stable releases, the table of either node can list the other release if the client protocol, replica wire revision and storage marker match. Each node hashes one identity per release its row lists
 //! ([`CompatibleRelease`]). A hello carries the identity of the dialer in
 //! its header and the listed identities as its body. The acceptor picks the
 //! identity the link runs under, which is that of the listed release, and
@@ -92,7 +86,7 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Most identities a hello body carries. An acceptor reads a hello before it
-/// authenticates the dialer, so this bounds that read at 4 KiB of body.
+/// authenticates the dialer, so this bounds that read at 4 KiB of body. Changing the limit requires a replica wire revision bump.
 pub const MAX_COMPATIBLE_RELEASES: usize = 128;
 
 /// Identity and auth parameters the owning shard needs to run a
@@ -134,7 +128,7 @@ impl ReplicaHandshakeCtx {
         if !rest.is_empty() {
             return None;
         }
-        let dialer_identity = identity_of(hello);
+        let dialer_identity = auth::read_identity(&hello.header().reserved_command);
         if dialer_identity == self.binary_identity || self.listed(&dialer_identity).is_some() {
             return Some(dialer_identity);
         }
@@ -150,7 +144,7 @@ impl ReplicaHandshakeCtx {
         &self,
         challenge: &Message<GenericHeader>,
     ) -> Option<[u8; auth::IDENTITY_LEN]> {
-        let link_identity = identity_of(challenge);
+        let link_identity = auth::read_identity(&challenge.header().reserved_command);
         (link_identity == self.binary_identity || self.listed(&link_identity).is_some())
             .then_some(link_identity)
     }
@@ -250,8 +244,7 @@ pub struct ReplicaTlsCtx {
 ///
 /// Command, cluster, build-identity, direction and placement rejections
 /// send a nonzero-status `ReplicaChallenge`, including when auth is
-/// disabled. Missing-nonce and post-challenge failures close without a
-/// response.
+/// disabled. Oversized hellos, missing nonces and post-challenge failures close without a response.
 ///
 /// # Errors
 ///
@@ -299,7 +292,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
         )
         .await;
     }
-    let hello_identity = identity_of(&msg);
+    let hello_identity = auth::read_identity(&msg.header().reserved_command);
     let Some(link_identity) = ctx.link_identity_of_hello(&msg) else {
         return reject(
             stream,
@@ -444,7 +437,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     if finish.header().command != Command::ReplicaFinish
         || finish.header().cluster != our_cluster
         || finish.header().replica != peer_id
-        || identity_of(&finish) != link_identity
+        || auth::read_identity(&finish.header().reserved_command) != link_identity
     {
         return reject(
             stream,
@@ -515,13 +508,6 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
             return Err(());
         }
     };
-    if ctx.compatible_releases.len() > MAX_COMPATIBLE_RELEASES {
-        warn!(
-            replica = peer_id,
-            "release compatibility row exceeds the replica hello limit"
-        );
-        return Err(());
-    }
     let hello = with_timings(
         with_identity(
             build_hello_message(
@@ -766,16 +752,6 @@ fn with_identity(
         new.reserved_command[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
             .copy_from_slice(identity);
     })
-}
-
-/// The build identity a handshake frame carries.
-fn identity_of(message: &Message<GenericHeader>) -> [u8; auth::IDENTITY_LEN] {
-    let mut identity = [0; auth::IDENTITY_LEN];
-    identity.copy_from_slice(
-        &message.header().reserved_command
-            [auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN],
-    );
-    identity
 }
 
 /// Protocol, replica wire, release and storage identity, independent of

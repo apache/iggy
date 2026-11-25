@@ -101,7 +101,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
+pub(crate) const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -612,11 +612,14 @@ async fn shard_main(
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
     let compatible_releases = RELEASE_COMPATIBILITY.compatible_with(crate::VERSION);
-    if shard_id == 0 && !compatible_releases.is_empty() {
+    if shard_id == 0 {
         info!(
             release = crate::VERSION,
+            client_protocol = %iggy_binary_protocol::ProtocolVersion(iggy_binary_protocol::IGGY_PROTOCOL_VERSION),
+            replica_wire_revision = iggy_binary_protocol::REPLICA_WIRE_REVISION,
+            storage_format = %String::from_utf8_lossy(STORAGE_FORMAT).trim_end(),
             ?compatible_releases,
-            "this release links with replicas on the releases it lists as compatible"
+            "replica handshake identity"
         );
     }
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {

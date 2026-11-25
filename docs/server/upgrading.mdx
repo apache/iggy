@@ -46,17 +46,17 @@ Encryption is selected when a stream is created. Each encrypted stream has its o
 
 ## Edge builds after 0.10.0
 
-Server 0.10.1-edge.2 changes the replica wire revision and the storage marker. Start every node with a fresh, empty data directory and upgrade all nodes together, as for 0.10.0. Access tokens issued by an earlier build are refused, so HTTP clients and the web UI sign in again.
+The replica wire revision 4 build of server 0.10.1-edge.2 introduced the current storage marker. When moving from an older marker, start every node with a fresh, empty data directory and upgrade all nodes together, as for 0.10.0. Access tokens issued before the credential change are refused, so HTTP clients and the web UI sign in again.
 
-A later 0.10.1-edge.2 build raises the replica wire revision again and keeps the storage marker. Stop every node and start them all on the new build. The data directories stay.
+That build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
 
-The build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
+Later builds with the same 0.10.1-edge.2 version use replica wire revision 5. To move from revision 4 to 5, stop every node, keep its existing data directory and restart the cluster on the new build.
 
 ## Release compatibility
 
-A cluster node links with a peer that runs its own server version. It also links with a peer on another version when the release compatibility table of either server lists the other version. The table is compiled into the server, and a version is matched by its exact string. A version that no pair names, such as a custom build under its own version, links only with itself. A node that refuses a peer logs the reason `incompatible_build`.
+Run the same server build on every node unless one stable release explicitly lists the other in its compiled compatibility table. The table currently lists no pairs. Edge builds can have the same version string and different replica wire revisions. An identity mismatch produces `incompatible_build`. The startup log reports the server version, client protocol, replica wire revision and storage marker.
 
-No version is listed yet, so every cluster node must run the same server version. Once a release lists an earlier one, the nodes of a cluster can be replaced one at a time between those two versions. A listed version still needs the same client protocol, replica wire revision and storage marker as the server that lists it.
+For a listed pair, verify that the client protocol, replica wire revision and storage marker match. If a peer-dependent default changes, explicitly configure a value supported by both releases on every node before replacing the first binary. Replace one node, confirm it has reconnected to its peers and caught up, and only then replace the next. Apply the new default after every node has rejoined. For a larger `metadata.journal_slots` value, increase it on the backups one at a time, then on the metadata primary.
 
 ## Check the cutover
 
