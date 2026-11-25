@@ -164,6 +164,42 @@ Always await `consumer.shutdown()` before dropping it. Shutdown flushes automati
 
 An uncertain committing read can require `abandon_operation` before seeking. Abandon does not undo a store. The [source consumer example](https://github.com/apache/iggy/blob/server-0.10.0/examples/rust/src/new-sdk/consumer/main.rs) shows explicit recovery choices.
 
+### Geo topics and their shadow topics
+
+A geo topic exists in each datacenter under the same stream and topic name. The messages written in another datacenter are in a read-only shadow topic of the same name, such as `payments` in the stream `__shadow_dc-b_orders`. `with_shadows()` turns a consumer group into one consumer over the topic in this cluster and each of its shadow topics:
+
+```rust
+let mut consumer = client
+    .consumer_group("billing", "orders", "payments")?
+    .poll_options(PollOptions {
+        commit: CommitPolicy::Manual,
+        ..PollOptions::wait(IggyDuration::ONE_SECOND)
+    })
+    .with_shadows()
+    .sources(GeoSources::Both)
+    .build();
+consumer.init().await?;
+
+while let Some(received) = consumer.next().await {
+    let received = received?;
+    match received.origin.name() {
+        Some(origin) => println!("from {origin}: {:?}", received.message.payload),
+        None => println!("from this datacenter: {:?}", received.message.payload),
+    }
+    consumer.commit(received.checkpoint()).await?;
+}
+consumer.shutdown().await?;
+```
+
+| Method | Default | Behavior |
+| --- | --- | --- |
+| `sources(...)` | `GeoSources::Both` | Read the topic in this cluster, its shadow topics, or both |
+| `discovery_interval(...)` | Five seconds | How often the consumer lists the streams for shadow topics that appeared or went away |
+
+The options set before `with_shadows()` apply to the consumer of each topic. Each topic is an ordinary group of the same name, with its own offsets and its own partition assignment. `commit(checkpoint)` stores the checkpoint in the topic that yielded it. Order holds within one origin and partition only, and shadow messages arrive seconds after local ones. A topic without messages does not hold back the others.
+
+A message carries `origin`: the `shadow_origin` of its shadow stream, or no name for the topic in this cluster. A read error is a `GeoReadError` that names the origin and the stream of the topic. Pass its origin to `seek(origin, partition_id, strategy)` to move a stopped partition. The consumer finds only the shadow streams the user may read, and reports a shadow topic it cannot open once. Only a consumer group can read shadow topics this way. See [Geo topics](https://github.com/apache/iggy/blob/master/core/server/docs/GEO_TOPICS.md#consumers) for how positions move between datacenters.
+
 ## Idempotent producer
 
 An idempotent producer prevents duplicate appends when the same producer batch is retried. Enable it with `.idempotent()` before `build()` and call `init()` to obtain a producer ID. The default is disabled, and this mode requires a binary transport.

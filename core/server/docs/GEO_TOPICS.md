@@ -120,6 +120,7 @@ shadow topic. A message becomes readable in another datacenter once its origin p
 | Recover the geo topics of a cluster that lost every disk, from its bucket     | Yes             |
 | Consumer positions that move between datacenters                              | Yes             |
 | Positions of plain consumers, and of Kafka groups through the Kafka gateway   | Yes             |
+| One consumer group over a topic and its shadow topics, in the Rust SDK        | Yes             |
 | The `geo_tiered` mode, and a switch between modes                             | No              |
 | Geo topics in encrypted streams                                               | No              |
 | Create, produce to or read geo topics through the Kafka gateway               | No              |
@@ -581,6 +582,42 @@ is not in the shadow topic: see [Delays](#delays). Every node of the cluster ser
 messages of a shadow partition, also after a restart. A consumer whose stored position is ahead
 of what the shadow partition serves waits until it gets there; its position is never moved back.
 
+The Rust SDK reads the topic and its shadow topics as one consumer. Add `with_shadows()` to the
+builder of a consumer group:
+
+```rust
+let mut consumer = client
+    .consumer_group("billing", "orders", "payments")?
+    .with_shadows()
+    .build();
+consumer.init().await?;
+while let Some(received) = consumer.next().await {
+    let received = received?;
+    // received.origin tells where the message was written.
+    consumer.commit(received.checkpoint()).await?;
+}
+consumer.shutdown().await?;
+```
+
+- The consumer reads `orders/payments` and the topic `payments` of each shadow stream of
+  `orders`, such as `__shadow_dc-b_orders`. It finds them by `shadow_origin` and by name. It lists
+  the streams again every `discovery_interval`, 5 seconds by default, so it starts to read a
+  shadow topic that appears later without a restart, and stops reading one that is gone, such as
+  the shadow of a retired origin.
+- Each message tells where it was written: in the origin that the `shadow_origin` of its shadow
+  stream names, or in this datacenter. A client cannot read the origin of the cluster it is
+  connected to, so a message of the topic in this cluster is marked local, with no origin name.
+- Order holds within one origin and partition only. Nothing orders the messages of two origins.
+- Messages of a shadow topic arrive seconds after those of the topic in this cluster, see
+  [Delays](#delays). A topic that is slow or has no messages does not hold back the others.
+- `sources` chooses the topics: `GeoSources::Both`, the default, `GeoSources::LocalOnly` or
+  `GeoSources::ShadowsOnly`.
+- The consumer finds only the shadow streams that the user may read, because a list of the streams
+  holds no other stream. A shadow topic that the consumer cannot open is reported once, and the
+  other topics are read on.
+
+The other SDKs read the topic and each shadow topic with a consumer of their own.
+
 ### Consumer groups and positions
 
 - The topic and each shadow topic are separate topics, so a consumer group keeps one position per
@@ -625,6 +662,12 @@ of what the shadow partition serves waits until it gets there; its position is n
   from coming back from the other clusters. The other clusters keep their groups of that name.
 - Membership, generations and partition assignments do not move. Consumers join and rebalance in
   the cluster they connect to.
+- A consumer that reads the topic with its shadow topics joins an ordinary group of its name on
+  each topic. Each topic keeps its own positions, which move between the datacenters as above,
+  and the consumer commits each message to the topic it came from. A group that moves to another
+  datacenter resumes each log from its own position there.
+- Each topic balances its partitions among the members of its group on its own. A member can hold
+  partitions of the topic and of shadow topics at once, and two members can hold different totals.
 - Grant read permissions on each shadow stream as on any other stream.
 
 ### Plain consumers and Kafka groups
@@ -1215,5 +1258,8 @@ object is deleted, and 1 hour before an unlisted long-term object is deleted.
   remove long-term segments. Only retention and a delete of the topic do.
 - **65,536 long-term segments per partition.** Merges keep the count down. A full log takes no new
   segment until merges or retention free room.
-- **No consumer that reads a topic with its shadow topics.** A consumer reads the topic and each
-  shadow topic separately. Stream reads mark a shadow stream with `shadow_origin`.
+- **Only the Rust SDK reads a topic with its shadow topics as one consumer.** In the other SDKs a
+  consumer reads the topic and each shadow topic separately. Stream reads mark a shadow stream
+  with `shadow_origin`.
+- **No origin name for the topic in this cluster.** A client cannot read the origin of the
+  cluster it is connected to, so the Rust consumer labels those messages as local only.

@@ -34,6 +34,10 @@ pub use crate::clients::client::IggyClient;
 pub use crate::clients::client_builder::IggyClientBuilder;
 pub use crate::clients::consumer::{IggyConsumer, IggyConsumerState, ReceivedMessage};
 pub use crate::clients::consumer_builder::IggyConsumerBuilder;
+pub use crate::clients::geo_consumer::{
+    GeoOrigin, GeoReadError, GeoReceivedMessage, GeoSources, IggyGeoConsumer,
+};
+pub use crate::clients::geo_consumer_builder::IggyGeoConsumerBuilder;
 pub use crate::clients::producer::IggyProducer;
 pub use crate::clients::producer_builder::IggyProducerBuilder;
 pub use crate::clients::producer_config::{BackgroundConfig, DirectConfig};

@@ -427,6 +427,11 @@ impl IggyConsumer {
         self.state.progress.count(checkpoint, 1, ends_batch);
     }
 
+    /// The id of the reader whose stamp the checkpoints of this consumer carry.
+    pub(crate) fn reader_id(&self) -> u64 {
+        self.state.progress.reader()
+    }
+
     /// Whether the client is up or comes back without the caller.
     pub(crate) async fn client_can_recover(&self) -> bool {
         self.client.read().await.can_recover().await
@@ -924,6 +929,21 @@ impl ReceivedMessage {
             checkpoint,
         }
     }
+
+    /// A message that the reader of the stamp of `checkpoint` yielded.
+    #[cfg(test)]
+    pub(crate) fn yielded(
+        message: IggyMessage,
+        current_offset: u64,
+        checkpoint: Checkpoint,
+    ) -> Self {
+        Self {
+            message,
+            current_offset,
+            partition_id: checkpoint.partition_id(),
+            checkpoint,
+        }
+    }
 }
 
 /// Yields messages one at a time, from the current batch first and from the reader once it is
@@ -1022,7 +1042,7 @@ impl IggyConsumer {
 
     /// Under `CommitAfter::Processing`, the message that the stream yielded last counts once the
     /// stream is polled again or shuts down.
-    fn count_uncounted(&mut self) {
+    pub(crate) fn count_uncounted(&mut self) {
         if let Some((checkpoint, ends_batch)) = self.uncounted.take() {
             self.count(checkpoint, ends_batch);
         }
