@@ -35,7 +35,7 @@
 //! sent them (G1), each is still in its origin's bucket (G8), and each
 //! shadow serves its origin's whole log within a bound of steps once the
 //! faults healed (G6). Every step of the run, the steps of its reads
-//! included, goes through [`Run::tick`], so each check sees each step and the
+//! included, goes through `Run::tick`, so each check sees each step and the
 //! bound counts every one.
 
 use std::collections::btree_map::Entry;
