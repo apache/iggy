@@ -53,6 +53,7 @@ public class IggyConsumer<T> : IggyConsumer
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages</param>
     /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
+    /// <exception cref="InvalidOperationException">Another receive or handler loop is active.</exception>
     public async IAsyncEnumerable<ReceivedMessage<T>> ReceiveDeserializedAsync(
         [EnumeratorCancellation] CancellationToken ct = default)
     {
