@@ -412,6 +412,12 @@ impl FreshWrites {
         objects
     }
 
+    /// The objects that hold the messages of a send that is not answered,
+    /// as the shard keeps them from here on: none while no send waits.
+    pub(crate) fn unanswered_sends(&self) -> Rc<RefCell<BTreeMap<u128, usize>>> {
+        Rc::clone(&self.awaited)
+    }
+
     /// Keep `send` at the end of the queue of `namespace`, its bytes in the
     /// share of its partition, and its object among the awaited ones.
     fn stage_send(&self, namespace: IggyNamespace, send: StagedSend) {

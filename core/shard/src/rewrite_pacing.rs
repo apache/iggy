@@ -43,9 +43,9 @@
 //! Every decision takes the time it is made at, so nothing here reads a
 //! clock.
 
-use partitions::{PlannedSegment, RewriteError};
+use partitions::{PlannedSegment, RewriteBudget, RewriteError};
 use server_common::sharding::IggyNamespace;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -194,6 +194,14 @@ pub struct RewritePacing {
     /// Whether the shard has yet to look over all its partitions for the
     /// ones to pace. A partition that sleeps is not looked at otherwise.
     sweep_wanted: bool,
+    /// Whether a partition the shard leads was past the backlog limit at
+    /// the last tick.
+    behind: Rc<Cell<bool>>,
+    /// Whether the store the rewrites read is on this node.
+    store_on_node: bool,
+    /// The share of the shard's time that its rewrites keep to, once the
+    /// first of them asked for it.
+    budget: Option<Rc<RewriteBudget>>,
 }
 
 impl Default for RewritePacing {
@@ -205,6 +213,9 @@ impl Default for RewritePacing {
             backlog_counts: Rc::default(),
             plans: Rc::default(),
             sweep_wanted: false,
+            behind: Rc::default(),
+            store_on_node: false,
+            budget: None,
         }
     }
 }
@@ -392,6 +403,35 @@ impl RewritePacing {
     #[must_use]
     pub const fn backlog_limit(&self) -> u64 {
         self.backlog_limit
+    }
+
+    /// Note whether a partition the shard leads is past the backlog limit.
+    pub fn set_behind(&self, behind: bool) {
+        self.behind.set(behind);
+    }
+
+    /// Whether a partition the shard leads was past the backlog limit at
+    /// the last tick, for the rewrites the shard runs.
+    #[must_use]
+    pub fn behind(&self) -> Rc<Cell<bool>> {
+        Rc::clone(&self.behind)
+    }
+
+    /// Note whether the store the rewrites read is on this node. A rewrite
+    /// started after this keeps to a budget that knows it.
+    pub fn set_store_on_node(&mut self, on_node: bool) {
+        self.store_on_node = on_node;
+        self.budget = None;
+    }
+
+    /// The budget of the shard's rewrites, which `start` makes the first
+    /// time, from whether the store is on this node.
+    pub fn budget(&mut self, start: impl FnOnce(bool) -> RewriteBudget) -> Rc<RewriteBudget> {
+        let store_on_node = self.store_on_node;
+        Rc::clone(
+            self.budget
+                .get_or_insert_with(|| Rc::new(start(store_on_node))),
+        )
     }
 
     /// Where a walk of a partition's log leaves its count, from a task

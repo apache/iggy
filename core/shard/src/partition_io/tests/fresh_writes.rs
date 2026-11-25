@@ -4796,6 +4796,28 @@ async fn given_a_backlog_past_the_limit_when_sends_arrive_should_delay_the_sends
     );
 }
 
+/// While a partition is past its limit, its sends wait for the rewrites
+/// and not behind them, so the rewrites of the shard stop keeping to their
+/// share of its time. Back under the limit, they keep to it again.
+#[compio::test]
+async fn given_a_backlog_past_the_limit_when_the_tick_runs_should_let_the_rewrites_run_flat_out() {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(backlog_owner(directory.path(), 1)).await;
+    let behind = owner.rewrite_pacing.borrow().behind();
+
+    pumped(&owner, async {
+        let backlog = commit_and_count_a_backlog(&owner).await;
+        until(&owner, |owner| {
+            owner.metrics().long_term_backlog_value().0 == i64::try_from(backlog).unwrap()
+        })
+        .await;
+        assert!(behind.get(), "past the limit");
+        owner.set_long_term_backlog_limit(0);
+        until(&owner, |_| !behind.get()).await;
+    })
+    .await;
+}
+
 /// An operator sees which partition lags: the shard leaves the messages and
 /// the bytes each placing partition it leads has yet to rewrite where a
 /// scrape reads them. A partition whose rewrites keep up reports zero.

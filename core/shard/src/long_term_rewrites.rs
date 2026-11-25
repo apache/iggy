@@ -52,6 +52,12 @@
 //! or an install, also starts a walk of its log that counts it, in a
 //! detached task whose count the tick hands back. The pass of a partition
 //! past its backlog limit does not wait out its interval.
+//!
+//! The rewrites of a shard keep to one share of its time while sends to the
+//! shard are not answered yet, see [`partitions::RewriteShare`], on the
+//! clock and the timer of the shard's bus. While a partition the shard
+//! leads is past its backlog limit, its sends wait for the rewrites and not
+//! behind them, so the rewrites run flat out.
 
 use crate::metrics::LongTermLag;
 use crate::rewrite_pacing::{BacklogCount, FinishedPlan, RewriteKey, RewriteResult};
@@ -60,15 +66,22 @@ use crate::{
     FinishedSegmentRewrite, IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channel,
 };
 use consensus::PartitionsHandle;
+use futures::FutureExt;
+use futures::future::LocalBoxFuture;
 use iggy_binary_protocol::PrepareHeader;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::ManifestSegment;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::{IggyPartition, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteStart};
+use partitions::{
+    IggyPartition, LONG_TERM_SEGMENT_BYTES, LongTermWriter, RewriteBudget, RewriteClock,
+    RewriteStart,
+};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -136,6 +149,12 @@ where
         self.rewrite_pacing.borrow_mut().set_backlog_limit(bytes);
     }
 
+    /// Note whether the store that this shard's rewrites read is on this
+    /// node, so that its reads take this node's cores, as a filesystem does.
+    pub fn set_rewrite_store_on_node(&self, on_node: bool) {
+        self.rewrite_pacing.borrow_mut().set_store_on_node(on_node);
+    }
+
     /// Set the longest wait between two rewrites of a partition this shard
     /// leads, which a partition with little load waits. A wait below
     /// [`crate::rewrite_pacing::REWRITE_INTERVAL_MIN`] counts as it.
@@ -162,6 +181,7 @@ where
     #[allow(clippy::future_not_send)]
     pub(crate) async fn on_rewrite_segments(&self, namespace: IggyNamespace, created_revision: u64)
     where
+        B: Clone,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -229,6 +249,7 @@ where
     #[allow(clippy::future_not_send)]
     pub(crate) async fn tick_long_term_rewrites(&self)
     where
+        B: Clone,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -321,6 +342,7 @@ where
         let now = self.bus.monotonic_micros();
         let due = {
             let mut pacing = self.rewrite_pacing.borrow_mut();
+            pacing.set_behind(!past_limit.is_empty());
             for key in &past_limit {
                 pacing.hurry(key, now);
             }
@@ -340,6 +362,7 @@ where
     #[allow(clippy::future_not_send)]
     async fn run_rewrite_pass(&self, namespace: IggyNamespace, created_revision: u64)
     where
+        B: Clone,
         MJ: JournalHandle,
         <MJ as JournalHandle>::Target:
             Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
@@ -432,6 +455,7 @@ where
             }
             Ok(Some(RewriteStart::Rewrite(id, rewrite, scope))) => (id, rewrite, scope),
         };
+        let rewrite = rewrite.paced_by(self.rewrite_budget());
         let undelivered = Rc::clone(&self.undelivered_segment_rewrites);
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
@@ -454,6 +478,23 @@ where
                 undelivered.borrow_mut().push(*finished);
             }
         });
+    }
+
+    /// The share of this shard's time that its rewrites keep to.
+    fn rewrite_budget(&self) -> Rc<RewriteBudget>
+    where
+        B: Clone,
+    {
+        let mut pacing = self.rewrite_pacing.borrow_mut();
+        let behind = pacing.behind();
+        pacing.budget(|store_on_node| {
+            let clock = ShardRewriteClock {
+                bus: self.bus.clone(),
+                unanswered: self.fresh_writes.unanswered_sends(),
+                behind,
+            };
+            RewriteBudget::new(Rc::new(clock), store_on_node)
+        })
     }
 
     /// The longest wait between two rewrites that the topic of `namespace`
@@ -592,5 +633,56 @@ where
         let (reply, _unread) = channel(1);
         self.dispatch_partition_submit(request, reply, None, None)
             .await;
+    }
+}
+
+/// The clock and the timer of a shard's bus, and whether sends to the shard
+/// wait, for its rewrites.
+struct ShardRewriteClock<B> {
+    bus: B,
+    /// The objects that hold the messages of the shard's sends that are not
+    /// answered yet.
+    unanswered: Rc<RefCell<BTreeMap<u128, usize>>>,
+    /// Whether a partition the shard leads is past its backlog limit.
+    behind: Rc<Cell<bool>>,
+}
+
+impl<B> RewriteClock for ShardRewriteClock<B>
+where
+    B: MessageBus + Clone + 'static,
+{
+    fn now_micros(&self) -> u64 {
+        self.bus.monotonic_micros()
+    }
+
+    fn sleep(&self, duration: Duration) -> LocalBoxFuture<'static, ()> {
+        let bus = self.bus.clone();
+        async move { bus.sleep(duration).await }.boxed_local()
+    }
+
+    fn sends_waiting(&self) -> bool {
+        !self.behind.get() && !self.unanswered.borrow().is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use message_bus::IggyMessageBus;
+
+    #[compio::test]
+    async fn given_unanswered_sends_when_asked_should_say_they_wait_unless_a_partition_is_behind() {
+        let clock = ShardRewriteClock {
+            bus: Rc::new(IggyMessageBus::new(0)),
+            unanswered: Rc::default(),
+            behind: Rc::default(),
+        };
+        assert!(!clock.sends_waiting(), "no send");
+
+        clock.unanswered.borrow_mut().insert(7, 1);
+        assert!(clock.sends_waiting());
+
+        clock.behind.set(true);
+        assert!(!clock.sends_waiting(), "the sends wait for the rewrites");
     }
 }

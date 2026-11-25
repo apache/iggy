@@ -54,8 +54,10 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
 use crate::remote_blocks::{
-    PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks, RemoteReadMetrics, StoreSlot,
+    FreshOrigin, PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks,
+    RemoteReadMetrics, StoreSlot,
 };
+use crate::rewrite_share::RewriteShare;
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -361,10 +363,17 @@ impl RemoteSegments {
 
     /// Keep the end of the long-term segment that a rewrite just stored, its
     /// `.log` bytes `log` read by `segment`, and its `index`, when the cache
-    /// keeps what reads fetch.
-    pub(crate) fn carry_long_term(&self, segment: &RemoteRange, log: &[u8], index: &[u8]) {
+    /// keeps what reads fetch. The copies count against the rewrite's
+    /// `share`.
+    pub(crate) async fn carry_long_term(
+        &self,
+        segment: &RemoteRange,
+        log: &[u8],
+        index: &[u8],
+        share: &mut RewriteShare,
+    ) {
         if let Some(blocks) = self.fetched_into_cache() {
-            blocks.carry_segment(segment, log, index);
+            blocks.carry_segment(segment, log, index, share).await;
         }
     }
 
@@ -436,9 +445,14 @@ impl RemoteSegments {
     }
 
     /// `range` of the fresh object `object_id` when this shard holds it in
-    /// memory, not counted as a read of it: a rewrite reads each blob once,
-    /// and what it read is in its long-term segment from then on.
-    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+    /// memory, and where those bytes came from, not counted as a read of
+    /// it: a rewrite reads each blob once, and what it read is in its
+    /// long-term segment from then on.
+    pub(crate) fn cached_fresh(
+        &self,
+        object_id: u128,
+        range: &Range<u64>,
+    ) -> Option<(Bytes, FreshOrigin)> {
         self.blocks.as_ref()?.peek_fresh(object_id, range)
     }
 

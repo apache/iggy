@@ -139,6 +139,10 @@ pub use long_term_rewrite::{
     BacklogWalk, ExecutorLongTermWriter, LONG_TERM_SEGMENT_BYTES, LongTermWriter, PlannedSegment,
     RewriteError, RewriteOutcome, RewriteStart, SegmentPlan, SegmentRewrite,
 };
+mod rewrite_share;
+pub use rewrite_share::{
+    REWRITE_SHARE_PERMILLE, REWRITE_SHARE_WINDOW, RewriteBudget, RewriteClock, RewriteShare,
+};
 pub use topic_object::{
     ExecutorTopicObjects, TOPIC_OBJECT_RETRY, TopicObjectOutcome, TopicObjects, delete_topic,
     list_topic_keys,
