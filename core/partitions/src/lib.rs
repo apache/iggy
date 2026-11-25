@@ -111,8 +111,8 @@ pub use proven_batch::{ProvenBatch, ProvenBatchError};
 mod topic_object;
 pub use segment_chain::object_prefix;
 pub use segment_upload::{
-    ExecutorUploader, SegmentUpload, SegmentUploadAttempt, SegmentUploader, StartedSegmentUpload,
-    UploadError, UploadOutcome, upload_segment,
+    ExecutorUploader, MEMORY_PIECE_LEN, SegmentUpload, SegmentUploadAttempt, SegmentUploader,
+    StartedSegmentUpload, UploadError, UploadOutcome, memory_body, upload_segment,
 };
 mod segment_verify;
 pub use segment_verify::{

@@ -46,7 +46,9 @@ use partitions::{
     ExecutorStoreViewReader, ExecutorTopicObjects, ExecutorUploader, ReadCache, ReadCacheSettings,
     RemoteSegments,
 };
-use shard::tier_service::{ClassLimits, StoreCallPolicy, TierService, TierServiceConfig};
+use shard::tier_service::{
+    ClassLimits, SecondAttempts, StoreCallPolicy, StoreWriter, TierService, TierServiceConfig,
+};
 use shard::{Sender, channel};
 use tracing::{info, warn};
 
@@ -267,7 +269,13 @@ pub fn start(
     // `preflight` and `probe` refused the boot already when these fail.
     let backend = store(config, node_store).ok().flatten()?;
     let layout = layout(config).ok()?;
-    let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
+    let writer = StoreWriter {
+        replica: replica_id,
+        shard: shard.id,
+        counters: shard.metrics().tier_store_counters(),
+    };
+    let service =
+        TierService::with_writer(backend, Rc::clone(bus), &service_config(config), writer);
     shard.set_fresh_upload_pace(
         config.fresh_upload_interval.get_duration(),
         usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
@@ -367,6 +375,13 @@ pub fn service_config(config: &TieredStorageConfig) -> TierServiceConfig {
             max_attempts: config.max_attempts,
             retry_delay: config.retry_delay.get_duration(),
             max_retry_delay: config.max_retry_delay.get_duration(),
+            attempt_stall_timeout: config.put_attempt_stall_timeout.get_duration(),
+            attempt_answer_timeout: config.put_attempt_answer_timeout.get_duration(),
+            second_attempts: SecondAttempts {
+                after: config.second_attempt_after.get_duration(),
+                after_per_mib: config.second_attempt_after_per_mib.get_duration(),
+                slots: usize::try_from(jobs.second_attempts).unwrap_or(usize::MAX),
+            },
         },
     }
 }

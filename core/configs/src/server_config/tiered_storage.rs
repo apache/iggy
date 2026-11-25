@@ -44,9 +44,18 @@ use std::time::Duration;
 /// a deadline.
 const TIMEOUT_BOUNDS: RangeInclusive<Duration> = Duration::from_secs(1)..=Duration::from_hours(1);
 
-/// Bounds of `retry_delay` and `max_retry_delay`.
+/// Bounds of `retry_delay` and `max_retry_delay`, and of
+/// `second_attempt_after` when it is on.
 const RETRY_DELAY_BOUNDS: RangeInclusive<Duration> =
     Duration::from_millis(1)..=Duration::from_hours(1);
+
+/// Bounds of `put_attempt_stall_timeout` and `put_attempt_answer_timeout`.
+/// An attempt is sent again, so it can be cut sooner than a call that is not.
+const ATTEMPT_TIMEOUT_BOUNDS: RangeInclusive<Duration> =
+    Duration::from_millis(100)..=Duration::from_hours(1);
+
+/// The most that `second_attempt_after_per_mib` adds for each MiB.
+const SECOND_ATTEMPT_PER_MIB_MAX: Duration = Duration::from_hours(1);
 
 /// The JSON API of Google Cloud Storage, which an empty `gcs.endpoint`
 /// names.
@@ -264,15 +273,19 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_request_timeout")]
     #[config_env(leaf)]
     pub request_timeout: IggyDuration,
-    /// The longest a put waits for the store to take the next piece of its
-    /// body, or to answer after the last piece. A put has no total deadline.
-    /// From 1 s to 1 h.
+    /// The longest a put whose body streams from a file waits for the store
+    /// to take the next piece of its body, or to answer after the last piece.
+    /// Such a put has no total deadline and is sent once. Each attempt at an
+    /// overwrite whose body the node holds in memory, such as a manifest,
+    /// waits the same. From 1 s to 1 h.
     #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_progress_timeout")]
     #[config_env(leaf)]
     pub progress_timeout: IggyDuration,
-    /// The most attempts at a store call other than a put that keeps failing
-    /// with a transient error, the first one included.
+    /// The most attempts at a store call that keeps failing with a transient
+    /// error, the first one included: a head, a get, a listing, a delete, and
+    /// a put whose body the node holds in memory, such as a fresh object or a
+    /// long-term segment. A put whose body streams from a file is sent once.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
     /// The wait before the first retry, doubled for each retry after it.
@@ -286,6 +299,36 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_max_retry_delay")]
     #[config_env(leaf)]
     pub max_retry_delay: IggyDuration,
+    /// The longest an attempt at a create-only put whose body the node holds
+    /// in memory, such as a fresh object or a long-term segment, waits for
+    /// the store to take the next piece of the body. The attempt is then
+    /// given up and the put sent again, within `max_attempts`. An overwrite
+    /// waits `progress_timeout` instead, because an attempt cut early can
+    /// land after a later put of other bytes. From 100 ms to 1 h.
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_put_attempt_stall_timeout")]
+    #[config_env(leaf)]
+    pub put_attempt_stall_timeout: IggyDuration,
+    /// The longest such an attempt waits for the answer after the last piece
+    /// of the body, before it is given up the same way. From 100 ms to 1 h.
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_put_attempt_answer_timeout")]
+    #[config_env(leaf)]
+    pub put_attempt_answer_timeout: IggyDuration,
+    /// How long a create-only put whose body the node holds in memory runs
+    /// before a second attempt starts beside it on another connection, for
+    /// an empty body. The first attempt to store the object wins, and the
+    /// other is dropped. Zero or `disabled` sends no second attempt.
+    /// Otherwise from 1 ms to 1 h.
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_second_attempt_after")]
+    #[config_env(leaf)]
+    pub second_attempt_after: IggyDuration,
+    /// What each MiB of the body adds to `second_attempt_after`. Up to 1 h.
+    #[serde_as(as = "DisplayFromStrOrNumber")]
+    #[serde(default = "default_second_attempt_after_per_mib")]
+    #[config_env(leaf)]
+    pub second_attempt_after_per_mib: IggyDuration,
     /// The bytes of what one shard reads from object stores that it keeps in
     /// memory for the next polls of the same bytes, which also hold the
     /// fresh objects it uploads. Zero keeps nothing that reads fetch and
@@ -389,6 +432,12 @@ pub struct TierJobsConfig {
     /// waits.
     #[serde(default = "default_housekeeping")]
     pub housekeeping: u32,
+    /// Second attempts at slow create-only puts that run at once, see
+    /// `second_attempt_after`. They have slots of their own and never take
+    /// one of `fresh_uploads`. A slow put that finds none free waits for its
+    /// first attempt.
+    #[serde(default = "default_second_attempts")]
+    pub second_attempts: u32,
 }
 
 /// What the `mock_s3` backend adds to the time of each store call. Its
@@ -440,6 +489,10 @@ impl Default for TieredStorageConfig {
             max_attempts: default_max_attempts(),
             retry_delay: default_retry_delay(),
             max_retry_delay: default_max_retry_delay(),
+            put_attempt_stall_timeout: default_put_attempt_stall_timeout(),
+            put_attempt_answer_timeout: default_put_attempt_answer_timeout(),
+            second_attempt_after: default_second_attempt_after(),
+            second_attempt_after_per_mib: default_second_attempt_after_per_mib(),
             read_cache_size: default_read_cache_size(),
             read_cache_block_size: default_read_cache_block_size(),
             read_ahead: default_read_ahead(),
@@ -464,6 +517,7 @@ impl Default for TierJobsConfig {
             speculative_fetch_bytes: default_speculative_fetch_bytes(),
             deletes: default_deletes(),
             housekeeping: default_housekeeping(),
+            second_attempts: default_second_attempts(),
         }
     }
 }
@@ -494,7 +548,9 @@ impl Display for TieredStorageConfig {
             "{{ backend: {}, prefix: {}, path: {}, bucket: {}, endpoint: {}, region: {}, \
              url_style: {}, credentials: {}, gcs: {}, jobs: {}, mock_s3: {}, \
              request_timeout: {}, progress_timeout: {}, max_attempts: {}, retry_delay: {}, \
-             max_retry_delay: {}, read_cache_size: {}, read_cache_block_size: {}, \
+             max_retry_delay: {}, put_attempt_stall_timeout: {}, put_attempt_answer_timeout: {}, \
+             second_attempt_after: {}, second_attempt_after_per_mib: {}, read_cache_size: {}, \
+             read_cache_block_size: {}, \
              read_ahead: {}, fresh_upload_interval: {}, long_term_backlog_limit: {}, \
              fresh_pending_bytes: {}, fresh_partition_pending_bytes: {}, orphan_grace: {} }}",
             self.backend,
@@ -513,6 +569,10 @@ impl Display for TieredStorageConfig {
             self.max_attempts,
             self.retry_delay,
             self.max_retry_delay,
+            self.put_attempt_stall_timeout,
+            self.put_attempt_answer_timeout,
+            self.second_attempt_after,
+            self.second_attempt_after_per_mib,
             self.read_cache_size,
             self.read_cache_block_size,
             self.read_ahead,
@@ -531,7 +591,7 @@ impl Display for TierJobsConfig {
             f,
             "{{ demand_fetches: {}, demand_fetch_bytes: {}, uploads: {}, upload_bytes: {}, \
              fresh_uploads: {}, speculative_fetches: {}, speculative_fetch_bytes: {}, \
-             deletes: {}, housekeeping: {} }}",
+             deletes: {}, housekeeping: {}, second_attempts: {} }}",
             self.demand_fetches,
             self.demand_fetch_bytes,
             self.uploads,
@@ -541,6 +601,7 @@ impl Display for TierJobsConfig {
             self.speculative_fetch_bytes,
             self.deletes,
             self.housekeeping,
+            self.second_attempts,
         )
     }
 }
@@ -619,6 +680,7 @@ impl TieredStorageConfig {
             ("speculative_fetches", jobs.speculative_fetches),
             ("deletes", jobs.deletes),
             ("housekeeping", jobs.housekeeping),
+            ("second_attempts", jobs.second_attempts),
         ];
         if let Some((name, _)) = counts.iter().find(|(_, count)| *count == 0) {
             return refuse(&format!("jobs.{name} must be greater than zero"));
@@ -636,6 +698,16 @@ impl TieredStorageConfig {
             ("progress_timeout", self.progress_timeout, TIMEOUT_BOUNDS),
             ("retry_delay", self.retry_delay, RETRY_DELAY_BOUNDS),
             ("max_retry_delay", self.max_retry_delay, RETRY_DELAY_BOUNDS),
+            (
+                "put_attempt_stall_timeout",
+                self.put_attempt_stall_timeout,
+                ATTEMPT_TIMEOUT_BOUNDS,
+            ),
+            (
+                "put_attempt_answer_timeout",
+                self.put_attempt_answer_timeout,
+                ATTEMPT_TIMEOUT_BOUNDS,
+            ),
         ];
         if let Some((name, _, bounds)) = durations
             .iter()
@@ -653,6 +725,7 @@ impl TieredStorageConfig {
         if self.max_retry_delay.get_duration() < self.retry_delay.get_duration() {
             return refuse("max_retry_delay must not be shorter than retry_delay");
         }
+        self.validate_second_attempts()?;
         self.validate_read_cache()?;
         if self.fresh_upload_interval.get_duration() > FRESH_UPLOAD_INTERVAL_MAX {
             return refuse(&format!(
@@ -668,6 +741,25 @@ impl TieredStorageConfig {
             ));
         }
         self.validate_fresh_pending_bytes()
+    }
+
+    /// The threshold of a second attempt, which zero turns off.
+    fn validate_second_attempts(&self) -> Result<(), ConfigurationError> {
+        let after = self.second_attempt_after.get_duration();
+        if !after.is_zero() && !RETRY_DELAY_BOUNDS.contains(&after) {
+            return refuse(&format!(
+                "second_attempt_after must be 0 (disabled) or between {} and {}",
+                IggyDuration::new(*RETRY_DELAY_BOUNDS.start()),
+                IggyDuration::new(*RETRY_DELAY_BOUNDS.end())
+            ));
+        }
+        if self.second_attempt_after_per_mib.get_duration() > SECOND_ATTEMPT_PER_MIB_MAX {
+            return refuse(&format!(
+                "second_attempt_after_per_mib must be at most {}",
+                IggyDuration::new(SECOND_ATTEMPT_PER_MIB_MAX)
+            ));
+        }
+        Ok(())
     }
 
     /// The block size always, and the size and readahead of a cache that is
@@ -744,6 +836,12 @@ impl TieredStorageConfig {
                 self.progress_timeout,
             ),
             (
+                "put_latency",
+                mock.put_latency,
+                "put_attempt_answer_timeout",
+                self.put_attempt_answer_timeout,
+            ),
+            (
                 "get_latency",
                 mock.get_latency,
                 "request_timeout",
@@ -795,6 +893,25 @@ fn default_retry_delay() -> IggyDuration {
 
 fn default_max_retry_delay() -> IggyDuration {
     IggyDuration::new_from_secs(5)
+}
+
+fn default_put_attempt_stall_timeout() -> IggyDuration {
+    IggyDuration::new_from_secs(1)
+}
+
+fn default_put_attempt_answer_timeout() -> IggyDuration {
+    IggyDuration::new_from_secs(5)
+}
+
+/// With `default_second_attempt_after_per_mib`, about the 99th percentile of
+/// a put of each size measured on GCS, so about one put in a hundred gets a
+/// second attempt.
+fn default_second_attempt_after() -> IggyDuration {
+    IggyDuration::new(Duration::from_millis(300))
+}
+
+fn default_second_attempt_after_per_mib() -> IggyDuration {
+    IggyDuration::new(Duration::from_millis(60))
 }
 
 fn default_read_cache_size() -> IggyByteSize {
@@ -863,6 +980,10 @@ const fn default_deletes() -> u32 {
 
 const fn default_housekeeping() -> u32 {
     1
+}
+
+const fn default_second_attempts() -> u32 {
+    4
 }
 
 #[cfg(test)]
@@ -1432,8 +1553,10 @@ mod tests {
             mock_s3,
             ..TieredStorageConfig::default()
         };
+        // A put whose body is held in memory waits for its answer for
+        // `put_attempt_answer_timeout`, 5 s by default.
         let just_below = mock(MockS3Config {
-            put_latency: duration("29999ms"),
+            put_latency: duration("4999ms"),
             get_latency: duration("29999ms"),
             other_latency: duration("29999ms"),
             bytes_per_second: "100 MiB".parse().unwrap(),
@@ -1441,6 +1564,10 @@ mod tests {
         let refused = [
             mock(MockS3Config {
                 put_latency: duration("30s"),
+                ..MockS3Config::default()
+            }),
+            mock(MockS3Config {
+                put_latency: duration("5s"),
                 ..MockS3Config::default()
             }),
             mock(MockS3Config {
@@ -1462,6 +1589,141 @@ mod tests {
             assert!(config.validate().is_err(), "{config}");
         }
         assert!(ignored_by_fs.validate().is_ok(), "{ignored_by_fs}");
+    }
+
+    #[test]
+    fn given_no_put_attempt_keys_when_reading_the_section_should_use_their_defaults() {
+        let config: TieredStorageConfig =
+            serde_json::from_str(r#"{"backend": "fs", "path": "/var/lib/iggy-tiered"}"#).unwrap();
+
+        assert_eq!(
+            config.put_attempt_stall_timeout.get_duration(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            config.put_attempt_answer_timeout.get_duration(),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            config.second_attempt_after.get_duration(),
+            Duration::from_millis(300)
+        );
+        assert_eq!(
+            config.second_attempt_after_per_mib.get_duration(),
+            Duration::from_millis(60)
+        );
+        assert_eq!(config.jobs.second_attempts, 4);
+        assert!(config.validate().is_ok(), "{config}");
+        let printed = config.to_string();
+        for shown in [
+            "put_attempt_stall_timeout: 1s",
+            "put_attempt_answer_timeout: 5s",
+            "second_attempt_after: 300ms",
+            "second_attempt_after_per_mib: 60ms",
+            "second_attempts: 4",
+        ] {
+            assert!(printed.contains(shown), "{shown} in {printed}");
+        }
+    }
+
+    #[test]
+    fn given_put_attempt_keys_when_reading_the_section_should_take_them() {
+        let config: TieredStorageConfig = serde_json::from_str(
+            r#"{"backend": "fs", "path": "/var/lib/iggy-tiered",
+                "put_attempt_stall_timeout": "2 s", "put_attempt_answer_timeout": "10 s",
+                "second_attempt_after": "500 ms", "second_attempt_after_per_mib": "20 ms",
+                "jobs": {"second_attempts": 8}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.put_attempt_stall_timeout.get_duration(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            config.put_attempt_answer_timeout.get_duration(),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            config.second_attempt_after.get_duration(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            config.second_attempt_after_per_mib.get_duration(),
+            Duration::from_millis(20)
+        );
+        assert_eq!(config.jobs.second_attempts, 8);
+        assert!(config.validate().is_ok(), "{config}");
+    }
+
+    #[test]
+    fn given_second_attempts_disabled_when_reading_the_section_should_turn_them_off() {
+        for text in ["disabled", "0", "none"] {
+            let config: TieredStorageConfig = serde_json::from_str(&format!(
+                r#"{{"backend": "fs", "path": "/var/lib/iggy-tiered",
+                    "second_attempt_after": "{text}"}}"#
+            ))
+            .unwrap();
+
+            assert!(config.second_attempt_after.is_zero(), "{text}");
+            assert!(config.validate().is_ok(), "{text}");
+        }
+    }
+
+    #[test]
+    fn given_put_attempt_values_outside_their_bounds_when_validating_should_refuse() {
+        let refused = [
+            TieredStorageConfig {
+                put_attempt_stall_timeout: duration("99ms"),
+                ..fs_config()
+            },
+            TieredStorageConfig {
+                put_attempt_answer_timeout: duration("61min"),
+                ..fs_config()
+            },
+            TieredStorageConfig {
+                second_attempt_after: duration("999us"),
+                ..fs_config()
+            },
+            TieredStorageConfig {
+                second_attempt_after: duration("61min"),
+                ..fs_config()
+            },
+            TieredStorageConfig {
+                second_attempt_after_per_mib: duration("61min"),
+                ..fs_config()
+            },
+            TieredStorageConfig {
+                jobs: TierJobsConfig {
+                    second_attempts: 0,
+                    ..TierJobsConfig::default()
+                },
+                ..fs_config()
+            },
+        ];
+        let at_the_bounds = [
+            TieredStorageConfig {
+                put_attempt_stall_timeout: duration("100ms"),
+                put_attempt_answer_timeout: duration("1h"),
+                second_attempt_after: duration("1ms"),
+                second_attempt_after_per_mib: duration("0"),
+                ..fs_config()
+            },
+            TieredStorageConfig {
+                put_attempt_stall_timeout: duration("1h"),
+                put_attempt_answer_timeout: duration("100ms"),
+                second_attempt_after: duration("1h"),
+                second_attempt_after_per_mib: duration("1h"),
+                ..fs_config()
+            },
+        ];
+
+        for config in refused {
+            assert!(config.validate().is_err(), "{config}");
+        }
+        for config in at_the_bounds {
+            assert!(config.validate().is_ok(), "{config}");
+        }
     }
 
     #[test]

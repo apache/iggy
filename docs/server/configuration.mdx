@@ -458,6 +458,23 @@ Tunables for the internal bus that ships consensus traffic between replicas and 
 | `rebalancing_timeout` | `"30s"` | Maximum time a partition can remain in pending revocation before being force-transferred to the target member. |
 | `heartbeat_interval` | `"5s"` | Membership heartbeat interval advertised to consumers. Session expiry derives separately from `heartbeat.interval`. |
 
+### `[tiered_storage]`
+
+The object store of tiered and geo topics. The backend, the bucket and the credentials are described in the server README and in the embedded `config.toml`. The keys below bound and retry the calls that each shard sends to the store. A put whose body the node holds in memory (fresh objects, long-term segments, manifests and the other small objects) is sent again after a failure. Every attempt of one put carries the same `put-id` entry in the object's user metadata, so a create-only put that the store refuses because an earlier attempt stored the object counts as stored. A put that streams a sealed segment from its file is sent once.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `request_timeout` | `"30 s"` | Longest wait for one attempt at a head, a read, a listing or a delete. From 1 s to 1 h. |
+| `progress_timeout` | `"30 s"` | A put that streams from a file fails when the store takes no piece of its body, or gives no answer after the last piece, for this long. It has no total deadline. Each attempt at an overwrite held in memory, such as a manifest, waits the same. From 1 s to 1 h. |
+| `max_attempts` | `3` | Attempts at a call that keeps failing for a transient reason, the first one included: heads, reads, listings, deletes and the puts whose body the node holds in memory. |
+| `retry_delay` | `"200 ms"` | Wait before the first retry, doubled for each retry after it. From 1 ms to 1 h. |
+| `max_retry_delay` | `"5 s"` | Longest wait between two attempts. From 1 ms to 1 h. |
+| `put_attempt_stall_timeout` | `"1 s"` | An attempt at a create-only put whose body the node holds in memory (a fresh object or a long-term segment) is given up and sent again when the store takes no 64 KiB piece of its body for this long. A late create finds the object and stores nothing. An overwrite waits `progress_timeout` instead, because an attempt cut early could land after a later put of other bytes. From 100 ms to 1 h. |
+| `put_attempt_answer_timeout` | `"5 s"` | The same for a create-only put, when the store gives no answer for this long after the last piece. From 100 ms to 1 h. |
+| `second_attempt_after` | `"300 ms"` | A create-only put whose body the node holds in memory, such as the upload of a fresh object, gets a second attempt on another connection once it has run this long plus `second_attempt_after_per_mib` for each MiB. The first attempt to store the object wins and the other is dropped. `"disabled"` sends none. Otherwise from 1 ms to 1 h. |
+| `second_attempt_after_per_mib` | `"60 ms"` | What each MiB of the body adds to `second_attempt_after`. With it, about the 99th percentile of a put of each size measured on GCS, so about one put in a hundred costs a second request. Up to 1 h. |
+| `jobs.second_attempts` | `4` | Second attempts that run at once on one shard. They take no slot of `jobs.fresh_uploads`, and a slow put that finds none free waits for its first attempt. At least 1. |
+
 ### `[node]`
 
 This node's own client-facing identity. The address is read only while `cluster.enabled = false`: in cluster mode the roster answers the same question per node, so the address itself is ignored and the server says so at startup. The key is still validated in every mode, so a malformed value refuses boot even with `cluster.enabled = true`.

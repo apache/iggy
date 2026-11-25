@@ -26,8 +26,9 @@ pub enum ErrorClass {
     /// A conditional create found an object under the key.
     PreconditionFailed,
     /// The same call can succeed after a backoff. A put that failed this way
-    /// can still have stored its object, unless the error is a checksum
-    /// mismatch, see [`crate::ObjectStore::put`].
+    /// can still have stored its object, unless
+    /// [`ObjectStoreError::put_may_have_stored`] says otherwise, see
+    /// [`crate::ObjectStore::put`].
     Transient,
     /// The same call cannot succeed until an operator or the caller changes
     /// something, such as the credentials or the request.
@@ -46,10 +47,14 @@ pub enum ObjectStoreError {
     /// The store answered with a server-side failure, such as an HTTP 5xx.
     #[error("the store is unavailable: {0}")]
     Unavailable(String),
-    /// The request got no answer: a refused or reset connection, a failed
-    /// name lookup or a failed TLS handshake.
+    /// The request got no answer after it left: a reset connection, or no
+    /// answer in time. The store can have taken it.
     #[error("transport failed: {0}")]
     Transport(String),
+    /// The request never left: the name lookup, the connection or the TLS
+    /// handshake failed first, so the store has not seen it.
+    #[error("the request was never sent: {0}")]
+    NotSent(String),
     /// The bytes of a put hash to another CRC32C than the one they were
     /// checked against, so the put stored nothing.
     ///
@@ -106,6 +111,7 @@ impl ObjectStoreError {
             Self::Throttled(_)
             | Self::Unavailable(_)
             | Self::Transport(_)
+            | Self::NotSent(_)
             | Self::ChecksumMismatch { .. } => ErrorClass::Transient,
             Self::Auth(_)
             | Self::BucketNotFound(_)
@@ -118,6 +124,17 @@ impl ObjectStoreError {
             | Self::ReadOnly { .. }
             | Self::Body(_) => ErrorClass::Permanent,
         }
+    }
+
+    /// Whether a put that failed with this error can still have stored its
+    /// object: the store took the request and its answer was lost, or the
+    /// answer does not say, see [`crate::ObjectStore::put`].
+    #[must_use]
+    pub const fn put_may_have_stored(&self) -> bool {
+        matches!(
+            self,
+            Self::Throttled(_) | Self::Unavailable(_) | Self::Transport(_) | Self::Malformed(_)
+        )
     }
 }
 
@@ -147,6 +164,10 @@ mod tests {
             ),
             (
                 ObjectStoreError::Transport("reset".to_owned()),
+                ErrorClass::Transient,
+            ),
+            (
+                ObjectStoreError::NotSent("refused".to_owned()),
                 ErrorClass::Transient,
             ),
             (
@@ -207,6 +228,32 @@ mod tests {
 
         for (error, class) in cases {
             assert_eq!(error.class(), class, "{error}");
+        }
+    }
+
+    #[test]
+    fn given_each_put_failure_when_asking_whether_it_stored_should_say_so_only_without_a_refusal() {
+        let key = || "a/b".to_owned();
+        let maybe_stored = [
+            ObjectStoreError::Throttled("slow down".to_owned()),
+            ObjectStoreError::Unavailable("500".to_owned()),
+            ObjectStoreError::Transport("reset".to_owned()),
+            ObjectStoreError::Malformed("no etag".to_owned()),
+        ];
+        let stored_nothing = [
+            ObjectStoreError::NotSent("refused".to_owned()),
+            ObjectStoreError::ChecksumMismatch { key: key() },
+            ObjectStoreError::PreconditionFailed { key: key() },
+            ObjectStoreError::Auth("denied".to_owned()),
+            ObjectStoreError::InvalidRequest("metadata".to_owned()),
+            ObjectStoreError::Body(io::Error::other("read failed")),
+        ];
+
+        for error in maybe_stored {
+            assert!(error.put_may_have_stored(), "{error}");
+        }
+        for error in stored_nothing {
+            assert!(!error.put_may_have_stored(), "{error}");
         }
     }
 }

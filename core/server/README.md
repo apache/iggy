@@ -717,6 +717,43 @@ every shard reads them, and answers each call after the latencies of
 `[tiered_storage.mock_s3]`. The server loses them all when it stops, so it is
 for benchmarks and tests only.
 
+Each shard bounds and retries the calls it sends to the store. A head, a
+read, a listing or a delete that gets no answer within `request_timeout`, or
+fails with a 5xx answer, throttling or a connection that broke or never
+opened, is sent again after `retry_delay`, doubled up to `max_retry_delay`, up
+to `max_attempts` in all. A put whose body the node holds in memory is sent
+again the same way: fresh objects, long-term segments, manifests and the other
+small objects of the cluster. Every attempt of one put carries the same
+`put-id` entry in the object's user metadata. An attempt at a create-only put,
+a fresh object or a long-term segment, is given up when the store takes no
+64 KiB piece of its body for `put_attempt_stall_timeout`, 1 second by default,
+or gives no answer for `put_attempt_answer_timeout`, 5 seconds by default,
+after the last piece. A create that lands late finds the object and stores
+nothing. An attempt at an overwrite, such as a manifest or a positions object,
+waits `progress_timeout` in both cases instead, because one cut early could
+land after a later put of other bytes. When the store refuses a create-only
+put after an attempt that may have reached it, the shard reads the object's
+metadata, and the put counts as stored when the object carries the put's id,
+its size and, where the store keeps one, its CRC32C. Otherwise the refusal
+goes to the caller, which runs its own check. A put that streams a sealed
+segment from its file is sent once, and fails when the store takes no piece of
+it, or gives no answer after the last piece, for `progress_timeout`.
+
+A create-only put whose body the node holds in memory, such as the upload of a
+fresh object that producers wait for, gets a second attempt on another
+connection once it has run for `second_attempt_after` plus
+`second_attempt_after_per_mib` for each MiB of its body, 300 ms plus 60 ms by
+default. The first attempt to store the object wins, and the other is dropped,
+which cancels its request. A store that took the dropped attempt whole
+refuses it, because the object is there by then. At most
+`jobs.second_attempts` run at once on a shard, and they take no slot of
+`jobs.fresh_uploads`. `second_attempt_after = "disabled"` turns them off. An
+overwrite never gets a second attempt, because a dropped attempt could land
+after a later put of other bytes. Each shard exports
+`object_store_put_retries_total`, `object_store_put_second_attempts_total`,
+`object_store_put_second_attempt_wins_total` and
+`object_store_put_own_objects_found_total`.
+
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:
 

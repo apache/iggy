@@ -708,6 +708,8 @@ fn header_crc32c(headers: &HeaderMap) -> Result<Option<u32>, ObjectStoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use http::HeaderValue;
 
     use super::*;
@@ -929,6 +931,104 @@ mod tests {
             "{refreshed:?}"
         );
         assert!(matches!(fixed, ObjectStoreError::Auth(_)), "{fixed:?}");
+    }
+
+    fn static_store(endpoint: &str) -> S3Store {
+        S3Store::new(S3Config {
+            endpoint: endpoint.to_owned(),
+            region: "us-east-1".to_owned(),
+            bucket: "segments".to_owned(),
+            url_style: UrlStyle::Path,
+            credentials: Credentials {
+                access_key_id: "id".to_owned(),
+                secret_access_key: "secret".to_owned(),
+                session_token: None,
+            }
+            .into(),
+        })
+        .unwrap()
+    }
+
+    fn put_to(store: &S3Store) -> Result<(), ObjectStoreError> {
+        let options = PutOptions {
+            mode: PutMode::IfAbsent,
+            ..PutOptions::default()
+        };
+        crate::contract::shard_runtime().block_on(store.put(
+            "a/b",
+            PutBody::from_bytes("segment bytes"),
+            &options,
+        ))
+    }
+
+    /// A refused connection proves that the store never saw the put, so a
+    /// retry needs no check for an object of its own.
+    #[test]
+    fn given_store_that_refuses_the_connection_when_putting_should_fail_as_never_sent() {
+        let store = static_store(&crate::http::test_endpoints::refusing());
+
+        let result = put_to(&store);
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::NotSent(_))),
+            "{result:?}"
+        );
+        assert!(!result.unwrap_err().put_may_have_stored());
+    }
+
+    #[test]
+    fn given_store_that_hangs_up_after_the_request_when_putting_should_fail_as_unknown() {
+        let store = static_store(&crate::http::test_endpoints::hanging_up());
+
+        let result = put_to(&store);
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::Transport(_))),
+            "{result:?}"
+        );
+        assert!(result.unwrap_err().put_may_have_stored());
+    }
+
+    /// Drops a put of `body` to `silent` once it ran for a moment, and says
+    /// whether the store then saw the connection close.
+    fn closes_when_dropped(silent: &crate::http::test_endpoints::Silent, body: PutBody) -> bool {
+        let store = static_store(&silent.endpoint);
+        let options = PutOptions::default();
+        crate::contract::shard_runtime().block_on(async {
+            let put = Box::pin(store.put("a/b", body, &options));
+            let wait = std::pin::pin!(compio::time::sleep(Duration::from_millis(200)));
+            let raced = futures::future::select(put, wait).await;
+            let futures::future::Either::Right(((), put)) = raced else {
+                panic!("the store answered a put it never answers");
+            };
+            drop(put);
+            // The connection task runs on this runtime, so it must close the
+            // connection before the runtime goes.
+            compio::time::sleep(Duration::from_millis(200)).await;
+            silent.client_closed(Duration::from_secs(2)).await
+        })
+    }
+
+    /// The first attempt of a put that a second one passed is dropped, and the
+    /// store must not keep waiting for it on an open connection.
+    #[test]
+    fn given_a_put_waiting_for_its_answer_when_dropped_should_close_the_connection() {
+        let silent = crate::http::test_endpoints::Silent::start(true);
+
+        assert!(closes_when_dropped(
+            &silent,
+            PutBody::from_bytes("segment bytes")
+        ));
+    }
+
+    #[test]
+    fn given_a_put_whose_store_stopped_reading_the_body_when_dropped_should_close_the_connection() {
+        let silent = crate::http::test_endpoints::Silent::start(false);
+        // More than the buffers of both sockets hold, so the client waits to
+        // write when it is dropped.
+        let body = PutBody::from_bytes_in_pieces(vec![7_u8; 64 << 20], 1 << 20);
+
+        assert!(closes_when_dropped(&silent, body));
     }
 
     #[test]

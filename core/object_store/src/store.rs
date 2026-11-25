@@ -96,12 +96,12 @@ pub trait ObjectStore {
     /// A failed put stores nothing and leaves an earlier object as it was, and
     /// so does a put that is dropped before the provider took its whole body.
     /// A put that ends without an answer after the provider took the whole
-    /// body is the exception: one dropped then, or one that failed with
-    /// [`ObjectStoreError::Malformed`] or with a
-    /// [`crate::ErrorClass::Transient`] error other than
-    /// [`ObjectStoreError::ChecksumMismatch`]. The store can commit such a put
-    /// and lose its answer, so a retry with `IfAbsent` can meet the caller's
-    /// own object, which [`ObjectMeta::crc32c`] tells apart.
+    /// body is the exception: one dropped then, or one that failed with an
+    /// error for which [`ObjectStoreError::put_may_have_stored`] holds. The
+    /// store can commit such a put and lose its answer, so a retry with
+    /// `IfAbsent` can meet the caller's own object, which
+    /// [`ObjectMeta::crc32c`] tells apart. A put that failed with
+    /// [`ObjectStoreError::NotSent`] never reached the store.
     ///
     /// # Errors
     /// [`ObjectStoreError::InvalidKey`] for a key that [`validate_key`]
@@ -192,20 +192,40 @@ pub trait ObjectStore {
 /// The bytes of one put: a declared length and the pieces that make it up.
 ///
 /// A provider sends each piece as it comes, so a large body never sits in
-/// memory whole.
+/// memory whole. A body held in memory can be sent again, see
+/// [`Self::try_clone`], and one that streams cannot.
 pub struct PutBody {
     len: u64,
-    pieces: LocalBoxStream<'static, io::Result<Bytes>>,
+    source: BodySource,
+}
+
+enum BodySource {
+    /// Bytes in memory, handed over `piece_len` bytes at a time.
+    Memory {
+        bytes: Bytes,
+        piece_len: usize,
+    },
+    Stream(LocalBoxStream<'static, io::Result<Bytes>>),
 }
 
 impl PutBody {
-    /// A body held in memory.
+    /// A body held in memory, handed over in one piece.
     #[must_use]
     pub fn from_bytes(bytes: impl Into<Bytes>) -> Self {
+        Self::from_bytes_in_pieces(bytes, usize::MAX)
+    }
+
+    /// A body held in memory, handed over `piece_len` bytes at a time, so a
+    /// provider that sums or copies what it sends does so in steps.
+    #[must_use]
+    pub fn from_bytes_in_pieces(bytes: impl Into<Bytes>, piece_len: usize) -> Self {
         let bytes = bytes.into();
         Self {
             len: bytes.len() as u64,
-            pieces: stream::iter([Ok(bytes)]).boxed_local(),
+            source: BodySource::Memory {
+                bytes,
+                piece_len: piece_len.max(1),
+            },
         }
     }
 
@@ -219,7 +239,7 @@ impl PutBody {
     pub fn from_stream(len: u64, pieces: impl Stream<Item = io::Result<Bytes>> + 'static) -> Self {
         Self {
             len,
-            pieces: pieces.boxed_local(),
+            source: BodySource::Stream(pieces.boxed_local()),
         }
     }
 
@@ -231,6 +251,29 @@ impl PutBody {
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Whether [`Self::try_clone`] gives a copy: the body is held in memory.
+    #[must_use]
+    pub const fn is_repeatable(&self) -> bool {
+        matches!(self.source, BodySource::Memory { .. })
+    }
+
+    /// Another body of the same bytes, in the same pieces, for a put that
+    /// sends them again. `None` for a body that streams, which yields its
+    /// pieces once.
+    #[must_use]
+    pub fn try_clone(&self) -> Option<Self> {
+        match &self.source {
+            BodySource::Memory { bytes, piece_len } => Some(Self {
+                len: self.len,
+                source: BodySource::Memory {
+                    bytes: bytes.clone(),
+                    piece_len: *piece_len,
+                },
+            }),
+            BodySource::Stream(_) => None,
+        }
     }
 
     /// The pieces for a provider to send, checked against the declared
@@ -245,8 +288,18 @@ impl PutBody {
     /// byte of a failed body. An empty body has no last byte, so a provider
     /// reads it to its end before it sends the request.
     pub fn into_pieces(self) -> impl Stream<Item = io::Result<Bytes>> + Unpin + 'static {
+        let pieces = match self.source {
+            BodySource::Memory { bytes, piece_len } => {
+                let len = bytes.len();
+                stream::iter((0..len).step_by(piece_len).map(move |start| {
+                    Ok(bytes.slice(start..len.min(start.saturating_add(piece_len))))
+                }))
+                .boxed_local()
+            }
+            BodySource::Stream(pieces) => pieces,
+        };
         ExactLen {
-            pieces: self.pieces,
+            pieces,
             remaining: self.len,
             last: None,
             done: false,
@@ -259,6 +312,7 @@ impl fmt::Debug for PutBody {
         formatter
             .debug_struct("PutBody")
             .field("len", &self.len)
+            .field("repeatable", &self.is_repeatable())
             .finish_non_exhaustive()
     }
 }
@@ -774,6 +828,40 @@ mod tests {
         assert!(!body.is_empty());
         assert!(PutBody::from_bytes(Bytes::new()).is_empty());
         assert_eq!(drain(body).unwrap(), b"segment");
+    }
+
+    #[test]
+    fn given_bytes_in_pieces_when_draining_should_hand_over_each_piece_and_the_rest() {
+        let body = PutBody::from_bytes_in_pieces(Bytes::from_static(b"abcdefg"), 3);
+
+        let yielded: Vec<Bytes> = block_on(body.into_pieces().try_collect()).unwrap();
+
+        assert_eq!(yielded, ["abc", "def", "g"]);
+        let empty = PutBody::from_bytes_in_pieces(Bytes::new(), 3);
+        assert_eq!(drain(empty).unwrap(), b"");
+    }
+
+    #[test]
+    fn given_body_in_memory_when_cloning_should_give_a_copy_of_the_same_pieces() {
+        let body = PutBody::from_bytes_in_pieces(Bytes::from_static(b"segment"), 4);
+
+        let copy = body.try_clone().unwrap();
+
+        assert!(body.is_repeatable() && copy.is_repeatable());
+        assert_eq!(copy.len(), 7);
+        let pieces: Vec<Bytes> = block_on(copy.into_pieces().try_collect()).unwrap();
+        assert_eq!(pieces, ["segm", "ent"]);
+        assert_eq!(drain(body).unwrap(), b"segment");
+        assert!(PutBody::from_bytes("bytes").try_clone().is_some());
+    }
+
+    #[test]
+    fn given_streamed_body_when_cloning_should_refuse() {
+        let body = PutBody::from_stream(6, pieces(&[b"ab", b"cdef"]));
+
+        assert!(!body.is_repeatable());
+        assert!(body.try_clone().is_none());
+        assert_eq!(drain(body).unwrap(), b"abcdef");
     }
 
     #[test]

@@ -48,6 +48,14 @@ use crate::state_transfer::{ChunkHasher, hash_segment_range};
 /// Bytes of a file that one piece of a put body holds.
 const UPLOAD_PIECE_LEN: usize = 1 << 20;
 
+/// Bytes of a body held in memory that one piece holds.
+///
+/// The tier store gives up an attempt at a create-only put whose provider
+/// takes no piece within its stall deadline, so a small piece makes that
+/// deadline mean "less than 64 KiB in that time", and a slow link that keeps
+/// moving is not cut.
+pub const MEMORY_PIECE_LEN: usize = 64 << 10;
+
 /// A sealed segment to upload, as the partition's owner captured it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentUpload {
@@ -313,13 +321,10 @@ async fn file_body(path: &str, len: u64) -> Result<PutBody, ObjectStoreError> {
 }
 
 /// `bytes` as a put body that hands them over a piece at a time, so a
-/// provider that sums or copies what it sends does so in steps.
+/// provider that sums or copies what it sends does so in steps, and that a
+/// put can send again.
 pub fn memory_body(bytes: &Bytes) -> PutBody {
-    let pieces: Vec<io::Result<Bytes>> = (0..bytes.len())
-        .step_by(UPLOAD_PIECE_LEN)
-        .map(|start| Ok(bytes.slice(start..bytes.len().min(start + UPLOAD_PIECE_LEN))))
-        .collect();
-    PutBody::from_stream(bytes.len() as u64, futures::stream::iter(pieces))
+    PutBody::from_bytes_in_pieces(bytes.clone(), MEMORY_PIECE_LEN)
 }
 
 /// The first `len` bytes of `file`, a piece at a time.

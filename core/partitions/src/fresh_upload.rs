@@ -22,9 +22,11 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_object_store::{
-    FreshObjectId, KeyLayout, ObjectStore, ObjectStoreError, PutBody, PutMode, PutOptions,
-    TierExecutor, TierJobCancelled, TierJobClass, TierJobRequest, TierScopeToken,
+    FreshObjectId, KeyLayout, ObjectStore, ObjectStoreError, PutMode, PutOptions, TierExecutor,
+    TierJobCancelled, TierJobClass, TierJobRequest, TierScopeToken,
 };
+
+use crate::segment_upload::memory_body;
 
 /// The result of an upload: the store's answer, or that the job's scope was
 /// cancelled first.
@@ -92,10 +94,7 @@ impl<E: TierExecutor> FreshObjectUploader for ExecutorFreshUploader<E> {
                     crc32c: Some(crc32c),
                     ..PutOptions::default()
                 };
-                match store
-                    .put(&key, PutBody::from_bytes(bytes.clone()), &options)
-                    .await
-                {
+                match store.put(&key, memory_body(&bytes), &options).await {
                     Err(ObjectStoreError::PreconditionFailed { .. }) => {
                         if holds_sent_bytes(&*store, &key, &bytes, crc32c).await? {
                             Ok(())
@@ -133,7 +132,7 @@ mod tests {
     use super::*;
     use iggy_object_store::{
         DeleteOutcome, FreshObject, InlineTierExecutor, ListPage, ListRequest, MemoryStore,
-        ObjectMeta, ObjectRange, RecordingStore, StoreCall, TierJobHandle, TierScope,
+        ObjectMeta, ObjectRange, PutBody, RecordingStore, StoreCall, TierJobHandle, TierScope,
     };
     use std::cell::RefCell;
     use std::future::Future;

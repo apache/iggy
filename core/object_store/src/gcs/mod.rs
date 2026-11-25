@@ -1369,6 +1369,43 @@ mod tests {
         );
     }
 
+    fn put_to(endpoint: &str) -> Result<(), ObjectStoreError> {
+        let store = GcsStore::new(config(endpoint)).unwrap();
+        let options = PutOptions {
+            mode: PutMode::IfAbsent,
+            ..PutOptions::default()
+        };
+        crate::contract::shard_runtime().block_on(store.put(
+            "a/b",
+            PutBody::from_bytes("segment bytes"),
+            &options,
+        ))
+    }
+
+    /// A refused connection proves that the store never saw the put, so a
+    /// retry needs no check for an object of its own.
+    #[test]
+    fn given_a_store_that_refuses_the_connection_when_putting_should_fail_as_never_sent() {
+        let result = put_to(&crate::http::test_endpoints::refusing());
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::NotSent(_))),
+            "{result:?}"
+        );
+        assert!(!result.unwrap_err().put_may_have_stored());
+    }
+
+    #[test]
+    fn given_a_store_that_hangs_up_after_the_request_when_putting_should_fail_as_unknown() {
+        let result = put_to(&crate::http::test_endpoints::hanging_up());
+
+        assert!(
+            matches!(&result, Err(ObjectStoreError::Transport(_))),
+            "{result:?}"
+        );
+        assert!(result.unwrap_err().put_may_have_stored());
+    }
+
     #[test]
     fn given_a_batch_when_deleting_should_send_one_request_per_key_a_few_at_once() {
         let fake = FakeGcs::start(|request| {
