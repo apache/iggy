@@ -60,6 +60,7 @@ use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topolo
 use crate::dispatch::reads::{partition_frontier_budget, read_frontier_budget};
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::geo_peers::PeerAuth;
+use crate::release_compatibility::RELEASE_COMPATIBILITY;
 use crate::server_error::ServerError;
 use crate::shell::{
     ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellShard, heartbeat_timings,
@@ -72,7 +73,7 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::replica::handshake::ReplicaHandshakeCtx;
+use message_bus::replica::handshake::{CompatibleRelease, ReplicaHandshakeCtx};
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, MessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
@@ -610,11 +611,23 @@ async fn shard_main(
     // Every shard can own a delegated replica connection, so every
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
+    let compatible_releases = RELEASE_COMPATIBILITY.compatible_with(crate::VERSION);
+    if shard_id == 0 && !compatible_releases.is_empty() {
+        info!(
+            release = crate::VERSION,
+            ?compatible_releases,
+            "this release links with replicas on the releases it lists as compatible"
+        );
+    }
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
         binary_identity: message_bus::replica::handshake::binary_identity(
             crate::VERSION,
             STORAGE_FORMAT,
         ),
+        compatible_releases: compatible_releases
+            .iter()
+            .map(|release| CompatibleRelease::new(release, STORAGE_FORMAT))
+            .collect(),
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,

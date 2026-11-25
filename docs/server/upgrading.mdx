@@ -9,7 +9,7 @@ Apache Iggy 0.10.0 changes the wire protocol, data directory format and public S
 
 There is no migration from a 0.9.x data directory. Keep a backup and export messages that you need with the old server and compatible clients. Start 0.10.0 with a separate, empty data directory. Import the retained data through a compatible client. Do not point the new server at the old directory.
 
-Do not use a rolling upgrade between server versions. Every cluster node must run the same server version. Keep the old deployment and its data available until you finish the cutover checks.
+Stop all 0.9 nodes before starting the 0.10 cluster. See [Release compatibility](#release-compatibility) for later upgrades. Keep the old deployment and its data available until you finish the cutover checks.
 
 ## Upgrade clients and tools
 
@@ -48,7 +48,15 @@ Encryption is selected when a stream is created. Each encrypted stream has its o
 
 Server 0.10.1-edge.2 changes the replica wire revision and the storage marker. Start every node with a fresh, empty data directory and upgrade all nodes together, as for 0.10.0. Access tokens issued by an earlier build are refused, so HTTP clients and the web UI sign in again.
 
+A later 0.10.1-edge.2 build raises the replica wire revision again and keeps the storage marker. Stop every node and start them all on the new build. The data directories stay.
+
 The build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
+
+## Release compatibility
+
+A cluster node links with a peer that runs its own server version. It also links with a peer on another version when the release compatibility table of either server lists the other version. The table is compiled into the server, and a version is matched by its exact string. A version that no pair names, such as a custom build under its own version, links only with itself. A node that refuses a peer logs the reason `incompatible_build`.
+
+No version is listed yet, so every cluster node must run the same server version. Once a release lists an earlier one, the nodes of a cluster can be replaced one at a time between those two versions. A listed version still needs the same client protocol, replica wire revision and storage marker as the server that lists it.
 
 ## Check the cutover
 

@@ -79,7 +79,9 @@ wire change that SDKs from before this release cannot decode.
 
 The preceding storage format, `IGGY-METADATA-CHANGE-LOG-2`, used replica wire revision 3. It introduced batched session finalization (op 70) and refused directories marked `IGGY-METADATA-CHANGE-LOG-1` before writing to them.
 
-Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Its replicated registration and password-change requests use replica wire revision 4. State transfer uses client table format `ICT6` and metadata snapshot format 21.
+Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Replica wire revision 4 introduced its replicated registration and password-change requests. State transfer uses client table format `ICT6` and metadata snapshot format 21.
+
+Replica wire revision 5 lets a ReplicaHello carry the identities of the releases its sender lists as compatible, see [Upgrade recovery](#upgrade-recovery). It changes no storage format. Stop every node and start them all on the new build.
 
 Every replica needs fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. Sign in again over HTTP or in the web UI to obtain an access token carrying the account revision.
 
@@ -1101,11 +1103,15 @@ admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
-This checkout accepts client protocol 0.12.3 at login. Replica wire revision 4 is checked separately when servers connect.
+A peer on another release is admitted only when the release compatibility table of either node lists the other release. The table is `RELEASE_COMPATIBILITY` in `core/server/src/release_compatibility.rs`. It is compiled into the server and ships empty. A release absent from every pair links only with itself.
+
+A node with a row sends the identities of its listed releases in its ReplicaHello and runs the link under the identity of the listed release, so the other node needs no knowledge of the first one.
+
+This checkout accepts client protocol 0.12.3 at login. Replica wire revision 5 is checked separately when servers connect.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Start this release from fresh storage on every replica.
+Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Upgrades from an incompatible storage or snapshot format require fresh storage on every replica. A revision 4 cluster already on the current storage marker and snapshot format can reuse its directories in a coordinated restart to revision 5.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

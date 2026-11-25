@@ -30,10 +30,12 @@
 //!    `mac_a` when the status is `Ok` (a nonzero status is a reject, no nonce/MAC);
 //! 3. `ReplicaFinish`    dialer -> acceptor: `mac_d` (dialer direction).
 //!
-//! Each MAC is `keyed_hash(key, DOMAIN_TAG || binary_identity || placement ||
-//! cluster_id || dialer_id || acceptor_id || nonce_d || nonce_a || mode ||
-//! tls_exporter || dir)`, where `placement` is the link count and link index
-//! the hello carries ([`LinkPlacement`]).
+//! Each MAC is `keyed_hash(key, DOMAIN_TAG || hello_hash || binary_identity ||
+//! placement || cluster_id || dialer_id || acceptor_id || nonce_d || nonce_a ||
+//! mode || tls_exporter || dir)`, where `placement` is the link count and link
+//! index the hello carries ([`LinkPlacement`]). `hello_hash` is the BLAKE3
+//! digest of the complete `ReplicaHello` frame and `binary_identity` is the
+//! identity the link runs under.
 //! Binding both nonces, the ordered peer pair, and a direction byte
 //! defeats replay and reflection. The MAC key is a subkey derived from
 //! the configured shared secret, so the raw secret never reaches the
@@ -391,6 +393,7 @@ impl ChannelBinding {
 
 /// The fields bound into a handshake MAC. Identical on both peers.
 pub struct Transcript {
+    pub hello_hash: Hash,
     pub binary_identity: [u8; IDENTITY_LEN],
     pub placement: LinkPlacement,
     pub cluster_id: u128,
@@ -491,6 +494,7 @@ impl ReplicaAuth {
     fn mac(key: &[u8; 32], dir: u8, transcript: &Transcript) -> Hash {
         let mut hasher = blake3::Hasher::new_keyed(key);
         hasher.update(DOMAIN_TAG);
+        hasher.update(transcript.hello_hash.as_bytes());
         hasher.update(&transcript.binary_identity);
         hasher.update(&transcript.placement.to_le_bytes());
         hasher.update(&transcript.cluster_id.to_le_bytes());
@@ -512,6 +516,7 @@ mod tests {
 
     fn transcript() -> Transcript {
         Transcript {
+            hello_hash: blake3::hash(b"hello"),
             binary_identity: [0x5a; IDENTITY_LEN],
             placement: LinkPlacement { links: 2, link: 1 },
             cluster_id: 0xDEAD_BEEF,
@@ -597,6 +602,18 @@ mod tests {
         let t = transcript();
         assert!(!auth.verify_dialer_mac(&t, &auth.acceptor_mac(&t)));
         assert!(!auth.verify_acceptor_mac(&t, &auth.dialer_mac(&t)));
+    }
+
+    #[test]
+    fn changed_hello_is_rejected_in_both_directions() {
+        let auth = ReplicaAuth::new(SECRET);
+        let original = transcript();
+        let changed = Transcript {
+            hello_hash: blake3::hash(b"another hello"),
+            ..transcript()
+        };
+        assert!(!auth.verify_dialer_mac(&changed, &auth.dialer_mac(&original)));
+        assert!(!auth.verify_acceptor_mac(&changed, &auth.acceptor_mac(&original)));
     }
 
     #[test]

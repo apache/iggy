@@ -2467,6 +2467,7 @@ mod tests {
         let bus = bus_with_layout(0, 4, 2);
         bus.set_replica_handshake_ctx(replica::handshake::ReplicaHandshakeCtx {
             binary_identity: [0; replica::auth::IDENTITY_LEN],
+            compatible_releases: Rc::default(),
             cluster_id: 1,
             self_id: 2,
             replica_count: 3,

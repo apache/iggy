@@ -28,7 +28,8 @@
 mod common;
 
 use common::{
-    install_dialed_replicas_locally, install_replicas_locally, loopback, set_replica_ctx,
+    TestRelease, install_dialed_replicas_locally, install_replicas_locally, loopback,
+    release_identity, self_signed_replica_tls_ctx, set_replica_ctx, set_replica_ctx_of_release,
 };
 use compio::net::TcpStream;
 use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
@@ -38,6 +39,7 @@ use message_bus::framing::{self, MAX_MESSAGE_SIZE};
 use message_bus::replica::auth::{
     self, HandshakeStatus, HeartbeatTimings, LinkPlacement, ReplicaAuth,
 };
+use message_bus::replica::handshake::MAX_COMPATIBLE_RELEASES;
 use message_bus::replica::listener::{MessageHandler, bind, run};
 use message_bus::replica::preamble::{Preamble, read_preamble, write_preamble};
 use message_bus::{IggyMessageBus, MessageBus, MessageBusConfig};
@@ -54,6 +56,9 @@ const PREAMBLE_WAIT: Duration = Duration::from_secs(2);
 /// The placement of link 0 between one-link nodes.
 const PLACEMENT: LinkPlacement = LinkPlacement { links: 1, link: 0 };
 const LINK_0_OF_REPLICA_0: Preamble = Preamble { dialer: 0, link: 0 };
+const OLDER_RELEASE: &str = "1.0.0";
+const NEWER_RELEASE: &str = "1.0.1";
+const OTHER_RELEASE: &str = "0.9.0";
 
 fn noop_handler() -> MessageHandler {
     Rc::new(|_peer, _msg| {})
@@ -196,6 +201,389 @@ async fn dialer_refuses_incompatible_build_with_and_without_auth() {
         peer.await.expect("peer task");
         dialer.shutdown(Duration::from_secs(2)).await;
     }
+}
+
+#[compio::test]
+async fn releases_link_when_either_lists_the_other_on_every_channel() {
+    for (authenticated, encrypted) in [(false, false), (true, false), (true, true)] {
+        for (dialer_release, acceptor_release, dialer_lists, acceptor_lists) in [
+            (OLDER_RELEASE, OLDER_RELEASE, &[][..], &[][..]),
+            (NEWER_RELEASE, OLDER_RELEASE, &[OLDER_RELEASE], &[]),
+            (OLDER_RELEASE, NEWER_RELEASE, &[], &[OLDER_RELEASE]),
+            (
+                NEWER_RELEASE,
+                OLDER_RELEASE,
+                &[OLDER_RELEASE],
+                &[NEWER_RELEASE],
+            ),
+        ] {
+            let acceptor = Rc::new(IggyMessageBus::new(0));
+            set_replica_ctx_of_release(
+                &acceptor,
+                CLUSTER,
+                1,
+                2,
+                authenticated.then(|| ReplicaAuth::new(SECRET_A)),
+                encrypted.then(|| self_signed_replica_tls_ctx(2)),
+                TestRelease {
+                    release: acceptor_release,
+                    compatible_with: acceptor_lists,
+                },
+            );
+            let addr = spawn_listener(&acceptor).await;
+            let dialer = Rc::new(IggyMessageBus::new(0));
+            set_replica_ctx_of_release(
+                &dialer,
+                CLUSTER,
+                0,
+                2,
+                authenticated.then(|| ReplicaAuth::new(SECRET_A)),
+                encrypted.then(|| self_signed_replica_tls_ctx(2)),
+                TestRelease {
+                    release: dialer_release,
+                    compatible_with: dialer_lists,
+                },
+            );
+            spawn_connector(&dialer, addr).await;
+
+            wait_until(|| dialer.replicas().contains(1), Duration::from_secs(2)).await;
+            wait_until(|| acceptor.replicas().contains(0), Duration::from_secs(2)).await;
+            assert_eq!(dialer.take_replica_link_stats().handshake_failures, 0);
+            assert_eq!(acceptor.take_replica_link_stats().handshake_failures, 0);
+
+            dialer.shutdown(Duration::from_secs(2)).await;
+            acceptor.shutdown(Duration::from_secs(2)).await;
+        }
+    }
+}
+
+/// Two releases that list the same third release still refuse each other:
+/// a row names the releases one release links with and implies nothing more.
+#[compio::test]
+async fn releases_that_do_not_list_each_other_refuse_the_link_with_and_without_auth() {
+    for authenticated in [false, true] {
+        let acceptor = Rc::new(IggyMessageBus::new(0));
+        let addr = spawn_acceptor_of_release(
+            &acceptor,
+            authenticated.then(|| ReplicaAuth::new(SECRET_A)),
+            OLDER_RELEASE,
+            &[OTHER_RELEASE],
+        )
+        .await;
+        let dialer = Rc::new(IggyMessageBus::new(0));
+        spawn_dialer_of_release(
+            &dialer,
+            authenticated.then(|| ReplicaAuth::new(SECRET_A)),
+            addr,
+            NEWER_RELEASE,
+            &[OTHER_RELEASE],
+        )
+        .await;
+
+        wait_until(
+            || dialer.take_replica_link_stats().handshake_failures > 0,
+            PREAMBLE_WAIT,
+        )
+        .await;
+        wait_until(
+            || acceptor.take_replica_link_stats().handshake_failures > 0,
+            PREAMBLE_WAIT,
+        )
+        .await;
+        assert!(!dialer.replicas().contains(1));
+        assert!(!acceptor.replicas().contains(0));
+
+        dialer.shutdown(Duration::from_secs(2)).await;
+        acceptor.shutdown(Duration::from_secs(2)).await;
+    }
+}
+
+/// The acceptor answers a release it lists under the identity of that
+/// release, the only one a node without the row accepts.
+#[compio::test]
+async fn acceptor_answers_a_release_it_lists_under_the_identity_of_that_release() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor_of_release(&acceptor, None, NEWER_RELEASE, &[OLDER_RELEASE]).await;
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+    framing::write_message(
+        &mut stream,
+        build_hello_of_release(
+            release_identity(OLDER_RELEASE),
+            &release_identity(NEWER_RELEASE),
+        ),
+    )
+    .await
+    .expect("write hello");
+
+    let challenge = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+        .await
+        .expect("read challenge");
+
+    assert_eq!(
+        auth::read_status(&challenge.header().reserved_command),
+        HandshakeStatus::Ok
+    );
+    assert_eq!(identity_of(&challenge), release_identity(OLDER_RELEASE));
+    wait_until(|| acceptor.replicas().contains(0), Duration::from_secs(2)).await;
+    acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
+/// A hello from another release that lists the release of the acceptor is
+/// answered under the identity of the acceptor.
+#[compio::test]
+async fn acceptor_answers_under_its_own_identity_when_the_hello_lists_its_release() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let addr = spawn_acceptor_of_release(&acceptor, None, OLDER_RELEASE, &[]).await;
+    let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+    framing::write_message(
+        &mut stream,
+        build_hello_of_release(
+            release_identity(NEWER_RELEASE),
+            &[
+                release_identity(OTHER_RELEASE),
+                release_identity(OLDER_RELEASE),
+            ]
+            .concat(),
+        ),
+    )
+    .await
+    .expect("write hello");
+
+    let challenge = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+        .await
+        .expect("read challenge");
+
+    assert_eq!(
+        auth::read_status(&challenge.header().reserved_command),
+        HandshakeStatus::Ok
+    );
+    assert_eq!(identity_of(&challenge), release_identity(OLDER_RELEASE));
+    wait_until(|| acceptor.replicas().contains(0), Duration::from_secs(2)).await;
+    acceptor.shutdown(Duration::from_secs(2)).await;
+}
+
+#[compio::test]
+async fn acceptor_refuses_a_hello_whose_listed_identities_are_cut_short() {
+    for release in [OLDER_RELEASE, NEWER_RELEASE, OTHER_RELEASE] {
+        let acceptor = Rc::new(IggyMessageBus::new(0));
+        let addr =
+            spawn_acceptor_of_release(&acceptor, None, OLDER_RELEASE, &[OTHER_RELEASE]).await;
+        let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+        let mut listed = release_identity(OLDER_RELEASE).to_vec();
+        listed.push(0);
+        framing::write_message(
+            &mut stream,
+            build_hello_of_release(release_identity(release), &listed),
+        )
+        .await
+        .expect("write hello");
+
+        let response = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+            .await
+            .expect("read refusal");
+
+        assert_eq!(
+            auth::read_status(&response.header().reserved_command),
+            HandshakeStatus::IncompatibleBuild
+        );
+        assert!(!acceptor.replicas().contains(0));
+        acceptor.shutdown(Duration::from_secs(2)).await;
+    }
+}
+
+#[compio::test]
+async fn acceptor_enforces_the_hello_identity_limit() {
+    for count in [MAX_COMPATIBLE_RELEASES, MAX_COMPATIBLE_RELEASES + 1] {
+        let acceptor = Rc::new(IggyMessageBus::new(0));
+        let addr = spawn_acceptor_of_release(&acceptor, None, OLDER_RELEASE, &[]).await;
+        let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
+        let listed = release_identity(OLDER_RELEASE).repeat(count);
+        framing::write_message(
+            &mut stream,
+            build_hello_of_release(release_identity(NEWER_RELEASE), &listed),
+        )
+        .await
+        .expect("write hello");
+        let response = framing::read_message(&mut stream, MAX_MESSAGE_SIZE).await;
+        if count == MAX_COMPATIBLE_RELEASES {
+            let challenge = response.expect("read challenge");
+            assert_eq!(
+                auth::read_status(&challenge.header().reserved_command),
+                HandshakeStatus::Ok
+            );
+            assert_eq!(identity_of(&challenge), release_identity(OLDER_RELEASE));
+        } else {
+            assert!(response.is_err());
+            assert!(!acceptor.replicas().contains(0));
+        }
+        acceptor.shutdown(PREAMBLE_WAIT).await;
+    }
+}
+
+/// The hello carries the identity of the dialer in its header and the
+/// identities of the releases it lists as its body. The dialer then links
+/// under a listed identity the acceptor answers with, and under no other.
+#[compio::test]
+async fn dialer_sends_the_identities_it_lists_and_links_under_one_of_them() {
+    for (answered_release, links) in [(OLDER_RELEASE, true), ("1.0.2", false)] {
+        let (listener, addr) = bind(loopback()).await.expect("bind");
+        let peer = compio::runtime::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_preamble(&mut stream, PREAMBLE_WAIT)
+                .await
+                .expect("read preamble");
+            let hello = framing::read_message(&mut stream, MAX_MESSAGE_SIZE)
+                .await
+                .expect("read hello");
+            let challenge = build_raw(CLUSTER, 1, Command::ReplicaChallenge).transmute_header(
+                |old, header: &mut GenericHeader| {
+                    *header = old;
+                    header.reserved_command
+                        [auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+                        .copy_from_slice(&release_identity(answered_release));
+                },
+            );
+            framing::write_message(&mut stream, challenge)
+                .await
+                .expect("write challenge");
+            (hello, stream)
+        });
+        let dialer = Rc::new(IggyMessageBus::new(0));
+        spawn_dialer_of_release(
+            &dialer,
+            None,
+            addr,
+            NEWER_RELEASE,
+            &[OLDER_RELEASE, OTHER_RELEASE],
+        )
+        .await;
+
+        let (hello, _held_link) = peer.await.expect("peer task");
+
+        assert_eq!(identity_of(&hello), release_identity(NEWER_RELEASE));
+        assert_eq!(
+            hello.body(),
+            [
+                release_identity(OLDER_RELEASE),
+                release_identity(OTHER_RELEASE),
+            ]
+            .concat()
+        );
+        if links {
+            wait_until(|| dialer.replicas().contains(1), Duration::from_secs(2)).await;
+        } else {
+            wait_until(
+                || dialer.take_replica_link_stats().handshake_failures > 0,
+                PREAMBLE_WAIT,
+            )
+            .await;
+            assert!(!dialer.replicas().contains(1), "{answered_release}");
+        }
+        dialer.shutdown(Duration::from_secs(2)).await;
+    }
+}
+
+/// A row longer than a hello carries is never sent, because every acceptor
+/// would refuse the frame unread.
+#[compio::test]
+async fn dialer_sends_no_hello_for_a_row_past_the_identity_limit() {
+    let (listener, addr) = bind(loopback()).await.expect("bind");
+    let peer = compio::runtime::spawn(async move {
+        let (mut stream, _) = listener.accept().await.expect("accept");
+        read_preamble(&mut stream, PREAMBLE_WAIT)
+            .await
+            .expect("read preamble");
+        framing::read_message(&mut stream, MAX_MESSAGE_SIZE).await
+    });
+    let releases: Vec<String> = (0..=MAX_COMPATIBLE_RELEASES)
+        .map(|patch| format!("0.8.{patch}"))
+        .collect();
+    let listed: Vec<&str> = releases.iter().map(String::as_str).collect();
+    let dialer = Rc::new(IggyMessageBus::new(0));
+    spawn_dialer_of_release(&dialer, None, addr, NEWER_RELEASE, &listed).await;
+
+    let hello = peer.await.expect("peer task");
+
+    assert!(
+        matches!(hello, Err(IggyError::ConnectionClosed)),
+        "expected a close without a hello"
+    );
+    assert!(!dialer.replicas().contains(1));
+    dialer.shutdown(Duration::from_secs(2)).await;
+}
+
+/// A relay between two authenticated nodes drops one of the identities the
+/// dialer lists. The acceptor still finds its own identity there and answers,
+/// but its MAC covers the hello it received, so the dialer refuses it.
+#[compio::test]
+#[allow(clippy::cast_possible_truncation)]
+async fn authenticated_handshake_fails_when_a_relay_alters_the_hello() {
+    let acceptor = Rc::new(IggyMessageBus::new(0));
+    let acceptor_addr = spawn_acceptor_of_release(
+        &acceptor,
+        Some(ReplicaAuth::new(SECRET_A)),
+        OLDER_RELEASE,
+        &[],
+    )
+    .await;
+    let (listener, relay_addr) = bind(loopback()).await.expect("bind relay");
+    let relay = compio::runtime::spawn(async move {
+        let (mut dialer_leg, _) = listener.accept().await.expect("accept");
+        read_preamble(&mut dialer_leg, PREAMBLE_WAIT)
+            .await
+            .expect("read preamble");
+        let mut acceptor_leg = connect_link(acceptor_addr, LINK_0_OF_REPLICA_0).await;
+        let hello = framing::read_message(&mut dialer_leg, MAX_MESSAGE_SIZE)
+            .await
+            .expect("read hello");
+        let kept = &hello.body()[..auth::IDENTITY_LEN];
+        let size = HEADER_SIZE + kept.len();
+        let mut altered = Message::<GenericHeader>::new(size).transmute_header(
+            |_, header: &mut GenericHeader| {
+                *header = *hello.header();
+                header.size = size as u32;
+            },
+        );
+        altered.as_mut_slice()[HEADER_SIZE..].copy_from_slice(kept);
+        framing::write_message(&mut acceptor_leg, altered)
+            .await
+            .expect("forward the altered hello");
+        let challenge = framing::read_message(&mut acceptor_leg, MAX_MESSAGE_SIZE)
+            .await
+            .expect("read challenge");
+        let status = auth::read_status(&challenge.header().reserved_command);
+        framing::write_message(&mut dialer_leg, challenge)
+            .await
+            .expect("forward challenge");
+        let finish = framing::read_message(&mut dialer_leg, MAX_MESSAGE_SIZE).await;
+        (status, finish.is_err())
+    });
+    let dialer = Rc::new(IggyMessageBus::new(0));
+    spawn_dialer_of_release(
+        &dialer,
+        Some(ReplicaAuth::new(SECRET_A)),
+        relay_addr,
+        NEWER_RELEASE,
+        &[OLDER_RELEASE, OTHER_RELEASE],
+    )
+    .await;
+
+    let (status, dialer_closed) = relay.await.expect("relay task");
+
+    assert_eq!(
+        status,
+        HandshakeStatus::Ok,
+        "the acceptor must answer the altered hello, or this proves nothing"
+    );
+    assert!(
+        dialer_closed,
+        "the dialer answered a challenge for a hello it did not send"
+    );
+    assert!(!dialer.replicas().contains(1));
+    assert!(!acceptor.replicas().contains(0));
+
+    dialer.shutdown(Duration::from_secs(2)).await;
+    acceptor.shutdown(Duration::from_secs(2)).await;
 }
 
 #[compio::test]
@@ -543,6 +931,83 @@ async fn acceptor_closes_a_slow_link_one_grace_after_connect() {
     acceptor.shutdown(Duration::from_secs(2)).await;
 }
 
+/// [`spawn_acceptor`] for a node that runs `release` and lists
+/// `compatible_with`.
+#[allow(clippy::future_not_send)]
+async fn spawn_acceptor_of_release(
+    bus: &Rc<IggyMessageBus>,
+    auth: Option<ReplicaAuth>,
+    release: &str,
+    compatible_with: &[&str],
+) -> std::net::SocketAddr {
+    set_replica_ctx_of_release(
+        bus,
+        CLUSTER,
+        1,
+        2,
+        auth,
+        None,
+        TestRelease {
+            release,
+            compatible_with,
+        },
+    );
+    spawn_listener(bus).await
+}
+
+/// [`spawn_dialer`] for a node that runs `release` and lists
+/// `compatible_with`.
+#[allow(clippy::future_not_send)]
+async fn spawn_dialer_of_release(
+    bus: &Rc<IggyMessageBus>,
+    auth: Option<ReplicaAuth>,
+    addr: std::net::SocketAddr,
+    release: &str,
+    compatible_with: &[&str],
+) {
+    set_replica_ctx_of_release(
+        bus,
+        CLUSTER,
+        0,
+        2,
+        auth,
+        None,
+        TestRelease {
+            release,
+            compatible_with,
+        },
+    );
+    spawn_connector(bus, addr).await;
+}
+
+/// Run the inbound listener of replica 1 on `bus`, whose handshake context
+/// is already set, and return its address.
+#[allow(clippy::future_not_send)]
+async fn spawn_listener(bus: &Rc<IggyMessageBus>) -> std::net::SocketAddr {
+    let (listener, addr) = bind(loopback()).await.expect("bind acceptor");
+    let token = bus.token();
+    let delegate = install_replicas_locally(bus.clone(), noop_handler());
+    let handle = compio::runtime::spawn(async move {
+        run(listener, token, delegate).await;
+    });
+    bus.track_background(handle);
+    addr
+}
+
+/// Start the connector of replica 0 on `bus`, whose handshake context is
+/// already set, toward replica 1 at `addr`.
+#[allow(clippy::future_not_send)]
+async fn spawn_connector(bus: &Rc<IggyMessageBus>, addr: std::net::SocketAddr) {
+    start_connector(
+        bus,
+        0,
+        vec![(1, addr)],
+        install_dialed_replicas_locally(bus.clone(), noop_handler()),
+        LONG_PERIOD,
+    )
+    .await;
+}
+
 /// Connect to `addr` and send `preamble`, the way the owner shard of a
 /// dialer starts a link.
 #[allow(clippy::future_not_send)]
@@ -575,6 +1040,39 @@ fn build_hello(
         }
         PLACEMENT.write(&mut h.reserved_command);
     })
+}
+
+/// Build a raw unauthenticated `ReplicaHello` of replica 0 for link 0 that
+/// carries `identity` in its header and `listed`, the identities of the
+/// releases its sender lists, as its body.
+#[allow(clippy::cast_possible_truncation)]
+fn build_hello_of_release(
+    identity: [u8; auth::IDENTITY_LEN],
+    listed: &[u8],
+) -> Message<GenericHeader> {
+    let size = HEADER_SIZE + listed.len();
+    let mut hello =
+        Message::<GenericHeader>::new(size).transmute_header(|_, h: &mut GenericHeader| {
+            h.command = Command::ReplicaHello;
+            h.cluster = CLUSTER;
+            h.replica = 0;
+            h.size = size as u32;
+            h.reserved_command[auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN]
+                .copy_from_slice(&identity);
+            PLACEMENT.write(&mut h.reserved_command);
+        });
+    hello.as_mut_slice()[HEADER_SIZE..].copy_from_slice(listed);
+    hello
+}
+
+/// The build identity a handshake frame carries.
+fn identity_of(message: &Message<GenericHeader>) -> [u8; auth::IDENTITY_LEN] {
+    let mut identity = [0; auth::IDENTITY_LEN];
+    identity.copy_from_slice(
+        &message.header().reserved_command
+            [auth::IDENTITY_OFFSET..auth::IDENTITY_OFFSET + auth::IDENTITY_LEN],
+    );
+    identity
 }
 
 /// Build a raw frame with an arbitrary command for the wire-level tests (used to
