@@ -415,6 +415,12 @@ try {
 a partition reader, as an async iterable, with a handler loop, or as a
 `Readable`.
 
+Breaking out of an iteration keeps the unread remainder of its batch. A later
+iteration or `consume()` continues with the next message. A seek discards the
+unread remainder for that partition. Group revocation also discards it under
+`CommitPolicy.Manual` and `CommitPolicy.Auto`. Use one iterator or handler loop
+at a time.
+
 ```typescript
 import { CommitAfter, CommitPolicy } from "apache-iggy";
 
