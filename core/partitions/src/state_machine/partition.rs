@@ -170,11 +170,10 @@ where
                 "state machines have not applied the view's history",
             ));
         }
-        // A command never waits in the request queue, so the slots it takes
-        // are the ones counted here.
-        if self.local_request_must_queue()
-            || self.uncommitted_commands() >= self.command_pipeline_slots()
-        {
+        // A command waits in the request queue behind the requests admitted
+        // before it, and its promotion does not check the share again, so the
+        // queued commands count toward it.
+        if self.uncommitted_commands() + self.queued_commands() >= self.command_pipeline_slots() {
             return Some((
                 IggyError::TransientNotAccepted,
                 "state-machine commands hold their share of the pipeline",
@@ -196,6 +195,17 @@ where
             .journal()
             .inner
             .commands_in(commit_min.saturating_add(1)..)
+    }
+
+    fn queued_commands(&self) -> usize {
+        self.consensus().with_pipeline(|pipeline| {
+            pipeline
+                .pending_requests()
+                .filter(|request| {
+                    request.message.header().operation == Operation::StateMachineCommand
+                })
+                .count()
+        })
     }
 
     /// Check a replicated command before journaling it. Ownership is not
