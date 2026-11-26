@@ -26,6 +26,11 @@
 //! ordinary journal repair. Artifacts ride the plane-agnostic manifest/chunk
 //! protocol from `core/consensus`; everything in this module is the
 //! partition-specific payload handling on either end.
+//!
+//! A tiered partition's segments that the store holds travel as their chain
+//! records alone, and the receiver reads them from the store. A replica that
+//! cannot read its store waits for it before it requests the transfer of a
+//! tiered partition, and stays behind its group until then.
 
 use crate::IggyPartition;
 use crate::iggy_partition::{InstalledConsumerGroupOwner, InstalledPartitionHistory};
