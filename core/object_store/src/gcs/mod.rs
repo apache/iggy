@@ -1930,7 +1930,7 @@ mod tests {
             "name": name,
             "size": "18",
             "generation": generation.to_string(),
-            "updated": updated,
+            "timeCreated": updated,
             "crc32c": json::encode_crc32c(crc32c),
         })
         .to_string()
@@ -2004,7 +2004,7 @@ mod tests {
             "name": "t",
             "size": size,
             "generation": "55",
-            "updated": "2026-01-01T00:00:00Z",
+            "timeCreated": "2026-01-01T00:00:00Z",
             "crc32c": json::encode_crc32c(crc32c::crc32c(PART_BYTES)),
         });
         (200, body.to_string().into_bytes())
@@ -2244,7 +2244,7 @@ mod tests {
                 "name": name,
                 "size": "1",
                 "generation": generation,
-                "updated": updated,
+                "timeCreated": updated,
             })
         };
         let old = at(chrono::TimeDelta::hours(2));
@@ -2313,7 +2313,7 @@ mod tests {
                     "name": parts_layout().upload_part_key(1, 1),
                     "size": "1",
                     "generation": "1",
-                    "updated": two_hours_ago,
+                    "timeCreated": two_hours_ago,
                 }]
             });
             (200, body.to_string().into_bytes())
@@ -2350,7 +2350,7 @@ mod tests {
                     "name": format!("{prefix}{number:05}"),
                     "size": "1",
                     "generation": generation,
-                    "updated": "2026-01-01T00:00:00Z",
+                    "timeCreated": "2026-01-01T00:00:00Z",
                 })
             };
             let body = serde_json::json!({
