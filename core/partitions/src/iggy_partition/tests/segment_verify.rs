@@ -191,6 +191,33 @@ async fn given_a_segment_retention_trims_while_its_job_runs_when_the_job_finds_i
 }
 
 #[compio::test]
+async fn given_a_missing_segment_when_retention_trims_it_should_drop_the_finding_at_the_next_request()
+ {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
+    let VerifyBegin::Job { id, job, .. } = partition.begin_segment_verify(IggyTimestamp::now())
+    else {
+        panic!("no job");
+    };
+    let missing = SegmentHeads {
+        log: ObjectHead::NotFound,
+        ..heads_of_stored(job.segments[0])
+    };
+    let report = SegmentVerifyReport {
+        answered: vec![missing, heads_of_stored(job.segments[1])],
+        unanswered: None,
+    };
+    partition.finish_segment_verify(id, &Ok(report));
+    assert_eq!(partition.stored_segment_findings(), (1, 0));
+
+    Box::pin(partition.remove_sealed_segments_up_to(SEALED[0].1)).await;
+    Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
+    partition.begin_segment_verify(IggyTimestamp::now());
+
+    assert_eq!(partition.stored_segment_findings(), (0, 0));
+    assert_eq!(partition.gauge_share().stored_segments_missing, 0);
+}
+
+#[compio::test]
 async fn given_a_replica_that_does_not_verify_when_asking_for_a_job_should_start_none() {
     let (_directory, mut backup) = Box::pin(partition_with_stored(2)).await;
     let view = backup.consensus.view() + 1;

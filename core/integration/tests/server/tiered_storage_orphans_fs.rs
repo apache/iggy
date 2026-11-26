@@ -40,7 +40,7 @@ use super::tiered_storage_fs::{
     metric, send_every_message, wait_for_upload,
 };
 
-/// Short, so two sweeps and the grace fit a test. The sweep runs every
+/// Short, so the sweeps a delete needs fit a test. The sweep runs every
 /// grace when that is shorter than an hour.
 const GRACE: &str = "2s";
 /// How long the sweeps may take to delete an orphan, or to show anything.

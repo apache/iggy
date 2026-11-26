@@ -254,6 +254,7 @@ mod tests {
         fn list_root(
             &self,
             _after: Option<String>,
+            _claimed_at: SystemTime,
             _scope: TierScopeToken,
         ) -> LocalBoxFuture<'static, RootListOutcome> {
             unreachable!("the sweep of uploads lists no root")
@@ -342,9 +343,10 @@ mod tests {
             fn list_root(
                 &self,
                 after: Option<String>,
+                claimed_at: SystemTime,
                 scope: TierScopeToken,
             ) -> LocalBoxFuture<'static, RootListOutcome> {
-                self.0.list_root(after, scope)
+                self.0.list_root(after, claimed_at, scope)
             }
 
             fn sweep_uploads(
