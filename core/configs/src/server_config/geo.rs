@@ -189,8 +189,8 @@ pub struct GeoPeerConfig {
     #[serde(default)]
     #[config_env(leaf)]
     pub url_style: S3UrlStyle,
-    /// The access key ID of the static `s3` credentials, which an `s3` peer
-    /// needs.
+    /// The access key ID of the static `s3` credentials. Without both keys,
+    /// an `s3` peer reads with the node's web identity or instance role.
     // skip_serializing keeps credentials out of the runtime
     // `current_config.toml`, as for the tiered storage credentials.
     #[serde(default, skip_serializing)]
@@ -374,10 +374,25 @@ impl Validatable<ConfigurationError> for GeoConfig {
 impl GeoPeerConfig {
     /// What the printed configuration shows for the credentials.
     fn credentials(&self) -> &'static str {
-        if self.access_key_id.is_empty() && self.secret_access_key.is_empty() {
-            "none"
-        } else {
+        if !self.access_key_id.is_empty() || !self.secret_access_key.is_empty() {
             "[redacted]"
+        } else if self.backend == TieredStorageBackend::S3 {
+            "web identity or instance role"
+        } else {
+            "none"
+        }
+    }
+
+    /// The static key that is missing while the other one is set, and that
+    /// other one.
+    fn half_of_the_keys(&self) -> Option<(&'static str, &'static str)> {
+        match (
+            self.access_key_id.is_empty(),
+            self.secret_access_key.is_empty(),
+        ) {
+            (true, false) => Some(("access_key_id", "secret_access_key")),
+            (false, true) => Some(("secret_access_key", "access_key_id")),
+            (true, true) | (false, false) => None,
         }
     }
 
@@ -402,8 +417,12 @@ impl GeoPeerConfig {
             TieredStorageBackend::Fs if self.path.trim().is_empty() => "path",
             TieredStorageBackend::S3 if self.bucket.trim().is_empty() => "bucket",
             TieredStorageBackend::S3 if self.region.trim().is_empty() => "region",
-            TieredStorageBackend::S3 if self.access_key_id.is_empty() => "access_key_id",
-            TieredStorageBackend::S3 if self.secret_access_key.is_empty() => "secret_access_key",
+            TieredStorageBackend::S3 if let Some((missing, set)) = self.half_of_the_keys() => {
+                return Some(format!(
+                    "{missing} must be set with {set}, or neither for the node's web identity \
+                     or instance role"
+                ));
+            }
             TieredStorageBackend::Fs | TieredStorageBackend::S3 => {
                 if self.prefix.is_empty() {
                     return Some("prefix must not be empty".to_owned());
@@ -987,5 +1006,76 @@ mod tests {
         assert!(text.contains("origin: dc-b"), "{text}");
         assert!(text.contains("credentials: [redacted]"), "{text}");
         assert!(text.contains("credentials: none"), "{text}");
+    }
+
+    fn keyless_s3_peer(origin: &str) -> GeoPeerConfig {
+        GeoPeerConfig {
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            ..s3_peer(origin)
+        }
+    }
+
+    #[test]
+    fn given_an_s3_peer_without_keys_when_validating_should_accept_it_for_the_node_credentials() {
+        let config = with_peers(vec![keyless_s3_peer("dc-b"), s3_peer("dc-c")]);
+
+        assert_eq!(config.peers[0].fault(), None);
+        assert!(config.validate().is_ok(), "{config}");
+    }
+
+    #[test]
+    fn given_an_s3_peer_with_one_key_when_validating_should_refuse_naming_the_other() {
+        let only_id = GeoPeerConfig {
+            secret_access_key: String::new(),
+            ..s3_peer("dc-b")
+        };
+        let only_secret = GeoPeerConfig {
+            access_key_id: String::new(),
+            ..s3_peer("dc-b")
+        };
+
+        for (peer, missing) in [
+            (only_id, "secret_access_key must be set with access_key_id"),
+            (
+                only_secret,
+                "access_key_id must be set with secret_access_key",
+            ),
+        ] {
+            let fault = peer.fault().unwrap_or_default();
+            assert!(fault.starts_with(missing), "{fault}");
+            assert!(with_peers(vec![peer]).validate().is_err(), "{missing}");
+        }
+    }
+
+    #[test]
+    fn given_s3_peers_with_and_without_keys_when_printing_should_name_the_source_and_never_a_key() {
+        let config = with_peers(vec![
+            keyless_s3_peer("dc-b"),
+            GeoPeerConfig {
+                secret_access_key: String::new(),
+                ..s3_peer("dc-c")
+            },
+            fs_peer("dc-d"),
+            gcs_peer("dc-e"),
+        ]);
+
+        let printed = config.to_string();
+        let peers = config
+            .peers
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+
+        assert!(!printed.contains("AKIDPEEREXAMPLE"), "{printed}");
+        assert!(!format!("{config:?}").contains("AKIDPEEREXAMPLE"));
+        assert!(
+            peers[0].contains("credentials: web identity or instance role"),
+            "{}",
+            peers[0]
+        );
+        assert!(peers[1].contains("credentials: [redacted]"), "{}", peers[1]);
+        assert!(peers[2].contains("credentials: none"), "{}", peers[2]);
+        assert!(peers[3].contains("credentials: none"), "{}", peers[3]);
     }
 }

@@ -204,7 +204,7 @@ async fn send_and_poll(harness: &TestHarness) {
 }
 
 /// Waits until `/metrics` shows each `(origin, verified, unreachable)`.
-async fn wait_for_gauges(http: &HttpClient, expected: &[(&str, bool, bool)]) {
+pub(super) async fn wait_for_gauges(http: &HttpClient, expected: &[(&str, bool, bool)]) {
     let deadline = Instant::now() + CHECK_DEADLINE;
     loop {
         let exposition = scrape(http).await;
