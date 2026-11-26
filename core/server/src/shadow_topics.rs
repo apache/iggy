@@ -903,6 +903,7 @@ fn retire(
 
 /// A stream create or rename, or a topic adoption, that committed metadata
 /// lacks for `origin`.
+#[allow(clippy::too_many_lines)]
 fn adopt(
     inner: &StreamsInner,
     origin: &str,
@@ -1007,7 +1008,7 @@ fn adopt(
             return Some(ShadowTopicRequest::AdoptTopic {
                 target: ShadowTopicTarget {
                     stream_id: u32::try_from(stream_id).ok()?,
-                    source: source.clone(),
+                    source,
                     topic_id: u32::try_from(topic_id).ok()?,
                     created_revision: object.key.created_revision,
                 },

@@ -652,6 +652,7 @@ impl<S: ObjectStore> PeerChecker<S> {
         delay
     }
 
+    #[allow(clippy::too_many_lines)]
     fn log(&self, before: PeerStatus, after: PeerStatus, check: &PeerCheck) {
         let origin = self.origin.as_str();
         let root = self.layout.root();
@@ -808,7 +809,7 @@ impl PeerCheck {
 
     /// A read of the check that failed with `error`: `outage` when a retry
     /// can get past it, a refusal that only an operator ends otherwise.
-    fn failed(error: ObjectStoreError, outage: PeerRead) -> Self {
+    const fn failed(error: ObjectStoreError, outage: PeerRead) -> Self {
         let read = match error.class() {
             ErrorClass::Transient => outage,
             ErrorClass::NotFound | ErrorClass::PreconditionFailed | ErrorClass::Permanent => {

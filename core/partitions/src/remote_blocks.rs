@@ -157,7 +157,7 @@ impl PartitionReadSettings {
 /// Whether a partition left the shard, which the partition shares with the
 /// snapshots of its polls and rewrites.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PartitionLeft(Rc<Cell<bool>>);
+pub struct PartitionLeft(Rc<Cell<bool>>);
 
 impl PartitionLeft {
     pub(crate) fn set(&self) {
