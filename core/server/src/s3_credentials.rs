@@ -36,6 +36,8 @@ use iggy_object_store::s3::credentials::{
     CredentialError, CredentialSource, CredentialTransport, Credentials, SharedCredentials,
 };
 
+use tracing::info;
+
 use crate::credential_refresh::{self, Refresh};
 use crate::server_error::ServerError;
 
@@ -47,13 +49,41 @@ use crate::server_error::ServerError;
 /// [`ServerError::TieredStorageCredentials`] when the source refuses the
 /// first fetch for a reason that a retry cannot fix, such as a role that
 /// does not trust the token.
-pub fn credentials(config: &TieredStorageConfig) -> Result<Option<SharedCredentials>, ServerError> {
-    credentials_from(config, |name| std::env::var(name).ok())
+pub fn credentials(
+    config: &TieredStorageConfig,
+    roles: &mut RoleCredentials,
+) -> Result<Option<SharedCredentials>, ServerError> {
+    credentials_from(config, |name| std::env::var(name).ok(), roles)
+}
+
+/// The roles whose credentials a refresher of this node already keeps fresh,
+/// each with its cell. A store that takes one of them shares the cell, so a
+/// node asks the credential service once per role and not once per store: a
+/// node with many peers would otherwise make one exchange per peer for the
+/// same answer.
+///
+/// Two stores share only when their sources are equal in every field, the
+/// role and the address of the service included.
+#[derive(Default)]
+pub struct RoleCredentials(Vec<(CredentialSource, SharedCredentials)>);
+
+impl RoleCredentials {
+    fn of(&self, source: &CredentialSource) -> Option<SharedCredentials> {
+        self.0
+            .iter()
+            .find(|(kept, _)| kept == source)
+            .map(|(_, shared)| shared.clone())
+    }
+
+    fn keep(&mut self, source: CredentialSource, shared: SharedCredentials) {
+        self.0.push((source, shared));
+    }
 }
 
 /// The credentials that every shard's store of the `s3` geo peer `peer`
 /// signs with: its static keys, or else the node's web identity or instance
-/// role. The boot does not wait for the first credentials of a role.
+/// role. The boot does not wait for the first credentials of a role. A peer
+/// whose role is in `roles` shares its cell and starts no refresher.
 ///
 /// The node, not the peer, calls STS, so web identity uses STS in
 /// `node_region`, the region of `[tiered_storage]`, and in the peer's region
@@ -65,13 +95,21 @@ pub fn credentials(config: &TieredStorageConfig) -> Result<Option<SharedCredenti
 pub fn peer_credentials(
     peer: &GeoPeerConfig,
     node_region: &str,
+    roles: &mut RoleCredentials,
 ) -> Result<SharedCredentials, ServerError> {
-    peer_credentials_from(peer, node_region, |name| std::env::var(name).ok())
+    peer_credentials_from(
+        peer,
+        node_region,
+        |name| std::env::var(name).ok(),
+        roles,
+        credential_refresh::start,
+    )
 }
 
 fn credentials_from(
     config: &TieredStorageConfig,
     env: impl Fn(&str) -> Option<String>,
+    roles: &mut RoleCredentials,
 ) -> Result<Option<SharedCredentials>, ServerError> {
     if config.backend != TieredStorageBackend::S3 {
         return Ok(None);
@@ -94,14 +132,19 @@ fn credentials_from(
         return Ok(Some(SharedCredentials::fixed(keys)));
     }
     let shared = SharedCredentials::refreshed();
-    credential_refresh::start_and_wait(S3Refresh::backend(source, shared.clone()))?;
+    credential_refresh::start_and_wait(S3Refresh::backend(source.clone(), shared.clone()))?;
+    roles.keep(source, shared.clone());
     Ok(Some(shared))
 }
 
+/// `start` starts the refresher of a role that no store of the node takes
+/// yet, without waiting for its first fetch.
 fn peer_credentials_from(
     peer: &GeoPeerConfig,
     node_region: &str,
     env: impl Fn(&str) -> Option<String>,
+    roles: &mut RoleCredentials,
+    start: impl FnOnce(S3Refresh) -> Result<(), ServerError>,
 ) -> Result<SharedCredentials, ServerError> {
     let refuse = |reason: String| ServerError::GeoPeer {
         origin: peer.origin.clone(),
@@ -118,9 +161,21 @@ fn peer_credentials_from(
     if let CredentialSource::Static(keys) = source {
         return Ok(SharedCredentials::fixed(keys));
     }
+    if let Some(shared) = roles.of(&source) {
+        info!(
+            source = source.name(),
+            "geo peer {:?} signs with credentials that the node already keeps fresh", peer.origin
+        );
+        return Ok(shared);
+    }
     let shared = SharedCredentials::refreshed();
-    credential_refresh::start(S3Refresh::peer(&peer.origin, source, shared.clone()))
-        .map_err(|error| refuse(error.to_string()))?;
+    start(S3Refresh::peer(
+        &peer.origin,
+        source.clone(),
+        shared.clone(),
+    ))
+    .map_err(|error| refuse(error.to_string()))?;
+    roles.keep(source, shared.clone());
     Ok(shared)
 }
 
@@ -193,7 +248,7 @@ impl Refresh for S3Refresh {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::future::{Future, ready};
     use std::path::PathBuf;
@@ -366,14 +421,14 @@ mod tests {
 
     #[test]
     fn given_static_keys_when_picking_credentials_should_fix_them_without_a_refresher() {
-        let shared = credentials_from(&s3_section("AKIDEXAMPLE"), |_| None)
+        let shared = credentials_from(&s3_section("AKIDEXAMPLE"), |_| None, &mut roles())
             .unwrap()
             .unwrap();
 
         assert!(!shared.refreshes());
         assert_eq!(key_of(&shared).as_deref(), Some("AKIDEXAMPLE"));
         assert!(
-            credentials_from(&TieredStorageConfig::default(), |_| None)
+            credentials_from(&TieredStorageConfig::default(), |_| None, &mut roles())
                 .unwrap()
                 .is_none()
         );
@@ -381,9 +436,11 @@ mod tests {
 
     #[test]
     fn given_no_source_when_picking_credentials_should_refuse_the_boot() {
-        let result = credentials_from(&s3_section(""), |name| {
-            (name == "AWS_EC2_METADATA_DISABLED").then(|| "true".to_owned())
-        });
+        let result = credentials_from(
+            &s3_section(""),
+            |name| (name == "AWS_EC2_METADATA_DISABLED").then(|| "true".to_owned()),
+            &mut roles(),
+        );
 
         assert!(
             matches!(result, Err(ServerError::TieredStorage { .. })),
@@ -397,12 +454,16 @@ mod tests {
         let token_file: PathBuf = directory.path().join("token");
         let token_file_text = token_file.to_string_lossy().into_owned();
 
-        let result = credentials_from(&s3_section(""), move |name| match name {
-            "AWS_WEB_IDENTITY_TOKEN_FILE" => Some(token_file_text.clone()),
-            "AWS_ROLE_ARN" => Some("arn:aws:iam::123456789012:role/iggy".to_owned()),
-            "AWS_ENDPOINT_URL_STS" => Some("http://127.0.0.1:1".to_owned()),
-            _ => None,
-        });
+        let result = credentials_from(
+            &s3_section(""),
+            move |name| match name {
+                "AWS_WEB_IDENTITY_TOKEN_FILE" => Some(token_file_text.clone()),
+                "AWS_ROLE_ARN" => Some("arn:aws:iam::123456789012:role/iggy".to_owned()),
+                "AWS_ENDPOINT_URL_STS" => Some("http://127.0.0.1:1".to_owned()),
+                _ => None,
+            },
+            &mut roles(),
+        );
 
         assert!(
             matches!(
@@ -457,12 +518,25 @@ mod tests {
         env_of(&pairs)
     }
 
+    fn roles() -> RoleCredentials {
+        RoleCredentials::default()
+    }
+
+    /// For a peer that must not get a refresher. It takes the refresher as
+    /// the starter does.
+    #[allow(clippy::needless_pass_by_value)]
+    fn no_refresher(refresh: S3Refresh) -> Result<(), ServerError> {
+        panic!("a refresher started for {}", refresh.subject());
+    }
+
     #[test]
     fn given_static_keys_when_picking_a_peers_credentials_should_fix_them_without_a_refresher() {
         let shared = peer_credentials_from(
             &s3_peer("AKIDPEEREXAMPLE"),
             "eu-central-1",
             web_identity_env(&[]),
+            &mut roles(),
+            no_refresher,
         )
         .unwrap();
 
@@ -502,6 +576,8 @@ mod tests {
             &s3_peer(""),
             "eu-central-1",
             env_of(&[("AWS_EC2_METADATA_DISABLED", "true")]),
+            &mut roles(),
+            no_refresher,
         );
 
         let Err(ServerError::GeoPeer { origin, reason }) = result else {
@@ -548,32 +624,141 @@ mod tests {
         );
     }
 
-    /// A role that refuses the peer for good never stops the boot: the
-    /// refresher starts in the background and keeps fetching, and the store
-    /// has no credentials until a fetch succeeds.
+    /// The boot does not wait for a peer's first credentials: the peer's role
+    /// goes to a refresher, and the cell is empty until that fetches.
     #[test]
-    fn given_a_peer_role_that_refuses_the_first_fetch_when_picking_its_credentials_should_not_refuse_the_boot()
+    fn given_a_peer_role_when_picking_its_credentials_should_start_a_refresher_and_not_wait() {
+        let started = RefCell::new(Vec::new());
+
+        let shared = peer_credentials_from(
+            &s3_peer(""),
+            "eu-central-1",
+            web_identity_env(&[]),
+            &mut roles(),
+            |refresh| {
+                started.borrow_mut().push(refresh.subject().to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(shared.refreshes());
+        assert!(shared.current().is_none());
+        assert_eq!(*started.borrow(), [r#"geo peer "dc-b""#]);
+    }
+
+    #[test]
+    fn given_a_refresher_that_does_not_start_when_picking_a_peers_credentials_should_refuse_naming_the_peer()
      {
-        let directory = tempfile::tempdir().unwrap();
-        let token_file = directory
-            .path()
-            .join("token")
-            .to_string_lossy()
-            .into_owned();
+        let mut roles = roles();
 
         let result = peer_credentials_from(
             &s3_peer(""),
             "eu-central-1",
-            env_of(&[
-                ("AWS_WEB_IDENTITY_TOKEN_FILE", token_file.as_str()),
-                ("AWS_ROLE_ARN", ROLE_ARN),
-                ("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1"),
-            ]),
+            web_identity_env(&[]),
+            &mut roles,
+            |_| {
+                Err(ServerError::TieredStorage {
+                    reason: "no runtime".to_owned(),
+                })
+            },
         );
 
-        let shared = result.unwrap();
-        assert!(shared.refreshes());
-        assert!(shared.current().is_none());
+        let Err(ServerError::GeoPeer { origin, reason }) = result else {
+            panic!("a peer without a refresher was accepted");
+        };
+        assert_eq!(origin, "dc-b");
+        assert!(reason.contains("no runtime"), "{reason}");
+        assert!(roles.0.is_empty(), "a role without a refresher was kept");
+    }
+
+    /// Stores that take the same role share one refresher and one cell, so
+    /// a node with many peers asks the credential service once per role.
+    #[test]
+    fn given_peers_and_a_backend_of_one_role_when_picking_credentials_should_share_one_refresher() {
+        let mut roles = roles();
+        let started = Cell::new(0);
+        let start = |_: S3Refresh| {
+            started.set(started.get() + 1);
+            Ok(())
+        };
+        let pick = |origin: &str, roles: &mut RoleCredentials| {
+            let peer = GeoPeerConfig {
+                origin: origin.to_owned(),
+                ..s3_peer("")
+            };
+            peer_credentials_from(&peer, "eu-central-1", web_identity_env(&[]), roles, start)
+                .unwrap()
+        };
+
+        let first = pick("dc-b", &mut roles);
+        let second = pick("dc-c", &mut roles);
+        first.replace(Credentials {
+            access_key_id: "ASIASHARED".to_owned(),
+            secret_access_key: "secret".to_owned(),
+            session_token: Some("token".to_owned()),
+        });
+
+        assert_eq!(started.get(), 1);
+        assert_eq!(second.current().unwrap().access_key_id, "ASIASHARED");
+
+        // The backend's refresher keeps the same role fresh.
+        let backend = SharedCredentials::refreshed();
+        let mut roles = RoleCredentials::default();
+        let source = peer_source(&s3_peer(""), "eu-central-1", web_identity_env(&[])).unwrap();
+        roles.keep(source, backend.clone());
+        let peer = pick("dc-b", &mut roles);
+        backend.replace(Credentials {
+            access_key_id: "ASIABACKEND".to_owned(),
+            secret_access_key: "secret".to_owned(),
+            session_token: None,
+        });
+
+        assert_eq!(started.get(), 1, "the peer started a refresher of its own");
+        assert_eq!(peer.current().unwrap().access_key_id, "ASIABACKEND");
+    }
+
+    /// Another role, or the same role at another address of the service, is
+    /// another source, with a refresher and a cell of its own.
+    #[test]
+    fn given_peers_of_different_sources_when_picking_credentials_should_keep_them_apart() {
+        let mut roles = roles();
+        let started = Cell::new(0);
+        let start = |_: S3Refresh| {
+            started.set(started.get() + 1);
+            Ok(())
+        };
+        let other_role = web_identity_env(&[("AWS_ROLE_SESSION_NAME", "other")]);
+        let other_service = web_identity_env(&[("AWS_ENDPOINT_URL_STS", "http://127.0.0.1:1")]);
+
+        let first = peer_credentials_from(
+            &s3_peer(""),
+            "eu-central-1",
+            web_identity_env(&[]),
+            &mut roles,
+            start,
+        )
+        .unwrap();
+        let second =
+            peer_credentials_from(&s3_peer(""), "eu-central-1", other_role, &mut roles, start)
+                .unwrap();
+        let third = peer_credentials_from(
+            &s3_peer(""),
+            "eu-central-1",
+            other_service,
+            &mut roles,
+            start,
+        )
+        .unwrap();
+        first.replace(Credentials {
+            access_key_id: "ASIAFIRST".to_owned(),
+            secret_access_key: "secret".to_owned(),
+            session_token: None,
+        });
+
+        assert_eq!(started.get(), 3);
+        assert!(second.current().is_none());
+        assert!(third.current().is_none());
     }
 
     #[test]

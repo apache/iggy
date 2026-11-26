@@ -28,7 +28,6 @@ use iggy_object_store::{IdentityRead, KeyLayout, StoreIdentity};
 use integration::harness::floci::{self, ACCESS_KEY_ID, FlociBucket, REGION, SECRET_ACCESS_KEY};
 use integration::harness::{TestHarness, TestServerConfig};
 use integration::iggy_harness;
-use tokio::sync::oneshot;
 use tokio::time::{Instant, sleep};
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -113,10 +112,11 @@ async fn given_web_identity_credentials_when_the_server_boots_should_claim_its_b
     );
 }
 
-/// A server with web identity and no static keys reads its `s3` peer with
-/// the credentials that STS, a mock here, hands out for its token, as it
-/// does for its own bucket. Floci checks every signature, so the peer counts
-/// as verified only when the node signed with what STS handed out.
+/// A server with web identity reads an `s3` peer that has no keys with the
+/// credentials that STS, a mock here, hands out for its token. The server's
+/// own store is a directory, so only the peer's store signs anything: Floci
+/// checks every signature, and the keys it accepts reach this server from
+/// STS alone. So a verified peer signed with what STS handed out for it.
 #[tokio::test]
 async fn given_an_s3_peer_without_keys_when_the_server_boots_should_verify_it_with_web_identity_credentials()
  {
@@ -125,18 +125,32 @@ async fn given_an_s3_peer_without_keys_when_the_server_boots_should_verify_it_wi
         .expect("a Floci bucket for the peer, which needs Docker");
     claim(peer.clone(), PEER_CLUSTER_UID).await;
     let sts = web_identity_sts().await;
-    let directory = tempfile::tempdir().expect("a directory for the token");
-    let mut harness = server_without_static_keys([
-        ("AWS_WEB_IDENTITY_TOKEN_FILE", token_file(directory.path())),
-        ("AWS_ROLE_ARN", ROLE_ARN.to_owned()),
-        ("AWS_ENDPOINT_URL_STS", sts.uri()),
-        ("IGGY_GEO_ORIGIN", "dc-a".to_owned()),
-        ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b".to_owned()),
-        ("IGGY_GEO_PEERS_0_BACKEND", "s3".to_owned()),
-        ("IGGY_GEO_PEERS_0_BUCKET", peer.bucket.clone()),
-        ("IGGY_GEO_PEERS_0_REGION", REGION.to_owned()),
-        ("IGGY_GEO_PEERS_0_ENDPOINT", peer.endpoint.clone()),
-    ]);
+    let directory = tempfile::tempdir().expect("a directory for the token and the store");
+    let own_store = directory.path().join("store");
+    std::fs::create_dir(&own_store).expect("a directory for the server's own store");
+    let extra_envs = HashMap::from(
+        [
+            ("IGGY_TIERED_STORAGE_BACKEND", "fs".to_owned()),
+            (
+                "IGGY_TIERED_STORAGE_PATH",
+                own_store.to_string_lossy().into_owned(),
+            ),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", token_file(directory.path())),
+            ("AWS_ROLE_ARN", ROLE_ARN.to_owned()),
+            ("AWS_ENDPOINT_URL_STS", sts.uri()),
+            ("IGGY_GEO_ORIGIN", "dc-a".to_owned()),
+            ("IGGY_GEO_PEERS_0_ORIGIN", "dc-b".to_owned()),
+            ("IGGY_GEO_PEERS_0_BACKEND", "s3".to_owned()),
+            ("IGGY_GEO_PEERS_0_BUCKET", peer.bucket.clone()),
+            ("IGGY_GEO_PEERS_0_REGION", REGION.to_owned()),
+            ("IGGY_GEO_PEERS_0_ENDPOINT", peer.endpoint.clone()),
+        ]
+        .map(|(name, value)| (name.to_owned(), value)),
+    );
+    let mut harness = TestHarness::builder()
+        .server(TestServerConfig::builder().extra_envs(extra_envs).build())
+        .build()
+        .expect("the harness");
 
     harness.start().await.expect("the server boots");
 
@@ -148,8 +162,8 @@ async fn given_an_s3_peer_without_keys_when_the_server_boots_should_verify_it_wi
         .expect("the mock records requests")
         .len();
     assert!(
-        exchanges >= 2,
-        "the bucket and the peer each exchange the token, but STS got {exchanges} requests"
+        exchanges >= 1,
+        "the peer's store exchanges the token, but STS got no request"
     );
 }
 
@@ -250,11 +264,11 @@ fn token_file(directory: &Path) -> String {
 }
 
 /// Claims the root `iggy` of `bucket` for `cluster_uid`, as the replica 0 of
-/// that cluster does. The S3 provider runs on compio, on a thread of its own.
+/// that cluster does. The S3 provider runs on compio, not on the harness's
+/// runtime.
 async fn claim(bucket: FlociBucket, cluster_uid: u128) {
-    let (claimed_sender, claimed) = oneshot::channel();
-    std::thread::spawn(move || {
-        let claimed = compio::runtime::Runtime::new()
+    let claimed = tokio::task::spawn_blocking(move || {
+        compio::runtime::Runtime::new()
             .expect("a compio runtime")
             .block_on(async {
                 let store = S3Store::new(bucket.s3_config()).expect("the S3 store");
@@ -263,13 +277,11 @@ async fn claim(bucket: FlociBucket, cluster_uid: u128) {
                     .claim(&store, &layout)
                     .await
                     .expect("the claim")
-            });
-        let _ = claimed_sender.send(claimed);
-    });
-    assert!(
-        claimed.await.expect("the claim thread"),
-        "the root of the peer was free"
-    );
+            })
+    })
+    .await
+    .expect("the claim task");
+    assert!(claimed, "the root of the peer was free");
 }
 
 /// The S3 provider runs on compio, not on the harness's runtime.

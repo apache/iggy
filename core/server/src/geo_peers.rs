@@ -55,6 +55,7 @@ use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, Sh
 use shard::{Receiver, Sender, channel};
 use tracing::{debug, error, info, warn};
 
+use crate::s3_credentials::RoleCredentials;
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
 use crate::store_identity::own_cluster_uid;
@@ -114,13 +115,18 @@ pub fn preflight(config: &GeoConfig) -> Result<(), ServerError> {
 /// # Errors
 /// [`ServerError::GeoPeer`] for an `s3` peer without keys on a node that
 /// has no role, and for a key file that cannot sign.
-pub fn auth(config: &GeoConfig, tiered: &TieredStorageConfig) -> Result<PeerAuth, ServerError> {
+pub fn auth(
+    config: &GeoConfig,
+    tiered: &TieredStorageConfig,
+    roles: &mut RoleCredentials,
+) -> Result<PeerAuth, ServerError> {
     config
         .peers
         .iter()
         .map(|peer| match peer.backend {
             TieredStorageBackend::S3 => {
-                crate::s3_credentials::peer_credentials(peer, &tiered.region).map(StoreAuth::S3)
+                crate::s3_credentials::peer_credentials(peer, &tiered.region, roles)
+                    .map(StoreAuth::S3)
             }
             TieredStorageBackend::Gcs => {
                 crate::gcs_credentials::peer_auth(&peer.origin, &peer.gcs).map(StoreAuth::Gcs)
@@ -625,6 +631,7 @@ mod tests {
     use std::ops::Range;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::SystemTime;
 
     use iggy_object_store::s3::Credentials;
@@ -996,7 +1003,7 @@ mod tests {
             &config,
             &tiered,
             &statuses,
-            &auth(&config, &tiered).unwrap(),
+            &auth(&config, &tiered, &mut RoleCredentials::default()).unwrap(),
         ) {
             checker.step(OWN, &metrics).await;
         }
@@ -1025,7 +1032,12 @@ mod tests {
         gcs.gcs.auth = configs::tiered_storage::GcsAuth::None;
         let config = geo(vec![fs_peer("dc-b", directory.path()), gcs.clone()]);
 
-        let auth = auth(&config, &TieredStorageConfig::default()).unwrap();
+        let auth = auth(
+            &config,
+            &TieredStorageConfig::default(),
+            &mut RoleCredentials::default(),
+        )
+        .unwrap();
 
         assert!(matches!(auth.of(0), Some(StoreAuth::None)));
         assert!(matches!(
@@ -1062,12 +1074,13 @@ mod tests {
         assert!(!statuses[0].get().serves_jobs());
     }
 
-    /// An S3 store on a thread of its own that answers every request with
-    /// the identity object of one cluster, and keeps the headers of each
-    /// request.
+    /// An S3 store on a thread of its own that answers one request with the
+    /// identity object of one cluster, keeps the headers of that request,
+    /// and then stops listening.
     struct FakeS3 {
         endpoint: String,
         requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+        worker: JoinHandle<()>,
     }
 
     impl FakeS3 {
@@ -1077,25 +1090,37 @@ mod tests {
             let requests = Arc::<Mutex<Vec<_>>>::default();
             let kept = Arc::clone(&requests);
             let body = StoreIdentity { cluster_uid }.to_string();
-            std::thread::spawn(move || {
-                for connection in listener.incoming() {
-                    let Ok(mut connection) = connection else {
-                        return;
-                    };
-                    kept.lock().unwrap().push(read_headers(&mut connection));
-                    let _ = write!(
-                        connection,
-                        "HTTP/1.1 200 OK\r\netag: \"identity\"\r\ncontent-length: {}\r\n\
-                         connection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                }
+            let worker = std::thread::spawn(move || {
+                let Ok((mut connection, _)) = listener.accept() else {
+                    return;
+                };
+                kept.lock().unwrap().push(read_headers(&mut connection));
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\netag: \"identity\"\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{body}",
+                    body.len()
+                );
             });
-            Self { endpoint, requests }
+            Self {
+                endpoint,
+                requests,
+                worker,
+            }
         }
 
+        /// The requests so far.
         fn requests(&self) -> Vec<BTreeMap<String, String>> {
             self.requests.lock().unwrap().clone()
+        }
+
+        /// The one request the store answered, once its thread has ended
+        /// and its socket is closed.
+        fn finish(self) -> BTreeMap<String, String> {
+            self.worker.join().expect("the fake store panicked");
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "one read per check: {requests:?}");
+            requests.remove(0)
         }
     }
 
@@ -1125,7 +1150,7 @@ mod tests {
         let config = geo(vec![s3_peer("dc-b", &store.endpoint)]);
         let statuses = statuses(&config);
         let tiered = TieredStorageConfig::default();
-        let auth = auth(&config, &tiered).unwrap();
+        let auth = auth(&config, &tiered, &mut RoleCredentials::default()).unwrap();
         let metrics = ShardMetrics::for_shard();
 
         for mut checker in checkers(&config, &tiered, &statuses, &auth) {
@@ -1140,10 +1165,7 @@ mod tests {
             statuses[0].get().identity,
             PeerIdentity::Verified { cluster_uid: DC_B }
         );
-        let requests = store.requests();
-        let [request] = requests.as_slice() else {
-            panic!("one read per check: {requests:?}");
-        };
+        let request = store.finish();
         let authorization = &request["authorization"];
         assert!(
             authorization.contains("Credential=AKIDPEEREXAMPLE/"),
@@ -1204,10 +1226,7 @@ mod tests {
             PeerIdentity::Verified { cluster_uid: DC_B }
         );
         assert_eq!(metrics.geo_peer_status_value("dc-b"), (true, false));
-        let requests = store.requests();
-        let [request] = requests.as_slice() else {
-            panic!("one read after the fetch: {requests:?}");
-        };
+        let request = store.finish();
         let authorization = &request["authorization"];
         assert!(
             authorization.contains("Credential=ASIAFETCHED/"),

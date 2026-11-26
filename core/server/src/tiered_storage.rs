@@ -50,6 +50,7 @@ use shard::{Sender, channel};
 use tracing::{info, warn};
 
 use crate::origin_recovery::OriginRecovery;
+use crate::s3_credentials::RoleCredentials;
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
 use crate::store_identity::{self, IdentityChecker, TierHandlers};
@@ -84,9 +85,12 @@ impl SharedStore {
     /// # Errors
     /// What [`crate::s3_credentials::credentials`] and
     /// [`crate::gcs_credentials::backend_auth`] return.
-    pub fn new(config: &TieredStorageConfig) -> Result<Self, ServerError> {
+    pub fn new(
+        config: &TieredStorageConfig,
+        roles: &mut RoleCredentials,
+    ) -> Result<Self, ServerError> {
         Ok(Self {
-            credentials: crate::s3_credentials::credentials(config)?,
+            credentials: crate::s3_credentials::credentials(config, roles)?,
             gcs: (config.backend == TieredStorageBackend::Gcs)
                 .then(|| crate::gcs_credentials::backend_auth(&config.gcs))
                 .transpose()?,
@@ -669,7 +673,7 @@ mod tests {
             backend: TieredStorageBackend::MockS3,
             ..TieredStorageConfig::default()
         };
-        let shared = SharedStore::new(&config).unwrap();
+        let shared = SharedStore::new(&config, &mut RoleCredentials::default()).unwrap();
         let writer = store(&config, &shared).unwrap().unwrap();
         let reader = store(&config, &shared).unwrap().unwrap();
 
