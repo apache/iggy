@@ -4101,6 +4101,10 @@ class OptionKey:
     Longest wait between two long-term rewrites of a geo topic's
     partition. An update can set it, not reset it.
     """
+    ShadowOrigin: typing.ClassVar[OptionKey]
+    r"""
+    The geo origin a shadow stream serves, computed by the server.
+    """
     ReadCacheSize: typing.ClassVar[OptionKey]
     r"""
     Memory each node keeps for what a topic's reads fetch from the object
@@ -4110,10 +4114,6 @@ class OptionKey:
     r"""
     Most bytes readahead fetches in front of a sequential reader of a
     topic. An update can set it, not reset it.
-    """
-    ShadowOrigin: typing.ClassVar[OptionKey]
-    r"""
-    The geo origin a shadow stream serves, computed by the server.
     """
     def __str__(self) -> builtins.str: ...
 

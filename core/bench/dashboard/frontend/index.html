@@ -33,16 +33,36 @@ under the License.
     img-src 'self' data:;"
         />
         <base href="/" />
-        <title>Apache Iggy Benchmarks Dashboard</title>
+        <!-- The server replaces everything from page-head-start to page-head-end with the head of
+             the page that it sends. -->
+        <!-- page-head-start -->
+        <title>Apache Iggy Benchmarks</title>
+        <!-- page-head-end -->
         <!-- Deferred, so the splash paints before the script loads. It stays above the app
              script, because deferred scripts run in document order and the charts need it. -->
         <script defer src="/vendor/echarts-5.5.1.min.js"></script>
         <link data-trunk rel="copy-dir" href="assets" />
-        <link data-trunk rel="rust" data-wasm-opt="z" />
+        <link
+            data-trunk
+            rel="rust"
+            data-bin="bench-dashboard-frontend"
+            data-cargo-features="hydration"
+            data-wasm-opt="z"
+        />
         <link data-trunk rel="css" href="assets/style.css" />
     </head>
 
     <body>
+        <!-- The app reads the stored theme only after it starts. This sets it before the first
+             paint, so a page that the server rendered does not flash light for a dark reader. -->
+        <script>
+            try {
+                if (localStorage.getItem("theme") === '"dark"') document.body.className = "dark";
+            } catch (e) {}
+        </script>
+        <!-- The server replaces everything from page-body-start to page-body-end with the app root
+             and the HTML of the page, when it renders the page. -->
+        <!-- page-body-start -->
         <div id="app">
             <div class="boot-splash" role="status" aria-live="polite">
                 <div class="boot-splash-body">
@@ -51,6 +71,7 @@ under the License.
                 </div>
             </div>
         </div>
+        <!-- page-body-end -->
         <style>
             .boot-splash {
                 position: fixed;

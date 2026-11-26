@@ -1803,11 +1803,14 @@ class PartitionReaderStoredOffsetTest {
         return read;
     }
 
-    /** Leaves a batch queued: its read answers a {@code next()} that the caller cancelled. */
+    /**
+     * Leaves a batch queued: its read answers a {@code next()} that the caller cancelled. The reader takes the batch in
+     * before any later call, such as a close.
+     */
     static void queue(PartitionReader reader, FakeTransport transport, FetchedMessages section)
             throws InterruptedException {
         CompletableFuture<PolledMessages> cancelled = reader.next();
-        Read read = transport.nextRead();
+        Read read = transport.nextRead(reader);
         assertThat(cancelled.cancel(false)).isTrue();
         read.answer(section);
     }

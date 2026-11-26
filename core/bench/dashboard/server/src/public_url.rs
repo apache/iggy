@@ -44,6 +44,11 @@ pub enum PublicUrlError {
 }
 
 impl PublicUrl {
+    /// The scheme, the host and the port, without a trailing slash.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// The absolute link to `path`, which starts with `/`.
     pub fn join(&self, path: &str) -> String {
         format!("{}{path}", self.0)

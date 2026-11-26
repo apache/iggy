@@ -158,7 +158,16 @@ impl OptionValueCodec for IggyByteSize {
     const KIND: HeaderKind = HeaderKind::Uint64;
 
     fn decode(key: OptionKey, entry: &WireUserHeaderEntry<'_>) -> Result<Self, IggyError> {
+        // The byte-size parser reads `unlimited` as 0, which for the read
+        // cache keys turns them off, the opposite of what it says.
+        let names_no_bound = |text: &str| {
+            matches!(key, OptionKey::ReadCacheSize | OptionKey::ReadAhead)
+                && text.eq_ignore_ascii_case("unlimited")
+        };
         let bytes = decode_u64_or(key, entry, |text| {
+            if names_no_bound(text) {
+                return None;
+            }
             Self::from_str(text).ok().map(|size| size.as_bytes_u64())
         })?;
         let bounded = match key {

@@ -985,6 +985,8 @@ fn read_cache(cache_bytes: usize) -> Rc<crate::ReadCache> {
         cache_bytes,
         block_bytes: 256 * 1024,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
     })
 }
 

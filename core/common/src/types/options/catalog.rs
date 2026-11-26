@@ -645,7 +645,7 @@ pub static CATALOG: [OptionDescriptor; 35] = [
                 "The most bytes that readahead fetches from the object store in front of a \
                  sequential reader of the topic, in bytes or a byte-size string (e.g. 1 MiB). \
                  0 turns readahead off, otherwise at least {} KiB, and at most one part in {} \
-                 of a read_cache_size that the topic sets. A partition reads ahead at most one \
+                 of a positive read_cache_size that the topic sets. A partition reads ahead at most one \
                  part in {} of its share of read_cache_size. Overrides [tiered_storage] \
                  read_ahead. An update can change it but not reset it. Unset, each node \
                  applies its server setting of the same name",
@@ -2234,6 +2234,28 @@ mod tests {
                 Err(IggyError::OptionNotResettable(key.to_string()))
             );
         }
+    }
+
+    #[test]
+    fn given_unlimited_for_a_read_cache_key_when_canonicalizing_should_refuse_it() {
+        for key in [OptionKey::ReadCacheSize, OptionKey::ReadAhead] {
+            for unlimited in ["unlimited", "Unlimited"] {
+                assert_eq!(
+                    canonical_value(key, &entry(key, &HeaderValue::try_from(unlimited).unwrap())),
+                    Err(IggyError::InvalidOptionValue(key.to_string())),
+                    "{key} = {unlimited}"
+                );
+            }
+        }
+        let other = OptionKey::SizeOfMessagesRequiredToSave;
+        assert!(
+            canonical_value(
+                other,
+                &entry(other, &HeaderValue::try_from("unlimited").unwrap())
+            )
+            .is_ok(),
+            "another byte-size key still reads it as 0"
+        );
     }
 
     #[test]

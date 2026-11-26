@@ -18,6 +18,7 @@
 mod args;
 mod artifacts;
 mod cache;
+mod card;
 mod config;
 mod dedicated_thread;
 mod embed_cache;
@@ -51,6 +52,7 @@ use public_url::PublicUrl;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use tracing_subscriber::{
     EnvFilter,
@@ -75,6 +77,8 @@ struct ServerState {
     _omb_watcher: Option<Arc<CacheWatcher>>,
     github_stars: Arc<StarCount>,
     public_url: Option<PublicUrl>,
+    /// Built once, outside the factory of the app, so the workers share one bound.
+    render_slots: Arc<Semaphore>,
 }
 
 #[actix_web::main]
@@ -175,6 +179,7 @@ async fn main() -> Result<(), std::io::Error> {
         _omb_watcher: omb_watcher,
         github_stars,
         public_url: args.public_url.clone(),
+        render_slots: pages::render_slots(),
     };
 
     info!("Starting server on {}", addr);
@@ -191,8 +196,8 @@ async fn main() -> Result<(), std::io::Error> {
     match &args.public_url {
         Some(public_url) => info!("Public URL: {public_url}"),
         None => warn!(
-            "Public URL: not set. robots.txt names no sitemap, and /sitemap.xml answers 404. Set \
-             --public-url on a public host"
+            "Public URL: not set. robots.txt names no sitemap, /sitemap.xml answers 404, and the \
+             pages have no canonical link and no preview image. Set --public-url on a public host"
         ),
     }
 
@@ -242,8 +247,10 @@ async fn main() -> Result<(), std::io::Error> {
             .app_data(web::Data::new(SiteState {
                 index_html: Path::new(FRONTEND_DIST_DIR).join("index.html"),
                 public_url: state.public_url.clone(),
+                config: Arc::clone(&state.config),
                 runs: Arc::clone(&state.cache),
                 omb_runs: state.omb_cache.clone(),
+                render_slots: Arc::clone(&state.render_slots),
             }))
             .service(handlers::health_check)
             .service(handlers::list_benchmark_summaries)
@@ -253,11 +260,14 @@ async fn main() -> Result<(), std::io::Error> {
             .service(handlers::get_benchmark_report_light)
             .service(handlers::get_benchmark_series)
             .service(handlers::get_test_artifacts_zip)
-            // Only `/embed/omb/chart.png` matches an OMB and an iggy-bench embed route. Both answer
-            // 400 for it, and this order names the missing OMB run id in the error.
+            // Only `/embed/omb/chart.png` and `/embed/omb/card.png` match an OMB and an iggy-bench
+            // embed route. Both answer 400 for them, and this order names the missing OMB run id
+            // in the error.
             .service(handlers::omb::embed_omb_chart_png)
+            .service(handlers::omb::embed_omb_card_png)
             .service(handlers::omb::embed_omb_chart)
             .service(handlers::embed_chart_png)
+            .service(handlers::embed_card_png)
             .service(handlers::embed_chart)
             .service(handlers::omb::list_omb_runs)
             .service(handlers::omb::get_omb_run)

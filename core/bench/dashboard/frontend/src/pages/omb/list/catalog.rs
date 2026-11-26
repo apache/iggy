@@ -22,18 +22,18 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+use bench_dashboard_shared::format::group_digits;
 use bench_dashboard_shared::identity::VersionOrder;
+use bench_dashboard_shared::labels::{RELEASE_LABEL, count_text, messages_text, milliseconds};
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::{
+    environment_text, mebibytes_text, topology_text, version_text,
+};
 use bench_dashboard_shared::omb::result::OmbPercentiles;
 use bench_dashboard_shared::omb::summary::{OmbBadge, OmbRunSummary, OmbRunTime};
 use bench_dashboard_shared::omb::workload::OmbWorkloadKey;
 
 use super::query::{Facet, OmbQuery, Sort};
-use crate::components::run_labels::{RELEASE_LABEL, messages_text, milliseconds};
-use crate::format::group_digits;
-use crate::pages::omb::common::{
-    count_text, environment_text, mebibytes_text, topology_text, version_text,
-};
 
 pub struct OmbCatalog {
     rows: Vec<Rc<OmbRunRow>>,
@@ -476,8 +476,8 @@ fn newer_version_first(left: &VersionOrder, right: &VersionOrder) -> Ordering {
 fn actors_label(workload: &OmbWorkloadKey) -> String {
     format!(
         "{}, {}",
-        count_text(workload.producers_per_topic, "producer", "producers"),
-        count_text(workload.consumers_per_topic, "consumer", "consumers")
+        count_text(workload.producers_per_topic.into(), "producer", "producers"),
+        count_text(workload.consumers_per_topic.into(), "consumer", "consumers")
     )
 }
 
