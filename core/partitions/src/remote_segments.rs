@@ -39,9 +39,11 @@ use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
+use futures::{StreamExt, stream};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, LongTermKey, ObjectRange, ObjectStore, ObjectStoreError, SegmentKey,
-    SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
+    ErrorClass, KeyLayout, LongTermKey, ObjectMeta, ObjectPrefix, ObjectRange, ObjectStore,
+    ObjectStoreError, SegmentKey, SegmentObject, TierExecutor, TierJobClass, TierJobRequest,
+    TierScope,
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
@@ -52,6 +54,8 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
 use crate::remote_blocks::{ReadCacheSettings, RemoteBlocks, RemoteReadMetrics};
+use crate::segment_chain::SegmentRecord;
+use crate::segment_upload::{is_recorded_log, is_whole_index};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -65,8 +69,16 @@ const INDEX_FETCH_CHUNK: u64 = (IGGY_INDEX_SIZE as u64) * 32 * 1024;
 /// joins it, for good.
 const INDEX_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The ranged read of an [`ObjectStore`], behind a pointer, so a partition
-/// does not carry the provider's type.
+/// How long the store may take to answer for one segment that a state
+/// transfer would send without its bytes.
+const STORED_SEGMENT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many segments one check of a stored front asks the store about at a
+/// time.
+const STORED_SEGMENT_CHECKS: usize = 4;
+
+/// The reads of an [`ObjectStore`], behind a pointer, so a partition does not
+/// carry the provider's type.
 pub trait RemoteObjects {
     /// See [`ObjectStore::get_range`].
     fn get_range<'a>(
@@ -91,6 +103,15 @@ pub trait RemoteObjects {
         }
         .boxed_local()
     }
+
+    /// See [`ObjectStore::head`]. A source that does not implement it answers
+    /// [`ObjectStoreError::Unsupported`].
+    fn head<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        future::ready(Err(ObjectStoreError::Unsupported("head".to_owned()))).boxed_local()
+    }
 }
 
 impl<S: ObjectStore> RemoteObjects for S {
@@ -100,6 +121,13 @@ impl<S: ObjectStore> RemoteObjects for S {
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
         ObjectStore::get_range(self, key, range).boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        ObjectStore::head(self, key).boxed_local()
     }
 }
 
@@ -165,6 +193,22 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
                 return Ok(None);
             }
             ObjectStore::get_range(&*store, &key, range).await.map(Some)
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        let request = TierJobRequest::new(self.class, self.scope.token());
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            ObjectStore::head(&*store, &key).await
         });
         async move {
             job.await
@@ -794,6 +838,56 @@ impl RemoteSegments {
             return Err(DiskFault::Tiered);
         }
         Ok(Frozen::from(Owned::<4096>::copy_from_slice(&object.bytes)))
+    }
+
+    /// The leading run of `segments` whose `.log` and `.index` the store holds
+    /// under `prefix` as their records describe. The run ends at the first
+    /// segment the store lacks, holds otherwise, or does not answer for in
+    /// [`STORED_SEGMENT_HEAD_TIMEOUT`].
+    pub(crate) async fn stored_front(
+        &self,
+        prefix: ObjectPrefix,
+        segments: Vec<SegmentRecord>,
+    ) -> Vec<SegmentRecord> {
+        stream::iter(segments)
+            .map(
+                |record| async move { self.holds_segment(prefix, &record).await.then_some(record) },
+            )
+            .buffered(STORED_SEGMENT_CHECKS)
+            .take_while(|held| future::ready(held.is_some()))
+            .filter_map(future::ready)
+            .collect()
+            .await
+    }
+
+    async fn holds_segment(&self, prefix: ObjectPrefix, record: &SegmentRecord) -> bool {
+        let key = |object| {
+            self.layout.segment_key(&SegmentKey {
+                prefix,
+                start_offset: record.start_offset,
+                object,
+            })
+        };
+        let (log_key, index_key) = (key(SegmentObject::Log), key(SegmentObject::Index));
+        let heads = future::join(self.objects.head(&log_key), self.objects.head(&index_key));
+        let reason = match compio::time::timeout(STORED_SEGMENT_HEAD_TIMEOUT, heads).await {
+            Ok((Ok(log), Ok(index))) => {
+                if is_recorded_log(&log, record) && is_whole_index(&index) {
+                    return true;
+                }
+                "the store holds other objects than the record describes".to_owned()
+            }
+            Ok((Err(error), _) | (_, Err(error))) => error.to_string(),
+            Err(_) => "the store did not answer in time".to_owned(),
+        };
+        warn!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            key = log_key,
+            reason,
+            "state transfer: a stored segment is not confirmed in the store, so its bytes travel"
+        );
+        false
     }
 
     /// Fetch the `.index` object next to the `.log` in `log` and put it at

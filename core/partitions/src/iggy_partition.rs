@@ -556,6 +556,9 @@ where
     /// the build ends, with the offer cache, and with the history it
     /// describes.
     pub(crate) transfer_plan: RefCell<Option<TransferPlanSlot>>,
+    /// What the store answered for the offer build in progress. Released
+    /// when the build ends and with the offer cache.
+    pub(crate) stored_front_check: RefCell<Option<crate::state_transfer::StoredFrontCheck>>,
 }
 
 // Cold state stays behind one pointer per field. Inline, one of these fields
@@ -1302,6 +1305,7 @@ where
             spilled_hasher: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
             transfer_plan: RefCell::new(None),
+            stored_front_check: RefCell::new(None),
         };
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
@@ -6466,7 +6470,6 @@ where
         self.remote_segments.is_some()
     }
 
-    #[cfg(test)]
     pub(crate) const fn remote_segments(&self) -> Option<&Rc<crate::RemoteSegments>> {
         self.remote_segments.as_ref()
     }
