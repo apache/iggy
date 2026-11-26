@@ -39,7 +39,7 @@ pub use credentials::SharedCredentials;
 pub use sigv4::Credentials;
 
 use crate::error::ObjectStoreError;
-use crate::http::{streamed, transport};
+use crate::http::{streamed, transport, within};
 use crate::layout::KeyLayout;
 use crate::store::{
     DeleteFailure, DeleteOutcome, ListPage, ListRequest, ObjectMeta, ObjectRange, ObjectStore,
@@ -55,6 +55,8 @@ const CHECKSUM_TYPE_HEADER: &str = "x-amz-checksum-type";
 /// the CRC32C of its bytes, which the store checks at completion and reports
 /// on a head, as for an object of one put.
 const FULL_OBJECT: &str = "FULL_OBJECT";
+/// The code of a conditional write that raced another one.
+const CONDITIONAL_CONFLICT: &str = "ConditionalRequestConflict";
 /// The fewest bytes of a part other than the last: 5 MiB.
 const MIN_PART_LEN: u64 = 5 * 1024 * 1024;
 /// The most parts of one multipart upload.
@@ -672,7 +674,9 @@ impl ObjectStore for S3Store {
     /// store checks. A 200 succeeds only with a `CompleteMultipartUploadResult`
     /// that carries an etag. An error in its body is classified by its code,
     /// and a body that holds neither is [`ObjectStoreError::Unavailable`].
-    /// Both can follow a completion that created the object.
+    /// Both can follow a completion that created the object. A
+    /// `ConditionalRequestConflict` ends the upload for S3, which asks for a
+    /// new one, so it is [`ObjectStoreError::UploadConflict`].
     async fn complete_parts(
         &self,
         upload: &PartsUpload,
@@ -705,11 +709,21 @@ impl ObjectStore for S3Store {
         let response = self.send(request, &[], cyper::Body::from(body)).await?;
         if !response.status().is_success() {
             let (status, date, error) = read_failure(response).await;
+            if error.code == CONDITIONAL_CONFLICT {
+                return Err(ObjectStoreError::UploadConflict {
+                    key: key.to_owned(),
+                });
+            }
             return Err(self.failure(status, date, &error, &Subject::Object(key)));
         }
         let answer = response.bytes().await.map_err(transport)?;
         match xml::parse_complete(&answer) {
             Ok(xml::Completion::Created) => Ok(()),
+            Ok(xml::Completion::Failed(error)) if error.code == CONDITIONAL_CONFLICT => {
+                Err(ObjectStoreError::UploadConflict {
+                    key: key.to_owned(),
+                })
+            }
             Ok(xml::Completion::Failed(error)) => Err(embedded_failure(
                 &error,
                 &Subject::Object(key),
@@ -733,12 +747,14 @@ impl ObjectStore for S3Store {
 
     /// Lists the multipart uploads under the root, and aborts those that the
     /// layout builds the keys of and that began before the cutoff, by the
-    /// store's clock as the answers' `Date` headers corrected it.
+    /// store's clock as the answers' `Date` headers corrected it. An abort
+    /// that gets no answer in time counts as failed, and the page goes on.
     async fn sweep_uploads(
         &self,
         layout: &KeyLayout,
         older_than: Duration,
         after: Option<&str>,
+        request_timeout: Duration,
     ) -> Result<SweptUploads, ObjectStoreError> {
         let prefix = format!("{}/", layout.root());
         let max_uploads = SWEEP_PAGE_LEN.to_string();
@@ -759,12 +775,15 @@ impl ObjectStore for S3Store {
             headers: Vec::new(),
             payload_sha256: EMPTY_PAYLOAD_SHA256,
         };
-        let response = self.send(listing, &[], cyper::Body::empty()).await?;
-        if !response.status().is_success() {
-            let (status, date, error) = read_failure(response).await;
-            return Err(self.failure(status, date, &error, &Subject::Bucket));
-        }
-        let page = xml::parse_uploads(&response.bytes().await.map_err(transport)?)?;
+        let page = within(request_timeout, "the listing of multipart uploads", async {
+            let response = self.send(listing, &[], cyper::Body::empty()).await?;
+            if !response.status().is_success() {
+                let (status, date, error) = read_failure(response).await;
+                return Err(self.failure(status, date, &error, &Subject::Bucket));
+            }
+            xml::parse_uploads(&response.bytes().await.map_err(transport)?)
+        })
+        .await?;
         let store_now = SystemTime::from(Utc::now() + self.clock_offset.get());
         let cutoff = store_now
             .checked_sub(older_than)
@@ -783,7 +802,8 @@ impl ObjectStore for S3Store {
                 swept.kept += 1;
                 continue;
             }
-            match self.abort_upload(&upload.key, &upload.upload_id).await {
+            let abort = self.abort_upload(&upload.key, &upload.upload_id);
+            match within(request_timeout, "an abort of a multipart upload", abort).await {
                 Ok(()) | Err(ObjectStoreError::NotFound { .. }) => swept.removed += 1,
                 Err(_) => swept.failed += 1,
             }
@@ -1522,7 +1542,7 @@ mod tests {
 
     #[test]
     fn given_answers_to_a_completion_when_classifying_should_map_each_and_read_errors_in_a_200() {
-        let cases: [(Answers, Expected); 6] = [
+        let cases: [(Answers, Expected); 8] = [
             (
                 |_| error_answer(412, "PreconditionFailed"),
                 |error| matches!(error, ObjectStoreError::PreconditionFailed { key } if key == "a/b"),
@@ -1533,6 +1553,17 @@ mod tests {
             ),
             (
                 |_| error_answer(409, "ConditionalRequestConflict"),
+                |error| matches!(error, ObjectStoreError::UploadConflict { key } if key == "a/b"),
+            ),
+            (
+                |_| {
+                    let body = "<Error><Code>ConditionalRequestConflict</Code></Error>";
+                    (200, Vec::new(), body.as_bytes().to_vec())
+                },
+                |error| matches!(error, ObjectStoreError::UploadConflict { .. }),
+            ),
+            (
+                |_| error_answer(409, "OperationAborted"),
                 |error| matches!(error, ObjectStoreError::Throttled(_)),
             ),
             (
@@ -1666,7 +1697,13 @@ mod tests {
         let store = static_store(&fake.endpoint);
         let layout = KeyLayout::new("iggy").unwrap();
 
-        let swept = run(store.sweep_uploads(&layout, Duration::from_secs(3600), None)).unwrap();
+        let swept = run(store.sweep_uploads(
+            &layout,
+            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(30),
+        ))
+        .unwrap();
 
         assert_eq!(
             swept,
@@ -1693,6 +1730,57 @@ mod tests {
         assert_eq!(
             aborted,
             ["/segments/iggy/1/2/3/4/00000000000000000000-00000000000000000099.log?uploadId=old"]
+        );
+    }
+
+    /// Lists two old uploads, and answers the abort of the first only after
+    /// 1.5 s. The endpoint takes one connection at a time, so the abort of
+    /// the second waits for it and is answered about 0.5 s after it left.
+    fn uploads_with_a_stalled_abort(request: &Recorded) -> Answer {
+        if request.method == "DELETE" {
+            if request.target.ends_with("uploadId=stalled") {
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+            return (204, Vec::new(), Vec::new());
+        }
+        let old =
+            (Utc::now() - TimeDelta::hours(2)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let key = "iggy/1/2/3/4/00000000000000000000-00000000000000000099.log";
+        let body = format!(
+            "<ListMultipartUploadsResult><IsTruncated>false</IsTruncated>\
+             <Upload><Key>{key}</Key><UploadId>stalled</UploadId><Initiated>{old}</Initiated></Upload>\
+             <Upload><Key>{key}</Key><UploadId>old</UploadId><Initiated>{old}</Initiated></Upload>\
+             </ListMultipartUploadsResult>"
+        );
+        (200, Vec::new(), body.into_bytes())
+    }
+
+    #[test]
+    fn given_an_abort_that_stalls_when_sweeping_should_count_it_failed_and_abort_the_rest() {
+        let fake = Recorder::start(uploads_with_a_stalled_abort);
+        let store = static_store(&fake.endpoint);
+        let layout = KeyLayout::new("iggy").unwrap();
+
+        let swept = run(store.sweep_uploads(
+            &layout,
+            Duration::from_secs(3600),
+            None,
+            Duration::from_secs(1),
+        ))
+        .unwrap();
+
+        assert_eq!((swept.removed, swept.kept, swept.failed), (1, 0, 1));
+        let aborted: Vec<String> = fake
+            .requests()
+            .iter()
+            .filter(|request| request.method == "DELETE")
+            .map(|request| request.target.clone())
+            .collect();
+        assert!(
+            aborted
+                .last()
+                .is_some_and(|target| target.ends_with("uploadId=old")),
+            "{aborted:?}"
         );
     }
 

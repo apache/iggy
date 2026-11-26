@@ -449,12 +449,12 @@ fn given_a_put_in_parts_dropped_midway_should_free_its_slots_and_leave_what_the_
     );
     let grace = Duration::from_secs(3600);
     let early = bus
-        .run(store.sweep_uploads(&layout(), grace, None))
+        .run(store.sweep_uploads(&layout(), grace, None, Duration::MAX))
         .unwrap();
     assert_eq!((early.removed, early.kept), (0, 1));
     bus.run_for(grace);
     let swept = bus
-        .run(store.sweep_uploads(&layout(), grace, None))
+        .run(store.sweep_uploads(&layout(), grace, None, Duration::MAX))
         .unwrap();
     assert_eq!((swept.removed, swept.kept), (1, 0));
     assert!(store.provider().uploads.borrow().is_empty());
@@ -496,4 +496,138 @@ fn given_an_upload_in_parts_past_its_deadline_should_abort_it_and_fail_as_transi
     assert_eq!(store.provider().aborts.get(), 1);
     assert_eq!(store.provider().parts_running.get(), 0, "no part runs on");
     assert_eq!(parts_counted(&store).2, 1);
+}
+
+/// The sweep counts the age of an upload from its begin, so the deadline
+/// does too.
+#[test]
+fn given_a_slow_begin_when_an_upload_in_parts_runs_past_its_deadline_should_count_the_begin() {
+    let (bus, store) = parts_store_with(StoreCallPolicy {
+        parts: PartsPolicy {
+            deadline: Some(Duration::from_secs(2)),
+            ..parts_policy().parts
+        },
+        ..parts_policy()
+    });
+    let bytes = large(2);
+    store.provider().begin_delay.set(Duration::from_millis(500));
+    store
+        .provider()
+        .part_scripts
+        .borrow_mut()
+        .extend([Script::of(Outcome::Hang); 8]);
+
+    let failed = bus.run(store.put("a/b", body(&bytes), &in_parts(&bytes)));
+
+    assert!(
+        matches!(failed, Err(ObjectStoreError::Transport(_))),
+        "{failed:?}"
+    );
+    assert_eq!(bus.now(), Duration::from_secs(2));
+    assert_eq!(store.provider().aborts.get(), 1);
+}
+
+/// S3 refuses the completion for a conditional write that raced it, and
+/// asks for a new upload with every part.
+#[test]
+fn given_a_conditional_conflict_on_completion_should_send_the_parts_again_in_a_new_upload() {
+    let (bus, store) = parts_store();
+    let bytes = large(2);
+    store
+        .provider()
+        .complete_scripts
+        .borrow_mut()
+        .push_back(Script::of(Outcome::Refuse(|| {
+            ObjectStoreError::UploadConflict {
+                key: "a/b".to_owned(),
+            }
+        })));
+
+    bus.run(store.put("a/b", body(&bytes), &in_parts(&bytes)))
+        .unwrap();
+
+    let provider = store.provider();
+    assert_eq!(provider.begun.get(), 2);
+    assert_eq!(provider.part_attempts.get(), 4);
+    assert_eq!(provider.completions.get(), 2);
+    assert_eq!(provider.aborts.get(), 1);
+    assert_eq!(stored(&store, "a/b"), bytes);
+    assert_eq!(parts_counted(&store), (2, 1, 1, 0, 4));
+}
+
+#[test]
+fn given_a_store_that_does_not_complete_uploads_in_parts_should_abort_and_put_whole() {
+    let (bus, store) = parts_store();
+    let bytes = large(2);
+    store
+        .provider()
+        .complete_scripts
+        .borrow_mut()
+        .push_back(Script::of(Outcome::Refuse(|| {
+            ObjectStoreError::Unsupported("multipart completion".to_owned())
+        })));
+
+    bus.run(store.put("a/b", body(&bytes), &in_parts(&bytes)))
+        .unwrap();
+
+    let provider = store.provider();
+    assert_eq!(provider.aborts.get(), 1);
+    assert!(provider.uploads.borrow().is_empty());
+    assert_eq!(provider.puts.borrow().len(), 1, "the whole put");
+    assert_eq!(stored(&store, "a/b"), bytes);
+    assert_eq!(parts_counted(&store), (1, 0, 1, 1, 2));
+}
+
+/// The first upload holds every slot, and the second runs one part outside
+/// them that takes ten seconds. The slots that the first gives back go to
+/// the rest of the second at once.
+#[test]
+fn given_a_slot_that_another_upload_frees_should_take_it_before_its_own_part_ends() {
+    let (bus, store) = parts_store();
+    let (first, second) = (large(4), large(4));
+    let fast = commit_after(Duration::from_millis(100));
+    store.provider().part_scripts.borrow_mut().extend([
+        fast,
+        fast,
+        fast,
+        commit_after(Duration::from_secs(10)),
+        fast,
+        fast,
+        fast,
+        fast,
+    ]);
+    let (first_options, second_options) = (in_parts(&first), in_parts(&second));
+    let both = future::join(
+        store.put("a/1", body(&first), &first_options),
+        store.put("a/2", body(&second), &second_options),
+    )
+    .boxed_local();
+
+    let raced = bus.run(future::select(both, bus.sleep(Duration::from_secs(1))));
+    let future::Either::Right(((), both)) = raced else {
+        panic!("the puts ended before the slow part");
+    };
+
+    assert_eq!(store.provider().part_attempts.get(), 8);
+    let (one, two) = bus.run(both);
+    one.unwrap();
+    two.unwrap();
+    assert_eq!(stored(&store, "a/2"), second);
+    assert_eq!(store.parts_in_flight(), 0);
+}
+
+#[test]
+fn given_a_release_that_stalls_after_the_object_is_created_should_answer_within_the_request_timeout()
+ {
+    let (bus, store) = parts_store();
+    let bytes = large(2);
+    store.provider().release_hangs.set(true);
+
+    bus.run(store.put("a/b", body(&bytes), &in_parts(&bytes)))
+        .unwrap();
+
+    assert_eq!(bus.now(), parts_policy().request_timeout);
+    assert_eq!(store.provider().releases.get(), 1);
+    assert_eq!(stored(&store, "a/b"), bytes);
+    assert_eq!(parts_counted(&store), (1, 1, 0, 0, 2));
 }

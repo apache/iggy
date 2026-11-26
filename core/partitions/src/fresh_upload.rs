@@ -42,6 +42,13 @@ pub trait FreshObjectUploader {
         bytes: Bytes,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, FreshUploadOutcome>;
+
+    /// Whether the store behind the uploader retries a failed put within a
+    /// budget of its own, so the shard stores each object with one upload
+    /// and never starts that budget over.
+    fn store_retries(&self) -> bool {
+        false
+    }
 }
 
 /// Uploads through a tier executor, in its class for fresh uploads.
@@ -61,12 +68,25 @@ pub trait FreshObjectUploader {
 pub struct ExecutorFreshUploader<E> {
     executor: E,
     layout: KeyLayout,
+    store_retries: bool,
 }
 
 impl<E> ExecutorFreshUploader<E> {
     #[must_use]
     pub const fn new(executor: E, layout: KeyLayout) -> Self {
-        Self { executor, layout }
+        Self {
+            executor,
+            layout,
+            store_retries: false,
+        }
+    }
+
+    /// The uploader over an executor whose store retries a failed put, see
+    /// [`FreshObjectUploader::store_retries`].
+    #[must_use]
+    pub const fn with_store_retries(mut self) -> Self {
+        self.store_retries = true;
+        self
     }
 
     /// The executor the uploads go through.
@@ -106,6 +126,10 @@ impl<E: TierExecutor> FreshObjectUploader for ExecutorFreshUploader<E> {
                 }
             })
             .boxed_local()
+    }
+
+    fn store_retries(&self) -> bool {
+        self.store_retries
     }
 }
 

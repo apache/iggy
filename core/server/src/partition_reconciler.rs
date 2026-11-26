@@ -226,9 +226,9 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, IggyPartitions, RecoveryPlan, Segment, StoreView, StoreViewRequest,
-    StreamKeyIdentity, TOPIC_OBJECT_RETRY, delete_partitions_from_disk, object_prefix,
-    read_created_revision,
+    IggyPartition, IggyPartitions, RecoveryPlan, Segment, StoreView, StoreViewOutcome,
+    StoreViewRequest, StreamKeyIdentity, TOPIC_OBJECT_RETRY, delete_partitions_from_disk,
+    object_prefix, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -270,6 +270,11 @@ const ESCALATE_AFTER_ATTEMPTS: u32 = 10;
 /// this long, and goes out on the next reconciler wake. An admitted fence
 /// commits on its own, so an earlier resend only meets a refusal.
 const LIFECYCLE_FENCE_RETRY_MICROS: u64 = 100_000;
+
+/// Reads of the object store for lost segment chains that one shard runs at
+/// once. Each holds a slot of the demand fetch class while it runs, so this
+/// bounds the share of that class that rebuilds take from polls.
+const CHAIN_STORE_READS: usize = 2;
 
 /// Doubles per attempt, clamped at `BACKOFF_MAX`.
 fn next_backoff(attempts: u32) -> Duration {
@@ -389,8 +394,38 @@ pub struct ReconcilerCtx {
     /// in microseconds since the Unix epoch.
     next_topic_object_check_at: Cell<u64>,
     /// The tiered partitions whose segment chain is gone and that wait for
-    /// what the store holds of them, with what each asks of it.
-    chain_rebuilds: RefCell<AHashMap<IggyNamespace, StoreViewRequest>>,
+    /// what the store holds of them, with where each wait stands.
+    chain_rebuilds: Rc<RefCell<AHashMap<IggyNamespace, ChainWait>>>,
+    /// The number the next read of the store for a lost chain takes.
+    next_chain_read: Cell<u64>,
+}
+
+/// Where the wait of a partition whose segment chain is gone stands.
+enum ChainWait {
+    /// A read of what `request` asks of the store has to start: the first
+    /// one, or another after a failure.
+    Queued(StoreViewRequest),
+    /// The read numbered `read` runs. Dropping `_scope` cancels it.
+    Reading {
+        request: StoreViewRequest,
+        read: u64,
+        _scope: TierScope,
+    },
+    /// The read finished, and the next check loads the partition with it.
+    Read {
+        request: StoreViewRequest,
+        outcome: StoreViewOutcome,
+    },
+}
+
+impl ChainWait {
+    const fn request(&self) -> &StoreViewRequest {
+        match self {
+            Self::Queued(request) | Self::Reading { request, .. } | Self::Read { request, .. } => {
+                request
+            }
+        }
+    }
 }
 
 impl ReconcilerCtx {
@@ -441,13 +476,26 @@ impl ReconcilerCtx {
             peer_manifests,
             peer_positions,
             next_topic_object_check_at: Cell::new(0),
-            chain_rebuilds: RefCell::new(AHashMap::new()),
+            chain_rebuilds: Rc::new(RefCell::new(AHashMap::new())),
+            next_chain_read: Cell::new(0),
         }
     }
 
     /// Record the owned namespaces boot did not build.
     pub fn mark_unbuilt(&self, namespaces: impl IntoIterator<Item = IggyNamespace>) {
         self.unbuilt_owned.borrow_mut().extend(namespaces);
+    }
+
+    /// Record the partitions boot left unbuilt because their segment chain is
+    /// gone, with what each asks of the store, so that their first check
+    /// reads the store and does not open the partition to learn it again.
+    pub fn await_chain_rebuilds(
+        &self,
+        waits: impl IntoIterator<Item = (IggyNamespace, StoreViewRequest)>,
+    ) {
+        for (ns, request) in waits {
+            self.wait_for_chain(ns, request);
+        }
     }
 
     /// Adds namespaces that a change announced to the work set.
@@ -574,24 +622,78 @@ impl ReconcilerCtx {
     }
 
     /// Note that the partition `ns` waits for the store to rebuild its chain
-    /// with what `request` asks of it. Returns whether it did not wait yet.
-    fn wait_for_chain(&self, ns: IggyNamespace, request: StoreViewRequest) -> bool {
-        let mut waiting = self.chain_rebuilds.borrow_mut();
-        let first = waiting.insert(ns, request).is_none();
-        self.shard
-            .metrics()
-            .set_partitions_awaiting_chain_rebuild(waiting.len());
-        first
+    /// with what `request` asks of it, and say so the first time.
+    fn wait_for_chain(&self, ns: IggyNamespace, request: StoreViewRequest) {
+        let (from, front) = (request.from, request.front);
+        if self.put_chain_wait(ns, ChainWait::Queued(request)) {
+            warn!(
+                shard = self.shard.id,
+                stream_id = ns.stream_id(),
+                topic_id = ns.topic_id(),
+                partition_id = ns.partition_id(),
+                from,
+                front,
+                "the segment chain of a tiered partition is gone; the partition waits for the \
+                 object store to account for the offsets below its local log"
+            );
+        }
     }
 
     fn stop_waiting_for_chain(&self, ns: IggyNamespace) {
-        let mut waiting = self.chain_rebuilds.borrow_mut();
-        if waiting.remove(&ns).is_some() {
+        drop(self.take_chain_wait(ns));
+    }
+
+    /// Store where the wait of `ns` stands. Returns whether it did not wait.
+    fn put_chain_wait(&self, ns: IggyNamespace, wait: ChainWait) -> bool {
+        let mut waits = self.chain_rebuilds.borrow_mut();
+        let first = waits.insert(ns, wait).is_none();
+        self.shard
+            .metrics()
+            .set_partitions_awaiting_chain_rebuild(waits.len());
+        first
+    }
+
+    /// Take the wait of `ns` out. Dropping a read under way cancels it.
+    fn take_chain_wait(&self, ns: IggyNamespace) -> Option<ChainWait> {
+        let mut waits = self.chain_rebuilds.borrow_mut();
+        let wait = waits.remove(&ns);
+        if wait.is_some() {
             self.shard
                 .metrics()
-                .set_partitions_awaiting_chain_rebuild(waiting.len());
+                .set_partitions_awaiting_chain_rebuild(waits.len());
+        }
+        wait
+    }
+
+    /// Whether the partition `ns` of incarnation `incarnation` waits for the
+    /// store to rebuild its chain, which no replica serves meanwhile.
+    fn waits_for_chain(&self, ns: IggyNamespace, incarnation: u64) -> bool {
+        self.chain_rebuilds
+            .borrow()
+            .get(&ns)
+            .is_some_and(|wait| wait.request().prefix.created_revision == incarnation)
+    }
+
+    /// Whether the next step of the wait of `ns` comes without a retry: a
+    /// read runs or finished, or one waits for another to end.
+    fn chain_read_due(&self, ns: IggyNamespace) -> bool {
+        let waits = self.chain_rebuilds.borrow();
+        match waits.get(&ns) {
+            Some(ChainWait::Reading { .. } | ChainWait::Read { .. }) => true,
+            Some(ChainWait::Queued(_)) => {
+                self.shard.store_view_reader().is_some() && chain_reads(&waits) >= CHAIN_STORE_READS
+            }
+            None => false,
         }
     }
+}
+
+/// The reads of the store for lost chains under way.
+fn chain_reads(waits: &AHashMap<IggyNamespace, ChainWait>) -> usize {
+    waits
+        .values()
+        .filter(|wait| matches!(wait, ChainWait::Reading { .. }))
+        .count()
 }
 
 pub type WakeTx = Sender<()>;
@@ -739,7 +841,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // Before the delete pass, so it starts the orphans the last sweep found
     // due.
     ctx.orphan_sweep
-        .pass(&ctx.shard, &ctx.incarnation_deletes, now);
+        .pass(&ctx.shard, &ctx.incarnation_deletes, now, Instant::now());
     ctx.incarnation_deletes.pass(&ctx.shard, now);
     ctx.upload_sweep.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
@@ -1410,9 +1512,12 @@ async fn reconcile_target(
         // knows, and the commit that moves metadata on brings the namespace
         // back.
         Ok(None) => Convergence::Converged,
-        // `load_prior_life` said why already.
+        // `load_prior_life` said why already. A read under way wakes the
+        // reconciler when it ends, and one waiting for a slot gets it then.
         Err(ServerError::PartitionChainMissing { .. }) => {
-            ctx.record_failure(ns, FailureCause::Add, now);
+            if !ctx.chain_read_due(ns) {
+                ctx.record_failure(ns, FailureCause::Add, now);
+            }
             Convergence::Pending
         }
         // Retrying cannot bring the history back; the tombstone keeps every
@@ -1447,9 +1552,11 @@ async fn reconcile_target(
 ///
 /// A tiered partition whose segment chain is gone fails the load while
 /// something below its local log may have left the disk. It then waits for
-/// what the store holds of it, read once this node passes its store identity
-/// check, and loads again with it. The wait ends with the load that rebuilt
-/// the chain or refused the partition.
+/// what the store holds of it, read in a task of its own once this node
+/// passes its store identity check, and loads again with it. The wait ends
+/// with the load that rebuilt the chain or refused the partition, and is
+/// dropped when committed metadata names another incarnation or trim than
+/// the one it reads for, which the next load reconsiders from local state.
 ///
 /// # Errors
 /// [`ServerError::PartitionChainMissing`] while the partition waits for the
@@ -1470,34 +1577,68 @@ async fn load_prior_life(
         topic_runtime,
         partitions,
     };
-    let waiting = ctx.chain_rebuilds.borrow().get(&ns).cloned();
-    let request = match waiting {
-        Some(request) => request,
-        None => match load.load(None).await {
-            Err(ServerError::PartitionChainMissing { request, .. }) => {
-                if ctx.wait_for_chain(ns, (*request).clone()) {
-                    warn!(
-                        shard = ctx.shard.id,
-                        stream_id = ns.stream_id(),
-                        topic_id = ns.topic_id(),
-                        partition_id = ns.partition_id(),
-                        from = request.from,
-                        front = request.front,
-                        "the segment chain of a tiered partition is gone; the partition waits \
-                         for the object store to account for the offsets below its local log"
-                    );
-                }
-                *request
-            }
-            loaded => return count_chain_recovery(ctx, loaded),
-        },
-    };
     let missing = |request: StoreViewRequest| ServerError::PartitionChainMissing {
         stream_id: ns.stream_id(),
         topic_id: ns.topic_id(),
         partition_id: ns.partition_id(),
         request: Box::new(request),
     };
+    let wait = ctx.take_chain_wait(ns).filter(|wait| {
+        wait.request().is_for(
+            partition_metadata.created_revision,
+            partition_metadata.deleted_up_to_offset,
+        )
+    });
+    let request = match wait {
+        None => match load.load(None).await {
+            Err(ServerError::PartitionChainMissing { request, .. }) => {
+                ctx.wait_for_chain(ns, (*request).clone());
+                *request
+            }
+            loaded => return count_chain_recovery(ctx, loaded),
+        },
+        Some(ChainWait::Queued(request)) => request,
+        Some(reading @ ChainWait::Reading { .. }) => {
+            let request = reading.request().clone();
+            ctx.put_chain_wait(ns, reading);
+            return Err(missing(request));
+        }
+        Some(ChainWait::Read { request, outcome }) => {
+            let view = match outcome {
+                Ok(Ok(view)) => view,
+                Ok(Err(error)) => {
+                    warn!(
+                        shard = ctx.shard.id,
+                        ns_raw = ns.inner(),
+                        %error,
+                        "the object store did not answer the read that rebuilds a lost segment \
+                         chain; it is read again"
+                    );
+                    ctx.put_chain_wait(ns, ChainWait::Queued(request.clone()));
+                    return Err(missing(request));
+                }
+                Err(TierJobCancelled) => {
+                    ctx.put_chain_wait(ns, ChainWait::Queued(request.clone()));
+                    return Err(missing(request));
+                }
+            };
+            let loaded = load.load(Some(&view)).await;
+            if let Err(ServerError::PartitionChainMissing { request, .. }) = &loaded {
+                ctx.put_chain_wait(ns, ChainWait::Queued((**request).clone()));
+                return loaded.map(|(partition, _)| partition);
+            }
+            return count_chain_recovery(ctx, loaded);
+        }
+    };
+    start_chain_read(ctx, ns, request.clone());
+    Err(missing(request))
+}
+
+/// Start the read of what `request` asks of the store for the partition
+/// `ns`, in a task that wakes the reconciler when it ends. The read waits
+/// queued while the node does not pass its store identity check yet, or
+/// while [`CHAIN_STORE_READS`] others run.
+fn start_chain_read(ctx: &ReconcilerCtx, ns: IggyNamespace, request: StoreViewRequest) {
     let Some(reader) = ctx.shard.store_view_reader() else {
         debug!(
             shard = ctx.shard.id,
@@ -1505,30 +1646,46 @@ async fn load_prior_life(
             "the node does not pass its store identity check yet; the rebuild of the segment \
              chain waits"
         );
-        return Err(missing(request));
+        ctx.put_chain_wait(ns, ChainWait::Queued(request));
+        return;
     };
-    let scope = TierScope::new();
-    let view = match reader.read(request.clone(), scope.token()).await {
-        Ok(Ok(view)) => view,
-        Ok(Err(error)) => {
-            warn!(
-                shard = ctx.shard.id,
-                ns_raw = ns.inner(),
-                %error,
-                "the object store did not answer the read that rebuilds a lost segment chain; \
-                 it is read again"
-            );
-            return Err(missing(request));
-        }
-        Err(TierJobCancelled) => return Err(missing(request)),
-    };
-    let loaded = load.load(Some(&view)).await;
-    if let Err(ServerError::PartitionChainMissing { request, .. }) = &loaded {
-        ctx.wait_for_chain(ns, (**request).clone());
-        return loaded.map(|(partition, _)| partition);
+    if chain_reads(&ctx.chain_rebuilds.borrow()) >= CHAIN_STORE_READS {
+        ctx.put_chain_wait(ns, ChainWait::Queued(request));
+        return;
     }
-    ctx.stop_waiting_for_chain(ns);
-    count_chain_recovery(ctx, loaded)
+    let read = ctx.next_chain_read.get();
+    ctx.next_chain_read.set(read.wrapping_add(1));
+    let scope = TierScope::new();
+    let outcome = reader.read(request.clone(), scope.token());
+    ctx.put_chain_wait(
+        ns,
+        ChainWait::Reading {
+            request,
+            read,
+            _scope: scope,
+        },
+    );
+    let waits = Rc::clone(&ctx.chain_rebuilds);
+    let shard = Rc::clone(&ctx.shard);
+    ctx.shard.bus.clone().spawn(async move {
+        let outcome = outcome.await;
+        let finished = {
+            let mut waits = waits.borrow_mut();
+            let running = waits.get_mut(&ns).filter(
+                |wait| matches!(wait, ChainWait::Reading { read: running, .. } if *running == read),
+            );
+            // `None` when the wait was dropped or replaced, and its scope with it.
+            running
+                .map(|wait| {
+                    let request = wait.request().clone();
+                    *wait = ChainWait::Read { request, outcome };
+                })
+                .is_some()
+        };
+        if finished {
+            shard.dispatch_metadata_commit_tick();
+        }
+    });
 }
 
 /// What [`load_prior_life`] loads a partition with.
@@ -2595,6 +2752,12 @@ async fn reconcile_retired_lifecycles(ctx: &ReconcilerCtx) {
                             "lifecycle waits for a durable partition fence");
                         continue;
                     }
+                    // What a load would do under the fence just written: the
+                    // partition no longer waits for the store.
+                    if ctx.waits_for_chain(target.namespace, target.incarnation) {
+                        partitions.fence(target.namespace, target.incarnation);
+                        ctx.stop_waiting_for_chain(target.namespace);
+                    }
                     if members.len() == 1 {
                         RETIRED_PARTITION_OP
                     } else {
@@ -2678,10 +2841,13 @@ const fn retired_bit(node: u8) -> Option<u32> {
 }
 
 /// Whether this node's copy of the target incarnation is gone: recovery
-/// fenced it, or it waits for a state transfer that would rebuild it.
+/// fenced it, or it waits for a state transfer that would rebuild it. A copy
+/// that waits for the store to rebuild its lost segment chain serves nothing
+/// either, and a delete loses nothing by retiring it.
 fn copy_lost_here(ctx: &ReconcilerCtx, target: &RetirementTarget) -> bool {
     let partitions = ctx.shard.plane.partitions();
     partitions.failed_revision(&target.namespace) == Some(target.incarnation)
+        || (target.deletes && ctx.waits_for_chain(target.namespace, target.incarnation))
         || partitions
             .get_by_ns(&target.namespace)
             .is_some_and(|partition| {
@@ -2808,6 +2974,7 @@ pub fn install_tick_handler(shard: &Rc<ServerShard>, wake_tx: WakeTx) {
 
 #[cfg(test)]
 mod tests {
+    mod chain_waits;
     mod geo_topics;
     mod orphan_sweep;
 

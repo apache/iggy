@@ -36,7 +36,8 @@ use tracing::{debug, info, warn};
 use crate::shell::ServerShard;
 use crate::store_identity::own_cluster_uid;
 
-/// The most pages one sweep removes. The next sweep goes on with the rest.
+/// The most pages one sweep removes. The next sweep goes on from where it
+/// stopped.
 const PAGES_PER_SWEEP: usize = 64;
 
 pub struct UploadSweep {
@@ -52,14 +53,19 @@ struct State {
     running: Option<TierScope>,
     /// When the next sweep may start, in microseconds since the Unix epoch.
     next_sweep_at: u64,
+    /// Where the next sweep starts: after the last page of the sweep before,
+    /// until a sweep reaches the end of the listing.
+    cursor: Option<String>,
 }
 
-/// What one sweep removed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// What one sweep removed, and where the next one starts.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Removed {
     pub uploads: u64,
     pub kept: u64,
     pub failed: u64,
+    /// `None` when the sweep reached the end of the listing.
+    pub next: Option<String>,
 }
 
 /// Why a sweep removed nothing more.
@@ -105,13 +111,20 @@ impl UploadSweep {
         let scope = TierScope::new();
         let token = scope.token();
         state.running = Some(scope);
+        let start = state.cursor.clone();
         drop(state);
         let state = Rc::clone(&self.state);
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
         shard.bus.spawn(async move {
-            let swept = sweep_abandoned(&*deleter, cluster_uid, grace, token).await;
-            state.borrow_mut().running = None;
+            let swept = sweep_abandoned(&*deleter, cluster_uid, grace, start, token).await;
+            {
+                let mut state = state.borrow_mut();
+                state.running = None;
+                // A sweep that stopped early starts over, so it never trusts
+                // a cursor from a listing it did not finish.
+                state.cursor = swept.as_ref().ok().and_then(|removed| removed.next.clone());
+            }
             match swept {
                 Ok(removed) if removed.uploads > 0 || removed.failed > 0 => info!(
                     removed = removed.uploads,
@@ -132,8 +145,10 @@ impl UploadSweep {
 }
 
 /// Removes the uploads in parts that began more than `grace` ago, page by
-/// page, once the store identity object names `cluster_uid`. Another
-/// cluster's root under the same prefix is never swept.
+/// page from `start`, once the store identity object names `cluster_uid`.
+/// Another cluster's root under the same prefix is never swept. Uploads that
+/// it keeps stay in the listing, so a sweep that stops at
+/// [`PAGES_PER_SWEEP`] returns where the next one goes on.
 ///
 /// # Errors
 /// [`Stopped`] when the scope was cancelled, the identity object is not this
@@ -142,6 +157,7 @@ pub async fn sweep_abandoned(
     deleter: &dyn ObjectDeleter,
     cluster_uid: u128,
     grace: Duration,
+    start: Option<String>,
     token: TierScopeToken,
 ) -> Result<Removed, Stopped> {
     match deleter.read_claim(token.clone()).await {
@@ -164,7 +180,7 @@ pub async fn sweep_abandoned(
         }
     }
     let mut removed = Removed::default();
-    let mut after = None;
+    let mut after = start;
     for _ in 0..PAGES_PER_SWEEP {
         let page = match deleter.sweep_uploads(grace, after, token.clone()).await {
             Err(_) => return Err(Stopped::Cancelled),
@@ -182,6 +198,7 @@ pub async fn sweep_abandoned(
             break;
         }
     }
+    removed.next = after;
     Ok(removed)
 }
 
@@ -220,6 +237,8 @@ mod tests {
         pages: RefCell<Vec<SweptUploads>>,
         asked: Cell<usize>,
         grace: Cell<Option<Duration>>,
+        /// Where each page started.
+        starts: RefCell<Vec<Option<String>>>,
     }
 
     impl Sweeps {
@@ -229,6 +248,7 @@ mod tests {
                 pages: RefCell::new(pages),
                 asked: Cell::new(0),
                 grace: Cell::new(None),
+                starts: RefCell::default(),
             }
         }
     }
@@ -263,10 +283,11 @@ mod tests {
         fn sweep_uploads(
             &self,
             older_than: Duration,
-            _after: Option<String>,
+            after: Option<String>,
             _scope: TierScopeToken,
         ) -> LocalBoxFuture<'static, UploadSweepOutcome> {
             self.asked.set(self.asked.get() + 1);
+            self.starts.borrow_mut().push(after);
             self.grace.set(Some(older_than));
             let page = self.pages.borrow_mut().remove(0);
             std::future::ready(Ok(Ok(page))).boxed_local()
@@ -287,18 +308,55 @@ mod tests {
         let deleter = Sweeps::new(Some(OURS), vec![page(2, 1, Some("next")), page(1, 0, None)]);
         let grace = Duration::from_secs(3600);
 
-        let removed = sweep_abandoned(&deleter, OURS, grace, TierScope::new().token()).await;
+        let removed = sweep_abandoned(&deleter, OURS, grace, None, TierScope::new().token()).await;
 
         assert_eq!(
             removed,
             Ok(Removed {
                 uploads: 3,
                 kept: 1,
-                failed: 0
+                failed: 0,
+                next: None,
             })
         );
         assert_eq!(deleter.asked.get(), 2);
         assert_eq!(deleter.grace.get(), Some(grace));
+    }
+
+    /// Every page holds an upload that the sweep keeps, so a sweep that
+    /// started from the first page each time would never reach the later
+    /// pages.
+    #[compio::test]
+    async fn given_more_pages_than_one_sweep_takes_when_sweeping_again_should_go_on_from_the_cursor()
+     {
+        let mut pages: Vec<SweptUploads> = (0..PAGES_PER_SWEEP)
+            .map(|index| page(0, 1, Some(&format!("page-{index}"))))
+            .collect();
+        pages.push(page(1, 0, None));
+        let deleter = Sweeps::new(Some(OURS), pages);
+        let grace = Duration::from_secs(3600);
+
+        let first = sweep_abandoned(&deleter, OURS, grace, None, TierScope::new().token())
+            .await
+            .unwrap();
+        let second = sweep_abandoned(
+            &deleter,
+            OURS,
+            grace,
+            first.next.clone(),
+            TierScope::new().token(),
+        )
+        .await
+        .unwrap();
+
+        let last = format!("page-{}", PAGES_PER_SWEEP - 1);
+        assert_eq!(first.next.as_deref(), Some(last.as_str()));
+        assert_eq!(second.uploads, 1);
+        assert_eq!(second.next, None);
+        assert_eq!(
+            deleter.starts.borrow().last().cloned().flatten(),
+            Some(last)
+        );
     }
 
     #[compio::test]
@@ -310,6 +368,7 @@ mod tests {
                 &deleter,
                 OURS,
                 Duration::from_secs(3600),
+                None,
                 TierScope::new().token(),
             )
             .await;
@@ -364,6 +423,7 @@ mod tests {
             &deleter,
             OURS,
             Duration::from_secs(3600),
+            None,
             TierScope::new().token(),
         )
         .await;

@@ -446,7 +446,10 @@ impl RemoteSegments {
     /// `range` of the fresh object `object_id` when this shard holds it in
     /// memory, not counted as a read of it: a rewrite reads each blob once,
     /// and what it read is in its long-term segment from then on.
-    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+    ///
+    /// The bytes come in the pieces the cache keeps them in, back to back,
+    /// so that nothing is copied here.
+    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Vec<Bytes>> {
         self.blocks.as_ref()?.peek_fresh(object_id, range)
     }
 

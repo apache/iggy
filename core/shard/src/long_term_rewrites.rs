@@ -54,10 +54,16 @@
 //! past its backlog limit does not wait out its interval.
 //!
 //! The rewrites of a shard keep to one share of its time while sends to the
-//! shard are not answered yet, see [`partitions::RewriteShare`], on the
-//! clock and the timer of the shard's bus. While a partition the shard
-//! leads is past its backlog limit, its sends wait for the rewrites and not
-//! behind them, so the rewrites run flat out.
+//! shard are not answered yet, see [`partitions::RewriteBudget`], on the
+//! clock and the timer of the shard's bus. Those sends are the ones that go
+//! through the object store first and the ones that go straight to their
+//! partition. While a partition the shard leads is past its backlog limit,
+//! its sends wait for the rewrites and not behind them, so all the rewrites
+//! of the shard run flat out, see
+//! [`crate::rewrite_pacing::RewritePacing::set_behind`].
+//!
+//! A rewrite reports its segment as soon as the store holds it, and only
+//! then carries the end of it into the shard's cache.
 
 use crate::metrics::LongTermLag;
 use crate::rewrite_pacing::{BacklogCount, FinishedPlan, RewriteKey, RewriteResult};
@@ -343,6 +349,8 @@ where
         let now = self.bus.monotonic_micros();
         let due = {
             let mut pacing = self.rewrite_pacing.borrow_mut();
+            // Shard wide: see `RewritePacing::set_behind` for why, and for a
+            // limit of zero.
             pacing.set_behind(!past_limit.is_empty());
             for key in &past_limit {
                 pacing.hurry(key, now);
@@ -456,7 +464,7 @@ where
             }
             Ok(Some(RewriteStart::Rewrite(id, rewrite, scope))) => (id, rewrite, scope),
         };
-        let rewrite = rewrite.paced_by(self.rewrite_budget());
+        let (rewrite, later_carry) = rewrite.paced_by(self.rewrite_budget()).carrying_later();
         let undelivered = Rc::clone(&self.undelivered_segment_rewrites);
         // Through the bus, not the runtime directly: the simulator supplies
         // its own executor.
@@ -478,6 +486,9 @@ where
             {
                 undelivered.borrow_mut().push(*finished);
             }
+            if let Some(carry) = later_carry.take() {
+                carry.run().await;
+            }
         });
     }
 
@@ -488,10 +499,12 @@ where
     {
         let mut pacing = self.rewrite_pacing.borrow_mut();
         let behind = pacing.behind();
+        let direct_sends = pacing.direct_sends();
         pacing.budget(|store_on_node| {
             let clock = ShardRewriteClock {
                 bus: self.bus.clone(),
                 unanswered: self.fresh_writes.unanswered_sends(),
+                direct_sends,
                 behind,
             };
             RewriteBudget::new(Rc::new(clock), store_on_node)
@@ -644,6 +657,9 @@ struct ShardRewriteClock<B> {
     /// The objects that hold the messages of the shard's sends that are not
     /// answered yet.
     unanswered: Rc<RefCell<BTreeMap<u128, usize>>>,
+    /// The sends that went straight to a partition and are not answered
+    /// yet.
+    direct_sends: Rc<Cell<usize>>,
     /// Whether a partition the shard leads is past its backlog limit.
     behind: Rc<Cell<bool>>,
 }
@@ -662,22 +678,28 @@ where
     }
 
     fn sends_waiting(&self) -> bool {
-        !self.behind.get() && !self.unanswered.borrow().is_empty()
+        !self.behind.get() && (self.direct_sends.get() > 0 || !self.unanswered.borrow().is_empty())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rewrite_pacing::RewritePacing;
     use message_bus::IggyMessageBus;
+
+    fn clock() -> ShardRewriteClock<Rc<IggyMessageBus>> {
+        ShardRewriteClock {
+            bus: Rc::new(IggyMessageBus::new(0)),
+            unanswered: Rc::default(),
+            direct_sends: Rc::default(),
+            behind: Rc::default(),
+        }
+    }
 
     #[compio::test]
     async fn given_unanswered_sends_when_asked_should_say_they_wait_unless_a_partition_is_behind() {
-        let clock = ShardRewriteClock {
-            bus: Rc::new(IggyMessageBus::new(0)),
-            unanswered: Rc::default(),
-            behind: Rc::default(),
-        };
+        let clock = clock();
         assert!(!clock.sends_waiting(), "no send");
 
         clock.unanswered.borrow_mut().insert(7, 1);
@@ -685,5 +707,22 @@ mod tests {
 
         clock.behind.set(true);
         assert!(!clock.sends_waiting(), "the sends wait for the rewrites");
+    }
+
+    /// A send to a topic that does not place its batches goes straight to
+    /// its partition, and waits on the shard as much as a placed one does.
+    #[compio::test]
+    async fn given_an_unanswered_direct_send_when_asked_should_say_sends_wait_until_it_is_answered()
+    {
+        let pacing = RewritePacing::default();
+        let clock = ShardRewriteClock {
+            direct_sends: pacing.direct_sends(),
+            ..clock()
+        };
+        let send = pacing.direct_send();
+        assert!(clock.sends_waiting());
+
+        drop(send);
+        assert!(!clock.sends_waiting());
     }
 }

@@ -118,12 +118,14 @@ async fn given_an_orphan_next_to_other_keys_when_two_sweeps_pass_its_grace_shoul
         "iggy/notes".to_owned(),
     ];
     let kept: Vec<String> = [above_the_revision, geo, meta].concat();
+    past_the_second_of_the_claim().await;
     put_objects(store.path(), [orphan.clone(), kept.clone()].concat()).await;
     let sweeps_before = metric(&http, SWEEPS).await;
 
     wait_until_gone(store.path(), &orphan).await;
 
-    assert!(metric(&http, DELETED).await >= 1);
+    // The files go before the counter moves.
+    wait_for_metric(&http, DELETED, |deleted| deleted >= 1).await;
     // The sweeps that follow find nothing more to delete.
     let sweeps = metric(&http, SWEEPS).await;
     assert!(sweeps >= sweeps_before + 2, "{sweeps_before} then {sweeps}");
@@ -146,6 +148,7 @@ async fn given_a_store_identity_of_another_cluster_when_the_sweeps_run_should_de
     let http = HttpClient::login_root(&harness).await;
     wait_for_metric(&http, IDENTITY_VERIFIED, |verified| verified >= 1).await;
     let orphan = incarnation_keys(ORPHAN);
+    past_the_second_of_the_claim().await;
     put_objects(store.path(), orphan.clone()).await;
     wait_for_metric(&http, ORPHANS, |found| found == 1).await;
 
@@ -178,6 +181,12 @@ async fn given_orphan_grace_disabled_when_the_server_runs_should_sweep_nothing()
     }
     assert_eq!(metric(&http, SWEEPS).await, 0);
     assert_eq!(metric(&http, ORPHANS).await, 0);
+}
+
+/// Wait past the second the server claimed the root in. The sweep counts an
+/// object from that second as older than the claim, and never deletes it.
+async fn past_the_second_of_the_claim() {
+    sleep(Duration::from_millis(1_100)).await;
 }
 
 fn single_node(store: &Path, grace: &str) -> TestHarness {

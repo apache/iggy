@@ -25,7 +25,7 @@ use super::{
     MAX_PREALLOCATED_TOPIC_BYTES, MAX_REPLICATION_FACTOR, MAX_SIZE_OF_MESSAGES_REQUIRED_TO_SAVE,
     MAX_TOPIC_SEGMENT_SIZE, MIN_SEGMENT_MAX_AGE, MIN_TOPIC_SEGMENT_SIZE, OptionValue, OptionsScope,
     PartitionResizePolicy, READ_AHEAD_CACHE_SHARE, ResourceOptions, TOPIC_READ_AHEAD_MIN,
-    TOPIC_READ_CACHE_SIZE_MIN, TopicCreateOptions, TopicType, erase_options,
+    TOPIC_READ_CACHE_SIZE_MIN, TopicCreateOptions, TopicResolvedOptions, TopicType, erase_options,
 };
 use crate::http::users::defaults::{MAX_USERNAME_LENGTH, MIN_USERNAME_LENGTH};
 use crate::types::compression::compression_algorithm::CompressionAlgorithm;
@@ -976,21 +976,25 @@ pub fn drop_options_fixed_by_type(explicit: &mut ResourceOptions) -> bool {
     dropped
 }
 
-/// Store the durability that a topic's mode fixes, if it fixes one, as the
-/// derived entry of each of [`Durability::KEYS`] in the topic's stored
-/// options, which its partitions and every read of it take.
+/// Resolve a topic's stored options, after storing the durability that its
+/// mode fixes, if it fixes one, as the derived entry of each of
+/// [`Durability::KEYS`], which its partitions and every read of it take.
 ///
 /// A topic created before its mode fixed them holds another value in a
 /// snapshot or in the log, so this runs whenever a topic's options are
 /// loaded, not only on a create. `shadow` is the mode of the peer's topic
 /// for a topic of a shadow stream, which is stored as a normal topic.
-pub fn store_fixed_durability(options: &mut ResourceOptions, shadow: Option<GeoMode>) {
-    let fixed = match shadow {
-        Some(geo_mode) => geo_mode.fixed_durability(),
-        None => TopicCreateOptions::from_resource_options(options).fixed_durability(),
-    };
-    let Some(durability) = fixed else {
-        return;
+#[must_use]
+pub fn store_fixed_durability(
+    options: &mut ResourceOptions,
+    shadow: Option<GeoMode>,
+) -> TopicResolvedOptions {
+    let mut resolved = TopicResolvedOptions::from(&*options);
+    let Some(durability) = shadow
+        .or(resolved.geo_mode)
+        .and_then(GeoMode::fixed_durability)
+    else {
+        return resolved;
     };
     for key in Durability::KEYS {
         options.insert(
@@ -998,6 +1002,9 @@ pub fn store_fixed_durability(options: &mut ResourceOptions, shadow: Option<GeoM
             OptionValue::derived(HeaderValue::from(durability)),
         );
     }
+    resolved.runtime.durability = durability;
+    resolved.runtime.consumer_offset_durability = durability;
+    resolved
 }
 
 /// Validate and canonicalize a create or update options block.
@@ -1942,6 +1949,28 @@ mod tests {
     }
 
     #[test]
+    fn given_a_geo_create_naming_a_malformed_durability_when_admitted_should_refuse_it() {
+        for key in Durability::KEYS {
+            let entries = [
+                (OptionKey::TopicType, HeaderValue::try_from("geo").unwrap()),
+                (key, HeaderValue::try_from("fast").unwrap()),
+            ];
+            let result = admit(
+                OptionsScope::Topic,
+                OptionOperation::Create,
+                &block(&entries),
+                &[],
+                &OptionAdmissionContext::default(),
+            );
+            assert_eq!(
+                result.err(),
+                Some(IggyError::InvalidOptionValue(key.to_string())),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn given_a_create_naming_a_durability_when_admitted_should_ignore_it_only_on_a_geo_topic_in_the_geo_mode()
      {
         let admitted = |entries: &[(OptionKey, &str)]| {
@@ -2048,7 +2077,12 @@ mod tests {
             ),
         ] {
             let before = options.clone();
-            store_fixed_durability(&mut options, shadow);
+            let resolved = store_fixed_durability(&mut options, shadow);
+            assert_eq!(
+                resolved,
+                TopicResolvedOptions::from(&options),
+                "{case} resolves what it stores"
+            );
             if let Some(geo_mode) = shadow {
                 // A read of a shadow topic reports what is stored.
                 project_shadow_topic(&mut options, geo_mode).unwrap();

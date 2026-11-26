@@ -1350,7 +1350,10 @@ pub enum LifecycleFrame {
     /// object-store job of its deletes, when this replica is the primary and
     /// none is in flight. The timer task stamps `now` and reads the
     /// truncation watermark metadata holds. Does nothing on a shard without
-    /// a deleter.
+    /// a deleter. It also starts the next job of the partition's verify
+    /// pass, which checks that the store still holds the segments the
+    /// partition stored, when this replica is the primary, the job is due,
+    /// and the shard has a verifier and a free slot for it.
     DeleteObjects {
         namespace: IggyNamespace,
         /// The incarnation the pass was staged for, as on
@@ -1376,19 +1379,8 @@ pub enum LifecycleFrame {
     /// The result of a publish that a [`Self::PublishManifest`] pass started,
     /// sent by the task that ran it.
     ManifestPublishFinished(Box<FinishedManifestPublish>),
-    /// Per-shard pass over a partition of a tiered topic: start the next job
-    /// of its verify pass, which checks that the store still holds the
-    /// segments the partition stored, when this replica is the primary and
-    /// no job is in flight. The timer task stamps `now`. Does nothing on a
-    /// shard without a verifier.
-    VerifySegments {
-        namespace: IggyNamespace,
-        /// The incarnation the pass was staged for.
-        created_revision: u64,
-        now: IggyTimestamp,
-    },
-    /// The result of a job that a [`Self::VerifySegments`] pass started,
-    /// sent by the task that ran it.
+    /// The result of a verify job that a [`Self::DeleteObjects`] pass
+    /// started, sent by the task that ran it.
     SegmentVerifyFinished(Box<FinishedSegmentVerify>),
     /// The result of an attempt at the upload of a fresh object, sent by the
     /// task that ran it.
@@ -1571,6 +1563,8 @@ pub struct FinishedSegmentVerify {
     /// The incarnation that started the job. Slab ids are reused after a
     /// delete, so the namespace alone can name a later partition.
     pub created_revision: u64,
+    /// The shard's grant of the verifier that ran the job.
+    pub grant: u64,
     /// The partition's number for the job.
     pub id: u64,
     pub outcome: partitions::SegmentVerifyOutcome,
@@ -2407,6 +2401,10 @@ where
     /// verify pass takes them from here.
     undelivered_segment_verifies: Rc<RefCell<Vec<FinishedSegmentVerify>>>,
 
+    /// The verify jobs this shard runs, the partitions waiting for one, and
+    /// the grant of its verifier.
+    segment_verify_slots: RefCell<segment_verifies::VerifySlots>,
+
     /// The partitions whose changed manifest waits out
     /// [`partitions::MANIFEST_STORE_INTERVAL`], by namespace and incarnation.
     /// The pump's tick stages each one's pass once it passed, whether the
@@ -2837,6 +2835,7 @@ where
             undelivered_manifest_publishes: Rc::default(),
             segment_verifier: RefCell::new(None),
             undelivered_segment_verifies: Rc::default(),
+            segment_verify_slots: RefCell::default(),
             manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
@@ -3981,6 +3980,7 @@ where
             undelivered_manifest_publishes: Rc::default(),
             segment_verifier: RefCell::new(None),
             undelivered_segment_verifies: Rc::default(),
+            segment_verify_slots: RefCell::default(),
             manifests_held: RefCell::default(),
             fresh_writes: fresh_writes::FreshWrites::default(),
             fresh_sweeps: fresh_sweeps::FreshSweeps::default(),
@@ -6208,6 +6208,10 @@ where
                     return;
                 }
                 let hold = self.geo_commit_hold(&request);
+                // Counted until its reply settles, so that the shard's
+                // rewrites keep to their share while it waits.
+                let direct_send = (routing.0 == Operation::SendMessages)
+                    .then(|| self.rewrite_pacing.borrow().direct_send());
                 let (sender, receiver) = consensus::oneshot_channel();
                 self.plane
                     .partitions()
@@ -6227,6 +6231,7 @@ where
                             let _ = reply.try_send(committed.map(Message::into_generic));
                         }
                     }
+                    drop(direct_send);
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {

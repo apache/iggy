@@ -1292,6 +1292,10 @@ pub async fn given_parts_when_completing_should_create_the_whole_object_once(
         .complete_parts(&upload, &parts, &options, bytes.len() as u64)
         .await
         .unwrap_or_else(|error| panic!("complete {key:?}: {error}"));
+    store
+        .release_parts(&upload)
+        .await
+        .unwrap_or_else(|error| panic!("release {key:?}: {error}"));
 
     let head = store
         .head(&key)
@@ -1463,7 +1467,12 @@ async fn sweep_all(store: &impl ObjectStore, layout: &KeyLayout, older_than: Dur
     let mut after: Option<String> = None;
     for _ in 0..100 {
         let page = store
-            .sweep_uploads(layout, older_than, after.as_deref())
+            .sweep_uploads(
+                layout,
+                older_than,
+                after.as_deref(),
+                Duration::from_secs(30),
+            )
             .await
             .unwrap_or_else(|error| panic!("sweep: {error}"));
         removed += page.removed;
