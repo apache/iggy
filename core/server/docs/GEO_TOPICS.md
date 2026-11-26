@@ -936,9 +936,9 @@ per peer:
   check does not pass, and a recovery record under the peer's root only when the object names a
   cluster that the shadow streams did not come from;
 - each manifest or positions pass that reads an object of the peer reads the identity object
-  before and after it: two more gets at most every `[geo] manifest_poll_interval` per shard that
-  reads a changed manifest, and every `[geo] positions_poll_interval` per node while the peer's
-  positions change;
+  before and after it: two more gets at most every `[geo] manifest_poll_interval` per shard for
+  each 16 changed manifests that it reads, and every `[geo] positions_poll_interval` per node
+  while the peer's positions change;
 - the metadata primary lists the peer's topic objects every 5 seconds, reads each new object,
   and reads each known object again every 30 seconds;
 - every `[geo] positions_poll_interval`, shard 0 of each node that leads a partition of a geo or

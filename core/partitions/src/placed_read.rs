@@ -346,7 +346,14 @@ impl PlacedReadPlan {
                 let end = segment.size.min(position.saturating_add(len));
                 let read = usize::try_from(end - position).map_err(|_| DiskFault::Tiered)?;
                 let chunk = self
-                    .wait(remote.read(&log, position, read, next.as_ref(), self.read_settings))
+                    .wait(remote.read(
+                        &log,
+                        position,
+                        read,
+                        next.as_ref(),
+                        wanted.poll_offset(),
+                        self.read_settings,
+                    ))
                     .await?;
                 match take_whole_batches(chunk.as_slice(), wanted, batches)? {
                     Read::Batches(bytes) => {
@@ -870,6 +877,19 @@ impl Wanted {
         self.limited || self.messages >= u64::from(self.query.count())
     }
 
+    /// The offset the poll reads next, when it knows one. A consumer's next
+    /// poll can read some of the same bytes again, and its later offset
+    /// tells it apart from another poll of the same messages.
+    const fn poll_offset(&self) -> Option<u64> {
+        if self.messages > 0 {
+            return Some(self.next_offset);
+        }
+        match self.query {
+            MessageLookup::Offset { offset, .. } => Some(offset),
+            MessageLookup::Timestamp { .. } => None,
+        }
+    }
+
     /// Whether taking a batch that the read holds as `held` bytes would pass
     /// a byte limit. Never before a batch counted a message of the poll.
     const fn over_limit(&self, held: usize) -> bool {
@@ -1245,6 +1265,8 @@ mod tests {
                             cache_bytes,
                             block_bytes: 256 * 1024,
                             read_ahead: 0,
+                            read_ahead_fetches: 4,
+                            read_ahead_fetch_bytes: 32 * 1024 * 1024,
                         }),
                     ),
             )),

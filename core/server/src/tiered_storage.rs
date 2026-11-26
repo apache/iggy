@@ -242,6 +242,8 @@ pub fn read_cache_settings(config: &TieredStorageConfig) -> ReadCacheSettings {
         cache_bytes: usize::try_from(config.read_cache_size.as_bytes_u64()).unwrap_or(usize::MAX),
         block_bytes: config.read_cache_block_size.as_bytes_u64(),
         read_ahead: config.read_ahead.as_bytes_u64(),
+        read_ahead_fetches: usize::try_from(config.jobs.speculative_fetches).unwrap_or(usize::MAX),
+        read_ahead_fetch_bytes: config.jobs.speculative_fetch_bytes.as_bytes_u64(),
     }
 }
 

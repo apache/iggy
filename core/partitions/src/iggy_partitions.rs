@@ -2290,6 +2290,8 @@ mod tests {
                 cache_bytes: 64 * 1024 * 1024,
                 block_bytes: 4096,
                 read_ahead: 0,
+                read_ahead_fetches: 4,
+                read_ahead_fetch_bytes: 32 * 1024 * 1024,
             });
             let remote = Rc::new(
                 crate::RemoteSegments::new(
@@ -2310,8 +2312,14 @@ mod tests {
                 keyed_end_offset: None,
                 range: 0..4096,
             };
-            let mut read =
-                Box::pin(remote.read(&segment, 0, 100, None, crate::PartitionReadSettings::SHARD));
+            let mut read = Box::pin(remote.read(
+                &segment,
+                0,
+                100,
+                None,
+                None,
+                crate::PartitionReadSettings::SHARD,
+            ));
             assert!(futures::poll!(read.as_mut()).is_pending());
 
             if removed {

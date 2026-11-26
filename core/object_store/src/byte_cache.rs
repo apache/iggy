@@ -37,7 +37,9 @@
 //! outlast everything that is read once meanwhile, and several readers'
 //! readahead would push each other out before any of them arrived. Its first
 //! read moves it to the small queue as the read that fetched it, or every
-//! sequential reader would look like one that came back.
+//! sequential reader would look like one that came back. Readahead makes room
+//! only in its own queue and the small queue, so it never evicts what readers
+//! came back to, nor what this node holds.
 //!
 //! Bytes this node stored itself can be kept apart from both queues until
 //! their owner releases them, see [`Admission::Held`]. They take at most all
@@ -50,8 +52,9 @@
 //! of its limit, its small queue a tenth, and it remembers the keys of as
 //! many bytes as its main queue may hold. A full budget evicts as without
 //! limits, whoever owns what leaves, and an insert never evicts another
-//! owner's entry while the budget has room for it. Entries without an owner,
-//! and every held entry, count against the budget alone.
+//! owner's entry while the budget has room for it, but for what readahead
+//! fetched past its share of the budget, the oldest first. Entries without
+//! an owner, and every held entry, count against the budget alone.
 
 use bytes::Bytes;
 use std::collections::BTreeMap;
@@ -194,7 +197,8 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
 
     /// Keep `bytes` under `key`. `held` is the memory the buffer takes, which
     /// can be more than its length. Bytes that do not fit the whole budget
-    /// are not kept.
+    /// are not kept, and neither are bytes of readahead that find no room
+    /// in its share and the small queue.
     pub fn insert(&mut self, key: K, bytes: Bytes, held: usize, admission: Admission) {
         self.admit(key, bytes, held, admission, None);
     }
@@ -223,17 +227,34 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
         if owner.is_some_and(|owner| self.limit(&owner).is_some_and(|limit| held > limit)) {
             return;
         }
+        match admission {
+            Admission::Read => {
+                if let Some(owner) = owner {
+                    self.make_owner_room(owner, held);
+                }
+                self.make_room(held);
+            }
+            Admission::Ahead => {
+                let room = owner.is_none_or(|owner| self.make_owner_room_ahead(owner, held))
+                    && self.make_room_ahead(held);
+                if !room {
+                    // The keys of what it evicted on the way are remembered.
+                    self.forget_old_keys();
+                    if let Some(owner) = owner {
+                        self.forget_old_keys_of(owner);
+                    }
+                    return;
+                }
+            }
+            Admission::Held => {
+                // Released before room is made, so that what it releases can
+                // be what leaves.
+                self.release_held_past(self.held_limit().saturating_sub(held));
+                self.make_room(held);
+            }
+        }
         let remembered = self.entries.contains_key(&key);
         self.unlink(&key);
-        if admission == Admission::Held {
-            // Released before room is made, so that what it releases can be
-            // what leaves.
-            self.release_held_past(self.held_limit().saturating_sub(held));
-        }
-        if let Some(owner) = owner {
-            self.make_owner_room(owner, held, admission == Admission::Ahead);
-        }
-        self.make_room(held, admission == Admission::Ahead);
         let place = match admission {
             Admission::Held => Place::Kept,
             // A reader came back for bytes that had no room to wait in.
@@ -295,7 +316,7 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
             }
             self.limited.insert(owner, Limited { limit, lines });
         }
-        self.make_owner_room(owner, 0, false);
+        self.make_owner_room(owner, 0);
         self.forget_old_keys();
         self.forget_old_keys_of(owner);
     }
@@ -369,7 +390,7 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
     pub fn set_budget(&mut self, budget: usize) {
         self.budget = budget;
         self.release_held_past(self.held_limit());
-        self.make_room(0, false);
+        self.make_room(0);
         self.forget_old_keys();
     }
 
@@ -397,14 +418,13 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
         self.lines[place as usize].held
     }
 
-    /// Evict until `incoming` more bytes fit the budget. `ahead` says that
-    /// readahead fetched them, so they count towards its share.
-    fn make_room(&mut self, incoming: usize, ahead: bool) {
+    /// Evict until `incoming` more bytes that a reader asked for, or that
+    /// this node holds, fit the budget.
+    fn make_room(&mut self, incoming: usize) {
         while self.held() + incoming > self.budget {
             let small = self.held_in(Place::Small);
             let waiting = self.held_in(Place::Ahead);
-            let with_incoming = waiting + if ahead { incoming } else { 0 };
-            let passed = if waiting > 0 && with_incoming > self.budget / AHEAD_SHARE {
+            let passed = if waiting > self.budget / AHEAD_SHARE {
                 self.drop_oldest(Place::Ahead)
             } else if small > 0 && (small >= self.small_target() || self.main_is_empty()) {
                 self.pass_oldest_small()
@@ -421,10 +441,66 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
         }
     }
 
+    /// Make room for `incoming` bytes that readahead fetched: in its share,
+    /// by dropping the oldest of what it fetched before, and in the budget,
+    /// by passing on the oldest entries of the small queue. `false` when that
+    /// is not enough. Bytes larger than the share wait alone.
+    fn make_room_ahead(&mut self, incoming: usize) -> bool {
+        // They would not fit with only the main queue and the held bytes
+        // left, so evicting anything else first would gain nothing.
+        if self.held_in(Place::Main) + self.held_in(Place::Kept) + incoming > self.budget {
+            return false;
+        }
+        while self.held_in(Place::Ahead) > 0
+            && self.held_in(Place::Ahead) + incoming > self.budget / AHEAD_SHARE
+        {
+            self.drop_oldest(Place::Ahead);
+        }
+        while self.held() + incoming > self.budget {
+            if !self.pass_oldest_small() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// [`Self::make_room_ahead`] among the entries of `owner`, by its
+    /// limit. Its entries are never held, so only its main queue stays.
+    fn make_owner_room_ahead(&mut self, owner: O, incoming: usize) -> bool {
+        loop {
+            let Some(limited) = self.limited.get(&owner) else {
+                return true;
+            };
+            let limit = limited.limit;
+            let held = limited.held();
+            let waiting = limited.held_in(Place::Ahead);
+            let oldest = |place: Place| limited.lines[place as usize].oldest();
+            let passed = if limited.held_in(Place::Main) + incoming > limit {
+                return false;
+            } else if waiting > 0 && waiting + incoming > limit / AHEAD_SHARE {
+                oldest(Place::Ahead).inspect(|key| self.unlink(key))
+            } else if held + incoming > limit {
+                oldest(Place::Small).inspect(|key| self.pass_small(key))
+            } else {
+                return true;
+            };
+            if passed.is_none() {
+                return false;
+            }
+            if self
+                .limited
+                .get(&owner)
+                .is_none_or(|limited| limited.held() < held)
+            {
+                self.limit_evictions += 1;
+            }
+        }
+    }
+
     /// Evict among the entries of `owner` until `incoming` more bytes of it
-    /// fit its limit, by the rules of [`Self::make_room`] applied to its
-    /// entries alone. `ahead` says that readahead fetched them.
-    fn make_owner_room(&mut self, owner: O, incoming: usize, ahead: bool) {
+    /// that a reader asked for fit its limit, by the rules of
+    /// [`Self::make_room`] applied to its entries alone.
+    fn make_owner_room(&mut self, owner: O, incoming: usize) {
         loop {
             let Some(limited) = self.limited.get(&owner) else {
                 return;
@@ -438,8 +514,7 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
             let waiting = limited.held_in(Place::Ahead);
             let main_is_empty = limited.held_in(Place::Main) == 0;
             let oldest = |place: Place| limited.lines[place as usize].oldest();
-            let with_incoming = waiting + if ahead { incoming } else { 0 };
-            let passed = if waiting > 0 && with_incoming > limit / AHEAD_SHARE {
+            let passed = if waiting > limit / AHEAD_SHARE {
                 oldest(Place::Ahead).inspect(|key| self.unlink(key))
             } else if small > 0 && (small >= limit / SMALL_SHARE || main_is_empty) {
                 oldest(Place::Small).inspect(|key| self.pass_small(key))
@@ -1057,6 +1132,91 @@ mod tests {
         assert!(!cache.entries.contains_key(&100), "nothing is remembered");
     }
 
+    /// Free space is no reason to keep more readahead than its share.
+    #[test]
+    fn given_free_space_when_more_than_the_share_of_readahead_enters_should_drop_the_oldest_of_it()
+    {
+        let mut cache = ByteCache::new(80);
+        for key in [1, 2, 3] {
+            cache.insert(key, buffer(10), 10, Admission::Ahead);
+            assert_bounds(&cache);
+        }
+
+        assert_eq!(keys_in(&cache, Place::Ahead), [3]);
+        assert_eq!(cache.held(), 10);
+    }
+
+    #[test]
+    fn given_a_cache_full_of_what_readers_came_back_to_when_readahead_needs_room_should_not_keep_it()
+     {
+        let shared = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+        let mut cache = cache_with_shared(100, &shared);
+        for key in keys_in(&cache, Place::Small) {
+            cache.remove(&key);
+        }
+
+        cache.insert(50, buffer(12), 12, Admission::Ahead);
+
+        assert!(!cache.holds(&50));
+        assert_eq!(keys_in(&cache, Place::Main), shared);
+        assert_bounds(&cache);
+    }
+
+    #[test]
+    fn given_a_cache_full_of_held_bytes_when_readahead_needs_room_should_not_keep_it() {
+        let mut cache = ByteCache::new(80);
+        for key in 1..=7 {
+            cache.insert(key, buffer(10), 10, Admission::Held);
+        }
+        cache.insert(50, buffer(10), 10, Admission::Ahead);
+        assert_eq!(cache.held(), cache.budget());
+
+        cache.insert(51, buffer(11), 11, Admission::Ahead);
+
+        assert_eq!(keys_in(&cache, Place::Ahead), [50]);
+        assert!(!cache.holds(&51));
+        assert_eq!(keys_in(&cache, Place::Kept), [1, 2, 3, 4, 5, 6, 7]);
+        assert_bounds(&cache);
+    }
+
+    /// The small queue gives way to readahead, which is what a sequential
+    /// reader reads once next.
+    #[test]
+    fn given_a_cache_full_of_bytes_read_once_when_readahead_enters_should_take_the_place_of_the_oldest()
+     {
+        let mut cache = ByteCache::new(80);
+        for key in 1..=8 {
+            read_into(&mut cache, key, 10);
+        }
+
+        cache.insert(50, buffer(10), 10, Admission::Ahead);
+
+        assert_eq!(keys_in(&cache, Place::Ahead), [50]);
+        assert_eq!(keys_in(&cache, Place::Small), [2, 3, 4, 5, 6, 7, 8]);
+        assert_bounds(&cache);
+    }
+
+    /// An owner at its limit fetches ahead into its own small queue, never
+    /// into its main queue.
+    #[test]
+    fn given_an_owner_whose_limit_holds_what_readers_came_back_to_when_it_fetches_ahead_should_not_keep_it()
+     {
+        let shared = [1, 2, 3, 4, 5];
+        let mut cache = owned_cache_with_shared(1_000, &shared);
+        for key in owned_keys_in(&cache, Place::Small) {
+            cache.remove(&key);
+        }
+        cache.set_limit('B', Some(55));
+        assert_eq!(cache.held_by(&'B'), Some(50));
+
+        cache.insert_owned(60, buffer(6), 6, Admission::Ahead, 'B');
+
+        assert!(!cache.holds(&60));
+        assert_eq!(owned_keys_in(&cache, Place::Main), shared);
+        assert_eq!(cache.take_limit_evictions(), 0);
+        assert_owned_bounds(&cache);
+    }
+
     #[test]
     fn given_bytes_larger_than_the_budget_when_inserted_should_not_be_kept() {
         let mut cache = ByteCache::new(10);
@@ -1443,15 +1603,17 @@ mod tests {
             let owner = u8::try_from(key % 5).unwrap();
             let fits = cache.held() + len <= cache.budget()
                 && cache.limit(&owner).is_none_or(|limit| len <= limit);
-            let others: Vec<u32> = cache
+            let others: Vec<(u32, bool)> = cache
                 .entries
                 .iter()
                 .filter(|(_, entry)| entry.bytes.is_some() && entry.owner != Some(owner))
-                .map(|(key, _)| *key)
+                .map(|(key, entry)| (*key, entry.place == Place::Ahead))
                 .collect();
+            let mut ahead_insert = false;
             let owned_insert = match random.random_range(0..14) {
                 0 => {
                     cache.insert_owned(key, buffer(len), len, Admission::Ahead, owner);
+                    ahead_insert = true;
                     true
                 }
                 1 => {
@@ -1484,7 +1646,12 @@ mod tests {
                 },
             };
             if owned_insert && fits {
-                for other in others {
+                // Readahead past its share of the budget goes, the oldest
+                // first, whoever fetched it.
+                let kept = others
+                    .into_iter()
+                    .filter(|(_, ahead)| !(ahead_insert && *ahead));
+                for (other, _) in kept {
                     assert!(cache.holds(&other), "step {step}: {other} left for {key}");
                 }
             }

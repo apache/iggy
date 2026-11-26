@@ -294,6 +294,15 @@ impl SegmentBytes<'_> {
             Self::Remote { .. } => DiskFault::Tiered,
         }
     }
+
+    /// Drop what the read cache holds of the `len` bytes at `position`,
+    /// which are not a segment's batches, so that the next poll asks the
+    /// store for them again.
+    fn forget(&self, position: u64, len: usize) {
+        if let Self::Remote { remote, range, .. } = self {
+            remote.forget_cached(range, position, len);
+        }
+    }
 }
 
 /// Admission inputs carried by a read without access to consumer progress maps.
@@ -1238,7 +1247,7 @@ impl DiskReadPlan {
                 }
                 len = len.min(room);
             }
-            let chunk = match self.read_chunk(bytes, len, walk).await {
+            let chunk = match self.read_chunk(bytes, len, query, walk).await {
                 Ok(chunk) => chunk,
                 // Same fail-closed reason as a failed open.
                 Err(fault) => return SegmentWalk::Faulted(fault),
@@ -1246,6 +1255,7 @@ impl DiskReadPlan {
             if let Some(entry) = walk.unproven_entry.take()
                 && !entry_names_batch(&entry, &chunk)
             {
+                bytes.forget(walk.position, len);
                 error!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
@@ -1300,6 +1310,7 @@ impl DiskReadPlan {
                 // A batch that does not match its own checksum. Fail closed like
                 // an IO fault: serving it hands a consumer data provably not what
                 // was written, and skipping ahead punches a silent gap.
+                bytes.forget(walk.position, len);
                 return SegmentWalk::Faulted(bytes.unreadable());
             }
             if consumed == 0 {
@@ -1308,12 +1319,14 @@ impl DiskReadPlan {
                     // corrupt batch in this segment. Fail-closed like an IO
                     // fault so a later segment is never served over the corrupt
                     // run, which would punch a silent gap into the poll.
+                    bytes.forget(walk.position, len);
                     return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 // A single batch larger than the chunk. Its own header says
                 // how wide it is, so re-read exactly that; only a header this
                 // read could not reach leaves the old quadrupling.
                 if needed as u64 > persisted - walk.position {
+                    bytes.forget(walk.position, len);
                     return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 chunk_len = if needed > len {
@@ -1412,6 +1425,7 @@ impl DiskReadPlan {
         &self,
         bytes: &SegmentBytes<'_>,
         len: usize,
+        query: MessageLookup,
         walk: &mut DiskWalk,
     ) -> Result<Frozen<4096>, DiskFault> {
         match bytes {
@@ -1431,9 +1445,25 @@ impl DiskReadPlan {
                     walk.requested_bytes += len as u64;
                     walk.chunk_reads += 1;
                 }
+                // A consumer's next poll can read some of the same bytes
+                // again, and its later offset tells it apart from another
+                // poll of the same messages.
+                let poll_offset = match (walk.last_matching_offset, query) {
+                    (Some(last), _) => last.checked_add(1),
+                    (None, MessageLookup::Offset { offset, .. }) => Some(offset),
+                    (None, MessageLookup::Timestamp { .. }) => None,
+                };
+                let cached = remote.holds(range, walk.position, len, self.read_settings);
                 let read = async {
                     remote
-                        .read(range, walk.position, len, *next, self.read_settings)
+                        .read(
+                            range,
+                            walk.position,
+                            len,
+                            *next,
+                            poll_offset,
+                            self.read_settings,
+                        )
                         .await
                         .map_err(|fault| {
                             // A `.log` that was gone without an eviction was
@@ -1446,6 +1476,11 @@ impl DiskReadPlan {
                             }
                         })
                 };
+                // A failure of the store stands in the way of requests to it,
+                // and bytes in memory need none.
+                if cached {
+                    return read.await;
+                }
                 self.wait_for_store(state, read).await
             }
         }
