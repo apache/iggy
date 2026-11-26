@@ -605,11 +605,13 @@ what is left on disk:
 
 The rebuild waits until the node passes the store identity check, and costs
 one listing of the partition's objects, one HEAD of each segment it reads,
-and a HEAD and a read of the manifest, which it skips above 16 MiB. A range
-of offsets below the first local `.log` that the store does not account for
-refuses the partition, and the log names it. A partition with one replica then
-stays down with its files as they were and no new chain file. A replicated one
-sets its files aside and rejoins by state transfer. Each shard exports
+several at a time, and one read of at most the first 16 MiB of the manifest.
+A manifest larger than that is not decoded, and the rebuild goes on without
+checking against it. A range of offsets below the first local `.log` that the
+store does not account for refuses the partition, and the log names it. A
+partition with one replica then stays down with its files as they were and no
+new chain file. A replicated one sets its files aside and rejoins by state
+transfer. Each shard exports
 `partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
 `partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
