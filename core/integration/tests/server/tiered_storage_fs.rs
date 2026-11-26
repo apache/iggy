@@ -355,9 +355,31 @@ async fn given_an_evicted_front_whose_first_object_is_gone_when_the_chain_file_i
         harness.server().stdout_contains(&refusal),
         "the log does not name the unaccounted range: {refusal}"
     );
+    // A poll that succeeded with no message, or with other ones, would pass
+    // a check that only expects the read of every message to fail.
+    let local_start = local_logs
+        .keys()
+        .next()
+        .and_then(|name| name.strip_suffix(".log"))
+        .and_then(|stem| stem.parse::<u64>().ok())
+        .expect("a segment log named by its start");
+    let polled = client
+        .poll_messages(
+            &stream,
+            &topic,
+            PARTITION_ID,
+            &Consumer::default(),
+            &PollingStrategy::offset(local_start),
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
+        )
+        .await;
     assert!(
-        read_every_message(&client, &stream, &topic).await.is_err(),
-        "the refused partition served polls"
+        polled.is_err(),
+        "the refused partition served a poll of its local segment at {local_start}: {:?}",
+        polled.map(|polled| polled.messages.len())
     );
     assert!(!chain.exists(), "the refusal created a chain file");
     let logs = file_contents(&partition_dir, &["log"]);
