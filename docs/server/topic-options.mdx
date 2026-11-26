@@ -39,7 +39,7 @@ Options are key-value pairs sent with `CreateTopic`, and some of them can change
 
 Both retention policies can be active at once. The active segment is **never touched**, and its bytes are excluded from the size limit. A segment whose end offset exceeds the lowest stored consumer or consumer-group offset is retained. With no stored offsets, this barrier is absent. Deletion is done by the server's segment cleaner (`[data_maintenance.messages]`, enabled by default).
 
-Both durability policies write data to disk and default independently to `replicated`. Neither inherits the other. A geo topic in the `geo` mode is always `persisted` for both: the server ignores what its create sends for them. Flush thresholds schedule ordinary segment writes. Required persistence, capacity pressure, or lifecycle operations can flush earlier. They do not weaken the `persisted` completion guarantee.
+Both durability policies write data to disk and default independently to `replicated`. Neither inherits the other. A geo topic in the `geo` mode is always `persisted` for both: the server ignores what its create sends for them. A geo topic that an earlier build of the server stored with `replicated` takes `persisted` when a node loads its metadata, from a snapshot or from its log, and `GetTopic` reports what its partitions run with. What it acknowledged before that load has the guarantee of `replicated` only. Flush thresholds schedule ordinary segment writes. Required persistence, capacity pressure, or lifecycle operations can flush earlier. They do not weaken the `persisted` completion guarantee.
 
 Value forms are forgiving: byte sizes accept a raw number of bytes or a string like `"128 MiB"`, expiry accepts microseconds or a humantime string like `"7 days"`, booleans accept `true`/`false`. Create admission re-parses and re-encodes what you send, so a string `segment_size=128MiB` is stored as the number it names.
 
@@ -69,18 +69,18 @@ Keys absent from the wire request are resolved by the admitting server and store
 A poll of data that a topic keeps in the object store, such as the tiered segments of a topic with `tiered_storage` or the long-term segments of a geo topic, reads it through the read cache of the partition's shard. Each shard has one, sized by the node's `[tiered_storage] read_cache_size`, and it reads ahead of a sequential reader by up to `[tiered_storage] read_ahead`. A topic can override both for itself, with options of the same names:
 
 - `read_cache_size` is divided evenly across the topic's partitions. Each share is a limit on what that partition keeps, drawn from the shard's shared budget, not a reservation: what a quiet partition leaves unused is there for the others, and a partition over its limit evicts its own blocks. A share below 8 blocks of the node's `read_cache_block_size` keeps nothing.
-- `read_ahead` replaces the node's readahead for the topic's readers. A partition reads ahead at most an eighth of its share of `read_cache_size`.
+- `read_ahead` replaces the node's readahead for the topic's readers. A partition reads ahead at most an eighth of its share of `read_cache_size` and an eighth of its shard's read cache.
 - `0` turns either off for the topic: with `read_cache_size` at `0`, its reads go to the store each time and nothing they fetch is kept.
 - Unset, each node applies its own `[tiered_storage]` setting of the same name, and only the shard's budget bounds the topic's partitions.
 
-Both keys work the same on normal and geo topics. A topic without `tiered_storage` accepts them, and they apply once its data is read from the store. An update can change either one, and the next poll reads with the new value, with no restart. Neither can be reset, because the default is each node's own setting and `0` is a value: set the node's value to follow it again. The fresh objects that a shard uploads for geo topics are held for the polls at the tail whatever a topic sets.
+Both keys work the same on normal and geo topics. A topic without `tiered_storage` accepts them, and they apply once its data is read from the store. An update can change either one, and the next poll reads with the new value, with no restart. Neither can be reset, because the default is each node's own setting and `0` is a value. So no update returns a topic to the node's settings: an update that sets the node's current value fixes it for the topic, with `read_cache_size` divided across its partitions, and the topic does not follow later changes to the node's settings. The fresh objects that a shard uploads for geo topics are held for the polls at the tail whatever a topic sets.
 
 ```bash
 iggy topic create my-stream archive 4 none --set tiered_storage=true --set read_cache_size=64MiB
 iggy topic update my-stream archive --set read_ahead=0
 ```
 
-A shadow topic inherits both keys from the geo topic that it shadows in another datacenter, and follows each update of them there, within about 35 seconds. A key that the geo topic does not set is unset on the shadow topic too, and each node that reads it applies its own setting. A client cannot set them on a shadow topic: an update of a shadow topic is refused with `ShadowStreamReadOnly`.
+A shadow topic inherits both keys from the geo topic that it shadows in another datacenter, and follows each update of them there, typically within about 35 seconds. The other datacenter proposes a limited number of shadow operations per pass, read cache changes last, so an update can wait for later passes while earlier operations, such as the adoptions of many new topics, are queued. A key that the geo topic does not set is unset on the shadow topic too, and each node that reads it applies its own setting. A client cannot set them on a shadow topic: an update of a shadow topic is refused with `ShadowStreamReadOnly`.
 
 ## Create-only vs updatable
 

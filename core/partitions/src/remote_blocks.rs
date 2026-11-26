@@ -116,8 +116,8 @@ pub struct PartitionReadSettings {
     /// exactly its range.
     pub limit: Option<usize>,
     /// Bytes that readahead fetches in front of the partition's sequential
-    /// readers at most, and never more than an eighth of its limit. Below
-    /// [`READ_AHEAD_START_BLOCKS`] blocks, none.
+    /// readers at most, and never more than an eighth of its limit or of the
+    /// shard's cache. Below [`READ_AHEAD_START_BLOCKS`] blocks, none.
     pub read_ahead: Option<u64>,
 }
 
@@ -271,7 +271,7 @@ impl ReadCache {
                 limit
             }
         });
-        {
+        let budget = {
             let mut cache = self.cache.borrow_mut();
             if cache.limit(&owner) != limit {
                 if let (Some(0), Some(share @ 1..)) = (limit, settings.limit) {
@@ -286,7 +286,8 @@ impl ReadCache {
                 }
                 cache.set_limit(owner, limit);
             }
-        }
+            cache.budget()
+        };
         if limit == Some(0) {
             return None;
         }
@@ -297,9 +298,8 @@ impl ReadCache {
             let wanted = settings
                 .read_ahead
                 .map_or(self.ahead_blocks_max, |bytes| bytes / self.block_bytes);
-            let within = limit.map_or(wanted, |limit| {
-                wanted.min(limit as u64 / AHEAD_SHARE as u64 / self.block_bytes)
-            });
+            let room = limit.map_or(budget, |limit| limit.min(budget));
+            let within = wanted.min(room as u64 / AHEAD_SHARE as u64 / self.block_bytes);
             if within < READ_AHEAD_START_BLOCKS {
                 0
             } else {
@@ -3143,6 +3143,46 @@ mod tests {
             assert_eq!(
                 reach.div_ceil(BLOCK).saturating_sub(12),
                 blocks_ahead,
+                "{row}"
+            );
+        }
+    }
+
+    /// A partition's own readahead keeps within an eighth of the shard's
+    /// cache when its limit is unset or above that cache.
+    #[compio::test]
+    async fn given_a_partition_readahead_above_an_eighth_of_the_shard_cache_when_reading_in_order_should_fetch_ahead_within_it()
+     {
+        const SHARD_CACHE_BYTES: usize = 32 * BLOCK_LEN;
+        for (row, limit) in [
+            ("no limit", None),
+            ("a limit above the cache", Some(2 * SHARD_CACHE_BYTES)),
+        ] {
+            let len = 40 * BLOCK;
+            let (store, ahead) = (Store::holding(len), Store::holding(len));
+            let remote = remote(&store, Rc::clone(&ahead) as _, SHARD_CACHE_BYTES, 2 * BLOCK);
+            let source = partition_source(1, len);
+            let settings = PartitionReadSettings {
+                limit,
+                read_ahead: Some(16 * BLOCK),
+            };
+            for block in 0..12 {
+                read_as(
+                    &remote,
+                    &source,
+                    block * BLOCK..(block + 1) * BLOCK,
+                    settings,
+                )
+                .await
+                .unwrap();
+                settle().await;
+            }
+
+            let reach = ahead.asked().iter().map(|(_, end)| *end).max().unwrap_or(0);
+            let an_eighth_of_the_cache = (SHARD_CACHE_BYTES / AHEAD_SHARE / BLOCK_LEN) as u64;
+            assert_eq!(
+                reach.div_ceil(BLOCK).saturating_sub(12),
+                an_eighth_of_the_cache,
                 "{row}"
             );
         }

@@ -192,7 +192,7 @@ impl OptionValueCodec for Durability {
     }
 
     fn encode(&self) -> Result<HeaderValue, IggyError> {
-        HeaderValue::from_str(self.as_ref())
+        Ok(HeaderValue::from(*self))
     }
 
     fn to_option_string(&self) -> String {

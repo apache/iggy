@@ -547,7 +547,8 @@ reservation: a partition over its limit evicts its own blocks, and what a quiet
 partition leaves unused is there for the others. A share below 8 blocks of the
 node's `read_cache_block_size` keeps nothing. The topic's `read_ahead` replaces
 the node's for its readers, and a partition reads ahead at most an eighth of
-its share. `0` turns either off for the topic. Unset, each node applies its own
+its share and an eighth of the cache of its shard. `0` turns either off for the
+topic. Unset, each node applies its own
 setting: only the cache of the shard bounds the topic's partitions, and they
 read ahead the node's `read_ahead`. Neither can be reset. The fresh objects a
 shard uploads are held for the polls at the tail whatever a topic sets. A
@@ -606,11 +607,13 @@ what is left on disk:
 
 The rebuild waits until the node passes the store identity check, and costs
 one listing of the partition's objects, one HEAD of each segment it reads,
-and a HEAD and a read of the manifest, which it skips above 16 MiB. A range
-of offsets below the first local `.log` that the store does not account for
-refuses the partition, and the log names it. A partition with one replica then
-stays down with its files as they were and no new chain file. A replicated one
-sets its files aside and rejoins by state transfer. Each shard exports
+several at a time, and one read of at most the first 16 MiB of the manifest.
+A manifest larger than that is not decoded, and the rebuild goes on without
+checking against it. A range of offsets below the first local `.log` that the
+store does not account for refuses the partition, and the log names it. A
+partition with one replica then stays down with its files as they were and no
+new chain file. A replicated one sets its files aside and rejoins by state
+transfer. Each shard exports
 `partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
 `partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
@@ -626,15 +629,26 @@ or, on a store that keeps no CRC32C, with another hash in its metadata, counts
 as diverged, and so does an `.index` that is not a whole number of entries. The
 node logs each such segment once as an error when it finds it, and once more
 when a later check finds it as recorded again. It repairs, deletes and fences
-nothing. A store error is no finding: after a timeout, a 5xx answer or
-throttling the next job checks the segment again, and after any other error
-the next pass does. Each shard exports `partition_segment_verify_passes_total`,
+nothing. A store error is no finding, and the segment counts as neither
+missing nor verified. After a timeout, a 5xx answer or throttling, the next
+job asks for the segment again, until 3 jobs in a row got no answer for it.
+The pass then goes on with the next segments, and asks for it once more after
+the last of them. After any other error, or when that last ask fails too, the
+next pass checks the segment. Each shard exports
+`partition_segment_verify_passes_total`,
 `partition_stored_segments_verified_total`, and the gauges
 `partition_stored_segments_missing` and `partition_stored_segments_diverged`
 over the partitions it leads, which drop to 0 when it stops leading them. No
 provider computes a CRC32C again on a HEAD, so the check compares what the
 store recorded when it took the object, not the bytes it holds now: a byte that
 flips inside an object file of the `fs` backend is not found.
+
+Each run of the message cleaner starts the next job of each partition's pass,
+as it starts the manifest publish, the object deletes and the retention of a
+tiered topic. A node with `cleaner_enabled = false` in
+`[data_maintenance.messages]` checks no segment, and its
+`partition_stored_segments_missing` and `partition_stored_segments_diverged`
+stay at 0 whatever the store lost.
 
 A committed delete of a partition, or of the topic or stream that holds it,
 queues the delete of the partition's objects in the memory of the metadata
@@ -651,18 +665,26 @@ described below:
   the revision the partition was created at. An incarnation is an orphan when
   committed metadata holds no partition of it and its revision is not above
   the one the sweep read before the listing.
-- It deletes an orphan only once two full sweeps in a row of the same primary
-  process found it, and the newest of its objects is older than
-  `[tiered_storage] orphan_grace`, 6 hours by default, by the time the store
-  gives each object. The delete goes through the same queue as a committed
-  delete: it checks committed metadata again, reads the store identity object
-  again and deletes nothing when it changed, lists the incarnation again, and
-  deletes each `.index` before its `.log` and the manifest last.
+- It deletes an orphan only once full sweeps in a row of the same primary
+  process found the same objects of it, by their number and the time the
+  store gives the newest, for `[tiered_storage] orphan_grace`, 6 hours by
+  default. The grace runs on the clock of the primary, from the start of the
+  second of those sweeps, so a clock of the primary that is ahead of the
+  store's does not shorten it, and a new object of the orphan starts it again.
+- The delete goes through the same queue as a committed delete, in turns
+  that each list at most 4 pages of the incarnation and give the delete slot
+  back between them. Every turn checks committed metadata and reads the store
+  identity object again, and deletes nothing when it changed. The first turns
+  list the whole incarnation and delete nothing. The turns after them list it
+  again and delete what they listed, each `.index` before any `.log` and the
+  manifest last. A turn that finds a long-term segment, a geo topic object, or
+  an object newer than the sweeps found or no newer than the claim ends the
+  delete.
 - The primary sweeps every hour, or every `orphan_grace` when that is shorter.
   `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
   the whole root, a store identity object that names another cluster, and a
   change of the metadata primary or of its view each drop what the sweeps
-  found, so the next two sweeps start the count again.
+  found, so the count starts again with the next sweeps.
 
 The sweep never deletes:
 
@@ -685,13 +707,16 @@ The sweep never deletes:
 Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
 root, the gauge `orphan_incarnations`, the orphans the last sweep found,
 `orphan_incarnations_deleted_total`, the gauge `orphan_objects_before_claim`,
-and `orphan_identity_skips_total`, the sweeps and deletes that stopped at a
-store identity object other than the one they expected. Only shard 0 of the
-metadata primary moves them. A sweep costs a HEAD and a read of the identity
-object and one listing request per 1,000 keys under the prefix, fresh objects
-and the keys of other prefixes nested in it included. The delete of an orphan
-costs a read of the identity object, the listing of the incarnation, a HEAD of
-its manifest and of its geo topic object, and the deletes.
+the objects no newer than the claim of the incarnations the last sweep left to
+an operator, and `orphan_identity_skips_total`, the sweeps and deletes that
+stopped at a store identity object other than the one they expected. Only
+shard 0 of the metadata primary moves them. A sweep costs a HEAD and a read of
+the identity object and one listing request per 1,000 keys under the prefix,
+fresh objects and the keys of other prefixes nested in it included. The delete
+of an orphan lists the incarnation twice, and costs a read of the identity
+object per turn, a HEAD of its geo topic object per turn that deletes and at
+the end of the first listing, a HEAD of its manifest at the end of each
+listing, and the deletes.
 
 Restoring metadata while tiered storage is in use is not supported. If
 metadata is rolled back or restored under the same cluster id, the
@@ -721,10 +746,15 @@ Each shard bounds and retries the calls it sends to the store. A head, a
 read, a listing or a delete that gets no answer within `request_timeout`, or
 fails with a 5xx answer, throttling or a connection that broke or never
 opened, is sent again after `retry_delay`, doubled up to `max_retry_delay`, up
-to `max_attempts` in all. A put whose body the node holds in memory is sent
-again the same way: fresh objects, long-term segments, manifests and the other
-small objects of the cluster. Every attempt of one put carries the same
-`put-id` entry in the object's user metadata. An attempt at a create-only put,
+to `max_attempts` in all. A create-only put whose body the node holds in
+memory, a fresh object or a long-term segment, is sent again the same way. An
+overwrite, such as a manifest, a positions object or a topic object, is sent
+again only when its request never left the node, for example when the
+connection was refused or the name lookup or TLS handshake failed. An attempt
+that may have reached the store can land after a later overwrite of the same
+key and roll it back, so any other failure of an overwrite goes to the caller.
+Every attempt of one put carries the same `put-id` entry in the object's user
+metadata. An attempt at a create-only put,
 a fresh object or a long-term segment, is given up when the store takes no
 64 KiB piece of its body for `put_attempt_stall_timeout`, 1 second by default,
 or gives no answer for `put_attempt_answer_timeout`, 5 seconds by default,
@@ -797,6 +827,12 @@ shard or node: an upload gives up at half the grace, and the other half covers
 the skew between the clocks. `abandoned_upload_grace = "disabled"` turns the
 sweep off, and an upload in parts then has no deadline. The grace is at least
 30 minutes, so its second half takes the 15 minutes of skew that S3 accepts.
+On `s3` the sweep, and the abort of an upload in parts that fails, need
+`s3:ListBucketMultipartUploads` and `s3:AbortMultipartUpload` on the bucket,
+besides `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket`.
+Without them the sweep removes nothing and logs why, and S3 keeps charging for
+the parts of every abandoned upload. A bucket lifecycle rule that aborts
+incomplete multipart uploads is the alternative.
 
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:

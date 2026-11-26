@@ -36,7 +36,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
 use consensus::{MetadataHandle, VsrConsensus};
@@ -46,7 +46,7 @@ use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use partitions::{
     ClaimStamp, ObjectDeleter, OrphanCandidates, OrphanGuard, RootListing, SweepFindings,
-    SweepStamp, quiet_since, sweep_interval,
+    SweepStamp, sweep_interval,
 };
 use tracing::{debug, info, warn};
 
@@ -113,7 +113,7 @@ impl OrphanSweep {
             let queued = deletes.queue_orphans(shard, due, now);
             info!(
                 offered,
-                queued, "queued the delete of orphan incarnations that two sweeps found"
+                queued, "queued the delete of orphan incarnations that the sweeps found due"
             );
         }
         if state.running.is_some() || now.as_micros() < state.next_sweep_at {
@@ -203,7 +203,8 @@ struct Sweep {
     /// The revision committed metadata had reached before the listing.
     revision: u64,
     grace: Duration,
-    /// When the pass that started the sweep ran.
+    /// When the pass that started the sweep ran, which the previous sweep
+    /// ended before.
     now: IggyTimestamp,
 }
 
@@ -234,27 +235,23 @@ impl Sweep {
         match swept {
             Ok((claim, listing)) => {
                 let streams = self.owner.plane.metadata().mux_stm.streams();
-                let findings =
-                    SweepFindings::of(&listing, self.revision, claim.claimed_at, |prefix| {
-                        holds_incarnation(streams, prefix)
-                    });
-                let quiet_since = quiet_since(system_time(self.now), self.grace);
+                let findings = SweepFindings::of(&listing, self.revision, |prefix| {
+                    holds_incarnation(streams, prefix)
+                });
                 let stamp = SweepStamp {
                     view: self.view,
                     claim: claim.clone(),
                 };
                 let due = state
                     .candidates
-                    .settle(stamp, &findings.orphans, quiet_since);
-                if let Some(quiet_since) = quiet_since {
-                    state.due.extend(due.into_iter().map(|prefix| {
-                        let guard = OrphanGuard {
-                            claim: claim.clone(),
-                            quiet_since,
-                        };
-                        (prefix, guard)
-                    }));
-                }
+                    .settle(stamp, &findings.orphans, self.now, self.grace);
+                state.due.extend(due.into_iter().map(|(prefix, newest)| {
+                    let guard = OrphanGuard {
+                        claim: claim.clone(),
+                        newest,
+                    };
+                    (prefix, guard)
+                }));
                 metrics.record_orphan_sweep();
                 metrics
                     .set_orphan_findings(findings.orphans.len(), findings.objects_before_claim());
@@ -295,7 +292,11 @@ impl Sweep {
         let mut listing = RootListing::default();
         let mut after = None;
         loop {
-            let pages = match self.deleter()?.list_root(after, self.token.clone()).await? {
+            let pages = match self
+                .deleter()?
+                .list_root(after, claim.claimed_at, self.token.clone())
+                .await?
+            {
                 Ok(pages) => pages,
                 Err(error) => {
                     warn!(
@@ -345,8 +346,8 @@ fn log_findings(listing: &RootListing, findings: &SweepFindings, due: usize) {
             due,
             ?sample,
             "found partition incarnations with objects in the store that committed metadata no \
-             longer holds; each is deleted once a second sweep finds it and its newest object is \
-             older than tiered_storage.orphan_grace"
+             longer holds; each is deleted once the sweeps find the same objects of it for \
+             tiered_storage.orphan_grace"
         );
     }
     if !findings.before_claim.is_empty() {
@@ -364,10 +365,6 @@ fn log_findings(listing: &RootListing, findings: &SweepFindings, due: usize) {
              it left; the sweep never deletes them, and an operator may"
         );
     }
-}
-
-fn system_time(timestamp: IggyTimestamp) -> SystemTime {
-    UNIX_EPOCH + Duration::from_micros(timestamp.as_micros())
 }
 
 fn micros(duration: Duration) -> u64 {

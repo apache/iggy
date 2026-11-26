@@ -21,6 +21,7 @@
 //! lists that segment. Nothing in `dc-b` reads the fresh objects of `dc-a`.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -29,7 +30,8 @@ use std::time::Duration;
 use iggy::prelude::*;
 use iggy_object_store::{KeyLayout, RecoveryRecord};
 use integration::harness::{
-    Bucket, BucketEvent, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide, ServerHandle,
+    Bucket, BucketEvent, BucketWatch, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide,
+    ServerHandle,
 };
 use tokio::time::{Instant, sleep};
 
@@ -83,8 +85,8 @@ const CHANGED_LOG: &str = "the store identity object of the geo peer no longer n
 /// How long the node rebuilt on an empty disk may take to recover `dc-a` and
 /// claim its root.
 const RECOVERY_DEADLINE: Duration = Duration::from_secs(120);
-/// How long a running node may take to accept a recovered origin: at most
-/// one regular identity check of the peer, and slack.
+/// How long a running node may take from the claim to accept a recovered
+/// origin: at most one regular identity check of the peer, and slack.
 const SUCCESSOR_DEADLINE: Duration = Duration::from_secs(90);
 
 #[tokio::test]
@@ -159,13 +161,7 @@ async fn given_a_shadow_without_consumers_when_its_origin_produces_should_send_t
     sleep(REQUEST_WINDOW).await;
     let (lists_after, gets_after) = manifest_requests(&scrape(&http_b).await);
     let reads = watch.reads();
-    let lost = watch
-        .changes()
-        .into_iter()
-        .filter(
-            |change| matches!(change, BucketEvent::Change { kind, .. } if kind == "events lost"),
-        )
-        .count();
+    let lost = events_lost(&watch);
     drop(watch);
     producing.store(false, Ordering::Release);
     let sent = producer.await.expect("the producer finishes");
@@ -425,7 +421,13 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
     await_listed(pair.a().bucket(), 2 * BATCH_MESSAGES - 1).await;
 
     let node_b = pair.b().harness().node(0);
-    await_log(node_b, SUCCESSOR_LOG, SUCCESSOR_DEADLINE).await;
+    await_log(
+        node_b,
+        SUCCESSOR_LOG,
+        0,
+        SUCCESSOR_DEADLINE.saturating_sub(claimed_at.elapsed()),
+    )
+    .await;
     let accepted_within = claimed_at.elapsed();
     assert_eq!(
         read_next(
@@ -457,6 +459,7 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
         .stop()
         .await
         .expect("dc-b stops");
+    let accepted_before_restart = logged(pair.b().harness().node(0), SUCCESSOR_LOG);
     let mirror = pair
         .b()
         .peer_mirror()
@@ -471,7 +474,13 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
         .expect("dc-b starts again");
     let client_b = booted_client(pair.b()).await;
     let node_b = pair.b().harness().node(0);
-    let restarted_within = await_log(node_b, SUCCESSOR_LOG, CHECK_DEADLINE).await;
+    let restarted_within = await_log(
+        node_b,
+        SUCCESSOR_LOG,
+        accepted_before_restart,
+        CHECK_DEADLINE,
+    )
+    .await;
     eprintln!(
         "dc-a {retired:032x} recovered as {successor:032x}; the running dc-b accepted it within \
          {accepted_within:?} of the claim, the restarted one within {restarted_within:?} of taking \
@@ -513,6 +522,12 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
         }
     }
     eprintln!("opens of the bucket of dc-a by the restarted dc-b: {opens:?}");
+    let lost = events_lost(&watch);
+    assert_eq!(
+        lost, 0,
+        "the watch on the mirror lost events, so its reads cannot show what the restarted dc-b \
+         opened"
+    );
     let identity_reads = opens.other.get("meta/identity").copied().unwrap_or(0);
     assert!(
         identity_reads > 0 && opens.recovery > 0 && opens.manifest_files > 0 && opens.segments > 0,
@@ -867,17 +882,43 @@ async fn await_listed(bucket: &Bucket, last: u64) {
     }
 }
 
-/// Wait until `node` logs `marker`, and return how long that took.
-async fn await_log(node: &ServerHandle, marker: &str, within: Duration) -> Duration {
+/// Wait until `node` logged `marker` more than `before` times, and return how
+/// long that took.
+async fn await_log(node: &ServerHandle, marker: &str, before: usize, within: Duration) -> Duration {
     let started = Instant::now();
-    while !node.stdout_contains(marker) {
+    while logged(node, marker) <= before {
         assert!(
             started.elapsed() < within,
-            "the node never logged {marker:?}"
+            "the node never logged {marker:?} within {within:?}"
         );
         sleep(Duration::from_millis(250)).await;
     }
     started.elapsed()
+}
+
+/// How many times `node` logged `marker` in its own log files. They keep every
+/// run of the node in any test mode, so a count taken before a restart tells
+/// the runs apart.
+fn logged(node: &ServerHandle, marker: &str) -> usize {
+    let Ok(entries) = fs::read_dir(node.data_path().join("logs")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .map(|log| log.matches(marker).count())
+        .sum()
+}
+
+/// How many times `watch` lost events, after which its reads are incomplete.
+fn events_lost(watch: &BucketWatch) -> usize {
+    watch
+        .changes()
+        .iter()
+        .filter(
+            |change| matches!(change, BucketEvent::Change { kind, .. } if kind == "events lost"),
+        )
+        .count()
 }
 
 /// Scrape `/metrics` through `http` until each gauge of the peer `dc-a`

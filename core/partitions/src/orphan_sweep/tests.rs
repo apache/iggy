@@ -32,13 +32,20 @@ const ORPHAN: ObjectPrefix = ObjectPrefix {
 /// The revision committed metadata reached before the listing.
 const REVISION: u64 = 10;
 const OURS: u128 = 0x0123_4567_89ab_cdef_0011_2233_4455_6677;
+const GRACE: Duration = Duration::from_secs(60);
 
 fn layout() -> KeyLayout {
     KeyLayout::new("iggy").unwrap()
 }
 
+/// A moment the store gave.
 fn at(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
+}
+
+/// A moment of this node's clock.
+fn node(secs: u64) -> IggyTimestamp {
+    IggyTimestamp::from(secs * 1_000_000)
 }
 
 /// The claim of the root, at second 100.
@@ -95,7 +102,7 @@ fn topic_of(prefix: ObjectPrefix) -> TopicKey {
 fn listing(objects: &[(String, u64)]) -> RootListing {
     let mut listing = RootListing::default();
     for (key, secs) in objects {
-        listing.take(&layout(), &listed(key.clone(), *secs));
+        listing.take(&layout(), &listed(key.clone(), *secs), claim().claimed_at);
     }
     listing
 }
@@ -116,14 +123,7 @@ fn held_nothing(_: &ObjectPrefix) -> bool {
 fn judged(objects: &[(String, u64)], holds: impl Fn(&ObjectPrefix) -> bool) -> Verdict {
     let listing = listing(objects);
     let listed = listing.incarnations[&ORPHAN];
-    verdict(
-        &ORPHAN,
-        &listed,
-        &listing.topics,
-        REVISION,
-        claim().claimed_at,
-        holds,
-    )
+    verdict(&ORPHAN, &listed, &listing.topics, REVISION, holds)
 }
 
 #[test]
@@ -202,9 +202,9 @@ fn given_a_listing_when_taking_its_objects_should_sum_each_incarnation_and_count
         listing.incarnations[&ORPHAN],
         ListedIncarnation {
             objects: 3,
+            before_claim: 0,
             manifest: true,
             long_term: false,
-            oldest: at(200),
             newest: at(400),
         }
     );
@@ -212,9 +212,9 @@ fn given_a_listing_when_taking_its_objects_should_sum_each_incarnation_and_count
         listing.incarnations[&other],
         ListedIncarnation {
             objects: 1,
+            before_claim: 0,
             manifest: false,
             long_term: true,
-            oldest: at(500),
             newest: at(500),
         }
     );
@@ -228,6 +228,7 @@ fn given_a_listing_cut_into_jobs_when_merging_should_equal_the_listing_in_one_pa
     let objects = [
         (segment(ORPHAN, 0, SegmentObject::Log), 300),
         (segment(ORPHAN, 10, SegmentObject::Log), 900),
+        (segment(ORPHAN, 20, SegmentObject::Log), 50),
         (layout().manifest_key(&ORPHAN), 150),
         (long_term(ORPHAN), 400),
         (layout().topic_key(&topic_of(ORPHAN)), 600),
@@ -270,7 +271,6 @@ fn given_an_incarnation_above_the_revision_read_before_the_listing_when_judging_
             &listing.incarnations[prefix],
             &listing.topics,
             REVISION,
-            claim().claimed_at,
             held_nothing,
         )
     };
@@ -345,75 +345,178 @@ fn given_a_listing_when_finding_should_keep_the_orphans_with_their_newest_object
     objects.extend(incarnation(geo, 200));
     objects.push((long_term(geo), 200));
 
-    let findings = SweepFindings::of(&listing(&objects), REVISION, claim().claimed_at, |prefix| {
-        *prefix == live
-    });
+    let findings = SweepFindings::of(&listing(&objects), REVISION, |prefix| *prefix == live);
 
-    assert_eq!(findings.orphans, BTreeMap::from([(ORPHAN, at(250))]));
+    assert_eq!(
+        findings.orphans.keys().copied().collect::<Vec<_>>(),
+        [ORPHAN]
+    );
+    assert_eq!(findings.orphans[&ORPHAN].newest, at(250));
+    assert_eq!(findings.orphans[&ORPHAN].objects, 4);
     assert_eq!(findings.before_claim, BTreeMap::from([(retired, 3)]));
     assert_eq!(findings.objects_before_claim(), 3);
 }
 
 #[test]
+fn given_an_incarnation_with_objects_on_both_sides_of_the_claim_when_finding_should_count_only_those_no_newer_than_it()
+ {
+    let mut objects = incarnation(ORPHAN, 200);
+    objects.push((segment(ORPHAN, 10, SegmentObject::Log), 99));
+    objects.push((segment(ORPHAN, 10, SegmentObject::Index), 100));
+    let listing = listing(&objects);
+
+    let findings = SweepFindings::of(&listing, REVISION, held_nothing);
+
+    assert_eq!(listing.incarnations[&ORPHAN].objects, 5);
+    assert_eq!(listing.incarnations[&ORPHAN].before_claim, 2);
+    assert_eq!(findings.before_claim, BTreeMap::from([(ORPHAN, 2)]));
+    assert_eq!(findings.objects_before_claim(), 2);
+}
+
+/// What a listing found of an orphan: its newest moment and its objects.
+fn found(newest: u64, objects: usize) -> BTreeMap<ObjectPrefix, ListedIncarnation> {
+    BTreeMap::from([(
+        ORPHAN,
+        ListedIncarnation {
+            objects,
+            before_claim: 0,
+            manifest: true,
+            long_term: false,
+            newest: at(newest),
+        },
+    )])
+}
+
+/// Settle sweeps of `stamp` that found `orphans`, one starting at each of
+/// `starts`, and return what the last one found due.
+fn settled(
+    candidates: &mut OrphanCandidates,
+    stamp: &SweepStamp,
+    orphans: &BTreeMap<ObjectPrefix, ListedIncarnation>,
+    starts: &[IggyTimestamp],
+) -> Vec<(ObjectPrefix, SystemTime)> {
+    let mut due = Vec::new();
+    for started in starts {
+        due = candidates.settle(stamp.clone(), orphans, *started, GRACE);
+    }
+    due
+}
+
+#[test]
 fn given_one_full_sweep_when_settling_should_delete_nothing() {
     let mut candidates = OrphanCandidates::default();
-    let orphans = BTreeMap::from([(ORPHAN, at(200))]);
 
     assert_eq!(
-        candidates.settle(stamp(), &orphans, Some(at(1_000))),
+        candidates.settle(stamp(), &found(200, 3), node(0), GRACE),
         Vec::new()
     );
     assert_eq!(candidates.len(), 1);
 }
 
 #[test]
-fn given_two_full_sweeps_in_a_row_when_settling_should_delete_the_orphans_both_found_past_their_grace()
+fn given_sweeps_that_list_an_orphan_the_same_when_settling_should_count_the_grace_from_the_start_of_the_second()
  {
     let mut candidates = OrphanCandidates::default();
-    let recent = ObjectPrefix {
-        partition_id: 1,
-        ..ORPHAN
-    };
-    let only_second = ObjectPrefix {
-        partition_id: 2,
-        ..ORPHAN
-    };
-    candidates.settle(
-        stamp(),
-        &BTreeMap::from([(ORPHAN, at(200)), (recent, at(200))]),
-        Some(at(1_000)),
-    );
+    let orphan = found(200, 3);
+    let just_short = IggyTimestamp::from(node(10 + 60).as_micros() - 1);
 
-    let due = candidates.settle(
-        stamp(),
-        &BTreeMap::from([(ORPHAN, at(500)), (recent, at(501)), (only_second, at(200))]),
-        Some(at(500)),
+    assert_eq!(
+        settled(
+            &mut candidates,
+            &stamp(),
+            &orphan,
+            &[node(0), node(10), just_short]
+        ),
+        Vec::new()
     );
+    assert_eq!(
+        candidates.settle(stamp(), &orphan, node(10 + 60), GRACE),
+        vec![(ORPHAN, at(200))]
+    );
+}
 
-    assert_eq!(due, vec![ORPHAN]);
-    assert_eq!(candidates.len(), 3);
+#[test]
+fn given_a_node_clock_ahead_of_the_store_when_settling_should_still_wait_the_grace_from_the_second_sweep()
+ {
+    let mut candidates = OrphanCandidates::default();
+    // This node's clock reads far past the moment the store gave the
+    // newest object.
+    let orphan = found(200, 3);
+    let ahead = 1_000_000;
+
+    assert_eq!(
+        settled(
+            &mut candidates,
+            &stamp(),
+            &orphan,
+            &[node(ahead), node(ahead + 60)]
+        ),
+        Vec::new()
+    );
+    assert_eq!(
+        candidates.settle(stamp(), &orphan, node(ahead + 120), GRACE),
+        vec![(ORPHAN, at(200))]
+    );
+}
+
+#[test]
+fn given_an_orphan_that_gains_an_object_between_sweeps_when_settling_should_wait_the_full_grace_again()
+ {
+    for (case, changed) in [
+        ("a newer object", found(250, 4)),
+        ("an object in the same second", found(200, 4)),
+    ] {
+        let mut candidates = OrphanCandidates::default();
+        settled(
+            &mut candidates,
+            &stamp(),
+            &found(200, 3),
+            &[node(0), node(60)],
+        );
+
+        assert_eq!(
+            settled(
+                &mut candidates,
+                &stamp(),
+                &changed,
+                &[node(120), node(180), node(239)]
+            ),
+            Vec::new(),
+            "{case}"
+        );
+        assert_eq!(
+            candidates.settle(stamp(), &changed, node(240), GRACE),
+            vec![(ORPHAN, changed[&ORPHAN].newest)],
+            "{case}"
+        );
+    }
 }
 
 #[test]
 fn given_a_sweep_that_did_not_find_an_orphan_when_settling_should_start_its_count_again() {
     let mut candidates = OrphanCandidates::default();
-    let found = BTreeMap::from([(ORPHAN, at(200))]);
-    candidates.settle(stamp(), &found, Some(at(1_000)));
-    candidates.settle(stamp(), &BTreeMap::new(), Some(at(1_000)));
+    let orphan = found(200, 3);
+    settled(&mut candidates, &stamp(), &orphan, &[node(0), node(60)]);
+    candidates.settle(stamp(), &BTreeMap::new(), node(120), GRACE);
 
     assert_eq!(
-        candidates.settle(stamp(), &found, Some(at(1_000))),
+        settled(
+            &mut candidates,
+            &stamp(),
+            &orphan,
+            &[node(180), node(240), node(299)]
+        ),
         Vec::new()
     );
     assert_eq!(
-        candidates.settle(stamp(), &found, Some(at(1_000))),
-        vec![ORPHAN]
+        candidates.settle(stamp(), &orphan, node(300), GRACE),
+        vec![(ORPHAN, at(200))]
     );
 }
 
 #[test]
 fn given_sweeps_under_another_view_or_claim_when_settling_should_start_the_count_again() {
-    let found = BTreeMap::from([(ORPHAN, at(200))]);
+    let orphan = found(200, 3);
     let other_view = SweepStamp {
         view: stamp().view + 1,
         ..stamp()
@@ -442,45 +545,55 @@ fn given_sweeps_under_another_view_or_claim_when_settling_should_start_the_count
 
     for second in [other_view, other_etag, other_cluster, later_claim] {
         let mut candidates = OrphanCandidates::default();
-        candidates.settle(stamp(), &found, Some(at(1_000)));
+        settled(&mut candidates, &stamp(), &orphan, &[node(0), node(60)]);
 
         assert_eq!(
-            candidates.settle(second.clone(), &found, Some(at(1_000))),
+            settled(
+                &mut candidates,
+                &second,
+                &orphan,
+                &[node(120), node(180), node(239)]
+            ),
             Vec::new(),
             "{second:?}"
         );
         assert_eq!(
-            candidates.settle(second.clone(), &found, Some(at(1_000))),
-            vec![ORPHAN],
+            candidates.settle(second.clone(), &orphan, node(240), GRACE),
+            vec![(ORPHAN, at(200))],
             "{second:?}"
         );
     }
 }
 
 #[test]
-fn given_cleared_candidates_when_settling_should_need_two_sweeps_again() {
+fn given_cleared_candidates_when_settling_should_start_the_count_again() {
     let mut candidates = OrphanCandidates::default();
-    let found = BTreeMap::from([(ORPHAN, at(200))]);
-    candidates.settle(stamp(), &found, Some(at(1_000)));
+    let orphan = found(200, 3);
+    settled(&mut candidates, &stamp(), &orphan, &[node(0), node(60)]);
 
     candidates.clear();
 
     assert!(candidates.is_empty());
     assert_eq!(
-        candidates.settle(stamp(), &found, Some(at(1_000))),
+        settled(&mut candidates, &stamp(), &orphan, &[node(120), node(180)]),
         Vec::new()
     );
 }
 
 #[test]
-fn given_no_moment_old_enough_when_settling_should_delete_nothing() {
+fn given_a_node_clock_that_steps_back_when_settling_should_delete_nothing() {
     let mut candidates = OrphanCandidates::default();
-    let found = BTreeMap::from([(ORPHAN, at(0))]);
-    candidates.settle(stamp(), &found, None);
+    let orphan = found(200, 3);
 
-    assert_eq!(candidates.settle(stamp(), &found, None), Vec::new());
-    assert_eq!(quiet_since(at(5), Duration::MAX), None);
-    assert_eq!(quiet_since(at(5), Duration::from_secs(5)), Some(at(0)));
+    assert_eq!(
+        settled(
+            &mut candidates,
+            &stamp(),
+            &orphan,
+            &[node(100), node(160), node(50)]
+        ),
+        Vec::new()
+    );
 }
 
 #[test]
@@ -498,7 +611,7 @@ fn given_a_grace_when_timing_the_sweeps_should_sweep_every_hour_or_every_grace_w
 fn guard() -> OrphanGuard {
     OrphanGuard {
         claim: claim(),
-        quiet_since: at(500),
+        newest: at(500),
     }
 }
 
@@ -518,27 +631,51 @@ fn given_the_identity_object_the_delete_reads_when_checking_the_claim_should_tak
     assert!(!guard().same_claim(&IdentityRead::Invalid, Some("claim")));
 }
 
+/// The check of objects, each stored at a second and of a long-term
+/// segment or not.
+fn checked(objects: &[(u64, bool)]) -> OrphanCheck {
+    let mut check = OrphanCheck::default();
+    for (secs, long_term) in objects {
+        check.take(&guard(), at(*secs), *long_term);
+    }
+    check
+}
+
 #[test]
 fn given_what_the_delete_lists_when_checking_the_guard_should_refuse_anything_the_sweep_did_not_judge()
  {
-    let guard = guard();
-
-    assert_eq!(guard.refusal([at(101), at(500)], false, false), None);
-    assert_eq!(guard.refusal([], false, false), None);
+    assert_eq!(checked(&[(101, false), (500, false)]).refusal(false), None);
+    assert_eq!(checked(&[]).refusal(false), None);
     assert_eq!(
-        guard.refusal([at(200), at(501)], false, false),
+        checked(&[(200, false), (501, false)]).refusal(false),
         Some(OrphanRefusal::Recent)
     );
     assert_eq!(
-        guard.refusal([at(100), at(200)], false, false),
+        checked(&[(100, false), (200, false)]).refusal(false),
         Some(OrphanRefusal::BeforeClaim)
     );
     assert_eq!(
-        guard.refusal([at(200)], true, false),
+        checked(&[(200, true)]).refusal(false),
         Some(OrphanRefusal::LongTerm)
     );
     assert_eq!(
-        guard.refusal([at(200)], false, true),
+        checked(&[(200, false)]).refusal(true),
         Some(OrphanRefusal::TopicObject)
     );
+}
+
+#[test]
+fn given_objects_taken_page_by_page_when_checking_should_keep_the_first_age_refusal_below_the_long_term_and_topic_checks()
+ {
+    let mut check = checked(&[(200, false), (501, false)]);
+    check.take(&guard(), at(100), false);
+
+    assert_eq!(check.age, Some(OrphanRefusal::Recent));
+    assert_eq!(check.refusal(false), Some(OrphanRefusal::Recent));
+    assert_eq!(check.refusal(true), Some(OrphanRefusal::TopicObject));
+
+    check.take(&guard(), at(300), true);
+
+    assert_eq!(check.refusal(true), Some(OrphanRefusal::LongTerm));
+    assert_eq!(check.age, Some(OrphanRefusal::Recent));
 }

@@ -669,8 +669,10 @@ impl ObjectStore for S3Store {
 
     /// `CompleteMultipartUpload` with `If-None-Match: *` for a create-only
     /// put, the full object CRC32C and the object's size, all of which the
-    /// store checks. An error in the body of a 200 is a failure of the
-    /// store, which can still have created the object.
+    /// store checks. A 200 succeeds only with a `CompleteMultipartUploadResult`
+    /// that carries an etag. An error in its body is classified by its code,
+    /// and a body that holds neither is [`ObjectStoreError::Unavailable`].
+    /// Both can follow a completion that created the object.
     async fn complete_parts(
         &self,
         upload: &PartsUpload,
@@ -706,13 +708,18 @@ impl ObjectStore for S3Store {
             return Err(self.failure(status, date, &error, &Subject::Object(key)));
         }
         let answer = response.bytes().await.map_err(transport)?;
-        xml::embedded_error(&answer).map_or(Ok(()), |error| {
-            Err(embedded_failure(
+        match xml::parse_complete(&answer) {
+            Ok(xml::Completion::Created) => Ok(()),
+            Ok(xml::Completion::Failed(error)) => Err(embedded_failure(
                 &error,
                 &Subject::Object(key),
                 &self.bucket,
-            ))
-        })
+            )),
+            Err(unread) => Err(ObjectStoreError::Unavailable(format!(
+                "a 200 answer to the completion of {key:?} holds neither its result nor an \
+                 error: {unread}"
+            ))),
+        }
     }
 
     /// `AbortMultipartUpload`. An upload that is gone, aborted or completed,
@@ -998,6 +1005,7 @@ mod tests {
     use http::HeaderValue;
 
     use super::*;
+    use crate::error::ErrorClass;
     use crate::http::test_endpoints::{Answer, Recorded, Recorder};
     use crate::store::PUT_ID_METADATA;
 
@@ -1499,7 +1507,8 @@ mod tests {
             (
                 200,
                 Vec::new(),
-                b"<CompleteMultipartUploadResult/>".to_vec(),
+                b"<CompleteMultipartUploadResult><ETag>\"x-2\"</ETag></CompleteMultipartUploadResult>"
+                    .to_vec(),
             )
         });
         let store = static_store(&fake.endpoint);
@@ -1552,6 +1561,64 @@ mod tests {
 
             let error = completed.unwrap_err();
             assert!(expected(&error), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn given_an_error_root_with_attributes_in_a_200_when_completing_should_classify_its_code() {
+        let fake = Recorder::start(|_| {
+            let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error \
+                        xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                        <Code>PreconditionFailed</Code></Error>";
+            (200, Vec::new(), body.as_bytes().to_vec())
+        });
+        let store = static_store(&fake.endpoint);
+
+        let completed =
+            run(store.complete_parts(&upload("a/b"), &parts(), &PutOptions::default(), 12));
+
+        let error = completed.unwrap_err();
+        assert!(
+            matches!(&error, ObjectStoreError::PreconditionFailed { key } if key == "a/b"),
+            "{error:?}"
+        );
+    }
+
+    /// The store sent its status before it finished, so a 200 that names no
+    /// outcome can follow a completion that created the object, and the
+    /// caller's check of the object under the key settles it.
+    #[test]
+    fn given_a_200_without_a_result_when_completing_should_fail_as_one_that_may_have_created_the_object()
+     {
+        let cases: [Answers; 4] = [
+            |_| (200, Vec::new(), Vec::new()),
+            |_| {
+                (
+                    200,
+                    Vec::new(),
+                    b"<CompleteMultipartUploadResult/>".to_vec(),
+                )
+            },
+            |_| (200, Vec::new(), b"<html>bad gateway</html>".to_vec()),
+            |_| {
+                let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\n   ";
+                (200, Vec::new(), body.as_bytes().to_vec())
+            },
+        ];
+        for answer in cases {
+            let fake = Recorder::start(answer);
+            let store = static_store(&fake.endpoint);
+
+            let completed =
+                run(store.complete_parts(&upload("a/b"), &parts(), &PutOptions::default(), 12));
+
+            let error = completed.unwrap_err();
+            assert!(
+                matches!(error, ObjectStoreError::Unavailable(_)),
+                "{error:?}"
+            );
+            assert_eq!(error.class(), ErrorClass::Transient);
+            assert!(error.put_may_have_stored());
         }
     }
 

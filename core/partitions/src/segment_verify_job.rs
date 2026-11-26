@@ -22,7 +22,7 @@ use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_common::IggyTimestamp;
 use iggy_object_store::{
-    ErrorClass, KeyLayout, ObjectPrefix, ObjectStore, ObjectStoreError, SegmentKey, SegmentObject,
+    KeyLayout, ObjectPrefix, ObjectStore, ObjectStoreError, SegmentKey, SegmentObject,
     TierExecutor, TierJobClass, TierJobRequest, TierScopeToken,
 };
 use journal::superblock::SuperblockStore;
@@ -186,6 +186,7 @@ where
         };
         let view = self.consensus().view();
         let namespace_raw = self.namespace().inner();
+        let trim_point = self.chain_trim_point();
         let Some(chain) = self.segment_chain.as_deref() else {
             return VerifyBegin::Idle;
         };
@@ -193,7 +194,7 @@ where
             Some(state) if state.view() == view => state,
             slot => slot.insert(Box::new(SegmentVerifies::new(view))),
         };
-        let dropped = state.retain_stored(|start_offset| chain.confirmed_record(start_offset));
+        let dropped = trim_point.map_or(0, |trim_point| state.trim(trim_point));
         if dropped > 0 {
             debug!(
                 namespace_raw,
@@ -235,7 +236,7 @@ where
             ..
         }) = outcome
         {
-            log_unanswered(namespace_raw, unanswered);
+            log_unanswered(namespace_raw, unanswered, settled.postponed);
         }
         for transition in &settled.transitions {
             log_transition(namespace_raw, transition);
@@ -244,24 +245,24 @@ where
     }
 }
 
-fn log_unanswered(namespace_raw: u64, unanswered: &Unanswered) {
+fn log_unanswered(namespace_raw: u64, unanswered: &Unanswered, postponed: bool) {
     let Unanswered {
         start_offset,
         error,
     } = unanswered;
-    if error.class() == ErrorClass::Transient {
-        debug!(
-            namespace_raw,
-            start_offset,
-            %error,
-            "the object store did not answer for a stored segment, which the next job checks again"
-        );
-    } else {
+    if postponed {
         warn!(
             namespace_raw,
             start_offset,
             %error,
             "the object store did not answer for a stored segment, which waits for the next pass"
+        );
+    } else {
+        debug!(
+            namespace_raw,
+            start_offset,
+            %error,
+            "the object store did not answer for a stored segment, which this pass asks for again"
         );
     }
 }

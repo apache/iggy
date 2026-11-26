@@ -111,7 +111,8 @@ impl IncarnationDeletes {
         let offered = orphans.len();
         let queued = orphans
             .into_iter()
-            .filter(|(prefix, guard)| queue.queue_orphan(*prefix, guard.clone(), now))
+            .map(|(prefix, guard)| queue.queue_orphan(prefix, guard, now))
+            .filter(|queued| *queued)
             .count();
         if queued < offered {
             warn!(
@@ -208,6 +209,7 @@ fn record_settled(shard: &ServerShard, prefix: ObjectPrefix, settled: Option<Inc
         Some(
             IncarnationSettled::Deleted { orphan: false }
             | IncarnationSettled::Retried
+            | IncarnationSettled::Continues
             | IncarnationSettled::Refused(_),
         )
         | None => {}

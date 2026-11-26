@@ -1079,19 +1079,50 @@ fn given_failures_past_the_attempts_when_putting_should_return_the_last_one() {
     assert_eq!(bus.now(), Duration::from_millis(700));
 }
 
+/// An attempt at an overwrite that may have reached the store can land after
+/// a later overwrite of the key, so a retry that succeeds would let the
+/// caller publish over an object that the late attempt then rolls back.
 #[test]
-fn given_an_overwrite_with_a_lost_answer_when_putting_should_send_again_without_a_check() {
+fn given_an_overwrite_that_may_have_reached_the_store_when_it_fails_should_return_the_error_without_sending_again()
+ {
+    let errors: [fn() -> ObjectStoreError; 4] = [
+        lost,
+        || ObjectStoreError::Unavailable("500".to_owned()),
+        || ObjectStoreError::Throttled("slow down".to_owned()),
+        || ObjectStoreError::ChecksumMismatch {
+            key: "a/b".to_owned(),
+        },
+    ];
+    for error in errors {
+        for outcome in [Outcome::LoseAnswer(error), Outcome::Refuse(error)] {
+            let (bus, store) = store();
+            let bytes = object(1);
+            store.provider().script([Script::of(outcome)]);
+
+            let failed = bus.run(store.put("a/b", body(&bytes), &PutOptions::default()));
+
+            assert_eq!(failed.unwrap_err().to_string(), error().to_string());
+            assert_eq!(store.provider().puts.borrow().len(), 1, "{}", error());
+            assert_eq!(store.provider().heads.get(), 0);
+            assert_eq!(counted(&store).0, 0, "no retry");
+        }
+    }
+}
+
+#[test]
+fn given_an_overwrite_that_never_left_when_putting_should_send_it_again() {
     let (bus, store) = store();
     let bytes = object(1);
     store
         .provider()
-        .script([Script::of(Outcome::LoseAnswer(lost))]);
+        .script([Script::of(Outcome::NotSent), Script::of(Outcome::NotSent)]);
 
     bus.run(store.put("a/b", body(&bytes), &PutOptions::default()))
         .unwrap();
 
-    assert_eq!(store.provider().puts.borrow().len(), 2);
+    assert_eq!(store.provider().puts.borrow().len(), 3);
     assert_eq!(store.provider().heads.get(), 0);
+    assert_eq!(counted(&store).0, 2);
     assert_eq!(stored(&store, "a/b"), bytes);
 }
 
@@ -1253,7 +1284,8 @@ fn given_an_overwrite_slower_than_the_attempt_deadlines_should_let_it_finish() {
 }
 
 #[test]
-fn given_an_overwrite_whose_body_stops_moving_should_give_it_up_after_the_progress_timeout() {
+fn given_an_overwrite_whose_body_stops_moving_should_fail_after_the_progress_timeout_without_sending_again()
+ {
     let (bus, store) = store();
     let bytes = object(1);
     store.provider().script([Script {
@@ -1261,32 +1293,40 @@ fn given_an_overwrite_whose_body_stops_moving_should_give_it_up_after_the_progre
         ..Script::of(Outcome::Commit)
     }]);
 
-    bus.run(store.put("a/b", body(&bytes), &PutOptions::default()))
-        .unwrap();
+    let failed = bus.run(store.put("a/b", body(&bytes), &PutOptions::default()));
 
-    assert_eq!(store.provider().puts.borrow().len(), 2);
-    assert_eq!(
-        bus.now(),
-        policy().progress_timeout + Duration::from_millis(100)
+    assert!(
+        matches!(failed, Err(ObjectStoreError::Transport(_))),
+        "{failed:?}"
     );
-    assert_eq!(stored(&store, "a/b"), bytes);
+    assert_eq!(store.provider().puts.borrow().len(), 1);
+    assert_eq!(bus.now(), policy().progress_timeout);
 }
 
+/// The store takes the attempt and commits it after the put gave up, as a
+/// timed-out request that reached the store can.
 #[test]
-fn given_an_overwrite_without_an_answer_should_give_it_up_after_the_progress_timeout() {
+fn given_an_overwrite_answered_after_the_progress_timeout_should_fail_without_sending_again() {
     let (bus, store) = store();
     let bytes = object(1);
-    store.provider().script([Script::of(Outcome::Hang)]);
+    store
+        .provider()
+        .script([Script::commit_after(policy().progress_timeout * 2)]);
 
-    bus.run(store.put("a/b", body(&bytes), &PutOptions::default()))
-        .unwrap();
+    let failed = bus.run(store.put("a/b", body(&bytes), &PutOptions::default()));
 
-    assert_eq!(store.provider().puts.borrow().len(), 2);
-    assert_eq!(
-        bus.now(),
-        policy().progress_timeout + Duration::from_millis(100)
+    assert!(
+        matches!(failed, Err(ObjectStoreError::Transport(_))),
+        "{failed:?}"
     );
-    assert_eq!(stored(&store, "a/b"), bytes);
+    assert_eq!(store.provider().puts.borrow().len(), 1);
+    assert_eq!(bus.now(), policy().progress_timeout);
+    bus.run_for(policy().progress_timeout * 2);
+    assert_eq!(
+        store.provider().commits.get(),
+        1,
+        "the one attempt landed late"
+    );
 }
 
 #[test]
