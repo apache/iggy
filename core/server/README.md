@@ -546,7 +546,8 @@ reservation: a partition over its limit evicts its own blocks, and what a quiet
 partition leaves unused is there for the others. A share below 8 blocks of the
 node's `read_cache_block_size` keeps nothing. The topic's `read_ahead` replaces
 the node's for its readers, and a partition reads ahead at most an eighth of
-its share. `0` turns either off for the topic. Unset, each node applies its own
+its share and an eighth of the cache of its shard. `0` turns either off for the
+topic. Unset, each node applies its own
 setting: only the cache of the shard bounds the topic's partitions, and they
 read ahead the node's `read_ahead`. Neither can be reset. The fresh objects a
 shard uploads are held for the polls at the tail whatever a topic sets. A

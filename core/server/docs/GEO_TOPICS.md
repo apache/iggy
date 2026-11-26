@@ -515,9 +515,10 @@ apply their own settings. The values are kept as the origin set them, also when 
 the nodes of the other cluster: a share of `read_cache_size` below 8 blocks of a node's
 `read_cache_block_size` keeps nothing on that node, which logs it once for each such partition,
 and a partition reads ahead at most an eighth of its share. A client cannot set them on a shadow
-topic. An update reaches the shadow topics in up to about 35 seconds, see [Delays](#delays). While
-the origin's bucket does not answer, and after its origin retired, a shadow topic keeps the last
-values it took.
+topic. An update typically reaches the shadow topics within about 35 seconds, and later while
+earlier shadow operations are queued, see [Delays](#delays). After a recovery of the origin, a
+shadow topic follows the successor's updates. While the origin's bucket does not answer, and after
+its origin retired, a shadow topic keeps the last values it took.
 
 ### What happens after a create
 
@@ -665,7 +666,7 @@ deduplicate on an id of their own, such as the message id that the producer sets
 | Published               | Readable in another datacenter       | Up to `[geo] manifest_poll_interval`, 5 s by default, until the peer lists the manifest, then one read of the manifest and one commit in the peer.                                                                                                                   |
 | Committed               | Readable in another datacenter       | The two rows above added up, seconds: the next rewrite and manifest, then the peer's next listing. Nothing else brings a message there.                                                                                                                              |
 | Geo topic created       | Shadow topic in each peer            | About a second to store the topic object, then up to 5 s until a peer lists it.                                                                                                                                                                                      |
-| Read cache updated      | Shadow topic reads with it           | About a second to store the topic object again, then up to 30 s until a peer reads it again and up to 5 s until its next pass, then one commit in the peer.                                                                                                          |
+| Read cache updated      | Shadow topic reads with it           | Typically about a second to store the topic object again, then up to 30 s until a peer reads it again and up to 5 s until its next pass, then one commit in the peer. Earlier shadow operations queued in the peer can delay it by more passes.                      |
 | Group offset store      | Acknowledged, position in the bucket | One commit of the store, one commit of the fold and one put of the node's object of the log. A put that runs, or one that started less than `[geo] consumer_offset_upload_interval` (50 ms by default) before, delays it to the next put.                            |
 | Poll with `auto_commit` | Position stored in the bucket        | Up to `[geo] positions_publish_interval`, 1 s by default, then a commit of the fold and the upload of the object.                                                                                                                                                    |
 | Position stored         | Taken by another datacenter          | Up to `[geo] positions_poll_interval`, 1 s by default, then one read of the object and one commit in that cluster.                                                                                                                                                   |
@@ -910,7 +911,9 @@ one starts from the position its peers hold.
 A recovery that fails logs the reason and runs again at the next check, 5 seconds later.
 Each attempt finds what an earlier one stored and goes on. It refuses a topic of another
 `[geo] origin`, a cluster that already holds streams, and a bucket that another cluster
-recovered already.
+recovered already. It also refuses a bucket with a topic object that this build cannot read,
+damaged or in a format it does not know, so that it never recovers only some of the topics.
+The log names the object and its format marker, the first 8 bytes, such as `IGGYTOP3`.
 
 ### What it writes
 
