@@ -259,7 +259,9 @@ impl SegmentRewrite {
                 keyed_end_offset: Some(record.end_offset),
                 range: 0..record.size,
             };
-            remote.carry_long_term(&segment, &log, &index);
+            remote
+                .carry_long_term(&segment, &log, &index, &self.read.read_settings.current())
+                .await;
         }
         Ok(ManifestSegment {
             start_offset: record.start_offset,
@@ -844,6 +846,13 @@ where
             self.long_term_backlog.take(size);
         }
         self.prune_proof_rows();
+        self.note_long_term_floor_to_cache();
+    }
+
+    /// Tell the shard's cache where the long-term floor stands, so it lets go
+    /// of the fresh objects whose batches of this partition the floor
+    /// passed.
+    pub(crate) fn note_long_term_floor_to_cache(&self) {
         if let (Some(remote), Some(floor)) = (self.remote_segments(), self.long_term_floor()) {
             remote.note_long_term_floor(self.namespace(), floor);
         }

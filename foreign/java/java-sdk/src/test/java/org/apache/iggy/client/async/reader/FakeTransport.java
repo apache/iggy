@@ -27,6 +27,7 @@ import org.apache.iggy.consumeroffset.ConsumerOffsetInfo;
 import org.apache.iggy.exception.IggyErrorCode;
 import org.apache.iggy.exception.IggyOperationException;
 import org.apache.iggy.exception.IggyServerException;
+import org.apache.iggy.exception.IggyValidationException;
 import org.apache.iggy.message.DeferredPollOptions;
 import org.apache.iggy.message.FetchedMessages;
 import org.apache.iggy.message.PolledMessages;
@@ -52,6 +53,8 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A transport whose reads the test answers one by one. It keeps the stored offsets as the server does and records every
@@ -166,6 +169,22 @@ final class FakeTransport implements ReaderTransport {
         if (read == null) {
             throw new AssertionError("The reader sent no read");
         }
+        return read;
+    }
+
+    /**
+     * The next read that {@code reader} sends, once the reader can take in its reply and the replies of the reads that
+     * it sent before. The loop task that sends a read gets ready for the reply only after it hands the read to this
+     * fake. An answer before the end of that task reaches the reader after a later call, such as a close or the answer
+     * of a later read. A seek of a partition that the reader does not read runs on the loop after that task and changes
+     * nothing.
+     */
+    Read nextRead(PartitionReader reader) throws InterruptedException {
+        Read read = nextRead();
+        long unread = 999L;
+        assertThatThrownBy(() ->
+                        reader.seek(unread, PollingStrategy.next()).get(TIMEOUT.toMillis(), TimeUnit.MILLISECONDS))
+                .hasCauseInstanceOf(IggyValidationException.class);
         return read;
     }
 

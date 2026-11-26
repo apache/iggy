@@ -18,13 +18,14 @@
 //! The configuration table of the OMB compare page: one row per workload field, per setup value
 //! and per sidecar property, one column per run.
 
+use bench_dashboard_shared::format::group_digits;
 use bench_dashboard_shared::omb::compare::{OmbPropertyRow, OmbSetupField};
+use bench_dashboard_shared::omb::labels::{length_text, version_text};
 use bench_dashboard_shared::omb::setup::OmbSetup;
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 use bench_dashboard_shared::omb::workload::{OmbWorkloadField, OmbWorkloadKey};
 
-use crate::format::group_digits;
-use crate::pages::omb::common::{NOT_RECORDED, length_text, version_text};
+use crate::pages::omb::common::NOT_RECORDED;
 
 /// What a property cell shows for a run whose sidecar doesn't set the property.
 pub const NOT_SET: &str = "not set";

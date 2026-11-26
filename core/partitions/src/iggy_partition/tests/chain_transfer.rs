@@ -19,13 +19,22 @@
 
 use super::eviction::{KEEP_NOTHING, chain_records, confirm, evict, reboot};
 use super::floor_eviction::advance_over;
+use super::remote_poll::{attach, layout};
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
-use crate::SegmentLocation;
 use crate::segment_chain::{
     Chain, ChainRecord, HEADER_SIZE, RECORD_SIZE, chain_path, decode_chain,
 };
+use crate::segment_upload::{SegmentUpload, upload_segment};
 use crate::state_transfer::{PartitionInstallError, PartitionStateTransferOffer};
+use crate::tiered_floor::AdvanceTieredFloor;
+use crate::{RemoteObjects, SegmentLocation};
+use futures::FutureExt;
+use futures::future::LocalBoxFuture;
+use iggy_object_store::{
+    MemoryStore, ObjectMeta, ObjectRange, ObjectStore, ObjectStoreError, PutBody, PutOptions,
+    SegmentKey, SegmentObject,
+};
 
 /// Sealed segments of a partition with [`ORIGIN_OPS`] one-message ops.
 const ORIGIN_SEALED: [u64; 3] = [0, 2, 4];
@@ -33,9 +42,20 @@ const ORIGIN_SEALED: [u64; 3] = [0, 2, 4];
 /// An origin whose store holds every sealed segment, and whose first two
 /// left the disk.
 async fn tiered_origin() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus>>) {
+    let (directory, origin, _store) = Box::pin(tiered_origin_with_store()).await;
+    (directory, origin)
+}
+
+/// [`tiered_origin`] with the store it reads from.
+async fn tiered_origin_with_store() -> (
+    tempfile::TempDir,
+    Box<IggyPartition<IggyMessageBus>>,
+    Rc<MemoryStore>,
+) {
     let (directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
     let mut origin = Box::new(origin);
     confirm(&mut origin, &ORIGIN_SEALED);
+    let store = Box::pin(store_sealed(&mut origin, directory.path())).await;
     let floor = origin.sealed_segment_record(2).unwrap().end_offset;
     Box::pin(evict(&mut origin, floor, KEEP_NOTHING)).await;
     assert_eq!(
@@ -47,7 +67,67 @@ async fn tiered_origin() -> (tempfile::TempDir, Box<IggyPartition<IggyMessageBus
             SegmentLocation::Local
         ]
     );
-    (directory, origin)
+    (directory, origin, store)
+}
+
+/// Upload every sealed segment of `partition` from `directory` to a new store
+/// that `partition` then reads from.
+async fn store_sealed(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    directory: &Path,
+) -> Rc<MemoryStore> {
+    let store = Rc::new(MemoryStore::new());
+    for start_offset in ORIGIN_SEALED {
+        let path = |extension: &str| {
+            directory
+                .join(format!("{start_offset:020}.{extension}"))
+                .to_string_lossy()
+                .into_owned()
+        };
+        let upload = SegmentUpload {
+            prefix: PREFIX,
+            record: partition.sealed_segment_record(start_offset).unwrap(),
+            log_path: path("log"),
+            index_path: path("index"),
+        };
+        upload_segment(&*store, &layout(), &upload).await.unwrap();
+    }
+    attach(partition, Rc::clone(&store) as Rc<dyn RemoteObjects>);
+    store
+}
+
+fn object_key(start_offset: u64, object: SegmentObject) -> String {
+    layout().segment_key(&SegmentKey {
+        prefix: PREFIX,
+        start_offset,
+        object,
+    })
+}
+
+/// Delete the `object` of the segment at `start_offset` from `store`.
+async fn lose(store: &MemoryStore, start_offset: u64, object: SegmentObject) {
+    let deleted = store
+        .delete(&[object_key(start_offset, object)])
+        .await
+        .unwrap();
+    assert!(deleted.is_complete());
+}
+
+fn offered(offer: &PartitionStateTransferOffer) -> Vec<u64> {
+    offer
+        .segments
+        .iter()
+        .map(|source| source.entry.frontier)
+        .collect()
+}
+
+/// The advance that confirmed `segment`, as a chain carries it.
+const fn advanced(segment: crate::segment_chain::SegmentRecord) -> ChainRecord {
+    ChainRecord::Advanced(AdvanceTieredFloor {
+        start: segment.start_offset,
+        up_to: segment.end_offset,
+        hash: segment.hash,
+    })
 }
 
 /// An empty receiver at the path boot recovery looks in under `root`.
@@ -77,7 +157,9 @@ fn locations<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<SegmentLocation
         .collect()
 }
 
-fn layout<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<(u64, u64, u64, SegmentLocation)> {
+/// The segments without where their bytes are: a receiver holds none of the
+/// bytes of a segment the store has, while the sender may still hold them.
+fn extents<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<(u64, u64, u64)> {
     partition
         .log
         .segments()
@@ -87,18 +169,8 @@ fn layout<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<(u64, u64, u64, Se
                 segment.start_offset,
                 segment.end_offset,
                 segment.size.as_bytes_u64(),
-                segment.location,
             )
         })
-        .collect()
-}
-
-/// The segments without where their bytes are: a receiver holds none of the
-/// bytes of a segment the store has, while the sender may still hold them.
-fn extents<B: MessageBus>(partition: &IggyPartition<B>) -> Vec<(u64, u64, u64)> {
-    layout(partition)
-        .into_iter()
-        .map(|(start_offset, end_offset, size, _)| (start_offset, end_offset, size))
         .collect()
 }
 
@@ -138,13 +210,8 @@ async fn given_a_tiered_origin_when_offering_should_carry_its_chain_and_no_store
 
     let offer = Box::pin(serve_offer(&mut origin)).await;
 
-    let offered: Vec<u64> = offer
-        .segments
-        .iter()
-        .map(|source| source.entry.frontier)
-        .collect();
     assert_eq!(
-        offered,
+        offered(&offer),
         [6],
         "a segment the store holds sends no bytes, on the sender's disk or not"
     );
@@ -205,6 +272,162 @@ async fn given_a_stored_segment_on_the_senders_disk_when_installed_should_be_rem
     assert_eq!(locations(&rebooted), remote_front);
 }
 
+/// A floor advance once matched the segment, and the store has since lost
+/// it. The sender still holds the bytes, so they travel, with the advance
+/// that lets the receiver evict the segment once the store holds it again.
+#[compio::test]
+async fn given_a_stored_segment_missing_from_the_store_when_offering_should_send_its_bytes() {
+    let (_origin_directory, mut origin, store) = Box::pin(tiered_origin_with_store()).await;
+    lose(&store, 4, SegmentObject::Log).await;
+
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(offered(&offer), [4, 6]);
+    let sealed = ORIGIN_SEALED.map(|start| origin.sealed_segment_record(start).unwrap());
+    assert_eq!(
+        offered_chain(&offer).records,
+        [
+            ChainRecord::Remote(sealed[0]),
+            ChainRecord::Remote(sealed[1]),
+            ChainRecord::Sealed(sealed[2]),
+            advanced(sealed[2]),
+        ]
+    );
+    let root = tempfile::tempdir().unwrap();
+    let (_config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
+    Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
+    assert_eq!(locations(&receiver), locations(&origin));
+}
+
+#[compio::test]
+async fn given_a_stored_segment_that_differs_in_the_store_when_offering_should_send_its_bytes() {
+    let (_origin_directory, mut origin, store) = Box::pin(tiered_origin_with_store()).await;
+    let key = object_key(4, SegmentObject::Log);
+    let size = origin.sealed_segment_record(4).unwrap().size;
+    let other = vec![0xA5; usize::try_from(size).unwrap()];
+    store
+        .put(&key, PutBody::from_bytes(other), &PutOptions::default())
+        .await
+        .unwrap();
+
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(offered(&offer), [4, 6]);
+}
+
+/// The receiver takes the stored front as the front of its log, so the
+/// first segment the store lacks ends it, and every segment after it sends
+/// its bytes, stored or not.
+#[compio::test]
+async fn given_a_stored_segment_missing_from_the_store_when_offering_should_send_the_bytes_of_every_segment_after_it()
+ {
+    let (directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
+    let mut origin = Box::new(origin);
+    confirm(&mut origin, &ORIGIN_SEALED);
+    let store = Box::pin(store_sealed(&mut origin, directory.path())).await;
+    lose(&store, 2, SegmentObject::Index).await;
+
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(offered(&offer), [2, 4, 6]);
+    let sealed = ORIGIN_SEALED.map(|start| origin.sealed_segment_record(start).unwrap());
+    assert_eq!(
+        offered_chain(&offer).records,
+        [
+            ChainRecord::Remote(sealed[0]),
+            ChainRecord::Sealed(sealed[1]),
+            ChainRecord::Sealed(sealed[2]),
+            advanced(sealed[1]),
+            advanced(sealed[2]),
+        ]
+    );
+}
+
+/// A store that answers no request.
+struct Unreachable;
+
+impl RemoteObjects for Unreachable {
+    fn get_range<'a>(
+        &'a self,
+        _key: &'a str,
+        _range: std::ops::Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        async { Err(ObjectStoreError::Unavailable("unreachable".to_owned())) }.boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        async { Err(ObjectStoreError::Unavailable("unreachable".to_owned())) }.boxed_local()
+    }
+}
+
+#[compio::test]
+async fn given_a_store_that_does_not_answer_when_offering_should_send_the_bytes_on_the_senders_disk()
+ {
+    let (_origin_directory, mut origin) = Box::pin(tiered_origin()).await;
+    attach(&mut origin, Rc::new(Unreachable));
+
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(
+        offered(&offer),
+        [4, 6],
+        "a segment whose `.log` left the disk still travels as its record"
+    );
+}
+
+#[compio::test]
+async fn given_no_store_to_ask_when_offering_should_send_the_bytes_on_the_senders_disk() {
+    let (_directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
+    let mut origin = Box::new(origin);
+    confirm(&mut origin, &ORIGIN_SEALED);
+
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(offered(&offer), [0, 2, 4, 6]);
+}
+
+/// Each offer build asks the store again: an earlier answer does not outlive
+/// the build it was given for.
+#[compio::test]
+async fn given_an_object_lost_after_an_offer_when_offering_again_should_send_its_bytes() {
+    let (_origin_directory, mut origin, store) = Box::pin(tiered_origin_with_store()).await;
+    let first = Box::pin(serve_offer(&mut origin)).await;
+    assert_eq!(offered(&first), [6]);
+    lose(&store, 4, SegmentObject::Log).await;
+
+    Box::pin(commit_records(
+        &mut origin,
+        ORIGIN_OPS + 1,
+        &segment_records(1),
+    ))
+    .await;
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(offered(&offer).first(), Some(&4));
+}
+
+/// The shard drops a build nobody pulls any more, and the store's answer
+/// with it.
+#[compio::test]
+async fn given_an_object_lost_during_an_abandoned_build_when_offering_again_should_send_its_bytes()
+{
+    let (_origin_directory, mut origin, store) = Box::pin(tiered_origin_with_store()).await;
+    let config = repair_config();
+    assert!(matches!(
+        Box::pin(after_store_check(&mut origin, &config)).await,
+        Err(PartitionTransferUnavailable::FlushPending)
+    ));
+    lose(&store, 4, SegmentObject::Log).await;
+
+    origin.clear_state_transfer_offer_cache();
+    let offer = Box::pin(serve_offer(&mut origin)).await;
+
+    assert_eq!(offered(&offer), [4, 6]);
+}
+
 /// A rebuilt replica that later leads the partition publishes its manifest.
 /// The records of the segments it received no bytes of are all it has to
 /// list them, so they have to count as stored without an advance of its own.
@@ -238,12 +461,7 @@ async fn given_a_stored_segment_behind_an_unstored_one_when_its_chain_is_install
     let mut origin = Box::new(origin);
     confirm(&mut origin, &[2, 4]);
     let offer = Box::pin(serve_offer(&mut origin)).await;
-    let offered: Vec<u64> = offer
-        .segments
-        .iter()
-        .map(|source| source.entry.frontier)
-        .collect();
-    assert_eq!(offered, [0, 2, 4, 6]);
+    assert_eq!(offered(&offer), [0, 2, 4, 6]);
     let root = tempfile::tempdir().unwrap();
     let (config, mut receiver) = Box::pin(receiver_on_disk(root.path())).await;
     Box::pin(install_offer_with_reuse(&mut receiver, &offer)).await;
@@ -338,6 +556,7 @@ async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send
     let (directory, origin) = Box::pin(tiered_partition(&segment_records(ORIGIN_OPS), 0)).await;
     let mut origin = Box::new(origin);
     confirm(&mut origin, &ORIGIN_SEALED);
+    Box::pin(store_sealed(&mut origin, directory.path())).await;
     let floor = origin.sealed_segment_record(2).unwrap().end_offset;
     let log = directory.path().join(format!("{:020}.log", 2));
     let bytes = std::fs::read(&log).unwrap();
@@ -368,12 +587,7 @@ async fn given_an_eviction_cut_short_before_its_unlink_when_offering_should_send
 
     let offer = Box::pin(serve_offer(&mut origin)).await;
 
-    let offered: Vec<u64> = offer
-        .segments
-        .iter()
-        .map(|source| source.entry.frontier)
-        .collect();
-    assert_eq!(offered, [6]);
+    assert_eq!(offered(&offer), [6]);
     assert_eq!(
         offered_chain(&offer).records,
         [
@@ -514,14 +728,15 @@ async fn given_a_chain_the_receiver_cannot_take_when_installing_should_refuse_it
         }
     ));
 
+    // Remote segments 0 and 2, with 4 missing before the first local one.
     let mut holed = chain.clone();
-    holed.records.remove(1);
+    holed.records.remove(2);
     holed.valid_len -= RECORD_SIZE as u64;
     assert!(matches!(
         Box::pin(refusal(&offer, holed.encode())).await,
         PartitionInstallError::SegmentSetHole {
-            previous_end: 1,
-            next_start: 4,
+            previous_end: 3,
+            next_start: 6,
         }
     ));
 
