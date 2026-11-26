@@ -291,6 +291,94 @@ async fn given_evicted_segments_polled_with_each_limit_when_polling_twice_should
     assert_eq!(cache.take_metrics().cached_bytes, 0);
 }
 
+/// An evicted partition that reads through a shard cache of 64 MiB, the
+/// cache, and what every poll returned while its segments were local.
+async fn cached_partition() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    Rc<ReadCache>,
+    Vec<(Option<u64>, Vec<u8>)>,
+) {
+    let (directory, mut partition, store, local) = Box::pin(uploaded_partition()).await;
+    let cache = ReadCache::new(ReadCacheSettings {
+        cache_bytes: 64 * 1024 * 1024,
+        block_bytes: 4096,
+        read_ahead: 0,
+    });
+    partition.set_remote_segments(Rc::new(
+        RemoteSegments::new(Rc::clone(&store) as _, layout()).with_cache(store as _, &cache),
+    ));
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    (directory, partition, cache, local)
+}
+
+fn plan_reading(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    settings: PartitionReadSettings,
+) -> PollPlan {
+    let args = PollingArgs::new(PollingStrategy::offset(0), 10, false);
+    partition.build_poll_plan_reading(
+        PollingConsumer::Consumer(1, 0),
+        &args,
+        false,
+        usize::MAX,
+        settings,
+    )
+}
+
+#[compio::test]
+async fn given_a_plan_built_before_a_smaller_limit_when_it_reads_after_should_read_with_the_smaller_limit()
+ {
+    let (_directory, mut partition, cache, local) = Box::pin(cached_partition()).await;
+    let keeps_nothing = PartitionReadSettings {
+        limit: Some(0),
+        read_ahead: None,
+    };
+    let older = plan_reading(&mut partition, PartitionReadSettings::SHARD);
+    let newer = plan_reading(&mut partition, keeps_nothing);
+
+    let newer = newer.execute().await;
+    let older = older.execute().await;
+
+    assert_eq!(accepted(&mut partition, newer), local[0]);
+    assert_eq!(accepted(&mut partition, older), local[0]);
+    assert_eq!(
+        cache.take_metrics().cached_bytes,
+        0,
+        "the older plan put back no limit"
+    );
+}
+
+#[compio::test]
+async fn given_a_plan_that_reads_no_store_when_handed_read_settings_should_not_load_them() {
+    let (directory, mut partition, store, _) = Box::pin(uploaded_partition()).await;
+    attach(&mut partition, store);
+    let loaded = Cell::new(0);
+    let load = || {
+        loaded.set(loaded.get() + 1);
+        PartitionReadSettings::SHARD
+    };
+
+    plan(&mut partition, PollingStrategy::offset(0)).read_store_with(load);
+    assert_eq!(loaded.get(), 0, "a local poll loads nothing");
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    plan(&mut partition, PollingStrategy::offset(0)).read_store_with(load);
+    assert_eq!(loaded.get(), 1, "a poll of the store loads them");
+}
+
+#[compio::test]
+async fn given_a_plan_of_a_partition_that_left_the_shard_when_it_reads_should_keep_nothing_in_the_cache()
+ {
+    let (_directory, mut partition, cache, local) = Box::pin(cached_partition()).await;
+    let detached = plan_reading(&mut partition, PartitionReadSettings::SHARD);
+    partition.forget_reads();
+
+    let result = detached.execute().await;
+
+    assert_eq!(accepted(&mut partition, result), local[0]);
+    assert_eq!(cache.take_metrics().cached_bytes, 0);
+}
+
 #[compio::test]
 async fn given_evicted_segments_without_a_local_index_when_polling_should_fetch_the_index_object() {
     let (directory, mut partition, store, local) = Box::pin(uploaded_partition()).await;

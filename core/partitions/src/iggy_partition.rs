@@ -185,6 +185,9 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// How the polls of this incarnation read the store through the shard's
+    /// cache, shared with each plan so that it reads the latest.
+    read_policy: crate::remote_segments::ReadPolicy,
     /// The other cluster's log that this partition serves in place of its
     /// own, `None` for a partition that holds its own messages.
     pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
@@ -1179,6 +1182,7 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            read_policy: crate::remote_segments::ReadPolicy::default(),
             peer_log: None,
             retired_peer_indexes: Vec::new(),
             pending_advances: VecDeque::new(),
@@ -6473,6 +6477,7 @@ where
     /// The partition leaves the shard: what its reads keep in the shard's
     /// cache goes, and what its GETs in flight fetch is not kept.
     pub(crate) fn forget_reads(&self) {
+        self.read_policy.end();
         if let Some(remote) = &self.remote_segments {
             let prefix = self
                 .read_prefix()
@@ -6481,33 +6486,10 @@ where
         }
     }
 
-    /// [`Self::build_poll_plan`] for a poll whose reply holds at most
-    /// `byte_budget` bytes of messages.
-    #[cfg(test)]
-    pub(crate) fn build_poll_plan_within(
-        &mut self,
-        consumer: PollingConsumer,
-        args: &PollingArgs,
-        validate_checksum: bool,
-        byte_budget: usize,
-    ) -> PollPlan {
-        self.build_poll_plan_reading(
-            consumer,
-            args,
-            validate_checksum,
-            byte_budget,
-            crate::PartitionReadSettings::SHARD,
-        )
-    }
-
     /// [`Self::build_poll_plan_within`] whose reads of the store use the
-    /// shard's cache with `read_settings`.
-    ///
-    /// The snapshot ends at the segment that covers the poll's count or its
-    /// budget, whichever comes first. Remote segments make the list as long
-    /// as total retention, so a snapshot that ran to the tail would cost a
-    /// poll near the front of a long topic a clone per segment.
-    #[allow(clippy::too_many_lines)]
+    /// shard's cache with `read_settings`, as the shard sets them through
+    /// [`PollPlan::read_store_with`].
+    #[cfg(test)]
     pub(crate) fn build_poll_plan_reading(
         &mut self,
         consumer: PollingConsumer,
@@ -6516,6 +6498,28 @@ where
         byte_budget: usize,
         read_settings: crate::PartitionReadSettings,
     ) -> PollPlan {
+        let plan = self.build_poll_plan_within(consumer, args, validate_checksum, byte_budget);
+        plan.read_store_with(|| read_settings);
+        plan
+    }
+
+    /// [`Self::build_poll_plan`] for a poll whose reply holds at most
+    /// `byte_budget` bytes of messages. Its reads of the store use the
+    /// partition's read settings as they are at each read.
+    ///
+    /// The snapshot ends at the segment that covers the poll's count or its
+    /// budget, whichever comes first. Remote segments make the list as long
+    /// as total retention, so a snapshot that ran to the tail would cost a
+    /// poll near the front of a long topic a clone per segment.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn build_poll_plan_within(
+        &mut self,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        validate_checksum: bool,
+        byte_budget: usize,
+    ) -> PollPlan {
+        let read_settings = self.read_policy.clone();
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
         // is fully synchronous, so the single load cannot drift mid-plan.
@@ -6781,7 +6785,7 @@ where
             long_term,
             long_term_floor: self.long_term_floor(),
             long_term_next,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: self.read_policy.clone(),
         }
     }
 

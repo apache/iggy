@@ -21,7 +21,6 @@
 //! yield. Execution returns facts about that snapshot. Only the partition
 //! owner validates its history and accepts progress.
 
-use crate::PartitionReadSettings;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
@@ -29,7 +28,9 @@ use crate::journal::{
     unpin_sparse_source,
 };
 use crate::placed_read::PlacedReadPlan;
-use crate::remote_segments::{IndexFetch, IndexFetchFence, RemoteRange, RemoteSegments};
+use crate::remote_segments::{
+    IndexFetch, IndexFetchFence, ReadPolicy, RemoteRange, RemoteSegments,
+};
 use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchRef};
@@ -207,7 +208,7 @@ pub struct DiskReadPlan {
     /// buys nothing and costs the re-read it triggers.
     pub(crate) widest_batch_bytes: u64,
     /// How the partition's reads of remote segments use the shard's cache.
-    pub(crate) read_settings: PartitionReadSettings,
+    pub(crate) read_settings: ReadPolicy,
 }
 
 pub struct DiskSegment {
@@ -606,6 +607,18 @@ impl PollPlan {
             PollTier::Placed { .. } => true,
             PollTier::Empty | PollTier::Resident { .. } => false,
         }
+    }
+
+    /// Read the object store with what `settings` returns, which only a plan
+    /// that reads the store asks for. They become the partition's, so the
+    /// reads still to come of its older plans use them too.
+    pub fn read_store_with(&self, settings: impl FnOnce() -> crate::PartitionReadSettings) {
+        let policy = match &self.tier {
+            PollTier::Disk { disk, .. } if disk.reads_remote() => &disk.read_settings,
+            PollTier::Placed { placed, .. } => &placed.read_settings,
+            PollTier::Disk { .. } | PollTier::Empty | PollTier::Resident { .. } => return,
+        };
+        policy.set(settings());
     }
 
     /// Stop waiting for the object store at `deadline`. The read then returns
@@ -1433,7 +1446,13 @@ impl DiskReadPlan {
                 }
                 let read = async {
                     remote
-                        .read(range, walk.position, len, *next, self.read_settings)
+                        .read(
+                            range,
+                            walk.position,
+                            len,
+                            *next,
+                            self.read_settings.current(),
+                        )
                         .await
                         .map_err(|fault| {
                             // A `.log` that was gone without an eviction was
@@ -2085,7 +2104,7 @@ mod tests {
             deadline: None,
             bytes_per_message,
             widest_batch_bytes,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2182,7 +2201,7 @@ mod tests {
             deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2361,7 +2380,7 @@ mod tests {
             deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2514,7 +2533,7 @@ mod tests {
                         deadline: None,
                         bytes_per_message: None,
                         widest_batch_bytes: 0,
-                        read_settings: crate::PartitionReadSettings::SHARD,
+                        read_settings: ReadPolicy::default(),
                         segments: vec![DiskSegment {
                             start_offset: 0,
                             persisted: bytes.len() as u64,
@@ -2652,7 +2671,7 @@ mod tests {
                     deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
-                    read_settings: crate::PartitionReadSettings::SHARD,
+                    read_settings: ReadPolicy::default(),
                     segments: vec![DiskSegment {
                         start_offset: 0,
                         persisted: bytes.len() as u64,
@@ -2881,7 +2900,7 @@ mod tests {
                     deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
-                    read_settings: crate::PartitionReadSettings::SHARD,
+                    read_settings: ReadPolicy::default(),
                     segments: vec![DiskSegment {
                         start_offset: 0,
                         persisted: persisted as u64,

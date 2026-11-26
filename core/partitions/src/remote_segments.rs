@@ -224,6 +224,41 @@ impl FreshReads {
     }
 }
 
+/// The read settings of one incarnation of a partition, which every poll
+/// plan of it shares and reads at each read of the store.
+///
+/// A plan runs off the pump, after plans built later may have run. Reading
+/// the shared value keeps an older plan from putting back a limit that the
+/// partition's topic changed since, and the end of the incarnation keeps a
+/// plan that outlived it from registering one for a partition that is gone.
+#[derive(Debug, Clone)]
+pub(crate) struct ReadPolicy(Rc<Cell<Option<PartitionReadSettings>>>);
+
+impl Default for ReadPolicy {
+    fn default() -> Self {
+        Self(Rc::new(Cell::new(Some(PartitionReadSettings::SHARD))))
+    }
+}
+
+impl ReadPolicy {
+    /// The incarnation reads with `settings` from now on, unless it ended.
+    pub(crate) fn set(&self, settings: PartitionReadSettings) {
+        if self.0.get().is_some() {
+            self.0.set(Some(settings));
+        }
+    }
+
+    /// The incarnation left the shard, so its reads go past the cache.
+    pub(crate) fn end(&self) {
+        self.0.set(None);
+    }
+
+    /// What a read reads with now, `None` once the incarnation ended.
+    pub(crate) fn current(&self) -> Option<PartitionReadSettings> {
+        self.0.get()
+    }
+}
+
 /// Where the shard reads remote segments from.
 pub struct RemoteSegments {
     objects: Rc<dyn RemoteObjects>,
@@ -395,13 +430,15 @@ impl RemoteSegments {
 
     /// How the partition `prefix` names reads through the cache with
     /// `settings`, `None` without a cache that keeps what it fetches for it.
+    /// Without `settings`, those of an incarnation that left the shard, it
+    /// reads past the cache, so the cache records nothing for it again.
     fn reading(
         &self,
         prefix: ObjectPrefix,
-        settings: PartitionReadSettings,
+        settings: Option<PartitionReadSettings>,
     ) -> Option<(&RemoteBlocks, Reading)> {
         let blocks = self.fetched_into_cache()?;
-        Some((blocks, blocks.reading(prefix, settings)?))
+        Some((blocks, blocks.reading(prefix, settings?)?))
     }
 
     /// The bytes at `range` of the fresh object `object_id`: the blob of one
@@ -418,7 +455,7 @@ impl RemoteSegments {
         object_id: u128,
         range: Range<u64>,
         prefix: ObjectPrefix,
-        settings: PartitionReadSettings,
+        settings: impl Into<Option<PartitionReadSettings>>,
     ) -> Result<Bytes, DiskFault> {
         if let Some(blob) = self
             .blocks
@@ -428,7 +465,7 @@ impl RemoteSegments {
         {
             return Ok(blob);
         }
-        if let Some((blocks, reading)) = self.reading(prefix, settings) {
+        if let Some((blocks, reading)) = self.reading(prefix, settings.into()) {
             let key = self.layout.fresh_key(object_id);
             return blocks.read_fresh(reading, object_id, &key, range).await;
         }
@@ -486,10 +523,10 @@ impl RemoteSegments {
         &self,
         log: &RemoteRange,
         cap: u64,
-        settings: PartitionReadSettings,
+        settings: impl Into<Option<PartitionReadSettings>>,
     ) -> Result<Bytes, DiskFault> {
         let key = self.object_key(log, SegmentObject::Index);
-        if let Some((blocks, reading)) = self.reading(log.key.prefix, settings) {
+        if let Some((blocks, reading)) = self.reading(log.key.prefix, settings.into()) {
             return blocks.read_segment_index(reading, log, &key, cap).await;
         }
         self.objects
@@ -516,7 +553,7 @@ impl RemoteSegments {
         object_id: u128,
         ranges: &[Range<u64>],
         prefix: ObjectPrefix,
-        settings: PartitionReadSettings,
+        settings: impl Into<Option<PartitionReadSettings>>,
     ) -> Result<FreshReads, DiskFault> {
         let mut missing: Vec<Range<u64>> = ranges
             .iter()
@@ -536,7 +573,7 @@ impl RemoteSegments {
         let start = missing.iter().map(|range| range.start).min();
         let end = missing.iter().map(|range| range.end).max();
         if let Some((start, end)) = start.zip(end)
-            && let Some((blocks, reading)) = self.reading(prefix, settings)
+            && let Some((blocks, reading)) = self.reading(prefix, settings.into())
         {
             let key = self.layout.fresh_key(object_id);
             let bytes = blocks
@@ -612,7 +649,7 @@ impl RemoteSegments {
         position: u64,
         len: usize,
         next: Option<&RemoteRange>,
-        settings: PartitionReadSettings,
+        settings: impl Into<Option<PartitionReadSettings>>,
     ) -> Result<Frozen<4096>, DiskFault> {
         let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
@@ -620,7 +657,7 @@ impl RemoteSegments {
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
-        if let Some((blocks, reading)) = self.reading(source.key.prefix, settings) {
+        if let Some((blocks, reading)) = self.reading(source.key.prefix, settings.into()) {
             let next_key = next.map(|next| self.object_key(next, next.key.object));
             let next = next.zip(next_key.as_deref());
             return blocks
