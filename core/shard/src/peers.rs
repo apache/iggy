@@ -253,8 +253,11 @@ impl PeerIdentity {
     #[must_use]
     pub const fn after(self, read: PeerRead) -> Self {
         match (self, read) {
-            // Only an operator ends a change, and an outage changes nothing.
-            (Self::Changed { .. }, _) | (_, PeerRead::Unreachable) => self,
+            // Only an operator ends a change, an outage changes nothing, and
+            // neither does a claim that recovery records did not prove yet.
+            (Self::Changed { .. }, _)
+            | (_, PeerRead::Unreachable)
+            | (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unproven { .. }) => self,
             // A recovery of the cluster that owned the root replaces its
             // claim and keeps every key, also while the node reads the peer.
             (
@@ -268,7 +271,6 @@ impl PeerIdentity {
             (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unknown { recorded, found }) => {
                 Self::Mismatched { recorded, found }
             }
-            (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unproven { .. }) => self,
             (
                 Self::Unverified | Self::Mismatched { .. },
                 PeerRead::OwnCluster(_) | PeerRead::Invalid | PeerRead::Missing | PeerRead::Refused,
