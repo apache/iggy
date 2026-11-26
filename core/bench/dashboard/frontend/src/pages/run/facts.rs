@@ -22,7 +22,12 @@ use std::iter;
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::delta::Metric;
+use bench_dashboard_shared::format::{format_bytes, group_digits};
 use bench_dashboard_shared::identity::{DataVolumeKey, KindFamily, WorkloadField, WorkloadKey};
+use bench_dashboard_shared::labels::{
+    MachineName, data_volume_text, durability_text, memory_text, metric_name, milliseconds,
+    nodes_text, numeric_text, rate_text,
+};
 use bench_dashboard_shared::metrics::rate_limit_bytes;
 use bench_dashboard_shared::summary::{BenchmarkSummary, actors, kind_name};
 use bench_report::group_metrics_summary::BenchmarkGroupMetricsSummary;
@@ -35,14 +40,8 @@ use bench_report::params::{BenchmarkDataVolume, BenchmarkParams};
 use bench_report::server_stats::BenchmarkServerStats;
 use bench_report::transport::BenchmarkTransport;
 
-use super::change::metric_name;
 use crate::components::ladder::log_bar_pcts;
-use crate::components::run_labels::{
-    CONDITION_SEPARATOR, DayLabel, MachineName, batch_size_text, data_volume_text, durability_text,
-    memory_text, message_size_text, milliseconds, nodes_text, numeric_text, rate_limit_text,
-    rate_text, topic_durability,
-};
-use crate::format::{format_bytes, group_digits};
+use crate::components::run_labels::DayLabel;
 
 pub const NO_OPTIONS_NOTE: &str = "The report doesn't record any options, so the bench defaults \
                                    apply.";
@@ -111,26 +110,6 @@ pub struct LadderRow {
     pub metric: Option<Metric>,
     /// The length of the bar on a log scale, in percent of the longest bar.
     pub bar_pct: f64,
-}
-
-/// The run's conditions in one line: message size, batch size, data volume, rate limit, transport,
-/// durability, machine and topology.
-pub fn conditions(summary: &BenchmarkSummary) -> String {
-    let key = &summary.workload_key;
-    let mut parts = vec![
-        message_size_text(key.message_size),
-        batch_size_text(key.messages_per_batch),
-        data_volume_text(key.data_volume),
-        rate_limit_text(key.rate_limit.as_deref()),
-        key.transport.to_string(),
-    ];
-    parts
-        .extend(topic_durability(summary).map(|durability| durability_text(durability).to_owned()));
-    parts.extend([
-        MachineName(&summary.machine).to_string(),
-        nodes_text(summary.nodes),
-    ]);
-    parts.join(CONDITION_SEPARATOR)
 }
 
 impl Command {
@@ -618,6 +597,7 @@ mod tests {
     use crate::test_support::{
         RELEASE, consumer, group_summary, params, producer, rate_limited, run, summarize,
     };
+    use bench_dashboard_shared::labels::conditions;
     use bench_report::benchmark_kind::BenchmarkKind;
     use bench_report::numeric_parameter::BenchmarkNumericParameter;
     use bench_report::options::BenchmarkDurability;

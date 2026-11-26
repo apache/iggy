@@ -21,17 +21,19 @@
 //! percent without a verdict.
 
 use bench_dashboard_shared::delta::ValueRange;
+use bench_dashboard_shared::labels::{messages_text, milliseconds};
+use bench_dashboard_shared::omb::labels::{
+    mebibytes_text, microseconds, run_name, short_id, version_text,
+};
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 use yew::prelude::*;
 
 use super::history::Baseline;
 
 use crate::components::headline::neutral_chip;
-use crate::components::run_labels::{messages_text, milliseconds};
 use crate::pages::omb::common::{
     END_TO_END_LATENCY_HINT, NOT_MEASURED, NOT_RECORDED, PUBLISH_DELAY_HINT, PUBLISH_LATENCY_HINT,
-    PUBLISH_THROUGHPUT_HINT, change_text, mebibytes_text, microseconds, run_name, short_id,
-    version_text,
+    PUBLISH_THROUGHPUT_HINT, change_text,
 };
 use crate::pages::run::change::{percent_change, range_text};
 

@@ -380,7 +380,7 @@ Server OTLP export is unavailable in this revision: `grpc` prevents startup, and
 | `shutdown_drain_timeout` | `"10 s"` | Per-shard bus drain budget on shutdown. Slow-fsync hosts may need more. |
 | `shutdown_poll_interval` | `"50 ms"` | Poll cadence for the shutdown flag. Must be less than or equal to `shutdown_drain_timeout`. |
 | `shutdown_join_timeout` | `"30 s"` | Hard deadline for joining shard threads at exit. A wedged shard is abandoned with an error log. Must be at least `shutdown_drain_timeout`. |
-| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. |
+| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. The loop also compares every partition with committed metadata again in the background, and the tick does not change the pace of that. It reads 1,024 entries (streams, topics, partitions, routing rows) every 250 ms, and starts again 10 minutes after it ended. The time for all partitions grows with their number: about 17 minutes at one million streams of one partition each. |
 
 Valid `cpu_allocation` syntaxes:
 

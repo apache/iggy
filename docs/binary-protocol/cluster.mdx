@@ -1,9 +1,9 @@
 ---
 title: Server-to-server
-description: "Replica links, consensus commands, history fences and the header layouts used by Apache Iggy 0.10.0."
+description: "Replica links, consensus commands, history fences and the header layouts used by Apache Iggy, including the replica wire revision 5 handshake."
 ---
 
-Replicas use dedicated TCP listeners and 256-byte headers. Client listeners reject replica control commands. The replica protocol has no mixed-version upgrade path. Run the same server version and `replica_connections_per_peer` on every node.
+Replicas use dedicated TCP listeners and 256-byte headers. Client listeners reject replica control commands. Replicas on different server versions link only when the [release compatibility table](#build-identity-and-release-compatibility) lists them, and it lists none yet. Run the same server build and `replica_connections_per_peer` on every node.
 
 ## Transport
 
@@ -20,6 +20,18 @@ The preamble selects a shard and is not authentication. ReplicaHello repeats the
 ## Handshake
 
 ReplicaHello, ReplicaChallenge and ReplicaFinish establish the connection. `[cluster.auth]` enables the shared-key BLAKE3 MAC. `[cluster.tls]` encrypts traffic with TLS 1.3 and ALPN `iggy-replica`. TLS requires replica authentication. See [Cluster security](/docs/clustering/security) for configuration and key rotation.
+
+### Build identity and release compatibility
+
+ReplicaHello, an accepted ReplicaChallenge and ReplicaFinish carry a 32-byte build identity at zero-based header bytes 193 to 224 inclusive. It is a BLAKE3 hash of the client protocol version, the replica wire revision, the server release and the storage format marker. A node also computes the identity of every release that its row of the release compatibility table lists, with its own protocol version, wire revision and storage marker.
+
+A ReplicaHello carries the identity of the dialer in its header. Before replica wire revision 5, the dialer sends a header-only ReplicaHello. Starting with revision 5, the body carries one 32-byte identity for each release the dialer lists, up to 128 identities. The acceptor closes an oversized frame before reading its body and rejects a partial identity with `IncompatibleBuild`.
+
+The acceptor selects the identity of the link. It selects the identity of the dialer when that is its own or one it lists. It selects its own when the hello body contains it. Otherwise it answers with a ReplicaChallenge of status `IncompatibleBuild` (6).
+
+An accepted ReplicaChallenge and ReplicaFinish carry the selected identity and have no body. When authentication is enabled, both MACs cover that identity and the BLAKE3 hash of the complete ReplicaHello frame. The dialer closes the link when the challenge carries an identity that is neither its own nor one it lists.
+
+A node can admit a later release that explicitly lists it. The table is compiled into the server and ships empty. See [Release compatibility](/docs/server/upgrading#release-compatibility).
 
 ## Command discriminants
 
@@ -319,7 +331,7 @@ RequestPrepares asks for a retained operation range. RepairPrepare sends the ori
 
 State transfer handles larger gaps. RequestStateTransfer obtains a manifest, then RequestStateChunk and StateChunk transfer artifacts. The receiver checks each complete artifact against its manifest length and checksum before using it. The manifest has magic `ISM1`, a u32 entry count, a u8 entry length and a trailing XxHash3-64 checksum. Entries contain kind, frontier, length and checksum.
 
-Server 0.10.0 uses replica wire revision 1, writes metadata snapshot format 15, reads formats 14 and 15, and transfers the client table as `ICT5`. Server 0.10.1-edge.2 uses replica wire revision 4 and the formats below.
+Server 0.10.0 uses replica wire revision 1, writes metadata snapshot format 15, reads formats 14 and 15, and transfers the client table as `ICT5`. Server 0.10.1-edge.2 builds use revisions 4 and 5. The revision 5 build uses the formats below.
 
 | Kind | Artifact | Current format |
 | --- | --- | --- |
