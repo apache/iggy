@@ -42,11 +42,14 @@ import org.apache.iggy.message.PollingStrategy;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.MethodSource;
 
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -65,6 +68,12 @@ class AsyncPartitionReaderTest extends BaseIntegrationTest {
     // More than the reads that the late message waits for when the reads take turns.
     private static final int BACKLOG_MESSAGES = 50;
     private static final PollOptions SHORT_WAIT = PollOptions.waitFor(Duration.ofSeconds(1));
+    private static final String TIMED_TOPIC = "timed";
+    private static final int TIMED_BATCH_MESSAGES = 5;
+    // Gives the second batch a later timestamp on the server, so a timestamp splits the two batches.
+    private static final long TIMED_BATCH_GAP_MILLIS = 20;
+    private static final int TIMED_READ_COUNT = 3;
+    private static final String UNDER_COMMIT_POLICY = "{displayName} under {0}";
 
     private AsyncIggyTcpClient client;
     private StreamId stream;
@@ -327,6 +336,57 @@ class AsyncPartitionReaderTest extends BaseIntegrationTest {
         assertThat(polled.continuation()).isPresent();
     }
 
+    /**
+     * The server fetches only from an offset or from the next offset, so the reader finds the offset of a timestamp
+     * with a poll first.
+     */
+    @ParameterizedTest(name = UNDER_COMMIT_POLICY)
+    @MethodSource("commitPolicies")
+    void shouldStartAtATimestamp(CommitPolicy commit) throws Exception {
+        BigInteger secondBatch = sendTimedBatches();
+
+        assertThat(firstOffsets("timestamp-start", PollingStrategy.timestamp(secondBatch), commit, 1))
+                .containsExactly(5L);
+    }
+
+    /** A Last start delivers the last messages of the partition, as many as one read of the reader takes. */
+    @ParameterizedTest(name = UNDER_COMMIT_POLICY)
+    @MethodSource("commitPolicies")
+    void shouldStartAtTheLastMessages(CommitPolicy commit) throws Exception {
+        sendTimedBatches();
+
+        assertThat(firstOffsets("last-start", PollingStrategy.last(), commit, TIMED_READ_COUNT))
+                .containsExactly(7L, 8L, 9L);
+    }
+
+    @ParameterizedTest(name = UNDER_COMMIT_POLICY)
+    @MethodSource("commitPolicies")
+    void shouldSeekToATimestamp(CommitPolicy commit) throws Exception {
+        BigInteger secondBatch = sendTimedBatches();
+        PartitionReader reader = timedReader("timestamp-seek", PollingStrategy.next(), commit);
+        try {
+            assertThat(nextOffsets(reader, 1)).containsExactly(0L);
+
+            reader.seek(0L, PollingStrategy.timestamp(secondBatch)).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+
+            assertThat(nextOffsets(reader, 1)).containsExactly(5L);
+        } finally {
+            reader.closeAsync().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    /** Under OnRead a stored offset wins over the start, so the second reader shows what the first close stored. */
+    @Test
+    void shouldResumeAfterTheStoredOffsetInsteadOfATimestampStart() throws Exception {
+        PollingStrategy start = PollingStrategy.timestamp(sendTimedBatches());
+        assertThat(firstOffsets("resume", start, CommitPolicy.onRead(), TIMED_BATCH_MESSAGES))
+                .containsExactly(5L, 6L, 7L, 8L, 9L);
+
+        sendTimed(1);
+
+        assertThat(firstOffsets("resume", start, CommitPolicy.onRead(), 1)).containsExactly(10L);
+    }
+
     private Map<Long, List<String>> readAll(PartitionReader reader, long messages) throws Exception {
         Map<Long, List<String>> read = new HashMap<>();
         long count = 0;
@@ -346,9 +406,81 @@ class AsyncPartitionReaderTest extends BaseIntegrationTest {
                 .map(info -> info.storedOffset());
     }
 
+    /**
+     * Creates a topic of one partition with offsets 0 to 9, whose second batch from offset 5 came later. Returns the
+     * timestamp that the server gave offset 5.
+     */
+    private BigInteger sendTimedBatches() throws Exception {
+        client.topics().createTopic(stream, TIMED_TOPIC, 1L).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        sendTimed(TIMED_BATCH_MESSAGES);
+        TimeUnit.MILLISECONDS.sleep(TIMED_BATCH_GAP_MILLIS);
+        sendTimed(TIMED_BATCH_MESSAGES);
+        List<Message> sent = client.messages()
+                .pollMessages(
+                        stream,
+                        TopicId.of(TIMED_TOPIC),
+                        0L,
+                        Consumer.of(ConsumerId.of("timestamps")),
+                        PollingStrategy.offset(BigInteger.ZERO),
+                        PollOptions.defaults())
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                .messages();
+        BigInteger secondBatch = sent.get(TIMED_BATCH_MESSAGES).header().timestamp();
+        assertThat(secondBatch)
+                .as("the timestamp of the second batch")
+                .isGreaterThan(sent.get(TIMED_BATCH_MESSAGES - 1).header().timestamp());
+        return secondBatch;
+    }
+
+    private void sendTimed(int messages) throws Exception {
+        client.messages()
+                .sendMessages(
+                        stream,
+                        TopicId.of(TIMED_TOPIC),
+                        Partitioning.partitionId(0L),
+                        Collections.nCopies(messages, Message.of(TIMED_TOPIC)))
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    private PartitionReader timedReader(String consumer, PollingStrategy start, CommitPolicy commit) throws Exception {
+        return client.reader(stream, TopicId.of(TIMED_TOPIC), Consumer.of(ConsumerId.of(consumer)))
+                .partitions(List.of(0L))
+                .start(start)
+                .options(SHORT_WAIT.withCount(TIMED_READ_COUNT).withCommit(commit))
+                .build()
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** The first {@code count} offsets that a new reader delivers before its close. */
+    private List<Long> firstOffsets(String consumer, PollingStrategy start, CommitPolicy commit, int count)
+            throws Exception {
+        PartitionReader reader = timedReader(consumer, start, commit);
+        try {
+            return nextOffsets(reader, count);
+        } finally {
+            reader.closeAsync().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    /** The first {@code count} offsets of the next batches of {@code reader}. */
+    private static List<Long> nextOffsets(PartitionReader reader, int count) throws Exception {
+        List<Long> offsets = new ArrayList<>();
+        while (offsets.size() < count) {
+            PolledMessages batch = reader.next().get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            for (Message message : batch.messages()) {
+                offsets.add(message.header().offset().longValueExact());
+            }
+        }
+        return offsets.subList(0, count);
+    }
+
     private static List<String> texts(PolledMessages batch) {
         return batch.messages().stream()
                 .map(message -> new String(message.payload(), StandardCharsets.UTF_8))
                 .toList();
+    }
+
+    private static List<CommitPolicy> commitPolicies() {
+        return List.of(CommitPolicy.onRead(), CommitPolicy.manual());
     }
 }

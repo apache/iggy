@@ -30,8 +30,8 @@ use std::time::Duration;
 use iggy::prelude::{
     IggyClient, IggyError, MAX_METADATA_CHANGES_LIMIT, MetadataChange, MetadataChangeCursor,
     MetadataChangeGroup, MetadataChangeStart, MetadataChangeStatus, MetadataChanges,
-    MetadataChangesQuery, MetadataCurrentItem, MetadataUserChange, Permissions, SystemClient,
-    UserStatus,
+    MetadataChangesQuery, MetadataCurrentItem, MetadataOptions, MetadataUserChange, SystemClient,
+    TopicCreateOptions, UserStatus,
 };
 use tokio::sync::{broadcast, watch};
 use tokio::time::{Instant, sleep};
@@ -41,11 +41,10 @@ use tracing::{debug, info, warn};
 use super::group_index::GroupFeed;
 use super::group_offsets::kafka_group_of;
 use super::{LazyClient, REQUEST_TIMEOUT};
-use crate::auth::{UserKey, principal_permissions};
+use crate::auth::{Grants, UserKey};
 use crate::bridge::config::IggyBridgeConfig;
 use crate::bridge::error::BridgeError;
 use crate::bridge::topic_map::TopicMapping;
-use crate::protocol::acl::PrincipalPermissions;
 
 /// The record groups the follower reads. Members and sessions change with every consumer, and
 /// nothing here needs them.
@@ -75,6 +74,12 @@ pub struct TopicShape {
     /// name gets another.
     pub incarnation: u64,
     pub partitions: u32,
+    /// Iggy's numeric ids of the stream and the topic, which permission grants name.
+    pub stream_id: u32,
+    pub topic_id: u32,
+    /// Whether the topic is geo, which a shadow topic of another datacenter's geo topic reads as.
+    /// Another datacenter can move the offsets of its groups, so only Iggy holds them.
+    pub geo: bool,
 }
 
 /// A Kafka topic that the change log shows deleted.
@@ -112,10 +117,10 @@ pub struct PermissionBoard {
 }
 
 /// What an Iggy user can do, as the change log last said.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UserAccess {
     /// An active user, with its permissions.
-    Active(PrincipalPermissions),
+    Active(Grants),
     /// A user that was deleted or is no longer active.
     Revoked,
 }
@@ -178,7 +183,21 @@ impl PermissionBoard {
             .iter()
             .filter(|(_, entry)| entry.username == username)
             .max_by_key(|(user, _)| user.created_at)
-            .map(|(_, entry)| entry.access)
+            .map(|(_, entry)| entry.access.clone())
+    }
+
+    /// The newest user named `username` and its grants, while the change log shows it active.
+    #[must_use]
+    pub fn active_user(&self, username: &str) -> Option<(UserKey, Grants)> {
+        lock(&self.users)
+            .by_key
+            .iter()
+            .filter(|(_, entry)| entry.username == username)
+            .max_by_key(|(user, _)| user.created_at)
+            .and_then(|(user, entry)| match &entry.access {
+                UserAccess::Active(grants) => Some((*user, grants.clone())),
+                UserAccess::Revoked => None,
+            })
     }
 
     fn set(&self, user: UserKey, username: &str, access: UserAccess) {
@@ -187,9 +206,17 @@ impl PermissionBoard {
         users.set(user, username, access, revision);
     }
 
+    /// Closes the connections signed in as `user` and keeps what it may do, as
+    /// a password change ends the user's sessions and leaves the account active.
+    fn end_sessions(&self, user: UserKey, username: &str) {
+        let mut users = lock(&self.users);
+        let revision = self.next_revision();
+        users.end_sessions(user, username, revision);
+    }
+
     /// Sets the permissions of `user` while it is active. The change has no status, so it neither
     /// re-activates a revoked user nor adds one the board does not hold.
-    fn set_permissions(&self, user: UserKey, username: &str, permissions: PrincipalPermissions) {
+    fn set_permissions(&self, user: UserKey, username: &str, grants: Grants) {
         let mut users = lock(&self.users);
         let active = users
             .by_key
@@ -197,7 +224,7 @@ impl PermissionBoard {
             .is_some_and(|entry| entry.access != UserAccess::Revoked);
         if active {
             let revision = self.next_revision();
-            users.set(user, username, UserAccess::Active(permissions), revision);
+            users.set(user, username, UserAccess::Active(grants), revision);
         }
     }
 
@@ -261,17 +288,26 @@ impl Users {
         self.by_key.get(&user).map_or_else(
             || revoked(self.dropped),
             |entry| {
-                revoked(entry.revoked).or_else(|| (entry.changed > seen).then_some(entry.access))
+                revoked(entry.revoked)
+                    .or_else(|| (entry.changed > seen).then(|| entry.access.clone()))
             },
         )
     }
 
+    fn end_sessions(&mut self, user: UserKey, username: &str, revision: u64) {
+        if let Some(entry) = self.by_key.get_mut(&user) {
+            entry.revoked = revision;
+        }
+        self.revoked_names.insert(username.to_owned(), revision);
+    }
+
     fn set(&mut self, user: UserKey, username: &str, access: UserAccess, revision: u64) {
+        let revokes = access == UserAccess::Revoked;
         let entry = self.by_key.entry(user).or_insert_with(|| UserEntry {
             username: username.to_owned(),
             changed: revision,
             revoked: 0,
-            access,
+            access: access.clone(),
         });
         if entry.username != username {
             let renamed = mem::replace(&mut entry.username, username.to_owned());
@@ -279,7 +315,7 @@ impl Users {
         }
         entry.changed = revision;
         entry.access = access;
-        if access == UserAccess::Revoked {
+        if revokes {
             entry.revoked = revision;
             self.revoked_names.insert(username.to_owned(), revision);
         }
@@ -289,15 +325,11 @@ impl Users {
 impl UserAccess {
     fn of(user: &MetadataUserChange) -> Self {
         if user.status == UserStatus::Active {
-            Self::Active(granted(user.permissions.as_ref()))
+            Self::Active(Grants::of(user.permissions.as_ref()))
         } else {
             Self::Revoked
         }
     }
-}
-
-fn granted(permissions: Option<&Permissions>) -> PrincipalPermissions {
-    permissions.map(principal_permissions).unwrap_or_default()
 }
 
 /// What one read leaves the follower to do next.
@@ -597,6 +629,7 @@ struct TopicEntry {
     key: TopicKey,
     name: String,
     partitions: u32,
+    geo: bool,
 }
 
 /// One incarnation of a topic, in one incarnation of its stream.
@@ -679,7 +712,12 @@ impl Mirror {
                 Changed::ALL
             }
             MetadataChange::TopicCreated(topic) | MetadataChange::TopicUpdated(topic) => {
-                self.put_topic(topic_key!(topic), &topic.name, Some(topic.partitions_count));
+                self.put_topic(
+                    topic_key!(topic),
+                    &topic.name,
+                    Some(topic.partitions_count),
+                    geo_of(&topic.options),
+                );
                 Changed::ALL
             }
             MetadataChange::TopicDeleted(topic) => {
@@ -706,12 +744,16 @@ impl Mirror {
                 Changed::default()
             }
             MetadataChange::UserPermissionsUpdated(user) => {
-                let granted = granted(user.permissions.as_ref());
-                permissions.set_permissions(user_key!(user), &user.username, granted);
+                let grants = Grants::of(user.permissions.as_ref());
+                permissions.set_permissions(user_key!(user), &user.username, grants);
                 Changed::default()
             }
             MetadataChange::UserDeleted(user) => {
                 permissions.set(user_key!(user), &user.username, UserAccess::Revoked);
+                Changed::default()
+            }
+            MetadataChange::UserPasswordChanged(user) => {
+                permissions.end_sessions(user_key!(user), &user.username);
                 Changed::default()
             }
             _ => Changed::default(),
@@ -729,7 +771,7 @@ impl Mirror {
                 self.put_stream(stream.stream_id, stream.stream_created_op, &stream.name);
             }
             MetadataCurrentItem::Topic(topic) => {
-                self.put_topic(topic_key!(topic), &topic.name, None);
+                self.put_topic(topic_key!(topic), &topic.name, None, geo_of(&topic.options));
             }
             MetadataCurrentItem::Partitions(partitions) => {
                 self.set_partitions(topic_key!(partitions), partitions.partitions_count);
@@ -775,6 +817,9 @@ impl Mirror {
                 let shape = TopicShape {
                     incarnation: topic.key.topic_created_op,
                     partitions: topic.partitions,
+                    stream_id: topic.key.stream_id,
+                    topic_id: topic.key.topic_id,
+                    geo: topic.geo,
                 };
                 Some((kafka_topic.to_owned(), shape))
             })
@@ -842,18 +887,18 @@ impl Mirror {
     }
 
     /// As [`Self::put_stream`], by the op that created the topic. Without `partitions`, the topic
-    /// keeps the count it had.
-    fn put_topic(&mut self, key: TopicKey, name: &str, partitions: Option<u32>) {
+    /// keeps the count it had, and without `geo`, whether it was geo.
+    fn put_topic(&mut self, key: TopicKey, name: &str, partitions: Option<u32>, geo: Option<bool>) {
         let slot = (key.stream_id, key.topic_id);
-        let mut known_partitions = 0;
+        let (mut known_partitions, mut known_geo) = (0, false);
         match self
             .topics
             .get(&slot)
-            .map(|topic| (topic.key, topic.partitions))
+            .map(|topic| (topic.key, topic.partitions, topic.geo))
         {
-            Some((known, _)) if known.topic_created_op > key.topic_created_op => return,
-            Some((older, _)) if older != key => self.drop_topic(older),
-            Some((_, partitions)) => known_partitions = partitions,
+            Some((known, _, _)) if known.topic_created_op > key.topic_created_op => return,
+            Some((older, _, _)) if older != key => self.drop_topic(older),
+            Some((_, partitions, geo)) => (known_partitions, known_geo) = (partitions, geo),
             None => {}
         }
         self.topics.insert(
@@ -862,6 +907,7 @@ impl Mirror {
                 key,
                 name: name.to_owned(),
                 partitions: partitions.unwrap_or(known_partitions),
+                geo: geo.unwrap_or(known_geo),
             },
         );
     }
@@ -896,6 +942,16 @@ impl Mirror {
     }
 }
 
+/// Whether `options` make a topic geo, `None` when the change log could not read them.
+fn geo_of(options: &MetadataOptions) -> Option<bool> {
+    match options {
+        MetadataOptions::Readable(options) => {
+            Some(TopicCreateOptions::from_resource_options(options).is_geo())
+        }
+        MetadataOptions::Unreadable => None,
+    }
+}
+
 fn deleted_topic(key: TopicKey, kafka_topic: &str) -> DeletedTopic {
     DeletedTopic {
         name: kafka_topic.to_owned(),
@@ -917,7 +973,7 @@ mod tests {
         MetadataConsumerGroupDeleted, MetadataConsumerGroupItem, MetadataOptions,
         MetadataPartitionsChanged, MetadataPermissionsUpdatedReason, MetadataStreamChange,
         MetadataStreamDeleted, MetadataTopicChange, MetadataTopicDeleted, MetadataTopicItem,
-        MetadataUserIdentity, MetadataUserPermissionsUpdated,
+        MetadataUserIdentity, MetadataUserPermissionsUpdated, Permissions, TopicType,
     };
 
     use super::super::ScannedGroups;
@@ -1081,11 +1137,11 @@ mod tests {
     }
 
     fn manages_topics() -> UserAccess {
-        UserAccess::Active(principal_permissions(&permissions(true)))
+        UserAccess::Active(Grants::of(Some(&permissions(true))))
     }
 
     fn reads_nothing() -> UserAccess {
-        UserAccess::Active(principal_permissions(&permissions(false)))
+        UserAccess::Active(Grants::of(Some(&permissions(false))))
     }
 
     /// A mirror with stream `kafka`, the default stream, and its topic `orders`.
@@ -1361,7 +1417,38 @@ mod tests {
             Some(&TopicShape {
                 incarnation: 10,
                 partitions: 5,
+                stream_id: KAFKA,
+                topic_id: 1,
+                geo: false,
             })
+        );
+    }
+
+    /// Another datacenter can move the offsets of a geo topic, so the coordinator log does not
+    /// answer them (`OffsetFetch`).
+    #[test]
+    fn given_a_geo_topic_should_show_it_geo_also_after_options_it_cannot_read() {
+        let (mut mirror, _) = seeded();
+        let mut geo = topic(KAFKA, 1, 10, "orders");
+        geo.options = MetadataOptions::Readable(
+            TopicCreateOptions {
+                topic_type: Some(TopicType::Geo),
+                ..TopicCreateOptions::default()
+            }
+            .to_option_map()
+            .unwrap(),
+        );
+
+        apply_all(&mut mirror, &[MetadataChange::TopicUpdated(geo)]);
+        assert!(mirror.kafka_topic_shapes(&mapping())["orders"].geo);
+
+        apply_all(
+            &mut mirror,
+            &[MetadataChange::TopicUpdated(topic(KAFKA, 1, 10, "orders"))],
+        );
+        assert!(
+            mirror.kafka_topic_shapes(&mapping())["orders"].geo,
+            "unreadable options change nothing"
         );
     }
 
@@ -1470,6 +1557,48 @@ mod tests {
         assert_eq!(board.access("bob"), Some(UserAccess::Revoked));
         assert_eq!(board.access("carol"), Some(UserAccess::Revoked));
         assert_eq!(board.access("dave"), None);
+    }
+
+    #[test]
+    fn given_a_password_change_should_close_the_connections_of_that_user_and_keep_its_access() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserCreated(user(ALICE, "alice", UserStatus::Active, false)),
+                MetadataChange::UserCreated(user(BOB, "bob", UserStatus::Active, false)),
+            ],
+        );
+        let before = board.revision();
+        let (mut alice_seen, mut bob_seen, mut unresolved_seen) = (before, before, before);
+
+        apply_users(
+            &board,
+            &[MetadataChange::UserPasswordChanged(MetadataUserIdentity {
+                user_id: ALICE.user_id,
+                user_created_at: ALICE.created_at,
+                username: "alice".to_owned(),
+            })],
+        );
+        let mut signed_in_after = board.revision();
+
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut alice_seen),
+            Some(UserAccess::Revoked)
+        );
+        assert_eq!(
+            board.changed_since(None, "alice", &mut unresolved_seen),
+            Some(UserAccess::Revoked),
+            "a connection that never resolved its user closes too"
+        );
+        assert_eq!(board.changed_since(Some(BOB), "bob", &mut bob_seen), None);
+        assert_eq!(
+            board.changed_since(Some(ALICE), "alice", &mut signed_in_after),
+            None,
+            "a sign-in after the change stays"
+        );
+        assert_eq!(board.access("alice"), Some(reads_nothing()));
+        assert!(board.active_user("alice").is_some());
     }
 
     #[test]
@@ -1594,6 +1723,26 @@ mod tests {
             Some(manages_topics())
         );
         assert_eq!(board.access("alice"), Some(manages_topics()), "the newest");
+    }
+
+    /// A connection whose permission read failed at login reads its user and grants here.
+    #[test]
+    fn given_a_username_should_find_its_newest_user_only_while_active() {
+        let board = PermissionBoard::default();
+        apply_users(
+            &board,
+            &[
+                MetadataChange::UserCreated(user(ALICE, "alice", UserStatus::Active, false)),
+                MetadataChange::UserCreated(user(ALICE_AGAIN, "alice", UserStatus::Active, true)),
+                MetadataChange::UserCreated(user(BOB, "bob", UserStatus::Inactive, true)),
+            ],
+        );
+
+        let (found, grants) = board.active_user("alice").expect("alice is active");
+        assert_eq!(found, ALICE_AGAIN, "the newest");
+        assert_eq!(UserAccess::Active(grants), manages_topics());
+        assert_eq!(board.active_user("bob"), None, "inactive");
+        assert_eq!(board.active_user("carol"), None, "never shown");
     }
 
     /// A connection whose permission read failed knows only its username.

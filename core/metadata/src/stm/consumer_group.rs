@@ -36,7 +36,7 @@ use crate::stm::result::{
     ApplyReply, CreateConsumerGroupResult, DeleteConsumerGroupResult, JoinConsumerGroupResult,
     LeaveConsumerGroupResult,
 };
-use crate::stm::stream::{Partition, StreamsInner};
+use crate::stm::stream::{Partition, PartitionChangeKind, StreamsInner};
 use bytes::Bytes;
 
 use bytes::{BufMut, BytesMut};
@@ -240,13 +240,35 @@ impl ConsumerGroup {
         self.rebuild_member_assignments();
     }
 
+    /// Whether `installation` is the handover that `partition_id` waits for.
+    #[must_use]
+    pub fn revocation_pending(
+        &self,
+        partition_id: usize,
+        installation: &InstallConsumerGroupOwnerRequest,
+        partition_op: u64,
+    ) -> bool {
+        installation.group_id == self.id
+            && partition_op != 0
+            && self
+                .assignments
+                .get(&partition_id)
+                .is_some_and(|assignment| {
+                    assignment.incarnation == installation.incarnation
+                        && assignment.pending.is_some_and(|pending| {
+                            pending.owner == installation.owner
+                                && pending.metadata_op == installation.metadata_op
+                        })
+                })
+    }
+
     pub fn complete_revocation(
         &mut self,
         partition_id: usize,
         installation: &InstallConsumerGroupOwnerRequest,
         partition_op: u64,
     ) -> bool {
-        if installation.group_id != self.id || partition_op == 0 {
+        if !self.revocation_pending(partition_id, installation, partition_op) {
             return false;
         }
         let Some(assignment) = self.assignments.get_mut(&partition_id) else {
@@ -255,12 +277,6 @@ impl ConsumerGroup {
         let Some(pending) = assignment.pending else {
             return false;
         };
-        if assignment.incarnation != installation.incarnation
-            || pending.owner != installation.owner
-            || pending.metadata_op != installation.metadata_op
-        {
-            return false;
-        }
         let previous = assignment.owner;
         assignment.owner = (!pending.owner.is_unassigned()).then_some(pending.owner);
         assignment.pending = None;
@@ -539,8 +555,8 @@ impl StateHandler for CreateConsumerGroupRequest {
 
         let Some(topic) = state
             .items
-            .get_mut(stream_id)
-            .and_then(|stream| stream.topics.get_mut(topic_id))
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
         else {
             return ApplyReply::err(CreateConsumerGroupResult::TopicNotFound);
         };
@@ -556,15 +572,23 @@ impl StateHandler for CreateConsumerGroupRequest {
         if !admits_consumer_group(topic.consumer_groups.len()) {
             return ApplyReply::err(CreateConsumerGroupResult::TooManyConsumerGroups);
         }
+        let Some(topic) = state
+            .items
+            .make_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(CreateConsumerGroupResult::TopicNotFound);
+        };
         let id = topic.next_consumer_group_id;
         topic.next_consumer_group_id += 1;
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
         topic
             .consumer_groups
-            .insert(id, ConsumerGroup::new(id, name.clone()));
+            .insert(id, Box::new(ConsumerGroup::new(id, name.clone())));
         topic.consumer_group_index.insert(name, id);
         let partitions_count = topic.partitions.len() as u32;
         let consumer_groups_count = topic.consumer_groups.len() as u32;
+        state.catalog_counts.consumer_groups += 1;
         let changes = state
             .topic_key(stream_id, topic_id)
             .map(|topic| {
@@ -617,8 +641,8 @@ impl StateHandler for DeleteConsumerGroupRequest {
         };
         let Some(topic) = state
             .items
-            .get_mut(stream_id)
-            .and_then(|stream| stream.topics.get_mut(topic_id))
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
         else {
             return ApplyReply::err(DeleteConsumerGroupResult::TopicNotFound);
         };
@@ -639,7 +663,7 @@ impl StateHandler for DeleteConsumerGroupRequest {
         }
         let Some(topic) = state
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .and_then(|stream| stream.topics.get_mut(topic_id))
         else {
             return ApplyReply::err(DeleteConsumerGroupResult::TopicNotFound);
@@ -649,13 +673,19 @@ impl StateHandler for DeleteConsumerGroupRequest {
         };
         topic.consumer_group_index.remove(&group.name);
         let consumer_groups_count = u32::try_from(topic.consumer_groups.len()).ok();
+        state.catalog_counts.consumer_groups =
+            state.catalog_counts.consumer_groups.saturating_sub(1);
         // A finalized deletion applies at its completion op. A sibling group
         // created after the intent can hold a later op than the intent.
         topic.consumer_group_catalog_op = state.apply_context.metadata_op;
-        // Bump the partition-shaping revision so the reconciler's fast-skip
-        // doesn't pass over the delete: it reclaims the group's leftover
-        // offsets on the topic's surviving partitions.
+        // Each partition of the topic gets a change, so the reconciler
+        // reclaims the group's leftover offsets on it.
         state.revision = state.revision.wrapping_add(1);
+        state.record_topic_partition_changes(
+            stream_id,
+            topic_id,
+            PartitionChangeKind::ConsumerGroupDeleted,
+        );
         // The dropped group may have held pending revocations.
         state.recompute_consumer_group_metadata();
         let (requested_op, actor) = state.deletion_origin();
@@ -706,30 +736,44 @@ impl StateHandler for JoinConsumerGroupRequest {
         if state.lifecycle_blocks_consumer(stream_id, topic_id, group_id) {
             return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
         }
+        let Some(group_id) = group_id else {
+            return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
+        };
+        let session = Some(self.session);
+        // Idempotent: a re-join from the same client and session changes nothing,
+        // so it must not copy a stream that a checkpoint capture shares.
+        let rejoined = state
+            .items
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
+            .and_then(|topic| topic.consumer_groups.get(&group_id))
+            .map(|group| {
+                group.members.iter().any(|(_, member)| {
+                    member.client_id == self.client_id && member.session == session
+                })
+            });
+        match rejoined {
+            None => return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound),
+            Some(true) => return ApplyReply::ok(Bytes::new()),
+            Some(false) => {}
+        }
 
         let Some(topic) = state
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .and_then(|stream| stream.topics.get_mut(topic_id))
         else {
             return ApplyReply::err(JoinConsumerGroupResult::TopicNotFound);
         };
-        let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
-            return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
-        };
         let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
             return ApplyReply::err(JoinConsumerGroupResult::ConsumerGroupNotFound);
         };
-        // Idempotent: a re-join from the same client keeps its membership.
+        // A re-join from the same client in a new session keeps its membership.
         let already = group
             .members
             .iter_mut()
             .find(|(_, member)| member.client_id == self.client_id);
         if let Some((member_key, member)) = already {
-            let session = Some(self.session);
-            if member.session == session {
-                return ApplyReply::ok(Bytes::new());
-            }
             let before = member.partitions.clone();
             member.session = session;
             group.rebalance_members(
@@ -744,10 +788,9 @@ impl StateHandler for JoinConsumerGroupRequest {
                 .topic_key(stream_id, topic_id)
                 .zip(u32::try_from(group_id).ok())
                 .zip(u32::try_from(member_key).ok())
-                .map(|((topic, group_id), member_id)| {
+                .map_or_default(|((topic, group_id), member_id)| {
                     installed_partition_changes(topic, group_id, member_id, &before, &after)
                 })
-                .unwrap_or_default()
                 .into_iter()
                 .map(|body| {
                     AppliedChange::new(
@@ -826,17 +869,19 @@ impl StateHandler for LeaveConsumerGroupRequest {
             return ApplyReply::err(iggy_common::IggyError::LifecycleBusy.as_code());
         }
 
+        // Reject before `make_mut`: it copies a stream that a checkpoint capture
+        // shares, and a rejected Leave changes nothing.
         let Some(topic) = state
             .items
-            .get_mut(stream_id)
-            .and_then(|stream| stream.topics.get_mut(topic_id))
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
         else {
             return ApplyReply::err(LeaveConsumerGroupResult::TopicNotFound);
         };
-        let Some(group_id) = topic.resolve_group_id(&self.group_id) else {
+        let Some(group_id) = group_id else {
             return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
-        let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
+        let Some(group) = topic.consumer_groups.get(&group_id) else {
             return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
         let member_key = group
@@ -850,6 +895,16 @@ impl StateHandler for LeaveConsumerGroupRequest {
             // server-internal RemoveConsumerGroupMember (disconnect cleanup)
             // stays idempotent -- only this client-facing Leave is loud.
             return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupMemberNotFound);
+        };
+        let Some(topic) = state
+            .items
+            .make_mut(stream_id)
+            .and_then(|stream| stream.topics.get_mut(topic_id))
+        else {
+            return ApplyReply::err(LeaveConsumerGroupResult::TopicNotFound);
+        };
+        let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
+            return ApplyReply::err(LeaveConsumerGroupResult::ConsumerGroupNotFound);
         };
         group.members.remove(key);
         group.rebalance_members(
@@ -937,32 +992,60 @@ impl StateHandler for RemoveConsumerGroupMembersRequest {
         let mut removed = Vec::new();
         for &client_id in &self.client_ids {
             let mut any_removed = false;
-            for (stream_id, stream) in &mut state.items {
-                for (topic_id, topic) in &mut stream.topics {
-                    for group in topic.consumer_groups.values_mut() {
-                        let member_key = group
-                            .members
-                            .iter()
-                            .find(|(_, m)| m.client_id == client_id)
-                            .map(|(key, _)| key);
-                        if let Some(key) = member_key {
-                            group.members.remove(key);
-                            group.rebalance_members(
-                                &topic.partitions,
-                                state.apply_context.metadata_op,
-                                timestamp.as_micros(),
-                            );
-                            removed.push((stream_id, topic_id, group.id, key, client_id));
-                            any_removed = true;
-                        }
-                    }
+            // The index lists the client's groups in catalog order, so this
+            // visits them as a walk of every stream would, and writes only the
+            // streams that hold them. A group the index names twice is visited
+            // once, as in that walk.
+            let mut visited = None;
+            for &(stream_id, topic_id, group_id, _) in state
+                .consumer_group_members
+                .get(&client_id)
+                .into_iter()
+                .flatten()
+            {
+                let group_key = (stream_id, topic_id, group_id);
+                if visited == Some(group_key) {
+                    continue;
+                }
+                visited = Some(group_key);
+                let Some(topic) = state
+                    .items
+                    .make_mut(stream_id)
+                    .and_then(|stream| stream.topics.get_mut(topic_id))
+                else {
+                    continue;
+                };
+                let Some(group) = topic.consumer_groups.get_mut(&group_id) else {
+                    continue;
+                };
+                let member_key = group
+                    .members
+                    .iter()
+                    .find(|(_, m)| m.client_id == client_id)
+                    .map(|(key, _)| key);
+                if let Some(key) = member_key {
+                    group.members.remove(key);
+                    group.rebalance_members(
+                        &topic.partitions,
+                        state.apply_context.metadata_op,
+                        timestamp.as_micros(),
+                    );
+                    removed.push((stream_id, topic_id, group.id, key, client_id));
+                    any_removed = true;
                 }
             }
-            // Only perturb the reconciler when a membership actually changed.
+            // Bump only when a membership actually changed. `revision` stamps
+            // the incarnation of every later partition, so every replica must
+            // bump at the same ops.
             if any_removed {
                 state.revision = state.revision.wrapping_add(1);
-                state.recompute_consumer_group_metadata();
             }
+        }
+        // One rebuild for the whole op, because it walks the catalog. The
+        // loop reads the index only for the groups of its own client, and
+        // the removal of another client changes none of them.
+        if !removed.is_empty() {
+            state.recompute_consumer_group_metadata();
         }
         // Counts are the groups' final ones, so the records do not depend on
         // the order the sessions ended in.
@@ -1078,9 +1161,27 @@ impl StateHandler for CompleteConsumerGroupRevocationRequest {
         let Some(topic_id) = state.resolve_topic_id(stream_id, &self.topic_id) else {
             return ApplyReply::ok(Bytes::new());
         };
+        // Reject before `make_mut`: it copies a stream that a checkpoint capture
+        // shares, and a completion of a handover that is not pending changes
+        // nothing.
+        let pending = state
+            .items
+            .get(stream_id)
+            .and_then(|stream| stream.topics.get(topic_id))
+            .and_then(|topic| topic.consumer_groups.get(&self.installation.group_id))
+            .is_some_and(|group| {
+                group.revocation_pending(
+                    self.partition_id as usize,
+                    &self.installation,
+                    self.partition_op,
+                )
+            });
+        if !pending {
+            return ApplyReply::ok(Bytes::new());
+        }
         let Some(topic) = state
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .and_then(|stream| stream.topics.get_mut(topic_id))
         else {
             return ApplyReply::ok(Bytes::new());
@@ -1158,9 +1259,21 @@ impl StateHandler for RefreshConsumerGroupSessionRequest {
         let mut handovers = Vec::new();
         if let Some(memberships) = state.consumer_group_members.get(&self.client_id) {
             for &(stream_id, topic_id, group_id, member_id) in memberships {
+                // A membership already in this session changes nothing, so it must
+                // not copy a stream that a checkpoint capture shares.
+                let refreshed = state
+                    .items
+                    .get(stream_id)
+                    .and_then(|stream| stream.topics.get(topic_id))
+                    .and_then(|topic| topic.consumer_groups.get(&group_id))
+                    .and_then(|group| group.members.get(member_id))
+                    .is_none_or(|member| member.session == Some(self.session));
+                if refreshed {
+                    continue;
+                }
                 let Some(topic) = state
                     .items
-                    .get_mut(stream_id)
+                    .make_mut(stream_id)
                     .and_then(|stream| stream.topics.get_mut(topic_id))
                 else {
                     continue;
@@ -1171,26 +1284,23 @@ impl StateHandler for RefreshConsumerGroupSessionRequest {
                 let Some(member) = group.members.get_mut(member_id) else {
                     continue;
                 };
-                if member.session != Some(self.session) {
-                    let before = member.partitions.clone();
-                    member.session = Some(self.session);
-                    group.rebalance_members(
-                        &topic.partitions,
-                        state.apply_context.metadata_op,
-                        timestamp.as_micros(),
-                    );
-                    group.index_pending_revocations(
-                        stream_id,
-                        topic_id,
-                        &mut state.pending_revocations,
-                    );
-                    let after = group
-                        .members
-                        .get(member_id)
-                        .map(|member| member.partitions.clone())
-                        .unwrap_or_default();
-                    handovers.push((stream_id, topic_id, group_id, member_id, before, after));
-                }
+                let before = member.partitions.clone();
+                member.session = Some(self.session);
+                group.rebalance_members(
+                    &topic.partitions,
+                    state.apply_context.metadata_op,
+                    timestamp.as_micros(),
+                );
+                group.index_pending_revocations(
+                    stream_id,
+                    topic_id,
+                    &mut state.pending_revocations,
+                );
+                let after = group
+                    .members
+                    .get(member_id)
+                    .map_or_default(|member| member.partitions.clone());
+                handovers.push((stream_id, topic_id, group_id, member_id, before, after));
             }
         }
         let mut records: Vec<WirePartitionHandedOverBody> = handovers
@@ -1239,6 +1349,19 @@ pub struct ConsumerGroupMemberSnapshot {
     pub session: Option<u64>,
 }
 
+impl From<&ConsumerGroupMember> for ConsumerGroupMemberSnapshot {
+    fn from(member: &ConsumerGroupMember) -> Self {
+        Self {
+            id: member.id,
+            client_id: member.client_id,
+            session: member.session,
+        }
+    }
+}
+
+/// The length of the msgpack array a [`ConsumerGroupSnapshot`] encodes as.
+pub(crate) const CONSUMER_GROUP_SNAPSHOT_FIELDS: usize = 5;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConsumerGroupSnapshot {
     pub id: u64,
@@ -1258,16 +1381,7 @@ impl ConsumerGroupSnapshot {
             members: group
                 .members
                 .iter()
-                .map(|(member_id, member)| {
-                    (
-                        member_id,
-                        ConsumerGroupMemberSnapshot {
-                            id: member.id,
-                            client_id: member.client_id,
-                            session: member.session,
-                        },
-                    )
-                })
+                .map(|(member_id, member)| (member_id, member.into()))
                 .collect(),
             assignments: group.assignments.clone(),
         }
@@ -1306,7 +1420,7 @@ impl ConsumerGroupSnapshot {
 mod tests {
     use super::*;
     use crate::stm::snapshot::Snapshotable;
-    use crate::stm::stream::Streams;
+    use crate::stm::stream::{PartitionChange, Streams};
     use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
     use iggy_binary_protocol::requests::partitions::{
         CreatePartitionsRequest, CreatePartitionsWithAssignmentsRequest, DeletePartitionsRequest,
@@ -1318,6 +1432,7 @@ mod tests {
     };
     use iggy_binary_protocol::{WireName, WireOptions};
     use iggy_common::IggyTimestamp;
+    use server_common::sharding::IggyNamespace;
 
     #[test]
     fn given_balanced_owners_when_fourth_member_joins_should_move_only_three_partitions() {
@@ -1921,6 +2036,45 @@ mod tests {
         assert_eq!(streams.consumer_group_session(OTHER), None);
     }
 
+    /// The final delete of a group records one change per partition of its
+    /// topic, so each owner reclaims the group's offsets without a walk.
+    #[test]
+    fn given_group_delete_when_it_finalizes_should_record_a_change_per_topic_partition() {
+        let mut state = streams_with_topic();
+        assert_eq!(create_group(&mut state, "group").code, 0);
+        let before = state.revision;
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(0),
+        };
+        let apply = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(apply.code, 0);
+
+        let changes: Vec<_> = state
+            .recent_partition_changes
+            .since(before)
+            .expect("the feed holds the delete")
+            .copied()
+            .collect();
+        assert_eq!(
+            changes,
+            [(
+                state.revision,
+                PartitionChange {
+                    namespace: IggyNamespace::new(0, 0, 0),
+                    created_revision: state.items[0].topics[0].partitions[0].created_revision,
+                    kind: PartitionChangeKind::ConsumerGroupDeleted,
+                    skips_object_deletes: false,
+                }
+            )]
+        );
+    }
+
     #[test]
     fn deleting_a_parent_removes_its_session_refresh_index() {
         const CLIENT: u128 = 7;
@@ -2121,6 +2275,51 @@ mod tests {
         assert_eq!(topic.consumer_groups[&0].members[0].partitions, [0, 1]);
         assert!(topic.consumer_groups[&1].assignments.is_empty());
         Streams::from_snapshot(Streams::from(state.clone()).to_snapshot()).unwrap();
+    }
+
+    #[test]
+    fn given_a_deleted_group_when_snapshotted_and_listed_should_hold_ascending_ids() {
+        let mut state = streams_with_topic();
+        for name in ["a", "b", "c", "d", "e"] {
+            assert_eq!(create_group(&mut state, name).code, 0);
+        }
+        let delete = DeleteConsumerGroupRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(0),
+            group_id: WireIdentifier::numeric(2),
+        };
+        let deleted = crate::stm::lifecycle::apply_with_lifecycle_completion(
+            &delete,
+            &mut state,
+            IggyTimestamp::now(),
+        );
+        assert_eq!(deleted.code, 0);
+        assert_eq!(create_group(&mut state, "f").code, 0);
+        let expected = [0, 1, 3, 4, 5];
+
+        let snapshot = Streams::from(state).to_snapshot();
+        let snapshotted: Vec<u64> = snapshot.items[0].1.topics[0]
+            .1
+            .consumer_groups
+            .iter()
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(snapshotted, expected);
+
+        let restored = Streams::from_snapshot(snapshot).unwrap();
+        let listed: Vec<u64> = restored.read(|inner| {
+            inner
+                .items
+                .get(0)
+                .unwrap()
+                .topics
+                .get(0)
+                .unwrap()
+                .consumer_groups_after(None, false)
+                .map(|group| group.id)
+                .collect()
+        });
+        assert_eq!(listed, expected);
     }
 
     #[test]

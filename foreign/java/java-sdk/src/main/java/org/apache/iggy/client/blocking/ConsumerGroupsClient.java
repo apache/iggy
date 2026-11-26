@@ -25,6 +25,8 @@ import org.apache.iggy.consumergroup.ConsumerGroupDetails;
 import org.apache.iggy.identifier.ConsumerId;
 import org.apache.iggy.identifier.StreamId;
 import org.apache.iggy.identifier.TopicId;
+import org.apache.iggy.system.NamedPageQuery;
+import org.apache.iggy.system.Page;
 
 import java.util.List;
 import java.util.Optional;
@@ -41,7 +43,17 @@ public interface ConsumerGroupsClient {
         return getConsumerGroups(StreamId.of(streamId), TopicId.of(topicId));
     }
 
+    /**
+     * Over TCP, reads the list in pages of up to 1000 groups, so the list is not one consistent read. All pages share
+     * the sign-in and the request timeout of the call, so a new sign-in during the read fails it. Over TCP, the call
+     * fails with {@link org.apache.iggy.exception.IggyMalformedResponseException} when the server answers the page
+     * cursor it was sent. Over HTTP, reads the whole list in one reply, which the server builds from pages of 1000, so
+     * it is not one consistent read either.
+     */
     List<ConsumerGroup> getConsumerGroups(StreamId streamId, TopicId topicId);
+
+    /** Gets one page of consumer groups. A query that breaks the page rules fails with an invalid command error. */
+    Page<ConsumerGroup> getConsumerGroupsPage(StreamId streamId, TopicId topicId, NamedPageQuery query);
 
     default ConsumerGroupDetails createConsumerGroup(Long streamId, Long topicId, String name) {
         return createConsumerGroup(StreamId.of(streamId), TopicId.of(topicId), name);

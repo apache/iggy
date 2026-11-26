@@ -44,6 +44,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -109,6 +110,17 @@ class AsyncIggyTcpClientTransientFailoverTest {
     private static final Duration REFUSAL_HELD_AFTER = TEST_POLL_TIMEOUT.minus(REFUSAL_HOLD_WINDOW);
 
     private static final java.util.Map<Integer, Integer> REPLICA_IDS = new java.util.concurrent.ConcurrentHashMap<>();
+
+    @Test
+    void shouldBackOffRefusalsWithIndependentCappedJitter() {
+        var state = new AsyncTcpConnection.TransientFailoverState();
+        for (long pauseMillis : new long[] {25, 50, 100, 200, 400, 500, 500}) {
+            assertThat(state.retryPauseNanos(0.5)).isEqualTo(TimeUnit.MILLISECONDS.toNanos(pauseMillis));
+        }
+        assertThat(state.retryPauseNanos(0)).isZero();
+        assertThat(new AsyncTcpConnection.TransientFailoverState().retryPauseNanos(0.5))
+                .isEqualTo(TimeUnit.MILLISECONDS.toNanos(25));
+    }
 
     @Test
     void shouldRetainUncertainMutationOutcomeAfterLaterRefusal() throws Exception {
@@ -1689,19 +1701,7 @@ class AsyncIggyTcpClientTransientFailoverTest {
                     try {
                         for (int connection = 0; connection < connectionCount; connection++) {
                             try (Socket socket = server.accept()) {
-                                InputStream input = socket.getInputStream();
-                                OutputStream output = socket.getOutputStream();
-                                Request request;
-                                while ((request = readRequest(input, connection)) != null) {
-                                    Response response = handler.handle(request);
-                                    if (response.command() == -1) {
-                                        break;
-                                    }
-                                    writeResponse(output, request, response);
-                                    if (response.closeAfterReply()) {
-                                        break;
-                                    }
-                                }
+                                serveConnection(socket, connection, handler);
                             }
                         }
                         serving.complete(null);
@@ -1715,6 +1715,27 @@ class AsyncIggyTcpClientTransientFailoverTest {
         serverThread.setDaemon(true);
         serverThread.start();
         return serving;
+    }
+
+    private static void serveConnection(Socket socket, int connection, RequestHandler handler) throws IOException {
+        InputStream input = socket.getInputStream();
+        OutputStream output = socket.getOutputStream();
+        try {
+            Request request;
+            while ((request = readRequest(input, connection)) != null) {
+                Response response = handler.handle(request);
+                if (response.command() == -1) {
+                    break;
+                }
+                writeResponse(output, request, response);
+                if (response.closeAfterReply()) {
+                    break;
+                }
+            }
+        } catch (SocketException linkGone) {
+            // A client that drops the link while a reply is on its way resets it instead of closing it. That ends
+            // the connection as a clean close does, and the tests that disconnect on purpose see both.
+        }
     }
 
     static Request readRequest(InputStream input, int connection) throws IOException {

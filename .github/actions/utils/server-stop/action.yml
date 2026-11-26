@@ -53,15 +53,24 @@ runs:
 
         if ps -p "$PID_INPUT" > /dev/null 2>&1; then
           kill "$PID_INPUT" || true
-          for i in $(seq 1 ${{ inputs.kill-timeout-seconds }}); do
-            ps -p "$PID_INPUT" > /dev/null 2>&1 || exit 0
+          stopped=false
+          for _ in $(seq 1 ${{ inputs.kill-timeout-seconds }}); do
+            if ! ps -p "$PID_INPUT" > /dev/null 2>&1; then
+              stopped=true
+              break
+            fi
             sleep 1
           done
-          echo "Process still alive after grace; sending SIGKILL"
-          kill -9 "$PID_INPUT" || true
+          if [[ "$stopped" != "true" ]]; then
+            echo "Process still alive after grace; sending SIGKILL"
+            kill -9 "$PID_INPUT" || true
+          fi
         fi
 
+        # A clean stop prints the tail too: the end of the log is what a
+        # failed test run needs.
         if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
-          echo "---- last 50 lines of server log ----"
+          echo "::group::Last 50 lines of $LOG_FILE"
           tail -n 50 "$LOG_FILE" || true
+          echo "::endgroup::"
         fi

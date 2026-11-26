@@ -40,6 +40,7 @@ export const Operation = {
   UpdateTopicResolved: 73,
   UpdateUserResolved: 74,
   RewrapStreamKeys: 75,
+  ShadowTopic: 76,
   CreateStream: 128,
   // 129 was UpdateStream. Never reuse it.
   DeleteStream: 130,
@@ -61,13 +62,15 @@ export const Operation = {
   JoinConsumerGroup: 148,
   LeaveConsumerGroup: 149,
   UpdateResource: 150,
+  RetireGeoOrigin: 151,
   SendMessages: 160,
   StoreConsumerOffset: 161,
   DeleteConsumerOffset: 162,
   RetireSession: 166,
   InstallConsumerGroupOwner: 167,
   TransitionPartitionHistory: 168,
-  RetireConsumerGroupOwners: 169
+  RetireConsumerGroupOwners: 169,
+  StateMachineCommand: 170
 } as const;
 
 const INTERNAL_START = 64;
@@ -99,7 +102,8 @@ const REPLICATED_OPERATION: ReadonlyMap<number, number> = new Map([
   [COMMAND_CODE.DeleteGroup, Operation.DeleteConsumerGroup],
   [COMMAND_CODE.JoinGroup, Operation.JoinConsumerGroup],
   [COMMAND_CODE.LeaveGroup, Operation.LeaveConsumerGroup],
-  [COMMAND_CODE.UpdateResource, Operation.UpdateResource]
+  [COMMAND_CODE.UpdateResource, Operation.UpdateResource],
+  [COMMAND_CODE.RetireGeoOrigin, Operation.RetireGeoOrigin]
 ]);
 
 const KNOWN_OPERATIONS: ReadonlySet<number> =
@@ -119,7 +123,8 @@ export const isInternal = (operation: number): boolean =>
     operation === Operation.RetireSession ||
     operation === Operation.InstallConsumerGroupOwner ||
     operation === Operation.TransitionPartitionHistory ||
-    operation === Operation.RetireConsumerGroupOwners;
+    operation === Operation.RetireConsumerGroupOwners ||
+    operation === Operation.StateMachineCommand;
 
 /**
  * Metadata classification is an explicit allowlist, not a range:
@@ -131,7 +136,7 @@ export const isMetadata = (operation: number): boolean => {
   if (isInternal(operation) && operation < Operation.SendMessages) return true;
   if (operation === Operation.DeleteSegments) return false;
   return operation >= METADATA_START &&
-    operation <= Operation.UpdateResource;
+    operation <= Operation.RetireGeoOrigin;
 };
 
 /**

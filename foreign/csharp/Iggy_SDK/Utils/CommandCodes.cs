@@ -27,6 +27,7 @@ internal static class CommandCodes
     internal const int BIND_SESSION_CODE = 15;
     internal const int UPDATE_RESOURCE_CODE = 16;
     internal const int GET_METADATA_CHANGES_CODE = 17;
+    internal const int RETIRE_GEO_ORIGIN_CODE = 18;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;
@@ -68,6 +69,7 @@ internal static class CommandCodes
     // 304 was UpdateTopic and must never be reused.
     internal const int CREATE_PARTITIONS_CODE = 402;
     internal const int DELETE_PARTITIONS_CODE = 403;
+    internal const int GET_PARTITIONS_CODE = 404;
     internal const int DELETE_SEGMENTS_CODE = 503;
     internal const int GET_CONSUMER_GROUP_CODE = 600;
     internal const int GET_CONSUMER_GROUPS_CODE = 601;

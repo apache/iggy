@@ -21,6 +21,7 @@ using Apache.Iggy.Consumers;
 using Apache.Iggy.Contracts;
 using Apache.Iggy.Enums;
 using Apache.Iggy.Exceptions;
+using Apache.Iggy.Extensions;
 using Apache.Iggy.IggyClient;
 using Apache.Iggy.Kinds;
 using Apache.Iggy.Messages;
@@ -744,6 +745,69 @@ public class IggyConsumerTests
 
         messageReceived.ShouldBeTrue();
         await consumer.DisposeAsync();
+    }
+
+    public static IEnumerable<Func<(Protocol, CommitMode, bool)>> ConsumerResumeData()
+    {
+        return from protocol in IggyServerFixture.ProtocolData()
+               from mode in new[] { CommitMode.Manual, CommitMode.OnRead, CommitMode.Auto }
+               from rented in new[] { false, true }
+               select new Func<(Protocol, CommitMode, bool)>(() => (protocol(), mode, rented));
+    }
+
+    [Test]
+    [MethodDataSource(nameof(ConsumerResumeData))]
+    public async Task Consumer_After_PartialIteration_Should_Resume_UnreadMessages(
+        Protocol protocol, CommitMode mode, bool rented)
+    {
+        using var client = await Fixture.CreateAuthenticatedClient(protocol);
+        var testStream = await CreateTestStreamWithMessages(client, protocol, 1, 6);
+        var stream = Identifier.String(testStream.StreamId);
+        var topic = Identifier.String(testStream.TopicId);
+        var identity = Consumer.New("resume-iteration");
+        var commit = mode switch
+        {
+            CommitMode.OnRead => CommitPolicy.OnRead,
+            CommitMode.Auto => CommitPolicy.Auto(new AutoCommit
+            { Interval = TimeSpan.FromHours(1), After = CommitAfter.Processing }),
+            _ => CommitPolicy.Manual
+        };
+        await using var consumer = IggyConsumerBuilder.Create(client, stream, topic, identity)
+            .WithPartitions(0)
+            .WithPollingStrategy(PollingStrategy.First())
+            .WithPollOptions(new PollOptions { Count = 2, MaxWait = TimeSpan.FromSeconds(1), Commit = commit })
+            .Build();
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await consumer.InitAsync(timeout.Token);
+        List<ulong> offsets = [];
+        for (var iteration = 0; iteration < 3; iteration++)
+        {
+            if (rented)
+            {
+                await foreach (var message in consumer.ReceiveRentedAsync(timeout.Token))
+                {
+                    using (message) { offsets.Add(message.CurrentOffset); }
+                    break;
+                }
+            }
+            else
+            {
+                await foreach (var message in consumer.ReceiveAsync(timeout.Token))
+                {
+                    offsets.Add(message.CurrentOffset);
+                    break;
+                }
+            }
+        }
+        offsets.ShouldBe([0ul, 1ul, 2ul]);
+        await consumer.ShutdownAsync();
+        await using var restarted = await client.Reader(stream, topic, identity)
+            .WithPartitions(0)
+            .WithStart(PollingStrategy.Next())
+            .WithOptions(new PollOptions { Count = 1, MaxWait = TimeSpan.FromSeconds(1), Commit = CommitPolicy.Manual })
+            .BuildAsync();
+        var batch = await restarted.NextAsync(timeout.Token);
+        batch.Messages.Single().Header.Offset.ShouldBe(mode == CommitMode.Manual ? 0ul : 3ul);
     }
 
     private async Task<TestStreamInfo> CreateTestStreamWithMessages(IIggyClient client, Protocol protocol,

@@ -52,6 +52,37 @@ func ServerOptions() (string, []tcp.Option) {
 	return *tcpServerAddr, []tcp.Option{tcp.WithServerAddress(*tcpServerAddr)}
 }
 
+// GetTcpOptions parses the server address and TLS flags into tcp.Options.
+func GetTcpOptions() (string, []tcp.Option) {
+	tcpServerAddr := flag.String("tcp-server-address", "127.0.0.1:8090", "TCP server address")
+	tlsEnabled := flag.Bool("tls", false, "Enable TLS")
+	tlsCAFile := flag.String("tls-ca-file", "", "Path to CA certificate file for TLS")
+	tlsDomain := flag.String("tls-domain", "", "TLS server domain name for SNI")
+	flag.Parse()
+
+	if _, err := net.ResolveTCPAddr("tcp", *tcpServerAddr); err != nil {
+		log.Fatalf("Invalid server address %s! Usage: --tcp-server-address <server-address>", *tcpServerAddr)
+	}
+
+	tcpOptions := []tcp.Option{
+		tcp.WithServerAddress(*tcpServerAddr),
+	}
+
+	if *tlsEnabled {
+		var tlsOpts []tcp.TLSOption
+		if *tlsCAFile != "" {
+			tlsOpts = append(tlsOpts, tcp.WithTLSCAFile(*tlsCAFile))
+		}
+		if *tlsDomain != "" {
+			tlsOpts = append(tlsOpts, tcp.WithTLSDomain(*tlsDomain))
+		}
+		tcpOptions = append(tcpOptions, tcp.WithTLS(tlsOpts...))
+		log.Printf("TLS enabled with CA file: %s, domain: %s", *tlsCAFile, *tlsDomain)
+	}
+
+	return *tcpServerAddr, tcpOptions
+}
+
 // TenantsFromEnv reads the tenant count from TENANTS_COUNT.
 func TenantsFromEnv() int {
 	raw, ok := os.LookupEnv("TENANTS_COUNT")

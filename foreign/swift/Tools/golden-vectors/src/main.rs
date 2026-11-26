@@ -41,6 +41,9 @@ use iggy_binary_protocol::primitives::metadata_changes::{
     WireMetadataChangePhase, WireMetadataChangeStatus, WireStreamBody, WireStreamKey,
 };
 use iggy_binary_protocol::primitives::options::WireOptions;
+use iggy_binary_protocol::primitives::page::{
+    MAX_PAGE_LIMIT, WirePageCursor, WirePageOrder, WirePageQuery,
+};
 use iggy_binary_protocol::primitives::partition_history::PartitionContext;
 use iggy_binary_protocol::primitives::permissions::{
     WireGlobalPermissions, WirePermissions, WireStreamPermissions, WireTopicPermissions,
@@ -54,7 +57,7 @@ use iggy_binary_protocol::requests::messages::{
     MIN_DEFERRED_POLL_MAX_BYTES, PollMessagesRequest, RawMessage, SendMessagesEncoder,
 };
 use iggy_binary_protocol::requests::partitions::{
-    CreatePartitionsRequest, DeletePartitionsRequest,
+    CreatePartitionsRequest, DeletePartitionsRequest, GetPartitionsRequest,
 };
 use iggy_binary_protocol::requests::personal_access_tokens::*;
 use iggy_binary_protocol::requests::segments::DeleteSegmentsRequest;
@@ -65,12 +68,13 @@ use iggy_binary_protocol::requests::topics::{
 };
 use iggy_binary_protocol::requests::users::login_register::BindSecret;
 use iggy_binary_protocol::requests::users::*;
+use iggy_binary_protocol::responses::PageResponse;
 use iggy_binary_protocol::responses::clients::{
     ClientDetailsResponse, ClientResponse, ConsumerGroupInfoResponse, GetClientsResponse,
 };
 use iggy_binary_protocol::responses::consumer_groups::{
     ConsumerGroupDetailsResponse, ConsumerGroupMemberResponse, ConsumerGroupResponse,
-    GetConsumerGroupsResponse, SyncConsumerGroupResponse,
+    SyncConsumerGroupResponse,
 };
 use iggy_binary_protocol::responses::consumer_offsets::ConsumerOffsetResponse;
 use iggy_binary_protocol::responses::messages::{
@@ -81,30 +85,26 @@ use iggy_binary_protocol::responses::messages::{
 use iggy_binary_protocol::responses::personal_access_tokens::{
     GetPersonalAccessTokensResponse, PersonalAccessTokenResponse, RawPersonalAccessTokenResponse,
 };
-use iggy_binary_protocol::responses::streams::{
-    GetStreamResponse, GetStreamsResponse, StreamResponse, TopicHeader,
-};
+use iggy_binary_protocol::responses::streams::{GetStreamResponse, StreamResponse, TopicResponse};
 use iggy_binary_protocol::responses::system::get_stats::{CacheMetricEntry, StatsResponse};
 use iggy_binary_protocol::responses::system::{
     ClusterMetadataResponse, ClusterNodeResponse, DescribeOptionsResponse,
     GetMetadataChangesResponse, OptionDescriptor, WireMetadataChangeRecord,
 };
-use iggy_binary_protocol::responses::topics::{
-    GetTopicResponse, GetTopicsResponse, PartitionResponse,
-};
+use iggy_binary_protocol::responses::topics::{GetTopicResponse, PartitionResponse};
 use iggy_binary_protocol::responses::users::{
-    GetUsersResponse, IdentityResponse, LoginRegisterResponse, UserDetailsResponse, UserResponse,
+    IdentityResponse, LoginRegisterResponse, UserDetailsResponse, UserResponse,
 };
 use iggy_binary_protocol::{
     AckLevel, ClientVersionInfo, IGGY_PROTOCOL_VERSION, IGGY_PROTOCOL_VERSION_MIN, WireConsumer,
     WireIdentifier, WireName, WirePartitioning, WirePollingStrategy,
 };
 use iggy_common::{
-    CompressionAlgorithm, DeferredPollOptions, Durability, IggyByteSize, IggyDuration, IggyError,
-    IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION, OptionKey, OptionsPatch,
-    RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions, StreamEncryptionKey,
-    StreamUpdateOptions, TopicCreateOptions, TopicUpdateOptions, UserStatus, UserUpdateOptions,
-    stream_key_fingerprint,
+    CompressionAlgorithm, DeferredPollOptions, Durability, GeoMode, GeoTopicDurations,
+    IggyByteSize, IggyDuration, IggyError, IggyExpiry, MaxTopicSize, NO_ASSIGNED_PARTITION,
+    OptionKey, OptionsPatch, RESYNC_REQUIRED_PARTITION_SENTINEL, StreamCreateOptions,
+    StreamEncryptionKey, StreamUpdateOptions, TopicCreateOptions, TopicType, TopicUpdateOptions,
+    UserStatus, UserUpdateOptions, stream_key_fingerprint,
 };
 use secrecy::SecretString;
 use serde::Serialize;
@@ -329,8 +329,8 @@ fn batch_record(
     bytes
 }
 
-fn topic_header(id: u32, name_value: &str) -> TopicHeader {
-    TopicHeader {
+fn topic_response(id: u32, name_value: &str) -> TopicResponse {
+    TopicResponse {
         id,
         created_at: 1_710_000_000_000_000,
         partitions_count: 3,
@@ -514,7 +514,13 @@ fn main() {
             stream_id: named("my-stream"),
         },
     );
-    add(&mut vectors, "request.get_streams", &GetStreamsRequest);
+    add(
+        &mut vectors,
+        "request.get_streams",
+        &GetStreamsRequest {
+            page: WirePageQuery::default(),
+        },
+    );
     add(
         &mut vectors,
         "request.update_resource.stream",
@@ -561,6 +567,16 @@ fn main() {
         "request.get_topics",
         &GetTopicsRequest {
             stream_id: numeric(42),
+            page: WirePageQuery {
+                order: WirePageOrder::Created,
+                descending: true,
+                limit: 20,
+                cursor: Some(WirePageCursor::Created {
+                    created_at: 1_710_000_000_000_000,
+                    id: 7,
+                }),
+                name: Some(name("ord")),
+            },
         },
     );
     let topic_update = update_resource(
@@ -616,6 +632,20 @@ fn main() {
     );
     add(
         &mut vectors,
+        "request.get_partitions",
+        &GetPartitionsRequest {
+            stream_id: named("stream"),
+            topic_id: named("topic"),
+            page: WirePageQuery {
+                descending: true,
+                limit: MAX_PAGE_LIMIT,
+                cursor: Some(WirePageCursor::Id(2)),
+                ..WirePageQuery::default()
+            },
+        },
+    );
+    add(
+        &mut vectors,
         "request.delete_segments",
         &DeleteSegmentsRequest {
             stream_id: numeric(1),
@@ -657,6 +687,7 @@ fn main() {
         &GetConsumerGroupsRequest {
             stream_id: numeric(1),
             topic_id: numeric(2),
+            page: WirePageQuery::default(),
         },
     );
     add(
@@ -903,7 +934,17 @@ fn main() {
             user_id: numeric(42),
         },
     );
-    add(&mut vectors, "request.get_users", &GetUsersRequest);
+    // The first page of the walk that the list methods do.
+    add(
+        &mut vectors,
+        "request.get_users",
+        &GetUsersRequest {
+            page: WirePageQuery {
+                limit: MAX_PAGE_LIMIT,
+                ..WirePageQuery::default()
+            },
+        },
+    );
     add(
         &mut vectors,
         "request.update_resource.user",
@@ -1325,20 +1366,21 @@ fn main() {
         "response.get_stream",
         &GetStreamResponse {
             stream: stream_response(1, 2),
-            topics: vec![topic_header(1, "topic-a"), topic_header(2, "topic-b")],
+            topics: vec![topic_response(1, "topic-a"), topic_response(2, "topic-b")],
         },
     );
     add(
         &mut vectors,
         "response.get_streams",
-        &GetStreamsResponse {
-            streams: vec![stream_response(1, 2), stream_response(2, 0)],
+        &PageResponse {
+            items: vec![stream_response(1, 2), stream_response(2, 0)],
+            next: Some(WirePageCursor::Id(2)),
         },
     );
     add(
         &mut vectors,
         "response.topic_header",
-        &topic_header(5, "events"),
+        &topic_response(5, "events"),
     );
     let partitions = vec![
         PartitionResponse {
@@ -1379,21 +1421,36 @@ fn main() {
         &mut vectors,
         "response.get_topic",
         &GetTopicResponse {
-            topic: topic_header(1, "my-topic"),
-            partitions,
+            topic: topic_response(1, "my-topic"),
+            partitions: partitions.clone(),
+        },
+    );
+    add(
+        &mut vectors,
+        "response.get_partitions",
+        &PageResponse {
+            items: partitions,
+            next: Some(WirePageCursor::Id(2)),
         },
     );
     add(
         &mut vectors,
         "response.get_topics",
-        &GetTopicsResponse {
-            topics: vec![topic_header(1, "events"), topic_header(2, "logs")],
+        &PageResponse {
+            items: vec![topic_response(1, "events"), topic_response(2, "logs")],
+            next: Some(WirePageCursor::Created {
+                created_at: 1_710_000_000_000_000,
+                id: 2,
+            }),
         },
     );
     add(
         &mut vectors,
         "response.get_topics.empty",
-        &GetTopicsResponse { topics: vec![] },
+        &PageResponse::<TopicResponse> {
+            items: vec![],
+            next: None,
+        },
     );
     add(
         &mut vectors,
@@ -1432,8 +1489,8 @@ fn main() {
     add(
         &mut vectors,
         "response.get_consumer_groups",
-        &GetConsumerGroupsResponse {
-            groups: vec![
+        &PageResponse {
+            items: vec![
                 ConsumerGroupResponse {
                     id: 1,
                     partitions_count: 4,
@@ -1447,6 +1504,7 @@ fn main() {
                     name: name("group-b"),
                 },
             ],
+            next: None,
         },
     );
     add(
@@ -1551,8 +1609,8 @@ fn main() {
     add(
         &mut vectors,
         "response.get_users",
-        &GetUsersResponse {
-            users: vec![
+        &PageResponse {
+            items: vec![
                 user,
                 UserResponse {
                     id: 2,
@@ -1563,6 +1621,7 @@ fn main() {
                     derived_options: WireOptions::empty(),
                 },
             ],
+            next: None,
         },
     );
     add(
@@ -1842,7 +1901,16 @@ fn main() {
         },
     );
 
-    // Domain option blocks.
+    // Domain option blocks. The zero duration is a value of a geo topic, sent
+    // rather than dropped as a default.
+    let geo_durations = GeoTopicDurations {
+        fresh_upload_interval: Some(IggyDuration::from(50_000u64)),
+        consumer_offset_upload_interval: Some(IggyDuration::from(0u64)),
+        positions_publish_interval: Some(IggyDuration::new_from_secs(2)),
+        tombstone_grace: Some(IggyDuration::new_from_secs(3_600)),
+        positions_resume_timeout: Some(IggyDuration::new_from_secs(30)),
+        long_term_rewrite_max_interval: Some(IggyDuration::new_from_secs(20)),
+    };
     let create_options = TopicCreateOptions {
         partitions_count: Some(3),
         compression_algorithm: Some(CompressionAlgorithm::Gzip),
@@ -1858,6 +1926,17 @@ fn main() {
         size_of_messages_required_to_save: Some(IggyByteSize::from(4096)),
         preallocate_segments: Some(false),
         replication_factor: Some(2),
+        segment_max_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+            3_600,
+        ))),
+        tiered_storage: Some(false),
+        local_retention_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+            1_800,
+        ))),
+        local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
+        topic_type: Some(TopicType::Geo),
+        geo_mode: Some(GeoMode::GeoTiered),
+        geo_durations,
         raw: BTreeMap::new(),
     };
     add(
@@ -1868,6 +1947,12 @@ fn main() {
     let update_options = TopicUpdateOptions {
         message_expiry: Some(IggyExpiry::NeverExpire),
         max_topic_size: Some(MaxTopicSize::Unlimited),
+        tiered_storage: Some(true),
+        local_retention_age: Some(IggyExpiry::ExpireDuration(IggyDuration::new_from_secs(
+            1_800,
+        ))),
+        local_retention_size: Some(MaxTopicSize::Custom(IggyByteSize::from(536_870_912))),
+        geo_durations,
         ..Default::default()
     };
     add(

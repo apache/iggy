@@ -85,8 +85,8 @@
 //! | `pause` | each node in turn: SIGSTOP for `d`, then SIGCONT | fails on master like `isolate`: the cluster evicts the frozen node's client sessions and the standalone consumers stay at `unauthenticated` |
 //! | `isolate` | each node in turn: every replica-to-replica connection of the node reset and redials refused for `d`, then restored; clients still reach it | fails on master: session eviction leaves the standalone consumers at `unauthenticated` until the end (see below) |
 //! | `kill-storm` | four SIGKILL and restart cycles `g` apart, `d` down each | pass |
-//! | `cascading-crash` | for each node: SIGKILL it, SIGKILL its successor `SECOND_KILL_DELAY_SECS` later during the view change, restart both `d` after the second kill; `persisted` | fails on master with `persisted`: after the restarted pair elected a new view, the surviving node fenced partition 0 as divergent (`partition WAL append does not extend its history`, then a ShardFatal and a process exit) and the partition stayed frozen. With `replicated` on 3 nodes one node stays alive alone for `d`, so acknowledged writes held only by the killed pair are lost by design, the same mechanism as `full-outage`. #4476 and #4500 cover the fenced replica and the survivor election, not that loss |
-//! | `full-outage` | SIGKILL every node at once after `g`, restart all after `d`; `persisted` | fails on master with `persisted`: the cluster recovers and loses nothing, but every producer stays `disconnected` until the end, the producer stall described below. With `replicated`, unflushed acknowledged writes are lost by design, so that setting is expected to fail |
+//! | `cascading-crash` | for each node: SIGKILL it, SIGKILL its successor `SECOND_KILL_DELAY_SECS` later during the view change, restart both `d` after the second kill; `persisted` | fails on master with `persisted`: after the restarted pair elected a new view, the surviving node fenced partition 0 as divergent (`partition WAL append does not extend its history`, then a ShardFatal and a process exit) and the partition stayed frozen. With `replicated` on 3 nodes one node stays alive alone for `d`, so acknowledged writes held only by the killed pair, and not yet handed to the OS there, are lost by design, the same mechanism as `full-outage`. #4476 and #4500 cover the fenced replica and the survivor election, not that loss |
+//! | `full-outage` | SIGKILL every node at once after `g`, restart all after `d`; `persisted` | fails on master with `persisted`: the cluster recovers and loses nothing, but every producer stays `disconnected` until the end, the producer stall described below. With `replicated`, acknowledged writes that a server had not yet handed to the OS are lost by design, so that setting can fail |
 //! | `rolling-crash` | `crash-restart` on 1 partition at 30k messages/s from 12 producers in batches of 100, `persisted`, a kill every 80 s and 40 s down, for 360 s | #4438: a restarted replica logs `needs state transfer`, never finishes the transfer and keeps serving a stale prefix. Timing dependent; the loss reaches millions of messages at this load. Expected: pass |
 //! | `split-primaries` | `crash-restart`, then a 60 s window without faults, opened once the replica mesh has formed, in which the p99 latency of an acknowledged batch and the longest gap between acknowledgements must stay under `IGGY_TEST_CHAOS_P99_LIMIT_MS` | #4436: once partition primaries sit on different nodes, the SDK moves its session on nearly every send. `given_partitions_on_different_primaries_when_sending_round_robin_should_keep_the_session` in `partition_primary_routing.rs` is the deterministic test. Expected: pass |
 //!
@@ -246,20 +246,18 @@ use std::io::Read;
 use std::ops::RangeInclusive;
 use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::path::PathBuf;
-use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use assert_cmd::cargo::CommandCargoExt;
 use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use iggy::prelude::*;
 use integration::harness::handle::common::SIGTERM_TIMEOUT;
 use integration::harness::{
     GroupPoller, ServerHandle, StopOutcome, TestBinary, TestBinaryError, TestHarness,
-    TestServerConfig, disk, resolve_config_paths,
+    TestServerConfig, cargo_bin_path, disk, log_capture, resolve_config_paths,
 };
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -332,8 +330,10 @@ const CLEANER_INTERVAL: &str = "1s";
 /// The server's own shutdown budget has to end inside the harness's SIGTERM
 /// grace, or a wedged shard reads as a SIGKILL instead of the server's
 /// `abandoning it` line and its failure exit. Shard 0 may wait the join
-/// budget plus one drain and one poll interval, 3.05 s here against the 5 s
-/// grace; the defaults (10 s drain, 30 s join) outlast it.
+/// budget plus one drain and one poll interval, 3.05 s here, after a primary
+/// handoff of at most 1 s, against the 5 s grace; the defaults (15 s handoff,
+/// 10 s drain, 30 s join) outlast it.
+const SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT: &str = "1s";
 const SHUTDOWN_DRAIN_TIMEOUT: &str = "1s";
 const SHUTDOWN_POLL_INTERVAL: &str = "50ms";
 const SHUTDOWN_JOIN_TIMEOUT: &str = "2s";
@@ -386,7 +386,7 @@ type SharedLog = Arc<Mutex<ObservedLog>>;
 #[parallel]
 #[ignore = "runs for minutes against a multi-node cluster; run with --run-ignored only"]
 async fn given_cluster_when_scenario_faults_hit_should_keep_acked_messages() {
-    crate::use_saved_logs_on_failure();
+    log_capture::use_saved_logs_on_failure();
     let config = ChaosConfig::from_env();
     let mut harness = build_cluster(&config);
     let mut report =
@@ -1249,6 +1249,10 @@ fn build_cluster(config: &ChaosConfig) -> TestHarness {
         (
             "data_maintenance.messages.interval".to_owned(),
             CLEANER_INTERVAL.to_owned(),
+        ),
+        (
+            "sharding.shutdown_primary_handoff_timeout".to_owned(),
+            SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT.to_owned(),
         ),
         (
             "sharding.shutdown_drain_timeout".to_owned(),
@@ -4264,8 +4268,7 @@ fn run_metadata(config: &ChaosConfig) -> serde_json::Value {
 }
 
 fn server_binary_metadata() -> serde_json::Value {
-    let command = Command::cargo_bin("iggy-server").expect("locate the prebuilt server");
-    let path = PathBuf::from(command.get_program());
+    let path = cargo_bin_path("iggy-server").expect("locate the prebuilt server");
     let fingerprint = || -> std::io::Result<String> {
         let mut file = File::open(&path)?;
         let mut digest = Context::new(&SHA256);

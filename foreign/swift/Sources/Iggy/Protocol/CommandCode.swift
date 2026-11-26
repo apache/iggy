@@ -27,6 +27,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     case bindSession = 15
     case updateResource = 16
     case getMetadataChanges = 17
+    case retireGeoOrigin = 18
     case getMe = 20
     case getClient = 21
     case getClients = 22
@@ -70,6 +71,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
     // 304 was update_topic and 305 purge_topic. The server keeps both retired.
     case createPartitions = 402
     case deletePartitions = 403
+    case getPartitions = 404
     case deleteSegments = 503
     case getConsumerGroup = 600
     case getConsumerGroups = 601
@@ -90,6 +92,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .bindSession: "session.bind"
         case .updateResource: "resource.update"
         case .getMetadataChanges: "metadata.changes"
+        case .retireGeoOrigin: "geo.retire_origin"
         case .getMe: "me"
         case .getClient: "client.get"
         case .getClients: "client.list"
@@ -126,6 +129,7 @@ public enum CommandCode: UInt32, Sendable, Hashable, CaseIterable {
         case .deleteTopic: "topic.delete"
         case .createPartitions: "partition.create"
         case .deletePartitions: "partition.delete"
+        case .getPartitions: "partition.list"
         case .deleteSegments: "segment.delete"
         case .getConsumerGroup: "consumer_group.get"
         case .getConsumerGroups: "consumer_group.list"

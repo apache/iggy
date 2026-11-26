@@ -30,7 +30,7 @@ use crate::{
         },
         producing_consumer::BenchmarkProducingConsumer,
     },
-    utils::finish_condition::BenchmarkFinishCondition,
+    utils::{finish_condition::BenchmarkFinishCondition, warmup::BenchmarkWarmup},
 };
 use bench_report::{
     benchmark_kind::BenchmarkKind, individual_metrics::BenchmarkIndividualMetrics,
@@ -57,7 +57,7 @@ impl TypedBenchmarkProducingConsumer {
         message_size: BenchmarkNumericParameter,
         send_finish_condition: Arc<BenchmarkFinishCondition>,
         poll_finish_condition: Arc<BenchmarkFinishCondition>,
-        warmup_time: IggyDuration,
+        warmup: BenchmarkWarmup,
         sampling_time: IggyDuration,
         moving_average_window: u32,
         limit_bytes_per_second: Option<IggyByteSize>,
@@ -72,7 +72,7 @@ impl TypedBenchmarkProducingConsumer {
             partitions: partitions_count,
             messages_per_batch,
             message_size,
-            warmup_time,
+            warmup,
             pretty,
         };
 
@@ -81,7 +81,7 @@ impl TypedBenchmarkProducingConsumer {
             consumer_group_id,
             stream_id,
             messages_per_batch,
-            warmup_time,
+            warmup,
             polling_kind,
             poll_options,
             origin_timestamp_latency_calculation,

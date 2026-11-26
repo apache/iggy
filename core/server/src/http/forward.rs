@@ -127,6 +127,7 @@ use crate::http::state::{
 };
 use crate::http::wire::DeferredPollQuery;
 use crate::http::{HttpState, close_connection};
+use crate::namespace::PrimaryLookup;
 use crate::server_error::ServerError;
 
 /// Marker stamped on every forwarded request. Loop guard only: a node that is
@@ -570,7 +571,9 @@ pub(in crate::http) async fn serve_partition<E: Rejection>(
             let served = serve_locally().await;
             let not_accepted = match served.as_ref().err().and_then(Rejection::rejection) {
                 Some(IggyError::NotPrimary) if target => {
-                    return Ok(not_primary(partition_primary(state, namespace).await));
+                    return Ok(not_primary(
+                        partition_primary(state, namespace, request.deadline).await,
+                    ));
                 }
                 Some(IggyError::NotPrimary) => false,
                 Some(IggyError::TransientNotAccepted) => true,
@@ -582,7 +585,7 @@ pub(in crate::http) async fn serve_partition<E: Rejection>(
         };
         let mut waited_for_view = false;
         let primary = loop {
-            if let Some(primary) = partition_primary(state, namespace).await {
+            if let Some(primary) = partition_primary(state, namespace, request.deadline).await {
                 break primary;
             }
             if out_of_time() {
@@ -638,12 +641,14 @@ pub(in crate::http) async fn serve_partition<E: Rejection>(
 /// Refuse a request unless this node is the primary of its partition group in
 /// this replica's view. Only `?ack=none` needs it: it answers once the
 /// partition plane takes the write, before the owner's gate can refuse it, so
-/// the gate's refusal never reaches it.
+/// the gate's refusal never reaches it. The lookup ends at `deadline`, the
+/// deadline of the request.
 pub(in crate::http) async fn require_local_primary(
     state: &HttpInner,
     namespace: IggyNamespace,
+    deadline: Instant,
 ) -> Result<(), IggyError> {
-    match partition_primary(state, namespace).await {
+    match partition_primary(state, namespace, deadline).await {
         Some(primary) if is_local_replica(state, primary.replica) => Ok(()),
         Some(_) => Err(IggyError::NotPrimary),
         None => Err(IggyError::TransientNotAccepted),
@@ -1035,7 +1040,7 @@ async fn attach_partition_request(state: HttpState, request: Request, next: Next
             bearer,
             verified.jwt_id.as_deref(),
             verified.user_id,
-            verified.user_created_at,
+            &verified.credential,
         );
         let relay_targets = if deferred {
             &state.forward.deferred_relay_targets
@@ -1518,14 +1523,27 @@ fn partition_hop(
 }
 
 /// The primary of the partition group in this replica's view. `None` while the
-/// group has no usable view here: view change, state transfer or a partition
-/// that is not materialized yet.
+/// group has no usable view here: view change, state transfer, a partition
+/// that is not materialized yet, a primary here that still starts its view, or
+/// an older incarnation of the ids that the owner has not replaced yet.
+///
+/// The owner must not hold this lookup. [`serve_partition`] tells a refusal
+/// from before the group had a primary by a lookup that returned `None`, and
+/// it tests the deadline of the request between two lookups. An owner that
+/// does not answer ends the lookup at `deadline`, the deadline of the request:
+/// the reply budget of the read can be longer than the request.
 async fn partition_primary(
     state: &HttpInner,
     namespace: IggyNamespace,
+    deadline: Instant,
 ) -> Option<PartitionPrimary> {
     state.metrics.partition_primary_probes.inc();
-    match crate::namespace::partition_primary(&state.shard, namespace).await? {
+    let lookup =
+        crate::namespace::partition_primary(&state.shard, namespace, PrimaryLookup::AnswerNow);
+    match compio::time::timeout(deadline.saturating_duration_since(Instant::now()), lookup)
+        .await
+        .ok()??
+    {
         PartitionReadReply::Primary { view, primary } => Some(PartitionPrimary {
             view,
             replica: primary,
@@ -1720,6 +1738,7 @@ mod tests {
     use hyper::service::Service as _;
     use hyper_util::service::TowerToHyperService;
     use iggy_binary_protocol::requests::users::UpdatePermissionsRequest;
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
     use iggy_binary_protocol::{Operation, WireEncode, WireIdentifier};
     use iggy_common::IggyDuration;
     use metadata::impls::metadata::StreamsFrontend;
@@ -1731,7 +1750,7 @@ mod tests {
     use crate::http::admission::MAX_IN_FLIGHT_RELAY_TARGETS;
     use crate::http::handlers::HTTP_UNREGISTERED_CLIENT_ID;
     use crate::http::reads::tests::{
-        READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
+        CLUSTER_UID, READER_CREATED_AT, READER_ID, commit_user_request, read_state, read_state_on,
         read_state_with_frontier,
     };
     use crate::http::router;
@@ -1856,7 +1875,12 @@ mod tests {
         );
         let token = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .unwrap();
         let route = HeaderValue::try_from(
             PartitionRoute {
@@ -2383,7 +2407,12 @@ mod tests {
             .expect("a proof is a header value");
         let token = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .expect("a token for the reader");
         let mut headers = marked(&route, Some(&proof));
         headers.insert(
@@ -2524,7 +2553,12 @@ mod tests {
             .expect("a proof is a header value");
         let bearer = state
             .jwt
-            .generate(READER_ID, IggyTimestamp::from(READER_CREATED_AT))
+            .generate(
+                READER_ID,
+                CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                CLUSTER_UID,
+                u64::MAX,
+            )
             .expect("a token for the reader")
             .access_token;
         let mut headers = marked(&route, Some(&proof));
@@ -2541,7 +2575,7 @@ mod tests {
                     &bearer,
                     verified.jwt_id.as_deref(),
                     verified.user_id,
-                    verified.user_created_at,
+                    &verified.credential,
                 ))
             }
             RelayTargetRefusal::BudgetSaturated => None,
@@ -3052,6 +3086,39 @@ mod tests {
         assert!(
             matches!(outcome, AttemptOutcome::Relay(_)),
             "a hint never turns an answer into a retry"
+        );
+    }
+
+    /// The read behind the primary lookup has a reply budget of its own, longer
+    /// than a short request. An owner shard that does not answer must not hold
+    /// the request for it.
+    #[compio::test]
+    async fn given_an_owner_that_does_not_answer_the_primary_lookup_when_routing_should_answer_at_the_deadline()
+     {
+        let (sender, _owner_inbox, _owner_replies) = shard_channel(0, 1, 1);
+        let state = read_state_on(Some(sender), None);
+        let request = partition_request(PartitionHop::Contacted, SHORT_BUDGET);
+        let started = Instant::now();
+
+        let served: Result<Response, PartitionWriteError> = serve_partition(
+            &state,
+            &request,
+            IggyNamespace::new(1, 1, 0),
+            NO_CONTEXT,
+            PartitionEffect::Write,
+            FirstAttempt::Lookup,
+            async || panic!("no primary is in view"),
+        )
+        .await;
+
+        let Ok(response) = served else {
+            panic!("the deadline answers the request");
+        };
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            started.elapsed() < BUDGET,
+            "the lookup held the request for {:?}",
+            started.elapsed()
         );
     }
 

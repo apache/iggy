@@ -417,6 +417,13 @@ enum Requests {
         [scope.rawValue]
     }
 
+    /// `[origin_len:u8][origin]`
+    static func retireGeoOrigin(origin: String) throws -> [UInt8] {
+        var writer = ByteWriter()
+        try writer.writeName(validatedWireName(origin, what: "origin"))
+        return writer.bytes
+    }
+
     /// `[start:u8][cursor:44][has_since:u8][since:u64][has_until:u8][until:u64][limit:u32][groups_count:u8][group:u8]*[token_len:u16][token]`.
     /// The cursor is all zero unless the read starts after it, and groups
     /// travel in the caller's order, at most 255 of them as in the Rust encoder.
@@ -450,6 +457,40 @@ enum Requests {
         }
         writer.write(UInt16(token.count))
         writer.write(token)
+        return writer.bytes
+    }
+
+    // MARK: List pages
+
+    /// A list request: the parent identifiers, then the page block
+    /// `[order:u8][descending:u8][limit:u32][cursor_len:u8][cursor][name_len:u8][name]`,
+    /// where a length of 0 means no cursor or no name. A ``PageQuery`` sends a
+    /// name length of 0. A query that breaks a page rule fails with
+    /// ``IggyErrorCode/invalidCommand``, so both lengths fit their byte.
+    static func listPage(_ parents: Identifier..., query: PageQuery) throws -> [UInt8] {
+        try query.validate()
+        return try listPage(parents, query, name: nil)
+    }
+
+    static func listPage(_ parents: Identifier..., query: NamedPageQuery) throws -> [UInt8] {
+        try query.validate()
+        return try listPage(parents, query.page, name: query.name)
+    }
+
+    private static func listPage(_ parents: [Identifier], _ page: PageQuery, name: String?) throws -> [UInt8] {
+        var writer = ByteWriter()
+        for parent in parents {
+            try parent.encode(into: &writer)
+        }
+        writer.write(page.order.rawValue)
+        writer.write(page.descending)
+        writer.write(page.limit)
+        let cursor = page.cursor?.bytes ?? []
+        writer.write(UInt8(cursor.count))
+        writer.write(cursor)
+        let name = name ?? ""
+        writer.write(UInt8(name.utf8.count))
+        writer.write(name)
         return writer.bytes
     }
 }

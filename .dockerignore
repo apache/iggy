@@ -42,6 +42,5 @@
 !/target/debug/iggy
 !/target/debug/iggy-server
 !/target/debug/iggy-mcp
-!/target/debug/iggy-connectors
 /web/node_modules
 /web/dist

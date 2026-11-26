@@ -42,6 +42,7 @@ internal enum VsrOperation : byte
     UpdateTopicResolved = 73,
     UpdateUserResolved = 74,
     RewrapStreamKeys = 75,
+    ShadowTopic = 76,
 
     CreateStream = 128,
     // 129 was UpdateStream. Never reuse it.
@@ -64,6 +65,7 @@ internal enum VsrOperation : byte
     JoinConsumerGroup = 148,
     LeaveConsumerGroup = 149,
     UpdateResource = 150,
+    RetireGeoOrigin = 151,
 
     SendMessages = 160,
     StoreConsumerOffset = 161,
@@ -71,7 +73,8 @@ internal enum VsrOperation : byte
     RetireSession = 166,
     InstallConsumerGroupOwner = 167,
     TransitionPartitionHistory = 168,
-    RetireConsumerGroupOwners = 169
+    RetireConsumerGroupOwners = 169,
+    StateMachineCommand = 170
 }
 
 internal static class VsrOperations
@@ -101,6 +104,7 @@ internal static class VsrOperations
         CommandCodes.GET_STREAMS_CODE,
         CommandCodes.GET_TOPIC_CODE,
         CommandCodes.GET_TOPICS_CODE,
+        CommandCodes.GET_PARTITIONS_CODE,
         CommandCodes.GET_CONSUMER_GROUP_CODE,
         CommandCodes.GET_CONSUMER_GROUPS_CODE,
         CommandCodes.SYNC_CONSUMER_GROUP_CODE,
@@ -139,6 +143,7 @@ internal static class VsrOperations
             CommandCodes.CREATE_TOPIC_CODE => VsrOperation.CreateTopic,
             CommandCodes.DELETE_TOPIC_CODE => VsrOperation.DeleteTopic,
             CommandCodes.UPDATE_RESOURCE_CODE => VsrOperation.UpdateResource,
+            CommandCodes.RETIRE_GEO_ORIGIN_CODE => VsrOperation.RetireGeoOrigin,
             CommandCodes.CREATE_PARTITIONS_CODE => VsrOperation.CreatePartitions,
             CommandCodes.DELETE_PARTITIONS_CODE => VsrOperation.DeletePartitions,
             CommandCodes.DELETE_SEGMENTS_CODE => VsrOperation.DeleteSegments,
@@ -213,7 +218,8 @@ internal static class VsrOperations
     internal static bool IsInternal(this VsrOperation operation)
     {
         return ((byte)operation >= InternalStart && (byte)operation < MetadataStart)
-            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners;
+            || operation is VsrOperation.RetireSession or VsrOperation.InstallConsumerGroupOwner or VsrOperation.TransitionPartitionHistory or VsrOperation.RetireConsumerGroupOwners
+                or VsrOperation.StateMachineCommand;
     }
 
     /// <summary>
@@ -242,7 +248,8 @@ internal static class VsrOperations
             or VsrOperation.DeletePersonalAccessToken
             or VsrOperation.JoinConsumerGroup
             or VsrOperation.LeaveConsumerGroup
-            or VsrOperation.UpdateResource;
+            or VsrOperation.UpdateResource
+            or VsrOperation.RetireGeoOrigin;
     }
 
     /// <summary>

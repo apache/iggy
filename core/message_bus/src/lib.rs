@@ -702,7 +702,9 @@ pub trait MessageBus {
     /// silently no-opping, so a bus that forgets to override cannot hang
     /// undetected.
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> {
-        compio::time::sleep(duration)
+        // `compio::time::sleep` reads the clock at its first poll, so the
+        // deadline is taken here to anchor it at creation.
+        compio::time::sleep_until(Instant::now() + duration)
     }
 
     /// Spawn a detached background task on the ambient runtime.
@@ -762,6 +764,13 @@ pub trait MessageBus {
     /// same reason as [`Self::take_replica_read_stats`].
     fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         ReplicaLinkMetrics::default()
+    }
+
+    /// Whether frames flow to `replica` now. True by default: the simulator
+    /// bus and the test buses own no replica link, so their answer is the
+    /// result of the next send.
+    fn replica_is_up(&self, _replica: u8) -> bool {
+        true
     }
 }
 
@@ -1769,6 +1778,10 @@ impl<T: MessageBus + ?Sized> MessageBus for std::rc::Rc<T> {
     fn take_replica_link_stats(&self) -> ReplicaLinkMetrics {
         (**self).take_replica_link_stats()
     }
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        (**self).replica_is_up(replica)
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -1868,6 +1881,10 @@ impl MessageBus for IggyMessageBus {
             bundles_up: self.bundles_up() as u64,
             ..self.replica_link_stats.take()
         }
+    }
+
+    fn replica_is_up(&self, replica: u8) -> bool {
+        self.owner_table.is_up(replica)
     }
 }
 
@@ -2031,6 +2048,24 @@ mod tests {
             .insert(replica, sender, writer, reader, conn_shutdown)
             .expect("free registry slot");
         conn_token
+    }
+
+    #[compio::test]
+    #[allow(clippy::future_not_send)]
+    async fn given_sleep_built_before_a_wait_when_polled_should_count_from_its_creation() {
+        let duration = Duration::from_millis(50);
+        let bus = IggyMessageBus::new(0);
+        let sleep = bus.sleep(duration);
+        compio::time::sleep(duration).await;
+
+        let first_poll = Instant::now();
+        sleep.await;
+
+        assert!(
+            first_poll.elapsed() < duration,
+            "{:?}",
+            first_poll.elapsed()
+        );
     }
 
     #[compio::test]
@@ -2435,6 +2470,7 @@ mod tests {
             cluster_id: 1,
             self_id: 2,
             replica_count: 3,
+            heartbeat: crate::replica::auth::HeartbeatTimings::default(),
             auth: None,
             tls: None,
         });

@@ -73,6 +73,12 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
+        topic_type: TopicType,
+        /// False on a normal topic, which has no geo mode.
+        has_geo_mode: bool,
+        geo_mode: GeoMode,
+        /// Each one unset on a normal topic.
+        geo_durations: GeoTopicDurations,
         messages_count: u64,
         partitions_count: u32,
         /// Options the creating client set explicitly. Carried as
@@ -119,6 +125,12 @@ mod ffi {
         message_expiry: u64,
         compression_algorithm: String,
         max_topic_size: u64,
+        topic_type: TopicType,
+        /// See [`Topic::has_geo_mode`].
+        has_geo_mode: bool,
+        geo_mode: GeoMode,
+        /// See [`Topic::geo_durations`].
+        geo_durations: GeoTopicDurations,
         messages_count: u64,
         partitions_count: u32,
         partitions: Vec<Partition>,
@@ -148,6 +160,10 @@ mod ffi {
         /// One per server key that wraps the stream's key, empty for a
         /// plaintext stream.
         encryption_kek_fingerprints: Vec<String>,
+        /// True only on a shadow stream, the stream that serves the geo topics
+        /// of another datacenter.
+        has_shadow_origin: bool,
+        shadow_origin: String,
     }
 
     /// Who chose a stream's at-rest data key.
@@ -156,6 +172,39 @@ mod ffi {
         None = 0,
         Stream = 1,
         Server = 2,
+    }
+
+    /// What a topic is, fixed at creation.
+    #[repr(u8)]
+    enum TopicType {
+        Normal = 0,
+        Geo = 1,
+    }
+
+    /// How a geo topic writes its messages, fixed at creation.
+    #[repr(u8)]
+    enum GeoMode {
+        Geo = 0,
+        GeoTiered = 1,
+    }
+
+    /// The durations of a geo topic in microseconds, each overriding the
+    /// server setting of the same name on every node. A `has_` flag is false
+    /// when the topic leaves its duration to that setting. Zero is a value.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    struct GeoTopicDurations {
+        has_fresh_upload_interval: bool,
+        fresh_upload_interval_micros: u64,
+        has_consumer_offset_upload_interval: bool,
+        consumer_offset_upload_interval_micros: u64,
+        has_positions_publish_interval: bool,
+        positions_publish_interval_micros: u64,
+        has_tombstone_grace: bool,
+        tombstone_grace_micros: u64,
+        has_positions_resume_timeout: bool,
+        positions_resume_timeout_micros: u64,
+        has_long_term_rewrite_max_interval: bool,
+        long_term_rewrite_max_interval_micros: u64,
     }
 
     #[repr(u8)]
@@ -337,11 +386,11 @@ mod ffi {
         has_poll_options: bool,
         poll_options: PollOptions,
         /// The encoded bytes of the requests in flight and the queued
-        /// batches. Default 16 MiB.
+        /// batches. Default 16 MiB, raised to at least 32 full batches.
         has_prefetch_bytes: bool,
         prefetch_bytes: u32,
         /// The messages of the requests in flight and the queued batches.
-        /// Default: the larger of 16,000 and `count`.
+        /// Default 16,000, raised to at least 32 full batches.
         has_prefetch_messages: bool,
         prefetch_messages: u32,
     }
@@ -399,6 +448,15 @@ mod ffi {
         // A `rust::Vec` holds an opaque Rust type only behind a `Box`.
         #[allow(clippy::vec_box)]
         skip: Vec<Box<Continuation>>,
+        /// True for messages that a lost read committed and that the reader
+        /// could not read again. The error is then `fetch_progress_uncertain`.
+        has_lost: bool,
+        /// The first and last offset of those messages.
+        lost_first: u64,
+        lost_last: u64,
+        /// True when the reader stopped the partition after refusals in a row
+        /// that a retry does not change. Only a `seek` reads it again.
+        lasting_refusal: bool,
     }
 
     /// Commit confirmation for one partition written by `send_messages`.
@@ -442,6 +500,9 @@ mod ffi {
         has_encryption_key_fingerprint: bool,
         encryption_key_fingerprint: String,
         encryption_kek_fingerprints: Vec<String>,
+        /// See [`Stream::has_shadow_origin`].
+        has_shadow_origin: bool,
+        shadow_origin: String,
     }
 
     struct ConsumerGroupMember {
@@ -636,6 +697,12 @@ mod ffi {
         derived_options: Vec<HeaderEntry>,
     }
 
+    struct PersonalAccessTokenInfo {
+        name: String,
+        has_expiry: bool,
+        expiry: u64,
+    }
+
     struct LoginInfo {
         user_id: u32,
         has_access_token: bool,
@@ -673,6 +740,7 @@ mod ffi {
         pending_max_bytes: u64,
     }
 
+    #[derive(Default)]
     struct TopicCreateOptions {
         has_partitions_count: bool,
         partitions_count: u32,
@@ -697,14 +765,30 @@ mod ffi {
         preallocate_segments: bool,
         has_replication_factor: bool,
         replication_factor: u32,
+        has_segment_max_age: bool,
+        segment_max_age_kind: String,
+        segment_max_age_value: u64,
+        has_tiered_storage: bool,
+        tiered_storage: bool,
+        has_local_retention_age: bool,
+        local_retention_age_kind: String,
+        local_retention_age_value: u64,
+        has_local_retention_size: bool,
+        local_retention_size: String,
         has_partition_resize_policy: bool,
         partition_resize_policy: String,
+        has_topic_type: bool,
+        topic_type: String,
+        has_geo_mode: bool,
+        geo_mode: String,
+        geo_durations: GeoTopicDurations,
         raw_options: Vec<HeaderEntry>,
     }
 
     /// Reset keys travel as catalog names and are validated against the
     /// scope's catalog before anything is sent. Raw reset names are left to
     /// the server.
+    #[derive(Default)]
     struct TopicUpdateOptions {
         has_name: bool,
         name: String,
@@ -713,6 +797,15 @@ mod ffi {
         message_expiry_value: u64,
         has_max_topic_size: bool,
         max_topic_size: String,
+        has_tiered_storage: bool,
+        tiered_storage: bool,
+        has_local_retention_age: bool,
+        local_retention_age_kind: String,
+        local_retention_age_value: u64,
+        has_local_retention_size: bool,
+        local_retention_size: String,
+        /// Set-only: none of the durations can be reset.
+        geo_durations: GeoTopicDurations,
         reset: Vec<String>,
         raw_reset: Vec<String>,
         raw_options: Vec<HeaderEntry>,
@@ -894,6 +987,65 @@ mod ffi {
         current_page_token: MetadataCurrentPageToken,
     }
 
+    /// The order of a list page. The values are the wire codes.
+    #[repr(u8)]
+    enum PageOrder {
+        Id = 0,
+        Created = 1,
+    }
+
+    /// One list page query. The cursor travels as bytes, so the bridge refuses
+    /// text that is not UTF-8 with InvalidCommand. The flag keeps an absent
+    /// cursor apart from an empty one, which is refused.
+    struct PageQuery {
+        order: PageOrder,
+        descending: bool,
+        limit: u32,
+        has_cursor: bool,
+        cursor: Vec<u8>,
+    }
+
+    /// One page query of a list of named entities: streams, topics, consumer
+    /// groups and users. The name travels as bytes with a flag, as the cursor
+    /// does.
+    struct NamedPageQuery {
+        page: PageQuery,
+        has_name: bool,
+        name: Vec<u8>,
+    }
+
+    /// One page of a list, with one struct for each list. `next` is the
+    /// `pg1_` text of the cursor of the next page when `has_next` is set.
+    struct StreamsPage {
+        items: Vec<Stream>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct TopicsPage {
+        items: Vec<Topic>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct PartitionsPage {
+        items: Vec<Partition>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct ConsumerGroupsPage {
+        items: Vec<ConsumerGroup>,
+        has_next: bool,
+        next: String,
+    }
+
+    struct UsersPage {
+        items: Vec<UserInfo>,
+        has_next: bool,
+        next: String,
+    }
+
     extern "Rust" {
         /// The private part of a batch: the partition context and the reader
         /// stamp of its checkpoints, and its continuation.
@@ -950,6 +1102,13 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_streams(self: &Client) -> Result<Vec<Stream>>;
+        /// Reads one page of the streams the caller may read. An invalid query fails
+        /// with InvalidCommand (3) before anything is sent, as on the other page calls.
+        fn get_streams_page(
+            self: &Client,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<StreamsPage>;
         fn get_stream(self: &Client, stream_id: Identifier) -> Result<StreamDetails>;
         fn delete_stream(
             self: &Client,
@@ -969,6 +1128,12 @@ mod ffi {
             topic_id: Identifier,
         ) -> Result<TopicDetails>;
         fn get_topics(self: &Client, stream_id: Identifier) -> Result<Vec<Topic>>;
+        fn get_topics_page(
+            self: &Client,
+            stream_id: Identifier,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<TopicsPage>;
         fn update_topic(
             self: &Client,
             stream_id: Identifier,
@@ -996,6 +1161,13 @@ mod ffi {
             partitions_count: u32,
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
+        fn get_partitions_page(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            query: PageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<PartitionsPage>;
         fn create_consumer_group(
             self: &Client,
             stream_id: Identifier,
@@ -1014,6 +1186,13 @@ mod ffi {
             stream_id: Identifier,
             topic_id: Identifier,
         ) -> Result<Vec<ConsumerGroup>>;
+        fn get_consumer_groups_page(
+            self: &Client,
+            stream_id: Identifier,
+            topic_id: Identifier,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<ConsumerGroupsPage>;
         fn delete_consumer_group(
             self: &Client,
             stream_id: Identifier,
@@ -1208,7 +1387,10 @@ mod ffi {
         /// Stores the offset of a checkpoint that this reader delivered. A
         /// checkpoint of an older generation of its partition, or at or below
         /// the last commit, stores nothing. Refused with
-        /// `CommitPolicy::OnRead`.
+        /// `CommitPolicy::OnRead`. C++ cannot cancel the call, so it ends at a
+        /// deadline 10 s after its start: after a refusal for an earlier owner
+        /// (5009), the read of the new owner retries only until then, and the
+        /// call fails with the refusal.
         fn commit(
             self: &PartitionReader,
             checkpoint: &Checkpoint,
@@ -1227,8 +1409,12 @@ mod ffi {
         /// Sets the next read position of a partition and drops its queued
         /// batches. It resumes a stopped partition. With `CommitPolicy::OnRead`
         /// a seek to an offset above 0 first stores the offset before it, so a
-        /// restart resumes at the new position, and a failed store fails the
-        /// seek with nothing moved. Every other seek stores nothing.
+        /// restart resumes at the new position. A seek to offset 0 or `first`
+        /// deletes the stored offset, and a seek to a timestamp stores the
+        /// offset before the first message at the timestamp, if there is one.
+        /// A failed read, lookup, store or delete fails the seek with nothing
+        /// moved. Every other seek stores nothing. It ends at a deadline 10 s
+        /// after its start, as `commit` does.
         fn seek(
             self: &PartitionReader,
             partition_id: u32,
@@ -1356,6 +1542,11 @@ mod ffi {
         ) -> Result<()>;
         fn get_user(self: &Client, user_id: Identifier) -> Result<UserInfoDetails>;
         fn get_users(self: &Client) -> Result<Vec<UserInfo>>;
+        fn get_users_page(
+            self: &Client,
+            query: NamedPageQuery,
+            error_info: &mut ErrorInfo,
+        ) -> Result<UsersPage>;
         #[allow(clippy::too_many_arguments)]
         fn create_user(
             self: &Client,
@@ -1393,14 +1584,22 @@ mod ffi {
             error_info: &mut ErrorInfo,
         ) -> Result<()>;
         fn get_cluster_metadata(self: &Client) -> Result<ClusterMetadata>;
-        // fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
+        /// Retires the geo origin of a datacenter that never returns. Needs
+        /// root or the global manage_servers permission.
+        fn retire_geo_origin(self: &Client, origin: &str, error_info: &mut ErrorInfo)
+        -> Result<()>;
+        fn get_personal_access_tokens(self: &Client) -> Result<Vec<PersonalAccessTokenInfo>>;
         fn create_personal_access_token(
             self: &Client,
             name: String,
             expiry_kind: String,
             expiry_value: u64,
         ) -> Result<String>;
-        // fn delete_personal_access_token(self: &Client, name: String) -> Result<()>;
+        fn delete_personal_access_token(
+            self: &Client,
+            name: &str,
+            error_info: &mut ErrorInfo,
+        ) -> Result<()>;
         // fn login_with_personal_access_token(self: &Client, token: String) -> Result<IdentityInfo>;
 
         unsafe fn delete_client(client: *mut Client);
@@ -1432,7 +1631,8 @@ mod ffi {
             error_info: &mut ReadErrorInfo,
         ) -> Result<Vec<ReceivedMessage>>;
         /// Stores the offset of a checkpoint that this consumer handed over.
-        /// Refused with `CommitPolicy::OnRead`.
+        /// Refused with `CommitPolicy::OnRead`. It ends at a deadline 10 s
+        /// after its start, as the `commit` of a reader does.
         fn commit(
             self: &Consumer,
             checkpoint: &Checkpoint,
@@ -1444,8 +1644,12 @@ mod ffi {
         -> Result<()>;
         /// Sets the next read position of a partition. With
         /// `CommitPolicy::OnRead` a seek to an offset above 0 first stores the
-        /// offset before it, and a failed store fails the seek with nothing
-        /// moved. Every other seek stores nothing.
+        /// offset before it, a seek to offset 0 or `first` deletes the stored
+        /// offset, and a seek to a timestamp stores the offset before the first
+        /// message at the timestamp, if there is one. A failed read, lookup,
+        /// store or delete fails the seek with nothing moved. Every other seek
+        /// stores nothing. It ends at a deadline 10 s after its start, as the
+        /// `commit` of a reader does.
         fn seek(
             self: &Consumer,
             partition_id: u32,

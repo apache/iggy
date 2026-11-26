@@ -303,6 +303,7 @@ public sealed partial class NativeRecoveryTests
         using var cluster = new RecoveryCluster(TimeSpan.FromSeconds(45));
         using var client = ConfiguredClient(cluster);
         await client.ConnectAsync(cluster.Token);
+        await cluster.UntilAsync(() => Binds(cluster) == 1);
         var register = Signal();
         var release = Signal();
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cluster.Token);
@@ -662,7 +663,7 @@ public sealed partial class NativeRecoveryTests
         return release.Task;
     }
 
-    private sealed class HeldContinuations : SynchronizationContext
+    internal sealed class HeldContinuations : SynchronizationContext
     {
         private readonly ConcurrentQueue<(SendOrPostCallback Callback, object? State)> _pending = new();
         internal SemaphoreSlim Posted { get; } = new(0);

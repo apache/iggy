@@ -291,7 +291,7 @@ Key new minimums:
 | Fetch | v4-v12 | v17 | 5 versions behind |
 | ListOffsets | v1-v7 | v9 | 2 versions behind |
 | Metadata | v0-v9 | v12 | 3 versions behind |
-| ApiVersions | v0-v3 | v4 | 1 version behind |
+| ApiVersions | v0-v5 | v4 | current, with v5 of Kafka 4.4 (KIP-1242) |
 | CreateTopics | v2-v5 | v7 | 2 versions behind |
 | FindCoordinator | v0-v4 | v6 | 2 versions behind |
 | JoinGroup | v0-v9 | v9 | current |

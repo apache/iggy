@@ -193,6 +193,14 @@ pub const COMMAND_TABLE: &[CommandMeta] = &[
     CommandMeta::non_replicated(POLL_MESSAGES_DEFERRED_CODE, "message.poll_deferred"),
     CommandMeta::non_replicated(CANCEL_DEFERRED_REQUEST_CODE, "message.cancel_deferred"),
     CommandMeta::non_replicated(FETCH_MESSAGES_CODE, "message.fetch"),
+    // Partitions
+    CommandMeta::non_replicated(GET_PARTITIONS_CODE, "partition.list"),
+    // Geo peers
+    CommandMeta::replicated(
+        RETIRE_GEO_ORIGIN_CODE,
+        "geo.retire_origin",
+        Operation::RetireGeoOrigin,
+    ),
 ];
 
 /// Lookup command metadata by command code.
@@ -266,6 +274,8 @@ pub const fn command_index(code: u32) -> Option<usize> {
         POLL_MESSAGES_DEFERRED_CODE => 49,
         CANCEL_DEFERRED_REQUEST_CODE => 50,
         FETCH_MESSAGES_CODE => 51,
+        GET_PARTITIONS_CODE => 52,
+        RETIRE_GEO_ORIGIN_CODE => 53,
         _ => return None,
     };
     Some(idx)
@@ -300,11 +310,13 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         Operation::JoinConsumerGroup => 40,
         Operation::LeaveConsumerGroup => 41,
         Operation::UpdateResource => 47,
+        Operation::RetireGeoOrigin => 53,
         Operation::CreateTopicWithAssignments
         | Operation::UpdateStreamResolved
         | Operation::UpdateTopicResolved
         | Operation::UpdateUserResolved
         | Operation::RewrapStreamKeys
+        | Operation::ShadowTopic
         | Operation::CreatePartitionsWithAssignments
         | Operation::RemoveConsumerGroupMember
         | Operation::CompleteConsumerGroupRevocation
@@ -318,7 +330,8 @@ pub const fn lookup_by_operation(op: Operation) -> Option<&'static CommandMeta> 
         | Operation::CompleteLifecycle
         | Operation::TransitionPartitionHistory
         | Operation::InstallConsumerGroupOwner
-        | Operation::RetireConsumerGroupOwners => return None,
+        | Operation::RetireConsumerGroupOwners
+        | Operation::StateMachineCommand => return None,
     };
     Some(&COMMAND_TABLE[idx])
 }

@@ -63,8 +63,9 @@ pub fn init_logging(
 ) -> Option<Telemetry> {
     // STDIO transport needs stderr output with no ANSI codes
     // HTTP transport can use normal stdout with ANSI
+    // rmcp logs whole requests and replies at DEBUG, too verbose for a default
     let (default_level, use_stderr, use_ansi) = match transport {
-        McpTransport::Stdio => ("DEBUG", true, false),
+        McpTransport::Stdio => ("INFO", true, false),
         McpTransport::Http => ("INFO", false, true),
     };
 

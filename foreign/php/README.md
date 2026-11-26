@@ -246,12 +246,46 @@ foreach ($client->describeOptions(Iggy\OptionsScope::Topic) as $spec) {
   The key, the `loginUser()` password and the `fromConnectionString()` string are marked `#[\SensitiveParameter]`, so exception traces hold a `SensitiveParameterValue` in their place. The `raw` arrays of `createStream()`, `updateStream()`, `createTopic()` and `updateTopic()` are marked as well, because an unknown key may hold a secret.
 
   Reads report only `encryption_key_source` (`stream`, `server`, or `none` for a plaintext stream), `encryption_key_fingerprint` and `encryption_kek_fingerprint`, comma-separated during a server key rotation. `Iggy\Client::encryptionKeyFingerprint($key)` computes the fingerprint of a key you hold. Without a key, a server with encryption enabled generates one.
-- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros` and `max_topic_size`. Null arguments keep stored values. `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry and size cap are resettable, every other case is refused with the server's error.
+- `updateStream()` renames a stream and `updateTopic()` renames a topic or changes `message_expiry_micros`, `max_topic_size`, `local_retention_age_micros` and `local_retention_size`, and turns `tiered_storage` on, never off. Null arguments keep stored values.
+- `reset` takes `Iggy\StreamOptionKey` or `Iggy\TopicOptionKey` cases and returns keys to their server defaults. Only the topic's message expiry, size cap, local retention age and local retention size are resettable, every other case is refused with the server's error.
+- A geo topic (`topic_type: 'geo'`) can override six server settings of the same name on each node:
+  `fresh_upload_interval_micros`, `consumer_offset_upload_interval_micros`, `positions_publish_interval_micros`,
+  `tombstone_grace_micros`, `positions_resume_timeout_micros` and `long_term_rewrite_max_interval_micros`.
+  `createTopic()` and `updateTopic()` take each as an int or a decimal string of microseconds. 0 is a value of its own,
+  for example no wait, and null leaves the server setting in force. An update can change them, the only options it can
+  change on a geo topic, but cannot reset them. A normal topic refuses them as `Invalid option value` (code 4042).
+  Topic reads have properties of the same names. If the topic does not set a duration, its property is null.
 - `raw` on create and update sends string-valued keys this build does not know, and `raw_reset` resets keys by name. The server decides whether each one is accepted. A name listed twice across `reset` and `raw_reset` is refused as `Invalid command`.
 - `createTopic()` takes `replication_factor`, how many nodes store each partition: 1 to 32 and at most the cluster's node count. Null lets the server's `[cluster] default_replication_factor` apply. The factor is create-only, and a value out of range is refused as `Invalid replication factor` (code 2018).
 - A topic read's `partitions` holds one `Iggy\Partition` per partition with `id`, `segments_count`, `current_offset`, `size_bytes`, `messages_count`, `members` (the node ids that store the partition) and `in_sync_members` (the members its primary last reported in sync and that are up, empty until it first reports).
 - `describeOptions(Iggy\OptionsScope)` returns the server catalog as `Iggy\OptionSpec` objects with `key`, `kind`, `updatable`, `resettable`, `secret`, `read_only`, `critical`, `default_value` and `description`.
-- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key) and 2018 (invalid replication factor).
+- SDK exceptions carry the server error code in `getCode()`, for example 4103 (option cannot be updated), 4104 (option cannot be reset), 4105 (read-only option), 4108 (root user cannot be changed by this caller), 4041 (unsupported option key), 4042 (invalid option value) and 2018 (invalid replication factor).
+
+## List Pages
+
+`getStreamsPage()`, `getTopicsPage()`, `getPartitionsPage()`, `getConsumerGroupsPage()` and `getUsersPage()` read one page of a list. Named arguments set the order, the direction, the limit, the cursor and a name filter. To read the next page, call the method again with the same arguments and the `next` of the page as `cursor`. A page can be empty and still have a `next`, so a walk ends at the first page without one.
+
+```php
+use Iggy\PageOrder;
+
+$cursor = null;
+do {
+    $page = $client->getStreamsPage(order: PageOrder::Created, limit: 50, cursor: $cursor, name: 'orders');
+    foreach ($page->items as $stream) {
+        echo $stream->id, ' ', $stream->name, PHP_EOL;
+    }
+    $cursor = $page->next;
+} while ($cursor !== null);
+```
+
+- A null `order` reads in `PageOrder::Id` order, and `descending: true` reverses the order. `PageOrder::Created` sorts by creation time and then by id. Partitions and consumer groups walk by id in both orders, because their ids follow creation.
+- `limit` is 1 to 1000, and a null `limit` reads 100. `name` keeps the entries whose name holds the text, case-sensitive, and is 1 to 255 bytes. A partition has no name, so `getPartitionsPage()` takes no `name`.
+- A cursor is the `pg1_` text that the CLI and the HTTP API use. It holds only a position, so send it back with the same order, direction, filter and parent ids.
+- A query out of range, or a cursor text that the client cannot read, throws `Invalid command` (code 3) before anything is sent. The server refuses a cursor that does not fit the query, and a partition name, with the same error. Over HTTP, these server refusals throw code 300, and the message holds the server's error.
+- The argument check runs first. A `limit` that is not an integer or does not fit 32 unsigned bits throws `IggyException` with code 0.
+- Each page is a separate read. An entity that someone creates or deletes during a walk can appear or not appear, so a walk is not a snapshot. `getMetadataChanges()` gives an exact copy. `getTopicsPage()` of a stream that does not exist returns an empty page without `next`.
+- Pages hold `Iggy\Stream`, `Iggy\Topic`, `Iggy\Partition`, `Iggy\ConsumerGroup` or `Iggy\UserInfo` objects with readonly snake_case properties. `created_at` is in microseconds. Streams, topics and users return `options` and `derived_options` arrays like `StreamDetails`, and streams also return its three `encryption_*` properties.
+- The reply of `getStream()` or `getTopic()` can pass the server cap of a little over 64 MB. Over TCP, QUIC and WebSocket, the call then throws `ReplyTooLarge` (code 97). The connection stays usable, and `getTopicsPage()` and `getPartitionsPage()` read such a stream or topic in pages.
 
 ## Metadata Changes
 
@@ -366,7 +400,7 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
 - Each node counts the messages in its stream, topic and system stats. After a
   successful send, a node that is not the partition primary shows the new count
   only after the next prepare or commit broadcast. When no other write follows,
-  this delay is at most `cluster.commit_broadcast_interval` (500 ms by default).
+  this delay is at most `cluster.commit_busy_heartbeat_interval` (500 ms by default).
   See [metadata freshness and counters](../../core/server/README.md#metadata-freshness-and-counters).
 - Methods are exposed to PHP as camelCase, for example `createStream()` and
   `pollMessages()`.
@@ -398,7 +432,10 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
 - With `CommitPolicy::onRead()`, the server stores the offset of each reply. A lost reply, also to a `disconnect()` while the poll waits, then throws `FetchProgressUncertain` (14010), and the partition stays blocked until `abandonOperation()`. `disconnect()` closes the connection until the next `connect()`, after which `loginUser()` signs in again.
 - `consumerGroup()` builds a member of a consumer group, and creates a missing group
   by default. `reader()` builds a batch reader of chosen partitions as a standalone
-  consumer, and `groupReader()` a batch reader of an existing consumer group.
+  consumer, and `groupReader()` a batch reader of an existing consumer group. A group
+  create or join with an unknown outcome throws its error, and the next `groupReader()`
+  or `consumerGroup()` joins again. A join that landed keeps its member in the group
+  until the session ends.
 - `PartitionReader::next()` waits until a batch arrives. Give `timeout_micros` to
   limit the wait. At the timeout, `next()` returns `null`, and the script gets control
   back. A batch that arrives later stays in the reader for the next call.
@@ -409,8 +446,9 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   it on a client that sends nothing else meanwhile.
 - The default options of a reader or a consumer wait 5 seconds for up to 1000
   messages. A wait of 0 polls an idle topic in a busy loop. `prefetch_bytes`
-  (16 MiB) and `prefetch_messages` bound the requests in flight and the queued
-  batches.
+  (16 MiB) and `prefetch_messages` (16000) are the requested budgets for the
+  requests in flight and the queued batches. Each effective budget holds at
+  least 32 full batches: 32 MiB and 32000 messages with the default options.
 - With `CommitPolicy::manual()`, the consumer stores no offset. Commit checkpoints
   after processing, or each restart reads the same messages again.
 - Under `CommitPolicy::auto()`, `consumeMessages()` counts a message after its callback
@@ -424,6 +462,8 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   commit after a recreation or an owner change is refused instead of landing on the newer
   partition. `storeOffset()` commits under the context of the latest message consumed
   from that partition. `PolledMessages::checkpoint()` covers the whole batch.
+- PHP cannot cancel `commit()` and `seek()` of a reader or a consumer, or `storeOffset()`
+  and `deleteOffset()` of a consumer, so each one ends at a deadline 10 s after its start.
 - `PolledMessages::continuation()` continues a poll after the batch, under the
   partition context of the batch. A read after a recreation fails with
   `HistoryUnavailable` (87). A continuation cannot move to another process: store a
@@ -436,12 +476,20 @@ follow($client, [MetadataChangeGroup::Streams, MetadataChangeGroup::Topics]);
   `getCode()` is the error code, `getPrevious()` the typed exception that a direct call
   would throw, `partition_id` the partition or `null`, and `skip` the continuation after
   a message that does not decode. The reader retries by itself. `HistoryUnavailable`
-  (87) stops the partition until `seek()`.
+  (87) stops the partition until `seek()`. A lost read can commit messages that the
+  reader cannot read again. Then the reader throws `FetchProgressUncertain` (14010)
+  once. Its `lost` holds the first and last offset of those messages as `[first, last]`.
+  This error stops nothing and needs no seek. A seek after it drops the batch that
+  follows the range. If the reader stopped the partition, the error that stopped it
+  comes after that batch. Earlier versions gave this error a `skip` after the range.
+  Code that handles `FetchProgressUncertain` with `abandonOperation()` and a `seek()`
+  must now check `lost` first and do neither for this error.
 - Call `close()` on a reader and `shutdown()` on a consumer before the script ends.
   Under `CommitPolicy::auto()`, they store the latest counted position first. Under
   `CommitPolicy::onRead()`, they move the offset back to the last delivered
   message, so the next run reads the prefetched messages again. Destroying the object
-  without them skips those messages.
+  without them, or a crash, skips those messages. The loss is at most the effective
+  budget, which holds at least 32 batches.
 - A poll with a fresh strategy, or an offset write without a checkpoint, uses the
   context of its route. It can fail once with `HistoryUnavailable` (87), or
   `ConsumerGroupPartitionNotOwned` (5009) for a consumer group, after another client

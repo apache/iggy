@@ -18,8 +18,8 @@
 //! User password-hashing request rewriting.
 //!
 //! Passwords arrive raw on the wire. The metadata STM stores
-//! `CreateUserRequest::password` / `ChangePasswordRequest::new_password`
-//! verbatim as the credential hash, and login verifies against it with
+//! `CreateUserRequest::password` and the `password_hash` of its replicated
+//! password change verbatim as the credential hash, and login verifies against it with
 //! Argon2, so the stored value must already be a PHC hash. Hashing inside
 //! the replicated `apply` would call `OsRng` for the Argon2 salt on every
 //! replica and diverge state (and a raw password would never parse,
@@ -29,11 +29,11 @@
 //! `ChangePassword` also verifies the caller-supplied `current_password`
 //! against the target's stored hash before the op replicates (the legacy
 //! server does this for self- and admin-initiated changes alike), pins the
-//! target to the id of the user it verified, and always empties that field,
-//! so no plaintext credential ever rides the replicated prepare/WAL. A
-//! mismatch or an unresolved target is committed as a rejecting no-op
-//! (signalled by an empty new password) rather than denied pre-consensus, so
-//! the caller's request sequence stays contiguous. See
+//! target to the id of the user it verified with that user's access revision,
+//! and drops the current password, so no plaintext credential ever rides the
+//! replicated prepare/WAL. A mismatch or an unresolved target is committed as a
+//! rejecting no-op (signalled by an empty hash) rather than denied
+//! pre-consensus, so the caller's request sequence stays contiguous. See
 //! `verify_and_rewrite_change_password`.
 
 use crate::shell::{ShellBus, ShellShard};
@@ -41,12 +41,15 @@ use crate::wire::{request_body, rewrite_request_body};
 use bytes::Bytes;
 use consensus::MetadataHandle;
 use iggy_binary_protocol::codec::{WireDecode, WireEncode};
-use iggy_binary_protocol::requests::users::{ChangePasswordRequest, CreateUserRequest};
+use iggy_binary_protocol::requests::users::{
+    ChangePasswordRequest as WireChangePasswordRequest, CreateUserRequest,
+};
 use iggy_binary_protocol::{Operation, PrepareHeader, RoutedRequestHeader, WireIdentifier};
 use iggy_common::{IggyError, UserId};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::user::ChangePasswordRequest;
 use server_common::{Message, crypto};
 use std::rc::Rc;
 
@@ -62,6 +65,7 @@ use std::rc::Rc;
 pub fn maybe_rewrite_user_password_request<B, MJ, S, SB>(
     shard: &Rc<ShellShard<B, MJ, S, SB>>,
     request: Message<RoutedRequestHeader>,
+    keep_session: bool,
 ) -> Result<Message<RoutedRequestHeader>, IggyError>
 where
     B: ShellBus,
@@ -80,8 +84,8 @@ where
             wire.to_bytes()
         }
         Operation::ChangePassword => {
-            let mut wire =
-                ChangePasswordRequest::decode_from(body).map_err(|_| IggyError::InvalidCommand)?;
+            let wire = WireChangePasswordRequest::decode_from(body)
+                .map_err(|_| IggyError::InvalidCommand)?;
             let target = shard
                 .plane
                 .metadata()
@@ -89,10 +93,13 @@ where
                 .users()
                 .read(|users| users.resolve_password_hash(&wire.user_id));
             verify_and_rewrite_change_password(
-                &mut wire,
+                wire,
+                keep_session,
                 target
                     .as_ref()
-                    .map(|(user_id, stored_hash)| (*user_id, stored_hash.as_ref())),
+                    .map(|(user_id, stored_hash, access_revision)| {
+                        (*user_id, stored_hash.as_ref(), *access_revision)
+                    }),
             )
         }
         _ => return Ok(request),
@@ -101,50 +108,55 @@ where
     rewrite_request_body(&request, &rewritten)
 }
 
-/// Strip the current password, then re-encode the body for replication.
+/// Drop the current password and encode the replicated change.
 ///
-/// `target` is the id and stored hash of the user `wire.user_id` resolves to
-/// on this node, `None` when it does not resolve. The supplied
-/// `current_password` is verified against that hash, and `wire.user_id` is
-/// pinned to that id. Apply resolves the identifier again, so without the pin
-/// a name rebound before apply (root renamed to the verified name) would
-/// point the change at a user whose password was never checked.
+/// `target` is the id, stored hash and access revision of the user
+/// `wire.user_id` resolves to on this node, `None` when it does not resolve.
+/// The supplied `current_password` is verified against that hash, and the
+/// change is pinned to that id and revision. Apply resolves the identifier
+/// again, so without the pin a name rebound before apply (root renamed to the
+/// verified name) would point the change at a user whose password was never
+/// checked. Without the revision a concurrent change verified against the same
+/// hash would replace a password that changed after its verify.
 ///
 /// A mismatch or an unresolved target does NOT deny pre-consensus: that would
 /// consume the client's request id without recording it in the replicated
 /// `ClientTable`, so a retry of that id would re-execute instead of deduping.
-/// Instead the new password is emptied, which signals the committed apply to
+/// Instead the hash is left empty, which signals the committed apply to
 /// reject (a committed no-op that advances the watermark). Apply answers
 /// `UserNotFound` when the target is still missing and `InvalidCredentials`
 /// otherwise, also for a target created or renamed into place before apply.
 ///
-/// Either way the current password is stripped and an accepted new one hashed,
-/// so no plaintext credential ever enters consensus. Concurrent same-user
-/// `ChangePassword` ops each verify against the hash read here, so the last to
-/// commit wins over a now-stale predecessor. There is no compare-and-swap,
-/// which is benign and inherent to distributed submission.
+/// Either way the current password is dropped and an accepted new one hashed,
+/// so no plaintext credential ever enters consensus.
 fn verify_and_rewrite_change_password(
-    wire: &mut ChangePasswordRequest,
-    target: Option<(UserId, &str)>,
+    wire: WireChangePasswordRequest,
+    keep_session: bool,
+    target: Option<(UserId, &str, u64)>,
 ) -> Bytes {
-    let credentials_ok = match target {
-        Some((user_id, stored_hash)) => {
-            wire.user_id = WireIdentifier::numeric(user_id);
-            crypto::verify_password(&wire.current_password, stored_hash)
-        }
-        None => false,
+    let (user_id, access_revision, credentials_ok) = match target {
+        Some((user_id, stored_hash, access_revision)) => (
+            WireIdentifier::numeric(user_id),
+            access_revision,
+            crypto::verify_password(&wire.current_password, stored_hash),
+        ),
+        None => (wire.user_id, 0, false),
     };
-    wire.current_password = String::new();
-    wire.new_password = if credentials_ok {
-        crypto::hash_password(&wire.new_password)
-    } else {
-        // Empty hash is a reserved sentinel the committed apply reads as
-        // InvalidCredentials. Unambiguous only because `hash_password` is total
-        // and its Argon2 PHC output is never empty, so no real hash collides
-        // with it.
-        String::new()
-    };
-    wire.to_bytes()
+    ChangePasswordRequest {
+        user_id,
+        access_revision,
+        keep_session,
+        password_hash: if credentials_ok {
+            crypto::hash_password(&wire.new_password)
+        } else {
+            // Empty hash is a reserved sentinel the committed apply reads as
+            // InvalidCredentials. Unambiguous only because `hash_password` is
+            // total and its Argon2 PHC output is never empty, so no real hash
+            // collides with it.
+            String::new()
+        },
+    }
+    .to_bytes()
 }
 
 #[cfg(test)]
@@ -159,6 +171,7 @@ mod tests {
     use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
     use metadata::stm::authz::GatedApply;
     use metadata::stm::result::{ApplyReply, ChangePasswordResult};
+    use std::cell::Cell;
     use std::mem::size_of;
     use std::sync::Arc;
 
@@ -170,67 +183,96 @@ mod tests {
     const ADMIN_PASSWORD: &str = "mallory-password";
     const UNUSED_USERNAME: &str = "unused-name";
     const VSR_CLIENT_ID: u128 = 1;
+    const VERIFIED_REVISION: u64 = 42;
+
+    thread_local! {
+        /// Root holds op 1, as in a real cluster.
+        static NEXT_OP: Cell<u64> = const { Cell::new(2) };
+    }
 
     #[test]
     fn given_wrong_current_password_when_rewrite_should_signal_reject() {
         let stored_hash = crypto::hash_password("some-other-password");
-        let mut wire = change_password_request();
 
-        let body = verify_and_rewrite_change_password(&mut wire, Some((7, &stored_hash)));
+        let body = verify_and_rewrite_change_password(
+            change_password_request(),
+            true,
+            Some((7, &stored_hash, VERIFIED_REVISION)),
+        );
 
         let decoded =
             ChangePasswordRequest::decode_from(&body).expect("re-encoded body round-trips");
-        assert!(
-            decoded.current_password.is_empty(),
-            "current password must be stripped before replication"
-        );
-        // An empty new password is the reject signal the committed apply turns
-        // into InvalidCredentials, never a raw or hashed plaintext.
-        assert!(
-            decoded.new_password.is_empty(),
-            "a wrong current password must signal reject via an empty new password"
+        // An empty hash is the reject signal the committed apply turns into
+        // InvalidCredentials, never a raw or hashed plaintext.
+        assert_eq!(
+            decoded,
+            ChangePasswordRequest {
+                user_id: WireIdentifier::numeric(7),
+                access_revision: VERIFIED_REVISION,
+                keep_session: true,
+                password_hash: String::new(),
+            }
         );
     }
 
     #[test]
-    fn given_correct_current_password_when_rewrite_should_strip_and_hash() {
+    fn given_correct_current_password_when_rewrite_should_pin_revision_and_hash() {
         let stored_hash = crypto::hash_password(CURRENT_PASSWORD);
-        let mut wire = change_password_request();
 
-        let body = verify_and_rewrite_change_password(&mut wire, Some((7, &stored_hash)));
+        let body = verify_and_rewrite_change_password(
+            change_password_request(),
+            true,
+            Some((7, &stored_hash, VERIFIED_REVISION)),
+        );
 
         let decoded =
             ChangePasswordRequest::decode_from(&body).expect("re-encoded body round-trips");
-        assert!(
-            decoded.current_password.is_empty(),
-            "current password must be stripped before replication"
-        );
+        assert_eq!(decoded.user_id, WireIdentifier::numeric(7));
+        assert_eq!(decoded.access_revision, VERIFIED_REVISION);
         assert_ne!(
-            decoded.new_password, NEW_PASSWORD,
+            decoded.password_hash, NEW_PASSWORD,
             "new password must be hashed, not replicated raw"
         );
         assert!(
-            crypto::verify_password(NEW_PASSWORD, &decoded.new_password),
+            crypto::verify_password(NEW_PASSWORD, &decoded.password_hash),
             "hashed new password must verify against the raw input"
         );
     }
 
     #[test]
     fn given_unresolved_target_when_rewrite_should_signal_reject() {
-        let mut wire = change_password_request();
-
-        let body = verify_and_rewrite_change_password(&mut wire, None);
+        let body = verify_and_rewrite_change_password(change_password_request(), true, None);
 
         let decoded =
             ChangePasswordRequest::decode_from(&body).expect("re-encoded body round-trips");
-        assert!(
-            decoded.current_password.is_empty(),
-            "current password must be stripped even for an unresolved target"
+        assert_eq!(
+            decoded,
+            ChangePasswordRequest {
+                user_id: WireIdentifier::numeric(7),
+                access_revision: 0,
+                keep_session: true,
+                password_hash: String::new(),
+            }
         );
-        assert!(
-            decoded.new_password.is_empty(),
-            "an unverified target must signal reject via an empty new password"
+    }
+
+    #[test]
+    fn given_change_verified_before_another_commits_when_committed_should_keep_newer_password() {
+        let shard = credentials_shard();
+        let admin = create_admin(&shard);
+        let stale = edge_rewritten_change_password(&shard, ADMIN_USERNAME, ADMIN_PASSWORD);
+        let newer = edge_rewritten_change_password(&shard, ADMIN_USERNAME, ADMIN_PASSWORD);
+
+        let first = commit(&shard, admin, Operation::ChangePassword, &newer);
+        let second = commit(&shard, admin, Operation::ChangePassword, &stale);
+
+        assert_eq!(first.code, 0, "the first verified change commits");
+        assert_eq!(
+            second.code,
+            u32::from(ChangePasswordResult::InvalidCredentials),
+            "a change verified against the replaced password must be refused"
         );
+        assert_password(&shard, admin, NEW_PASSWORD);
     }
 
     #[test]
@@ -280,8 +322,8 @@ mod tests {
         assert_password(&shard, admin, NEW_PASSWORD);
     }
 
-    fn change_password_request() -> ChangePasswordRequest {
-        ChangePasswordRequest {
+    fn change_password_request() -> WireChangePasswordRequest {
+        WireChangePasswordRequest {
             user_id: WireIdentifier::numeric(7),
             current_password: CURRENT_PASSWORD.to_owned(),
             new_password: NEW_PASSWORD.to_owned(),
@@ -341,15 +383,15 @@ mod tests {
         target: &str,
         current_password: &str,
     ) -> Bytes {
-        let body = ChangePasswordRequest {
+        let body = WireChangePasswordRequest {
             user_id: WireIdentifier::named(target).expect("valid target name"),
             current_password: current_password.to_owned(),
             new_password: NEW_PASSWORD.to_owned(),
         }
         .to_bytes();
         let request = request_message(Operation::ChangePassword, VSR_CLIENT_ID, 1, 1, &body);
-        let rewritten =
-            maybe_rewrite_user_password_request(shard, request).expect("well-formed body rewrites");
+        let rewritten = maybe_rewrite_user_password_request(shard, request, true)
+            .expect("well-formed body rewrites");
         Bytes::copy_from_slice(request_body(&rewritten))
     }
 
@@ -364,13 +406,15 @@ mod tests {
         .to_bytes()
     }
 
-    /// Commits `body` as `caller` through the in-apply RBAC gate.
+    /// Commits `body` as `caller` through the in-apply RBAC gate, at the op
+    /// after the previous commit of this test.
     fn commit(shard: &Rc<TestShard>, caller: u32, operation: Operation, body: &[u8]) -> ApplyReply {
         let mut prepare = prepare_message(operation, VSR_CLIENT_ID, 1, body);
-        bytemuck::checked::from_bytes_mut::<PrepareHeader>(
+        let header = bytemuck::checked::from_bytes_mut::<PrepareHeader>(
             &mut prepare.as_mut_slice()[..size_of::<PrepareHeader>()],
-        )
-        .user_id = caller;
+        );
+        header.user_id = caller;
+        header.op = NEXT_OP.with(|next| next.replace(next.get() + 1));
         shard
             .plane
             .metadata()

@@ -187,6 +187,7 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
             GET_CLIENTS_CODE => client.get_clients().await.map(|_| ()),
 
             GET_CLUSTER_METADATA_CODE => client.get_cluster_metadata().await.map(|_| ()),
+            RETIRE_GEO_ORIGIN_CODE => client.retire_geo_origin("dc-a").await,
             DESCRIBE_OPTIONS_CODE => client
                 .describe_options(OptionsScope::Topic)
                 .await
@@ -290,6 +291,10 @@ async fn test_all_commands_require_auth(client: &IggyClient, binding_identity: S
                     .delete_partitions(&ctx.stream_id, &ctx.topic_id, 1)
                     .await
             }
+            GET_PARTITIONS_CODE => client
+                .get_partitions_page(&ctx.stream_id, &ctx.topic_id, &PageQuery::default())
+                .await
+                .map(|_| ()),
 
             // Messages
             GET_PARTITION_ROUTE_CODE => client
@@ -585,10 +590,25 @@ async fn setup_test_resources(client: &IggyClient) {
         .expect("create topic");
 }
 
+/// The client is signed in with `auth-test-pat`, so deleting it ends this
+/// session and comes last.
 async fn cleanup_test_resources(client: &IggyClient) {
-    let _ = client.delete_personal_access_token("auth-test-pat").await;
     client
         .delete_stream(&Identifier::named(STREAM_NAME).unwrap())
         .await
         .expect("delete stream");
+    client
+        .delete_personal_access_token("auth-test-pat")
+        .await
+        .expect("delete the token of this session");
+    let refused = client.get_streams().await;
+    assert!(
+        matches!(
+            refused,
+            Err(IggyError::Unauthenticated
+                | IggyError::InvalidCredentials
+                | IggyError::InvalidPersonalAccessToken)
+        ),
+        "deleting the token must end the session it opened, got {refused:?}"
+    );
 }

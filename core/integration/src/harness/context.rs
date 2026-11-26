@@ -25,7 +25,12 @@ use std::thread;
 use uuid::Uuid;
 
 const TEST_CLEANUP_DISABLED_ENV_VAR: &str = "IGGY_TEST_CLEANUP_DISABLED";
+/// Replaces the default root of the test directories. A crate that uses the
+/// harness as a git dependency sets it, because the default root lies inside
+/// the cargo git checkout.
+const TEST_LOGS_DIR_ENV_VAR: &str = "IGGY_TEST_LOGS_DIR";
 const TEST_DIRECTORY_NAME_MAX_BYTES: usize = 255;
+pub(crate) const TEST_STDOUT_LOG_FILE: &str = "test_stdout.log";
 
 /// Global registry mapping test names to their log directories.
 static TEST_DIRECTORIES: LazyLock<RwLock<HashMap<String, PathBuf>>> =
@@ -52,11 +57,15 @@ fn is_cleanup_disabled_by_env() -> bool {
 }
 
 static TEST_LOGS_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(|p| p.parent())
-        .expect("Failed to find workspace root")
-        .join("test_logs")
+    std::env::var_os(TEST_LOGS_DIR_ENV_VAR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .expect("Failed to find workspace root")
+                .join("test_logs")
+        })
 });
 
 /// Owns the test directory and provides paths for all binaries within a test.
@@ -140,7 +149,7 @@ impl TestContext {
     }
 
     pub fn test_stdout_path(&self) -> PathBuf {
-        self.base_dir.join("test_stdout.log")
+        self.base_dir.join(TEST_STDOUT_LOG_FILE)
     }
 
     pub fn cleanup(&self) {

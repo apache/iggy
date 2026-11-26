@@ -41,6 +41,7 @@ public sealed class WireNameLengthContractsTests
         { nameof(TcpContracts.CreateGroup), "name", () => TcpContracts.CreateGroup(Id, Id, "") },
         { nameof(TcpContracts.CreatePersonalAccessToken), "name", () => TcpContracts.CreatePersonalAccessToken("", null) },
         { nameof(TcpContracts.DeletePersonalRequestToken), "name", () => TcpContracts.DeletePersonalRequestToken("") },
+        { nameof(TcpContracts.RetireGeoOrigin), "origin", () => TcpContracts.RetireGeoOrigin("") },
         { nameof(TcpContracts.LoginWithPersonalAccessToken), "token", () => TcpContracts.LoginWithPersonalAccessToken("") },
         { nameof(TcpContracts.LoginUser) + "/userName", "userName", () => TcpContracts.LoginUser("", "pass", null, null) },
         { nameof(TcpContracts.LoginUser) + "/password", "password", () => TcpContracts.LoginUser("user", "", null, null) }
@@ -52,6 +53,7 @@ public sealed class WireNameLengthContractsTests
         { nameof(TcpContracts.CreateGroup), "name", () => TcpContracts.CreateGroup(Id, Id, OverLimit) },
         { nameof(TcpContracts.CreatePersonalAccessToken), "name", () => TcpContracts.CreatePersonalAccessToken(OverLimit, null) },
         { nameof(TcpContracts.DeletePersonalRequestToken), "name", () => TcpContracts.DeletePersonalRequestToken(OverLimit) },
+        { nameof(TcpContracts.RetireGeoOrigin), "origin", () => TcpContracts.RetireGeoOrigin(OverLimit) },
         { nameof(TcpContracts.LoginWithPersonalAccessToken), "token", () => TcpContracts.LoginWithPersonalAccessToken(OverLimit) },
         { nameof(TcpContracts.LoginUser) + "/userName", "userName", () => TcpContracts.LoginUser(OverLimit, "pass", null, null) },
         { nameof(TcpContracts.LoginUser) + "/password", "password", () => TcpContracts.LoginUser("user", OverLimit, null, null) }
@@ -64,6 +66,7 @@ public sealed class WireNameLengthContractsTests
         { nameof(TcpContracts.CreateGroup), 2 * (2 + Id.Length), () => TcpContracts.CreateGroup(Id, Id, AtLimit) },
         { nameof(TcpContracts.CreatePersonalAccessToken), 0, () => TcpContracts.CreatePersonalAccessToken(AtLimit, null) },
         { nameof(TcpContracts.DeletePersonalRequestToken), 0, () => TcpContracts.DeletePersonalRequestToken(AtLimit) },
+        { nameof(TcpContracts.RetireGeoOrigin), 0, () => TcpContracts.RetireGeoOrigin(AtLimit) },
         { nameof(TcpContracts.LoginWithPersonalAccessToken), 0, () => TcpContracts.LoginWithPersonalAccessToken(AtLimit) },
         { nameof(TcpContracts.LoginUser) + "/userName", 0, () => TcpContracts.LoginUser(AtLimit, "pass", null, null) },
         { nameof(TcpContracts.LoginUser) + "/password", 1 + 4, () => TcpContracts.LoginUser("user", AtLimit, null, null) }

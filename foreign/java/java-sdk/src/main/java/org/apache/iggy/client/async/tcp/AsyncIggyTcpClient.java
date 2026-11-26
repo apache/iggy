@@ -370,10 +370,11 @@ public class AsyncIggyTcpClient {
         Supplier<AsyncTcpConnection> currentConnection = connection::get;
         return newConnection.connect().thenRun(() -> {
             log.debug("Connected to {} | {}", target.serverAddress(), IggyVersion.getInstance());
-            var messages = new MessagesTcpClient(currentConnection, routingState, pollRouter);
+            var consumerGroups = new ConsumerGroupsTcpClient(currentConnection);
+            var messages = new MessagesTcpClient(currentConnection, routingState, pollRouter, consumerGroups);
             var offsets = new ConsumerOffsetsTcpClient(currentConnection, pollRouter);
             messagesClient = messages;
-            consumerGroupsClient = new ConsumerGroupsTcpClient(currentConnection);
+            consumerGroupsClient = consumerGroups;
             consumerOffsetsClient = offsets;
             rawRequests = new RawPartitionRequests(currentConnection, pollRouter, messages, offsets);
             // One partition can be cached under its name and under its id, so
@@ -565,6 +566,11 @@ public class AsyncIggyTcpClient {
         } catch (RuntimeException error) {
             return CompletableFuture.failedFuture(error);
         }
+    }
+
+    /** The highest metadata op that a reply of the client reported as committed, as an unsigned value. */
+    long metadataWatermark() {
+        return session.metadataWatermark();
     }
 
     /**
@@ -1706,6 +1712,12 @@ public class AsyncIggyTcpClient {
     /** Whether a sign-in is remembered for replay, for tests in this package. */
     boolean hasRememberedLogin() {
         return rememberedLogin != null;
+    }
+
+    /** Whether the link of the sign-in is open, for tests in this package that drop it. */
+    boolean hasOpenSignInLink() {
+        AsyncTcpConnection current = connection.get();
+        return current != null && current.hasOpenChannel();
     }
 
     /**

@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::args::common::{ListMode, parse_key_value, split_reset};
+use crate::args::common::{GetOutput, ListOutputArgs, NamedPageArgs, parse_key_value, split_reset};
 use clap::{Args, Subcommand};
 use iggy::prelude::{
-    CompressionAlgorithm, Identifier, IggyExpiry, MaxTopicSize, TopicUpdateOptions,
+    CompressionAlgorithm, GeoTopicDurations, Identifier, IggyExpiry, MaxTopicSize,
+    TopicUpdateOptions,
 };
 
 #[derive(Debug, Clone, Subcommand)]
@@ -81,6 +82,8 @@ pub(crate) enum TopicAction {
     /// Examples
     ///  iggy topic list 1
     ///  iggy topic list prod
+    ///  iggy topic list prod --sort created --desc --limit 20
+    ///  iggy topic list prod --name sensor --limit 50
     #[clap(verbatim_doc_comment, visible_alias = "l")]
     List(TopicListArgs),
 }
@@ -187,6 +190,11 @@ impl From<&TopicUpdateArgs> for TopicUpdateOptions {
             name: args.name.clone(),
             message_expiry: args.message_expiry.clone().map(IggyExpiry::from),
             max_topic_size: args.max_topic_size,
+            tiered_storage: None,
+            local_retention_age: None,
+            local_retention_size: None,
+            // `--set` carries them, as every other geo topic option.
+            geo_durations: GeoTopicDurations::default(),
             reset,
             raw_reset,
             raw: args.set.iter().cloned().collect(),
@@ -206,6 +214,10 @@ pub(crate) struct TopicGetArgs {
     /// Topic ID can be specified as a topic name or ID
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) topic_id: Identifier,
+
+    /// Output format (table or json)
+    #[clap(short, long, value_enum, default_value_t = GetOutput::Table)]
+    pub(crate) output: GetOutput,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -216,9 +228,11 @@ pub(crate) struct TopicListArgs {
     #[arg(value_parser = clap::value_parser!(Identifier))]
     pub(crate) stream_id: Identifier,
 
-    /// List mode (table or list)
-    #[clap(short, long, value_enum, default_value_t = ListMode::Table)]
-    pub(crate) list_mode: ListMode,
+    #[command(flatten)]
+    pub(crate) list_output: ListOutputArgs,
+
+    #[command(flatten)]
+    pub(crate) page: NamedPageArgs,
 }
 
 #[cfg(test)]

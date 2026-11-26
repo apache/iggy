@@ -449,7 +449,7 @@ public final class ConsensusSession {
         return parent == null ? metadataWatermark : parent.metadataWatermark();
     }
 
-    synchronized void observeMetadata(long commit) {
+    public synchronized void observeMetadata(long commit) {
         if (parent != null) {
             parent.observeMetadata(commit);
             return;

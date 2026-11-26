@@ -44,7 +44,7 @@ on:
         required: false
         default: ""
       publish_dockerhub:
-        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-connectors, rust-kafka-gateway, web-ui)"
+        description: "Docker images to publish (comma-separated: rust-server, rust-mcp, rust-bench-dashboard, rust-kafka-gateway, web-ui)"
         type: string
         required: false
         default: ""
@@ -253,6 +253,11 @@ jobs:
 
             // Parse Docker images
             ('${{ inputs.publish_dockerhub }}').split(',').map(s => s.trim()).filter(Boolean).forEach(img => {
+              // With use_latest_ci off, the config of a commit from before the move still lists
+              // this image. This workflow no longer selects the glibc build that the image needs.
+              if (img === 'rust-connectors') {
+                throw new Error('rust-connectors moved to apache/iggy-connectors. Publish the image from that repository.');
+              }
               if (cfg[img]?.registry === 'dockerhub') wants.push(img);
               else core.warning(`Unknown Docker image: ${img}`);
             });
@@ -786,22 +791,11 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "✅ Resolved ${{ matrix.key }} -> version=$VERSION"
 
-      - name: Determine libc for component
-        id: libc
-        run: |
-          # Connectors runtime must use glibc because it dlopen()s glibc plugins
-          if [ "${{ matrix.key }}" = "rust-connectors" ]; then
-            echo "libc=glibc" >> "$GITHUB_OUTPUT"
-          else
-            echo "libc=musl" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Publish Docker image
         id: docker
         uses: ./.github/actions/utils/docker-buildx
         with:
           task: publish
-          libc: ${{ steps.libc.outputs.libc }}
           component: ${{ matrix.key }}
           version: ${{ steps.ver.outputs.version }}
           platform: ${{ matrix.platform }}

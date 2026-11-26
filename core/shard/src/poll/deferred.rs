@@ -44,8 +44,9 @@ use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle};
 use crossfire::TrySendError;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::responses::messages::poll_messages::POLL_RESPONSE_HEADER_SIZE;
-use iggy_common::{DeferredPollOptions, IggyError, PollingKind, PollingStrategy};
+use iggy_common::{DeferredPollOptions, IggyError, IggyTimestamp, PollingKind, PollingStrategy};
 use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
@@ -106,7 +107,8 @@ pub enum PollQuotaIdentity {
 pub struct DeferredPollContext {
     pub session: Option<SessionAttachment>,
     pub user_id: u32,
-    pub user_created_at: Option<u64>,
+    /// What the credential of a caller without a session proved.
+    pub credential: Option<CredentialProof>,
     pub quota: PollQuotaIdentity,
     pub primary: bool,
 }
@@ -135,6 +137,10 @@ pub struct DeferredPollRequest {
     /// started from. `None` means from its admission. A fetch that resolved
     /// its starts before it waited sets that time.
     pub stores_fenced_from: Option<u64>,
+    /// Whether the owner holds this read for a partition that cannot serve
+    /// yet. A fetch clears it for a read beside others, because a held read
+    /// keeps back the replies of the reads beside it.
+    pub holdable: bool,
     pub(crate) deadline: u64,
     pub(crate) request_deadline: u64,
 }
@@ -157,6 +163,7 @@ impl DeferredPollRequest {
             commit_gate: None,
             oversized_turn: None,
             stores_fenced_from: None,
+            holdable: true,
             deadline: 0,
             request_deadline: 0,
         }
@@ -336,6 +343,8 @@ struct PartitionStatus {
     /// A fault, a read history that changes, a state transfer, or a status
     /// other than normal.
     unstable: bool,
+    /// The view start is applied and the view is persisted. The quorum check
+    /// that bounds the reads of a cut-off primary waits for that write.
     view_started: bool,
     primary: bool,
     /// The incarnation that the owner of the partition serves.
@@ -356,7 +365,7 @@ impl PartitionStatus {
                 || partition.requires_state_transfer()
                 || !consensus.is_normal()
                 || consensus.is_transferring(),
-            view_started: consensus.applied_view_start(),
+            view_started: consensus.applied_view_start() && !consensus.needs_superblock_persist(),
             primary: consensus.is_primary(),
             incarnation,
         }
@@ -373,6 +382,10 @@ impl PartitionStatus {
         consumer: PollingConsumer,
         owner: impl FnOnce(u64) -> Option<ConsumerGroupOwner>,
     ) -> Result<bool, IggyError> {
+        // A reused namespace may still hold the old partition until reconciliation.
+        if !metadata.matches_partition(self.incarnation) {
+            return Err(IggyError::TransientNotAccepted);
+        }
         if self.deleted {
             return Err(IggyError::HistoryUnavailable);
         }
@@ -394,10 +407,7 @@ impl PartitionStatus {
             }
             PollingConsumer::Consumer(..) => true,
         };
-        if self.unstable
-            || (primary && (!self.view_started || !self.primary))
-            || !metadata.matches_partition(self.incarnation)
-        {
+        if self.unstable || (primary && (!self.view_started || !self.primary)) {
             return Err(IggyError::TransientNotAccepted);
         }
         Ok(installed)
@@ -1159,10 +1169,11 @@ where
         namespace: IggyNamespace,
         context: &DeferredPollContext,
     ) -> Result<(), IggyError> {
+        let now_micros = self.bus.realtime_micros();
         if context
             .session
             .as_ref()
-            .is_some_and(|session| !session.is_valid())
+            .is_some_and(|session| !session.is_valid_at(now_micros))
         {
             return Err(IggyError::StaleClient);
         }
@@ -1175,10 +1186,14 @@ where
             return Err(IggyError::TransientNotAccepted);
         }
         let metadata = &self.plane.metadata().mux_stm;
-        if context.user_created_at.is_some_and(|created_at| {
-            !metadata
-                .users()
-                .read(|users| users.is_active_account(context.user_id, created_at))
+        if context.credential.is_some_and(|credential| {
+            !metadata.users().read(|users| {
+                users.accepts_credential_at(
+                    context.user_id,
+                    &credential,
+                    IggyTimestamp::from(now_micros),
+                )
+            })
         }) {
             return Err(IggyError::Unauthenticated);
         }
@@ -1246,6 +1261,17 @@ where
         Ok(visibility)
     }
 
+    /// Whether the partition's peer log dropped or replaced a segment that
+    /// `result` walked, see [`partitions::IggyPartition::peer_log_moved_under_read`].
+    fn peer_log_moved_under_read(&self, namespace: IggyNamespace, result: &PollReadResult) -> bool {
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                partition.peer_log_moved_under_read(result)
+            })
+            .unwrap_or(false)
+    }
+
     fn offset_stored_since(
         &self,
         namespace: IggyNamespace,
@@ -1293,6 +1319,9 @@ where
         let admission = (|| {
             request.options.validate(request.args.count)?;
             let (history, _, view) = self.validate_deferred_context(namespace, &request)?;
+            if let Some(error) = self.geo_position_refusal(namespace, request.consumer) {
+                return Err(error);
+            }
             let config = *self.deferred_polls.config.borrow();
             let mut state = self.deferred_polls.state.borrow_mut();
             let id = state.admit(request.context.quota, &config)?;
@@ -1482,7 +1511,7 @@ where
         }
     }
 
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::too_many_lines, clippy::future_not_send)]
     async fn probe_deferred_poll(&self, id: u64, mut waiter: Waiter) {
         let refused_at = self.deferred_polls.take_read_place(id, &mut waiter);
         if waiter.reply.is_disconnected() {
@@ -1535,10 +1564,15 @@ where
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         }
-        let Some(plan) = self.plane.partitions().build_poll_snapshot(
+        let max_selected_bytes = reply_byte_limit(
+            &waiter.request.options,
+            self.deferred_polls.config.borrow().max_read_bytes,
+        );
+        let Some(plan) = self.plane.partitions().build_poll_snapshot_within(
             &waiter.namespace,
             waiter.request.consumer,
             &waiter.request.args,
+            max_selected_bytes,
         ) else {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;
@@ -1549,15 +1583,16 @@ where
             self.accept_deferred_result(id, waiter, result).await;
             return;
         }
+        let Ok(cold) = self.poll_completions.admit(plan.reads_remote()) else {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        };
+        let plan = plan.with_deadline(std::time::Instant::now() + crate::COLD_POLL_BUDGET);
         let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place, read_bytes) else {
             self.deferred_polls.queue_read(id, waiter, place);
             return;
         };
         let max_bytes = walk_bytes(reservation.bytes);
-        let max_selected_bytes = reply_byte_limit(
-            &waiter.request.options,
-            self.deferred_polls.config.borrow().max_read_bytes,
-        );
         let completion =
             match self
                 .poll_completions
@@ -1577,7 +1612,9 @@ where
             .waiters
             .insert(id, waiter);
         self.bus.spawn(async move {
-            completion.complete(plan.execute_with_limit(max_bytes, max_selected_bytes).await);
+            let result = plan.execute_with_limit(max_bytes, max_selected_bytes).await;
+            drop(cold);
+            completion.complete(result);
         });
     }
 
@@ -1606,6 +1643,12 @@ where
                 return;
             }
         };
+        // Whatever the read found in the store, a trim or a merge in the
+        // peer log it covers makes the retry plan from the new log.
+        if self.peer_log_moved_under_read(waiter.namespace, &result) {
+            self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
+            return;
+        }
         let result = match result.checked() {
             Ok(result) => result,
             Err(error) => {

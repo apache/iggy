@@ -69,6 +69,33 @@ public sealed partial class NativeRecoveryTests
         Assert.Equal(4, cluster.Writes.Count);
     }
 
+    /// <summary>
+    ///     A store under a fully zero context takes the lane of its route. Lane (0, 0) is the metadata lane, so a
+    ///     retained metadata write never blocks a store of partition 0.
+    /// </summary>
+    [Fact]
+    public async Task given_a_retained_metadata_write_when_storing_partition_0_under_a_fully_zero_context_should_store_it()
+    {
+        using var cluster = new RecoveryCluster();
+        using var client = await cluster.ConnectAsync();
+        using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(cluster.Token);
+        cluster.OnMetadata = request =>
+        {
+            cancellation.Cancel();
+            return Reply(request.Operation, [], VsrError.TRANSIENT_NOT_COMMITTED);
+        };
+        var lost = await Assert.ThrowsAsync<VsrRequestOutcomeUnknownException>(() =>
+            client.CreateStreamAsync("created", token: cancellation.Token));
+        cluster.OnMetadata = request => Result(request);
+
+        await client.StoreOffsetAsync(Consumer.New(3), Stream, Topic, 10, 0, default(PartitionContext), cluster.Token);
+
+        Assert.Equal(new PartitionContext(17, 0, 1), Assert.Single(cluster.Writes).Context);
+        var blocked = await Assert.ThrowsAsync<VsrLaneBlockedException>(() =>
+            client.CreateStreamAsync("again", token: cluster.Token));
+        Assert.Equal(lost.OperationId, blocked.OperationId);
+    }
+
     [Theory]
     [InlineData((byte)0, false)]
     [InlineData((byte)1, true)]

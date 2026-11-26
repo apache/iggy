@@ -52,11 +52,11 @@ pub(super) struct Recorded {
 }
 
 impl Recorded {
-    /// The `context` the request body carries, `None` when the field is absent.
+    /// The `context` the request body carries, `None` when the field is absent or null.
     pub(super) fn context(&self) -> Option<PartitionContext> {
         let body: serde_json::Value = serde_json::from_slice(&self.body).unwrap();
         body.get("context")
-            .map(|context| serde_json::from_value(context.clone()).unwrap())
+            .and_then(|context| serde_json::from_value(context.clone()).unwrap())
     }
 
     /// The value of `key` in the query of the request, `None` when the key is absent.
@@ -87,6 +87,14 @@ impl Reply {
             body: String::new(),
             cut: false,
             stall: false,
+        }
+    }
+
+    /// A body that is not the server's, as a proxy in front of it renders.
+    pub(super) fn text(status: u16, body: &str) -> Self {
+        Self {
+            body: body.to_owned(),
+            ..Self::empty(status)
         }
     }
 

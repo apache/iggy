@@ -95,7 +95,6 @@ jobs:
               'PHP SDK': 'php',
               'CLI': 'tui',
               'Web UI': 'web',
-              'Connectors': 'connectors',
               'MCP server': 'mcp',
               'Configuration': 'config',
               'Wire protocol / API': 'api',

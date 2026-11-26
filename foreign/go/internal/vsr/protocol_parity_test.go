@@ -67,6 +67,7 @@ var goOperations = map[string]Operation{
 	"UpdateTopicResolved":             OperationUpdateTopicResolved,
 	"UpdateUserResolved":              OperationUpdateUserResolved,
 	"RewrapStreamKeys":                OperationRewrapStreamKeys,
+	"ShadowTopic":                     OperationShadowTopic,
 	"CreateStream":                    OperationCreateStream,
 	"DeleteStream":                    OperationDeleteStream,
 	"CreateTopic":                     OperationCreateTopic,
@@ -85,6 +86,7 @@ var goOperations = map[string]Operation{
 	"JoinConsumerGroup":               OperationJoinConsumerGroup,
 	"LeaveConsumerGroup":              OperationLeaveConsumerGroup,
 	"UpdateResource":                  OperationUpdateResource,
+	"RetireGeoOrigin":                 OperationRetireGeoOrigin,
 	"SendMessages":                    OperationSendMessages,
 	"StoreConsumerOffset":             OperationStoreConsumerOffset,
 	"DeleteConsumerOffset":            OperationDeleteConsumerOffset,
@@ -93,6 +95,7 @@ var goOperations = map[string]Operation{
 	"InstallConsumerGroupOwner":       OperationInstallConsumerGroupOwner,
 	"RetireConsumerGroupOwners":       OperationRetireConsumerGroupOwners,
 	"TransitionPartitionHistory":      OperationTransitionPartitionHistory,
+	"StateMachineCommand":             OperationStateMachineCommand,
 }
 
 // goEvictionReasons names every eviction discriminant the codec declares.

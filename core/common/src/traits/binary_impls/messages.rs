@@ -33,7 +33,6 @@ use bytes::{Bytes, BytesMut};
 use iggy_binary_protocol::codec::WireDecode;
 use iggy_binary_protocol::codec::WireEncode;
 use iggy_binary_protocol::codes::SEND_MESSAGES_CODE;
-use iggy_binary_protocol::codes::SYNC_CONSUMER_GROUP_CODE;
 use iggy_binary_protocol::requests::consumer_groups::SyncConsumerGroupRequest;
 use iggy_binary_protocol::requests::messages::{
     FetchMessagesRequest, FetchMessagesTarget, PollMessagesRequest, RawMessage, SendMessagesEncoder,
@@ -87,8 +86,8 @@ pub(crate) async fn synced_group_assignment<B: BinaryClient>(
         let deadline = crate::binary_operation_deadline();
         loop {
             let generation = state.session_generation();
-            let response = client
-                .send_raw_with_response(SYNC_CONSUMER_GROUP_CODE, request.to_bytes())
+            let (response, commit) = client
+                .send_group_sync_with_commit(request.to_bytes())
                 .await?;
             let assignment = if response.is_empty() {
                 None
@@ -107,7 +106,15 @@ pub(crate) async fn synced_group_assignment<B: BinaryClient>(
                 // A successful read from the replaced session cannot publish its old membership.
                 Err(IggyError::TransientNotAccepted) if tokio::time::Instant::now() < deadline => {}
                 Err(error) => return Err(error),
-                Ok(()) => return Ok(assignment),
+                Ok(changed) => {
+                    // A handover installs a new owner in a later op than the join, and a
+                    // primary that has not applied it refuses the read as not owned. So the
+                    // reads of a changed assignment wait for the commit it was read at.
+                    if changed {
+                        client.observe_metadata_commit(commit);
+                    }
+                    return Ok(assignment);
+                }
             }
         }
     })

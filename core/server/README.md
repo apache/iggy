@@ -42,13 +42,19 @@ cargo run --bin iggy-server --release -- --replica-id 0
 
 Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default-root-credentials`, and `--list-config-env-vars`. Other settings come from configuration.
 
+`scripts/pgo.sh` builds an iggy-server with profile-guided optimization (PGO), and with `--bolt` also with LLVM BOLT. It trains an instrumented 3-node cluster on the build host with `iggy-bench` over TCP, with replicated and persisted durability. By default it compiles for the CPU of the build host. Run `scripts/pgo.sh --help` for the steps and the prerequisites.
+
 ## Upgrading
 
 Deploy matching server and SDK releases together. Rolling upgrades and mixed
 server versions are unsupported. Partition control frames from older servers
 carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-METADATA-CHANGE-LOG-1` storage gate
+complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
 requires fresh storage and rejects older data directories without modifying them.
+A partition of a tiered topic keeps a chain file, and its older segments live
+only in the object store. A build from before tiered storage would read such a
+partition as one that lost data, so `IGGY-METADATA-CHANGE-LOG-2` data directories
+must be wiped before the upgrade.
 Metadata snapshots now carry the metadata change log and topic creation ops, so
 `IGGY-RESOURCE-OPTIONS-1` data directories must be wiped before the upgrade.
 Cached replies now preserve a committed-result marker, which older receipts lack.
@@ -63,15 +69,20 @@ finalization and the paid-through mark on session retirement. Peers compare a
 replica wire revision at the handshake, so a build from before that change and a
 build after it refuse each other even when both report the same version, for
 example two consecutive `:edge` images. Stop every node and start them all on the
-new build. Their `IGGY-METADATA-CHANGE-LOG-1` data directories are kept: older
-metadata snapshots and journal entries read with every partition on every node,
-and older builds refuse the newer snapshot format instead of misreading it.
+new build.
 Topics created without `replication_factor` still go on every node, so clients
 that never send the key, which includes every SDK, connector, benchmark and MCP
 release before the option, keep the old layout. Set `[cluster]
 default_replication_factor` to a number to give those topics fewer copies.
 Topic responses carry each partition's member list and in-sync members, a client
 wire change that SDKs from before this release cannot decode.
+
+The preceding storage format, `IGGY-METADATA-CHANGE-LOG-2`, used replica wire revision 3. It introduced batched session finalization (op 70) and refused directories marked `IGGY-METADATA-CHANGE-LOG-1` before writing to them.
+
+Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Its replicated registration and password-change requests use replica wire revision 4. State transfer uses client table format `ICT6` and metadata snapshot format 21.
+
+Every replica needs fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. Sign in again over HTTP or in the web UI to obtain an access token carrying the account revision.
+
 No in-place upgrade, storage conversion tool or retained-data migration is
 provided. Use an offline cutover with logical re-ingestion:
 
@@ -156,14 +167,44 @@ readiness probes identify responsive replicas, new primaries are assigned only
 to those replicas. Before readiness is known, all configured replicas remain
 eligible. After the responsive replica set
 has been stable for five seconds, the metadata primary balances existing primary
-counts one partition at a time. It confirms the source's committed frontier and
-the target's applied history, then grants the move to the source primary. The
+counts, with up to 512 moves in flight. For each move it confirms the source's
+committed frontier and the target's applied history, then grants the move to
+the source primary. The
 source finishes its accepted writes before it requests a persisted consensus
 view change.
 Recovering partitions are skipped without delaying transfers of other partitions.
 Every replica still stores every partition.
 Balancing primary counts does not balance bytes, throughput or CPU load. A hot
 partition still has one ordering primary.
+
+On the first stop signal, a node of a cluster hands off the partitions it leads
+before it shuts down. Without the handoff, each of them waits for a heartbeat
+timeout before it elects a new primary. Each shard spreads them over the members
+that are in sync and reachable, and the node takes no primaries while it leaves.
+The shutdown waits for every shard to finish, at most
+`sharding.shutdown_primary_handoff_timeout` (15 s by default). `"0 s"` skips
+the handoff, and so do `"disabled"`, `"none"` and `"unlimited"`, which also read
+as zero. A second stop signal ends the handoff. The metadata group has no
+handoff and still waits for the timeout.
+
+When a node fails, each partition it led elects a new primary after a heartbeat
+timeout. Each shard starts at most 4 of these elections per 10 ms tick, and none
+while 128 of its partitions are in a view change. A view change stops counting
+once `cluster.view_change_status_timeout` (5 s by default) passes after its
+replica wrote the new view to disk. Each view change in a row doubles that
+time, up to 16x. Thus partitions that lost their quorum do not stop the
+elections of other partitions.
+`/metrics` reports `partitions_in_view_change`, every partition of a shard in a
+view change, and `partition_view_change_votes_held`, the elections it holds
+back.
+
+The 10 ms tick of a shard visits only the partitions with work. A partition
+with nothing to commit, replicate, persist or repair sleeps until its next
+timeout, and a frame for it or a finished I/O step makes it due on the next
+tick. `/metrics` reports `partition_tick_visits`, the visits of a shard, and
+`partition_missed_wakeups`, the sleeping partitions that a check found with
+work and woke. That check tests a few sleeping partitions per tick. Its
+counter stays at 0 on a correct server, so report a value above 0 as a bug.
 
 A create whose namespace is invalid can receive 58 (`TransientNotAccepted`) while
 any metadata write is pending, even an unrelated one. Under steady unrelated
@@ -228,7 +269,7 @@ Requests queued behind the ones a connection runs are capped at 1024 frames and 
 
 On a multi-replica node, client partition requests require recent metadata quorum
 evidence before namespace lookup and authorization. The evidence lasts
-`K = cluster.heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
+`K = cluster.commit_busy_heartbeat_timeout + 3 seconds` (8 seconds by default); expired or
 absent evidence yields 58. A primary credits answered probes while ready. A
 backup credits only a probe from its current metadata primary whose advertised
 commit covers the adopted view's head and is already applied locally. Commit
@@ -250,7 +291,14 @@ Message and size counters in stream, topic and system stats (`get_stream`,
 `get_topic`, `get_stats` and the list forms) are counted per node. A node that
 is not the partition primary learns of a commit from the next prepare or from
 the periodic commit broadcast. It counts the message only then. While the
-cluster is idle, its counters can lag by up to `cluster.commit_broadcast_interval`.
+cluster is idle, its counters can lag by up to `cluster.commit_busy_heartbeat_interval`.
+
+`GetStats` and the stream, topic, partition, segment and message gauges of
+`/metrics` read node totals. Each metadata change and each partition write
+keeps these totals up to date, so these reads walk no stream. The per-topic
+series of `/metrics` (`topic_size_bytes`, `topic_messages` and
+`topic_max_size_bytes`) still walk every topic on each scrape. On a node with
+many topics, set `[http.metrics] topic_gauges = false` to drop them.
 
 ### Sessions and retry receipts
 
@@ -265,11 +313,17 @@ External group offsets belong to groups managed outside Iggy, such as a Kafka
 gateway. They require no Iggy group membership and can exceed the partition's
 message-offset range.
 
-The bind proof is an independent session credential. Password changes and PAT
-revocation or expiry do not end an established session. Binding checks that the
-owner still exists and is active; current permissions still govern each request.
-Explicit logout, lease expiry, user deactivation and user deletion end session
-access.
+The bind proof binds a connection to a session the owner opened with a credential. Binding checks that the owner still exists and is active, and that a session opened with a personal access token still has that token, unexpired. Current permissions still govern each request. Explicit logout, lease expiry, user deactivation and user deletion end session access.
+
+A successful password change ends every session of the account except the TCP, QUIC or WebSocket session that made the change. It invalidates all previously issued Iggy access tokens for that account, including tokens exchanged from personal access tokens. An HTTP self-change also closes its submitting session. A caller presenting a self-issued token must sign in again.
+
+Deleting a personal access token ends the sessions opened with it and the access tokens exchanged from it. Its expiry stops them at the expiry time, before the cleaner deletes it, and an access token exchanged from it never outlives it. Personal access tokens survive a password change, so a service that signs in with one opens a new session after the change.
+
+Deactivating an account ends every session and deletes all its personal access tokens. After reactivation, sign in again and issue new personal access tokens.
+
+Each node decides from the metadata it has applied. A node that has not applied a password change or a token delete yet still serves the old credential until it does. Over HTTP it answers an access token issued after a password change it has not applied with a retryable refusal.
+
+A registration proved against a superseded account revision or a deleted token is refused. The client can sign in again with a current credential. A session that ends during a send leaves that send uncertain, as described below.
 
 If a committed reply is lost and that session ends before the caller proves the
 outcome, the operation remains uncertain. Signing in again, including after
@@ -317,10 +371,12 @@ its dispatch, while the next request to that partition waits for the previous
 write to settle. Waiters acquire the in-flight permit after the partition gate,
 so they do not consume the session's budget for other partitions.
 
-Durability defaults remain `Replicated`, and ordinary SDK sends and explicit
-offset writes support the configured policy. Crash-safe send retries require
-`Persisted`; crash-safe explicit offset retries require `Persisted` and
-`Quorum`. Weaker policies can lose data and receipts on a crash. A retained
+Durability defaults remain `Replicated`. A geo topic in the `geo` mode has no
+choice: it is always `Persisted`, and the option is ignored on create. See
+[geo topics](docs/GEO_TOPICS.md#create-a-geo-topic).
+Ordinary SDK sends and explicit offset writes support the configured policy.
+Crash-safe send retries require `Persisted`; crash-safe explicit offset retries
+require `Persisted` and `Quorum`. Weaker policies can lose data and receipts on a crash. A retained
 receipt still replays its original result, but a lost receipt cannot prevent
 another execution. NoAck and internal auto-commit polls retain their weaker
 completion contracts.
@@ -448,13 +504,509 @@ stream counters follow those reports too, so they trail the members.
 
 Topics created before replication factors keep every partition on every node.
 
+### Tiered storage
+
+The `[tiered_storage]` section of [config.toml](config.toml) names an object
+store for the sealed segments of tiered topics. A topic with `tiered_storage`
+on uploads each sealed segment there, removes the local copy once local
+retention allows it, and reads the segment back from the store when a poll
+asks for it. Geo topics keep their messages in the same store: see
+[geo topics](docs/GEO_TOPICS.md).
+
+The cluster accepts `tiered_storage` on a topic only while every node has a
+backend and passes the store identity check described below. Until then the
+request fails with `FeatureUnavailable`.
+
+Each partition of a tiered topic also has a manifest object,
+`<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
+It lists the segments that the store holds, with their offsets, timestamps,
+sizes and checksums, so a reader that has only the bucket can read the
+partition. Such a reader takes only the segments that the manifest lists. Any
+other object under the partition's prefix can belong to an upload that never
+committed, or to a segment that retention removed. The partition's primary
+writes it on each run of the message cleaner, when a segment was uploaded or
+removed since the last one. The cluster never reads its own manifests back.
+The objects of a removed segment are deleted only once the manifest no longer
+lists it.
+
+The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
+in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
+an empty `endpoint`, it uses AWS in `region`. `url_style` picks whether the
+bucket goes in the URL path or in the host name.
+
+The `gcs` backend keeps the objects in a Google Cloud Storage bucket, which
+`[tiered_storage.gcs]` names. It talks to the JSON API of GCS, never to its
+S3 interoperability endpoint: GCS takes a create-only put as its own
+`ifGenerationMatch=0` precondition, and the server relies on create-only puts.
+An empty `endpoint` is Google Cloud Storage. An emulator, such as
+fake-gcs-server, takes its own URL and `auth = "none"`. GCS takes one write
+per second to one object name, so on `gcs` set `[geo]
+consumer_offset_upload_interval` to `1 s` or more, or to `disabled`.
+
+The `mock_s3` backend keeps the objects in the memory of the server, where
+every shard reads them, and answers each call after the latencies of
+`[tiered_storage.mock_s3]`. The server loses them all when it stops, so it is
+for benchmarks and tests only.
+
+The `s3` backend signs each request with the first credentials that the node
+has, in the order of the AWS SDKs:
+
+1. The static keys `access_key_id` and `secret_access_key`.
+2. Web identity: the token in `AWS_WEB_IDENTITY_TOKEN_FILE`, which STS
+   exchanges for credentials of `AWS_ROLE_ARN`. EKS sets both variables for a
+   pod with a service account role. `AWS_ROLE_SESSION_NAME` and
+   `AWS_ENDPOINT_URL_STS` change the session name and the STS URL.
+3. The role of the EC2 instance, from its instance metadata service.
+   `AWS_EC2_METADATA_DISABLED=true` turns this source off, and
+   `AWS_EC2_METADATA_SERVICE_ENDPOINT` moves the service.
+
+The node fetches temporary credentials once and shares them with every shard.
+It fetches new ones 5 minutes before the old ones expire. If a fetch fails,
+the node keeps the credentials that it has and tries again. The first retry
+comes after 1 second, and the wait doubles up to 1 minute. If the source
+refuses the first fetch,
+for example because the role does not trust the token, the server does not
+start. If the source does not answer at boot, the server starts without
+credentials and keeps trying. No log line shows a key or a token.
+
+With `auth = "auto"`, the `gcs` backend sends an access token from the first
+source that the node has, in the order of Google's application default
+credentials:
+
+1. The service account JSON key file that `service_account_key` names. The
+   node signs a JWT with its key and exchanges it at the key's `token_uri`.
+2. The key file that `GOOGLE_APPLICATION_CREDENTIALS` names.
+3. The metadata server of the Compute Engine instance or the GKE node, which
+   on GKE with Workload Identity hands out the token of the pod's service
+   account. `GCE_METADATA_HOST` moves it.
+
+Only `service_account` key files work. A file that cannot be read or holds no
+RSA key stops the boot. The token reaches every shard and is refreshed as the
+`s3` credentials are. The service account needs the Storage Object User role
+on the bucket.
+
+At boot the server reads the store identity object `<prefix>/meta/identity`
+once. Only a missing bucket, rejected credentials or a store that ignores
+create-only puts stop the boot. If the store does not answer within
+`request_timeout`, or 5 seconds at most, the server starts with the
+`object_store_unreachable` gauge at 1. The store identity check judges any
+other answer.
+
+Fresh objects, segment uploads, the store identity object and recovery records
+are all written create-only, so of two writers that race on one key only one
+wins. A store that takes `If-None-Match` and overwrites anyway breaks that for
+all of them. So once the identity object holds this cluster's id, each node
+puts the same bytes once more, create-only, before its first upload, and the
+store must refuse that put. A store that takes it fails the check: the node
+runs no uploads or object deletes, and logs the settings to fix. At boot the
+probe sends the same put when the object is already there, and a store that
+takes it stops the boot. Either way the put writes the bytes that the object
+already holds.
+
+The store identity object claims the prefix for one cluster. While replica 0 is
+the caught-up metadata primary and no topic keeps data in the store, it writes
+the object. A tiered topic keeps data in the store, and so does a topic whose
+partitions place their batches. If the key already holds an object, the write
+fails. Each node reads the object
+back through its own store every minute, or every 5 seconds while the object is
+missing or the store does not answer. While the object names the node's own
+cluster, the node runs uploads and object deletes.
+
+While another replica leads metadata, no node claims the prefix, and each node
+logs that no cluster claimed it yet. `iggy cluster metadata` shows the leader.
+Restart the leader, and the next replica takes over. Repeat until replica 0
+leads.
+
+Each shard exports two gauges for its node:
+
+- `object_store_identity_verified` is 1 while the node passes its check. It is
+  0 until replica 0 claims the prefix, and while the object is missing or names
+  another cluster.
+- `object_store_unreachable` is 1 while the store does not answer the check. A
+  node that passed keeps passing through an outage.
+
+Uploads that fail on a store that answers the check show in
+`partition_segment_upload_lag_seconds`, not in these gauges.
+
+The object holds two lines of text, and each line ends with a newline:
+
+```text
+iggy-store-identity 1
+cluster_uid 0123456789abcdef0011223344556677
+```
+
+`cluster_uid` is 32 lowercase hexadecimal digits. When the result of its check
+changes, each node logs its own `cluster_uid`. No node writes the object again
+once a topic keeps data in the store.
+
+With the `fs` backend, the object is the file `<path>/<prefix>/meta/identity`.
+Copy it once a node logs that the object store root belongs to this cluster. If
+the file is lost or damaged later, put the copy back. A hand-written file does
+not work, because `fs` keeps a header before the body of each object file. A
+node that finds a wrong file still boots, but it runs no uploads or object
+deletes until the right file is back.
+
+With the `s3` and `gcs` backends, the object is the key `<prefix>/meta/identity`
+in the bucket. If it is lost or damaged, write the two lines back under that
+key with any client of the store, such as `gcloud storage cp`. Each node logs
+the `cluster_uid` to write.
+
+A node logs that the object names another cluster when:
+
+- Another cluster uses the same prefix. Give this cluster another `prefix`.
+- This cluster's metadata was rebuilt, which gives it a new `cluster_uid`. The
+  objects under the prefix belong to its earlier lifetime. Give the cluster
+  another `prefix`, or delete every object under the prefix, and replica 0
+  claims it again. A cluster rebuilt after every node lost its disk can
+  instead take back the geo topics of its earlier lifetime with
+  `[geo] recover_cluster_uid`, as [Recover an origin that lost its
+  disks](docs/GEO_TOPICS.md#recover-an-origin-that-lost-its-disks) describes.
+- The object holds bytes that no cluster wrote. Put the `fs` copy back, or
+  write the two lines again on `s3` or `gcs`.
+
+Give every node the same store and the same prefix. The check cannot tell every
+pair of stores apart. For example, replica 0 reaches an empty store, and the
+other nodes reach a store with an earlier claim of the same cluster. Then every
+node passes its check. Until a topic keeps data in the store, replica 0 also
+claims again after any check that did not pass, so if its `fs` mount drops, it
+claims the empty mount point.
+
+### Geo peers
+
+[Geo topics](docs/GEO_TOPICS.md) is the operator guide: what a geo topic
+guarantees, how to set up two clusters, how clients use them, the delays, what
+is lost when a datacenter fails, and the limits of this version. This section
+and the two after it are the reference for the parts it builds on.
+
+The `[geo]` section of `config.toml` names this cluster among the datacenters
+and lists its peers: the other clusters whose stores it reads.
+`origin` is the name of this cluster. Shadow stream names and the objects that
+this cluster publishes for its peers carry it. An origin name holds 1 to 32
+lowercase letters, digits and `-`. It starts with a letter and does not end
+with `-`. A cluster with peers needs an origin.
+
+Each `[[geo.peers]]` table gives the peer's `origin` and the keys of the peer's
+`[tiered_storage]` store: `backend`, `prefix`, `path` for `fs`, `bucket`,
+`region`, `endpoint` and `url_style` for `s3`, and a `[geo.peers.gcs]` table
+for `gcs`, with the keys of `[tiered_storage.gcs]`. An `s3` peer needs the
+static keys `access_key_id` and `secret_access_key`. The printed configuration
+never shows them. A `gcs` peer takes its token as the `gcs` backend does, from
+a refresher of its own, and the boot never waits for that token. A cluster
+reads at most 16 peers.
+
+The server never writes to a peer's store. Each shard reads a peer through a
+store that refuses every put, conditional create and delete before the request
+leaves the node. Read-only credentials are therefore enough. Each shard runs
+one tier service per peer, with the timeouts and job caps of
+`[tiered_storage]`. A slow peer takes no job slot of this cluster's store or of
+another peer.
+
+When the node starts, shard 0 reads each peer's store identity object,
+`<prefix>/meta/identity`. After that it reads the object every minute. While the node
+reads nothing from the peer, or the peer's store does not answer, it reads the
+object every 5 seconds. The node remembers the first cluster that the object
+names. It keeps that cluster in memory only, so after a restart it reads the
+object again.
+
+Only a configuration that can never work stops the boot, for example a prefix
+that is not a usable key prefix. A peer whose store does not answer never stops
+the boot and never delays local traffic.
+
+Each shard exports two gauges for its node per peer, labelled with the peer's
+`origin`:
+
+- `geo_peer_identity_verified` is 1 while the node reads the peer. It is 0
+  until a check reads the peer's identity object, and while the object is
+  missing, refused or changed.
+- `geo_peer_unreachable` is 1 while the peer's store does not answer the check.
+  A node that verified the peer keeps reading what the store returns.
+
+A node logs that the identity object of a geo peer no longer names the cluster
+that it read first. From then on, the node reads nothing from the peer until it
+restarts. This happens when:
+
+- The peer's metadata was rebuilt, which gives the peer a new `cluster_uid`.
+  Its stream, topic and partition ids start again, so the objects under its
+  prefix belong to another history.
+- The peer's entry in this file now points at the store of another cluster.
+  Correct the entry.
+- The object holds bytes that no cluster wrote. The peer's operator puts the
+  object back, as the tiered storage section describes.
+
+Before you restart the node, find out which cluster owns the peer's prefix now.
+After the restart, the node remembers the cluster that it finds then.
+
+A node also reads nothing from a peer whose identity object names this cluster.
+Then the peer's store and prefix are this cluster's own.
+
+### Geo topic objects
+
+The cluster publishes one object for each of its geo topics in its own
+`[tiered_storage]` store, under
+`<prefix>/meta/topics/<stream_id>/<topic_id>/<created_revision>`. A peer reads
+these objects to find the geo topics of this cluster. One listing of
+`<prefix>/meta/topics/` finds all of them. An object holds the origin, the
+`cluster_uid`, the stream and topic names and ids, and the partition count. It
+also holds the compression algorithm, the largest message size, the retention
+limits and the geo mode.
+
+The caught-up metadata primary stores the object of a new geo topic within
+about a second of its creation. When the content of the object changes, for
+example after a stream rename, it stores the object again. The primary of each
+partition of a geo topic reads the object before it takes messages, and again
+after each change of primary. Until then, the partition refuses messages with
+`TransientNotAccepted`, which the SDKs retry. A store that does not answer
+therefore delays the first messages of a new geo topic, but the topic stays.
+
+When a client deletes a geo topic, the metadata primary replaces its object with
+a tombstone. A tombstone tells the peers that the topic is gone. The primary
+lists the topic objects once a minute. The grace is the topic's own
+`tombstone_grace`, which its object records, or else `[geo] tombstone_grace` (24
+hours by default). After the grace, the primary deletes the segments and
+manifests of the topic, and then the tombstone. The tombstone records the time
+of its write. A restart or a new metadata primary therefore does not restart the
+grace.
+
+### Shadow streams
+
+A cluster serves the geo topics of each peer that it reads as shadow streams.
+A shadow stream is named `__shadow_<origin>_<stream>`, after the peer's origin
+and stream name. It holds the geo topics of that peer stream, with the peer's
+topic ids and partition ids. The normal topics of the peer stream do not
+appear. The partitions of a shadow topic keep none of the peer's messages on
+this node's disk. They read the peer's log from the peer's store, as the
+manifests that they committed list it: see
+[Following peer manifests](#following-peer-manifests).
+
+Every 5 seconds, the caught-up metadata primary lists the topic objects of each
+peer. It reads each new object, and it reads a known object again every 30
+seconds. Then it proposes each change through the metadata consensus of this
+cluster, one operation at a time, so every node holds the same shadow streams:
+
+- A live object of a new peer stream creates its shadow stream.
+- A live object adds its topic to the shadow stream.
+- A renamed peer stream renames its shadow stream.
+- A tombstone detaches the shadow topic. The topic stays readable until
+  `tombstone_grace` passed since the peer wrote the tombstone. Then the primary
+  removes it.
+- An object that the peer's store no longer lists for 2 minutes removes its
+  shadow topic.
+- A shadow stream without topics and without live objects is removed.
+
+A read of a shadow stream, alone or in a listing, reports the read-only key
+`shadow_origin` with the peer's origin, and no other stream carries it. Every
+SDK has a typed getter for it, and `iggy stream list` shows it in the Origin
+column. A read of a shadow topic reports `topic_type` as `geo` and the
+`geo_mode` of the peer's topic, although the topic is stored as a normal one.
+`iggy topic get` shows the type, the mode and, in a shadow stream, the origin
+of a topic.
+
+Clients read a shadow stream like any other stream. Consumer groups, consumer
+offsets and permissions work on it, and its positions stay in this cluster. A
+client cannot write to a shadow stream or change it. The server refuses these
+requests with `ShadowStreamReadOnly` (1021): a send, a topic create, update or
+delete, a partition add or delete, a segment delete, and a stream update or
+delete. A stream create or rename to a name that starts with `__shadow_`
+returns `InvalidStreamName` (1013).
+
+If a stream of this cluster already has the name of a shadow stream, the
+server logs it and adopts nothing for that peer stream. Rename the stream to
+let the peer's topics in. A peer stream whose shadow stream name is longer than
+255 bytes is also logged and skipped.
+
+A shadow topic is stale while the peer's store does not answer, or while the
+node reads nothing from the peer. A stale topic serves what it holds. The
+primary removes no stale topic, except one whose grace ended. The gauge
+`geo_shadow_topics_stale`, labelled with the peer's `origin`, counts the stale
+shadow topics on the metadata primary.
+
+If the identity object of a peer names another cluster than the one that the
+shadow streams came from, the server logs it. It leaves those shadow streams
+as they are.
+
+An operator retires a peer whose datacenter never returns with
+`iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs
+root or the global `manage_servers` permission. The retirement commits through
+the metadata of this cluster and cannot be undone. From then on, the nodes send
+the peer's store only the reads of polls. Each shadow partition of the peer
+drops the segments that the retention of its topic in the peer removes, and the
+primary removes each shadow topic once that `message_expiry` passed since the
+retirement, then each empty shadow stream. A client may delete the shadow
+streams and topics of a retired peer. See
+[Retire an origin](docs/GEO_TOPICS.md#retire-an-origin).
+
+### Following peer manifests
+
+The primary of each partition of a geo topic publishes a manifest of the
+partition's segments in its cluster's store, under
+`<prefix>/meta/<stream_id>/<topic_id>/<partition_id>/<created_revision>/manifest.bin`.
+A shadow partition serves the segments that the last manifest it committed
+lists, at the peer's offsets.
+
+Every `[geo] manifest_poll_interval` (5 seconds by default), shard 0 of each
+node lists `<prefix>/meta/<stream_id>/` of each peer stream that a shadow
+stream serves. It does so only for the shadow partitions whose primary this
+node is. The listing gives the etag of each manifest. When the etag of a
+manifest differs from the one that the shadow partition committed, the shard
+that owns the partition reads the manifest. The partition's primary checks the manifest
+against what the partition holds and commits it through the partition's
+consensus. A command lists only the segments that changed, and a large
+catch-up takes several commands. Every replica applies the same commands, so
+every replica serves the same range, and a restart does not go back.
+
+The manifests are all that a node reads of a peer's partitions, apart from
+the segments that polls read: it reads none of the peer's fresh objects. A
+message reaches a shadow topic once the peer's rewrite put it in a long-term
+segment and stored the manifest, and this cluster listed and committed that
+manifest, seconds after its commit: see the [delays](docs/GEO_TOPICS.md#delays).
+A shadow partition never serves an offset past the end of the last segment
+that the manifest it committed lists.
+
+The listings and reads go to the peer's own tier service, in its
+housekeeping class. A slow or unreachable peer therefore takes no job slot of
+this cluster's store, and none that a poll of a shadow partition waits for.
+After a listing that fails, the node waits twice as long before the next
+one, up to a minute.
+
+The server refuses a manifest that goes back, names another partition
+incarnation or does not check. The shadow partition keeps what it holds. Once
+the etag of that manifest changes, the server reads it again. Each shard
+exports these metrics per peer, labelled with the peer's `origin`:
+
+- `geo_peer_manifest_requests_total` and `geo_peer_manifest_failures_total`,
+  with a `request` label of `list` or `get`, count the requests to the peer's
+  store and the ones that failed.
+- `geo_peer_manifests_refused_total` counts the refused manifests. Alert on
+  any increase.
+- `geo_peer_manifest_commands_total` counts the commands that committed
+  manifests.
+- `geo_peer_manifest_listed_seconds` is the Unix time of the last listing that
+  succeeded, on shard 0.
+- `geo_shadow_partitions_behind` counts the shadow partitions whose committed
+  manifest is behind the peer's. `geo_shadow_manifest_lag_seconds` is the
+  time since the furthest behind of them fell behind.
+
+### Consumer group positions
+
+The consumer groups of geo topics and shadow topics carry their positions to
+the other datacenters, through the buckets. A group is known across
+datacenters by its name on the topic. The group `billing` of the geo topic
+`orders/payments` of `dc-a` and the group `billing` of the shadow topic
+`__shadow_dc-a_orders/payments` of `dc-b` read the same log, and share one
+position on each of its partitions.
+
+Plain consumers and the external offsets of groups carry their positions in
+the same way. A plain consumer is known by its id, the number its client sets
+or the hash of its name. External offsets are known by their group's name, and
+are apart from the offsets that the group stores as itself. The Kafka gateway
+keeps the offsets of the Kafka group `billing` as the external offsets of the
+group `kafka.cg.billing`. It creates that group at its first commit to a topic.
+So a read of a missing group's external offsets answers by its name, from
+another datacenter's position. Neither has members, so the member check
+below does not hold them back: a log is read under one of their names in one
+datacenter at a time.
+
+A position is a reset counter and an offset. Of two positions the one with
+the higher reset wins, and within one reset the higher offset. A group that
+stores an offset below the one it had, or deletes its offset, moves its
+reset one up, so the move backwards wins over the higher offsets that the
+other datacenters still hold. The positions of each partition live in a
+state machine of the partition and commit through its consensus.
+
+Every `[geo] positions_publish_interval` (1 second by default), each node
+folds what its groups committed on the partitions it leads into their
+positions and stores, in its own bucket, one object for each log in which it
+leads a partition:
+`<prefix>/meta/positions/<origin>/<stream_id>-<topic_id>-<created_revision>-<replica>`,
+where the origin and the ids name the log as its origin does. Only the
+partition's primary publishes it, as only the primary uploads its messages:
+groups commit at the primary, and the backups commit the same positions. A
+node stores an object only when the positions of a partition it leads
+changed. It keeps in it the partitions it stopped leading as it last stored
+them, and a new primary stores the partition at its first round. A node
+deletes its object of a log the cluster no longer holds.
+
+A `StoreConsumerOffset` that a consumer sends itself, with a quorum ack, on a
+geo or shadow partition, commits as any other and is answered only once the
+node's object of the log holds the position it stored. The consumer is a
+group, the external offsets of a group, or a plain consumer. Shard 0 then
+runs a round of that topic between the periodic ones: the primary folds the
+commit, and the node stores the object. A store that finds no round running
+and none started in the last `[geo] consumer_offset_upload_interval` (50 ms
+by default) starts one at once, and the stores that arrive meanwhile share the
+next one, so a busy log costs one put an interval and not one a store. The
+puts take the fresh upload slots of shard 0 (`[tiered_storage.jobs]
+fresh_uploads`), so they never wait for an idle shard. A put that fails is tried again in a later round, after a wait that doubles from
+twice the interval up to a second. A store whose position is not stored
+within 10 seconds, or whose partition stops being led here, is answered with
+`TransientNotCommitted` (57): its commit stands, and the SDK sends the same
+request again, which the partition answers from its dedup table and which
+waits again, on the current primary. `disabled` answers these stores at the
+commit, as a poll's `auto_commit` always is. The HTTP API refuses group
+offset stores, so they all come over the binary transports.
+
+Every `[geo] positions_poll_interval` (1 second by default), shard 0 of each
+node that leads a partition of a geo or shadow topic lists
+`<prefix>/meta/positions/` in the store of each peer, reads the objects whose
+etag changed, and takes the highest position of each group across the
+peer's nodes. The partition's primary commits the positions that win over
+its own. It does not move a group that has members in this cluster, whose
+consumers' commits decide its position here, except in the wait after a
+start described below, when no group reads. A position ahead of what the
+partition serves is kept, and the group's polls wait there. A position for a
+group name that does not exist here is kept until a group of that name is
+created. That group's first polls wait until the position is bound to it.
+
+After a node starts, the polls of groups and plain consumers on geo and shadow
+partitions, and the reads of external offsets there, wait, with
+`TransientNotAccepted` (58), until the partition took the positions of every
+peer once, or until `[geo] positions_resume_timeout` (10 seconds by default)
+passed. A datacenter that returns therefore resumes a group from where the
+other datacenters left it.
+
+A group moved to another datacenter needs no step to hand over its
+positions. Stop its consumers, wait `positions_poll_interval` until the
+other datacenter took the last position (plus `positions_publish_interval`
+for a group that commits on read), and start them there. A group whose
+consumers start sooner keeps the position its datacenter took before them,
+and reads again what came after it, skipping nothing.
+
+Each shard exports:
+
+- `geo_peer_position_requests_total` and `geo_peer_position_failures_total`,
+  per `origin` and `request` (`list` or `get`), count the requests for the
+  peer's positions and the ones that failed.
+- `geo_peer_positions_adopted_total`, per `origin`, counts the positions of
+  the peer that the partitions here proposed to take.
+- `geo_positions_stored_total` and `geo_positions_store_failures_total` count
+  the objects of positions that the node stored and the ones its store
+  refused.
+- `geo_positions_commits_confirmed_total` and
+  `geo_positions_commits_uncertain_total` count the group offset stores
+  answered once their positions were stored, and the ones answered with 57.
+- `geo_positions_resume_waiting` is 1 while group polls on the shard wait for
+  the peers' positions after a start.
+
 ## Resource options
 
 Streams, topics and users take their settings from one option catalog. The binary `DescribeOptions` command (13), `GET /options/{scope}` over HTTP (`stream`, `topic` or `user`) and `iggy options <scope>` list every key a client can see with its kind, default, description and five flags: updatable, resettable, secret, read-only and critical.
 
-Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy`, `replication_factor` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
+Most keys are fixed at create. A topic's `compression_algorithm`, `segment_size`, `durability`, `consumer_offset_durability`, `partition_resize_policy`, `replication_factor`, `topic_type`, `geo_mode` and save thresholds, and a stream's `encryption_key`, are refused by an update with `OptionNotUpdatable` (4103). `compression_algorithm` is create-only because the server never applies it and stored batches carry no codec marker.
 
-The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
+A topic's `topic_type` is `normal` or `geo`. A topic without it is stored as `normal`. A geo topic's partitions upload each send to the object store before they commit it, see [geo topics](docs/GEO_TOPICS.md). The cluster accepts a geo topic only while every node passes the store identity check of [tiered storage](#tiered-storage). Until then, the server refuses it with `FeatureUnavailable` (5).
+
+Only a geo topic has a `geo_mode`: `geo` or `geo_tiered`. A geo topic without one is stored with `geo`. Clients cannot pick `geo_tiered` yet, and the server refuses it with `FeatureUnavailable` (5). The server refuses a normal topic that sets a mode with `InvalidOptionValue` (4042).
+
+A geo topic keeps its name, its partition count and its options, all but its durations. The server stores `partition_resize_policy` as `fixed` on it, so adding or deleting its partitions returns `PartitionResizeDisabled` (2023). An update of its name or of any other option returns `OptionNotUpdatable` (4103).
+
+A geo topic can set six durations, each of which overrides the server setting of the same name for this topic: `fresh_upload_interval`, `consumer_offset_upload_interval`, `positions_publish_interval`, `tombstone_grace`, `positions_resume_timeout` and `long_term_rewrite_max_interval`.
+Unset, each node applies its own setting. An update can change them, and a reset of one returns `OptionNotResettable` (4104). A normal topic that sets one returns `InvalidOptionValue` (4042). See [durations of a geo topic](docs/GEO_TOPICS.md#durations-of-a-geo-topic).
+
+A create that sets `tiered_storage` to `true`, or a `partition_resize_policy` other than `fixed`, on a geo topic returns `InvalidOptionValue` (4042). A geo topic in an encrypted stream returns `FeatureUnavailable` (5), because its sends reach the object store before the stream's encryption runs.
+
+Both keys are critical. A node on a build without them refuses a topic that sets them, and does not serve it as a normal topic.
+
+The updatable keys are `name` for streams and topics, `username` and `status` for users, and a topic's `message_expiry` and `max_topic_size`. The durations of a geo topic are updatable too. Only those two topic keys can be reset to their default, any other reset is refused with `OptionNotResettable` (4104). Read-only keys, such as the stream key projections below, are refused with `ReadOnlyOption` (4105).
 
 Only root may rename the root user or change its status. Root cannot deactivate itself. These requests return `CannotModifyRootUser` (4108), and a rejected update leaves root active with its existing username.
 
@@ -492,6 +1044,34 @@ The primary logs each sweep that rewraps streams, each stream it cannot rewrap, 
 
 A stream created during phase 1 also carries a wrap under the old key until phase 2 drops it. Rotation changes only the wraps, so whoever already holds a stream's data key, or an old wrap together with the old server key, can still read that stream. Changing a stream's own data key is not supported.
 
+## List pages
+
+The binary list commands answer one page at a time: `GetUsers` (32), `GetStreams` (201), `GetTopics` (301), `GetPartitions` (404) and `GetConsumerGroups` (601). Each request ends with a page block. The block holds the order (`id` or `created`), a descending flag and a limit from 1 to 1000. It can also hold a cursor and a name filter. The server refuses a request without the block, or with a value out of range, with `InvalidCommand` (3).
+
+On the command line, `iggy stream list`, `iggy topic list`, `iggy partition list`, `iggy consumer-group list` and `iggy user list` read pages. They take `--desc`, `--limit` and `--after`, and all but `iggy partition list` also take `--sort` and `--name`.
+
+The `created` order sorts by creation time and then by id, so entities created at the same time keep a fixed order. Partitions and consumer groups walk by id in both orders, because their ids follow creation. The name filter keeps the entries whose name holds the text, case-sensitive. A partition has no name, so the server refuses `GetPartitions` with a name.
+
+A page ends at its limit, before its items pass 1 MiB, or after the walk passes 65536 entries. The first item always fits, so every read moves forward. A page can hold fewer items than the limit, or none, and still carry a `next` cursor. Read pages until `next` is absent. Cursors print as `pg1_` tokens. A cursor holds only a position, so send it back with the same order, direction, filter and parent.
+
+Each page is a separate read of one node. An entity that exists during the whole walk and matches the filter appears exactly once. An entity that someone creates or deletes during the walk can appear or not appear, so a walk is not a snapshot. Use `GetMetadataChanges` for an exact copy. If the pages of one walk come from different nodes, a later page can come from an older state. Over HTTP, `consistency=linearizable` sends every page read to the primary.
+
+`GetStreams` and `GetTopics` need only an authenticated caller. They list the streams `GetStream` serves the caller and the topics `GetTopic` serves it, so a caller without a grant reads an empty last page. A stream or topic grant lists its stream or topic.
+
+A caller that reads a stream only through topic grants does not see the stream in `GetStreams`, because a stream entry carries totals over all its topics, and lists those topics with `GetTopics` under the stream id it knows. In either sort order, a scoped page counts only entries covered by the caller's read grants toward the 65536-entry scan limit. A name filter can still leave a page empty with a cursor.
+
+`GetTopics` for a stream that does not exist, or that no grant of the caller reaches, answers an empty last page without walking it. With a cursor, a caller with a global read grant gets `StreamIdNotFound` (1009) for a missing stream, because the stream was deleted during the walk. Every other caller gets the empty last page, so a missing and a hidden stream read the same. `GetPartitions` and `GetConsumerGroups` answer the not-found error of the missing stream or topic.
+
+Over HTTP, four routes take the page keys `order`, `descending`, `limit`, `cursor` and `name`, next to `consistency`. They are `GET /streams`, `GET /streams/{stream_id}/topics`, `GET /streams/{stream_id}/topics/{topic_id}/consumer-groups` and `GET /users`. If the query has `limit` or `cursor`, the route returns one page as `{"items": [...], "next": "pg1_..."}`, and the last page has no `next`.
+
+Without `limit` and `cursor`, these four routes return a bare array of every item. The array follows `order` and `descending` and holds only the items that match `name`. The server builds that array from pages of 1000, so it is not one consistent read either. `GET /streams/{stream_id}/topics/{topic_id}/partitions` always returns a page.
+
+The server refuses an unknown, repeated or malformed query key with 400. The list routes of server 0.10.0 ignored an unknown key, for example the cache buster `?_=1699`, so a client that sends one now gets 400.
+
+The cap `MAX_RECORD_REPLY_SIZE` is a little over 64 MB. If the binary reply frame of `GetClients` or of a metadata read passes it, the server answers with `ReplyTooLarge` (97). The metadata reads are those of streams, topics, partitions, consumer groups, users, options, stats and cluster metadata. The connection stays open. A page stays far below that cap. `GetStream`, `GetTopic` and `GetClients` can pass it on a very large catalog.
+
+`GetSnapshot` does not use this cap. It refuses an archive frame above 64 MiB, the frame limit of the message bus, with `SnapshotFileCompletionFailed`. HTTP replies have no such cap.
+
 ## Metadata changes
 
 Each node keeps a bounded log of the public results of committed metadata operations: streams, topics, partition counts, consumer groups and their members, users, personal access tokens and sessions. One operation can produce several records, for example a stream delete followed by the permission updates that pruned grants on it. Refused, denied and no-op operations produce none. Records are produced by the state machine on every replica alike, so a cursor taken on one node continues on another.
@@ -521,11 +1101,11 @@ admission.
 Executable packaging does not affect that identity, so stripping or rebuilding
 the same compatible release does not by itself prevent a replica from joining.
 
-This checkout uses protocol 0.12.0, and 0.12.0 is also its minimum. It is a breaking change: released `server-0.9.0` uses protocol 0.11.0 and accepts every 0.11.x patch, so it rejects 0.12.0 clients before decoding their login, and this server rejects 0.11.x clients the same way. The retired update commands and the removed fixed topic fields mean older clients cannot work against it in any case.
+This checkout accepts client protocol 0.12.3 at login. Replica wire revision 4 is checked separately when servers connect.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 15 is the current format and 14 the oldest readable one. A data directory holding an older snapshot is refused, and journals written by older builds hold operations this build no longer knows. Start this release from fresh storage on every replica.
+Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Start this release from fresh storage on every replica.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The
@@ -539,7 +1119,7 @@ Replacing the binary does not migrate old data. Use the offline re-ingestion
 procedure above for an upgrade. A recovery from a backup must use a separately
 verified, compatible backup; copying a format marker is not a migration.
 
-Within compatible `IGGY-METADATA-CHANGE-LOG-1` storage, this release reads superblock
+Within compatible `IGGY-TIERED-SEGMENT-CHAIN-2` storage, this release reads superblock
 envelope versions 1 and 2 and writes version 2. Legacy 66- and 74-byte consensus
 records remain readable. New records atomically retain an adopted view, its
 advertised head and exact prepare headers alongside the existing consensus state.
@@ -612,8 +1192,8 @@ Before a partition can serve, initialization publishes its incarnation in
 `partition-initialization/<namespace>/created.revision` under the system data
 directory. This atomic record remains outside the partition directory, including
 after that directory is lost. Preserve it with metadata and partition backups.
-Storage format `IGGY-METADATA-CHANGE-LOG-1` requires this initialization contract;
-older data directories are refused before mutation.
+
+Storage format `IGGY-TIERED-SEGMENT-CHAIN-2` requires this initialization record. The server refuses older directories before writing to them.
 
 Retirement also writes `retirement.fence` in that external namespace directory
 before counting a permanently failed partition as retired. The fence names the
@@ -623,11 +1203,19 @@ If the fence cannot be persisted, the session remains retained and retirement
 retries. Temporary teardown tombstones and state transfer do not qualify as
 permanent failures.
 
-Partition retirement barriers batch up to 128 ended sessions per commit. Each
-session still requires retirement reports covering every allocated partition
-from a common replica quorum before metadata releases its registry slot. Segment
-deletion does not invalidate those reports; changes to partition incarnations
-do. Metadata snapshot format 10 persists that separate revision.
+Each node retires ended sessions in batches. When a walk starts, its watermark
+is the highest end op among the ended sessions. Its batch is every session that
+ended at or below the watermark. The walk visits each partition that the node
+stores. A partition proves the batch once its metadata frontier reaches the
+watermark and no batch session holds an entry or a pending request on it. A
+partition retirement barrier names up to 128 of the sessions that
+still hold entries, and it raises the frontier.
+
+A partition created above the watermark cannot hold a session of the batch, so
+the walk skips it. A topic created or deleted during a walk does not restart
+it. Metadata releases the registry slots of every session at or below the
+lowest watermark among the reports of a replica quorum. A partition whose
+members did not prove the batch owes the retirement, as described above.
 
 A committed partition that has never initialized on this replica can finish
 initialization after a crash, including when all replicas stopped before their

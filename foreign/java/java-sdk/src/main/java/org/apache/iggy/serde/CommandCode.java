@@ -35,6 +35,7 @@ public interface CommandCode {
         BIND_SESSION(15),
         UPDATE_RESOURCE(16),
         GET_METADATA_CHANGES(17),
+        RETIRE_GEO_ORIGIN(18),
         GET_ME(20),
         GET_CLIENT(21),
         GET_ALL_CLIENTS(22);
@@ -173,7 +174,8 @@ public interface CommandCode {
 
     enum Partition implements CommandCode {
         CREATE(402),
-        DELETE(403);
+        DELETE(403),
+        GET_ALL(404);
 
         private final int value;
 

@@ -60,6 +60,11 @@ final class SystemTcpClient implements SystemClient {
     }
 
     @Override
+    public void retireGeoOrigin(String origin) {
+        FutureUtil.resolve(delegate.retireGeoOrigin(origin));
+    }
+
+    @Override
     public ClientInfoDetails getMe() {
         return FutureUtil.resolve(delegate.getMe());
     }

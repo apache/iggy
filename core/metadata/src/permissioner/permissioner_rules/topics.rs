@@ -27,56 +27,10 @@ impl Permissioner {
         stream_id: usize,
         topic_id: usize,
     ) -> Result<(), IggyError> {
-        if let Some(global) = self.users_permissions.get(&user_id)
-            && (global.read_streams
-                || global.manage_streams
-                || global.manage_topics
-                || global.read_topics)
-        {
-            return Ok(());
-        }
-
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
-        {
-            if stream_permissions.manage_stream
-                || stream_permissions.read_stream
-                || stream_permissions.manage_topics
-                || stream_permissions.read_topics
-            {
-                return Ok(());
-            }
-
-            if let Some(topics) = &stream_permissions.topics
-                && let Some(topic_permissions) = topics.get(&topic_id)
-                && (topic_permissions.manage_topic || topic_permissions.read_topic)
-            {
-                return Ok(());
-            }
-        }
-
-        Err(IggyError::Unauthorized)
-    }
-
-    pub fn get_topics(&self, user_id: u32, stream_id: usize) -> Result<(), IggyError> {
-        if let Some(global) = self.users_permissions.get(&user_id)
-            && (global.read_streams
-                || global.manage_streams
-                || global.manage_topics
-                || global.read_topics)
-        {
-            return Ok(());
-        }
-
-        if let Some(stream_permissions) = self.users_streams_permissions.get(&(user_id, stream_id))
-            && (stream_permissions.manage_stream
-                || stream_permissions.read_stream
-                || stream_permissions.manage_topics
-                || stream_permissions.read_topics)
-        {
-            return Ok(());
-        }
-
-        Err(IggyError::Unauthorized)
+        self.read_grants(user_id, stream_id)
+            .reads_topic(topic_id)
+            .then_some(())
+            .ok_or(IggyError::Unauthorized)
     }
 
     /// Inheritance: `manage_streams` -> `manage_topics`

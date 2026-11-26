@@ -775,6 +775,26 @@ func (e DeferredPollCapacityExceeded) Is(target error) bool {
 	return ok
 }
 
+type TieredReadFailed struct{}
+
+func (e TieredReadFailed) Error() string {
+	return "tiered data cannot be read from the object store; a retry does not help"
+}
+func (e TieredReadFailed) Code() Code { return 96 }
+func (e TieredReadFailed) Is(target error) bool {
+	_, ok := target.(TieredReadFailed)
+	return ok
+}
+
+type ReplyTooLarge struct{}
+
+func (e ReplyTooLarge) Error() string { return "the reply is larger than the reply size limit" }
+func (e ReplyTooLarge) Code() Code    { return 97 }
+func (e ReplyTooLarge) Is(target error) bool {
+	_, ok := target.(ReplyTooLarge)
+	return ok
+}
+
 type ClientNotFound struct {
 	ID uint32
 }
@@ -1149,6 +1169,17 @@ func (e TooManyStreams) Error() string { return "too many streams" }
 func (e TooManyStreams) Code() Code    { return 1020 }
 func (e TooManyStreams) Is(target error) bool {
 	_, ok := target.(TooManyStreams)
+	return ok
+}
+
+type ShadowStreamReadOnly struct{}
+
+func (e ShadowStreamReadOnly) Error() string {
+	return "the stream is a shadow of another cluster's stream and takes no writes"
+}
+func (e ShadowStreamReadOnly) Code() Code { return 1021 }
+func (e ShadowStreamReadOnly) Is(target error) bool {
+	_, ok := target.(ShadowStreamReadOnly)
 	return ok
 }
 
@@ -2983,6 +3014,8 @@ var (
 	ErrLifecycleBusy                              = LifecycleBusy{}
 	ErrNotPrimary                                 = NotPrimary{}
 	ErrDeferredPollCapacityExceeded               = DeferredPollCapacityExceeded{}
+	ErrTieredReadFailed                           = TieredReadFailed{}
+	ErrReplyTooLarge                              = ReplyTooLarge{}
 	ErrClientNotFound                             = ClientNotFound{}
 	ErrInvalidClientId                            = InvalidClientId{}
 	ErrConnectionClosed                           = ConnectionClosed{}
@@ -3017,6 +3050,7 @@ var (
 	ErrCannotReadStreams                          = CannotReadStreams{}
 	ErrInvalidTopicSize                           = InvalidTopicSize{}
 	ErrTooManyStreams                             = TooManyStreams{}
+	ErrShadowStreamReadOnly                       = ShadowStreamReadOnly{}
 	ErrCannotCreateTopicsDirectory                = CannotCreateTopicsDirectory{}
 	ErrCannotCreateTopicDirectory                 = CannotCreateTopicDirectory{}
 	ErrCannotCreateTopicInfo                      = CannotCreateTopicInfo{}
@@ -3249,6 +3283,8 @@ const (
 	LifecycleBusyCode                              Code = 88
 	NotPrimaryCode                                 Code = 89
 	DeferredPollCapacityExceededCode               Code = 90
+	TieredReadFailedCode                           Code = 96
+	ReplyTooLargeCode                              Code = 97
 	ClientNotFoundCode                             Code = 100
 	InvalidClientIdCode                            Code = 101
 	ConnectionClosedCode                           Code = 206
@@ -3283,6 +3319,7 @@ const (
 	CannotReadStreamsCode                          Code = 1015
 	InvalidTopicSizeCode                           Code = 1019
 	TooManyStreamsCode                             Code = 1020
+	ShadowStreamReadOnlyCode                       Code = 1021
 	CannotCreateTopicsDirectoryCode                Code = 2000
 	CannotCreateTopicDirectoryCode                 Code = 2001
 	CannotCreateTopicInfoCode                      Code = 2002
@@ -3587,6 +3624,10 @@ func (c Code) String() string {
 		return "NotPrimary"
 	case DeferredPollCapacityExceededCode:
 		return "DeferredPollCapacityExceeded"
+	case TieredReadFailedCode:
+		return "TieredReadFailed"
+	case ReplyTooLargeCode:
+		return "ReplyTooLarge"
 	case ClientNotFoundCode:
 		return "ClientNotFound"
 	case InvalidClientIdCode:
@@ -3655,6 +3696,8 @@ func (c Code) String() string {
 		return "InvalidTopicSize"
 	case TooManyStreamsCode:
 		return "TooManyStreams"
+	case ShadowStreamReadOnlyCode:
+		return "ShadowStreamReadOnly"
 	case CannotCreateTopicsDirectoryCode:
 		return "CannotCreateTopicsDirectory"
 	case CannotCreateTopicDirectoryCode:
@@ -4116,6 +4159,10 @@ func FromCode(code Code) IggyError {
 		return ErrNotPrimary
 	case DeferredPollCapacityExceededCode:
 		return ErrDeferredPollCapacityExceeded
+	case TieredReadFailedCode:
+		return ErrTieredReadFailed
+	case ReplyTooLargeCode:
+		return ErrReplyTooLarge
 	case ClientNotFoundCode:
 		return ErrClientNotFound
 	case InvalidClientIdCode:
@@ -4184,6 +4231,8 @@ func FromCode(code Code) IggyError {
 		return ErrInvalidTopicSize
 	case TooManyStreamsCode:
 		return ErrTooManyStreams
+	case ShadowStreamReadOnlyCode:
+		return ErrShadowStreamReadOnly
 	case CannotCreateTopicsDirectoryCode:
 		return ErrCannotCreateTopicsDirectory
 	case CannotCreateTopicDirectoryCode:

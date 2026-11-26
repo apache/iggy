@@ -29,10 +29,9 @@ use std::time::Duration;
 /// and the rounding error stays around one part in a thousand.
 const TARGET_CELLS_PER_SECOND: u64 = 1_000_000;
 
-/// Default burst window. After a stall, an actor catches up at most this much time, so a batch
-/// that takes longer lowers the achieved rate. A whole second of credit would end a stall in a
-/// spike far above the rate, and the spike would land on the measured latency. Consumers that
-/// report message age pass a larger window, because they must drain the backlog of a stall.
+/// After a stall, an actor catches up at most this much time, so a batch that takes longer lowers
+/// the achieved rate. A whole second of credit would end a stall in a spike far above the rate,
+/// and the spike would land on the measured latency.
 const BURST_WINDOW_MILLIS: u64 = 100;
 
 const NANOS_PER_SECOND: u64 = 1_000_000_000;
@@ -45,16 +44,19 @@ pub struct BenchmarkRateLimiter {
     burst_cells: NonZeroU32,
     /// Unused bytes in the last paid cell, always less than `cell_bytes`.
     unused_cell_bytes: u64,
+    /// Share of the first batch that is charged a second time, in units of `1 / 2^32`. `None`
+    /// when no such charge is due.
+    ///
+    /// An actor sends a batch and then waits here, so its schedule starts when the limiter is
+    /// created. Without this charge, actors that start together send in phase for the whole
+    /// run, and their batches queue behind each other on the server. The charge moves each
+    /// schedule by a random part of one batch period.
+    start_phase: Option<u32>,
 }
 
 impl BenchmarkRateLimiter {
     pub fn new(bytes_per_second: IggyByteSize) -> Self {
-        Self::with_burst_window(bytes_per_second, Duration::from_millis(BURST_WINDOW_MILLIS))
-    }
-
-    pub fn with_burst_window(bytes_per_second: IggyByteSize, burst_window: Duration) -> Self {
-        let (quota, cell_bytes, burst_cells) =
-            Self::quota_for(bytes_per_second.as_bytes_u64(), burst_window);
+        let (quota, cell_bytes, burst_cells) = Self::quota_for(bytes_per_second.as_bytes_u64());
 
         let rate_limiter = GovernorRateLimiter::direct(quota);
         // Spend the burst budget up front, so the first batches of a run are paced like every
@@ -66,6 +68,7 @@ impl BenchmarkRateLimiter {
             cell_bytes,
             burst_cells,
             unused_cell_bytes: 0,
+            start_phase: Some(rand::random()),
         }
     }
 
@@ -76,7 +79,8 @@ impl BenchmarkRateLimiter {
     /// nanoseconds, and clamps every rate past 1e9 cells/s to one nanosecond per cell. Sizing
     /// the cell first keeps the period near a microsecond, where the same truncation costs a
     /// thousandth of the rate.
-    fn quota_for(bytes_per_second: u64, burst_window: Duration) -> (Quota, u64, NonZeroU32) {
+    fn quota_for(bytes_per_second: u64) -> (Quota, u64, NonZeroU32) {
+        let burst_window = Duration::from_millis(BURST_WINDOW_MILLIS);
         let bytes_per_second = bytes_per_second.max(1);
         let cell_bytes = (bytes_per_second / TARGET_CELLS_PER_SECOND).max(1);
         let cells_per_second = (bytes_per_second / cell_bytes).max(1);
@@ -98,6 +102,7 @@ impl BenchmarkRateLimiter {
     /// window of data asks for one. Such a charge is taken in successive calls, which together
     /// take the same time as one call would.
     pub async fn wait_until_necessary(&mut self, bytes: u64) {
+        let bytes = bytes.saturating_add(self.take_start_phase_bytes(bytes));
         let credited_bytes = bytes.min(self.unused_cell_bytes);
         let uncredited_bytes = bytes - credited_bytes;
         // Empty polls still pass through the limiter.
@@ -125,20 +130,30 @@ impl BenchmarkRateLimiter {
             self.unused_cell_bytes = self.cell_bytes - remainder;
         }
     }
+
+    /// Extra bytes that the first batch pays for the start phase. Less than `bytes`.
+    fn take_start_phase_bytes(&mut self, bytes: u64) -> u64 {
+        // An empty poll has no bytes to scale, so the phase waits for the first batch.
+        self.start_phase.take_if(|_| bytes > 0).map_or(0, |share| {
+            let extra_bytes = (u128::from(bytes) * u128::from(share)) >> u32::BITS;
+            u64::try_from(extra_bytes).unwrap_or(u64::MAX)
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures_util::FutureExt;
-    use tokio::time::{Instant, sleep, timeout};
+    use tokio::time::{Instant, timeout};
 
     const TEST_RATE: u64 = 1_000;
-    const CATCH_UP_WINDOW: Duration = Duration::from_secs(1);
-    const STALL: Duration = Duration::from_millis(500);
-    const CATCH_UP_DEADLINE: Duration = Duration::from_millis(200);
+    const PACING_DEADLINE: Duration = Duration::from_secs(1);
     const TEST_CELL_BYTES: u64 = 1_000;
     const TEST_REPLENISH_PERIOD: Duration = Duration::from_hours(1);
+    const HALF_SHARE: u32 = 1 << 31;
+    const BATCH_CELLS: u32 = 10;
+    const HALF_BATCH_CELLS: u32 = BATCH_CELLS / 2;
 
     #[test]
     fn given_fractional_batches_when_charged_should_match_combined_batch() {
@@ -178,7 +193,7 @@ mod tests {
     #[test]
     fn given_maximum_byte_charges_when_pacing_should_not_overflow() {
         const BATCH_COUNT: u32 = 2;
-        let (_, cell_bytes, _) = BenchmarkRateLimiter::quota_for(u64::MAX, CATCH_UP_WINDOW);
+        let (_, cell_bytes, _) = BenchmarkRateLimiter::quota_for(u64::MAX);
         let total_bytes = u128::from(u64::MAX) * u128::from(BATCH_COUNT);
         let cells = u32::try_from(total_bytes.div_ceil(u128::from(cell_bytes))).unwrap();
         let mut limiter = with_available_cells(cell_bytes, cells);
@@ -217,18 +232,58 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn given_consumer_stall_when_catching_up_should_use_banked_credit() {
-        let mut limiter =
-            BenchmarkRateLimiter::with_burst_window(TEST_RATE.into(), CATCH_UP_WINDOW);
-        sleep(STALL).await;
+    #[test]
+    fn given_a_start_phase_when_charging_batches_should_charge_its_share_once() {
+        let batch_bytes = u64::from(BATCH_CELLS) * TEST_CELL_BYTES;
+        let mut limiter = with_available_cells(TEST_CELL_BYTES, HALF_BATCH_CELLS + 2 * BATCH_CELLS);
+        limiter.start_phase = Some(HALF_SHARE);
 
-        timeout(
-            CATCH_UP_DEADLINE,
-            limiter.wait_until_necessary(TEST_RATE / 2),
-        )
-        .await
-        .expect("a consumer must drain half a second of backlog from its accumulated credit");
+        for batch in 0..2 {
+            assert_eq!(
+                limiter.wait_until_necessary(batch_bytes).now_or_never(),
+                Some(()),
+                "batch {batch}: only the first batch must pay the start phase"
+            );
+        }
+        assert!(
+            limiter.rate_limiter.check().is_err(),
+            "the first batch must pay half a batch more"
+        );
+    }
+
+    #[test]
+    fn given_a_start_phase_when_an_empty_poll_comes_first_should_charge_the_first_batch() {
+        const EMPTY_POLL_CELLS: u32 = 1;
+        let batch_bytes = u64::from(BATCH_CELLS) * TEST_CELL_BYTES;
+        let mut limiter = with_available_cells(
+            TEST_CELL_BYTES,
+            EMPTY_POLL_CELLS + HALF_BATCH_CELLS + BATCH_CELLS,
+        );
+        limiter.start_phase = Some(HALF_SHARE);
+
+        assert_eq!(limiter.wait_until_necessary(0).now_or_never(), Some(()));
+        assert_eq!(
+            limiter.wait_until_necessary(batch_bytes).now_or_never(),
+            Some(())
+        );
+        assert!(
+            limiter.rate_limiter.check().is_err(),
+            "the batch after the empty poll must pay the start phase"
+        );
+    }
+
+    #[test]
+    fn given_a_start_phase_when_charging_the_largest_batch_should_not_overflow() {
+        let (_, cell_bytes, _) = BenchmarkRateLimiter::quota_for(u64::MAX);
+        let cells = u32::try_from(u64::MAX.div_ceil(cell_bytes)).unwrap();
+        let mut limiter = with_available_cells(cell_bytes, cells);
+        limiter.start_phase = Some(u32::MAX);
+
+        assert_eq!(
+            limiter.wait_until_necessary(u64::MAX).now_or_never(),
+            Some(())
+        );
+        assert!(limiter.rate_limiter.check().is_err());
     }
 
     #[tokio::test]
@@ -238,7 +293,7 @@ mod tests {
         let mut limiter = BenchmarkRateLimiter::new(TEST_RATE.into());
         let bytes = BURSTS * u64::from(limiter.burst_cells.get()) * limiter.cell_bytes;
 
-        timeout(CATCH_UP_WINDOW, limiter.wait_until_necessary(bytes))
+        timeout(PACING_DEADLINE, limiter.wait_until_necessary(bytes))
             .await
             .expect("an oversized charge must complete in successive bursts");
 
@@ -261,8 +316,7 @@ mod tests {
             350_000_000,
             2_000_000_000,
         ] {
-            let (quota, cell_bytes, _) =
-                BenchmarkRateLimiter::quota_for(rate, Duration::from_millis(BURST_WINDOW_MILLIS));
+            let (quota, cell_bytes, _) = BenchmarkRateLimiter::quota_for(rate);
             let period_ns = quota.replenish_interval().as_nanos() as f64;
             let replenished_bytes_per_second = 1e9 / period_ns * cell_bytes as f64;
             let error = (replenished_bytes_per_second - rate as f64).abs() / rate as f64;
@@ -283,6 +337,7 @@ mod tests {
             cell_bytes,
             burst_cells,
             unused_cell_bytes: 0,
+            start_phase: None,
         }
     }
 }

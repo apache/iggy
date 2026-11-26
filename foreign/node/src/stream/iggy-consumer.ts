@@ -40,7 +40,11 @@ export type ConsumerRequest = {
   streamId: Id,
   topicId: Id,
   partitions: number[],
-  /** Where a partition without a position starts, Next by default. */
+  /**
+   * Where a partition without a position starts, Next by default. With
+   * `CommitPolicy.OnRead` the start applies only to a partition without a
+   * stored offset. A partition with one resumes after it.
+   */
   start?: PollingStrategy,
   /** The limits of each read and the commit policy. A read waits up to 5 s by default. */
   options?: Partial<PollOptions>,
@@ -53,10 +57,16 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
 
 /**
  * Hands over the messages of a topic one at a time, on a `PartitionReader`.
+ * After a loop ends, a later iteration or `consume()` continues with the next
+ * unread message of its batch. A seek drops the unread remainder for that
+ * partition, as does revocation under Manual or Auto. Use one iterator or
+ * handler loop at a time.
  * With `CommitPolicy.Manual` the application commits checkpoints. With
  * `CommitPolicy.OnRead` the server stores the offset of each read and
- * `shutdown()` moves it back to the last message handed over. With
- * `CommitPolicy.Auto` a message counts when it is handed over
+ * `shutdown()` moves it back to the last message handed over. It does not
+ * move the offset of a partition that left the assignment, so the group
+ * loses the messages of that partition that the consumer did not hand over.
+ * With `CommitPolicy.Auto` a message counts when it is handed over
  * (`after: delivery`), once the iterator is read again or the handler of
  * `consume()` returns with success (`after: processing`), or on `mark()`,
  * and the latest counted position is stored at the interval or event of the
@@ -64,13 +74,16 @@ export type ConsumerGroupRequest = Omit<ConsumerRequest, 'partitions'>;
  * to `onError` and the consumer goes on. A stop of a partition
  * (`stopsPartition`) ends the iteration with its `ReadError`, and so does a
  * message that does not decode, whose `skip` passes it with `seek`. A
- * `resumable` stop reads again after a `seek` to Next.
+ * `resumable` stop reads again after a `seek` to Next. A lost range (`lost`)
+ * ends the iteration with its `ReadError` too. The reader reads on after
+ * that range, so a new iteration hands over the messages after it.
  */
 export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   private uncounted?: { checkpoint: Checkpoint, endsBatch: boolean };
   private stopped = false;
-  /** The batch whose messages the consumer hands over, until a seek of its partition drops the rest. */
+  /** The batch retained across loops while the reader still allows delivery. */
   private current?: PolledBatch;
+  private index = 0;
 
   /** @internal */
   constructor(
@@ -87,13 +100,14 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   }
 
   async *[Symbol.asyncIterator](): AsyncIterator<ConsumerMessage> {
+    this.countProcessed();
     while (!this.stopped) {
       const batch = await this.nextBatch();
       if (!batch) return;
       this.current = batch;
-      for (let index = 0; index < batch.messages.length && this.current === batch; index += 1) {
+      while (this.index < batch.messages.length && this.current === batch && this.reader.keepsBatch(batch)) {
         if (this.stopped) return;
-        const message = this.hand(batch, index);
+        const message = this.hand(batch, this.index++);
         yield message;
         this.countProcessed();
       }
@@ -107,13 +121,14 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
    * handler runs leaves it uncounted too.
    */
   async consume(handler: (message: ConsumerMessage) => Promise<void> | void): Promise<void> {
+    this.countProcessed();
     while (!this.stopped) {
       const batch = await this.nextBatch();
       if (!batch) return;
       this.current = batch;
-      for (let index = 0; index < batch.messages.length && this.current === batch; index += 1) {
+      while (this.index < batch.messages.length && this.current === batch && this.reader.keepsBatch(batch)) {
         if (this.stopped) return;
-        const message = this.hand(batch, index);
+        const message = this.hand(batch, this.index++);
         // A shutdown while the handler runs must not count its message.
         const handled = this.uncounted;
         this.uncounted = undefined;
@@ -123,9 +138,13 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
     }
   }
 
-  /** Stores the offset of a checkpoint that this consumer handed over. */
-  commit(checkpoint: Checkpoint): Promise<void> {
-    return this.reader.commit(checkpoint);
+  /**
+   * Stores the offset of a checkpoint that this consumer handed over, as
+   * `PartitionReader.commit` does. `signal` ends the read for the owner of a
+   * store that the server refuses as not owned.
+   */
+  commit(checkpoint: Checkpoint, { signal }: { signal?: AbortSignal } = {}): Promise<void> {
+    return this.reader.commit(checkpoint, { signal });
   }
 
   /** Counts a checkpoint under `CommitPolicy.Auto` with `after: marked`. */
@@ -138,22 +157,23 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
    * does, and drops the rest of the batch of that partition that the consumer
    * hands over.
    */
-  async seek(partitionId: number, start: PollingStrategy): Promise<void> {
-    await this.reader.seek(partitionId, start);
-    if (this.current?.partitionId === partitionId) this.current = undefined;
+  seek(partitionId: number, start: PollingStrategy): Promise<void> {
+    return this.reader.seek(partitionId, start);
   }
 
   /**
    * Stops the consumer: counts the last message under `after: processing`,
    * closes the reader, which stores or rewinds the offsets, and leaves the group.
-   * A later call waits for the first one and ends as it does.
+   * `signal` of the first call ends the reads for the owner of the writes of
+   * the close, as `PartitionReader.close` describes. A later call waits for the
+   * first one and ends as it does. Its signal does not end the shutdown.
    */
-  async shutdown(): Promise<void> {
+  async shutdown({ signal }: { signal?: AbortSignal } = {}): Promise<void> {
     if (!this.stopped) {
       this.stopped = true;
       this.countProcessed();
     }
-    await this.reader.close();
+    await this.reader.close({ signal });
   }
 
   /**
@@ -181,12 +201,17 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   }
 
   private async nextBatch(): Promise<PolledBatch | undefined> {
+    if (this.current && this.index < this.current.messages.length && this.reader.keepsBatch(this.current))
+      return this.current;
+    this.current = undefined;
     while (true) {
       try {
-        return await this.reader.next();
+        const batch = await this.reader.next();
+        this.index = 0;
+        return batch;
       } catch (error) {
         if (this.stopped && !(error instanceof ReadError)) return undefined;
-        if (!(error instanceof ReadError) || error.skip || error.stopsPartition) throw error;
+        if (!(error instanceof ReadError) || error.skip || error.stopsPartition || error.lost) throw error;
         this.onError?.(error);
       }
     }
@@ -221,7 +246,13 @@ export const openConsumer = (getClient: ClientProvider) =>
 /** Opens a member of the consumer group `name`, created when it is missing. */
 export const openConsumerGroup = (getClient: ClientProvider) =>
   async ({ name, streamId, topicId, start, options, onError }: ConsumerGroupRequest): Promise<IggyConsumer> => {
-    await ensureConsumerGroup(getClient)(streamId, topicId, String(name));
+    try {
+      await ensureConsumerGroup(getClient)(streamId, topicId, String(name));
+    } catch (error) {
+      // No later step takes this create on, so nobody resolves it.
+      await PartitionReader.abandonUnknown(getClient, error);
+      throw error;
+    }
     return new IggyConsumer(await PartitionReader.open(getClient, {
       streamId, topicId, consumer: { kind: ConsumerKind.Group, id: name }, start, options
     }), afterOf(options), onError);

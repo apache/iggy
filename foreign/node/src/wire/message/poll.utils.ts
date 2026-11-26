@@ -375,9 +375,15 @@ export const deserializePollMessages = (r: Buffer, pos = 0) => {
   const count = r.readUInt32LE(pos + 12);
   const context = deserializePartitionContext(r, pos + 16);
   const records = r.subarray(pos + POLL_RESPONSE_HEADER_SIZE);
-  const messages = deserializeMessages(records);
-  if (messages.length !== count)
-    throw new DeserializeError("poll response count does not match its messages", { record: records });
+  let messages: Message[];
+  try {
+    messages = deserializeMessages(records);
+    if (messages.length !== count)
+      throw new DeserializeError("poll response count does not match its messages", { record: records });
+  } catch (error) {
+    if (error instanceof DeserializeError) error.context = context;
+    throw error;
+  }
 
   return {
     partitionId,

@@ -28,6 +28,7 @@ use super::cluster::{
     ClusterTlsConfig, TransportPorts,
 };
 use super::external_auth::ExternalAuthConfig;
+use super::geo::GeoConfig;
 use super::message_bus::MessageBusConfig;
 use super::metadata::MetadataConfig;
 use super::node::NodeConfig;
@@ -35,6 +36,7 @@ use super::partition::PartitionConfig;
 use super::quic::{QuicCertificateConfig, QuicConfig};
 use super::server::ServerConfig;
 use super::tcp::{TcpConfig, TcpTlsConfig};
+use super::tiered_storage::TieredStorageConfig;
 use super::websocket::{WebSocketConfig, WebSocketTlsConfig};
 use crate::common::http::HttpConfig;
 use crate::common::server::{
@@ -71,6 +73,8 @@ impl Default for ServerConfig {
             partition: PartitionConfig::default(),
             message_bus: MessageBusConfig::default(),
             external_auth: ExternalAuthConfig::default(),
+            tiered_storage: TieredStorageConfig::default(),
+            geo: GeoConfig::default(),
         }
     }
 }
@@ -80,10 +84,25 @@ impl Default for ClusterConfig {
         ClusterConfig {
             enabled: SERVER_CONFIG.cluster.enabled,
             name: SERVER_CONFIG.cluster.name.parse().unwrap(),
-            heartbeat_timeout: SERVER_CONFIG.cluster.heartbeat_timeout.parse().unwrap(),
-            commit_broadcast_interval: SERVER_CONFIG
+            commit_heartbeat_grid: SERVER_CONFIG.cluster.commit_heartbeat_grid.parse().unwrap(),
+            commit_busy_heartbeat_interval: SERVER_CONFIG
                 .cluster
-                .commit_broadcast_interval
+                .commit_busy_heartbeat_interval
+                .parse()
+                .unwrap(),
+            commit_busy_heartbeat_timeout: SERVER_CONFIG
+                .cluster
+                .commit_busy_heartbeat_timeout
+                .parse()
+                .unwrap(),
+            commit_idle_heartbeat_interval: SERVER_CONFIG
+                .cluster
+                .commit_idle_heartbeat_interval
+                .parse()
+                .unwrap(),
+            commit_idle_heartbeat_timeout: SERVER_CONFIG
+                .cluster
+                .commit_idle_heartbeat_timeout
                 .parse()
                 .unwrap(),
             prepare_retransmit_interval: SERVER_CONFIG
@@ -189,6 +208,19 @@ impl Default for MetadataConfig {
     }
 }
 
+impl Default for NodeConfig {
+    fn default() -> NodeConfig {
+        NodeConfig {
+            advertised_address: None,
+            free_space_reserve: SERVER_CONFIG
+                .node
+                .free_space_reserve
+                .parse()
+                .expect("static_toml node.free_space_reserve must parse as IggyByteSize"),
+        }
+    }
+}
+
 impl Default for PartitionConfig {
     fn default() -> PartitionConfig {
         // Read from the embedded TOML so the Default impl and the on-disk
@@ -214,6 +246,22 @@ impl Default for PartitionConfig {
                 .expect("the embedded config.toml carries a nonzero offset_reservation_lease"),
             evicted_ring_capacity: partition.evicted_ring_capacity as usize,
             evicted_ring_bytes_max: partition.evicted_ring_bytes_max.parse().unwrap(),
+            journal_memory_node_bytes_max: partition
+                .journal_memory_node_bytes_max
+                .parse()
+                .expect("embedded node-wide repair ring budget is valid"),
+            checkpoint_idle_delay: partition
+                .checkpoint_idle_delay
+                .parse()
+                .expect("embedded checkpoint idle delay is valid"),
+            checkpoint_max_delay: partition
+                .checkpoint_max_delay
+                .parse()
+                .expect("embedded checkpoint max delay is valid"),
+            wal_reload_node_bytes_max: partition
+                .wal_reload_node_bytes_max
+                .parse()
+                .expect("embedded node-wide WAL reload budget is valid"),
             transfer_served_cache_bytes_max: partition
                 .transfer_served_cache_bytes_max
                 .parse()

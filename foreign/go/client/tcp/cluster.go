@@ -59,6 +59,11 @@ func (c *IggyTcpClient) GetClusterMetadata(ctx context.Context) (*iggcon.Cluster
 	}
 }
 
+func (c *IggyTcpClient) RetireGeoOrigin(ctx context.Context, origin string) error {
+	_, err := c.do(ctx, &command.RetireGeoOrigin{Origin: origin})
+	return err
+}
+
 func (c *IggyTcpClient) refreshRoster(ctx context.Context, link *tcpLink) error {
 	if link == nil {
 		link = c.links.any()
