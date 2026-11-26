@@ -49,7 +49,7 @@ impl IggyGeoConsumerBuilder {
     }
 
     /// Sets how often the consumer looks for shadow topics that appeared or went away. Five
-    /// seconds by default.
+    /// seconds by default. [`IggyGeoConsumer::init`] refuses an interval too long to schedule.
     pub fn discovery_interval(self, interval: NonZeroIggyDuration) -> Self {
         Self {
             discovery_interval: interval.get_duration(),
@@ -65,7 +65,7 @@ impl IggyGeoConsumerBuilder {
             self.consumer.topic_id().clone(),
             self.sources,
             self.discovery_interval,
-            Arc::new(ClientCatalog::new(self.consumer)),
+            Arc::new(ClientCatalog::new(self.consumer, self.discovery_interval)),
         )
     }
 }

@@ -603,12 +603,18 @@ let mut consumer = client
     .with_shadows()
     .build();
 consumer.init().await?;
+let mut outcome = Ok(());
 while let Some(received) = consumer.next().await {
-    let received = received?;
+    // The consumer reads on after an error of one topic.
+    let Ok(received) = received else { continue };
     // received.origin tells where the message was written.
-    consumer.commit(received.checkpoint()).await?;
+    if let Err(error) = consumer.commit(received.checkpoint()).await {
+        outcome = Err(error);
+        break;
+    }
 }
 consumer.shutdown().await?;
+outcome?;
 ```
 
 - The consumer reads `orders/payments` and the topic `payments` of each shadow stream of
@@ -622,11 +628,16 @@ consumer.shutdown().await?;
 - Order holds within one origin and partition only. Nothing orders the messages of two origins.
 - Messages of a shadow topic arrive seconds after those of the topic in this cluster, see
   [Delays](#delays). A topic that is slow or has no messages does not hold back the others.
+  The joins of the shadow topics share the requests of the client, so a slow join can delay
+  the other joins, but not the topics already read.
 - `sources` chooses the topics: `GeoSources::Both`, the default, `GeoSources::LocalOnly` or
   `GeoSources::ShadowsOnly`.
 - The consumer finds only the shadow streams that the user may read, because a list of the streams
   holds no other stream. A shadow topic that the consumer cannot open is reported once, and the
-  other topics are read on.
+  other topics are read on. The geo consumers of one client share a listing of the streams that
+  is younger than half their `discovery_interval`.
+- `init()` refuses HTTP, which cannot join a consumer group, and, when the consumer reads the
+  topic in this cluster, a topic that is not a geo topic or a stream that is a shadow stream.
 
 The other SDKs read the topic and each shadow topic with a consumer of their own.
 

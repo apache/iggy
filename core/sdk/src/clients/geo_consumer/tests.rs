@@ -30,20 +30,22 @@ use futures::task::{ArcWake, noop_waker_ref, waker};
 use futures::{FutureExt, Stream, StreamExt};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
-    Checkpoint, Consumer, Identifier, IggyError, IggyMessage, PartitionContext, PollingStrategy,
-    ReaderStamp,
+    AutoLogin, Checkpoint, Consumer, Identifier, IggyError, IggyMessage, PartitionContext,
+    PollingStrategy, ReaderStamp,
 };
 use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
 use super::{
-    GeoOrigin, GeoReadError, GeoReceivedMessage, GeoSources, IggyGeoConsumer, LogCatalog,
-    LogConsumer, ShadowStream, TopicNames,
+    Committer, GeoOrigin, GeoReadError, GeoReceivedMessage, GeoSources, IggyGeoConsumer,
+    ListingCache, LocalTopic, LogCatalog, LogConsumer, ShadowStream, TopicNames,
 };
 use crate::client_wrappers::client_wrapper::ClientWrapper;
 use crate::clients::consumer::ReceivedMessage;
 use crate::clients::consumer_builder::IggyConsumerBuilder;
 use crate::clients::reader::ReadError;
+use crate::http::http_client::HttpClient;
+use crate::session_owner::SessionOwner;
 use crate::tcp::tcp_client::TcpClient;
 
 const STREAM: &str = "orders";
@@ -486,7 +488,7 @@ async fn given_a_shutdown_cancelled_while_a_shadow_joins_when_shutdown_runs_agai
     let mut consumer = catalog.initialized(GeoSources::Both).await;
 
     cancel_after_polls(consumer.shutdown());
-    assert!(!catalog.log(STREAM).is_shut_down());
+    assert_eq!(catalog.opens_of(&shadow), 0);
     assert_eq!(consumer.init().await, Err(IggyError::InvalidConfiguration));
     assert!(consumer.next().await.is_none());
     gate.open();
@@ -622,6 +624,286 @@ async fn given_shadows_only_with_partitions_for_a_group_when_initializing_should
     assert_eq!(initialized, Err(IggyError::InvalidCommand));
 }
 
+#[tokio::test(start_paused = true)]
+async fn given_a_gone_shadow_whose_consumer_fails_to_shut_down_when_it_is_dropped_should_report_the_failure()
+ {
+    let catalog = FakeCatalog::default();
+    let gone = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    catalog.log(&gone).fail_shutdown(IggyError::Disconnected);
+    catalog.remove_shadow(&gone);
+
+    let error = next_error(&mut consumer).await;
+
+    assert!(catalog.log(&gone).is_shut_down());
+    assert_eq!(error.origin.as_ref().and_then(GeoOrigin::name), Some(DC_B));
+    assert_eq!(error.stream.as_deref(), Some(gone.as_str()));
+    assert_eq!(error.error.error, IggyError::Disconnected);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_gone_shadow_still_shutting_down_when_the_consumer_shuts_down_should_return_its_failure()
+ {
+    let catalog = FakeCatalog::default();
+    let gone = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    let gone_log = catalog.log(&gone);
+    let gate = gone_log.hold_shutdown();
+    gone_log.fail_shutdown(IggyError::Disconnected);
+    catalog.remove_shadow(&gone);
+    assert!(timeout(INTERVAL * 2, consumer.next()).await.is_err());
+
+    gate.open();
+    let shutdown = consumer.shutdown().await;
+
+    assert!(gone_log.is_shut_down());
+    assert!(catalog.log(STREAM).is_shut_down());
+    assert_eq!(shutdown, Err(IggyError::Disconnected));
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_gone_shadow_whose_consumer_still_shuts_down_when_the_shadow_comes_back_should_join_it_after_the_shutdown()
+ {
+    let catalog = FakeCatalog::default();
+    let shadow = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    let old = catalog.log(&shadow);
+    let gate = old.hold_shutdown();
+    catalog.remove_shadow(&shadow);
+    assert!(timeout(INTERVAL * 2, consumer.next()).await.is_err());
+    catalog.add_shadow(DC_B);
+    catalog.queue(&shadow, 0, 0..1);
+
+    assert!(timeout(INTERVAL * 3, consumer.next()).await.is_err());
+    assert_eq!(
+        catalog.opens_of(&shadow),
+        1,
+        "joined before the old one left"
+    );
+    gate.open();
+    let message = next_message(&mut consumer).await;
+
+    assert!(old.is_shut_down());
+    assert_eq!(message.origin.name(), Some(DC_B));
+    assert_eq!(catalog.opens_of(&shadow), 2);
+}
+
+#[tokio::test]
+async fn given_a_discovery_interval_too_long_to_schedule_when_initializing_should_refuse_it_before_sending_anything()
+ {
+    let catalog = FakeCatalog::default();
+    let mut consumer = catalog.consumer_with_interval(GeoSources::Both, Duration::MAX);
+
+    assert_eq!(consumer.init().await, Err(IggyError::InvalidConfiguration));
+    assert_eq!(catalog.attempts_of(STREAM), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_stream_renamed_after_init_when_the_next_search_runs_should_read_the_shadows_of_its_new_name()
+ {
+    let catalog = FakeCatalog::default();
+    let old = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    catalog.rename_stream("invoices");
+    let new = catalog.add_shadow_of(DC_C, "invoices");
+    catalog.queue(&new, 0, 0..1);
+
+    let message = next_message(&mut consumer).await;
+
+    assert_eq!(message.origin.name(), Some(DC_C));
+    assert!(catalog.log(&old).is_shut_down());
+}
+
+#[tokio::test]
+async fn given_a_shadow_still_joining_when_shutting_down_should_shut_down_the_joined_consumers_without_waiting_for_it()
+ {
+    let catalog = FakeCatalog::default();
+    let slow = catalog.add_shadow(DC_B);
+    let gate = catalog.hold_opens(&slow);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+
+    let mut shutdown = std::pin::pin!(consumer.shutdown());
+    let mut cx = Context::from_waker(noop_waker_ref());
+    assert!(shutdown.as_mut().poll(&mut cx).is_pending());
+    assert!(catalog.log(STREAM).is_shut_down(), "it waited for the join");
+    gate.open();
+    timeout(TEST_BUDGET, shutdown)
+        .await
+        .expect("shutdown in time")
+        .unwrap();
+
+    assert!(catalog.log(&slow).is_shut_down());
+}
+
+#[tokio::test]
+async fn given_http_when_initializing_any_sources_should_refuse_the_transport() {
+    let builder = IggyConsumerBuilder::new(
+        IggyRwLock::new(ClientWrapper::Http(HttpClient::default())),
+        GROUP.to_owned(),
+        Consumer::group(Identifier::named(GROUP).unwrap()),
+        Identifier::named(STREAM).unwrap(),
+        Identifier::named(TOPIC).unwrap(),
+        None,
+    );
+    for sources in [
+        GeoSources::Both,
+        GeoSources::LocalOnly,
+        GeoSources::ShadowsOnly,
+    ] {
+        let mut consumer = builder.clone().with_shadows().sources(sources).build();
+
+        let initialized = timeout(TEST_BUDGET, consumer.init())
+            .await
+            .expect("init in time");
+
+        assert_eq!(
+            initialized,
+            Err(IggyError::FeatureUnavailable),
+            "{sources:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_geo_consumers_of_one_session_when_they_search_within_the_reuse_window_should_share_one_listing()
+ {
+    let client = tcp_client();
+    let session = Arc::new(SessionOwner::new(AutoLogin::Disabled));
+    let first = ListingCache::shared(&session, 1, &client);
+    let second = ListingCache::shared(&session, 1, &client.clone());
+    let listings = ListingCounter::default();
+
+    let listed = first.listing(INTERVAL / 2, listings.list()).await.unwrap();
+    second.listing(INTERVAL / 2, listings.list()).await.unwrap();
+    sleep(INTERVAL / 2).await;
+    first.listing(INTERVAL / 2, listings.list()).await.unwrap();
+
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listings.count(), 2);
+}
+
+#[tokio::test]
+async fn given_a_login_as_another_user_when_searching_should_not_reuse_the_listing_of_the_previous_one()
+ {
+    let client = tcp_client();
+    let session = Arc::new(SessionOwner::new(AutoLogin::Disabled));
+    let before = ListingCache::shared(&session, 1, &client);
+    let listings = ListingCounter::default();
+    before.listing(INTERVAL, listings.list()).await.unwrap();
+
+    let after = ListingCache::shared(&session, 2, &client);
+    after.listing(INTERVAL, listings.list()).await.unwrap();
+
+    assert!(!Arc::ptr_eq(&before, &after));
+    assert_eq!(listings.count(), 2);
+}
+
+#[tokio::test]
+async fn given_a_dropped_client_when_another_client_searches_should_not_reuse_its_listing() {
+    let listings = ListingCounter::default();
+    let dropped = {
+        let session = Arc::new(SessionOwner::new(AutoLogin::Disabled));
+        let cache = ListingCache::shared(&session, 1, &tcp_client());
+        cache.listing(INTERVAL, listings.list()).await.unwrap();
+        cache
+    };
+
+    let session = Arc::new(SessionOwner::new(AutoLogin::Disabled));
+    let cache = ListingCache::shared(&session, 1, &tcp_client());
+    cache.listing(INTERVAL, listings.list()).await.unwrap();
+
+    assert!(!Arc::ptr_eq(&dropped, &cache));
+    assert_eq!(listings.count(), 2);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_missing_shadow_whose_check_is_slow_when_a_new_shadow_appears_should_read_the_new_one_without_waiting()
+ {
+    let catalog = FakeCatalog::default();
+    let slow = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    let _gate = catalog.hold_checks(&slow);
+    catalog.log(&slow).fail(ReadError::new(
+        None,
+        IggyError::TopicNameNotFound(TOPIC.to_owned(), slow.clone()),
+    ));
+    let new = catalog.add_shadow(DC_C);
+    catalog.queue(&new, 0, 0..1);
+
+    let message = next_message(&mut consumer).await;
+
+    assert_eq!(message.origin.name(), Some(DC_C));
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_refused_shadow_that_vanishes_when_it_comes_back_should_report_its_refusal_again() {
+    let catalog = FakeCatalog::default();
+    let refusing = catalog.add_shadow(DC_B);
+    catalog
+        .world()
+        .refusals
+        .insert(refusing.clone(), IggyError::Unauthorized);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    let first = next_error(&mut consumer).await;
+    catalog.remove_shadow(&refusing);
+    assert!(timeout(INTERVAL * 2, consumer.next()).await.is_err());
+    assert!(consumer.refused.is_empty());
+    catalog.add_shadow(DC_B);
+
+    let again = next_error(&mut consumer).await;
+
+    for error in [first, again] {
+        assert_eq!(error.origin.as_ref().and_then(GeoOrigin::name), Some(DC_B));
+        assert_eq!(error.error.error, IggyError::Unauthorized);
+    }
+}
+
+#[tokio::test]
+async fn given_idle_logs_when_one_log_yields_many_messages_should_poll_each_idle_log_once() {
+    let catalog = FakeCatalog::default();
+    let idle = [catalog.add_shadow(DC_B), catalog.add_shadow(DC_C)];
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    catalog.log(STREAM).send(0, 0..10);
+
+    for _ in 0..10 {
+        assert!(ready_message(&mut consumer).origin.is_local());
+    }
+
+    for stream in &idle {
+        assert_eq!(catalog.log(stream).polls(), 1, "{stream}");
+    }
+}
+
+#[tokio::test]
+async fn given_a_normal_local_topic_when_initializing_should_refuse_it_before_joining_its_group() {
+    for sources in [GeoSources::Both, GeoSources::LocalOnly] {
+        let catalog = FakeCatalog::default();
+        catalog.add_shadow(DC_B);
+        catalog.world().local_normal = true;
+        let mut consumer = catalog.consumer(sources);
+
+        assert_eq!(
+            consumer.init().await,
+            Err(IggyError::InvalidConfiguration),
+            "{sources:?}"
+        );
+        assert_eq!(catalog.attempts_of(STREAM), 0);
+        assert_eq!(catalog.world().listings, 0);
+    }
+}
+
+#[tokio::test]
+async fn given_a_shadow_stream_as_the_stream_of_the_consumer_when_initializing_should_refuse_it_before_joining_its_group()
+ {
+    let catalog = FakeCatalog::default();
+    catalog.world().local_shadow_origin = Some(DC_B.to_owned());
+    let mut consumer = catalog.consumer(GeoSources::Both);
+
+    assert_eq!(consumer.init().await, Err(IggyError::InvalidConfiguration));
+    assert_eq!(catalog.attempts_of(STREAM), 0);
+}
+
 #[test]
 fn given_a_geo_consumer_should_move_between_tasks() {
     fn assert_send<T: Send>() {}
@@ -670,6 +952,32 @@ fn ready_message(consumer: &mut IggyGeoConsumer) -> GeoReceivedMessage {
         .expect("a message")
 }
 
+fn tcp_client() -> IggyRwLock<ClientWrapper> {
+    IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default()))
+}
+
+/// Counts the listings that a listing cache starts.
+#[derive(Clone, Default)]
+struct ListingCounter(Arc<AtomicUsize>);
+
+impl ListingCounter {
+    fn list(&self) -> impl FnOnce() -> BoxFuture<'static, Result<Vec<ShadowStream>, IggyError>> {
+        let count = Arc::clone(&self.0);
+        move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            let shadow = ShadowStream {
+                name: format!("__shadow_{DC_B}_{STREAM}"),
+                origin: DC_B.to_owned(),
+            };
+            ready(Ok(vec![shadow])).boxed()
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Default)]
 struct WakeCounter(AtomicUsize);
 
@@ -704,6 +1012,14 @@ struct World {
     /// The streams whose opens wait for a gate.
     open_gates: HashMap<String, Arc<Gate>>,
     listing_gate: Option<Arc<Gate>>,
+    /// The streams whose checks of the topic wait for a gate.
+    holds_gates: HashMap<String, Arc<Gate>>,
+    /// The name of the stream of the consumer, `STREAM` when `None`.
+    stream_name: Option<String>,
+    /// Set when the stream of the consumer is a shadow stream of this origin.
+    local_shadow_origin: Option<String>,
+    /// Set when the topic of the consumer is a normal topic.
+    local_normal: bool,
 }
 
 /// Holds back each call that waits on it until it opens.
@@ -736,12 +1052,16 @@ impl FakeCatalog {
     }
 
     fn consumer(&self, sources: GeoSources) -> IggyGeoConsumer {
+        self.consumer_with_interval(sources, INTERVAL)
+    }
+
+    fn consumer_with_interval(&self, sources: GeoSources, interval: Duration) -> IggyGeoConsumer {
         IggyGeoConsumer::new(
             GROUP.to_owned(),
             Identifier::named(STREAM).unwrap(),
             Identifier::named(TOPIC).unwrap(),
             sources,
-            INTERVAL,
+            interval,
             Arc::new(self.clone()),
         )
     }
@@ -771,9 +1091,39 @@ impl FakeCatalog {
         gate
     }
 
+    /// Holds each check of whether `stream` holds the topic until the gate opens.
+    fn hold_checks(&self, stream: &str) -> Arc<Gate> {
+        let gate = Gate::new();
+        self.world()
+            .holds_gates
+            .insert(stream.to_owned(), Arc::clone(&gate));
+        gate
+    }
+
+    fn rename_stream(&self, name: &str) {
+        self.world().stream_name = Some(name.to_owned());
+    }
+
+    fn names(&self) -> TopicNames {
+        TopicNames {
+            stream: self
+                .world()
+                .stream_name
+                .clone()
+                .unwrap_or_else(|| STREAM.to_owned()),
+            topic: TOPIC.to_owned(),
+        }
+    }
+
     /// Lists the shadow stream of `origin`, which holds the topic, and returns its name.
     fn add_shadow(&self, origin: &str) -> String {
-        let name = format!("__shadow_{origin}_{STREAM}");
+        self.add_shadow_of(origin, STREAM)
+    }
+
+    /// Lists the shadow stream of `origin` for `stream`, which holds the topic, and returns its
+    /// name.
+    fn add_shadow_of(&self, origin: &str, stream: &str) -> String {
+        let name = format!("__shadow_{origin}_{stream}");
         let mut world = self.world();
         world.shadows.push(ShadowStream {
             name: name.clone(),
@@ -853,6 +1203,8 @@ impl FakeCatalog {
         let handle = Arc::new(LogHandle {
             reader: NEXT_READER.fetch_add(1, Ordering::Relaxed),
             sender,
+            shutdown_gate: Mutex::default(),
+            shutdown_error: Mutex::default(),
             commits: Mutex::default(),
             marks: Mutex::default(),
             seeks: Mutex::default(),
@@ -867,12 +1219,16 @@ impl FakeCatalog {
         Ok(Box::new(FakeLog { handle, receiver }))
     }
 
-    fn listing(&self) -> Result<Vec<ShadowStream>, IggyError> {
+    fn listing(&self) -> Result<Arc<[ShadowStream]>, IggyError> {
         let world = self.world();
         match &world.listing_error {
             Some(error) => Err(error.clone()),
-            None => Ok(world.shadows.clone()),
+            None => Ok(Arc::from(world.shadows.clone())),
         }
+    }
+
+    fn holds(&self, stream: &str, topic: &str) -> Result<bool, IggyError> {
+        Ok(topic == TOPIC && self.world().holding.contains(stream))
     }
 }
 
@@ -881,19 +1237,30 @@ impl LogCatalog for FakeCatalog {
         Ok(())
     }
 
+    fn check_transport(&self) -> BoxFuture<'static, Result<(), IggyError>> {
+        ready(Ok(())).boxed()
+    }
+
+    fn find_local(&self) -> BoxFuture<'static, Result<LocalTopic, IggyError>> {
+        let names = self.names();
+        let world = self.world();
+        ready(Ok(LocalTopic {
+            names,
+            shadow_origin: world.local_shadow_origin.clone(),
+            is_geo: !world.local_normal,
+        }))
+        .boxed()
+    }
+
     fn open_local(&self) -> BoxFuture<'static, Result<Box<dyn LogConsumer>, IggyError>> {
         self.open(STREAM)
     }
 
     fn names(&self) -> BoxFuture<'static, Result<TopicNames, IggyError>> {
-        ready(Ok(TopicNames {
-            stream: STREAM.to_owned(),
-            topic: TOPIC.to_owned(),
-        }))
-        .boxed()
+        ready(Ok(FakeCatalog::names(self))).boxed()
     }
 
-    fn shadow_streams(&self) -> BoxFuture<'static, Result<Vec<ShadowStream>, IggyError>> {
+    fn shadow_streams(&self) -> BoxFuture<'static, Result<Arc<[ShadowStream]>, IggyError>> {
         let gate = {
             let mut world = self.world();
             world.listings += 1;
@@ -917,8 +1284,19 @@ impl LogCatalog for FakeCatalog {
         stream: &str,
         topic: &str,
     ) -> BoxFuture<'static, Result<bool, IggyError>> {
-        let holds = topic == TOPIC && self.world().holding.contains(stream);
-        ready(Ok(holds)).boxed()
+        let gate = self.world().holds_gates.get(stream).cloned();
+        match gate {
+            None => ready(self.holds(stream, topic)).boxed(),
+            Some(gate) => {
+                let catalog = self.clone();
+                let (stream, topic) = (stream.to_owned(), topic.to_owned());
+                async move {
+                    gate.pass().await;
+                    catalog.holds(&stream, &topic)
+                }
+                .boxed()
+            }
+        }
     }
 
     fn open_shadow(
@@ -934,6 +1312,10 @@ impl LogCatalog for FakeCatalog {
 struct LogHandle {
     reader: u64,
     sender: UnboundedSender<Result<ReceivedMessage, ReadError>>,
+    /// Holds the shutdown of the consumer until it opens.
+    shutdown_gate: Mutex<Option<Arc<Gate>>>,
+    /// The error that the shutdown of the consumer returns.
+    shutdown_error: Mutex<Option<IggyError>>,
     commits: Mutex<Vec<Checkpoint>>,
     marks: Mutex<Vec<Checkpoint>>,
     seeks: Mutex<Vec<(u32, PollingStrategy)>>,
@@ -966,6 +1348,16 @@ impl LogHandle {
 
     fn fail(&self, error: ReadError) {
         self.sender.unbounded_send(Err(error)).unwrap();
+    }
+
+    fn hold_shutdown(&self) -> Arc<Gate> {
+        let gate = Gate::new();
+        *self.shutdown_gate.lock().unwrap() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    fn fail_shutdown(&self, error: IggyError) {
+        *self.shutdown_error.lock().unwrap() = Some(error);
     }
 
     fn commits(&self) -> Vec<Checkpoint> {
@@ -1012,9 +1404,12 @@ impl LogConsumer for FakeLog {
         self.handle.reader
     }
 
-    fn commit(&self, checkpoint: Checkpoint) -> BoxFuture<'static, Result<(), IggyError>> {
-        self.handle.commits.lock().unwrap().push(checkpoint);
-        ready(Ok(())).boxed()
+    fn committer(&self) -> Committer {
+        let handle = Arc::clone(&self.handle);
+        Committer::Fake(Arc::new(move |checkpoint| {
+            handle.commits.lock().unwrap().push(checkpoint);
+            Ok(())
+        }))
     }
 
     fn mark(&self, checkpoint: Checkpoint) -> Result<(), IggyError> {
@@ -1036,8 +1431,20 @@ impl LogConsumer for FakeLog {
     }
 
     fn shutdown(&mut self) -> BoxFuture<'_, Result<(), IggyError>> {
-        self.handle.shut_down.store(true, Ordering::SeqCst);
-        self.receiver.close();
-        ready(Ok(())).boxed()
+        let gate = self.handle.shutdown_gate.lock().unwrap().clone();
+        async move {
+            if let Some(gate) = gate {
+                gate.pass().await;
+            }
+            self.handle.shut_down.store(true, Ordering::SeqCst);
+            self.receiver.close();
+            self.handle
+                .shutdown_error
+                .lock()
+                .unwrap()
+                .clone()
+                .map_or(Ok(()), Err)
+        }
+        .boxed()
     }
 }
