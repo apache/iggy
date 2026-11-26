@@ -968,7 +968,10 @@ fn adopt(
                 },
                 create: Box::new(adoption(stream_id, object)?),
                 retention: retention_of(object),
-                geo_mode: geo_mode_of(object),
+                geo_mode: match object.geo_mode {
+                    TopicGeoMode::Geo => GeoMode::Geo,
+                    TopicGeoMode::GeoTiered => GeoMode::GeoTiered,
+                },
             });
         }
     }
@@ -1034,21 +1037,14 @@ fn follow_read_cache(
 }
 
 /// The create of the shadow topic of `object`, without the partition
-/// assignments that the metadata primary fills in.
-///
-/// Its partitions run with the durability that the origin's `geo_mode`
-/// fixes, as a read of the shadow topic reports. With replicated offsets, a
-/// crash of every node would leave a shadow partition waiting for its last
-/// replica before it elects.
+/// assignments that the metadata primary fills in. The metadata stores the
+/// durability that the origin's `geo_mode` fixes when it applies the create.
 fn adoption(stream_id: usize, object: &TopicObject) -> Option<CreateTopicWithAssignmentsRequest> {
-    let durability = geo_mode_of(object).fixed_durability().unwrap_or_default();
     let options = TopicCreateOptions {
         compression_algorithm: Some(match object.compression {
             TopicCompression::None => CompressionAlgorithm::None,
             TopicCompression::Gzip => CompressionAlgorithm::Gzip,
         }),
-        durability,
-        consumer_offset_durability: durability,
         read_cache: TopicReadCache {
             size: object.read_cache_size.map(IggyByteSize::from),
             read_ahead: object.read_ahead.map(IggyByteSize::from),
@@ -1072,14 +1068,6 @@ const fn retention_of(object: &TopicObject) -> ShadowRetention {
     ShadowRetention {
         message_expiry: object.message_expiry,
         max_topic_size: object.max_topic_size,
-    }
-}
-
-/// The mode of the topic of `object` in the peer.
-const fn geo_mode_of(object: &TopicObject) -> GeoMode {
-    match object.geo_mode {
-        TopicGeoMode::Geo => GeoMode::Geo,
-        TopicGeoMode::GeoTiered => GeoMode::GeoTiered,
     }
 }
 

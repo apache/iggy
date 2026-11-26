@@ -431,6 +431,11 @@ trusts no node's log: it elects a primary only once all of its nodes are back. W
 `persisted`, any quorum of them elects. The `geo_tiered` mode, not available in this version,
 is the one meant for a faster path.
 
+A geo topic in the `geo` mode that an earlier build of the server stored with `replicated`, and
+a shadow topic of one, take `persisted` for both when a node loads its metadata, from a snapshot
+or from its log. `GetTopic` then reports what the partitions run with. What such a topic
+acknowledged before that load has the guarantee of `replicated` only.
+
 ### What a create refuses
 
 | Request                                                              | Answer                        |

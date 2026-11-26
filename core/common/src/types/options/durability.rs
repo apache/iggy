@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use strum::{AsRefStr, Display, EnumString, IntoStaticStr};
 
 use super::OptionKey;
+use crate::types::message::{HeaderKind, HeaderValue};
 
 /// Storage guarantee required at explicit operation completion. Both policies persist data.
 #[derive(
@@ -55,5 +56,13 @@ impl Durability {
     #[must_use]
     pub const fn is_persisted(self) -> bool {
         matches!(self, Self::Persisted)
+    }
+}
+
+impl From<Durability> for HeaderValue {
+    fn from(durability: Durability) -> Self {
+        let name: &'static str = durability.into();
+        // Both names are short ASCII, always a valid string header value.
+        Self::new_unchecked(HeaderKind::String, name.as_bytes())
     }
 }

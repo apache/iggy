@@ -67,8 +67,8 @@ pub use catalog::{
     OptionDefault, OptionDescriptor, OptionMutability, OptionOperation, OptionStorage,
     OptionVisibility, StreamEncryptionSource, admit, canonical_value, check_critical_options,
     critical_keys_marker, derived_defaults, descriptors_for, drop_options_fixed_by_type,
-    project_shadow_origin, project_shadow_topic, public_options, stream_key_from_entry,
-    stream_wrap_set,
+    project_shadow_origin, project_shadow_topic, public_options, store_fixed_durability,
+    stream_key_from_entry, stream_wrap_set,
 };
 pub use codec::OptionValueCodec;
 pub use durability::Durability;
