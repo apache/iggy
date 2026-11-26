@@ -185,6 +185,9 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// Set once the partition leaves the shard, for the polls and rewrites
+    /// that outlive it.
+    reads_left: crate::PartitionLeft,
     /// The other cluster's log that this partition serves in place of its
     /// own, `None` for a partition that holds its own messages.
     pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
@@ -1179,6 +1182,7 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            reads_left: crate::PartitionLeft::default(),
             peer_log: None,
             retired_peer_indexes: Vec::new(),
             pending_advances: VecDeque::new(),
@@ -6473,6 +6477,7 @@ where
     /// The partition leaves the shard: what its reads keep in the shard's
     /// cache goes, and what its GETs in flight fetch is not kept.
     pub(crate) fn forget_reads(&self) {
+        self.reads_left.set();
         if let Some(remote) = &self.remote_segments {
             let prefix = self
                 .read_prefix()
@@ -6516,6 +6521,7 @@ where
         byte_budget: usize,
         read_settings: crate::PartitionReadSettings,
     ) -> PollPlan {
+        let read_settings = self.reads_with(read_settings);
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
         // is fully synchronous, so the single load cannot drift mid-plan.
@@ -6781,7 +6787,16 @@ where
             long_term,
             long_term_floor: self.long_term_floor(),
             long_term_next,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: self.reads_with(crate::PartitionReadSettings::SHARD),
+        }
+    }
+
+    /// `settings` for the reads of this partition, which stop once it leaves
+    /// the shard.
+    fn reads_with(&self, settings: crate::PartitionReadSettings) -> crate::PartitionReadSettings {
+        crate::PartitionReadSettings {
+            left: Some(self.reads_left.clone()),
+            ..settings
         }
     }
 

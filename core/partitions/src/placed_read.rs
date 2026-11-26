@@ -338,7 +338,11 @@ impl PlacedReadPlan {
                 .or(self.long_term_next.as_ref())
                 .map(|next| self.long_term_log(next));
             let index = self
-                .wait(remote.read_long_term_index(&log, LONG_TERM_INDEX_BYTES, self.read_settings))
+                .wait(remote.read_long_term_index(
+                    &log,
+                    LONG_TERM_INDEX_BYTES,
+                    &&self.read_settings,
+                ))
                 .await?;
             let mut position = wanted.first_position(&index, segment.size);
             let mut len = LONG_TERM_READ_BYTES;
@@ -352,7 +356,7 @@ impl PlacedReadPlan {
                         read,
                         next.as_ref(),
                         wanted.poll_offset(),
-                        self.read_settings,
+                        &self.read_settings,
                     ))
                     .await?;
                 let fault = match take_whole_batches(chunk.as_slice(), wanted, batches) {
@@ -616,19 +620,16 @@ impl PlacedReadPlan {
         let (Some(remote), [first, _, ..]) = (self.remote.as_deref(), run) else {
             return Ok(FreshReads::default());
         };
-        let blobs: Vec<_> = run
-            .iter()
-            .filter_map(|placed| {
-                let placement = placed.placement;
-                let end = placement.position.checked_add(placement.length)?;
-                Some(placement.position..end)
-            })
-            .collect();
+        let blobs = run.iter().filter_map(|placed| {
+            let placement = placed.placement;
+            let end = placement.position.checked_add(placement.length)?;
+            Some(placement.position..end)
+        });
         self.wait(remote.fetch_fresh(
             first.placement.object_id,
-            &blobs,
+            blobs,
             self.prefix,
-            self.read_settings,
+            &self.read_settings,
         ))
         .await
     }
@@ -657,7 +658,7 @@ impl PlacedReadPlan {
                 placement.object_id,
                 range,
                 self.prefix,
-                self.read_settings,
+                &self.read_settings,
             ))
             .await?
         };

@@ -420,22 +420,45 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
     /// this node holds, fit the budget.
     fn make_room(&mut self, incoming: usize) {
         while self.held() + incoming > self.budget {
-            let small = self.held_in(Place::Small);
-            let waiting = self.held_in(Place::Ahead);
-            let passed = if waiting > self.budget / AHEAD_SHARE {
-                self.drop_oldest(Place::Ahead)
-            } else if small > 0 && (small >= self.small_target() || self.main_is_empty()) {
-                self.pass_oldest_small()
-            } else if !self.main_is_empty() {
-                self.pass_oldest_main()
-            } else {
-                // Only bytes nobody has read are left, and the budget bounds
-                // them too.
-                self.drop_oldest(Place::Ahead) || self.drop_oldest(Place::Kept)
-            };
-            if !passed {
+            let Some((place, key)) = Self::victim(&self.lines, self.budget) else {
                 return;
+            };
+            self.evict(place, &key);
+        }
+    }
+
+    /// Where the entry that gives way next among `lines`, which may hold
+    /// `room` bytes, is, and its key: the oldest readahead past its share,
+    /// the oldest of the small queue once it holds its share or the main
+    /// queue is empty, the oldest of the main queue, and once only bytes
+    /// nobody has read are left, readahead and then held entries. `None`
+    /// once nothing is left.
+    fn victim(lines: &[Line<K>; 5], room: usize) -> Option<(Place, K)> {
+        let held = |place: Place| lines[place as usize].held;
+        let oldest = |place: Place| lines[place as usize].oldest().map(|key| (place, key));
+        let small = held(Place::Small);
+        let main_is_empty = held(Place::Main) == 0;
+        if held(Place::Ahead) > room / AHEAD_SHARE {
+            oldest(Place::Ahead)
+        } else if small > 0 && (small >= room / SMALL_SHARE || main_is_empty) {
+            oldest(Place::Small)
+        } else if !main_is_empty {
+            oldest(Place::Main)
+        } else {
+            oldest(Place::Ahead).or_else(|| oldest(Place::Kept))
+        }
+    }
+
+    /// Take the entry under `key` out of `place`, by the rules of that place.
+    fn evict(&mut self, place: Place, key: &K) {
+        match place {
+            Place::Small => self.pass_small(key),
+            Place::Main => self.pass_main(key),
+            Place::Kept => {
+                self.let_go.push(key.clone());
+                self.unlink(key);
             }
+            Place::Ahead | Place::Gone => self.unlink(key),
         }
     }
 
@@ -503,27 +526,16 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
             let Some(limited) = self.limited.get(&owner) else {
                 return;
             };
-            let limit = limited.limit;
             let held = limited.held();
-            if held + incoming <= limit {
+            if held + incoming <= limited.limit {
                 return;
             }
-            let small = limited.held_in(Place::Small);
-            let waiting = limited.held_in(Place::Ahead);
-            let main_is_empty = limited.held_in(Place::Main) == 0;
-            let oldest = |place: Place| limited.lines[place as usize].oldest();
-            let passed = if waiting > limit / AHEAD_SHARE {
-                oldest(Place::Ahead).inspect(|key| self.unlink(key))
-            } else if small > 0 && (small >= limit / SMALL_SHARE || main_is_empty) {
-                oldest(Place::Small).inspect(|key| self.pass_small(key))
-            } else if !main_is_empty {
-                oldest(Place::Main).inspect(|key| self.pass_main(key))
-            } else {
-                oldest(Place::Ahead).inspect(|key| self.unlink(key))
+            // Held entries belong to no owner, so the last fallback finds
+            // none here.
+            let Some((place, key)) = Self::victim(&limited.lines, limited.limit) else {
+                return;
             };
-            if passed.is_none() {
-                return;
-            }
+            self.evict(place, &key);
             if self
                 .limited
                 .get(&owner)
@@ -546,17 +558,12 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
         self.budget - self.budget / UNHELD_SHARE
     }
 
-    /// Drop the oldest entry of `place` with nothing remembered. `false`
-    /// when it has none.
-    fn drop_oldest(&mut self, place: Place) -> bool {
-        let Some(key) = self.lines[place as usize].oldest() else {
-            return false;
-        };
-        if place == Place::Kept {
-            self.let_go.push(key.clone());
+    /// Drop the oldest entry of `place` with nothing remembered, if it has
+    /// one.
+    fn drop_oldest(&mut self, place: Place) {
+        if let Some(key) = self.lines[place as usize].oldest() {
+            self.evict(place, &key);
         }
-        self.unlink(&key);
-        true
     }
 
     /// Release the oldest held entries until they take at most `limit`.
@@ -572,10 +579,6 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
 
     const fn small_target(&self) -> usize {
         self.budget / SMALL_SHARE
-    }
-
-    const fn main_is_empty(&self) -> bool {
-        self.held_in(Place::Main) == 0
     }
 
     /// Take the oldest entry out of the small queue, see
@@ -607,19 +610,17 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
             self.unlink(key);
         } else {
             self.relink(key, Place::Gone);
-            if let Some(entry) = self.entries.get_mut(key) {
-                entry.bytes = None;
+            let Some(entry) = self.entries.get_mut(key) else {
+                return;
+            };
+            entry.bytes = None;
+            // Evictions for the budget or for another owner pass on its
+            // entries too, and its own inserts alone would not trim what
+            // they add to its keys.
+            if let Some(owner) = entry.owner {
+                self.forget_old_keys_of(owner);
             }
         }
-    }
-
-    /// Take the oldest entry of the main queue, see [`Self::pass_main`].
-    /// `false` when the queue is empty.
-    fn pass_oldest_main(&mut self) -> bool {
-        self.lines[Place::Main as usize]
-            .oldest()
-            .inspect(|key| self.pass_main(key))
-            .is_some()
     }
 
     /// Take `key` out of the main queue: back in as its newest, with one
@@ -884,6 +885,10 @@ mod tests {
                 assert_eq!(line.held, held, "{owner:?}");
             }
             assert!(limited.held() <= limited.limit, "{owner:?}");
+            assert!(
+                limited.held_in(Place::Gone) <= limited.limit - limited.limit / SMALL_SHARE,
+                "the keys {owner:?} remembers past its limit"
+            );
         }
         let mut recounted: BTreeMap<O, BTreeSet<u32>> = BTreeMap::new();
         for (key, entry) in &cache.entries {

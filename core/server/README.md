@@ -546,8 +546,8 @@ counters `remote_read_block_hits_total`, `remote_read_block_misses_total`,
 `remote_read_ahead_hits_total`, `remote_read_blocks_fetched_ahead_total`,
 `remote_read_demand_bytes_total`, `remote_read_ahead_bytes_total`,
 `remote_read_fresh_releases_total`, `remote_read_carried_bytes_total` and
-`remote_read_limit_evictions_total`, the blocks that left because their
-partition was over its limit, and the gauges `remote_read_cache_bytes` and
+`remote_read_limit_evictions_total`, the blocks and whole objects, such as a
+segment's `.index`, that left because their partition was over its limit, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
 
 Each partition of a tiered topic also has a manifest object,

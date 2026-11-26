@@ -97,7 +97,7 @@ fn plan(partition: &mut IggyPartition<IggyMessageBus>, strategy: PollingStrategy
 /// [`polled_all`] with the read settings `settings` for the partition.
 pub(super) async fn polled_all_reading(
     partition: &mut IggyPartition<IggyMessageBus>,
-    settings: PartitionReadSettings,
+    settings: &PartitionReadSettings,
 ) -> Vec<(Option<u64>, Vec<u8>)> {
     let mut polls = Vec::new();
     for strategy in strategies() {
@@ -108,7 +108,7 @@ pub(super) async fn polled_all_reading(
                 &args,
                 false,
                 usize::MAX,
-                settings,
+                settings.clone(),
             )
             .execute()
             .await;
@@ -143,11 +143,7 @@ async fn polled(
 pub(super) async fn polled_all(
     partition: &mut IggyPartition<IggyMessageBus>,
 ) -> Vec<(Option<u64>, Vec<u8>)> {
-    let mut polls = Vec::new();
-    for strategy in strategies() {
-        polls.push(Box::pin(polled(partition, strategy)).await);
-    }
-    polls
+    Box::pin(polled_all_reading(partition, &PartitionReadSettings::SHARD)).await
 }
 
 async fn failed(
@@ -249,7 +245,7 @@ impl RemoteObjects for Counted {
 async fn fetched(
     partition: &mut IggyPartition<IggyMessageBus>,
     counted: &Counted,
-    settings: PartitionReadSettings,
+    settings: &PartitionReadSettings,
 ) -> (Vec<(Option<u64>, Vec<u8>)>, usize) {
     let before = counted.gets.get();
     let polled = Box::pin(polled_all_reading(partition, settings)).await;
@@ -283,25 +279,26 @@ async fn given_evicted_segments_polled_with_each_limit_when_polling_twice_should
     let under = PartitionReadSettings {
         limit: Some(usize::try_from((LIMIT_BLOCKS_MIN - 1) * BLOCK_BYTES).unwrap()),
         read_ahead: None,
+        left: None,
     };
     let shard = PartitionReadSettings::SHARD;
 
-    let (cold, cold_gets) = Box::pin(fetched(&mut partition, &counted, shard)).await;
-    let (warm, warm_gets) = Box::pin(fetched(&mut partition, &counted, shard)).await;
+    let (cold, cold_gets) = Box::pin(fetched(&mut partition, &counted, &shard)).await;
+    let (warm, warm_gets) = Box::pin(fetched(&mut partition, &counted, &shard)).await;
     assert!(cache.take_metrics().cached_bytes > 0);
-    let (limited, limited_gets) = Box::pin(fetched(&mut partition, &counted, under)).await;
+    let (limited, limited_gets) = Box::pin(fetched(&mut partition, &counted, &under)).await;
     assert_eq!(
         cache.take_metrics().cached_bytes,
         0,
         "the limit evicted what it held"
     );
-    let (again, again_gets) = Box::pin(fetched(&mut partition, &counted, under)).await;
+    let (again, again_gets) = Box::pin(fetched(&mut partition, &counted, &under)).await;
 
     assert_eq!([&cold, &warm, &limited, &again], [&local; 4]);
     assert!(cold_gets > 0);
     assert_eq!(warm_gets, 0, "a second pass reads the cache");
     assert!(limited_gets > 0 && again_gets == limited_gets);
-    Box::pin(fetched(&mut partition, &counted, shard)).await;
+    Box::pin(fetched(&mut partition, &counted, &shard)).await;
     assert!(cache.take_metrics().cached_bytes > 0);
     partition.forget_reads();
     assert_eq!(cache.take_metrics().cached_bytes, 0);

@@ -110,7 +110,7 @@ pub struct ReadCacheSettings {
 
 /// What a partition's topic sets for the partition's reads through the
 /// shard's cache. `None` leaves a value to the shard.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PartitionReadSettings {
     /// The most bytes of the shard's cache that the blocks the partition
     /// fetched hold: a limit, not a reservation, so what it leaves unused is
@@ -119,9 +119,13 @@ pub struct PartitionReadSettings {
     /// exactly its range.
     pub limit: Option<usize>,
     /// Bytes that readahead fetches in front of the partition's sequential
-    /// readers at most, and never more than an eighth of its limit. Below
+    /// readers at most, and never more than an eighth of its limit or of the
+    /// shard's budget, whichever is smaller. Below
     /// [`READ_AHEAD_START_BLOCKS`] blocks, none.
     pub read_ahead: Option<u64>,
+    /// Whether the partition left the shard, `None` for reads that no
+    /// partition makes. The polls and rewrites that outlive it carry it.
+    pub(crate) left: Option<PartitionLeft>,
 }
 
 impl PartitionReadSettings {
@@ -129,7 +133,29 @@ impl PartitionReadSettings {
     pub const SHARD: Self = Self {
         limit: None,
         read_ahead: None,
+        left: None,
     };
+
+    /// Whether the partition that reads with these left the shard: it keeps
+    /// nothing in the cache from then on, and starts no GET.
+    pub(crate) fn left_shard(&self) -> bool {
+        self.left.as_ref().is_some_and(PartitionLeft::is_set)
+    }
+}
+
+/// Whether a partition left the shard, which the partition shares with the
+/// snapshots of its polls and rewrites.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PartitionLeft(Rc<Cell<bool>>);
+
+impl PartitionLeft {
+    pub(crate) fn set(&self) {
+        self.0.set(true);
+    }
+
+    fn is_set(&self) -> bool {
+        self.0.get()
+    }
 }
 
 /// What the cache of a shard did since the last [`ReadCache::take_metrics`].
@@ -214,16 +240,6 @@ pub struct ReadCache {
     /// They wait in the part of readahead, and their first reads are no
     /// readahead hits.
     carried: RefCell<BTreeSet<CacheKey>>,
-    /// The partitions with GETs in flight, by how many, and whether the
-    /// partition left the shard since, so what those GETs fetch is not kept.
-    fetches_of: RefCell<BTreeMap<ReadOwner, OwnerFetches>>,
-}
-
-/// The GETs in flight of one partition.
-#[derive(Default)]
-struct OwnerFetches {
-    count: usize,
-    gone: bool,
 }
 
 impl ReadCache {
@@ -254,7 +270,6 @@ impl ReadCache {
             counted: Cell::default(),
             held: RefCell::default(),
             carried: RefCell::default(),
-            fetches_of: RefCell::default(),
         })
     }
 
@@ -278,7 +293,7 @@ impl ReadCache {
 
     /// How `owner` reads with `settings`: its limit goes to the cache when
     /// it changed, and `None` says that it keeps nothing it fetches.
-    fn reading(&self, owner: ReadOwner, settings: PartitionReadSettings) -> Option<Reading> {
+    fn reading(&self, owner: ReadOwner, settings: &PartitionReadSettings) -> Option<Reading> {
         let kept_at_least = LIMIT_BLOCKS_MIN.saturating_mul(self.block_bytes);
         let limit = settings.limit.map(|limit| {
             if (limit as u64) < kept_at_least {
@@ -287,12 +302,13 @@ impl ReadCache {
                 limit
             }
         });
-        {
+        let budget = {
             let mut cache = self.cache.borrow_mut();
             if cache.limit(&owner) != limit {
                 cache.set_limit(owner, limit);
             }
-        }
+            cache.budget()
+        };
         if limit == Some(0) {
             return None;
         }
@@ -303,9 +319,8 @@ impl ReadCache {
             let wanted = settings
                 .read_ahead
                 .map_or(self.ahead_blocks_max, |bytes| bytes / self.block_bytes);
-            let within = limit.map_or(wanted, |limit| {
-                wanted.min(limit as u64 / AHEAD_SHARE as u64 / self.block_bytes)
-            });
+            let room = limit.map_or(budget, |limit| limit.min(budget));
+            let within = wanted.min(room as u64 / AHEAD_SHARE as u64 / self.block_bytes);
             if within < READ_AHEAD_START_BLOCKS {
                 0
             } else {
@@ -315,16 +330,8 @@ impl ReadCache {
         Some(Reading {
             owner,
             ahead_blocks,
+            left: settings.left.clone(),
         })
-    }
-
-    /// `owner` left the shard: what it holds goes, and so does what its
-    /// GETs in flight fetch.
-    fn forget_owner(&self, owner: ReadOwner) {
-        self.cache.borrow_mut().remove_owner(&owner);
-        if let Some(fetches) = self.fetches_of.borrow_mut().get_mut(&owner) {
-            fetches.gone = true;
-        }
     }
 
     /// Drop every block and object kept of the store in `store`.
@@ -521,12 +528,12 @@ impl ReadCache {
         self.carried.borrow_mut().remove(key)
     }
 
-    /// Keep what a GET of `kind` for `owner` fetched of `object`, unless the
-    /// owner left the shard since.
+    /// Keep what a GET of `kind` for `reading` fetched of `object`, unless
+    /// its partition left the shard since.
     fn keep(
         &self,
         kind: FetchKind,
-        owner: ReadOwner,
+        reading: &Reading,
         object: ObjectId,
         fetched: &Fetched,
         blocks: &[Bytes],
@@ -535,12 +542,8 @@ impl ReadCache {
             FetchKind::Demand => Admission::Read,
             FetchKind::Ahead => Admission::Ahead,
         };
-        let gone = self
-            .fetches_of
-            .borrow()
-            .get(&owner)
-            .is_some_and(|fetches| fetches.gone);
-        if !gone {
+        if !reading.left_shard() {
+            let owner = reading.owner;
             let mut cache = self.cache.borrow_mut();
             let mut carried = self.carried.borrow_mut();
             for (key, bytes) in fetched.keys(object).zip(blocks) {
@@ -618,15 +621,18 @@ impl RemoteBlocks {
     pub(crate) fn reading(
         &self,
         prefix: ObjectPrefix,
-        settings: PartitionReadSettings,
+        settings: &PartitionReadSettings,
     ) -> Option<Reading> {
         self.cache.reading(self.owner(prefix), settings)
     }
 
     /// The partition whose incarnation `prefix` names in this store left the
-    /// shard.
+    /// shard: what it holds goes.
     pub(crate) fn forget_reader(&self, prefix: ObjectPrefix) {
-        self.cache.forget_owner(self.owner(prefix));
+        self.cache
+            .cache
+            .borrow_mut()
+            .remove_owner(&self.owner(prefix));
     }
 
     const fn owner(&self, prefix: ObjectPrefix) -> ReadOwner {
@@ -719,7 +725,7 @@ impl RemoteBlocks {
             },
             end: None,
         };
-        self.read_whole(reading.owner, object, key_of, cap).await
+        self.read_whole(&reading, object, key_of, cap).await
     }
 
     /// Hold the whole fresh object `object_id`, which this shard has just
@@ -810,8 +816,15 @@ impl RemoteBlocks {
     /// The tail is copied [`REWRITE_YIELD_BYTES`] at a time, with a yield to
     /// the shard's other tasks between two, and the cache free for them. The
     /// index goes in last, so it is the newest of what waits there and the
-    /// last of it to go.
-    pub(crate) async fn carry_segment(&self, source: &RemoteRange, log: &[u8], index: &[u8]) {
+    /// last of it to go. Once the partition that reads with `settings`
+    /// leaves the shard, nothing more of it goes in.
+    pub(crate) async fn carry_segment(
+        &self,
+        source: &RemoteRange,
+        log: &[u8],
+        index: &[u8],
+        settings: &PartitionReadSettings,
+    ) {
         let Ok(identity) = self.admit() else {
             return;
         };
@@ -841,7 +854,10 @@ impl RemoteBlocks {
         }
         let share = (room / AHEAD_SHARE) as u64;
         // The index waits in the same share, and the oldest of it goes first.
-        let tail_room = share.saturating_sub(index.len() as u64);
+        // Alone past the share, it would wait there all the same.
+        let Some(tail_room) = share.checked_sub(index.len() as u64) else {
+            return;
+        };
         let first = (log.len() as u64)
             .saturating_sub(tail_room)
             .div_ceil(block_bytes);
@@ -853,7 +869,7 @@ impl RemoteBlocks {
         };
         let block_len = usize::try_from(block_bytes).unwrap_or(usize::MAX);
         let mut blocks = (first..).zip(tail.chunks(block_len)).peekable();
-        while blocks.peek().is_some() {
+        while blocks.peek().is_some() && !settings.left_shard() {
             {
                 let mut cache = self.cache.cache.borrow_mut();
                 let mut carried = self.cache.carried.borrow_mut();
@@ -878,20 +894,26 @@ impl RemoteBlocks {
                 yield_to_reactor().await;
             }
         }
-        let index_key = CacheKey::Whole(index_object);
+        let left = settings.left_shard();
         let mut cache = self.cache.cache.borrow_mut();
         let mut carried = self.cache.carried.borrow_mut();
-        carried.insert(index_key);
-        cache.insert_owned(
-            index_key,
-            Bytes::copy_from_slice(index),
-            index.len(),
-            Admission::Ahead,
-            owner,
-        );
+        if !left {
+            let index_key = CacheKey::Whole(index_object);
+            carried.insert(index_key);
+            cache.insert_owned(
+                index_key,
+                Bytes::copy_from_slice(index),
+                index.len(),
+                Admission::Ahead,
+                owner,
+            );
+        }
         // Only what the cache still holds may be read as handed over.
         carried.retain(|key| cache.holds(key));
         drop((cache, carried));
+        if left {
+            return;
+        }
         let mut counted = self.cache.counted.get();
         counted.carried_bytes += (index.len() + tail.len()) as u64;
         self.cache.counted.set(counted);
@@ -922,6 +944,11 @@ impl RemoteBlocks {
         next: Option<(ObjectId, &dyn Fn() -> String)>,
         poll_offset: Option<u64>,
     ) -> Result<(u64, Vec<Bytes>), DiskFault> {
+        // A poll that outlives its partition reads a block at a time, and
+        // starts no GET for it.
+        if reading.left_shard() {
+            return Err(DiskFault::Retryable);
+        }
         let cache = &self.cache;
         let Some(blocks) = object.blocks_of(range, cache.block_bytes) else {
             return Ok((0, Vec::new()));
@@ -947,16 +974,8 @@ impl RemoteBlocks {
             poll_offset,
             window,
         });
-        let waits = self.fetch_missing(reading.owner, object, key_of, first, &found);
-        self.read_ahead(
-            reading.owner,
-            object,
-            key_of,
-            last,
-            window,
-            next,
-            poll_offset,
-        );
+        let waits = self.fetch_missing(&reading, object, key_of, first, &found);
+        self.read_ahead(&reading, object, key_of, last, window, next, poll_offset);
         for (slot, fetch) in waits {
             found[slot] = Some(fetch.block(first + slot as u64).await?);
         }
@@ -964,14 +983,17 @@ impl RemoteBlocks {
         Ok((first, found.ok_or(DiskFault::Retryable)?))
     }
 
-    /// The whole `object`, of at most `cap` bytes, for `owner`.
+    /// The whole `object`, of at most `cap` bytes, for `reading`.
     async fn read_whole(
         &self,
-        owner: ReadOwner,
+        reading: &Reading,
         object: ObjectId,
         key_of: &dyn Fn() -> String,
         cap: u64,
     ) -> Result<Bytes, DiskFault> {
+        if reading.left_shard() {
+            return Err(DiskFault::Retryable);
+        }
         let whole = CacheKey::Whole(object);
         let cached = self.cache.cache.borrow_mut().read(&whole);
         let mut counted = self.cache.counted.get();
@@ -998,7 +1020,7 @@ impl RemoteBlocks {
         let fetch = joined.unwrap_or_else(|| {
             self.start_fetch(
                 FetchKind::Demand,
-                owner,
+                reading,
                 object,
                 key_of,
                 Fetched::Whole { cap },
@@ -1012,7 +1034,7 @@ impl RemoteBlocks {
     /// missing block goes in `found` and the GET it comes with.
     fn fetch_missing(
         &self,
-        owner: ReadOwner,
+        reading: &Reading,
         object: ObjectId,
         key_of: &dyn Fn() -> String,
         first: u64,
@@ -1038,7 +1060,7 @@ impl RemoteBlocks {
                 continue;
             };
             let fetched = Fetched::Blocks(*start..end + 1);
-            let fetch = self.start_fetch(FetchKind::Demand, owner, object, key_of, fetched);
+            let fetch = self.start_fetch(FetchKind::Demand, reading, object, key_of, fetched);
             waits.extend(run.iter().map(|(slot, _)| (*slot, fetch.clone())));
         }
         waits
@@ -1050,7 +1072,7 @@ impl RemoteBlocks {
     #[allow(clippy::too_many_arguments)]
     fn read_ahead(
         &self,
-        owner: ReadOwner,
+        reading: &Reading,
         object: ObjectId,
         key_of: &dyn Fn() -> String,
         last: u64,
@@ -1064,7 +1086,7 @@ impl RemoteBlocks {
         };
         let reach = last.saturating_add(window);
         let through = reach.min(last_block);
-        self.fetch_ahead(owner, object, key_of, last + 1..=through);
+        self.fetch_ahead(reading, object, key_of, last + 1..=through);
         // A reader that reached the end of the object, or whose readahead
         // did, goes on in `next`, even one that takes each object in one
         // read and so never had a window.
@@ -1083,7 +1105,7 @@ impl RemoteBlocks {
         });
         if reach > through {
             self.fetch_ahead(
-                owner,
+                reading,
                 next,
                 next_key_of,
                 0..=(reach - through - 1).min(next_last),
@@ -1096,7 +1118,7 @@ impl RemoteBlocks {
     /// is longer than its byte cap allows.
     fn fetch_ahead(
         &self,
-        owner: ReadOwner,
+        reading: &Reading,
         object: ObjectId,
         key_of: &dyn Fn() -> String,
         blocks: RangeInclusive<u64>,
@@ -1135,7 +1157,7 @@ impl RemoteBlocks {
             }
             self.start_fetch(
                 FetchKind::Ahead,
-                owner,
+                reading,
                 object,
                 key_of,
                 Fetched::Blocks(*start..end + 1),
@@ -1143,13 +1165,13 @@ impl RemoteBlocks {
         }
     }
 
-    /// Start one GET of `fetched` of `object` for `owner` in a task of its
+    /// Start one GET of `fetched` of `object` for `reading` in a task of its
     /// own, which keeps what it fetched whether anyone still waits for it or
     /// not.
     fn start_fetch(
         &self,
         kind: FetchKind,
-        owner: ReadOwner,
+        reading: &Reading,
         object: ObjectId,
         key_of: &dyn Fn() -> String,
         fetched: Fetched,
@@ -1167,7 +1189,7 @@ impl RemoteBlocks {
             Rc::clone(&self.cache),
             objects,
             kind,
-            owner,
+            reading.clone(),
             object,
             fetched,
             &fetch,
@@ -1278,11 +1300,19 @@ struct ReadOwner {
 }
 
 /// How one partition reads through the cache.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Reading {
     owner: ReadOwner,
     /// Blocks that readahead keeps in front of its readers at most.
     ahead_blocks: u64,
+    /// See [`PartitionReadSettings::left`].
+    left: Option<PartitionLeft>,
+}
+
+impl Reading {
+    fn left_shard(&self) -> bool {
+        self.left.as_ref().is_some_and(PartitionLeft::is_set)
+    }
 }
 
 /// An object as the cache names it: in which store, under whose identity,
@@ -1441,7 +1471,7 @@ struct Flight {
     cache: Rc<ReadCache>,
     objects: Rc<dyn RemoteObjects>,
     kind: FetchKind,
-    owner: ReadOwner,
+    reading: Reading,
     object: ObjectId,
     fetched: Fetched,
 }
@@ -1451,7 +1481,7 @@ impl Flight {
         cache: Rc<ReadCache>,
         objects: Rc<dyn RemoteObjects>,
         kind: FetchKind,
-        owner: ReadOwner,
+        reading: Reading,
         object: ObjectId,
         fetched: Fetched,
         fetch: &RunFetch,
@@ -1467,17 +1497,11 @@ impl Flight {
                 cache.ahead_fetches.set(cache.ahead_fetches.get() + 1);
             }
         }
-        cache
-            .fetches_of
-            .borrow_mut()
-            .entry(owner)
-            .or_default()
-            .count += 1;
         Self {
             cache,
             objects,
             kind,
-            owner,
+            reading,
             object,
             fetched,
         }
@@ -1517,8 +1541,13 @@ impl Flight {
                 .collect(),
             Fetched::Whole { .. } => Rc::from([Bytes::copy_from_slice(&bytes)]),
         };
-        self.cache
-            .keep(self.kind, self.owner, self.object, &self.fetched, &blocks);
+        self.cache.keep(
+            self.kind,
+            &self.reading,
+            self.object,
+            &self.fetched,
+            &blocks,
+        );
         Ok(blocks)
     }
 
@@ -1579,13 +1608,6 @@ impl Drop for Flight {
                 self.cache
                     .ahead_fetches
                     .set(self.cache.ahead_fetches.get().saturating_sub(1));
-            }
-        }
-        let mut fetches_of = self.cache.fetches_of.borrow_mut();
-        if let Some(fetches) = fetches_of.get_mut(&self.owner) {
-            fetches.count -= 1;
-            if fetches.count == 0 {
-                fetches_of.remove(&self.owner);
             }
         }
     }
@@ -2053,7 +2075,7 @@ mod tests {
                 len,
                 None,
                 poll_offset,
-                PartitionReadSettings::SHARD,
+                &PartitionReadSettings::SHARD,
             )
             .await
             .map(|read| read.as_slice().to_vec())
@@ -2074,7 +2096,7 @@ mod tests {
                 len,
                 Some(next),
                 None,
-                PartitionReadSettings::SHARD,
+                &PartitionReadSettings::SHARD,
             )
             .await
             .map(|read| read.as_slice().to_vec())
@@ -2630,12 +2652,17 @@ mod tests {
         let index = vec![7_u8; 4096];
 
         remote
-            .carry_long_term(&source, &object(LOG_LEN), &index)
+            .carry_long_term(
+                &source,
+                &object(LOG_LEN),
+                &index,
+                &PartitionReadSettings::SHARD,
+            )
             .await;
 
         assert_eq!(
             remote
-                .read_long_term_index(&source, 4096, PartitionReadSettings::SHARD)
+                .read_long_term_index(&source, 4096, &PartitionReadSettings::SHARD)
                 .await,
             Ok(Bytes::from(index))
         );
@@ -2656,7 +2683,12 @@ mod tests {
             ..source_of(0, log_len)
         };
         let log = object(log_len);
-        let mut carrying = std::pin::pin!(remote.carry_long_term(&source, &log, b"index"));
+        let mut carrying = std::pin::pin!(remote.carry_long_term(
+            &source,
+            &log,
+            b"index",
+            &PartitionReadSettings::SHARD
+        ));
 
         let mut polls = 0;
         loop {
@@ -2687,7 +2719,12 @@ mod tests {
             ..source()
         };
         remote
-            .carry_long_term(&source, &object(OBJECT_LEN), b"index")
+            .carry_long_term(
+                &source,
+                &object(OBJECT_LEN),
+                b"index",
+                &PartitionReadSettings::SHARD,
+            )
             .await;
         let _ = read_cache(&remote).take_metrics();
 
@@ -2697,7 +2734,7 @@ mod tests {
         );
         assert_eq!(
             remote
-                .read_long_term_index(&source, 5, PartitionReadSettings::SHARD)
+                .read_long_term_index(&source, 5, &PartitionReadSettings::SHARD)
                 .await,
             Ok(Bytes::from_static(b"index"))
         );
@@ -2939,7 +2976,7 @@ mod tests {
 
         for _ in 0..2 {
             let index = remote
-                .read_long_term_index(&log, 4 * BLOCK, PartitionReadSettings::SHARD)
+                .read_long_term_index(&log, 4 * BLOCK, &PartitionReadSettings::SHARD)
                 .await;
             assert_eq!(index.as_deref(), Ok(&expected(0..30_000)[..]));
         }
@@ -2965,9 +3002,9 @@ mod tests {
         };
         let open = store.close();
         let mut first =
-            Box::pin(remote.read_long_term_index(&log, 4 * BLOCK, PartitionReadSettings::SHARD));
+            Box::pin(remote.read_long_term_index(&log, 4 * BLOCK, &PartitionReadSettings::SHARD));
         let mut second =
-            Box::pin(remote.read_long_term_index(&log, 4 * BLOCK, PartitionReadSettings::SHARD));
+            Box::pin(remote.read_long_term_index(&log, 4 * BLOCK, &PartitionReadSettings::SHARD));
         while store.waiting.get() == 0 {
             assert!(futures::poll!(first.as_mut()).is_pending());
             settle().await;
@@ -2995,7 +3032,7 @@ mod tests {
 
         for _ in 0..2 {
             remote
-                .read_long_term_index(&log, 1000, PartitionReadSettings::SHARD)
+                .read_long_term_index(&log, 1000, &PartitionReadSettings::SHARD)
                 .await
                 .unwrap();
             assert_eq!(read_of(&remote, &log, 10..20).await, Ok(expected(10..20)));
@@ -3020,7 +3057,7 @@ mod tests {
         for _ in 0..2 {
             for range in ranges.clone() {
                 let read = remote
-                    .read_fresh(7, range.clone(), reader(), PartitionReadSettings::SHARD)
+                    .read_fresh(7, range.clone(), reader(), &PartitionReadSettings::SHARD)
                     .await;
                 assert_eq!(read.as_deref(), Ok(&expected(range)[..]));
             }
@@ -3052,7 +3089,7 @@ mod tests {
                     7,
                     BLOCK + 50..BLOCK + 200,
                     reader(),
-                    PartitionReadSettings::SHARD
+                    &PartitionReadSettings::SHARD
                 )
                 .await,
             Err(DiskFault::Tiered)
@@ -3063,7 +3100,7 @@ mod tests {
                     7,
                     2 * BLOCK + 1..2 * BLOCK + 9,
                     reader(),
-                    PartitionReadSettings::SHARD
+                    &PartitionReadSettings::SHARD
                 )
                 .await,
             Err(DiskFault::Tiered)
@@ -3081,7 +3118,7 @@ mod tests {
 
         for _ in 0..2 {
             let read = remote
-                .read_fresh(7, 100..200, reader(), PartitionReadSettings::SHARD)
+                .read_fresh(7, 100..200, reader(), &PartitionReadSettings::SHARD)
                 .await;
             assert_eq!(read.as_deref(), Ok(&expected(100..200)[..]));
         }
@@ -3101,14 +3138,14 @@ mod tests {
             remote.cache_fresh_object(7, object(OBJECT_LEN), std::iter::empty());
 
             let blob = remote
-                .read_fresh(7, 100..200, reader(), PartitionReadSettings::SHARD)
+                .read_fresh(7, 100..200, reader(), &PartitionReadSettings::SHARD)
                 .await;
             let fetched = remote
                 .fetch_fresh(
                     7,
-                    &[300..400, 400..500],
+                    [300..400, 400..500],
                     reader(),
-                    PartitionReadSettings::SHARD,
+                    &PartitionReadSettings::SHARD,
                 )
                 .await
                 .unwrap();
@@ -3131,9 +3168,9 @@ mod tests {
         let fetched = remote
             .fetch_fresh(
                 7,
-                &[far.clone(), 10..20],
+                [far.clone(), 10..20],
                 reader(),
-                PartitionReadSettings::SHARD,
+                &PartitionReadSettings::SHARD,
             )
             .await
             .unwrap();
@@ -3183,7 +3220,7 @@ mod tests {
 
         for other in 100..140 {
             remote
-                .read_fresh(other, 0..BLOCK, reader(), PartitionReadSettings::SHARD)
+                .read_fresh(other, 0..BLOCK, reader(), &PartitionReadSettings::SHARD)
                 .await
                 .unwrap();
         }
@@ -3191,7 +3228,7 @@ mod tests {
 
         assert_eq!(
             remote
-                .read_fresh(7, 10..20, reader(), PartitionReadSettings::SHARD)
+                .read_fresh(7, 10..20, reader(), &PartitionReadSettings::SHARD)
                 .await
                 .as_deref(),
             Ok(&expected(10..20)[..])
@@ -3218,7 +3255,7 @@ mod tests {
         assert_eq!(remote.take_read_metrics().unwrap().cached_bytes, 1300);
         assert_eq!(
             remote
-                .read_fresh(2, 0..100, reader(), PartitionReadSettings::SHARD)
+                .read_fresh(2, 0..100, reader(), &PartitionReadSettings::SHARD)
                 .await
                 .unwrap(),
             shared
@@ -3281,7 +3318,7 @@ mod tests {
     async fn read_fresh_asked(remote: &RemoteSegments, store: &Store, object_id: u128) -> usize {
         let before = store.asked().len();
         remote
-            .read_fresh(object_id, 10..20, reader(), PartitionReadSettings::SHARD)
+            .read_fresh(object_id, 10..20, reader(), &PartitionReadSettings::SHARD)
             .await
             .unwrap();
         store.asked().len() - before
@@ -3487,6 +3524,7 @@ mod tests {
         PartitionReadSettings {
             limit: Some(blocks * BLOCK_LEN),
             read_ahead: None,
+            left: None,
         }
     }
 
@@ -3494,7 +3532,7 @@ mod tests {
         remote: &RemoteSegments,
         source: &RemoteRange,
         range: Range<u64>,
-        settings: PartitionReadSettings,
+        settings: &PartitionReadSettings,
     ) -> Result<Vec<u8>, DiskFault> {
         let len = usize::try_from(range.end - range.start).unwrap();
         remote
@@ -3529,14 +3567,19 @@ mod tests {
             partition_source(1, 40 * BLOCK),
             partition_source(2, 40 * BLOCK),
         );
-        read_as(&remote, &shared, 0..4 * BLOCK, PartitionReadSettings::SHARD)
-            .await
-            .unwrap();
+        read_as(
+            &remote,
+            &shared,
+            0..4 * BLOCK,
+            &PartitionReadSettings::SHARD,
+        )
+        .await
+        .unwrap();
 
         for block in 0..40 {
             let range = block * BLOCK..(block + 1) * BLOCK;
             assert_eq!(
-                read_as(&remote, &long, range.clone(), limited(8)).await,
+                read_as(&remote, &long, range.clone(), &limited(8)).await,
                 Ok(expected(range))
             );
         }
@@ -3557,13 +3600,14 @@ mod tests {
         let nothing = PartitionReadSettings {
             limit: Some(0),
             read_ahead: None,
+            left: None,
         };
 
         let under = limited(usize::try_from(LIMIT_BLOCKS_MIN).unwrap() - 1);
         for settings in [under, nothing] {
             for _ in 0..2 {
                 assert_eq!(
-                    read_as(&remote, &source(), 100..300, settings).await,
+                    read_as(&remote, &source(), 100..300, &settings).await,
                     Ok(expected(100..300))
                 );
             }
@@ -3572,49 +3616,85 @@ mod tests {
 
         assert_eq!(store.asked(), [(100, 300); 4]);
         assert_eq!(read_cache(&remote).take_metrics().cached_bytes, 0);
-        read_as(&remote, &source(), 100..300, PartitionReadSettings::SHARD)
+        read_as(&remote, &source(), 100..300, &PartitionReadSettings::SHARD)
             .await
             .unwrap();
         assert_eq!(store.asked()[4], (0, BLOCK));
     }
 
     /// Readahead keeps at most an eighth of a partition's limit in front of
-    /// its readers, and none below two blocks.
+    /// its readers, or of the shard's budget when that is smaller, and none
+    /// below two blocks.
     #[compio::test]
     async fn given_partition_limits_and_readahead_when_reading_in_order_should_fetch_ahead_within_them()
      {
-        // (row, settings, the most blocks fetched ahead of the reader)
-        for (row, settings, blocks_ahead) in [
-            ("the shard's readahead", PartitionReadSettings::SHARD, 8),
-            ("an eighth of the limit", limited(32), 4),
-            ("an eighth of the limit is one block", limited(8), 0),
+        // (row, the shard's budget, settings, the most blocks fetched ahead
+        // of the reader)
+        for (row, cache_bytes, settings, blocks_ahead) in [
+            (
+                "the shard's readahead",
+                CACHE_BYTES,
+                PartitionReadSettings::SHARD,
+                8,
+            ),
+            ("an eighth of the limit", CACHE_BYTES, limited(32), 4),
+            (
+                "an eighth of the limit is one block",
+                CACHE_BYTES,
+                limited(8),
+                0,
+            ),
             (
                 "the partition's own readahead",
+                CACHE_BYTES,
                 PartitionReadSettings {
                     limit: None,
                     read_ahead: Some(2 * BLOCK),
+                    left: None,
                 },
                 2,
             ),
             (
                 "the partition's readahead is one block",
+                CACHE_BYTES,
                 PartitionReadSettings {
                     limit: None,
                     read_ahead: Some(BLOCK),
+                    left: None,
                 },
                 0,
+            ),
+            (
+                "the partition's readahead past an eighth of the budget",
+                32 * BLOCK_LEN,
+                PartitionReadSettings {
+                    limit: None,
+                    read_ahead: Some(16 * BLOCK),
+                    left: None,
+                },
+                4,
+            ),
+            (
+                "the partition's readahead past an eighth of a limit above the budget",
+                32 * BLOCK_LEN,
+                PartitionReadSettings {
+                    limit: Some(64 * BLOCK_LEN),
+                    read_ahead: Some(16 * BLOCK),
+                    left: None,
+                },
+                4,
             ),
         ] {
             let len = 40 * BLOCK;
             let (store, ahead) = (Store::holding(len), Store::holding(len));
-            let remote = remote(&store, Rc::clone(&ahead) as _, CACHE_BYTES, READ_AHEAD);
+            let remote = remote(&store, Rc::clone(&ahead) as _, cache_bytes, READ_AHEAD);
             let source = partition_source(1, len);
             for block in 0..12 {
                 read_as(
                     &remote,
                     &source,
                     block * BLOCK..(block + 1) * BLOCK,
-                    settings,
+                    &settings,
                 )
                 .await
                 .unwrap();
@@ -3630,6 +3710,16 @@ mod tests {
         }
     }
 
+    /// The settings of a partition that can leave the shard, and its flag.
+    fn leaving() -> (PartitionReadSettings, PartitionLeft) {
+        let left = PartitionLeft::default();
+        let settings = PartitionReadSettings {
+            left: Some(left.clone()),
+            ..PartitionReadSettings::SHARD
+        };
+        (settings, left)
+    }
+
     /// What a GET in flight for a partition that left the shard fetches is
     /// not kept, and nothing else of the partition is either.
     #[compio::test]
@@ -3637,19 +3727,16 @@ mod tests {
     {
         let store = Store::holding(OBJECT_LEN);
         let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
-        read_as(&remote, &source(), 0..BLOCK, PartitionReadSettings::SHARD)
+        let (settings, left) = leaving();
+        read_as(&remote, &source(), 0..BLOCK, &settings)
             .await
             .unwrap();
         let open = store.close();
         let source = source();
-        let mut in_flight = Box::pin(read_as(
-            &remote,
-            &source,
-            BLOCK..2 * BLOCK,
-            PartitionReadSettings::SHARD,
-        ));
+        let mut in_flight = Box::pin(read_as(&remote, &source, BLOCK..2 * BLOCK, &settings));
         assert!(futures::poll!(in_flight.as_mut()).is_pending());
 
+        left.set();
         remote.forget_reader(source.key.prefix);
         open.send(()).unwrap();
 
@@ -3660,11 +3747,83 @@ mod tests {
             &remote,
             &source,
             BLOCK..2 * BLOCK,
-            PartitionReadSettings::SHARD,
+            &PartitionReadSettings::SHARD,
         )
         .await
         .unwrap();
         assert_eq!(cached_blocks(&remote, &source), 1, "a new read keeps again");
+    }
+
+    /// A poll that outlives its partition, after the last GET it had in
+    /// flight ended, starts no GET for it and leaves nothing in the cache,
+    /// through the cache or past it.
+    #[compio::test]
+    async fn given_a_partition_that_left_the_shard_when_its_poll_reads_on_after_its_gets_ended_should_start_no_get_and_keep_nothing()
+     {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let (settings, left) = leaving();
+        read_as(&remote, &source(), 0..BLOCK, &settings)
+            .await
+            .unwrap();
+
+        left.set();
+        remote.forget_reader(source().key.prefix);
+        let under = PartitionReadSettings {
+            limit: Some(BLOCK_LEN),
+            ..settings.clone()
+        };
+
+        assert_eq!(
+            read_as(&remote, &source(), BLOCK..2 * BLOCK, &settings).await,
+            Err(DiskFault::Retryable)
+        );
+        assert_eq!(
+            read_as(&remote, &source(), 0..100, &under).await,
+            Err(DiskFault::Retryable),
+            "nor past the cache"
+        );
+        assert_eq!(
+            remote.read_long_term_index(&source(), 5, &settings).await,
+            Err(DiskFault::Retryable)
+        );
+        settle().await;
+        assert_eq!(store.asked(), [(0, BLOCK)]);
+        assert_eq!(read_cache(&remote).take_metrics().cached_bytes, 0);
+        let owner = ReadOwner {
+            store: OWN_STORE,
+            prefix: source().key.prefix,
+        };
+        assert_eq!(read_cache(&remote).cache.borrow().limit(&owner), None);
+    }
+
+    /// A rewrite that hands a segment over a stride at a time stops once its
+    /// partition leaves the shard, and what it handed over before goes.
+    #[compio::test]
+    async fn given_a_partition_that_leaves_the_shard_while_a_rewrite_carries_its_segment_should_keep_nothing_of_it()
+     {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let log_len = (3 * REWRITE_YIELD_BYTES) as u64;
+        let source = RemoteRange {
+            keyed_end_offset: Some(9),
+            ..source_of(0, log_len)
+        };
+        let log = object(log_len);
+        let (settings, left) = leaving();
+        let mut carrying =
+            std::pin::pin!(remote.carry_long_term(&source, &log, b"index", &settings));
+        assert!(futures::poll!(carrying.as_mut()).is_pending());
+        assert!(read_cache(&remote).take_metrics().cached_bytes > 0);
+
+        left.set();
+        remote.forget_reader(source.key.prefix);
+        carrying.await;
+
+        let metrics = read_cache(&remote).take_metrics();
+        assert_eq!(metrics.cached_bytes, 0);
+        assert_eq!(metrics.carried_bytes, 0);
+        assert!(read_cache(&remote).carried.borrow().is_empty());
     }
 
     /// A peer's partition and one of the node's own read within one budget,
@@ -3680,18 +3839,18 @@ mod tests {
         let gate = Rc::new(Gate(Cell::new(Some(7))));
         let peer = peer(&Store::holding(40 * BLOCK), &cache, &gate);
         let source = partition_source(1, 40 * BLOCK);
-        read_as(&own, &source, 0..4 * BLOCK, PartitionReadSettings::SHARD)
+        read_as(&own, &source, 0..4 * BLOCK, &PartitionReadSettings::SHARD)
             .await
             .unwrap();
 
         for block in 0..40 {
             let range = block * BLOCK..(block + 1) * BLOCK;
-            read_as(&peer, &source, range, limited(8)).await.unwrap();
+            read_as(&peer, &source, range, &limited(8)).await.unwrap();
         }
         assert_eq!(cached_blocks(&own, &source), 4);
         for block in 4..40 {
             let range = block * BLOCK..(block + 1) * BLOCK;
-            read_as(&own, &source, range, PartitionReadSettings::SHARD)
+            read_as(&own, &source, range, &PartitionReadSettings::SHARD)
                 .await
                 .unwrap();
         }
@@ -3717,7 +3876,7 @@ mod tests {
             for source in &partitions {
                 for block in 0..blocks_each {
                     let range = block * BLOCK..(block + 1) * BLOCK;
-                    read_as(&remote, source, range, settings).await.unwrap();
+                    read_as(&remote, source, range, &settings).await.unwrap();
                 }
             }
 
@@ -3737,6 +3896,30 @@ mod tests {
         }
     }
 
+    /// An index past an eighth of the partition's limit would take more than
+    /// the share on its own, so a rewrite hands over nothing of the segment.
+    #[compio::test]
+    async fn given_an_index_larger_than_an_eighth_of_the_partition_limit_when_a_rewrite_carries_its_segment_should_keep_none_of_it()
+     {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let segment = source_of(0, 40 * BLOCK);
+        let log = object(40 * BLOCK);
+        read_as(&remote, &segment, 0..10, &limited(16))
+            .await
+            .unwrap();
+        let held = read_cache(&remote).take_metrics().cached_bytes;
+        let index = vec![7_u8; usize::try_from(2 * BLOCK + 1).unwrap()];
+
+        remote
+            .carry_long_term(&segment, &log, &index, &PartitionReadSettings::SHARD)
+            .await;
+
+        let metrics = read_cache(&remote).take_metrics();
+        assert_eq!(metrics.carried_bytes, 0);
+        assert_eq!(metrics.cached_bytes, held);
+    }
+
     /// A rewrite hands the cache no more of a segment than an eighth of the
     /// limit of its partition, and nothing under eight blocks of it.
     #[compio::test]
@@ -3747,15 +3930,23 @@ mod tests {
         let segment = source_of(0, 40 * BLOCK);
         let log = object(40 * BLOCK);
 
-        remote.carry_long_term(&segment, &log, b"index").await;
+        remote
+            .carry_long_term(&segment, &log, b"index", &PartitionReadSettings::SHARD)
+            .await;
         let unlimited = read_cache(&remote).take_metrics().carried_bytes;
-        read_as(&remote, &segment, 0..10, limited(16))
+        read_as(&remote, &segment, 0..10, &limited(16))
             .await
             .unwrap();
-        remote.carry_long_term(&segment, &log, b"index").await;
+        remote
+            .carry_long_term(&segment, &log, b"index", &PartitionReadSettings::SHARD)
+            .await;
         let within_limit = read_cache(&remote).take_metrics().carried_bytes;
-        read_as(&remote, &segment, 0..10, limited(7)).await.unwrap();
-        remote.carry_long_term(&segment, &log, b"index").await;
+        read_as(&remote, &segment, 0..10, &limited(7))
+            .await
+            .unwrap();
+        remote
+            .carry_long_term(&segment, &log, b"index", &PartitionReadSettings::SHARD)
+            .await;
 
         // The index takes its room in the eighth, a block of the tail.
         assert_eq!(unlimited, CACHE_BYTES as u64 / 8 - BLOCK + 5);

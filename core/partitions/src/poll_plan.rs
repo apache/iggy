@@ -1453,7 +1453,7 @@ impl DiskReadPlan {
                     (None, MessageLookup::Offset { offset, .. }) => Some(offset),
                     (None, MessageLookup::Timestamp { .. }) => None,
                 };
-                let cached = remote.holds(range, walk.position, len, self.read_settings);
+                let cached = remote.holds(range, walk.position, len, &self.read_settings);
                 let read = async {
                     remote
                         .read(
@@ -1462,7 +1462,7 @@ impl DiskReadPlan {
                             len,
                             *next,
                             poll_offset,
-                            self.read_settings,
+                            &self.read_settings,
                         )
                         .await
                         .map_err(|fault| {

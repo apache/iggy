@@ -259,7 +259,9 @@ impl SegmentRewrite {
                 keyed_end_offset: Some(record.end_offset),
                 range: 0..record.size,
             };
-            remote.carry_long_term(&segment, &log, &index).await;
+            remote
+                .carry_long_term(&segment, &log, &index, &self.read.read_settings)
+                .await;
         }
         Ok(ManifestSegment {
             start_offset: record.start_offset,

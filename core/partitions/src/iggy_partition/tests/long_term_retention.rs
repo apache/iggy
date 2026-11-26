@@ -601,12 +601,13 @@ async fn given_long_term_segments_polled_through_a_cache_when_limited_or_gone_sh
     let under = PartitionReadSettings {
         limit: Some(1),
         read_ahead: None,
+        left: None,
     };
 
     let first = Box::pin(polled_all(&mut partition)).await;
     assert!(cached(&partition) > 0);
     let asked = counted.keys.borrow().len();
-    let limited = Box::pin(polled_all_reading(&mut partition, under)).await;
+    let limited = Box::pin(polled_all_reading(&mut partition, &under)).await;
     assert_eq!(cached(&partition), 0);
     let keys = counted.keys.borrow().clone();
     let (cached_pass, limited_pass) = keys.split_at(asked);

@@ -6397,7 +6397,7 @@ where
         clippy::unused_self,
         reason = "the topic options that set them read the shard's metadata"
     )]
-    pub const fn partition_read_settings(
+    const fn partition_read_settings(
         &self,
         _namespace: IggyNamespace,
     ) -> partitions::PartitionReadSettings {
