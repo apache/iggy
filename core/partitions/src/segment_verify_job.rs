@@ -83,11 +83,12 @@ impl<E: TierExecutor> SegmentVerifier for ExecutorSegmentVerifier<E> {
     }
 }
 
-/// HEAD the `.log` and then the `.index` of each segment of `job`, in order,
-/// up to the first HEAD that the store answers with an error other than
-/// [`ObjectStoreError::NotFound`]. The `.index` of a segment whose `.log` is
-/// missing is not asked for. A `.log` that differs from the record is
-/// reported even when the HEAD of its `.index` fails.
+/// HEAD the `.log` and then the `.index` of each segment of `job`, in order.
+///
+/// The HEADs stop at the first one that the store answers with an error
+/// other than [`ObjectStoreError::NotFound`]. The `.index` of a segment
+/// whose `.log` is missing is not asked for. A `.log` that differs from the
+/// record is reported even when the HEAD of its `.index` fails.
 pub async fn head_segments<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,

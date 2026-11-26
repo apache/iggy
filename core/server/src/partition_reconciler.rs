@@ -499,7 +499,7 @@ enum ChainWait {
     /// The read finished, and the next check loads the partition with it.
     Read {
         request: StoreViewRequest,
-        outcome: StoreViewOutcome,
+        outcome: Box<StoreViewOutcome>,
     },
 }
 
@@ -1913,7 +1913,7 @@ async fn load_prior_life(
             return Err(missing(request));
         }
         Some(ChainWait::Read { request, outcome }) => {
-            let view = match outcome {
+            let view = match *outcome {
                 Ok(Ok(view)) => view,
                 Ok(Err(error)) => {
                     warn!(
@@ -1987,7 +1987,10 @@ fn start_chain_read(ctx: &ReconcilerCtx, ns: IggyNamespace, request: StoreViewRe
             running
                 .map(|wait| {
                     let request = wait.request().clone();
-                    *wait = ChainWait::Read { request, outcome };
+                    *wait = ChainWait::Read {
+                        request,
+                        outcome: Box::new(outcome),
+                    };
                 })
                 .is_some()
         };

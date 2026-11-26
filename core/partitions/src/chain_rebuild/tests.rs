@@ -623,9 +623,12 @@ fn given_a_manifest_that_records_a_segment_differently_when_rebuilding_should_re
     );
 }
 
+/// A change of one timestamp of a manifest segment.
+type TimestampShift = fn(&mut ManifestSegment);
+
 #[test]
 fn given_a_manifest_that_records_other_timestamps_when_rebuilding_should_refuse() {
-    let shifts: [(&str, fn(&mut ManifestSegment)); 3] = [
+    let shifts: [(&str, TimestampShift); 3] = [
         ("start", |segment| segment.start_timestamp += 1),
         ("end", |segment| segment.end_timestamp += 1),
         ("max", |segment| segment.max_timestamp += 1),
@@ -1037,7 +1040,7 @@ async fn given_a_stale_manifest_size_from_a_head_when_reading_the_view_should_re
 async fn given_more_logs_than_heads_in_flight_when_reading_the_view_should_head_them_several_at_a_time()
  {
     let layout = KeyLayout::new("iggy").unwrap();
-    let segments: Vec<(u64, u64)> = (0..2 * STORE_VIEW_HEADS as u64 + 1)
+    let segments: Vec<(u64, u64)> = (0..=2 * STORE_VIEW_HEADS as u64)
         .map(|segment| (segment * 10, segment * 10 + 9))
         .collect();
     let gone = log_key(&layout, 10);
@@ -1351,20 +1354,22 @@ fn given_a_request_when_the_incarnation_or_the_trim_changes_should_no_longer_be_
     assert!(!request.is_for(PREFIX.created_revision, 29));
 }
 
+/// The turns that a failing HEAD waits, and the error it fails with, made
+/// from its key.
+type HeadFault = (usize, fn(String) -> ObjectStoreError);
+
 /// A store whose HEADs each wait a turn before they answer, so HEADs that run
 /// at the same time are seen to. A HEAD of a key in `failing` waits the turns
 /// given there, then fails with the error made from its key.
 struct SlowHeads {
     store: MemoryStore,
-    failing: HashMap<String, (usize, fn(String) -> ObjectStoreError)>,
+    failing: HashMap<String, HeadFault>,
     in_flight: Cell<usize>,
     most_in_flight: Cell<usize>,
 }
 
 impl SlowHeads {
-    fn new<const N: usize>(
-        failing: [(String, (usize, fn(String) -> ObjectStoreError)); N],
-    ) -> Self {
+    fn new<const N: usize>(failing: [(String, HeadFault); N]) -> Self {
         Self {
             store: MemoryStore::new(),
             failing: HashMap::from(failing),

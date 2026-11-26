@@ -1229,7 +1229,7 @@ impl DiskReadPlan {
     /// so narrowing it to a `usize` cannot truncate. The chunk itself is not
     /// bounded by `DISK_POLL_CHUNK_MAX`: a batch wider than the ceiling grows
     /// past it below.
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     async fn walk_segment(
         &self,
         bytes: &SegmentBytes<'_>,
