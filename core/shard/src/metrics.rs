@@ -1220,6 +1220,7 @@ impl ShardMetrics {
     }
 
     /// The count of stale shadow topics of the geo peer `origin`.
+    #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn geo_shadow_topics_stale_value(&self, origin: &str) -> i64 {
         let label = GeoPeerLabel {

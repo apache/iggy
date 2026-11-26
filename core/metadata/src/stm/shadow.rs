@@ -60,7 +60,7 @@ use iggy_binary_protocol::requests::topics::{
 use iggy_binary_protocol::{WireError, WireIdentifier, WireName};
 use iggy_common::{GeoMode, IggyTimestamp};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::change_log::{AppliedChange, change_actor, stream_body};
@@ -504,18 +504,42 @@ impl StreamsInner {
     /// adopted a stream of the origin.
     #[must_use]
     pub fn recorded_cluster_uids(&self, origin: &str) -> BTreeSet<u128> {
-        let retired = self
-            .retired_origins
-            .get(origin)
-            .into_iter()
-            .flat_map(|retired| retired.cluster_uids.iter().copied());
-        self.items
+        self.recorded_clusters()
+            .filter(|(of, _)| *of == origin)
+            .map(|(_, cluster_uid)| cluster_uid)
+            .collect()
+    }
+
+    /// [`Self::recorded_cluster_uids`] of every origin that it is not empty
+    /// for, from one pass over the streams.
+    #[must_use]
+    pub fn recorded_cluster_uids_by_origin(&self) -> BTreeMap<String, BTreeSet<u128>> {
+        let mut recorded: BTreeMap<String, BTreeSet<u128>> = BTreeMap::new();
+        for (origin, cluster_uid) in self.recorded_clusters() {
+            if let Some(clusters) = recorded.get_mut(origin) {
+                clusters.insert(cluster_uid);
+            } else {
+                recorded.insert(origin.to_owned(), BTreeSet::from([cluster_uid]));
+            }
+        }
+        recorded
+    }
+
+    /// Each origin with a cluster lifetime that a shadow stream or a
+    /// retirement recorded of it.
+    fn recorded_clusters(&self) -> impl Iterator<Item = (&str, u128)> {
+        let streams = self
+            .items
             .iter()
             .filter_map(|(_, stream)| stream.shadow.as_ref())
-            .filter(|source| source.origin == origin)
-            .map(|source| source.cluster_uid)
-            .chain(retired)
-            .collect()
+            .map(|source| (source.origin.as_str(), source.cluster_uid));
+        let retired = self.retired_origins.iter().flat_map(|(origin, retired)| {
+            retired
+                .cluster_uids
+                .iter()
+                .map(move |&cluster_uid| (origin.as_str(), cluster_uid))
+        });
+        streams.chain(retired)
     }
 }
 
@@ -1558,6 +1582,31 @@ mod tests {
             BTreeSet::from([PEER_CLUSTER, RETIRED_CLUSTER]),
             "a retired origin keeps the clusters of the shadow streams it had"
         );
+    }
+
+    #[test]
+    fn given_shadow_streams_and_a_retirement_of_two_origins_when_asking_for_every_origins_clusters_should_give_what_each_origin_gets()
+     {
+        let (mut inner, _) = shadowed();
+        assert_eq!(apply(&mut inner, 4, &retirement("dc-c")).code, 0);
+        inner
+            .retired_origins
+            .get_mut("dc-c")
+            .unwrap()
+            .cluster_uids
+            .push(RETIRED_CLUSTER);
+
+        let recorded = inner.recorded_cluster_uids_by_origin();
+
+        assert_eq!(
+            recorded,
+            BTreeMap::from([
+                (PEER.to_owned(), inner.recorded_cluster_uids(PEER)),
+                ("dc-c".to_owned(), inner.recorded_cluster_uids("dc-c")),
+            ])
+        );
+        assert_eq!(recorded[PEER], BTreeSet::from([PEER_CLUSTER]));
+        assert_eq!(recorded["dc-c"], BTreeSet::from([RETIRED_CLUSTER]));
     }
 
     #[test]

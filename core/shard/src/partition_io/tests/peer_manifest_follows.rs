@@ -18,13 +18,14 @@
 //! The primary of a shadow partition, which reads the peer manifests that a
 //! listing found changed and commits them.
 
+use std::cell::RefCell;
 use std::ops::Range;
 
 use super::segment_uploads::{namespace, pumped, until};
 use super::*;
-use crate::peer_manifest_follows::{MANIFESTS_PER_PASS, peer_manifest_passes};
+use crate::ListedPeerManifest;
+use crate::peer_manifest_follows::{MANIFESTS_PER_PASS, PeerManifestSource, peer_manifest_passes};
 use crate::peers::{IdentityBracket, PeerIdentity, PeerStatus, SharedPeerStatus};
-use crate::{ListedPeerManifest, PeerManifestSource};
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
 use iggy_object_store::{
@@ -177,6 +178,23 @@ impl RemoteObjects for HungRead {
             return std::future::pending().boxed_local();
         }
         ObjectStore::get_range(&*self.store, key, range).boxed_local()
+    }
+}
+
+/// The reads of `objects`, with the key of each kept in `keys`.
+struct KeysRead {
+    objects: Rc<dyn RemoteObjects>,
+    keys: Rc<RefCell<Vec<String>>>,
+}
+
+impl RemoteObjects for KeysRead {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        self.keys.borrow_mut().push(key.to_owned());
+        self.objects.get_range(key, range)
     }
 }
 
@@ -356,6 +374,54 @@ async fn given_a_manifest_read_that_never_answers_when_reading_more_than_one_pas
         passes.pop().unwrap().now_or_never().is_none(),
         "the pass of the slow read waits for it"
     );
+}
+
+/// A pass whose first read of the identity object fails cannot commit what
+/// it reads, so it reads no manifest and hands back the identity error.
+#[compio::test]
+async fn given_a_first_identity_read_that_fails_when_reading_a_pass_should_read_no_manifest_and_report_the_identity_error()
+ {
+    let store = Rc::new(MemoryStore::new());
+    publish(&store, &manifest(2)).await;
+    let keys = Rc::new(RefCell::new(Vec::new()));
+    let source = PeerManifestSource {
+        objects: Rc::new(KeysRead {
+            objects: Rc::new(Peer {
+                store,
+                fault: Fault::IdentityUnanswered,
+            }),
+            keys: Rc::clone(&keys),
+        }),
+        identity_key: peer_layout().identity_key(),
+        status: SharedPeerStatus::default(),
+    };
+    let listed = (0..2)
+        .map(|index| ListedPeerManifest {
+            namespace: IggyNamespace::new(0, 0, index),
+            created_revision: 1,
+            key: peer_layout().manifest_key(&PEER_PREFIX),
+            etag: format!("e{index}"),
+        })
+        .collect();
+
+    let mut passes = peer_manifest_passes(source, ORIGIN.to_owned(), listed);
+    let finished = passes.pop().unwrap().await;
+
+    assert!(passes.is_empty());
+    assert_eq!(
+        *keys.borrow(),
+        [peer_layout().identity_key()],
+        "the identity object alone"
+    );
+    assert_eq!(finished.len(), 2);
+    for read in finished {
+        assert_eq!(read.identity, IdentityBracket::Unread);
+        let error = read.outcome.expect_err("no manifest without the identity");
+        assert!(
+            error.contains("identity object") && error.contains("reset"),
+            "{error}"
+        );
+    }
 }
 
 /// A root that another cluster claimed while the pass read its manifest

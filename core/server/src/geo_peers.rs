@@ -25,7 +25,9 @@
 //!
 //! A peer never stops the boot once its configuration can work, and never
 //! holds up local traffic: the checks run in a task of shard 0 after the
-//! shards start. Shard 0 reads each peer's store identity object at once,
+//! shards start, each peer's on a schedule of its own, so a slow read of one
+//! peer holds up no check of another. Shard 0 reads each peer's store
+//! identity object at once,
 //! every 5 seconds while the node reads nothing from the peer or the store
 //! does not answer, and every minute after that. It checks a peer at once
 //! too when committed metadata changes the clusters it expects of the peer,
@@ -58,7 +60,8 @@
 //! polls wait for that one read, and no read of its identity object goes out
 //! after it, unless metadata stops covering that claim.
 
-use std::collections::BTreeSet;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -66,7 +69,7 @@ use std::time::{Duration, Instant};
 use configs::geo::{GeoConfig, GeoPeerConfig};
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
 use consensus::{MetadataHandle, PartitionsHandle};
-use futures::future::{Either, join_all, select};
+use futures::future::{join_all, select};
 use iggy_object_store::gcs::{GcsAuth, GcsStore};
 use iggy_object_store::s3::{Credentials, S3Store};
 use iggy_object_store::{
@@ -99,7 +102,8 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const CLUSTER_UID_WAIT: Duration = Duration::from_secs(1);
 /// The longest shard 0 waits before it looks again for a retired origin, a
 /// change of the clusters that metadata expects of a peer, or a check that a
-/// shard asked for. A look sends no request.
+/// shard asked for. A look sends no request, and reads committed metadata
+/// again only once its last read for any peer is this old.
 const LOOK_WAIT: Duration = Duration::from_secs(1);
 /// The most recovery records that one check reads. Each recovery of a
 /// cluster that lost every disk writes one.
@@ -267,54 +271,80 @@ fn checkers(
         .collect()
 }
 
-/// Check each peer whenever its check is due, until `stop` fires. A peer
-/// whose origin retired is marked so, and checked no more once a check
-/// accepted the claim on its root.
+/// Check each peer on a schedule of its own, see [`PeerChecker::run`], until
+/// `stop` fires or its sender is gone.
 async fn run<S: ObjectStore>(
     shard: Rc<ServerShard>,
-    mut checkers: Vec<PeerChecker<S>>,
+    checkers: Vec<PeerChecker<S>>,
     stop: Receiver<()>,
 ) {
-    loop {
-        let streams = shard.plane.metadata().mux_stm.streams();
-        let retired = streams.retired_origins();
-        for checker in &mut checkers {
-            if retired.contains_key(&checker.origin) {
-                checker.retire(shard.metrics());
-            }
-            let expected = streams.read(|inner| inner.recorded_cluster_uids(&checker.origin));
-            checker.look(expected, Instant::now(), shard.metrics());
+    let metadata = MetadataView::new(|| Looks::read(&shard), || own_cluster_uid(&shard));
+    let metrics = shard.metrics();
+    let checks = join_all(
+        checkers
+            .into_iter()
+            .map(|checker| checker.run(&metadata, metrics)),
+    );
+    select(pin!(checks), pin!(stop.recv())).await;
+}
+
+/// What committed metadata says of the peers, from one pass over its
+/// streams.
+#[derive(Debug, Default)]
+struct Looks {
+    /// The origins that it retired.
+    retired: BTreeSet<String>,
+    /// The clusters that it expects of each origin, see
+    /// [`StreamsInner::recorded_cluster_uids`].
+    recorded: BTreeMap<String, BTreeSet<u128>>,
+}
+
+impl Looks {
+    fn read(shard: &ServerShard) -> Self {
+        shard.plane.metadata().mux_stm.streams().read(|inner| Self {
+            retired: inner.retired_origins.keys().cloned().collect(),
+            recorded: inner.recorded_cluster_uids_by_origin(),
+        })
+    }
+}
+
+/// What the checks of every peer read of committed metadata, shared so that
+/// one read serves the looks of all of them.
+struct MetadataView<R, U> {
+    /// One read of [`Looks`].
+    read: R,
+    /// This cluster's `cluster_uid`, which the first committed metadata
+    /// operation sets.
+    own_cluster_uid: U,
+    /// The last [`Looks`] read, and when.
+    last: RefCell<Option<(Instant, Rc<Looks>)>>,
+}
+
+impl<R, U> MetadataView<R, U>
+where
+    R: Fn() -> Looks,
+    U: Fn() -> Option<u128>,
+{
+    const fn new(read: R, own_cluster_uid: U) -> Self {
+        Self {
+            read,
+            own_cluster_uid,
+            last: RefCell::new(None),
         }
-        let wait = match own_cluster_uid(&shard) {
-            None => CLUSTER_UID_WAIT,
-            Some(own_cluster_uid) => {
-                let now = Instant::now();
-                let metrics = shard.metrics();
-                let due = checkers
-                    .iter_mut()
-                    .filter(|checker| checker.wants_check(now))
-                    .map(|checker| checker.step(own_cluster_uid, metrics));
-                match select(pin!(join_all(due)), pin!(stop.recv())).await {
-                    Either::Left(_) => {}
-                    Either::Right(_) => return,
-                }
-                let now = Instant::now();
-                checkers
-                    .iter()
-                    .filter(|checker| checker.checks())
-                    .map(|checker| checker.due.saturating_duration_since(now))
-                    .min()
-                    .unwrap_or(RECHECK_INTERVAL)
-            }
-        };
-        // `Ok`: the stop fired, or its sender is gone. `Err`: the wait ran
-        // out.
-        if compio::time::timeout(wait.min(LOOK_WAIT), stop.recv())
-            .await
-            .is_ok()
+    }
+
+    /// What committed metadata says of the peers at `now`, read again once
+    /// the last read is a [`LOOK_WAIT`] old.
+    fn looks(&self, now: Instant) -> Rc<Looks> {
+        let mut last = self.last.borrow_mut();
+        if let Some((at, looks)) = last.as_ref()
+            && now.saturating_duration_since(*at) < LOOK_WAIT
         {
-            return;
+            return Rc::clone(looks);
         }
+        let looks = Rc::new((self.read)());
+        *last = Some((now, Rc::clone(&looks)));
+        looks
     }
 }
 
@@ -412,18 +442,54 @@ impl<S: ObjectStore> PeerChecker<S> {
         self.checks() && self.due <= now
     }
 
+    /// Look at committed metadata and at the checks that the shards ask for
+    /// at most a [`LOOK_WAIT`] apart, and check the peer whenever its check
+    /// is due, until dropped. A peer whose origin retired is marked so, and
+    /// checked no more once a check accepted the claim on its root.
+    async fn run<R, U>(mut self, metadata: &MetadataView<R, U>, metrics: &ShardMetrics)
+    where
+        R: Fn() -> Looks,
+        U: Fn() -> Option<u128>,
+    {
+        loop {
+            let now = Instant::now();
+            let looks = metadata.looks(now);
+            if looks.retired.contains(&self.origin) {
+                self.retire(metrics);
+            }
+            match looks.recorded.get(&self.origin) {
+                Some(expected) => self.look(expected, now, metrics),
+                None => self.look(&BTreeSet::new(), now, metrics),
+            }
+            let wait = match (metadata.own_cluster_uid)() {
+                None => CLUSTER_UID_WAIT,
+                Some(own_cluster_uid) => {
+                    if self.wants_check(now) {
+                        self.step(own_cluster_uid, metrics).await;
+                    }
+                    if self.checks() {
+                        self.due.saturating_duration_since(Instant::now())
+                    } else {
+                        RECHECK_INTERVAL
+                    }
+                }
+            };
+            compio::time::sleep(wait.min(LOOK_WAIT)).await;
+        }
+    }
+
     /// Take the clusters that committed metadata now expects of the peer,
     /// and any check that a shard asked for. Either makes the next check
     /// due at `now`. A verified cluster that the new clusters do not cover
     /// is read no more until a check accepts a claim again.
-    fn look(&mut self, expected: BTreeSet<u128>, now: Instant, metrics: &ShardMetrics) {
+    fn look(&mut self, expected: &BTreeSet<u128>, now: Instant, metrics: &ShardMetrics) {
         if self.status.take_check_request() {
             self.due = now;
         }
-        if expected == self.expected {
+        if *expected == self.expected {
             return;
         }
-        self.expected = expected;
+        expected.clone_into(&mut self.expected);
         self.due = now;
         let mut status = self.status.get();
         let PeerIdentity::Verified { cluster_uid } = status.identity else {
@@ -519,13 +585,11 @@ impl<S: ObjectStore> PeerChecker<S> {
         let proof = self.proof.insert(proof);
         let read = match proof.advance(&self.store, &self.layout, self.timeout).await {
             Err(error) => {
-                return PeerCheck {
-                    read: PeerRead::Unproven {
-                        found,
-                        unreachable: true,
-                    },
-                    error: Some(error),
+                let outage = PeerRead::Unproven {
+                    found,
+                    unreachable: true,
                 };
+                return PeerCheck::failed(error, outage);
             }
             Ok(()) => match proof.walk {
                 Walk::Ended(Some(of)) => PeerRead::Successor {
@@ -717,20 +781,24 @@ impl PeerCheck {
             Ok(IdentityRead::Found(found)) => PeerRead::Found(found.cluster_uid),
             Ok(IdentityRead::Invalid) => PeerRead::Invalid,
             Ok(IdentityRead::Missing) => PeerRead::Missing,
-            Err(error) => {
-                let read = match error.class() {
-                    ErrorClass::Transient => PeerRead::Unreachable,
-                    ErrorClass::NotFound
-                    | ErrorClass::PreconditionFailed
-                    | ErrorClass::Permanent => PeerRead::Refused,
-                };
-                return Self {
-                    read,
-                    error: Some(error),
-                };
-            }
+            Err(error) => return Self::failed(error, PeerRead::Unreachable),
         };
         Self { read, error: None }
+    }
+
+    /// A read of the check that failed with `error`: `outage` when a retry
+    /// can get past it, a refusal that only an operator ends otherwise.
+    fn failed(error: ObjectStoreError, outage: PeerRead) -> Self {
+        let read = match error.class() {
+            ErrorClass::Transient => outage,
+            ErrorClass::NotFound | ErrorClass::PreconditionFailed | ErrorClass::Permanent => {
+                PeerRead::Refused
+            }
+        };
+        Self {
+            read,
+            error: Some(error),
+        }
     }
 }
 
@@ -905,6 +973,7 @@ mod tests {
     use std::path::Path;
     use std::time::SystemTime;
 
+    use futures::future::{Either, join};
     use iggy_object_store::{
         DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, PutBody,
         PutOptions, RecordingStore, StoreCalls, TierExecutor, TierJobClass, TierJobRequest,
@@ -1351,21 +1420,39 @@ mod tests {
         clusters.windows(2).map(|pair| (pair[0], pair[1])).collect()
     }
 
-    /// A store whose reads of recovery records get no answer while
-    /// `unanswered` holds.
-    struct RecordsUnanswered {
-        store: MemoryStore,
-        unanswered: Rc<Cell<bool>>,
+    /// A store whose reads of recovery records fail as `fault` says.
+    struct RecoveryFaults {
+        store: Rc<MemoryStore>,
+        fault: Rc<Cell<Option<RecoveryFault>>>,
     }
 
-    impl ObjectStore for RecordsUnanswered {
+    #[derive(Clone, Copy)]
+    enum RecoveryFault {
+        /// The connection resets.
+        Reset,
+        /// The store rejects the credentials.
+        Refused,
+        /// No answer comes.
+        Silent,
+    }
+
+    impl RecoveryFaults {
+        fn new(store: MemoryStore, fault: Option<RecoveryFault>) -> Self {
+            Self {
+                store: Rc::new(store),
+                fault: Rc::new(Cell::new(fault)),
+            }
+        }
+    }
+
+    impl ObjectStore for RecoveryFaults {
         fn put(
             &self,
             key: &str,
             body: PutBody,
             options: &PutOptions,
         ) -> impl Future<Output = Result<(), ObjectStoreError>> {
-            ObjectStore::put(&self.store, key, body, options)
+            ObjectStore::put(&*self.store, key, body, options)
         }
 
         fn get_range(
@@ -1373,16 +1460,22 @@ mod tests {
             key: &str,
             range: Range<u64>,
         ) -> impl Future<Output = Result<ObjectRange, ObjectStoreError>> {
-            ObjectStore::get_range(&self.store, key, range)
+            ObjectStore::get_range(&*self.store, key, range)
         }
 
         fn head(&self, key: &str) -> impl Future<Output = Result<ObjectMeta, ObjectStoreError>> {
-            let unanswered = self.unanswered.get() && key.contains("/recovery/");
+            let fault = self.fault.get().filter(|_| key.contains("/recovery/"));
             async move {
-                if unanswered {
-                    return Err(ObjectStoreError::Transport("reset".to_owned()));
+                match fault {
+                    Some(RecoveryFault::Reset) => {
+                        Err(ObjectStoreError::Transport("reset".to_owned()))
+                    }
+                    Some(RecoveryFault::Refused) => {
+                        Err(ObjectStoreError::Auth("denied".to_owned()))
+                    }
+                    Some(RecoveryFault::Silent) => pending().await,
+                    None => ObjectStore::head(&*self.store, key).await,
                 }
-                ObjectStore::head(&self.store, key).await
             }
         }
 
@@ -1390,14 +1483,14 @@ mod tests {
             &self,
             keys: &[String],
         ) -> impl Future<Output = Result<DeleteOutcome, ObjectStoreError>> {
-            ObjectStore::delete(&self.store, keys)
+            ObjectStore::delete(&*self.store, keys)
         }
 
         fn list(
             &self,
             request: &ListRequest<'_>,
         ) -> impl Future<Output = Result<ListPage, ObjectStoreError>> {
-            ObjectStore::list(&self.store, request)
+            ObjectStore::list(&*self.store, request)
         }
     }
 
@@ -1422,11 +1515,45 @@ mod tests {
             status.clone(),
         );
         checker.look(
-            expected.iter().copied().collect(),
+            &expected.iter().copied().collect(),
             Instant::now(),
             &ShardMetrics::for_shard(),
         );
         (checker, status, calls)
+    }
+
+    /// A checker of `dc-b` that verified [`DC_B`], whose root
+    /// [`DC_B_RECOVERED`] now claims with the recovery record that proves it,
+    /// and whose reads of recovery records fail with `fault` until it is
+    /// cleared.
+    async fn claimed_by_successor(
+        fault: RecoveryFault,
+    ) -> (
+        PeerChecker<RecoveryFaults>,
+        SharedPeerStatus,
+        Rc<Cell<Option<RecoveryFault>>>,
+    ) {
+        let store = RecoveryFaults::new(
+            root_store(DC_B_RECOVERED, &[(DC_B, DC_B_RECOVERED)]).await,
+            Some(fault),
+        );
+        let fault = Rc::clone(&store.fault);
+        let status = SharedPeerStatus::default();
+        status.set(PeerStatus::default().after(PeerRead::Found(DC_B)));
+        let mut checker = PeerChecker::new(
+            "dc-b".to_owned(),
+            store,
+            layout(),
+            Duration::from_secs(5),
+            status.clone(),
+        );
+        checker.look(
+            &BTreeSet::from([DC_B]),
+            Instant::now(),
+            &ShardMetrics::for_shard(),
+        );
+        assert!(status.get().serves_polls());
+        (checker, status, fault)
     }
 
     /// A node that restarted after another cluster took the peer's root
@@ -1527,7 +1654,7 @@ mod tests {
         checker.step(OWN, &metrics).await;
         assert!(!checker.wants_check(Instant::now()), "the next check waits");
 
-        checker.look(BTreeSet::new(), Instant::now(), &metrics);
+        checker.look(&BTreeSet::new(), Instant::now(), &metrics);
         assert!(checker.wants_check(Instant::now()));
         checker.step(OWN, &metrics).await;
 
@@ -1547,10 +1674,10 @@ mod tests {
         checker.due = later;
         let metrics = ShardMetrics::for_shard();
 
-        checker.look(BTreeSet::new(), Instant::now(), &metrics);
+        checker.look(&BTreeSet::new(), Instant::now(), &metrics);
         assert_eq!(checker.due, later);
         status.request_check();
-        checker.look(BTreeSet::new(), Instant::now(), &metrics);
+        checker.look(&BTreeSet::new(), Instant::now(), &metrics);
 
         assert!(checker.wants_check(Instant::now()));
         assert!(!status.take_check_request(), "the look took the request");
@@ -1585,7 +1712,7 @@ mod tests {
 
         let metrics = ShardMetrics::for_shard();
         checker.step(OWN, &metrics).await;
-        checker.look(BTreeSet::from([DC_B, DC_C]), Instant::now(), &metrics);
+        checker.look(&BTreeSet::from([DC_B, DC_C]), Instant::now(), &metrics);
 
         assert!(status.get().serves_polls());
         assert!(!status.get().serves_jobs());
@@ -1609,7 +1736,7 @@ mod tests {
         assert!(status.get().serves_polls(), "the first claim counts");
         assert!(!checker.checks());
 
-        checker.look(BTreeSet::from([DC_B]), Instant::now(), &metrics);
+        checker.look(&BTreeSet::from([DC_B]), Instant::now(), &metrics);
 
         assert!(
             !status.get().serves_polls(),
@@ -1644,13 +1771,13 @@ mod tests {
         checker.step(OWN, &metrics).await;
         let first = calls.all().len();
 
-        checker.look(BTreeSet::from([DC_B, DC_C]), Instant::now(), &metrics);
+        checker.look(&BTreeSet::from([DC_B, DC_C]), Instant::now(), &metrics);
         assert!(status.get().serves_polls());
         checker.step(OWN, &metrics).await;
         assert!(status.get().serves_polls());
         assert_eq!(calls.all().len(), first + 1, "the identity object alone");
 
-        checker.look(BTreeSet::from([DC_C]), Instant::now(), &metrics);
+        checker.look(&BTreeSet::from([DC_C]), Instant::now(), &metrics);
         assert_eq!(
             status.get().identity,
             PeerIdentity::Unconfirmed {
@@ -1666,23 +1793,8 @@ mod tests {
     #[compio::test]
     async fn given_a_verified_peer_when_another_claim_appears_and_its_recovery_record_gets_no_answer_should_read_nothing_until_a_check_proves_it()
      {
-        let unanswered = Rc::new(Cell::new(true));
-        let store = RecordsUnanswered {
-            store: root_store(DC_B_RECOVERED, &[(DC_B, DC_B_RECOVERED)]).await,
-            unanswered: Rc::clone(&unanswered),
-        };
-        let status = SharedPeerStatus::default();
-        status.set(PeerStatus::default().after(PeerRead::Found(DC_B)));
-        let mut checker = PeerChecker::new(
-            "dc-b".to_owned(),
-            store,
-            layout(),
-            Duration::from_secs(5),
-            status.clone(),
-        );
+        let (mut checker, status, fault) = claimed_by_successor(RecoveryFault::Reset).await;
         let metrics = ShardMetrics::for_shard();
-        checker.look(BTreeSet::from([DC_B]), Instant::now(), &metrics);
-        assert!(status.get().serves_polls());
 
         checker.step(OWN, &metrics).await;
 
@@ -1692,7 +1804,45 @@ mod tests {
         );
         assert!(!status.get().serves_polls() && !status.get().serves_jobs());
         assert_eq!(metrics.geo_peer_status_value("dc-b"), (false, true));
-        unanswered.set(false);
+        fault.set(None);
+        checker.step(OWN, &metrics).await;
+        assert_eq!(
+            status.get().identity,
+            PeerIdentity::Verified {
+                cluster_uid: DC_B_RECOVERED
+            }
+        );
+        assert!(status.get().serves_polls());
+    }
+
+    /// A refusal of the read of a recovery record is no outage: the peer
+    /// serves nothing, `geo_peer_unreachable` stays 0, and the check reports
+    /// the refusal with its error, as it does for the identity object.
+    #[compio::test]
+    async fn given_a_verified_peer_when_the_store_refuses_the_read_of_a_recovery_record_should_report_a_refusal_and_not_raise_unreachable()
+     {
+        let (mut checker, status, fault) = claimed_by_successor(RecoveryFault::Refused).await;
+        let metrics = ShardMetrics::for_shard();
+
+        let check = checker.check(OWN).await;
+        assert_eq!(check.read, PeerRead::Refused);
+        assert!(
+            matches!(check.error, Some(ObjectStoreError::Auth(_))),
+            "{check:?}"
+        );
+        checker.record(&check, &metrics);
+
+        assert_eq!(
+            status.get(),
+            PeerStatus {
+                identity: PeerIdentity::Unconfirmed { cluster_uid: DC_B },
+                unreachable: false,
+                retired: false,
+            }
+        );
+        assert!(!status.get().serves_polls() && !status.get().serves_jobs());
+        assert_eq!(metrics.geo_peer_status_value("dc-b"), (false, false));
+        fault.set(None);
         checker.step(OWN, &metrics).await;
         assert_eq!(
             status.get().identity,
@@ -1783,5 +1933,103 @@ mod tests {
         assert!(statuses[0].get().retired);
         assert!(metrics.geo_peer_retired_value("dc-b"));
         assert!(!statuses[0].get().serves_jobs());
+    }
+
+    /// Wait until `done` holds.
+    async fn until(done: impl Fn() -> bool) {
+        while !done() {
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A check of `dc-b` that waits for the read of a recovery record holds
+    /// up no check of `dc-c`: the check that a shard asks for of `dc-c` runs
+    /// within a look, and finds the claim that replaced the one it read.
+    #[compio::test]
+    async fn given_a_peer_whose_recovery_record_never_answers_when_a_shard_asks_to_check_another_peer_should_check_that_one_at_once()
+     {
+        let waiting_status = SharedPeerStatus::default();
+        let waiting = PeerChecker::new(
+            "dc-b".to_owned(),
+            RecoveryFaults::new(root_store(OTHER, &[]).await, Some(RecoveryFault::Silent)),
+            layout(),
+            RECHECK_INTERVAL * 10,
+            waiting_status.clone(),
+        );
+        let dc_c = RecoveryFaults::new(root_store(DC_C, &[]).await, None);
+        let dc_c_root = Rc::clone(&dc_c.store);
+        let dc_c_status = SharedPeerStatus::default();
+        let asked = PeerChecker::new(
+            "dc-c".to_owned(),
+            dc_c,
+            layout(),
+            Duration::from_secs(5),
+            dc_c_status.clone(),
+        );
+        let metadata = MetadataView::new(
+            || Looks {
+                retired: BTreeSet::new(),
+                recorded: BTreeMap::from([("dc-b".to_owned(), BTreeSet::from([DC_B]))]),
+            },
+            || Some(OWN),
+        );
+        let metrics = ShardMetrics::for_shard();
+        let checks = join(
+            waiting.run(&metadata, &metrics),
+            asked.run(&metadata, &metrics),
+        );
+        let request = async {
+            until(|| dc_c_status.get().serves_polls()).await;
+            StoreIdentity { cluster_uid: OTHER }
+                .replace(&*dc_c_root, &layout())
+                .await
+                .unwrap();
+            dc_c_status.request_check();
+            until(|| !dc_c_status.get().serves_polls()).await;
+        };
+
+        let request = pin!(request);
+        let checks = pin!(checks);
+        let served = compio::time::timeout(LOOK_WAIT * 5, select(request, checks)).await;
+
+        assert!(
+            matches!(served, Ok(Either::Left(_))),
+            "the check of dc-c waited for the one of dc-b"
+        );
+        assert_eq!(
+            dc_c_status.get().identity,
+            PeerIdentity::Changed {
+                cluster_uid: DC_C,
+                found: Some(OTHER),
+            }
+        );
+        assert_eq!(
+            waiting_status.get(),
+            PeerStatus::default(),
+            "the check of dc-b still waits for its recovery record"
+        );
+    }
+
+    /// One read of committed metadata serves the looks of every peer for a
+    /// [`LOOK_WAIT`].
+    #[test]
+    fn given_looks_of_several_peers_within_a_look_wait_when_reading_metadata_should_read_it_once() {
+        let reads = Cell::new(0);
+        let metadata = MetadataView::new(
+            || {
+                reads.set(reads.get() + 1);
+                Looks::default()
+            },
+            || None,
+        );
+        let now = Instant::now();
+
+        for at in [now, now, now + LOOK_WAIT / 2] {
+            let _ = metadata.looks(at);
+        }
+        assert_eq!(reads.get(), 1);
+        let _ = metadata.looks(now + LOOK_WAIT);
+
+        assert_eq!(reads.get(), 2);
     }
 }

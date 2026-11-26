@@ -550,6 +550,11 @@ counters `remote_read_block_hits_total`, `remote_read_block_misses_total`,
 segment's `.index`, that left because their partition was over its limit, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
 
+A replica rebuilt by state transfer gets only the records of the segments
+that the store holds, and reads those segments from the store. A replica that
+cannot read its store waits for it before it rebuilds a tiered partition, and
+stays behind its group until then.
+
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
 It lists the segments that the store holds, with their offsets, timestamps,
@@ -891,7 +896,10 @@ shadow topics on the metadata primary.
 
 If the identity object of a peer names another cluster than the one that the
 shadow streams came from, the server logs it. It leaves those shadow streams
-as they are.
+as they are, unless the node reads the peer as the successor that recovery
+records prove of the only cluster that metadata records of the peer. Then the
+shadow streams follow the successor's topic objects, and a stream of the
+successor without a shadow stream gets none.
 
 An operator retires a peer whose datacenter never returns with
 `iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs

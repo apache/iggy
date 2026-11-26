@@ -906,7 +906,11 @@ stops writing. A peer that follows the lost cluster's fresh objects takes its ba
 below each partition's cutover in the record: from there on the partition's log is the
 rebuilt cluster's. A peer whose shadow streams came from the lost cluster follows the record
 from it to the rebuilt cluster, and reads the bucket as that cluster's. It reads no record of a
-bucket whose identity object names a cluster that its shadow streams came from.
+bucket whose identity object names a cluster that its shadow streams came from. When the lost
+cluster is the only one that the peer's metadata records of the origin, those shadow streams
+also follow the rebuilt cluster's topic objects: a tombstone detaches its topic, and a new topic
+of a shadowed stream gets a shadow topic. A stream that has no shadow stream gets none, and the
+peer logs it.
 
 The report lists, per partition:
 

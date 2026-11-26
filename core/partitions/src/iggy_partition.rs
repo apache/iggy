@@ -525,6 +525,9 @@ where
     /// Drives log escalation only -- never the backoff. See
     /// [`Self::record_transfer_refusal`].
     transfer_refusals: u32,
+    /// The last transfer arm found this node unable to read its object store,
+    /// so it did not request. Kept so each wait logs once.
+    transfer_waits_for_store: bool,
     /// A scheduled transfer re-arm: try `peer` again once `after_ticks`
     /// consensus ticks elapse. Owned by the shard tick sweep; while one is
     /// pending, the repair-refusal trigger must not arm concurrently.
@@ -559,6 +562,9 @@ where
     /// the build ends, with the offer cache, and with the history it
     /// describes.
     pub(crate) transfer_plan: RefCell<Option<TransferPlanSlot>>,
+    /// What the store answered for the offer build in progress. Released
+    /// when the build ends and with the offer cache.
+    pub(crate) stored_front_check: RefCell<Option<crate::state_transfer::StoredFrontCheck>>,
 }
 
 // Cold state stays behind one pointer per field. Inline, one of these fields
@@ -1299,6 +1305,7 @@ where
             repair_charged_view: 0,
             transfer_failures: 0,
             transfer_refusals: 0,
+            transfer_waits_for_store: false,
             transfer_rearm: None,
             segment_checksum_cache: RefCell::new(std::collections::HashMap::new()),
             reuse_scan_memo: RefCell::new(None),
@@ -1306,6 +1313,7 @@ where
             spilled_hasher: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
             transfer_plan: RefCell::new(None),
+            stored_front_check: RefCell::new(None),
         };
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
@@ -4244,6 +4252,23 @@ where
     pub const fn record_transfer_refusal(&mut self) -> u32 {
         self.transfer_refusals = self.transfer_refusals.saturating_add(1);
         self.transfer_refusals
+    }
+
+    /// Whether a state transfer can leave segments of this partition in the
+    /// object store, for this replica to read there afterwards. A replica
+    /// rebuilt by transfer may hold no chain yet, so the topic's option counts
+    /// as well as the chain.
+    #[must_use]
+    pub fn transfer_reads_store(&self) -> bool {
+        self.runtime_options.tiered_storage || self.is_tiered() || self.pending_tiering().is_some()
+    }
+
+    /// Record whether this partition waits for its node's object store before
+    /// it requests a transfer, and say whether that changed.
+    pub const fn note_transfer_waits_for_store(&mut self, waits: bool) -> bool {
+        let changed = self.transfer_waits_for_store != waits;
+        self.transfer_waits_for_store = waits;
+        changed
     }
 
     /// A fresh re-arm is scheduled: the stall budget starts over for it.
