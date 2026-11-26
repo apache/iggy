@@ -721,10 +721,15 @@ Each shard bounds and retries the calls it sends to the store. A head, a
 read, a listing or a delete that gets no answer within `request_timeout`, or
 fails with a 5xx answer, throttling or a connection that broke or never
 opened, is sent again after `retry_delay`, doubled up to `max_retry_delay`, up
-to `max_attempts` in all. A put whose body the node holds in memory is sent
-again the same way: fresh objects, long-term segments, manifests and the other
-small objects of the cluster. Every attempt of one put carries the same
-`put-id` entry in the object's user metadata. An attempt at a create-only put,
+to `max_attempts` in all. A create-only put whose body the node holds in
+memory, a fresh object or a long-term segment, is sent again the same way. An
+overwrite, such as a manifest, a positions object or a topic object, is sent
+again only when its request never left the node, for example when the
+connection was refused or the name lookup or TLS handshake failed. An attempt
+that may have reached the store can land after a later overwrite of the same
+key and roll it back, so any other failure of an overwrite goes to the caller.
+Every attempt of one put carries the same `put-id` entry in the object's user
+metadata. An attempt at a create-only put,
 a fresh object or a long-term segment, is given up when the store takes no
 64 KiB piece of its body for `put_attempt_stall_timeout`, 1 second by default,
 or gives no answer for `put_attempt_answer_timeout`, 5 seconds by default,
@@ -797,6 +802,12 @@ shard or node: an upload gives up at half the grace, and the other half covers
 the skew between the clocks. `abandoned_upload_grace = "disabled"` turns the
 sweep off, and an upload in parts then has no deadline. The grace is at least
 30 minutes, so its second half takes the 15 minutes of skew that S3 accepts.
+On `s3` the sweep, and the abort of an upload in parts that fails, need
+`s3:ListBucketMultipartUploads` and `s3:AbortMultipartUpload` on the bucket,
+besides `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and `s3:ListBucket`.
+Without them the sweep removes nothing and logs why, and S3 keeps charging for
+the parts of every abandoned upload. A bucket lifecycle rule that aborts
+incomplete multipart uploads is the alternative.
 
 The `s3` backend signs each request with the first credentials that the node
 has, in the order of the AWS SDKs:

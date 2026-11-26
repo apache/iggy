@@ -29,11 +29,15 @@ use iggy_object_store::{
     ObjectStore, ObjectStoreError, PartsUpload, PutBody, PutMode, PutOptions, PutParts, StoredPart,
 };
 use message_bus::MessageBus;
+use server_common::yield_to_reactor;
 use tracing::{debug, warn};
 
 use super::{Holder, TierStore, take_slot, worth_another_attempt};
 
 const MIB: u64 = 1024 * 1024;
+
+/// Bytes of a body summed between two yields to the shard's other tasks.
+const HASH_STRIDE: u64 = MIB;
 
 /// How a tier store uploads a long-term segment in parts.
 ///
@@ -148,8 +152,12 @@ where
             return None;
         }
         // The request that creates the object checks the CRC32C of all of it.
+        let crc32c = match options.crc32c {
+            Some(crc32c) => Some(crc32c),
+            None => crc32c_in_strides(body).await,
+        };
         let options = PutOptions {
-            crc32c: options.crc32c.or_else(|| body.crc32c()),
+            crc32c,
             ..options.clone()
         };
         let mut upload = 1;
@@ -283,18 +291,19 @@ where
                     pending.push_front((number, range));
                     break;
                 }
-                let Some((part, crc32c)) = body
-                    .try_slice(range)
-                    .and_then(|part| part.crc32c().map(|crc32c| (part, crc32c)))
-                else {
-                    return Err(UploadEnd::Failed(ObjectStoreError::InvalidRequest(
-                        format!("part {number} of {:?} is not in its body", upload.key),
-                    )));
+                let Some(part) = body.try_slice(range) else {
+                    return Err(UploadEnd::Failed(not_in_body(upload, number)));
                 };
+                // Summed in the part's own future, so the parts in flight
+                // move between the strides of the others.
                 running.push(
                     async move {
                         let _slot = slot;
-                        (number, self.send_part(upload, number, &part, crc32c).await)
+                        let sent = match crc32c_in_strides(&part).await {
+                            Some(crc32c) => self.send_part(upload, number, &part, crc32c).await,
+                            None => Err(not_in_body(upload, number)),
+                        };
+                        (number, sent)
                     }
                     .boxed_local(),
                 );
@@ -463,5 +472,226 @@ where
                 error => return Err(UploadEnd::Failed(error)),
             }
         }
+    }
+}
+
+/// The CRC32C of a body held in memory, summed [`HASH_STRIDE`] bytes at a
+/// time with a yield to the shard's other tasks between two strides. `None`
+/// for a body that streams.
+async fn crc32c_in_strides(body: &PutBody) -> Option<u32> {
+    let len = body.len();
+    let mut crc32c = body.try_slice(0..len.min(HASH_STRIDE))?.crc32c()?;
+    let mut start = HASH_STRIDE;
+    while start < len {
+        yield_to_reactor().await;
+        let end = len.min(start.saturating_add(HASH_STRIDE));
+        let stride = body.try_slice(start..end)?.crc32c()?;
+        crc32c = crc32c::crc32c_combine(crc32c, stride, usize::try_from(end - start).ok()?);
+        start = end;
+    }
+    Some(crc32c)
+}
+
+fn not_in_body(upload: &PartsUpload, number: u32) -> ObjectStoreError {
+    ObjectStoreError::InvalidRequest(format!(
+        "part {number} of {:?} is not in its body",
+        upload.key
+    ))
+}
+
+/// On the compio runtime, whose timer [`yield_to_reactor`] needs.
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::pin;
+    use std::rc::Rc;
+    use std::task::Poll;
+
+    use bytes::Bytes;
+    use iggy_object_store::{
+        DeleteOutcome, KeyLayout, ListPage, ListRequest, ObjectMeta, ObjectRange, PartsLimits,
+    };
+    use message_bus::IggyMessageBus;
+
+    use super::*;
+    use crate::tier_service::{StoreCallPolicy, StoreWriter};
+
+    /// A store that takes uploads in parts at once, and keeps the number and
+    /// the CRC32C of each part it gets.
+    #[derive(Default)]
+    struct PartsProbe {
+        parts: RefCell<Vec<(u32, u32)>>,
+    }
+
+    fn whole_call<T>() -> impl Future<Output = Result<T, ObjectStoreError>> {
+        future::ready(Err(ObjectStoreError::Unsupported(
+            "anything but an upload in parts".to_owned(),
+        )))
+    }
+
+    impl ObjectStore for PartsProbe {
+        fn put(
+            &self,
+            _key: &str,
+            _body: PutBody,
+            _options: &PutOptions,
+        ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+            whole_call()
+        }
+
+        fn get_range(
+            &self,
+            _key: &str,
+            _range: Range<u64>,
+        ) -> impl Future<Output = Result<ObjectRange, ObjectStoreError>> {
+            whole_call()
+        }
+
+        fn head(&self, _key: &str) -> impl Future<Output = Result<ObjectMeta, ObjectStoreError>> {
+            whole_call()
+        }
+
+        fn delete(
+            &self,
+            _keys: &[String],
+        ) -> impl Future<Output = Result<DeleteOutcome, ObjectStoreError>> {
+            whole_call()
+        }
+
+        fn list(
+            &self,
+            _request: &ListRequest<'_>,
+        ) -> impl Future<Output = Result<ListPage, ObjectStoreError>> {
+            whole_call()
+        }
+
+        fn parts_limits(&self) -> Option<PartsLimits> {
+            Some(PartsLimits {
+                min_part_len: 1,
+                max_parts: 32,
+            })
+        }
+
+        fn begin_parts(
+            &self,
+            key: &str,
+            _options: &PutOptions,
+            _layout: &KeyLayout,
+        ) -> impl Future<Output = Result<PartsUpload, ObjectStoreError>> {
+            future::ready(Ok(PartsUpload {
+                key: key.to_owned(),
+                id: "upload".to_owned(),
+            }))
+        }
+
+        fn put_part(
+            &self,
+            _upload: &PartsUpload,
+            number: u32,
+            _body: PutBody,
+            crc32c: u32,
+        ) -> impl Future<Output = Result<StoredPart, ObjectStoreError>> {
+            self.parts.borrow_mut().push((number, crc32c));
+            future::ready(Ok(StoredPart {
+                number,
+                tag: format!("etag-{number}"),
+                crc32c,
+            }))
+        }
+
+        fn complete_parts(
+            &self,
+            _upload: &PartsUpload,
+            _parts: &[StoredPart],
+            _options: &PutOptions,
+            _len: u64,
+        ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+            future::ready(Ok(()))
+        }
+    }
+
+    fn bytes_of(len: u64) -> Bytes {
+        (0..len)
+            .map(|index| u8::try_from(index % 251).unwrap())
+            .collect::<Vec<u8>>()
+            .into()
+    }
+
+    #[compio::test]
+    async fn given_bodies_of_several_lengths_when_summing_in_strides_should_match_and_yield_between_strides()
+     {
+        for len in [
+            0,
+            1,
+            HASH_STRIDE,
+            HASH_STRIDE + 1,
+            3 * HASH_STRIDE + HASH_STRIDE / 2,
+        ] {
+            let bytes = bytes_of(len);
+            let body = PutBody::from_bytes(bytes.clone());
+            let mut summing = pin!(crc32c_in_strides(&body));
+            let mut yields = 0;
+
+            let summed = loop {
+                match futures::poll!(summing.as_mut()) {
+                    Poll::Ready(summed) => break summed,
+                    Poll::Pending => {
+                        yields += 1;
+                        compio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                }
+            };
+
+            assert_eq!(summed, Some(crc32c::crc32c(&bytes)), "{len}");
+            assert_eq!(yields, len.div_ceil(HASH_STRIDE).saturating_sub(1), "{len}");
+        }
+    }
+
+    /// Every part is longer than one stride, so none goes out in the poll
+    /// that begins the upload.
+    #[compio::test]
+    async fn given_parts_longer_than_a_stride_when_putting_in_parts_should_yield_before_sending_any()
+     {
+        let part_len = 2 * HASH_STRIDE;
+        let bytes = bytes_of(2 * part_len + HASH_STRIDE + HASH_STRIDE / 2);
+        let store = TierStore::new(
+            PartsProbe::default(),
+            Rc::new(IggyMessageBus::new(0)),
+            StoreCallPolicy {
+                parts: PartsPolicy {
+                    part_len,
+                    ..PartsPolicy::default()
+                },
+                ..StoreCallPolicy::default()
+            },
+            StoreWriter {
+                layout: Some(KeyLayout::new("iggy").unwrap()),
+                ..StoreWriter::default()
+            },
+        );
+        let options = PutOptions {
+            mode: PutMode::IfAbsent,
+            parts: PutParts::Allowed,
+            crc32c: Some(crc32c::crc32c(&bytes)),
+            ..PutOptions::default()
+        };
+        let mut put = pin!(store.put("a/b", PutBody::from_bytes(bytes.clone()), &options));
+
+        let first = futures::poll!(put.as_mut());
+
+        assert!(first.is_pending(), "every part was summed in one poll");
+        assert!(store.provider().parts.borrow().is_empty());
+        put.await.unwrap();
+        let mut sent = store.provider().parts.borrow().clone();
+        sent.sort_unstable();
+        let expected: Vec<(u32, u32)> = (1..)
+            .zip(
+                bytes
+                    .chunks(usize::try_from(part_len).unwrap())
+                    .map(crc32c::crc32c),
+            )
+            .collect();
+        assert_eq!(sent, expected);
     }
 }

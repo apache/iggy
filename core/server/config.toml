@@ -1564,12 +1564,16 @@ handshake_grace = "10 s"
 #progress_timeout = "30 s"
 # The most attempts at a store call that keeps failing for a transient
 # reason, the first one included, and the backoff between them, each wait
-# from 1 ms to 1 h. They cover heads, reads, listings, deletes, and the puts
-# whose body the node holds in memory: fresh objects, long-term segments,
-# manifests and the other small objects. Each attempt of such a put carries
-# the same "put-id" in the object's metadata, so a create-only put that the
-# store refuses because an earlier attempt stored the object counts as
-# stored.
+# from 1 ms to 1 h. They cover heads, reads, listings, deletes, and the
+# create-only puts whose body the node holds in memory: fresh objects and
+# long-term segments. Each attempt of such a put carries the same "put-id" in
+# the object's metadata, so a create-only put that the store refuses because
+# an earlier attempt stored the object counts as stored. An overwrite, such as
+# a manifest, a positions object or a topic object, is sent again only when
+# its request never left the node, for example when the connection was
+# refused: an attempt that may have reached the store can land after a later
+# overwrite of the same key and roll it back, so any other failure goes to
+# the caller.
 #max_attempts = 3
 #retry_delay = "200 ms"
 #max_retry_delay = "5 s"
@@ -1620,7 +1624,10 @@ handshake_grace = "10 s"
 # sweep off and leaves an upload in parts without a deadline: on S3, a bucket
 # lifecycle rule that aborts incomplete multipart uploads does the same work.
 # Otherwise at least 30 min, so that the half that covers the skew of the
-# clocks takes the 15 minutes that S3 accepts.
+# clocks takes the 15 minutes that S3 accepts. On s3 the sweep needs
+# s3:ListBucketMultipartUploads and s3:AbortMultipartUpload on the bucket.
+# Without them it removes nothing, and S3 keeps charging for the parts of
+# every abandoned upload unless such a lifecycle rule aborts them.
 #abandoned_upload_grace = "1 h"
 # The bytes of what one shard reads from object stores that it keeps in
 # memory, so that a poll of bytes another poll read a moment ago does not ask

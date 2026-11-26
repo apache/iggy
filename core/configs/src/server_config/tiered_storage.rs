@@ -297,8 +297,11 @@ pub struct TieredStorageConfig {
     pub progress_timeout: IggyDuration,
     /// The most attempts at a store call that keeps failing with a transient
     /// error, the first one included: a head, a get, a listing, a delete, and
-    /// a put whose body the node holds in memory, such as a fresh object or a
-    /// long-term segment. A put whose body streams from a file is sent once.
+    /// a create-only put whose body the node holds in memory, such as a fresh
+    /// object or a long-term segment. An overwrite held in memory, such as a
+    /// manifest, is sent again only when its request never left the node,
+    /// because an attempt that may have reached the store can land after a
+    /// later overwrite. A put whose body streams from a file is sent once.
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
     /// The wait before the first retry, doubled for each retry after it.
