@@ -60,6 +60,7 @@ use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topolo
 use crate::dispatch::reads::{partition_frontier_budget, read_frontier_budget};
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::geo_peers::PeerAuth;
+use crate::release_compatibility::RELEASE_COMPATIBILITY;
 use crate::s3_credentials::RoleCredentials;
 use crate::server_error::ServerError;
 use crate::shell::{
@@ -73,7 +74,7 @@ use consensus::{MetadataHandle, PartitionsHandle};
 use iggy_binary_protocol::{Operation, PrepareHeader};
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
-use message_bus::replica::handshake::ReplicaHandshakeCtx;
+use message_bus::replica::handshake::{CompatibleRelease, ReplicaHandshakeCtx};
 use message_bus::transports::tls::install_default_crypto_provider;
 use message_bus::{IggyMessageBus, MessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
@@ -101,7 +102,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
+pub(crate) const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -613,11 +614,26 @@ async fn shard_main(
     // Every shard can own a delegated replica connection, so every
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
+    let compatible_releases = RELEASE_COMPATIBILITY.compatible_with(crate::VERSION);
+    if shard_id == 0 {
+        info!(
+            release = crate::VERSION,
+            client_protocol = %iggy_binary_protocol::ProtocolVersion(iggy_binary_protocol::IGGY_PROTOCOL_VERSION),
+            replica_wire_revision = iggy_binary_protocol::REPLICA_WIRE_REVISION,
+            storage_format = %String::from_utf8_lossy(STORAGE_FORMAT).trim_end(),
+            ?compatible_releases,
+            "replica handshake identity"
+        );
+    }
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
         binary_identity: message_bus::replica::handshake::binary_identity(
             crate::VERSION,
             STORAGE_FORMAT,
         ),
+        compatible_releases: compatible_releases
+            .iter()
+            .map(|release| CompatibleRelease::new(release, STORAGE_FORMAT))
+            .collect(),
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,

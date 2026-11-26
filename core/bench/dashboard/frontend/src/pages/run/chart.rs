@@ -22,6 +22,7 @@ use std::rc::Rc;
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::delta::Metric;
+use bench_dashboard_shared::labels::{metric_name, metric_value_text};
 use bench_dashboard_shared::series::{BenchmarkSeries, ChartSeries, SeriesMetric, SeriesScope};
 use bench_report::add_latency_distributions;
 use bench_report::group_metrics_kind::GroupMetricsKind;
@@ -32,7 +33,6 @@ use charming::series::{Line, Scatter};
 use uuid::Uuid;
 use yew::prelude::*;
 
-use super::change::{metric_name, metric_value_text};
 use super::facts::P9999_LABEL;
 use super::history::{CURRENT_LABEL, HistoryChart, VersionPoint};
 use crate::api::fetch_benchmark_series;
