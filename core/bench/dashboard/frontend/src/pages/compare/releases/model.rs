@@ -24,13 +24,12 @@ use std::fmt;
 
 use bench_dashboard_shared::config::{DashboardConfig, SuiteConfig, Thresholds};
 use bench_dashboard_shared::delta::{DeltaVerdict, Metric};
+use bench_dashboard_shared::history::{HistoryLine, LineVersion, VersionStep};
 use bench_dashboard_shared::identity::{HistoryKey, KindFamily};
-use bench_dashboard_shared::summary::BenchmarkSummary;
+use bench_dashboard_shared::summary::{BenchmarkSummary, RATE_LIMITED_HEADLINES};
 use uuid::Uuid;
 
-use crate::pages::run::change::{
-    Change, HistoryLine, LineVersion, RATE_LIMITED_HEADLINES, VersionStep, change,
-};
+use crate::pages::run::change::{Change, change};
 
 const SUITE_PARAM: &str = "suite";
 const BASE_PARAM: &str = "base";

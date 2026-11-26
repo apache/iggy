@@ -53,10 +53,6 @@ impl BenchmarkCache {
             .map(|loaded| loaded.report.clone())
     }
 
-    pub fn has_run(&self, uuid: &Uuid) -> bool {
-        self.runs().reports.contains_key(uuid)
-    }
-
     pub fn get_summaries(&self) -> Arc<Vec<BenchmarkSummary>> {
         Arc::clone(&self.runs().summaries)
     }

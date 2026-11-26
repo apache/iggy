@@ -28,38 +28,39 @@ pub struct ThemeProviderProps {
 
 #[function_component(ThemeProvider)]
 pub fn theme_provider(props: &ThemeProviderProps) -> Html {
-    let is_dark = use_state(|| {
-        LocalStorage::get("theme")
-            .map(|theme: String| theme == "dark")
-            .unwrap_or(false)
-    });
-
-    // Effect to update body class and local storage when theme changes
+    // `None` until the stored theme is read, which happens in an effect: the server has no storage,
+    // and the first render in the browser must give the HTML of the server. Until then the page is
+    // light, unless the script at the start of the body of `index.html` set the dark class.
+    let stored = use_state(|| None::<bool>);
     {
-        let is_dark = is_dark.clone();
-        use_effect_with(*is_dark, move |is_dark| {
-            let body = document().body().unwrap();
-            if *is_dark {
-                body.set_class_name("dark");
-            } else {
-                body.set_class_name("");
-            }
-
-            let _ = LocalStorage::set("theme", if *is_dark { "dark" } else { "light" });
-
-            || ()
+        let stored = stored.clone();
+        use_effect_with((), move |()| {
+            stored.set(Some(
+                LocalStorage::get("theme")
+                    .map(|theme: String| theme == "dark")
+                    .unwrap_or(false),
+            ));
         });
     }
+    let is_dark = stored.unwrap_or(false);
+
+    // Updates the body class and the storage when the theme changes, once the stored theme is known.
+    use_effect_with(*stored, move |stored| {
+        if let Some(is_dark) = *stored {
+            let body = document().body().unwrap();
+            body.set_class_name(if is_dark { "dark" } else { "" });
+            let _ = LocalStorage::set("theme", if is_dark { "dark" } else { "light" });
+        }
+        || ()
+    });
 
     let toggle_theme = {
-        let is_dark = is_dark.clone();
-        Callback::from(move |_| {
-            is_dark.set(!*is_dark);
-        })
+        let stored = stored.clone();
+        Callback::from(move |_| stored.set(Some(!is_dark)))
     };
 
     html! {
-        <ContextProvider<(bool, Callback<()>)> context={(*is_dark, toggle_theme)}>
+        <ContextProvider<(bool, Callback<()>)> context={(is_dark, toggle_theme)}>
             {props.children.clone()}
         </ContextProvider<(bool, Callback<()>)>>
     }
