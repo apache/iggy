@@ -320,6 +320,15 @@ zstd = "0.14.3"
 lto = true
 codegen-units = 1
 
+# The simulator's fuzz campaigns: optimized, with the debug assertions and
+# overflow checks that catch a broken invariant where it breaks.
+[profile.fuzz]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug-assertions = true
+overflow-checks = true
+
 # CPU-heavy crates that dominate dev-profile test time: password hashing,
 # checksums, RNG. Cheaper than raising opt-level for the whole graph.
 [profile.dev.package.argon2]

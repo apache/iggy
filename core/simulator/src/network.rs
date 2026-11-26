@@ -126,6 +126,11 @@ impl Network {
         self.simulator.is_link_enabled(from, to)
     }
 
+    /// Start fault injection: see [`PacketSimulator::set_faults`].
+    pub fn set_faults(&mut self, options: &PacketSimulatorOptions) {
+        self.simulator.set_faults(options);
+    }
+
     /// Clear all partitions, restoring full connectivity.
     ///
     /// **Warning:** resets all link filters to [`ALLOW_ALL`], including

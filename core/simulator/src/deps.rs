@@ -59,7 +59,10 @@ impl Clock for SimClock {
     type Realtime = IggyTimestamp;
 
     fn realtime(&self) -> IggyTimestamp {
-        IggyTimestamp::from(SIM_EPOCH_MICROS + self.timer.now().as_nanos() / 1_000)
+        IggyTimestamp::from(
+            SIM_EPOCH_MICROS.saturating_add_signed(self.timer.realtime_skew_micros())
+                + self.timer.now().as_nanos() / 1_000,
+        )
     }
 }
 

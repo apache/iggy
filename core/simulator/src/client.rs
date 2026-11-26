@@ -486,6 +486,33 @@ impl SimClient {
         self.build_request(Operation::CreateTopic, &wire.to_bytes())
     }
 
+    /// [`Self::create_topic`] for a geo topic, whose partitions put each batch
+    /// in the cluster's bucket before they commit it.
+    ///
+    /// # Panics
+    /// As [`Self::create_topic`].
+    pub fn create_geo_topic(
+        &self,
+        stream: &str,
+        name: &str,
+        partitions_count: u32,
+    ) -> Message<RoutedRequestHeader> {
+        let wire = CreateTopicRequest {
+            stream_id: WireIdentifier::named(stream).expect("stream name must be valid"),
+            partitions_count,
+            name: WireName::new(name).expect("topic name must be valid"),
+            options: iggy_common::TopicCreateOptions {
+                durability: iggy_common::Durability::Persisted,
+                consumer_offset_durability: iggy_common::Durability::Persisted,
+                topic_type: Some(iggy_common::TopicType::Geo),
+                ..Default::default()
+            }
+            .to_wire()
+            .expect("valid simulator geo topic options"),
+        };
+        self.build_request(Operation::CreateTopic, &wire.to_bytes())
+    }
+
     /// # Panics
     /// Panics if `stream` or `topic` is not a valid `WireName`, or `options`
     /// fail the client-side patch checks.

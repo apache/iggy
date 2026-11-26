@@ -30,7 +30,12 @@
 //!               [--crash-prob F] [--restart-prob F] [--crash-primary]
 //!               [network overrides: --packet-loss-prob, --replay-prob, --partition-mode,
 //!                --partition-prob, --unpartition-prob, --clog-prob, ...]
+//! workload-fuzz --geo [--seed N] [--ticks N] [--clients N] [--replicas N]
+//!               [--faults none|light|heavy|swarm] [--geo-partitions N]
 //! ```
+//!
+//! `--geo` runs two clusters whose geo topics replicate through their buckets
+//! instead, see [`simulator::geo_fuzz`].
 //!
 //! `--plane` selects the op mix (see [`ActionWeights`]). Partition-plane runs drain
 //! and converge most readily; `uniform` is the widest per-tick op coverage.
@@ -56,6 +61,8 @@ use server_common::sharding::IggyNamespace;
 use server_common::{MemoryPool, MemoryPoolSettings};
 use simulator::Simulator;
 use simulator::client::SimClient;
+use simulator::geo_fuzz::{self, GeoFaults, GeoFuzzOptions};
+use simulator::geo_world::GeoSeeds;
 use simulator::packet::{COMMAND_LABELS, PacketSimulatorOptions, PartitionMode, PartitionSymmetry};
 use simulator::workload::actions::Action;
 use simulator::workload::invariants::Invariants;
@@ -71,6 +78,9 @@ use strum::IntoEnumIterator;
 /// Apart from the `101` a panic exits with, because a run under a vacuity floor is
 /// not a failure: every oracle held and none of them had anything to compare.
 const EXIT_VACUOUS: i32 = 3;
+
+/// The chance that an idle client of a geo run starts a send on a step.
+const GEO_SEND_PER_TICK: f64 = 0.05;
 
 /// Tick budget for restoring every fixture topic and fixture group before the drain.
 const FIXTURE_RESTORE_TICKS: u64 = 50_000;
@@ -254,6 +264,15 @@ struct Args {
     /// partition has nothing to do.
     #[arg(long)]
     visit_every_partition: bool,
+    /// Run two clusters whose geo topics replicate through their buckets, in
+    /// place of the one-cluster workload. `--faults swarm` also draws the
+    /// faults of the buckets and the DCs and the skew of the clocks. Takes
+    /// `--seed`, `--ticks`, `--replicas`, `--clients` and `--faults`.
+    #[arg(long)]
+    geo: bool,
+    /// Partitions of each cluster's geo topic, with `--geo`.
+    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u32).range(1..=8))]
+    geo_partitions: u32,
 }
 
 /// Named network fault profile: one flag for "how hostile is the network", rather
@@ -858,17 +877,12 @@ fn main() {
     let crash_prob = args.crash_prob;
     let quiesce = !args.no_quiesce;
 
-    // Surface the seed on any panic (invariant or oracle violation) so the run
-    // is replayable. The process still exits non-zero via the default hook.
-    std::panic::set_hook(Box::new(move |info| {
-        eprintln!("workload-fuzz FAILED, reproduce with --seed {seed}\n{info}");
-        // The hook REPLACES the default one, so without this `RUST_BACKTRACE=1`
-        // silently does nothing and an assertion deep in consensus reports only its
-        // message. Gated on the env var: always printing would bury a campaign.
-        if std::env::var_os("RUST_BACKTRACE").is_some_and(|value| value != "0") {
-            eprintln!("{}", std::backtrace::Backtrace::force_capture());
-        }
-    }));
+    install_panic_hook(seed);
+
+    if args.geo {
+        run_geo(&args, seed);
+        return;
+    }
 
     let network_opts = network_options(&args, replicas, clients, seed);
     exit_on_unusable_configuration(&args, &network_opts);
@@ -968,6 +982,60 @@ fn main() {
 
     print_command_coverage(&sim);
     println!("executor schedule: {:#018x}", sim.schedule_hash());
+    println!("workload-fuzz: OK (seed={seed})");
+}
+
+/// Surface the seed on any panic (invariant or oracle violation) so the run
+/// is replayable. The process still exits non-zero via the default hook.
+fn install_panic_hook(seed: u64) {
+    std::panic::set_hook(Box::new(move |info| {
+        eprintln!("workload-fuzz FAILED, reproduce with --seed {seed}\n{info}");
+        // The hook REPLACES the default one, so without this `RUST_BACKTRACE=1`
+        // silently does nothing and an assertion deep in consensus reports only its
+        // message. Gated on the env var: always printing would bury a campaign.
+        if std::env::var_os("RUST_BACKTRACE").is_some_and(|value| value != "0") {
+            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+        }
+    }));
+}
+
+/// Run two geo clusters for `--ticks` steps under the faults `--faults`
+/// names, then check every geo invariant, see [`simulator::geo_fuzz`].
+fn run_geo(args: &Args, seed: u64) {
+    let seeds = GeoSeeds::derive(seed);
+    let networks = seeds
+        .clusters
+        .map(|cluster_seed| args.faults.options(cluster_seed));
+    let faults = if args.faults == Faults::Swarm {
+        GeoFaults::swarm(seed)
+    } else {
+        GeoFaults::default()
+    };
+    println!(
+        "workload-fuzz --geo: seed={seed} ticks={} clients={} replicas={} partitions={} \
+         faults={:?}",
+        args.ticks, args.clients, args.replicas, args.geo_partitions, args.faults
+    );
+    for (cluster, network) in networks.iter().enumerate() {
+        println!("network {cluster}: {network:?}");
+    }
+    println!("geo faults: {faults:?}");
+    let report = geo_fuzz::run(&GeoFuzzOptions {
+        seed,
+        ticks: args.ticks,
+        replicas: args.replicas,
+        clients: args.clients,
+        partitions: args.geo_partitions,
+        networks,
+        faults,
+        send_per_tick: GEO_SEND_PER_TICK,
+    });
+    println!("geo report: {report:?}");
+    if report.is_vacuous() {
+        vacuous(format_args!(
+            "--geo: no send was acknowledged, so every check compared nothing (seed={seed:#x})"
+        ));
+    }
     println!("workload-fuzz: OK (seed={seed})");
 }
 

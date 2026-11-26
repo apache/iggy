@@ -22,7 +22,7 @@ use iggy_common::IggyByteSize;
 use journal::Journal;
 use journal::durable_storage::DurableStorage;
 use partitions::{PartitionPersistence, RetainedPartitionState, WalStorage};
-use server_common::send_messages::decode_prepare_slice_trusted;
+use server_common::send_messages::decode_prepare_batch_trusted;
 use server_common::sharding::IggyNamespace;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -134,7 +134,7 @@ fn fit_to_wal(retained: &mut RetainedPartitionState, persistence: &PartitionPers
                 .repair_header(op)
                 .is_some_and(|header| header.operation == Operation::SendMessages)
                 && let Some(entry) = journal.repair_entry(op)
-                && let Ok(batch) = decode_prepare_slice_trusted(entry.as_slice())
+                && let Ok(batch) = decode_prepare_batch_trusted(entry.as_slice())
                 && batch.header.message_count > 0
             {
                 write_offset = write_offset

@@ -15,10 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod bucket;
 pub mod bus;
 pub mod client;
 pub mod deps;
 pub mod executor;
+pub mod geo;
+pub mod geo_fuzz;
+pub mod geo_world;
 pub mod network;
 pub mod packet;
 pub mod ready_queue;
@@ -278,6 +282,8 @@ pub struct Simulator {
     /// gives the rebuilt shards the same one.
     repair_ring_bytes_max: Option<usize>,
     consumer_offsets_max: usize,
+    /// Geo topics of this cluster, see [`Self::enable_geo`]. `None` without.
+    geo: Option<geo::SimGeo>,
     // The liveness fence directory survives replica restarts and is removed last.
     _system_directory: Option<tempfile::TempDir>,
 }
@@ -635,6 +641,7 @@ impl Simulator {
             every_partition_due: false,
             repair_ring_bytes_max,
             consumer_offsets_max: partitions::DEFAULT_CONSUMER_OFFSETS_MAX,
+            geo: None,
             _system_directory: system_directory,
         }
     }
@@ -844,18 +851,7 @@ impl Simulator {
         username: &str,
         password: &str,
     ) {
-        // Connection metadata on every replica, as `install_client_fd` does in
-        // production. `ensure_transport_connection` reads it to admit the connection
-        // into the SessionManager, which the login's bind
-        // (Connected, Authenticated, Bound) requires.
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        for outbox in &self.outboxes {
-            outbox.insert_client_meta(ClientConnMeta::new(
-                client.client_id(),
-                addr,
-                ClientTransportKind::Tcp,
-            ));
-        }
+        self.admit_shell_client(client);
 
         // From here this client talks the real client protocol. See
         // `SimClient::shell_wire`.
@@ -875,6 +871,21 @@ impl Simulator {
         assert!(session > 0, "shell_login: login reply carried no session");
         client.bind_session(session);
         self.discover_partition_contexts(client);
+    }
+
+    /// Put `client`'s connection metadata on every replica, as
+    /// `install_client_fd` does in production. `ensure_transport_connection`
+    /// reads it to admit the connection into the `SessionManager`, which a
+    /// login's bind (Connected, Authenticated, Bound) requires.
+    pub(crate) fn admit_shell_client(&self, client: &SimClient) {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        for outbox in &self.outboxes {
+            outbox.insert_client_meta(ClientConnMeta::new(
+                client.client_id(),
+                addr,
+                ClientTransportKind::Tcp,
+            ));
+        }
     }
 
     /// Submit `message` to `target` and step until a client reply arrives,
@@ -1098,6 +1109,7 @@ impl Simulator {
         self.run_pumps();
 
         self.reconcile_transitions();
+        self.drive_geo();
         self.run_pumps();
 
         // Phase 2: Drain each replica's outbox into the network.
@@ -1313,6 +1325,7 @@ impl Simulator {
     fn reconcile_transitions(&mut self) {
         let now = self.realtime_micros();
         let timeout = rebalancing_timeout_micros();
+        let builds_geo_topics = self.geo.is_some();
         for (index, replica) in self.replicas.iter().enumerate() {
             if self
                 .crashed
@@ -1348,6 +1361,17 @@ impl Simulator {
                         true,
                     );
                 }
+            }
+            // A geo topic comes from a client and not from a fixture, so its
+            // partitions are built as the production reconciler builds every
+            // committed partition.
+            if builds_geo_topics {
+                targets.extend(
+                    streams
+                        .read(geo_partitions)
+                        .into_iter()
+                        .map(|namespace| (namespace, true)),
+                );
             }
             for transition in streams.consumer_group_pending_revocations() {
                 targets.insert(
@@ -1798,6 +1822,9 @@ impl Simulator {
                 replica.deferred_partitions.borrow_mut().insert(namespace);
             }
         }
+
+        // After the partitions, as boot wires the store once it built them.
+        self.wire_geo(replica_index);
 
         // Reconnect to the network and mark the replica live again.
         self.network
@@ -2278,6 +2305,7 @@ fn materialise_partition(
     // a second materialisation with no restart between would otherwise resurrect a
     // log the live partition has moved past.
     let mut retained = replica.partition_logs.borrow_mut().remove(&namespace);
+    let peer_log = peer_log_of(replica, namespace, retained.as_mut());
     let unsynced_lost = replica
         .unsynced_partition_logs
         .borrow_mut()
@@ -2315,13 +2343,7 @@ fn materialise_partition(
                 .with_members(members)
                 .with_created_op(created_op),
         );
-        // Before the pump hands the partition its first frame: its log holds
-        // one kind of batch for good.
-        if replica.placing_namespaces.borrow().contains(&namespace)
-            && let Some(partition) = owner_shard.plane.partitions().get_mut_by_ns(&namespace)
-        {
-            partition.set_places_batches(true);
-        }
+        finish_build(replica, owner_shard, namespace, peer_log);
     }
     for shard in &replica.shards {
         shard.shards_table().insert(
@@ -2330,6 +2352,76 @@ fn materialise_partition(
         );
     }
     true
+}
+
+/// Where the partition of `namespace` reads its peer's log, when it belongs
+/// to a shadow topic. Its `retained` state then keeps no segment, as boot
+/// finds none: the committed manifest of its state machines puts them back
+/// once it follows its peer's log again. Its journal stays, as its WAL does.
+fn peer_log_of(
+    replica: &SimReplica,
+    namespace: IggyNamespace,
+    retained: Option<&mut RetainedPartitionState>,
+) -> Option<(String, iggy_object_store::ObjectPrefix)> {
+    let shard = &replica.shards[0];
+    let peer_log = shard.plane.metadata().mux_stm.streams().read(|inner| {
+        let stream = inner.items.get(namespace.stream_id())?;
+        let topic = stream.topics.get(namespace.topic_id())?;
+        server::peer_log_of(stream, topic, namespace)
+    })?;
+    if let Some(retained) = retained {
+        while retained.log.retire_back().is_some() {}
+        retained.log.add_persisted_segment(
+            partitions::Segment::new(0, shard.plane.partitions().config().segment_size),
+            server_common::SegmentStorage::default(),
+            None,
+            None,
+        );
+    }
+    Some(peer_log)
+}
+
+/// What a partition of `namespace` takes before the pump hands it its first
+/// frame: whether it places its batches, which its log holds one kind of
+/// for good, and the log of its peer when it belongs to a shadow topic, which
+/// the production reconciler has it follow once it built it.
+fn finish_build(
+    replica: &SimReplica,
+    shard: &Replica,
+    namespace: IggyNamespace,
+    peer_log: Option<(String, iggy_object_store::ObjectPrefix)>,
+) {
+    let Some(partition) = shard.plane.partitions().get_mut_by_ns(&namespace) else {
+        return;
+    };
+    if replica.placing_namespaces.borrow().contains(&namespace) {
+        partition.set_places_batches(true);
+    }
+    let Some((origin, prefix)) = peer_log else {
+        return;
+    };
+    partition
+        .follow_peer_log(origin, prefix)
+        .expect("a shadow partition built from its committed state follows its peer's log");
+}
+
+/// Every committed partition of a geo topic, this cluster's own or a peer's
+/// shadow.
+fn geo_partitions(inner: &metadata::stm::stream::StreamsInner) -> Vec<IggyNamespace> {
+    let mut namespaces = Vec::new();
+    for (stream_id, stream) in &inner.items {
+        for (topic_id, topic) in &stream.topics {
+            if topic.is_geo() || topic.shadow.is_some() {
+                namespaces.extend(
+                    topic
+                        .partitions
+                        .iter()
+                        .map(|partition| IggyNamespace::new(stream_id, topic_id, partition.id)),
+                );
+            }
+        }
+    }
+    namespaces
 }
 
 /// The partition group, incarnation and view of a message the persist gate
@@ -2435,6 +2527,9 @@ mod stale_prepare_commit_tests;
 
 #[cfg(test)]
 mod placed_batches_tests;
+
+#[cfg(test)]
+mod geo_tests;
 
 #[cfg(test)]
 mod replication_flow_tests;

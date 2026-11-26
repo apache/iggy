@@ -57,6 +57,7 @@ impl TimerHandle {
     pub(crate) fn new() -> Self {
         Self(Rc::new(TimeShared {
             now_nanos: Cell::new(0),
+            realtime_skew_micros: Cell::new(0),
             origin: Instant::now(),
             queue: RefCell::new(TimerQueue {
                 heap: BinaryHeap::new(),
@@ -69,6 +70,19 @@ impl TimerHandle {
     #[must_use]
     pub fn now(&self) -> SimInstant {
         SimInstant(self.0.now_nanos.get())
+    }
+
+    /// How far the wall clock of this timeline is from the shared one, in
+    /// microseconds: ahead when positive.
+    #[must_use]
+    pub fn realtime_skew_micros(&self) -> i64 {
+        self.0.realtime_skew_micros.get()
+    }
+
+    /// Put the wall clock of this timeline `skew_micros` from the shared one,
+    /// as a node whose clock drifted. Deadlines and sleeps do not move.
+    pub fn set_realtime_skew_micros(&self, skew_micros: i64) {
+        self.0.realtime_skew_micros.set(skew_micros);
     }
 
     /// Local deadline time shares the virtual timeline across cloned handles.
@@ -194,6 +208,9 @@ impl Drop for SleepFuture {
 #[derive(Debug)]
 struct TimeShared {
     now_nanos: Cell<u64>,
+    /// How far this timeline's wall clock is from the one every simulator
+    /// starts with, in microseconds. Monotonic time does not see it.
+    realtime_skew_micros: Cell<i64>,
     origin: Instant,
     queue: RefCell<TimerQueue>,
 }

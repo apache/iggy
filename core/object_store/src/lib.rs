@@ -82,7 +82,7 @@ pub use identity::{IdentityRead, InvalidStoreIdentity, StoreIdentity};
 pub use inline::InlineTierExecutor;
 pub use layout::{KeyLayout, LongTermKey, ObjectPrefix, SegmentKey, SegmentObject, TopicKey};
 pub use manifest::{ManifestError, ManifestSegment, PartitionManifest};
-pub use memory::MemoryStore;
+pub use memory::{MemoryStore, Objects, checked_crc32c, read_body};
 pub use mock_s3::{MockS3Latency, MockS3Store};
 pub use positions::{
     GeoLog, GeoPosition, MAX_GROUP_NAME_LEN, MAX_POSITIONS_OBJECT_LEN, POSITIONS_PER_KIND_MAX,
