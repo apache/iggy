@@ -17,7 +17,10 @@
 
 use hash32::{Hasher, Murmur3Hasher};
 use server_common::sharding::{IggyNamespace, PartitionLocation};
+use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::hash::Hasher as _;
+use std::ops::Bound::{Excluded, Unbounded};
 
 /// Lookup table that maps partition namespaces to their owning shard.
 ///
@@ -68,9 +71,15 @@ impl ShardsTable for () {
     }
 }
 
-/// Lock-free shards table backed by [`papaya::HashMap`].
+/// Shards table backed by [`papaya::HashMap`], whose lookups take no lock.
+///
+/// One shard owns a table, and only that shard writes it or walks it.
 pub struct PapayaShardsTable {
     inner: papaya::HashMap<IggyNamespace, PartitionLocation>,
+    /// The namespaces of `inner` in key order. The map has no cursor, and a
+    /// walk in parts needs one ([`Self::namespaces_after`]). Written together
+    /// with `inner`, and never borrowed across an `.await`.
+    ordered: RefCell<BTreeSet<IggyNamespace>>,
 }
 
 impl Default for PapayaShardsTable {
@@ -84,6 +93,7 @@ impl PapayaShardsTable {
     pub fn new() -> Self {
         Self {
             inner: papaya::HashMap::new(),
+            ordered: RefCell::new(BTreeSet::new()),
         }
     }
 
@@ -91,7 +101,26 @@ impl PapayaShardsTable {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: papaya::HashMap::with_capacity(capacity),
+            ordered: RefCell::new(BTreeSet::new()),
         }
+    }
+
+    /// The namespaces after `after` in key order, at most `limit` of them,
+    /// from the first one for `None`. A walk in parts passes the last
+    /// namespace it got, so it holds no place in the table between two
+    /// parts, and a row written or removed between them cannot break it.
+    #[must_use]
+    pub fn namespaces_after(
+        &self,
+        after: Option<IggyNamespace>,
+        limit: usize,
+    ) -> Vec<IggyNamespace> {
+        self.ordered
+            .borrow()
+            .range((after.map_or(Unbounded, Excluded), Unbounded))
+            .take(limit)
+            .copied()
+            .collect()
     }
 }
 
@@ -107,12 +136,18 @@ impl ShardsTable for PapayaShardsTable {
     }
 
     fn insert(&self, namespace: IggyNamespace, location: PartitionLocation) {
-        self.inner.pin().insert(namespace, location);
+        if self.inner.pin().insert(namespace, location).is_none() {
+            self.ordered.borrow_mut().insert(namespace);
+        }
     }
 
     fn remove(&self, namespace: &IggyNamespace) -> Option<PartitionLocation> {
         let guard = self.inner.guard();
-        self.inner.remove(namespace, &guard).copied()
+        let removed = self.inner.remove(namespace, &guard).copied();
+        if removed.is_some() {
+            self.ordered.borrow_mut().remove(namespace);
+        }
+        removed
     }
 
     /// Snapshot: papaya guards cannot escape the call site.
@@ -209,7 +244,7 @@ impl PartitionShards {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use server_common::sharding::ShardId;
 
     const SHARD_COUNTS: [u16; 5] = [1, 2, 3, 4, 8];
     /// Enough namespaces that every shard of the largest count gets one.
@@ -278,6 +313,46 @@ mod tests {
         assert_eq!(
             owners(PartitionShards::new(4, false)),
             BTreeSet::from([0, 1, 2, 3])
+        );
+    }
+
+    /// The walk in parts must name each row once, in key order, whatever
+    /// order the rows were written in, and no row that was removed.
+    #[test]
+    fn given_written_and_removed_rows_when_walking_in_parts_should_name_each_row_once_in_key_order()
+    {
+        const PART: usize = 2;
+        let table = PapayaShardsTable::new();
+        let location = |epoch| PartitionLocation::new(ShardId::new(1), epoch);
+        let namespaces = [5, 1, 4, 2, 3].map(|stream| IggyNamespace::new(stream, 0, 0));
+        for namespace in namespaces {
+            table.insert(namespace, location(1));
+        }
+        table.insert(namespaces[0], location(2));
+        assert!(table.remove(&namespaces[2]).is_some());
+        assert!(table.remove(&namespaces[2]).is_none());
+
+        let mut walked = Vec::new();
+        let mut after = None;
+        loop {
+            let part = table.namespaces_after(after, PART);
+            walked.extend(&part);
+            if part.len() < PART {
+                break;
+            }
+            after = part.last().copied();
+        }
+
+        assert_eq!(
+            walked,
+            [1, 2, 3, 5].map(|stream| IggyNamespace::new(stream, 0, 0))
+        );
+        assert_eq!(table.epoch_for(namespaces[0]), Some(2));
+        let mut snapshot = table.namespaces();
+        snapshot.sort_unstable();
+        assert_eq!(
+            snapshot, walked,
+            "the walk and the map must hold the same rows"
         );
     }
 
