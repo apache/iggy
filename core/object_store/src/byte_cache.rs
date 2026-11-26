@@ -57,7 +57,7 @@
 //! an owner, and every held entry, count against the budget alone.
 
 use bytes::Bytes;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Of the budget, one part in this many is the small queue's.
 const SMALL_SHARE: usize = 10;
@@ -115,6 +115,10 @@ pub struct ByteCache<K, O = ()> {
     /// The entries of each owner with a limit, by where they are. An owner
     /// without one has no row: its entries count against the budget alone.
     limited: BTreeMap<O, Limited<K>>,
+    /// The keys of each owner that has entries, the ones it only remembers
+    /// too, so that giving an owner a limit or dropping it looks at its own
+    /// entries alone.
+    owned: BTreeMap<O, BTreeSet<K>>,
     budget: usize,
     entered: u64,
     /// Entries whose bytes left because their owner was over its limit,
@@ -142,6 +146,7 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
                 Line::new(),
             ],
             limited: BTreeMap::new(),
+            owned: BTreeMap::new(),
             budget,
             entered: 0,
             limit_evictions: 0,
@@ -291,9 +296,6 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
 
     /// Give `owner` the limit `limit`, evicting its entries down to it, or
     /// take its limit away with `None`.
-    ///
-    /// The first limit of an owner looks for its entries among all of them,
-    /// once.
     pub fn set_limit(&mut self, owner: O, limit: Option<usize>) {
         let Some(limit) = limit else {
             self.limited.remove(&owner);
@@ -309,10 +311,9 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
                 Line::new(),
                 Line::new(),
             ];
-            for (key, entry) in &self.entries {
-                if entry.owner == Some(owner) {
-                    lines[entry.place as usize].put(entry.entered, key.clone(), entry.held);
-                }
+            let keys = self.owned.get(&owner).into_iter().flatten();
+            for (key, entry) in keys.filter_map(|key| Some((key, self.entries.get(key)?))) {
+                lines[entry.place as usize].put(entry.entered, key.clone(), entry.held);
             }
             self.limited.insert(owner, Limited { limit, lines });
         }
@@ -322,23 +323,9 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
     }
 
     /// Drop every entry of `owner`, the keys it remembers too, and its limit.
-    /// The entries of an owner without a limit are looked for among all of
-    /// them.
     pub fn remove_owner(&mut self, owner: &O) {
-        let keys: Vec<K> = match self.limited.remove(owner) {
-            Some(limited) => limited
-                .lines
-                .into_iter()
-                .flat_map(|line| line.order.into_values())
-                .collect(),
-            None => self
-                .entries
-                .iter()
-                .filter(|(_, entry)| entry.owner.as_ref() == Some(owner))
-                .map(|(key, _)| key.clone())
-                .collect(),
-        };
-        for key in keys {
+        self.limited.remove(owner);
+        for key in self.owned.remove(owner).unwrap_or_default() {
             self.unlink(&key);
         }
     }
@@ -691,13 +678,25 @@ impl<K: Ord + Clone, O: Copy + Ord> ByteCache<K, O> {
         for lines in self.lines_of(entry.owner) {
             lines[entry.place as usize].put(entry.entered, key.clone(), entry.held);
         }
+        if let Some(owner) = entry.owner {
+            self.owned.entry(owner).or_default().insert(key.clone());
+        }
         self.entries.insert(key, entry);
     }
 
     fn unlink(&mut self, key: &K) {
-        if let Some(entry) = self.entries.remove(key) {
-            for lines in self.lines_of(entry.owner) {
-                lines[entry.place as usize].take(entry.entered, entry.held);
+        let Some(entry) = self.entries.remove(key) else {
+            return;
+        };
+        for lines in self.lines_of(entry.owner) {
+            lines[entry.place as usize].take(entry.entered, entry.held);
+        }
+        if let Some(owner) = entry.owner
+            && let Some(keys) = self.owned.get_mut(&owner)
+        {
+            keys.remove(key);
+            if keys.is_empty() {
+                self.owned.remove(&owner);
             }
         }
     }
@@ -863,6 +862,13 @@ mod tests {
             }
             assert!(limited.held() <= limited.limit, "{owner:?}");
         }
+        let mut recounted: BTreeMap<O, BTreeSet<u32>> = BTreeMap::new();
+        for (key, entry) in &cache.entries {
+            if let Some(owner) = entry.owner {
+                recounted.entry(owner).or_default().insert(*key);
+            }
+        }
+        assert_eq!(cache.owned, recounted, "the keys tracked by owner drifted");
     }
 
     /// A cache whose main queue holds `shared`, each read by four readers.
@@ -1515,6 +1521,25 @@ mod tests {
         assert_owned_bounds(&unlimited);
     }
 
+    /// An owner that never cached a block has no keys to look at, so its
+    /// first limit and its removal touch nothing of the others.
+    #[test]
+    fn given_owners_that_never_cached_when_limited_or_removed_should_leave_the_others_alone() {
+        let mut cache = ByteCache::<u32, char>::new(100);
+        for key in [1, 2, 3] {
+            read_as(&mut cache, 'A', key, 10);
+        }
+
+        cache.set_limit('B', Some(30));
+        cache.remove_owner(&'B');
+        cache.remove_owner(&'C');
+
+        assert_eq!(held_keys_of(&cache, 'A'), [1, 2, 3]);
+        assert_eq!(cache.owned.keys().copied().collect::<Vec<_>>(), ['A']);
+        assert_eq!(cache.limit(&'B'), None);
+        assert_owned_bounds(&cache);
+    }
+
     /// What this node stored and holds belongs to no owner, so no limit
     /// touches it.
     #[test]
@@ -1635,6 +1660,11 @@ mod tests {
                 }
                 5 if random.random_bool(0.1) => {
                     cache.remove_owner(&owner);
+                    false
+                }
+                6 if random.random_bool(0.05) => {
+                    let dropped = key % 7;
+                    cache.retain(|key| key % 7 != dropped);
                     false
                 }
                 _ => match cache.read(&key) {
