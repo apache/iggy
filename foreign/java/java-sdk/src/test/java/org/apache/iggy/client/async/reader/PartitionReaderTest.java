@@ -336,7 +336,7 @@ class PartitionReaderTest {
         PartitionReader reader = standalone(transport, MANUAL, 1L, 2L, 3L);
         try {
             Read first = transport.nextRead();
-            Read second = transport.nextRead();
+            Read second = transport.nextRead(reader);
             assertThat(List.of(first.targets().keySet(), second.targets().keySet()))
                     .containsExactlyInAnyOrder(Set.of(1L, 3L), Set.of(2L));
             Read groupOfTwo = first.targets().containsKey(2L) ? first : second;

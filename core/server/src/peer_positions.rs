@@ -309,11 +309,14 @@ impl<E: TierExecutor + Clone> PeerRead<E> {
             || keys
                 .iter()
                 .any(|(key, etag, _)| objects.get(key).is_none_or(|(known, _)| known != etag));
-        let before = if changed {
-            Some(read_identity(&service, &token, &layout).await)
-        } else {
-            None
-        };
+        if !changed {
+            return PassRead {
+                objects,
+                listed: true,
+                identity: None,
+            };
+        }
+        let before = read_identity(&service, &token, &layout).await;
         let mut kept = Objects::new();
         for (key, etag, expected) in keys {
             if let Some((known, object)) = objects.remove(&key)
@@ -359,17 +362,11 @@ impl<E: TierExecutor + Clone> PeerRead<E> {
                 }
             }
         }
-        let identity = match before {
-            Some(before) => {
-                let after = read_identity(&service, &token, &layout).await;
-                Some(IdentityBracket::of(&before, &after))
-            }
-            None => None,
-        };
+        let after = read_identity(&service, &token, &layout).await;
         PassRead {
             objects: kept,
             listed: true,
-            identity,
+            identity: Some(IdentityBracket::of(&before, &after)),
         }
     }
 }
@@ -653,9 +650,15 @@ mod tests {
         assert_eq!(first.objects.len(), 1);
         let reads = calls.all().len();
 
+        let held: Vec<String> = first.objects.keys().cloned().collect();
         let second = pass(&peer, first.objects).await;
         assert_eq!(second.identity, None);
         assert!(second.adopted(status));
+        assert_eq!(
+            second.objects.keys().cloned().collect::<Vec<_>>(),
+            held,
+            "the objects of the last pass"
+        );
         assert_eq!(calls.all().len(), reads + 1, "one listing");
         assert!(!status.take_check_request());
     }

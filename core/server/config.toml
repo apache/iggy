@@ -927,7 +927,12 @@ shutdown_join_timeout = "30 s"
 # wakes on every metadata commit from shard 0. The tick retries partitions
 # that a pass left unfinished (a backed-off build, an incomplete trim),
 # checks local changes that no commit announces, ages parked requests and
-# covers dropped wake-ups. A full reconcile runs every 10 minutes as a repair.
+# covers dropped wake-ups. The reconciler also compares every partition
+# with committed metadata again in the background, and this tick does not
+# change the pace of that. It reads 1,024 entries (streams, topics,
+# partitions, routing rows) every 250 ms, and starts again 10 minutes after
+# it ended. The time for all partitions grows with their number: about 17
+# minutes at one million streams of one partition each.
 reconcile_periodic_interval = "1 s"
 
 # WebSocket listener configuration. The frame-tuning knobs below are the
@@ -1635,21 +1640,22 @@ handshake_grace = "10 s"
 #abandoned_upload_grace = "1 h"
 # The bytes of what one shard reads from object stores that it keeps in
 # memory, so that a poll of bytes another poll read a moment ago does not ask
-# the store again: tiered and long-term segments and their indexes, fresh
-# objects, and the segments of geo peers. The same budget holds the fresh
-# objects that the shard uploads for geo topics, in up to seven eighths of
-# it, until the long-term rewrite takes their messages, so that a consumer at
-# the tail reads them from memory. A shard with a high upload rate wants
-# 64 MiB or more. Each shard keeps its own, so a node spends this times its
-# shards. "0" keeps nothing that reads fetch and turns readahead off: those
-# reads go to the store each time. It never stops the shard from holding what
-# it uploads, which then takes a fixed 64 MiB of its own. Otherwise at least 8
-# blocks of 'read_cache_block_size'. Every partition of the shard reads within
-# it. A topic can override it with its own 'read_cache_size' option, which is
-# shared evenly between the topic's partitions. Each share is a limit on what
-# that partition keeps, not a reservation: what a quiet partition leaves
-# unused is there for the others. A topic that sets none is bounded by this
-# budget alone.
+# the store again: tiered and long-term segments, the indexes of long-term
+# segments, fresh objects, and the segments of geo peers. The index of a
+# tiered segment is fetched once into a local index file on disk instead. The
+# same budget holds the fresh objects that the shard uploads for geo topics,
+# in up to seven eighths of it, until the long-term rewrite takes their
+# messages, so that a consumer at the tail reads them from memory. A shard
+# with a high upload rate wants 64 MiB or more. Each shard keeps its own, so a
+# node spends this times its shards. "0" keeps nothing that reads fetch and
+# turns readahead off: those reads go to the store each time. It never stops
+# the shard from holding what it uploads, which then takes a fixed 64 MiB of
+# its own. Otherwise at least 8 blocks of 'read_cache_block_size'. Every
+# partition of the shard reads within it. A topic can override it with its own
+# 'read_cache_size' option, which is shared evenly between the topic's
+# partitions. Each share is a limit on what that partition keeps, not a
+# reservation: what a quiet partition leaves unused is there for the others. A
+# topic that sets none is bounded by this budget alone.
 #read_cache_size = "64 MiB"
 # The piece of a segment that the cache fetches and keeps. A smaller block
 # wastes less on a small or random read. A larger block means fewer entries
@@ -1658,11 +1664,13 @@ handshake_grace = "10 s"
 #read_cache_block_size = "256 KiB"
 # When polls read a segment in order, the shard fetches up to this many bytes
 # past the last poll before a poll asks for them, in whole blocks. These
-# fetches take the speculative fetch caps of [tiered_storage.jobs] and start
-# only while no poll waits for the store. "0" turns readahead off. Otherwise
-# at least 2 blocks, and at most an eighth of 'read_cache_size', the part of
-# the cache where the fetched bytes wait for their poll. A topic can override
-# it with its own 'read_ahead' option.
+# fetches take the speculative fetch caps of [tiered_storage.jobs]: at most
+# 'speculative_fetches' of them at once, each at most
+# 'speculative_fetch_bytes'. One starts only while no fetch that a poll waits
+# for is queued, and it can run beside the ones that already run. "0" turns
+# readahead off. Otherwise at least 2 blocks, and at most an eighth of
+# 'read_cache_size', the part of the cache where the fetched bytes wait for
+# their poll. A topic can override it with its own 'read_ahead' option.
 #read_ahead = "2 MiB"
 # The shortest time between the starts of two uploads of fresh objects on one
 # shard, so a shard creates at most one object per interval, plus the objects
@@ -1891,10 +1899,17 @@ handshake_grace = "10 s"
 #region = "us-east-1"
 #endpoint = "https://storage.example.com"
 #url_style = "auto"
-# Static s3 credentials, which an s3 peer needs. Set them in the environment,
-# for the first peer with IGGY_GEO_PEERS_0_ACCESS_KEY_ID and
-# IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather than in this file. The printed
-# configuration never shows them.
+# Static s3 credentials. Set them in the environment, for the first peer with
+# IGGY_GEO_PEERS_0_ACCESS_KEY_ID and IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather
+# than in this file. A variable for one key of a peer replaces the whole list
+# of peers from this file, so set the peer's other keys there too
+# (IGGY_GEO_PEERS_0_ORIGIN, _BACKEND, _BUCKET, _REGION) and leave its table
+# out of this file. The printed configuration never shows the credentials.
+# Without them, an s3 peer reads with the node's web identity or instance
+# role, as the s3 backend does, and that role needs s3:GetObject and
+# s3:ListBucket on the peer's bucket. A peer's credentials never hold up the
+# boot: a role that hands out nothing leaves the peer unreachable, and the
+# node keeps fetching.
 #access_key_id = ""
 #secret_access_key = ""
 # The gcs backend: the peer's bucket and how this node gets a token that

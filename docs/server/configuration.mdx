@@ -380,7 +380,7 @@ Server OTLP export is unavailable in this revision: `grpc` prevents startup, and
 | `shutdown_drain_timeout` | `"10 s"` | Per-shard bus drain budget on shutdown. Slow-fsync hosts may need more. |
 | `shutdown_poll_interval` | `"50 ms"` | Poll cadence for the shutdown flag. Must be less than or equal to `shutdown_drain_timeout`. |
 | `shutdown_join_timeout` | `"30 s"` | Hard deadline for joining shard threads at exit. A wedged shard is abandoned with an error log. Must be at least `shutdown_drain_timeout`. |
-| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. |
+| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. The loop also compares every partition with committed metadata again in the background, and the tick does not change the pace of that. It reads 1,024 entries (streams, topics, partitions, routing rows) every 250 ms, and starts again 10 minutes after it ended. The time for all partitions grows with their number: about 17 minutes at one million streams of one partition each. |
 
 Valid `cpu_allocation` syntaxes:
 
@@ -460,7 +460,9 @@ Tunables for the internal bus that ships consensus traffic between replicas and 
 
 ### `[tiered_storage]`
 
-The object store of tiered and geo topics. The backend, the bucket and the credentials are described in the server README and in the embedded `config.toml`. The keys below bound and retry the calls that each shard sends to the store. A create-only put whose body the node holds in memory (fresh objects and long-term segments) is sent again after a transient failure. Every attempt of one put carries the same `put-id` entry in the object's user metadata, so a create-only put that the store refuses because an earlier attempt stored the object counts as stored. An overwrite (a manifest, a positions object or a topic object) is sent again only when its request never left the node, for example when the connection was refused: an attempt that may have reached the store can land after a later overwrite of the same key and roll it back, so any other failure goes to the caller. A put that streams a sealed segment from its file is sent once.
+Tiered storage keeps sealed segments in an object store. It is off until `backend` is set. The backend, the bucket and the credentials are described in the server README, and the server's embedded `config.toml` lists every key of the section.
+
+The keys below bound and retry the calls that each shard sends to the store. A create-only put whose body the node holds in memory (fresh objects and long-term segments) is sent again after a transient failure. Every attempt of one put carries the same `put-id` entry in the object's user metadata, so a create-only put that the store refuses because an earlier attempt stored the object counts as stored. An overwrite (a manifest, a positions object or a topic object) is sent again only when its request never left the node, for example when the connection was refused: an attempt that may have reached the store can land after a later overwrite of the same key and roll it back, so any other failure goes to the caller. A put that streams a sealed segment from its file is sent once.
 
 | Key | Default | Description |
 |-----|---------|-------------|
@@ -477,6 +479,16 @@ The object store of tiered and geo topics. The backend, the bucket and the crede
 | `part_size` | `"8 MiB"` | A long-term segment of at least twice this goes up in parts on `s3` and `gcs`, and one request then creates the object whole and create-only, with a CRC32C of all of it that the store checks: a multipart upload with a full object CRC32C on S3, temporary objects under `<prefix>/meta/uploads/` and a compose on GCS, through a temporary composite whose CRC32C the node checks first. Only an `https` endpoint of Google takes uploads in parts. Every other put goes whole, such as a fresh object that producers wait for. GCS composes at most 32 parts, so a part takes at least a 32nd of its object there. On GCS, a bucket with soft delete on keeps deleted objects billable for its retention, 7 days by default, so each long-term segment stored in parts is billed about twice for that time. Turning soft delete off on the bucket, or `part_size = "0"`, avoids it. A store that refuses multipart uploads makes the node put every object whole from then on. `"0"` puts every object whole. Otherwise from 5 MiB to 5 GiB. |
 | `jobs.parts_in_flight` | `8` | Parts of uploads in parts that run at once on one shard. An upload with no part in flight sends one even when they are all taken. At least 1. |
 | `abandoned_upload_grace` | `"1 h"` | How old an upload in parts that never completed must be before shard 0 of the metadata primary removes it, every hour or every grace when that is shorter, while the store identity check passes. An upload in parts gives up at half the grace, so the sweep never meets a live one. `"disabled"` turns the sweep off and leaves uploads in parts without a deadline. Otherwise at least 30 min, so the half that covers clock skew takes the 15 minutes that S3 accepts. On S3 the sweep needs `s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and `s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`). Without them it removes nothing, and S3 keeps charging for the parts of every abandoned upload unless a bucket lifecycle rule aborts incomplete multipart uploads. |
+
+The keys below set how each shard reads back from object stores: its own store and the stores of its geo peers.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `read_cache_size` | `"64 MiB"` | Bytes of what one shard reads from object stores that it keeps in memory. The same budget holds the fresh objects the shard uploads for geo topics, in up to seven eighths of it. Each shard has its own cache, so a node uses up to this times its number of shards. `"0"` keeps nothing that reads fetch and turns readahead off. The shard then holds what it uploads in a fixed 64 MiB of its own. Otherwise at least 8 blocks of `read_cache_block_size`. |
+| `read_cache_block_size` | `"256 KiB"` | The piece of a segment that the cache fetches and keeps. From `"64 KiB"` to `"1 MiB"`. |
+| `read_ahead` | `"2 MiB"` | Bytes that a shard fetches past the last poll when polls read a segment in order. `"0"` turns readahead off. Otherwise at least 2 blocks, and at most an eighth of `read_cache_size`. |
+
+Readahead takes the speculative fetch caps of `[tiered_storage.jobs]`: at most `speculative_fetches` (default `4`) fetches at once, each at most `speculative_fetch_bytes` (default `"32 MiB"`). A readahead fetch starts only while no fetch that a poll waits for is queued. The server checks these keys while the cache is on, on a node with a `backend` or with geo peers, whose reads go through the same cache.
 
 ### `[node]`
 

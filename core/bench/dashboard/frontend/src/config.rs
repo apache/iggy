@@ -17,7 +17,12 @@
 
 const PRODUCTION_API_BASE_URL: &str = "https://benchmarks.iggy.apache.org";
 
+/// The origin of the page. Outside the browser it is empty, so the links that the server renders
+/// are relative to the page, and the browser makes them absolute when it hydrates the page.
 pub fn get_api_base_url() -> String {
+    if !cfg!(target_arch = "wasm32") {
+        return String::new();
+    }
     // The dashboard server hosts the page next to the API, and `trunk serve` proxies the API
     // for the dev page (see Trunk.toml), so the API is always on the page origin.
     web_sys::window()

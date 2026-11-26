@@ -647,8 +647,9 @@ impl Topic {
         )
     }
 
-    /// [`Self::partitions_after`] skips or repeats partitions when ids do not
-    /// ascend over `partitions`. Only the primary mints the ids of a create.
+    /// [`Self::partitions_after`] and [`partition_position`] miss partitions
+    /// when ids do not ascend over `partitions`. A create refuses such ids
+    /// before it appends, so this guards the append itself.
     fn debug_assert_partition_ids_ascend(&self) {
         debug_assert!(
             self.partitions
@@ -2742,8 +2743,8 @@ impl Streams {
     /// plain scan of `partitions` would therefore cost ~N element visits per
     /// request on an N-partition topic. Partitions are pushed in dense id order by
     /// `CreateTopicWithAssignments` / `CreatePartitionsWithAssignments`, so the
-    /// direct index hits in one step; the scan stays as the fallback because
-    /// nothing in the type enforces that density.
+    /// direct index hits in one step; a binary search by id stays as the
+    /// fallback because nothing in the type enforces that density.
     #[must_use]
     pub fn created_revision_for_namespace(&self, namespace: IggyNamespace) -> Option<u64> {
         self.with_committed_partition(namespace, |partition| partition.created_revision)
@@ -3502,42 +3503,43 @@ pub(crate) const fn admits_slab_key(vacant_key: usize, ceiling: usize) -> bool {
 }
 
 /// The partition carrying `partition_id`, or `None` when the topic has none.
-///
-/// A primary mints dense 0-based ids, so the vector index IS the id and the
-/// direct hit answers every ordinary topic. The scan exists only for a vector
-/// left sparse by a partition delete, where an index no longer names its id.
 pub(crate) fn find_partition(partitions: &[Partition], partition_id: usize) -> Option<&Partition> {
-    if let Some(partition) = partitions.get(partition_id)
-        && partition.id == partition_id
-    {
-        return Some(partition);
-    }
-    partitions
-        .iter()
-        .find(|partition| partition.id == partition_id)
+    partitions.get(partition_position(partitions, partition_id)?)
 }
 
 fn find_partition_mut(partitions: &mut [Partition], partition_id: usize) -> Option<&mut Partition> {
-    let index = if partitions
-        .get(partition_id)
-        .is_some_and(|partition| partition.id == partition_id)
-    {
-        partition_id
-    } else {
-        partitions
-            .iter()
-            .position(|partition| partition.id == partition_id)?
-    };
+    let index = partition_position(partitions, partition_id)?;
     partitions.get_mut(index)
 }
 
-/// Range and distinctness for the ABSOLUTE partition ids on a topic create,
+/// The position in `partitions` of the partition carrying `partition_id`.
+///
+/// A primary mints dense 0-based ids, so the vector index IS the id and the
+/// direct hit answers every ordinary topic. An id that the topic does not
+/// hold, or a vector with a gap, takes a binary search. That search is
+/// correct only because ids strictly ascend over the vector: a create and a
+/// snapshot restore both refuse ids that do not.
+fn partition_position(partitions: &[Partition], partition_id: usize) -> Option<usize> {
+    if partitions
+        .get(partition_id)
+        .is_some_and(|partition| partition.id == partition_id)
+    {
+        return Some(partition_id);
+    }
+    partitions
+        .binary_search_by_key(&partition_id, |partition| partition.id)
+        .ok()
+}
+
+/// Range and strict ascent for the ABSOLUTE partition ids on a topic create,
 /// `None` when the vector is well formed.
 ///
 /// Range is the weaker half: two in-range entries sharing an id pack to ONE
 /// namespace, landing both partitions on a single consensus group, shard,
 /// directory and authorization scope. That is the aliasing the range bound
-/// prevents, reached without exceeding it.
+/// prevents, reached without exceeding it. Ascent rules it out, and it also
+/// keeps the order that [`partition_position`] and [`Topic::partitions_after`]
+/// search by.
 ///
 /// Unreachable from a well-behaved primary, which mints dense 0-based ids under
 /// `MAX_PARTITIONS_PER_REQUEST`. Apply is defensive because the prepare body is
@@ -3545,14 +3547,15 @@ fn find_partition_mut(partitions: &mut [Partition], partition_id: usize) -> Opti
 fn absolute_partition_ids_fault(
     partitions: &[CreatedPartitionAssignment],
 ) -> Option<CreateTopicResult> {
-    let mut seen = AHashSet::with_capacity(partitions.len());
+    let mut previous = None;
     for partition in partitions {
         if partition.partition_id as usize >= MAX_PARTITIONS {
             return Some(CreateTopicResult::PartitionIdSpaceExhausted);
         }
-        if !seen.insert(partition.partition_id) {
+        if previous.is_some_and(|previous| partition.partition_id <= previous) {
             return Some(CreateTopicResult::InvalidPartitionsCount);
         }
+        previous = Some(partition.partition_id);
     }
     None
 }
@@ -4543,7 +4546,6 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
             };
 
             let mut resolved: Vec<usize> = Vec::with_capacity(self.partitions.len());
-            let mut seen = AHashSet::with_capacity(self.partitions.len());
             for partition in &self.partitions {
                 let Some(resolved_id_u32) = partition.partition_id.checked_add(base_partition_id)
                 else {
@@ -4560,9 +4562,14 @@ impl StateHandler for CreatePartitionsWithAssignmentsRequest {
                 if resolved_id_usize >= MAX_PARTITIONS {
                     return ApplyReply::err(CreatePartitionsResult::PartitionIdSpaceExhausted);
                 }
-                // Two offsets resolving to one id alias onto a single namespace.
-                // Existing partitions cannot collide: `base` is one past the max.
-                if !seen.insert(resolved_id_usize) {
+                // Two offsets resolving to one id alias onto a single namespace,
+                // and ids that do not ascend hide a partition from the lookups
+                // that search `topic.partitions` by id. Existing partitions sit
+                // below every new id: `base` is one past the max.
+                if resolved
+                    .last()
+                    .is_some_and(|last| resolved_id_usize <= *last)
+                {
                     return ApplyReply::err(CreatePartitionsResult::InvalidPartitionsCount);
                 }
                 resolved.push(resolved_id_usize);
@@ -5169,6 +5176,7 @@ impl Snapshotable for Streams {
     ) -> Result<Self, crate::stm::snapshot::SnapshotError> {
         snapshot.validate_ownership_history(u64::MAX)?;
         snapshot.validate_partition_members()?;
+        snapshot.validate_partition_order()?;
         // Boot: no live registry exists yet, so mint one. Safe because
         // `new_from_empty` clones this single inner onto the other left-right
         // buffer rather than building a second one.
@@ -5180,6 +5188,8 @@ impl Snapshotable for Streams {
         Ok(inner.into())
     }
 }
+
+const PARTITION_IDS_DO_NOT_ASCEND: &str = "partition ids of a topic do not ascend";
 
 impl StreamsSnapshot {
     pub(crate) fn validate_partition_members(&self) -> Result<(), SnapshotError> {
@@ -5197,6 +5207,26 @@ impl StreamsSnapshot {
             Err(SnapshotError::InvalidState(
                 "partition member list is empty, oversized or repeats a node",
             ))
+        }
+    }
+
+    /// A restore keeps the order of each topic's partitions, and
+    /// [`partition_position`] and [`Topic::partitions_after`] search them by id.
+    /// Ids that do not strictly ascend would hide a live partition from both.
+    pub(crate) fn validate_partition_order(&self) -> Result<(), SnapshotError> {
+        let ascending = self
+            .items
+            .iter()
+            .flat_map(|(_, stream)| stream.topics.iter())
+            .all(|(_, topic)| {
+                topic
+                    .partitions
+                    .is_sorted_by(|left, right| left.id < right.id)
+            });
+        if ascending {
+            Ok(())
+        } else {
+            Err(SnapshotError::InvalidState(PARTITION_IDS_DO_NOT_ASCEND))
         }
     }
 }
@@ -8621,11 +8651,12 @@ pub(crate) mod tests {
             .clone()
     }
 
-    /// A delete leaves every surviving id above the hole naming an index that
-    /// is no longer its own, so the direct hit has to fall through to the scan
-    /// or the survivor resolves to nothing and its namespace stops routing.
+    /// In a vector with a gap an index no longer names its id, so the direct
+    /// hit has to fall through to the search by id, or a partition resolves
+    /// to nothing and its namespace stops routing. The search must also find
+    /// nothing for an id below, between and above the ids the vector holds.
     #[test]
-    fn given_sparse_partition_ids_when_resolving_should_fall_back_to_the_scan() {
+    fn given_sparse_partition_ids_when_resolving_should_fall_back_to_the_search() {
         let inner = inner_with_registered_partition();
         let template = committed_partition(&inner, 0, 0, 0);
         let partition = |id| Partition {
@@ -8633,7 +8664,7 @@ pub(crate) mod tests {
             ..template.clone()
         };
         let dense = vec![partition(0), partition(1)];
-        let sparse = vec![partition(3), partition(7)];
+        let mut sparse = vec![partition(3), partition(7)];
 
         assert_eq!(
             find_partition(&dense, 1).map(|partition| partition.id),
@@ -8647,9 +8678,15 @@ pub(crate) mod tests {
             find_partition(&sparse, 7).map(|partition| partition.id),
             7.into()
         );
-        assert!(find_partition(&sparse, 0).is_none());
-        assert!(find_partition(&sparse, 1).is_none());
+        for absent in [0, 1, 5, 8] {
+            assert!(find_partition(&sparse, absent).is_none(), "id {absent}");
+        }
         assert!(find_partition(&dense, 2).is_none());
+        assert_eq!(
+            find_partition_mut(&mut sparse, 7).map(|partition| partition.id),
+            7.into()
+        );
+        assert!(find_partition_mut(&mut sparse, 5).is_none());
     }
 
     /// A fetch resolves its stream, topic and group once, so each of its
@@ -9553,6 +9590,118 @@ pub(crate) mod tests {
             vec![0, 1, 2],
             "resolved ids must stay dense and distinct"
         );
+    }
+
+    fn ordered_assignment(partition_id: u32) -> CreatedPartitionAssignment {
+        CreatedPartitionAssignment {
+            initial_view: 0,
+            partition_id,
+            consensus_group_id: u64::from(partition_id) + 1,
+            members: Vec::new(),
+        }
+    }
+
+    /// Distinct ids that descend pass the range and the alias check. The
+    /// lookups search a topic's partitions by id, so a create must refuse
+    /// them: nothing else keeps the order in a release build.
+    #[test]
+    fn given_descending_partition_ids_on_topic_create_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let request = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![ordered_assignment(1), ordered_assignment(0)],
+        };
+        let reply = StateHandler::apply(&request, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(CreateTopicResult::InvalidPartitionsCount)
+        );
+        assert_eq!(
+            inner.items.get(0).unwrap().topics.len(),
+            0,
+            "a rejected create must not leave a half-built topic"
+        );
+    }
+
+    /// Same on the additive path: offsets that descend resolve to ids that
+    /// descend.
+    #[test]
+    fn given_descending_partition_offsets_when_adding_should_reject() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+
+        let seed = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 1, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![ordered_assignment(0)],
+        };
+        assert_eq!(
+            StateHandler::apply(&seed, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+
+        let descending = CreatePartitionsWithAssignmentsRequest {
+            request: WireCreatePartitionsRequest {
+                stream_id: WireIdentifier::numeric(0),
+                topic_id: WireIdentifier::numeric(0),
+                partitions_count: 2,
+            },
+            partitions: vec![ordered_assignment(1), ordered_assignment(0)],
+        };
+        let reply = StateHandler::apply(&descending, &mut inner, IggyTimestamp::now());
+        assert_eq!(
+            reply.code,
+            u32::from(CreatePartitionsResult::InvalidPartitionsCount)
+        );
+
+        let topic = inner.items.get(0).unwrap().topics.get(0).unwrap();
+        assert_eq!(
+            topic.partitions.len(),
+            1,
+            "a rejected batch must not append"
+        );
+    }
+
+    /// A restore keeps the order of a topic's partitions, and the lookups
+    /// search them by id. A snapshot whose ids repeat or descend would hide a
+    /// live partition from them, so neither restore path may take it.
+    #[test]
+    fn given_partition_ids_that_do_not_ascend_when_restoring_a_snapshot_should_refuse() {
+        let mut inner = StreamsInner::new();
+        create_stream(&mut inner, "s");
+        let request = CreateTopicWithAssignmentsRequest {
+            request: make_topic_request(0, 2, "t"),
+            derived_options: WireOptions::empty(),
+            partitions: vec![ordered_assignment(0), ordered_assignment(1)],
+        };
+        assert_eq!(
+            StateHandler::apply(&request, &mut inner, IggyTimestamp::now()).code,
+            0
+        );
+        let streams: Streams = inner.into();
+        let ascending = streams.to_snapshot();
+        assert!(Streams::from_snapshot(ascending.clone()).is_ok());
+
+        let mut descending = ascending.clone();
+        descending.items[0].1.topics[0].1.partitions.swap(0, 1);
+        let mut repeated = ascending;
+        repeated.items[0].1.topics[0].1.partitions[1].id = 0;
+
+        for section in [descending, repeated] {
+            assert!(matches!(
+                Streams::from_snapshot(section.clone()),
+                Err(SnapshotError::InvalidState(PARTITION_IDS_DO_NOT_ASCEND))
+            ));
+            let mut snapshot = MetadataSnapshot::new(1);
+            snapshot.streams = Some(section);
+            assert!(matches!(
+                MetadataSnapshot::decode(&snapshot.encode().unwrap()),
+                Err(SnapshotError::InvalidState(PARTITION_IDS_DO_NOT_ASCEND))
+            ));
+        }
     }
 
     /// Pins the asymmetry that hid the fork: ascending deletes leave a free-list
