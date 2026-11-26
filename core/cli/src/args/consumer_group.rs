@@ -52,6 +52,10 @@ pub(crate) enum ConsumerGroupAction {
     Delete(ConsumerGroupDeleteArgs),
     /// Get details of a single consumer group with given ID for given stream ID and topic ID
     ///
+    /// Prints each partition, its current offset, its stored offset, and its lag.
+    /// A stored offset sets lag to the current offset minus the stored offset.
+    /// No stored offset prints "-" for the current offset and the lag.
+    ///
     /// Stream ID can be specified as a stream name or ID
     /// Topic ID can be specified as a topic name or ID
     /// Consumer group ID can be specified as a consumer group name or ID

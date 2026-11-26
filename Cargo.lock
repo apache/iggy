@@ -5786,6 +5786,7 @@ version = "0.15.1-edge.2"
 dependencies = [
  "anyhow",
  "apple-native-keyring-store",
+ "async-broadcast",
  "async-trait",
  "bytes",
  "cfg_aliases",
