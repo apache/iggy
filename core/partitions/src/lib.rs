@@ -108,9 +108,8 @@ pub use segment_upload::{
 };
 mod segment_verify;
 pub use segment_verify::{
-    ObjectHead, SEGMENT_VERIFY_ATTEMPTS, SEGMENT_VERIFY_BATCH_MAX, SEGMENT_VERIFY_INTERVAL,
-    SegmentHeads, SegmentVerifyJob, SegmentVerifyOutcome, SegmentVerifyReport, Unanswered,
-    VerifyBegin,
+    ObjectHead, SegmentHeads, SegmentVerifyJob, SegmentVerifyOutcome, SegmentVerifyReport,
+    Unanswered, VerifyBegin, VerifyTally,
 };
 mod segment_verify_job;
 pub use segment_verify_job::{ExecutorSegmentVerifier, SegmentVerifier, head_segments};

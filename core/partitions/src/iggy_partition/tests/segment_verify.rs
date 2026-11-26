@@ -24,12 +24,12 @@ use super::*;
 use crate::segment_chain::SegmentRecord;
 use crate::{
     ExecutorSegmentVerifier, ObjectHead, SegmentHeads, SegmentVerifier, SegmentVerifyJob,
-    SegmentVerifyReport, VerifyBegin, head_segments, upload_segment,
+    SegmentVerifyReport, Unanswered, VerifyBegin, VerifyTally, head_segments, upload_segment,
 };
 use iggy_object_store::{
     DeleteOutcome, InlineTierExecutor, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange,
-    ObjectStore, ObjectStoreError, PutBody, PutOptions, RecordingStore, SegmentKey, SegmentObject,
-    StoreCall, UserMetadata,
+    ObjectStore, ObjectStoreError, PutBody, PutOptions, RecordingStore, SegmentKey,
+    SegmentMetadata, SegmentObject, StoreCall, UserMetadata,
 };
 use std::time::SystemTime;
 
@@ -74,25 +74,33 @@ async fn verify_job(
     partition: &mut IggyPartition<IggyMessageBus>,
     verifier: &Verifier,
 ) -> Option<usize> {
-    let VerifyBegin::Job { id, job, scope } = partition.begin_segment_verify(IggyTimestamp::now())
+    let VerifyBegin::Job { id, job, scope } =
+        partition.begin_segment_verify(IggyTimestamp::now(), 0)
     else {
         return None;
     };
     let outcome = verifier.verify(job, scope).await;
-    partition.finish_segment_verify(id, &outcome)
+    partition
+        .finish_segment_verify(id, &outcome)
+        .map(|tally| tally.checked)
 }
 
 fn heads_of_stored(record: SegmentRecord) -> SegmentHeads {
-    let meta = |size, crc32c| ObjectMeta {
+    let meta = |size, crc32c, metadata| ObjectMeta {
         size,
         etag: String::new(),
         last_modified: SystemTime::UNIX_EPOCH,
-        metadata: UserMetadata::new(),
+        metadata,
         crc32c: Some(crc32c),
     };
+    let described = UserMetadata::from(&SegmentMetadata::from(&record));
     SegmentHeads {
-        log: ObjectHead::Found(meta(record.size, record.crc32c)),
-        index: ObjectHead::Found(meta(crate::iggy_index::IGGY_INDEX_SIZE as u64, 0)),
+        log: ObjectHead::Found(meta(record.size, record.crc32c, described)),
+        index: Some(ObjectHead::Found(meta(
+            crate::iggy_index::IGGY_INDEX_SIZE as u64,
+            0,
+            UserMetadata::new(),
+        ))),
         record,
     }
 }
@@ -121,11 +129,11 @@ async fn given_a_primary_whose_store_holds_its_segments_when_its_first_pass_runs
     assert_eq!(calls.all()[before..], heads);
     assert_eq!(partition.stored_segment_findings(), (0, 0));
     assert!(matches!(
-        partition.begin_segment_verify(IggyTimestamp::now()),
+        partition.begin_segment_verify(IggyTimestamp::now(), 0),
         VerifyBegin::PassEnded
     ));
     assert!(matches!(
-        partition.begin_segment_verify(IggyTimestamp::now()),
+        partition.begin_segment_verify(IggyTimestamp::now(), 0),
         VerifyBegin::Idle
     ));
     assert_eq!(calls.all().len(), before + heads.len());
@@ -157,7 +165,7 @@ async fn given_a_stored_log_gone_from_the_store_when_a_new_primary_verifies_shou
     assert_eq!(partition.stored_segment_findings(), (0, 0));
     assert_eq!(partition.gauge_share().stored_segments_missing, 0);
     assert!(matches!(
-        partition.begin_segment_verify(IggyTimestamp::now()),
+        partition.begin_segment_verify(IggyTimestamp::now(), 0),
         VerifyBegin::Idle
     ));
     assert!(partition.segment_verifies.is_none());
@@ -167,7 +175,7 @@ async fn given_a_stored_log_gone_from_the_store_when_a_new_primary_verifies_shou
 async fn given_a_segment_retention_trims_while_its_job_runs_when_the_job_finds_it_missing_should_record_nothing()
  {
     let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
-    let VerifyBegin::Job { id, job, .. } = partition.begin_segment_verify(IggyTimestamp::now())
+    let VerifyBegin::Job { id, job, .. } = partition.begin_segment_verify(IggyTimestamp::now(), 0)
     else {
         panic!("no job");
     };
@@ -177,16 +185,22 @@ async fn given_a_segment_retention_trims_while_its_job_runs_when_the_job_finds_i
     Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
     let trimmed = SegmentHeads {
         log: ObjectHead::NotFound,
-        index: ObjectHead::NotFound,
+        index: None,
         record: job.segments[0],
     };
     let report = SegmentVerifyReport {
         answered: vec![trimmed, heads_of_stored(job.segments[1])],
         unanswered: None,
     };
-    let checked = partition.finish_segment_verify(id, &Ok(report));
+    let tally = partition.finish_segment_verify(id, &Ok(report));
 
-    assert_eq!(checked, Some(1));
+    assert_eq!(
+        tally,
+        Some(VerifyTally {
+            checked: 1,
+            unanswered: false
+        })
+    );
     assert_eq!(partition.stored_segment_findings(), (0, 0));
 }
 
@@ -194,13 +208,14 @@ async fn given_a_segment_retention_trims_while_its_job_runs_when_the_job_finds_i
 async fn given_a_missing_segment_when_retention_trims_it_should_drop_the_finding_at_the_next_request()
  {
     let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
-    let VerifyBegin::Job { id, job, .. } = partition.begin_segment_verify(IggyTimestamp::now())
+    let VerifyBegin::Job { id, job, .. } = partition.begin_segment_verify(IggyTimestamp::now(), 0)
     else {
         panic!("no job");
     };
     let missing = SegmentHeads {
         log: ObjectHead::NotFound,
-        ..heads_of_stored(job.segments[0])
+        index: None,
+        record: job.segments[0],
     };
     let report = SegmentVerifyReport {
         answered: vec![missing, heads_of_stored(job.segments[1])],
@@ -211,7 +226,7 @@ async fn given_a_missing_segment_when_retention_trims_it_should_drop_the_finding
 
     Box::pin(partition.remove_sealed_segments_up_to(SEALED[0].1)).await;
     Box::pin(settle_partition_io(&mut partition, &repair_config())).await;
-    partition.begin_segment_verify(IggyTimestamp::now());
+    partition.begin_segment_verify(IggyTimestamp::now(), 0);
 
     assert_eq!(partition.stored_segment_findings(), (0, 0));
     assert_eq!(partition.gauge_share().stored_segments_missing, 0);
@@ -227,7 +242,7 @@ async fn given_a_replica_that_does_not_verify_when_asking_for_a_job_should_start
 
     for partition in [&mut backup, &mut placing] {
         assert!(matches!(
-            partition.begin_segment_verify(IggyTimestamp::now()),
+            partition.begin_segment_verify(IggyTimestamp::now(), 0),
             VerifyBegin::Idle
         ));
     }
@@ -298,7 +313,7 @@ async fn given_a_head_the_store_does_not_answer_when_a_job_runs_should_stop_ther
         [SegmentHeads {
             record: records[0],
             log: ObjectHead::NotFound,
-            index: ObjectHead::NotFound,
+            index: None,
         }]
     );
     let unanswered = report.unanswered.unwrap();
@@ -306,13 +321,100 @@ async fn given_a_head_the_store_does_not_answer_when_a_job_runs_should_stop_ther
     assert!(matches!(unanswered.error, ObjectStoreError::Unavailable(_)));
     assert_eq!(
         calls.all(),
-        [
-            StoreCall::Head {
-                key: key(SEALED[0].0, SegmentObject::Log)
-            },
-            StoreCall::Head {
-                key: key(SEALED[0].0, SegmentObject::Index)
-            }
-        ]
+        [StoreCall::Head {
+            key: key(SEALED[0].0, SegmentObject::Log)
+        }],
+        "the index of a missing log is not asked for"
     );
+}
+
+#[compio::test]
+async fn given_a_diverged_log_whose_index_head_fails_when_a_job_runs_should_report_the_log_and_the_segment_unanswered()
+ {
+    let (_directory, partition) = Box::pin(partition_with_stored(2)).await;
+    let record = partition.sealed_segment_record(SEALED[0].0).unwrap();
+    let store = OneKeyUnavailable {
+        inner: RecordingStore::new(MemoryStore::new()),
+        key: key(SEALED[0].0, SegmentObject::Index),
+    };
+    store
+        .inner
+        .put(
+            &key(SEALED[0].0, SegmentObject::Log),
+            PutBody::from_bytes(vec![0; 3]),
+            &PutOptions::default(),
+        )
+        .await
+        .unwrap();
+    let job = SegmentVerifyJob {
+        prefix: PREFIX,
+        segments: vec![record],
+    };
+
+    let report = head_segments(&store, &layout(), &job).await;
+
+    assert!(matches!(
+        report.answered[..],
+        [SegmentHeads {
+            log: ObjectHead::Found(_),
+            index: None,
+            ..
+        }]
+    ));
+    assert_eq!(report.unanswered.unwrap().start_offset, SEALED[0].0);
+}
+
+#[compio::test]
+async fn given_a_job_the_store_left_unanswered_when_it_finishes_should_tally_it_unanswered() {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
+    let VerifyBegin::Job { id, job, .. } = partition.begin_segment_verify(IggyTimestamp::now(), 0)
+    else {
+        panic!("no job");
+    };
+    let report = SegmentVerifyReport {
+        answered: vec![heads_of_stored(job.segments[0])],
+        unanswered: Some(Unanswered {
+            start_offset: job.segments[1].start_offset,
+            error: ObjectStoreError::Unavailable("503".to_owned()),
+        }),
+    };
+
+    assert_eq!(
+        partition.finish_segment_verify(id, &Ok(report)),
+        Some(VerifyTally {
+            checked: 1,
+            unanswered: true
+        })
+    );
+}
+
+#[compio::test]
+async fn given_a_job_started_under_a_revoked_grant_when_the_verifier_comes_back_should_start_the_pass_over_and_ignore_the_old_result()
+ {
+    let (_directory, mut partition) = Box::pin(partition_with_stored(2)).await;
+    let VerifyBegin::Job {
+        id: revoked, job, ..
+    } = partition.begin_segment_verify(IggyTimestamp::now(), 0)
+    else {
+        panic!("no job");
+    };
+    let missing = SegmentHeads {
+        log: ObjectHead::NotFound,
+        index: None,
+        record: job.segments[0],
+    };
+
+    assert!(partition.segment_verify_due(IggyTimestamp::now(), 1));
+    let VerifyBegin::Job { job: over, .. } =
+        partition.begin_segment_verify(IggyTimestamp::now(), 1)
+    else {
+        panic!("the pass does not start over");
+    };
+    assert_eq!(over.segments, job.segments);
+    let report = SegmentVerifyReport {
+        answered: vec![missing],
+        unanswered: None,
+    };
+    assert_eq!(partition.finish_segment_verify(revoked, &Ok(report)), None);
+    assert_eq!(partition.stored_segment_findings(), (0, 0));
 }

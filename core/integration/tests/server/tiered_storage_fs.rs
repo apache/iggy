@@ -537,9 +537,19 @@ async fn given_stored_segments_the_store_holds_when_the_primary_verifies_should_
 
 /// A single node whose tiered topic holds the test's messages, with every
 /// sealed segment in the store and off the disk. Returns the names of the
-/// segment logs in the store.
+/// segment logs in the store. Each start writes a log of its own, which a
+/// verbose run would not, so the tests read only what the last start logged.
 async fn single_node_with_evicted_segments(store: &Path) -> (TestHarness, Vec<String>) {
-    let mut harness = single_node_with_fs_store(store);
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store))
+                .preserve_logs_on_restart(true)
+                .build(),
+        )
+        .build()
+        .expect("the harness");
     harness.start().await.expect("the server boots");
     let client = harness.tcp_root_client().await.expect("tcp root client");
     let stream = Identifier::named(STREAM).expect("stream identifier");

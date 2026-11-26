@@ -85,7 +85,7 @@ fn stored_index() -> ObjectHead {
 fn held(record: SegmentRecord) -> SegmentHeads {
     SegmentHeads {
         log: stored_log(&record),
-        index: stored_index(),
+        index: Some(stored_index()),
         record,
     }
 }
@@ -177,7 +177,8 @@ fn next_job(
     id: u64,
     stored: &[SegmentRecord],
 ) -> Option<(u64, Vec<SegmentRecord>)> {
-    match state.begin(now, id, PREFIX, |cursor| {
+    let last_stored = stored.last().map(|segment| segment.start_offset);
+    match state.begin(now, id, PREFIX, last_stored, |cursor| {
         stored
             .iter()
             .filter(move |segment| segment.start_offset >= cursor)
@@ -270,7 +271,7 @@ fn given_a_log_with_another_crc32c_when_comparing_should_find_it_diverged_in_che
 /// The hash a writer declared is all such a store gives back, so it stands
 /// in for the CRC32C.
 #[test]
-fn given_a_store_that_keeps_no_crc32c_when_comparing_should_compare_the_hash_in_the_metadata() {
+fn given_a_store_that_keeps_no_crc32c_when_comparing_should_compare_the_metadata() {
     let record = record(0);
     let without_crc32c = |metadata| SegmentHeads {
         log: ObjectHead::Found(meta(record.size, None, metadata)),
@@ -284,19 +285,42 @@ fn given_a_store_that_keeps_no_crc32c_when_comparing_should_compare_the_hash_in_
     assert_eq!(finding(&without_crc32c(metadata_of(&record))), None);
     assert_eq!(
         finding(&without_crc32c(metadata_of(&other))),
-        Some(Finding::Diverged(SegmentObject::Log, Divergence::Hash))
+        Some(Finding::Diverged(SegmentObject::Log, Divergence::Metadata))
     );
     assert_eq!(
         finding(&without_crc32c(UserMetadata::new())),
-        Some(Finding::Diverged(SegmentObject::Log, Divergence::Hash))
+        Some(Finding::Diverged(SegmentObject::Log, Divergence::Metadata))
     );
+}
+
+/// Rebuilding a lost chain takes the segment from its metadata, so a CRC32C
+/// that matches does not vouch for it.
+#[test]
+fn given_a_log_with_the_recorded_crc32c_when_its_metadata_is_missing_or_another_should_find_it_diverged_in_metadata()
+ {
+    let record = record(0);
+    let with_metadata = |metadata| SegmentHeads {
+        log: ObjectHead::Found(meta(record.size, Some(record.crc32c), metadata)),
+        ..held(record)
+    };
+    let other = SegmentRecord {
+        end_timestamp: record.end_timestamp + 1,
+        ..record
+    };
+
+    for metadata in [UserMetadata::new(), metadata_of(&other)] {
+        assert_eq!(
+            finding(&with_metadata(metadata)),
+            Some(Finding::Diverged(SegmentObject::Log, Divergence::Metadata))
+        );
+    }
 }
 
 #[test]
 fn given_an_index_that_is_not_whole_entries_when_comparing_should_find_it_diverged() {
     for size in [0, INDEX_BYTES - 1] {
         let heads = SegmentHeads {
-            index: ObjectHead::Found(meta(size, Some(1), UserMetadata::new())),
+            index: Some(ObjectHead::Found(meta(size, Some(1), UserMetadata::new()))),
             ..held(record(0))
         };
 
@@ -320,7 +344,7 @@ fn given_a_missing_index_beside_a_diverged_log_when_comparing_should_report_the_
             Some(record.crc32c),
             metadata_of(&record),
         )),
-        index: ObjectHead::NotFound,
+        index: Some(ObjectHead::NotFound),
         record,
     };
 
@@ -338,7 +362,7 @@ fn given_a_missing_index_beside_a_diverged_log_when_comparing_should_report_the_
 fn given_more_stored_segments_than_one_job_takes_when_a_pass_runs_should_check_them_in_capped_jobs_that_resume_where_the_last_stopped()
  {
     let stored = records(SEGMENT_VERIFY_BATCH_MAX as u64 * 2 + 3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let mut checked = Vec::new();
 
     for id in 1.. {
@@ -357,7 +381,7 @@ fn given_more_stored_segments_than_one_job_takes_when_a_pass_runs_should_check_t
 #[test]
 fn given_a_job_that_runs_when_asking_should_start_no_other() {
     let stored = records(3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     next_job(&mut state, at(0), 1, &stored).unwrap();
 
     assert_eq!(next_job(&mut state, at(0), 2, &stored), None);
@@ -366,13 +390,13 @@ fn given_a_job_that_runs_when_asking_should_start_no_other() {
 #[test]
 fn given_a_pass_that_ended_when_asking_should_start_the_next_only_an_interval_after_its_start() {
     let stored = records(2);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let started = 5_000;
     let (id, segments) = next_job(&mut state, at(started), 1, &stored).unwrap();
     let outcome = Ok(report(segments.into_iter().map(held).collect()));
     state.finish(id, &outcome, chain(&stored)).unwrap();
     assert!(matches!(
-        state.begin(at(started + 1), 2, PREFIX, |_| Vec::new()),
+        state.begin(at(started + 1), 2, PREFIX, None, |_| Vec::new()),
         VerifyBegin::PassEnded
     ));
 
@@ -386,14 +410,14 @@ fn given_a_pass_that_ended_when_asking_should_start_the_next_only_an_interval_af
 
 #[test]
 fn given_no_stored_segment_when_the_first_pass_runs_should_end_it_at_once() {
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
 
     assert!(matches!(
-        state.begin(at(0), 1, PREFIX, |_| Vec::new()),
+        state.begin(at(0), 1, PREFIX, None, |_| Vec::new()),
         VerifyBegin::PassEnded
     ));
     assert!(matches!(
-        state.begin(at(1), 1, PREFIX, |_| Vec::new()),
+        state.begin(at(1), 1, PREFIX, None, |_| Vec::new()),
         VerifyBegin::Idle
     ));
 }
@@ -402,7 +426,7 @@ fn given_no_stored_segment_when_the_first_pass_runs_should_end_it_at_once() {
 fn given_a_transient_error_when_a_job_ends_should_find_nothing_and_check_that_segment_in_the_next_job()
  {
     let stored = records(3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let (id, _) = next_job(&mut state, at(0), 1, &stored).unwrap();
 
     let settled = state
@@ -429,7 +453,7 @@ fn given_a_segment_the_store_never_answers_when_a_pass_runs_should_check_the_oth
  {
     let stored = records(3);
     let failing = stored[1].start_offset;
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let mut asked = 0;
     let mut checked = 0;
     let mut postponed = 0;
@@ -462,7 +486,7 @@ fn given_a_segment_set_aside_when_the_store_answers_it_after_the_others_should_c
  {
     let stored = records(2);
     let failing = stored[0].start_offset;
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     set_aside(&mut state, &stored, failing);
 
     let (id, rest) = next_job(&mut state, at(0), 10, &stored).unwrap();
@@ -493,7 +517,7 @@ fn given_a_segment_set_aside_when_the_store_answers_it_after_the_others_should_c
         }]
     );
     assert!(matches!(
-        state.begin(at(0), 12, PREFIX, |_| Vec::new()),
+        state.begin(at(0), 12, PREFIX, None, |_| Vec::new()),
         VerifyBegin::PassEnded
     ));
 }
@@ -502,7 +526,7 @@ fn given_a_segment_set_aside_when_the_store_answers_it_after_the_others_should_c
 fn given_a_segment_set_aside_when_retention_trims_it_should_not_ask_for_it_again() {
     let stored = records(2);
     let failing = stored[0].start_offset;
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     set_aside(&mut state, &stored, failing);
 
     state.trim(stored[0].end_offset);
@@ -517,7 +541,7 @@ fn given_a_segment_set_aside_when_retention_trims_it_should_not_ask_for_it_again
         )
         .unwrap();
     assert!(matches!(
-        state.begin(at(0), 11, PREFIX, |_| Vec::new()),
+        state.begin(at(0), 11, PREFIX, None, |_| Vec::new()),
         VerifyBegin::PassEnded
     ));
 }
@@ -526,7 +550,7 @@ fn given_a_segment_set_aside_when_retention_trims_it_should_not_ask_for_it_again
 fn given_a_permanent_error_when_a_job_ends_should_find_nothing_and_leave_that_segment_for_the_next_pass()
  {
     let stored = records(3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let (id, _) = next_job(&mut state, at(0), 1, &stored).unwrap();
 
     state
@@ -549,7 +573,7 @@ fn given_a_permanent_error_when_a_job_ends_should_find_nothing_and_leave_that_se
 #[test]
 fn given_a_cancelled_job_when_its_result_arrives_should_check_the_same_segments_in_the_next_job() {
     let stored = records(3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let (id, first) = next_job(&mut state, at(0), 1, &stored).unwrap();
 
     state
@@ -563,7 +587,7 @@ fn given_a_cancelled_job_when_its_result_arrives_should_check_the_same_segments_
 #[test]
 fn given_the_result_of_another_job_when_it_arrives_should_change_nothing() {
     let stored = records(1);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let (id, _) = next_job(&mut state, at(0), 1, &stored).unwrap();
 
     assert_eq!(
@@ -581,7 +605,7 @@ fn given_the_result_of_another_job_when_it_arrives_should_change_nothing() {
 #[test]
 fn given_a_missing_object_when_two_passes_find_it_should_report_it_found_once() {
     let stored = records(2);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let first = run_job(&mut state, 1, &stored, |record| {
         if record.start_offset == 0 {
             log_missing(record)
@@ -590,7 +614,7 @@ fn given_a_missing_object_when_two_passes_find_it_should_report_it_found_once() 
         }
     });
     assert!(matches!(
-        state.begin(at(1), 2, PREFIX, |_| Vec::new()),
+        state.begin(at(1), 2, PREFIX, None, |_| Vec::new()),
         VerifyBegin::PassEnded
     ));
 
@@ -623,10 +647,10 @@ fn given_a_missing_object_when_two_passes_find_it_should_report_it_found_once() 
 #[test]
 fn given_a_missing_object_when_a_later_pass_finds_it_as_recorded_should_report_it_cleared_once() {
     let stored = records(1);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     run_job(&mut state, 1, &stored, log_missing);
     assert_eq!(state.missing(), 1);
-    state.begin(at(1), 2, PREFIX, |_| Vec::new());
+    state.begin(at(1), 2, PREFIX, None, |_| Vec::new());
 
     let (id, segments) = next_job(&mut state, at(interval_micros()), 2, &stored).unwrap();
     let cleared = state
@@ -636,7 +660,7 @@ fn given_a_missing_object_when_a_later_pass_finds_it_as_recorded_should_report_i
             chain(&stored),
         )
         .unwrap();
-    state.begin(at(interval_micros() + 1), 3, PREFIX, |_| Vec::new());
+    state.begin(at(interval_micros() + 1), 3, PREFIX, None, |_| Vec::new());
     let (id, segments) = next_job(&mut state, at(interval_micros() * 2), 3, &stored).unwrap();
     let after = state
         .finish(
@@ -660,9 +684,9 @@ fn given_a_missing_object_when_a_later_pass_finds_it_as_recorded_should_report_i
 #[test]
 fn given_a_missing_object_that_comes_back_with_other_bytes_should_report_the_new_finding() {
     let stored = records(1);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     run_job(&mut state, 1, &stored, log_missing);
-    state.begin(at(1), 2, PREFIX, |_| Vec::new());
+    state.begin(at(1), 2, PREFIX, None, |_| Vec::new());
 
     let (id, segments) = next_job(&mut state, at(interval_micros()), 2, &stored).unwrap();
     let replaced = segments
@@ -694,7 +718,7 @@ fn given_a_missing_object_that_comes_back_with_other_bytes_should_report_the_new
 fn given_a_segment_trimmed_while_its_job_ran_when_the_job_finds_it_missing_should_drop_the_finding()
 {
     let stored = records(2);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let (id, segments) = next_job(&mut state, at(0), 1, &stored).unwrap();
 
     let settled = state
@@ -720,7 +744,7 @@ fn given_a_segment_trimmed_while_its_job_ran_when_the_job_finds_it_missing_shoul
 fn given_a_segment_whose_record_changed_while_its_job_ran_when_the_job_finds_it_diverged_should_drop_the_finding()
  {
     let stored = records(1);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     let (id, segments) = next_job(&mut state, at(0), 1, &stored).unwrap();
     let rewritten = [SegmentRecord {
         end_offset: stored[0].end_offset + 1,
@@ -742,7 +766,7 @@ fn given_a_segment_whose_record_changed_while_its_job_ran_when_the_job_finds_it_
 #[test]
 fn given_findings_when_retention_trims_their_segments_should_drop_them() {
     let stored = records(3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
     run_job(&mut state, 1, &stored, log_missing);
     assert_eq!(state.missing(), 3);
 
@@ -755,16 +779,96 @@ fn given_findings_when_retention_trims_their_segments_should_drop_them() {
 #[test]
 fn given_missing_and_diverged_segments_when_counting_should_count_each_kind() {
     let stored = records(3);
-    let mut state = SegmentVerifies::new(VIEW);
+    let mut state = SegmentVerifies::new(VIEW, 0);
 
     run_job(&mut state, 1, &stored, |record| match record.start_offset {
         0 => log_missing(record),
         10 => SegmentHeads {
-            index: ObjectHead::Found(meta(1, Some(1), UserMetadata::new())),
+            index: Some(ObjectHead::Found(meta(1, Some(1), UserMetadata::new()))),
             ..held(record)
         },
         _ => held(record),
     });
 
     assert_eq!((state.missing(), state.diverged()), (1, 1));
+}
+
+#[test]
+fn given_segments_stored_after_a_pass_started_when_it_runs_should_end_the_pass_before_them() {
+    let at_start = records(2);
+    let later = records(SEGMENT_VERIFY_BATCH_MAX as u64 + 2);
+    let mut state = SegmentVerifies::new(VIEW, 0);
+    let (id, first) = next_job(&mut state, at(0), 1, &at_start).unwrap();
+    assert_eq!(starts(&first), starts(&at_start));
+    state
+        .finish(
+            id,
+            &Ok(report(first.into_iter().map(held).collect())),
+            chain(&later),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        state.begin(at(0), 2, PREFIX, None, |cursor| {
+            later
+                .iter()
+                .filter(move |segment| segment.start_offset >= cursor)
+                .copied()
+                .collect::<Vec<_>>()
+        }),
+        VerifyBegin::PassEnded
+    ));
+}
+
+/// The `.log` is gone or differs whatever the `.index` says, so a HEAD of the
+/// `.index` that fails does not hide it.
+#[test]
+fn given_a_diverged_log_whose_index_got_no_answer_when_the_job_ends_should_report_it_and_ask_for_the_segment_again()
+ {
+    let stored = records(2);
+    let mut state = SegmentVerifies::new(VIEW, 0);
+    let (id, _) = next_job(&mut state, at(0), 1, &stored).unwrap();
+    let diverged = SegmentHeads {
+        log: ObjectHead::Found(meta(
+            stored[0].size + 1,
+            Some(stored[0].crc32c),
+            metadata_of(&stored[0]),
+        )),
+        index: None,
+        record: stored[0],
+    };
+
+    let settled = state
+        .finish(
+            id,
+            &Ok(unanswered(
+                vec![diverged],
+                stored[0].start_offset,
+                transient(),
+            )),
+            chain(&stored),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        settled.transitions[..],
+        [Transition::Found {
+            finding: Finding::Diverged(SegmentObject::Log, Divergence::Size { .. }),
+            ..
+        }]
+    ));
+    assert_eq!(settled.checked, 0, "counted once its index answers");
+    assert_eq!(state.diverged(), 1);
+    let (_, again) = next_job(&mut state, at(0), 2, &stored).unwrap();
+    assert_eq!(starts(&again), starts(&stored));
+}
+
+#[test]
+fn given_a_missing_log_when_comparing_should_find_it_missing_without_the_index() {
+    let heads = SegmentHeads {
+        index: None,
+        ..log_missing(record(0))
+    };
+
+    assert_eq!(finding(&heads), Some(Finding::Missing(SegmentObject::Log)));
 }
