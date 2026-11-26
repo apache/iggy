@@ -75,6 +75,7 @@ import { snapshot } from './system/snapshot.command.js';
 import { ping } from './system/ping.command.js';
 
 import { getClusterMetadata } from './cluster/get-cluster-metadata.command.js';
+import { retireGeoOrigin } from './cluster/retire-geo-origin.command.js';
 
 import { getTokens } from './token/get-tokens.command.js';
 import { createToken } from './token/create-token.command.js';
@@ -207,7 +208,8 @@ const systemAPI = (c: ClientProvider) => ({
 type SystemAPI = ReturnType<typeof systemAPI>;
 
 const clusterAPI = (c: ClientProvider) => ({
-  getClusterMetadata: getClusterMetadata(c)
+  getClusterMetadata: getClusterMetadata(c),
+  retireGeoOrigin: retireGeoOrigin(c)
 });
 
 type ClusterAPI = ReturnType<typeof clusterAPI>;

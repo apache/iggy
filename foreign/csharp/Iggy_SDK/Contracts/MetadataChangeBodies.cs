@@ -51,7 +51,10 @@ public sealed class MetadataStreamChange : MetadataChangeBody
     /// <summary>Options a client set.</summary>
     public Dictionary<HeaderKey, HeaderValue>? Options { get; init; }
 
-    /// <summary>Options the server filled or computes, such as the encryption key source and fingerprints.</summary>
+    /// <summary>
+    ///     Options the server filled or computes, such as the encryption key source and fingerprints and the origin
+    ///     of a shadow stream.
+    /// </summary>
     public Dictionary<HeaderKey, HeaderValue>? DerivedOptions { get; init; }
 
     /// <summary>The server holds stored critical state it cannot read. A mirror keeps its previous values.</summary>
@@ -64,6 +67,9 @@ public sealed class MetadataStreamChange : MetadataChangeBody
     /// <summary>Fingerprint of the stream's key. Null for a plaintext stream.</summary>
     public string? EncryptionKeyFingerprint =>
         OptionValues.Text(Options, DerivedOptions, StreamOptionKey.EncryptionKeyFingerprint);
+
+    /// <summary>The geo origin whose topics this shadow stream serves, or null for any other stream.</summary>
+    public string? ShadowOrigin => OptionValues.Text(Options, DerivedOptions, StreamOptionKey.ShadowOrigin);
 }
 
 /// <summary>A removed stream. <see cref="RequestedOp" /> is the op of a deferred delete's request.</summary>

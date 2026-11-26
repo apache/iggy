@@ -107,6 +107,30 @@ for review.
 
 One PR = one thing. Bug fix, refactor, feature - separate PRs. Mixed PRs will be closed.
 
+### Docs
+
+The pages of [iggy.apache.org/docs](https://iggy.apache.org/docs/) live in `docs/` as MDX
+files. MDX is Markdown that can contain React components. If your change is visible to
+users, for example a new config key, CLI argument or SDK method, update `docs/` in the
+same PR. The connectors docs live in `docs/` of
+[apache/iggy-connectors](https://github.com/apache/iggy-connectors).
+
+[apache/iggy-website](https://github.com/apache/iggy-website) builds the site. It holds the
+components and the images that the pages use. To preview your pages, check it out next to
+this repository. Then run these commands in it, and the last two each in its own terminal:
+
+```bash
+npm ci
+IGGY_DOCS_DIR=../iggy/docs npm run docs:watch
+IGGY_DOCS_DIR=../iggy/docs npm run dev
+```
+
+The `docs:watch` command copies each saved page into the site. List each new page in the
+`meta.json` of its folder. Images live in `public/img/` of apache/iggy-website, so add a new
+image there in a website PR and wait until it merges. The `Docs` CI job builds the site with
+your pages. It fails on a broken link, on a missing image and on a page that its `meta.json`
+does not list.
+
 ### Review Comments
 
 Respond to every review comment, so that the reviewer knows you read it. Any one of these
@@ -277,7 +301,9 @@ A returning contributor is anyone who has had a commit merged into apache/iggy.
 Some labels move on their own. Opening a non-draft PR, or marking a draft
 ready, sets `S-waiting-on-review`. A "Request changes" review sets
 `S-waiting-on-author`, and so does a `/skill` bot review with findings for the
-author. Closing a PR, or converting it to a draft, clears both.
+author. Closing a PR, or converting it to a draft, clears both. GitHub skips
+the lifecycle workflow on a PR with merge conflicts, so there these labels
+catch up on a schedule instead of straight away.
 
 When a PR is opened, including a draft, `PR Triage Apply` checks its author once.
 It adds `Prolific Author` if a human author opened PRs in more than 20 visible

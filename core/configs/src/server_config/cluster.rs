@@ -20,11 +20,11 @@
 use super::defaults::SERVER_CONFIG;
 use crate::ConfigurationError;
 use crate::http::HttpJwtConfig;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyDuration, Validatable};
 use ipnet::{IpNet, Ipv4Net};
 use serde::{Deserialize, Serialize};
-use serde_with::{DisplayFromStr, serde_as};
+use serde_with::serde_as;
 use std::cmp::Reverse;
 use std::fmt;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -232,13 +232,13 @@ pub struct ClusterConfig {
     /// Interval between grid ticks, the only shard ticks on which heartbeats
     /// join a Commit batch. Must be a whole multiple of the 10 ms shard tick.
     #[serde(default = "default_commit_heartbeat_grid")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub commit_heartbeat_grid: IggyDuration,
     /// Interval between the heartbeats of a busy group, a whole multiple of
     /// `commit_heartbeat_grid`.
     #[serde(default = "default_commit_busy_heartbeat_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub commit_busy_heartbeat_interval: IggyDuration,
     /// How long the backups of a busy group wait for a heartbeat before they
@@ -246,19 +246,19 @@ pub struct ClusterConfig {
     /// window of a busy primary and, on Linux, the `TCP_USER_TIMEOUT` of every
     /// replica link.
     #[serde(default = "default_commit_busy_heartbeat_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub commit_busy_heartbeat_timeout: IggyDuration,
     /// Interval between the heartbeats of an idle group, a whole multiple of
     /// `commit_busy_heartbeat_interval`.
     #[serde(default = "default_commit_idle_heartbeat_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub commit_idle_heartbeat_interval: IggyDuration,
     /// How long the backups of an idle group wait for a heartbeat. The backups
     /// wait the larger of this value and `commit_busy_heartbeat_timeout`.
     #[serde(default = "default_commit_idle_heartbeat_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub commit_idle_heartbeat_timeout: IggyDuration,
     /// How often the primary retransmits prepares a backup has not yet acked.
@@ -267,7 +267,7 @@ pub struct ClusterConfig {
     /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
     /// at boot.
     #[serde(default = "default_prepare_retransmit_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub prepare_retransmit_interval: IggyDuration,
     /// How often a plane retransmits its `StartViewChange` / `DoViewChange`
@@ -277,7 +277,7 @@ pub struct ClusterConfig {
     /// `disabled` / `unlimited` sentinels, which all parse to zero) is rejected
     /// at boot.
     #[serde(default = "default_view_change_retransmit_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub view_change_retransmit_interval: IggyDuration,
     /// Backstop for a stalled view change: one that does not conclude within
@@ -290,7 +290,7 @@ pub struct ClusterConfig {
     /// view_change_retransmit_interval`. Zero (and the `0` / `disabled` /
     /// `unlimited` sentinels, which all parse to zero) is rejected at boot.
     #[serde(default = "default_view_change_status_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub view_change_status_timeout: IggyDuration,
     /// How often a recovering or view-change backup re-requests the current
@@ -298,7 +298,7 @@ pub struct ClusterConfig {
     /// consensus `RequestStartView` timer. Zero (and the `0` / `disabled` /
     /// `unlimited` sentinels, which all parse to zero) is rejected at boot.
     #[serde(default = "default_request_start_view_retransmit_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub request_start_view_retransmit_interval: IggyDuration,
     /// How many consecutive unanswered `RequestStartView` probes a recovering
@@ -318,7 +318,7 @@ pub struct ClusterConfig {
     /// Paces streams that are already open only. How long a hole waits before a
     /// stream is opened for it is `repair_gap_debounce_interval`.
     #[serde(default = "default_repair_retry_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub repair_retry_interval: IggyDuration,
     /// How long a backup must hold committed ops it cannot walk to before the
@@ -335,7 +335,7 @@ pub struct ClusterConfig {
     /// its value. Zero (and the `0` / `disabled` / `unlimited` sentinels, which
     /// all parse to zero) is rejected at boot.
     #[serde(default = "default_repair_gap_debounce_interval")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub repair_gap_debounce_interval: IggyDuration,
     /// Prepares a peer serves per repair round before the requester asks for
@@ -359,7 +359,7 @@ pub struct ClusterConfig {
     /// deadline; nonzero values below `MIN_SUPERBLOCK_WEDGED_FATAL_TIMEOUT` are
     /// rejected at boot.
     #[serde(default = "default_superblock_wedged_fatal_timeout")]
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[config_env(leaf)]
     pub superblock_wedged_fatal_timeout: IggyDuration,
     /// Replication factor of a topic created without one. The metadata primary
@@ -413,6 +413,23 @@ pub struct ClusterCoordinatorConfig {
     /// shard-0 parallelism more than replicas do.
     #[serde(default)]
     pub skip_shard_zero_for_clients: bool,
+    /// Place no partition on shard 0, so a stall of the metadata plane there
+    /// cannot stop the heartbeats of partition groups. Keep
+    /// `skip_shard_zero_for_replicas` on with it, or a replica link can still
+    /// sit on shard 0. With two shards every partition lands on shard 1. A
+    /// node with one shard refuses to start with this on, because no shard
+    /// would own a partition. Placement is recomputed at every boot and no
+    /// shard id is stored, so a restart may change this freely. Run the same
+    /// value on every node: a node that differs still routes correctly, but
+    /// frames between it and its peers can take an extra hop between shards,
+    /// as with differing shard counts. In both cases a peer can send
+    /// partition frames over link 0, and a node keeps that link on shard 0
+    /// when the shard range of the link holds only shard 0. Nodes with the
+    /// same shard count and the same value never do that. Older server
+    /// binaries reject a TOML config containing this key. Remove the key
+    /// before a rollback to one.
+    #[serde(default)]
+    pub skip_shard_zero_for_partitions: bool,
 }
 
 fn default_skip_shard_zero_for_replicas() -> bool {
@@ -429,6 +446,7 @@ impl Default for ClusterCoordinatorConfig {
             skip_shard_zero_for_replicas: default_skip_shard_zero_for_replicas(),
             replica_connections_per_peer: default_replica_connections_per_peer(),
             skip_shard_zero_for_clients: false,
+            skip_shard_zero_for_partitions: false,
         }
     }
 }

@@ -548,6 +548,7 @@ pub fn new_shard(
                 clock,
             ),
             None,
+            config.cluster.coordinator.skip_shard_zero_for_partitions,
             shard::metrics::ShardMetrics::for_shard(),
         )
         .expect("sim mesh senders are built in canonical order"),
@@ -555,6 +556,9 @@ pub fn new_shard(
 
     // The host needs the finished shard for internal completion submissions.
     *shard_handle.borrow_mut() = Some(Rc::downgrade(&shard));
+    if shard_idx == 0 {
+        server::boot::install_checkpoint_spawner(&shard);
+    }
     let mut stop_txs = Vec::new();
     if shell {
         let (stop_tx, stop_rx) = shard::channel(1);

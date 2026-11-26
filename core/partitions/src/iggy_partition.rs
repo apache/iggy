@@ -29,12 +29,12 @@ use crate::persistence::{
     FileSyncBarrier, PartitionPersistence, PersistenceCompletion, PersistenceNotifier,
 };
 use crate::poll_plan::{
-    DiskReadPlan, DiskSegment, PartitionDirResolution, PollContext, PollPlan, PollReadResult,
-    PollTier, ResidentTailSnapshot, SegmentSource,
+    DiskReadPlan, DiskSegment, PartitionDirResolution, PeerSegmentRun, PollContext, PollPlan,
+    PollReadResult, PollTier, ResidentTailSnapshot, SegmentSource,
 };
 use crate::producer_state::{ProducerAdmission, ProducerEntry, ProducerTable, StampedBatch};
 use crate::remote_segments::{IndexFetches, RemoteRange};
-use crate::segment::{Segment, SegmentLocation};
+use crate::segment::{RetainedSegment, Segment, SegmentLocation};
 use crate::state_machine::StateMachines;
 use crate::state_transfer::{
     PartitionTransferSession, PartitionTransferUnavailable, PendingTransferRearm, TransferPlanSlot,
@@ -62,6 +62,7 @@ use consensus::{
     send_prepare_ok as send_prepare_ok_common, verify_prepare_integrity,
 };
 use iggy_binary_protocol::batch::BatchProducer;
+use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, PlacedBatch, Placement, stored_header};
 use iggy_binary_protocol::primitives::consumer::WireConsumer;
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
 use iggy_binary_protocol::requests::consumer_offsets::{
@@ -83,7 +84,7 @@ use iggy_common::{
     ConsumerGroupId, ConsumerKind, ConsumerOffset, EncryptorKind, IggyByteSize, IggyError,
     IggyExpiry, IggyTimestamp, PartitionStats, PollingKind, TopicRuntimeOptions,
 };
-use iggy_object_store::{SegmentKey, SegmentObject};
+use iggy_object_store::{FreshObjectId, FreshProofRow, SegmentKey, SegmentObject};
 use journal::Journal as _;
 use journal::local_gate::LocalGate;
 use journal::superblock::{
@@ -96,8 +97,8 @@ use server_common::{
     Message, SegmentStorage,
     iobuf::Frozen,
     send_messages::{
-        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_slice,
-        decode_prepare_slice_trusted, stamp_prepare_for_persistence,
+        BatchHeader, ChecksumMode, convert_request_message, decode_prepare_batch,
+        decode_prepare_batch_trusted, decode_prepare_slice_trusted, stamp_prepare_for_persistence,
     },
     sharding::IggyNamespace,
 };
@@ -184,6 +185,13 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// The other cluster's log that this partition serves in place of its
+    /// own, `None` for a partition that holds its own messages.
+    pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
+    /// Where the polls of the segments that committed peer manifests took
+    /// out of the log may have put a fetched `.index`, for the owner to
+    /// remove.
+    pub(crate) retired_peer_indexes: Vec<String>,
     /// The floor advances this replica applied that its chain does not record
     /// yet, oldest first. Recorded ones leave from the front.
     pub(crate) pending_advances: VecDeque<crate::tiered_floor::AdvanceTieredFloor>,
@@ -202,6 +210,10 @@ where
     /// Set when a sealed segment became uploadable, for the shard to turn into
     /// an upload pass: the partition cannot send itself a frame.
     upload_wanted: Cell<bool>,
+    /// Set when a command changes the long-term log on the primary, and
+    /// taken by the shard, which publishes the manifest and starts the
+    /// rewrite that waited for the command.
+    pub(crate) long_term_changed: Cell<bool>,
     /// The highest committed truncation watermark a timed pass read from
     /// metadata for this partition. The watermark only rises, so the one
     /// metadata holds now is never below it.
@@ -211,14 +223,46 @@ where
     object_deletes: ObjectDeletes,
     /// Number of the last object-delete job this partition started.
     object_delete_jobs: u64,
+    /// What this replica deletes of its long-term objects while it is the
+    /// primary of a partition that places its batches. Behind a pointer: a
+    /// partition is moved by value through the futures that set it up, and
+    /// only the cleaner's passes and a commit to the long-term log read
+    /// this.
+    pub(crate) long_term_deletes: Box<crate::long_term_delete::LongTermDeletes>,
+    /// What this replica publishes of the partition's manifest while it is
+    /// the primary.
+    pub(crate) manifest_publishes: crate::manifest_publish::ManifestPublishes,
+    /// The rewrite of this partition's placed batches into long-term
+    /// segments, while this replica is the primary. Behind a pointer, as the
+    /// merges are.
+    pub(crate) long_term_rewrites: Box<crate::long_term_rewrite::LongTermRewrites>,
+    /// What this replica found of its geo topic's object while it is the
+    /// primary. Boxed to keep the partition small on the stack.
+    pub(crate) topic_object_check: Box<crate::topic_object::TopicObjectCheck>,
+    /// The merges of this partition's small long-term segments, while this
+    /// replica is the primary. Behind a pointer, as the deletes are.
+    pub(crate) long_term_merges: Box<crate::long_term_merge::LongTermMerges>,
+    /// Number of the last long-term plan or rewrite this partition started.
+    /// It outlives the view, so the late result of an earlier view's plan or
+    /// rewrite is never taken for the one in flight.
+    pub(crate) long_term_rewrite_jobs: u64,
+    /// What this partition committed above its long-term floor.
+    pub(crate) long_term_backlog: Box<crate::long_term_rewrite::LongTermBacklog>,
+    /// The proof rows of the placed batches it committed, `None` until it
+    /// commits one.
+    pub(crate) fresh_proofs: Option<Box<crate::fresh_proofs::FreshProofs>>,
+    /// Number of the last manifest publish this partition started. It
+    /// outlives the view, so the late result of an earlier view's publish is
+    /// never taken for the one in flight.
+    pub(crate) manifest_publish_jobs: u64,
     /// The fetches of remote segments' indexes that polls have in flight.
-    index_fetches: Rc<IndexFetches>,
+    pub(crate) index_fetches: Rc<IndexFetches>,
     pub stats: Arc<PartitionStats>,
     /// Widest batch committed here, the floor for a disk poll's first read.
     /// See [`Self::widest_committed_batch`].
     widest_batch_bytes: Cell<u64>,
     /// See [`PollVisibility::committed_bytes`].
-    committed_bytes: u64,
+    pub(crate) committed_bytes: u64,
     pub created_at: IggyTimestamp,
     pub revision_id: u64,
     pub(crate) offset_space: OffsetSpace,
@@ -1135,15 +1179,27 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            peer_log: None,
+            retired_peer_indexes: Vec::new(),
             pending_advances: VecDeque::new(),
             local_envelope: None,
             segment_upload: None,
             segment_upload_attempts: 0,
             upload_cursor: None,
             upload_wanted: Cell::new(false),
+            long_term_changed: Cell::new(false),
             committed_truncation: 0,
             object_deletes: ObjectDeletes::default(),
+            long_term_deletes: Box::default(),
             object_delete_jobs: 0,
+            manifest_publishes: crate::manifest_publish::ManifestPublishes::default(),
+            long_term_rewrites: Box::default(),
+            topic_object_check: Box::default(),
+            long_term_merges: Box::default(),
+            long_term_rewrite_jobs: 0,
+            long_term_backlog: Box::default(),
+            fresh_proofs: None,
+            manifest_publish_jobs: 0,
             index_fetches: Rc::new(IndexFetches::new(Rc::clone(&io_active), poll_history)),
             stats,
             widest_batch_bytes: Cell::new(0),
@@ -2049,11 +2105,15 @@ where
                 },
                 first_timestamp: segment.start_timestamp,
             };
-            persistence.enable_segment_storage(
-                initial,
+            let (max_size, max_age) = (
                 segment.max_size.as_bytes_u64(),
                 self.effective_segment_max_age(),
             );
+            if self.places_batches() {
+                persistence.enable_placed_segment_storage(initial, max_size, max_age);
+            } else {
+                persistence.enable_segment_storage(initial, max_size, max_age);
+            }
             if persistence.start() {
                 self.consensus
                     .message_bus()
@@ -3404,6 +3464,12 @@ where
         self.publish_poll_visibility();
     }
 
+    /// Whether a message of this partition ever committed, so its commit
+    /// offset names a message and is not an untouched zero.
+    pub(crate) const fn holds_committed_messages(&self) -> bool {
+        self.offset_space.committed_seeded
+    }
+
     /// Whether this partition ever stamped an offset, i.e. whether its offset
     /// counters describe a real offset space rather than an untouched zero. The
     /// one bit separating a partition holding one message at offset 0 from one
@@ -3877,7 +3943,7 @@ where
         let body = message
             .as_slice()
             .get(std::mem::size_of::<RoutedRequestHeader>()..message.header().size as usize)?;
-        let count = BatchHeader::decode(body).ok()?.message_count;
+        let count = stored_header(body).ok()?.message_count;
         // The batch's LAST offset, not one past it: the claim adds the exclusive
         // successor and the lease itself, so a ceiling one too high wastes an
         // offset on every claim and overstates what a crash can lose.
@@ -4203,6 +4269,36 @@ where
     pub fn set_runtime_options(&mut self, runtime_options: TopicRuntimeOptions) {
         self.runtime_options = runtime_options;
         self.refresh_recovered_log_complete();
+    }
+
+    /// Make this a partition that places its batches, as the topic's runtime
+    /// options do. Call it before the partition opens its WAL and takes its
+    /// first prepare: its segments hold one kind of batch for good.
+    pub const fn set_places_batches(&mut self, places_batches: bool) {
+        self.runtime_options.places_batches = places_batches;
+    }
+
+    /// Whether this partition places its batches: a message prepare carries
+    /// the batch header and where the messages sit in the object store, not
+    /// the messages. A partition that follows another cluster's log takes no
+    /// batch at all, whatever its topic's options say.
+    #[must_use]
+    pub const fn places_batches(&self) -> bool {
+        self.runtime_options.places_batches && self.peer_log.is_none()
+    }
+
+    /// The batch header of a message prepare this replica did not stamp,
+    /// checked in full. The prepare must carry what this partition's segments
+    /// hold: the whole batch, or a placed one.
+    fn decode_received_batch(
+        &self,
+        message: &Message<PrepareHeader>,
+    ) -> Result<BatchHeader, IggyError> {
+        let batch = decode_prepare_batch(message.as_slice())?;
+        if batch.placement.is_some() != self.places_batches() || self.peer_log.is_some() {
+            return Err(IggyError::CannotAppendMessage);
+        }
+        Ok(batch.header)
     }
 
     /// A replica whose materialization is missing lost the prepares it
@@ -4791,6 +4887,7 @@ where
         if result.context.history != self.poll_history
             || self.fatal.is_some()
             || self.materialization_missing
+            || self.peer_log_moved_under_read(&result)
         {
             return Err(IggyError::TransientNotAccepted);
         }
@@ -4995,10 +5092,10 @@ where
     }
 
     /// Admit an automatic commit without advancing this read's progress.
-    /// `Some` carries an assigned prepare. `None` means the request is queued
-    /// or the durable offset already covers it, both of which leave the
-    /// caller free to apply local progress. Errors release any provisional
-    /// guard.
+    /// `Some` carries an assigned prepare. `None` means the request is queued,
+    /// merged into one that is, or the durable offset already covers it, all
+    /// of which leave the caller free to apply local progress. Errors release
+    /// any provisional guard.
     fn admit_poll_auto_commit(
         &self,
         kind: ConsumerKind,
@@ -5068,6 +5165,10 @@ where
         if self.local_request_must_queue()
             || self.consumer_offset_is_blocked(kind, consumer_id, Some(offset), true)
         {
+            let Err(request) = self.merge_queued_auto_commit(kind, consumer_id, offset, request)
+            else {
+                return Ok(None);
+            };
             let context = AutoCommitRequestContext { reservation };
             self.queue_local_request(
                 consensus::RequestEntry::with_auto_commit(request, context),
@@ -5084,6 +5185,71 @@ where
                 reservation,
             }))
         }
+    }
+
+    /// Fold the commit-on-read `request` of the consumer into its commit-on-read
+    /// store that still waits in the request queue, raising that store's offset
+    /// to `offset`. Returns `request` when there is none to fold into.
+    ///
+    /// A consumer's stores prepare one at a time, so with offsets that wait for
+    /// a flush each queued store would pay a flush of its own, and a consumer
+    /// that reads faster than the disk flushes would fill the queue with
+    /// stores that the latest one supersedes. Commit-on-read stores apply as a
+    /// maximum, so one store of the highest offset commits the same.
+    ///
+    /// Only the consumer's last queued offset operation takes the fold, and
+    /// only a commit-on-read store of the same owner: an explicit store or
+    /// delete queued after it must still land between the two. An ack-less
+    /// operation of the consumer, which waits outside the request queue in
+    /// the same order, prevents it too. So does an offset beyond the stored
+    /// messages, which could need a send queued behind the store.
+    fn merge_queued_auto_commit(
+        &self,
+        kind: ConsumerKind,
+        consumer_id: u32,
+        offset: u64,
+        request: Message<RoutedRequestHeader>,
+    ) -> Result<(), Message<RoutedRequestHeader>> {
+        if self.store_offset_range_error(kind, offset).is_some()
+            || self.no_ack.iter().any(|pending| {
+                pending.pending.kind == kind && pending.pending.consumer_id == consumer_id
+            })
+        {
+            return Err(request);
+        }
+        self.consensus.with_pipeline_mut(|pipeline| {
+            let Some(queued) = pipeline.last_request_mut(|queued| {
+                Self::parse_consumer_offset_request(
+                    queued.message.header().operation,
+                    &queued.message,
+                )
+                .is_ok_and(|(queued_kind, queued_id, _, _)| {
+                    queued_kind == kind && queued_id == consumer_id
+                })
+            }) else {
+                return Err(request);
+            };
+            let queued_offset = Self::parse_consumer_offset_request(
+                queued.message.header().operation,
+                &queued.message,
+            )
+            .ok()
+            .and_then(|(_, _, queued_offset, _)| queued_offset);
+            let (Some(queued_offset), Some(_)) = (queued_offset, queued.auto_commit()) else {
+                return Err(request);
+            };
+            let (queued_header, header) = (queued.message.header(), request.header());
+            if queued_header.operation != Operation::StoreConsumerOffset
+                || queued_header.owner_generation != header.owner_generation
+                || queued_header.size != header.size
+            {
+                return Err(request);
+            }
+            if offset > queued_offset {
+                queued.message = request;
+            }
+            Ok(())
+        })
     }
 
     fn next_local_request_order(&self) -> Result<LocalRequestOrder, IggyError> {
@@ -5247,7 +5413,7 @@ where
         let batch = message
             .as_slice()
             .get(std::mem::size_of::<RoutedRequestHeader>()..)
-            .and_then(|body| BatchHeader::decode(body).ok())
+            .and_then(|body| stored_header(body).ok())
             .ok_or(IggyError::InvalidCommand)?;
         let Some(producer) = batch.producer else {
             return Ok(ProducerAdmission::Append);
@@ -5278,7 +5444,7 @@ where
             let batch = entry
                 .as_slice()
                 .get(std::mem::size_of::<PrepareHeader>()..)
-                .and_then(|body| BatchHeader::decode(body).ok())
+                .and_then(|body| stored_header(body).ok())
                 .ok_or(IggyError::TransientNotAccepted)?;
             if let Some(producer) = batch
                 .producer
@@ -6282,9 +6448,27 @@ where
         self.build_poll_plan_within(consumer, args, validate_checksum, usize::MAX)
     }
 
-    /// Hand polls the store that holds this partition's remote segments.
+    /// Hand polls the store that holds this partition's remote segments: the
+    /// node's own store, or the peer's for a partition that follows another
+    /// cluster's log.
     pub fn set_remote_segments(&mut self, remote: Rc<crate::RemoteSegments>) {
         self.remote_segments = Some(remote);
+    }
+
+    /// Forget the store this partition read remote segments from, so the
+    /// shard hands it the right one again.
+    pub(crate) fn clear_remote_segments(&mut self) {
+        self.remote_segments = None;
+    }
+
+    #[must_use]
+    pub const fn has_remote_segments(&self) -> bool {
+        self.remote_segments.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn remote_segments(&self) -> Option<&Rc<crate::RemoteSegments>> {
+        self.remote_segments.as_ref()
     }
 
     /// [`Self::build_poll_plan`] for a poll whose reply holds at most
@@ -6320,12 +6504,14 @@ where
             )),
             _ => None,
         };
-        let context = PollContext {
+        let mut context = PollContext {
             history: self.poll_history,
             consumer,
             auto_commit: args.auto_commit,
             owner,
             _group_poll: group_poll,
+            peer_first_segment: None,
+            peer_segments: None,
         };
         if !self.offset_space.committed_seeded || args.count == 0 {
             return PollPlan {
@@ -6380,6 +6566,17 @@ where
             }
         }
 
+        if self.places_batches() {
+            return PollPlan {
+                commit_offset,
+                context,
+                tier: PollTier::Placed {
+                    placed: self.placed_read_plan(Some(query)),
+                    query,
+                },
+            };
+        }
+
         let serve_journal_first = match query {
             MessageLookup::Offset { offset, .. } => self
                 .log
@@ -6417,12 +6614,22 @@ where
         // segment carries its shared read-state handle so the off-borrow read
         // reuses (or fills) the cached fd; only a sealed one also resolves its
         // start byte from the shared sparse index.
-        let object_prefix = self.object_prefix();
+        let object_prefix = self.read_prefix();
         let walked = walked_segments(
             &self.log.segments()[start_segment..],
             args.count,
             byte_budget,
         );
+        if self.peer_log.is_some() {
+            context.peer_first_segment = self
+                .log
+                .segments()
+                .get(start_segment)
+                .map(|segment| segment.start_offset);
+            context.peer_segments =
+                PeerSegmentRun::of(&self.log.segments()[start_segment..start_segment + walked]);
+        }
+        let keyed_by_both_offsets = self.reads_segments_keyed_by_both_offsets();
         let cut = start_segment + walked < self.log.segments().len();
         let segments = self.log.segments()[start_segment..start_segment + walked]
             .iter()
@@ -6440,6 +6647,7 @@ where
                                 start_offset: segment.start_offset,
                                 object: SegmentObject::Log,
                             },
+                            keyed_end_offset: keyed_by_both_offsets.then_some(segment.end_offset),
                             range: 0..segment.size.as_bytes_u64(),
                         })
                     }
@@ -6485,6 +6693,57 @@ where
         self.log.journal().inner.get_sync(query)
     }
 
+    /// What a poll of this partition reads when it places its batches: its
+    /// segments that hold a batch, and the placed batches still in its
+    /// journal. Taken under the partition borrow, so the read runs without.
+    ///
+    /// `query` is the poll the plan is for, and picks the long-term segments
+    /// it carries. A read that starts above the long-term floor passes none.
+    pub(crate) fn placed_read_plan(
+        &self,
+        query: Option<MessageLookup>,
+    ) -> crate::placed_read::PlacedReadPlan {
+        let long_term = self.long_term_segments();
+        let first = match query {
+            Some(MessageLookup::Offset { offset, .. }) => {
+                long_term.partition_point(|segment| segment.end_offset < offset)
+            }
+            Some(MessageLookup::Timestamp { timestamp, .. }) => {
+                long_term.partition_point(|segment| segment.max_timestamp < timestamp)
+            }
+            None => long_term.len(),
+        };
+        let long_term = long_term[first..]
+            .iter()
+            .take(crate::placed_read::LONG_TERM_SEGMENTS_PER_POLL)
+            .copied()
+            .collect();
+        let segments = self
+            .log
+            .segments()
+            .iter()
+            .filter(|segment| {
+                segment.location == SegmentLocation::Local && segment.size.as_bytes_u64() > 0
+            })
+            .map(|segment| crate::placed_read::PlacedSegment {
+                start_offset: segment.start_offset,
+                end_offset: segment.end_offset,
+                max_timestamp: segment.max_timestamp,
+                size: segment.size.as_bytes_u64(),
+            })
+            .collect();
+        crate::placed_read::PlacedReadPlan {
+            partition_dir: self.partition_dir_resolution(),
+            segments,
+            resident: self.log.journal().inner.resident_message_entries(),
+            remote: self.remote_segments.clone(),
+            deadline: None,
+            prefix: crate::object_prefix(self.namespace(), self.created_revision()),
+            long_term,
+            long_term_floor: self.long_term_floor(),
+        }
+    }
+
     /// Snapshot the resident journal tail (oldest resident offset + op-ascending
     /// message entry clones) for the disk-tier straddle continuation. Taken
     /// synchronously under the partition borrow so the splice runs off-task on
@@ -6514,16 +6773,8 @@ where
 
     fn get_consumer_offset(&self, consumer: PollingConsumer) -> Option<u64> {
         match consumer {
-            PollingConsumer::Consumer(id, _) => self
-                .consumer_offsets
-                .borrow()
-                .get(&id)
-                .map(|co| co.offset.load(Ordering::Relaxed)),
-            PollingConsumer::ConsumerGroup(group_id, _) => self
-                .consumer_group_offsets
-                .borrow()
-                .get(&ConsumerGroupId(group_id))
-                .map(|co| co.offset.load(Ordering::Relaxed)),
+            PollingConsumer::Consumer(id, _) => self.geo_consumer_offset(id),
+            PollingConsumer::ConsumerGroup(group_id, _) => self.geo_group_offset(group_id),
         }
     }
 
@@ -6567,6 +6818,9 @@ where
         // the persisted `base_timestamp` (and the `batch_checksum` derived from
         // it) byte-identical across replicas. A local `now()` diverges per node.
         let batch_timestamp = header.timestamp;
+        if prepare_is_placed(&message) != self.places_batches() {
+            return Err(IggyError::CannotAppendMessage);
+        }
         let (message, batch, batch_messages_count) =
             stamp_prepare_for_persistence(message, dirty_offset, batch_timestamp)
                 .map_err(|_| IggyError::CannotAppendMessage)?;
@@ -7907,7 +8161,7 @@ where
         }
     }
 
-    fn partition_dir(&self) -> Option<String> {
+    pub(crate) fn partition_dir(&self) -> Option<String> {
         if self.partition_dir.is_some() {
             return self.partition_dir.clone();
         }
@@ -8042,8 +8296,124 @@ where
         message: Message<RoutedRequestHeader>,
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
     ) {
-        self.admit_request(message, reply).await;
+        self.admit_request(message, reply, false).await;
         self.release_send_space();
+    }
+
+    /// [`Self::on_request`] for the `SendMessages` request of a client whose
+    /// batch this node stored in the object store: the request carries the
+    /// client's header and a placed batch in place of its messages.
+    ///
+    /// Only the node's own upload path may call it. A request from a client
+    /// goes through [`Self::on_request`], which takes no placed batch.
+    ///
+    /// # Panics
+    /// As [`Self::on_request`].
+    #[allow(clippy::future_not_send)]
+    pub async fn on_placed_request(
+        &mut self,
+        message: Message<RoutedRequestHeader>,
+        reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+    ) {
+        self.admit_request(message, reply, true).await;
+        self.release_send_space();
+    }
+
+    /// Whether this replica answers every client request as not accepted for
+    /// now: it is not a primary in normal status, or it is on its way out.
+    fn refuses_requests(&self) -> bool {
+        let consensus = self.consensus();
+        self.fatal.is_some()
+            || self.maintenance.shutdown.is_some()
+            || self.io_active.is_retiring()
+            || self.transition.is_some()
+            || self.materialization_missing
+            || consensus.is_follower()
+            || !consensus.is_normal()
+            || consensus.is_transferring()
+    }
+
+    /// Whether a send may go to the object store for this partition now: the
+    /// partition places its batches, and this replica would not refuse the
+    /// request that commits where they sit, which it does while its geo
+    /// topic's object is unread. The node's upload path asks before it
+    /// stores a send's messages, and again before it hands the request over.
+    #[must_use]
+    pub fn takes_placed_sends(&self) -> bool {
+        self.places_batches() && !self.refuses_requests() && self.takes_messages_of_its_topic()
+    }
+
+    /// Whether this replica proves the placed batches its partition
+    /// committed: it places them, and it is a primary in normal status that
+    /// is not on its way out.
+    #[must_use]
+    pub fn proves_placed_batches(&self) -> bool {
+        self.places_batches() && !self.refuses_requests()
+    }
+
+    /// The proof rows of the placed batches this replica committed, `None`
+    /// before it committed one.
+    #[must_use]
+    pub fn fresh_proofs(&self) -> Option<&crate::FreshProofs> {
+        self.fresh_proofs.as_deref()
+    }
+
+    /// Whether proof rows wait for this replica's shard since the last call.
+    /// Only a replica that [proves](Self::proves_placed_batches) them has
+    /// any to give.
+    pub fn take_proofs_wanted(&self) -> bool {
+        let Some(proofs) = self.fresh_proofs.as_deref() else {
+            return false;
+        };
+        if !self.proves_placed_batches() {
+            proofs.unwant();
+            return false;
+        }
+        proofs.take_wanted(self.consensus.view())
+    }
+
+    /// The `proven_below` of an object that a writer seals now, which holds
+    /// every row below `unstored_from` in a stored object. See
+    /// [`crate::FreshProofs::proven_below`].
+    #[must_use]
+    pub fn proven_below(&self, unstored_from: u64) -> u64 {
+        let long_term_floor = self.long_term_floor();
+        self.fresh_proofs.as_deref().map_or_else(
+            || long_term_floor.map_or(0, |floor| floor.saturating_add(1)),
+            |proofs| proofs.proven_below(unstored_from, long_term_floor),
+        )
+    }
+
+    /// Drop the proof rows that the long-term log now holds.
+    pub(crate) fn prune_proof_rows(&mut self) {
+        let long_term_floor = self.long_term_floor();
+        if let Some(proofs) = self.fresh_proofs.as_deref_mut() {
+            proofs.prune(long_term_floor);
+        }
+    }
+
+    /// Whether [`Self::on_placed_request`] has room for one more request. A
+    /// request handed over without room is answered as not accepted.
+    #[must_use]
+    pub fn has_request_room(&self) -> bool {
+        self.consensus()
+            .with_pipeline(|pipeline| !pipeline.request_queue_full())
+    }
+
+    /// Whether `message` is a request [`Self::on_placed_request`] takes: a
+    /// `SendMessages` whose body is one placed batch for this partition.
+    fn is_placed_request(&self, message: &Message<RoutedRequestHeader>) -> bool {
+        let header = message.header();
+        header.operation == Operation::SendMessages
+            && header.size as usize == size_of::<RoutedRequestHeader>() + PLACED_BATCH_SIZE
+            && message
+                .as_slice()
+                .get(size_of::<RoutedRequestHeader>()..header.size as usize)
+                .and_then(|body| PlacedBatch::decode(body).ok())
+                .is_some_and(|placed| {
+                    placed.header.message_count > 0
+                        && placed.header.partition_id == self.namespace().partition_id() as u64
+                })
     }
 
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -8051,6 +8421,7 @@ where
         &mut self,
         message: Message<RoutedRequestHeader>,
         reply: Option<consensus::Sender<Message<ReplyHeader>>>,
+        placed: bool,
     ) {
         // Taken by whichever arm answers: the deny paths, the NoAck fast path,
         // or the pipeline entry that fires it at commit. Exactly one runs.
@@ -8072,7 +8443,9 @@ where
                 },
             );
 
-            let message = if message.header().operation == Operation::SendMessages {
+            let message = if placed {
+                message
+            } else if message.header().operation == Operation::SendMessages {
                 // Skip the batch-checksum pass: on the partition ingest path
                 // nothing reads it before `stamp_prepare_for_persistence`
                 // recomputes it over the stamped header. An already-canonical
@@ -8123,16 +8496,33 @@ where
                 .await;
                 return;
             }
-            if self.fatal.is_some()
-                || self.maintenance.shutdown.is_some()
-                || self.io_active.is_retiring()
-                || self.transition.is_some()
-                || self.materialization_missing
-                || consensus.is_follower()
-                || !consensus.is_normal()
-                || consensus.is_transferring()
-                || committed_history_pending
+            // A partition takes what its segments hold. One that places its
+            // batches gets them from the node's upload path, and a send that
+            // reached it any other way was stored nowhere. One that follows
+            // another cluster's log holds what the origin's manifests list
+            // and nothing else.
+            let sends = message.header().operation == Operation::SendMessages;
+            let refusal = if placed != (self.places_batches() && sends)
+                || (placed && !self.is_placed_request(&message))
             {
+                Some("send does not carry what the partition's segments hold")
+            } else if self.peer_log.is_some() && sends {
+                Some("send to a partition that follows another cluster's log")
+            } else {
+                None
+            };
+            if let Some(refusal) = refusal {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::FeatureUnavailable.as_code(),
+                    refusal,
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            if self.refuses_requests() || committed_history_pending {
                 emit_partition_diag(
                     tracing::Level::WARN,
                     &PartitionDiagEvent::new(
@@ -8647,6 +9037,23 @@ where
                     message.header(),
                     IggyError::TransientNotAccepted.as_code(),
                     "data disk is below its free-space reserve",
+                    reply.take(),
+                )
+                .await;
+                return;
+            }
+            // Other clusters adopt a geo topic from its object in the store,
+            // so a geo topic's partition takes no messages before its primary
+            // read the object back. Below the dedup lookup for the reason
+            // the reserve is.
+            if message.header().operation == Operation::SendMessages
+                && !self.takes_messages_of_its_topic()
+            {
+                Self::send_partition_deny_or_log(
+                    consensus,
+                    message.header(),
+                    IggyError::TransientNotAccepted.as_code(),
+                    "the primary has not read the object of the geo topic yet",
                     reply.take(),
                 )
                 .await;
@@ -10264,7 +10671,7 @@ where
         if header.operation != Operation::SendMessages {
             return Err(IggyError::CannotAppendMessage);
         }
-        let validated = decode_prepare_slice(message.as_slice())?.header;
+        let validated = self.decode_received_batch(&message)?;
         if validated.message_count == 0 {
             return Err(IggyError::InvalidCommand);
         }
@@ -10314,8 +10721,9 @@ where
             return Err(IggyError::CannotAppendMessage);
         }
 
-        let batch_messages_size =
-            u64::try_from(batch.total_size()).map_err(|_| IggyError::CannotAppendMessage)?;
+        // What the segment holds of the batch: all of it, or the placed batch
+        // that stands in for it.
+        let batch_messages_size = prepare_body_length(&message);
         let last_dirty_offset = batch
             .base_offset
             .checked_add(u64::from(batch_messages_count) - 1)
@@ -10810,9 +11218,9 @@ where
             if peek_operation(entry) != Operation::SendMessages {
                 continue;
             }
-            let batch = decode_prepare_slice_trusted(entry.as_slice())
+            let batch = decode_prepare_batch_trusted(entry.as_slice())
                 .map_err(|_| IggyError::InvalidCommand)?;
-            if batch.message_count() == 0 {
+            if batch.header.message_count == 0 {
                 continue;
             }
             if ops.contains(&peek_op(entry)) {
@@ -10823,14 +11231,14 @@ where
                 &mut retained_info,
                 batch.header.base_offset,
                 batch.header.base_timestamp,
-                batch.header.total_size() as u64,
-                batch.message_count(),
+                batch.body_length,
+                batch.header.message_count,
             );
             retained_next_offset = retained_next_offset.max(
                 batch
                     .header
                     .base_offset
-                    .saturating_add(u64::from(batch.message_count())),
+                    .saturating_add(u64::from(batch.header.message_count)),
             );
         }
 
@@ -12761,6 +13169,9 @@ where
         }
         self.widest_batch_bytes
             .set(self.widest_batch_bytes.get().max(batch_stats.size_bytes));
+        if let Some((placement, placed_checksum)) = batch_stats.placed {
+            self.take_proof_row(&batch_stats, placement, placed_checksum);
+        }
         let end_offset = batch_stats.end_offset();
         // The committed counter now names data, which is what makes
         // it pollable and persistable. Outside the recovered-offset
@@ -12778,6 +13189,7 @@ where
         {
             self.offset.store(end_offset, Ordering::Release);
             self.committed_bytes = self.committed_bytes.saturating_add(batch_stats.size_bytes);
+            self.long_term_backlog.add(batch_stats.size_bytes);
             self.stats.set_current_offset(end_offset);
             // Advance the aggregate stats with the visible offset. Disk
             // persistence is threshold-gated in `commit_messages`, which
@@ -12786,6 +13198,34 @@ where
             self.stats
                 .increment_messages_count(u64::from(batch_stats.message_count));
             self.stats.increment_size_bytes(batch_stats.size_bytes);
+        }
+    }
+
+    /// Keep the proof row of a placed batch that committed here, on every
+    /// replica. The primary's shard is told that one waits.
+    fn take_proof_row(
+        &mut self,
+        batch_stats: &CommittedBatchStats,
+        placement: Placement,
+        placed_checksum: u64,
+    ) {
+        let long_term_floor = self.long_term_floor();
+        let primary = self.consensus.is_primary();
+        let proofs = self.fresh_proofs.get_or_insert_default();
+        proofs.commit(
+            FreshProofRow {
+                object_id: FreshObjectId::from_raw(placement.object_id),
+                position: placement.position,
+                base_offset: batch_stats.base_offset,
+                base_timestamp: batch_stats.timestamp,
+                message_count: batch_stats.message_count,
+                placed_checksum,
+            },
+            placement.proven_below,
+            long_term_floor,
+        );
+        if primary {
+            proofs.want();
         }
     }
 
@@ -12822,19 +13262,24 @@ where
         // Trusted (no batch-hash): the entry was read back from this replica's
         // own journal, where it was stamped/validated at append; only header
         // stats are needed, so re-hashing the ~1 MiB blob is redundant.
-        let batch = decode_prepare_slice_trusted(entry.as_slice())
+        let batch = decode_prepare_batch_trusted(entry.as_slice())
             .map_err(|_| IggyError::InvalidCommand)?;
-        let message_count = batch.message_count();
+        let message_count = batch.header.message_count;
         if message_count == 0 {
             return Ok(None);
         }
 
+        // The size is the batch's own, also when only a placed batch stands
+        // in for it here: it is what the partition's messages weigh.
         Ok(Some(CommittedBatchStats {
             base_offset: batch.header.base_offset,
             message_count,
             size_bytes: batch.header.total_size() as u64,
             producer: batch.header.producer,
             timestamp: batch.header.base_timestamp,
+            placed: batch
+                .placement
+                .map(|placement| (placement, batch.body_checksum)),
         }))
     }
 
@@ -13351,7 +13796,7 @@ where
     /// Minimum committed offset across all consumers and consumer groups, with
     /// the holder's identity. `None` when nothing has been committed, in which
     /// case there is no deletion barrier. External groups never hold retention.
-    fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
+    pub(crate) fn min_committed_offset(&self) -> Option<(u64, ConsumerKind, u32)> {
         let consumer_guard = self.consumer_offsets.borrow();
         let group_guard = self.consumer_group_offsets.borrow();
         let consumers = consumer_guard.values().map(|offset| {
@@ -13372,7 +13817,7 @@ where
     }
 
     /// Time-expiry plus size-retention in one pass, for a partition that is not
-    /// tiered: remove the leading sealed
+    /// tiered and holds whole batches: remove the leading sealed
     /// segments that have expired or that push the partition's SEALED bytes
     /// past `max_bytes`. Capped per call by
     /// `SEGMENT_REMOVAL_BUDGET_PER_PASS`; the returned
@@ -13387,9 +13832,16 @@ where
         // A tiered partition's retention is one decision for the local and
         // the remote segments together, which the primary commits as a
         // truncation. A replica that expired segments by itself could drop
-        // one that was never uploaded.
-        if self.is_tiered() {
+        // one that was never uploaded. The origin's manifests alone trim the
+        // log of a partition that follows another cluster's.
+        if self.is_tiered() || self.peer_log.is_some() {
             return SegmentRemoval::default();
+        }
+        // Its segments hold placed batches, whose size and age say nothing
+        // of the messages they name. Those are in the long-term segments,
+        // so what was trimmed there is all that goes here.
+        if self.places_batches() {
+            return self.remove_trimmed_segments().await;
         }
         let expired = leading_expired_end(self.log.segments(), now, message_expiry);
         let oversized =
@@ -13439,6 +13891,53 @@ where
         )
     }
 
+    /// What the retention policy of a topic that places its batches removes
+    /// from this partition's long-term log: the end offset of the last
+    /// leading long-term segment that expired or that pushes the bytes of
+    /// the segments before the last one past `max_bytes`, held at the
+    /// consumer barrier. The last segment is never named.
+    ///
+    /// Nothing is removed here. The caller commits the offset as a trim of
+    /// the long-term log, and every replica follows the trim point with
+    /// [`Self::remove_trimmed_segments`].
+    ///
+    /// `None` on a partition that does not place its batches, and on every
+    /// replica but a primary that applied the view it started: one decision
+    /// per partition keeps the log a function of its own commands.
+    #[must_use]
+    pub fn long_term_retention_end(
+        &self,
+        now: IggyTimestamp,
+        message_expiry: IggyExpiry,
+        max_bytes: Option<u64>,
+    ) -> Option<u64> {
+        if !self.places_batches() || !self.state_machines_current() {
+            return None;
+        }
+        retention_end(
+            self.long_term_segments(),
+            now,
+            message_expiry,
+            max_bytes,
+            self.min_committed_offset().map(|(barrier, _, _)| barrier),
+        )
+    }
+
+    /// Remove the sealed segments of placed batches that end at or below the
+    /// trim point of the long-term log, on any replica. A segment that
+    /// reaches past the trim point stays, as does every one between it and
+    /// the long-term floor.
+    ///
+    /// Capped per call as [`Self::remove_sealed_segments_up_to`] is.
+    pub async fn remove_trimmed_segments(&mut self) -> SegmentRemoval {
+        match self.long_term_trim_point() {
+            Some(trim_point) if self.places_batches() => {
+                self.remove_sealed_segments_up_to(trim_point).await
+            }
+            _ => SegmentRemoval::default(),
+        }
+    }
+
     /// Remove the oldest sealed segments whose `end_offset <= up_to_offset`,
     /// never the active segment and never past the consumer barrier (the
     /// minimum committed consumer/group offset). Unlinks the messages and
@@ -13458,6 +13957,22 @@ where
     /// return an empty result. Only an idle partition without a dispatcher removes
     /// files inline and returns their counts.
     pub async fn remove_sealed_segments_up_to(&mut self, up_to_offset: u64) -> SegmentRemoval {
+        // Its segments leave when a manifest of the origin trims them.
+        if self.peer_log.is_some() {
+            return SegmentRemoval::default();
+        }
+        // A placed batch above the long-term floor is the only record of
+        // where its messages sit in the object store. Removing it would lose
+        // them for the rewrite, and so for every other cluster, whoever
+        // asked: retention, or a client that deletes segments.
+        let up_to_offset = if self.places_batches() {
+            match self.long_term_floor() {
+                Some(floor) => up_to_offset.min(floor),
+                None => return SegmentRemoval::default(),
+            }
+        } else {
+            up_to_offset
+        };
         self.maintenance.retention = Some(
             self.maintenance
                 .retention
@@ -13682,7 +14197,12 @@ where
     }
 
     /// A request already under way keeps its progress and its retry delay.
+    /// A partition that follows another cluster's log keeps no chain, so it
+    /// never starts one.
     fn request_tiering(&mut self, prefix: iggy_object_store::ObjectPrefix) {
+        if self.peer_log.is_some() {
+            return;
+        }
         if self
             .maintenance
             .tiering
@@ -14049,7 +14569,7 @@ where
     /// Whether this replica is the one that deletes the partition's objects:
     /// the primary of a tiered partition that applied the view it started,
     /// as for [`Self::total_retention_end`].
-    fn deletes_objects(&self) -> bool {
+    pub(crate) fn deletes_objects(&self) -> bool {
         let consensus = &self.consensus;
         self.is_tiered()
             && consensus.is_primary()
@@ -14122,11 +14642,18 @@ where
     /// A replica that is not the primary drops what it queued and cancels
     /// the job it started, so a pass over a demoted replica is what stops
     /// its job.
+    ///
+    /// A partition that places its batches has no objects of this kind. Its
+    /// jobs are those of `Self::begin_long_term_delete`, which no
+    /// watermark bounds.
     pub fn begin_object_delete(
         &mut self,
         now: IggyTimestamp,
         committed_up_to: u64,
     ) -> Option<(crate::ObjectDeleteJob, iggy_object_store::TierScopeToken)> {
+        if self.places_batches() {
+            return self.begin_long_term_delete(now);
+        }
         if !self.deletes_objects() {
             self.object_deletes = ObjectDeletes::default();
             return None;
@@ -14178,7 +14705,23 @@ where
     /// grace period from `now`. A sweep that failed is repeated by a later
     /// pass. A delete forgets the segments it removed, and the ones it
     /// did not stay queued.
+    ///
+    /// Returns how many long-term objects a delete removed, which is none
+    /// on a partition that does not place its batches.
     pub fn finish_object_delete(
+        &mut self,
+        id: u64,
+        outcome: crate::ObjectDeleteOutcome,
+        now: IggyTimestamp,
+    ) -> usize {
+        if self.places_batches() {
+            return self.finish_long_term_delete(id, outcome, now);
+        }
+        self.finish_segment_object_delete(id, outcome, now);
+        0
+    }
+
+    fn finish_segment_object_delete(
         &mut self,
         id: u64,
         outcome: crate::ObjectDeleteOutcome,
@@ -15658,6 +16201,26 @@ where
             .journal()
             .inner
             .lowest_resident_send_in(from..=commit_to_op)?;
+        if self.places_batches() {
+            // A placed batch's own checksum covers its header, so its check
+            // does here what the batch checksum does for a whole batch.
+            let batch = decode_prepare_batch(entry.as_slice())
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        target: "iggy.partitions.diag",
+                        plane = "partitions",
+                        namespace_raw = self.namespace().inner(),
+                        op,
+                        %error,
+                        "resident placed batch fails its checks; the window has no anchor"
+                    );
+                })
+                .ok()?;
+            return Some(RepairAnchor {
+                op,
+                base_offset: batch.header.base_offset,
+            });
+        }
         // The batch checksum covers `base_offset` and hashes only each frame's
         // stored checksum, so a corrupt header still yields no anchor and the
         // floor is refused, without hashing every message body.
@@ -15722,7 +16285,7 @@ where
         if !self.prepare_history_available(message.header()) {
             return Err(IggyError::HistoryUnavailable);
         }
-        let batch = decode_prepare_slice(message.as_slice())?.header;
+        let batch = self.decode_received_batch(&message)?;
         self.append_canonical_send_messages(message, batch).await?;
         Ok(())
     }
@@ -15739,7 +16302,7 @@ where
         let (base_offset, base_timestamp, total_size, message_count) = (
             batch.base_offset,
             batch.base_timestamp,
-            batch.total_size() as u64,
+            prepare_body_length(&message),
             batch.message_count,
         );
         if message_count == 0 {
@@ -15970,6 +16533,20 @@ fn upsert_offset_max<K: Ord>(
 /// `PrepareHeader`, so reading the tag is a cheap cast, not a full batch decode;
 /// it tells a committed consumer-offset op (no segment bytes) apart from a
 /// `SendMessages` batch without relying on a decode failure to do so.
+/// Whether a message prepare carries a placed batch.
+fn prepare_is_placed(message: &Message<PrepareHeader>) -> bool {
+    message
+        .as_slice()
+        .get(std::mem::size_of::<PrepareHeader>()..)
+        .is_some_and(iggy_binary_protocol::placement::is_placed)
+}
+
+/// Bytes of a message prepare that its segment holds: the whole batch, or the
+/// placed batch that stands in for it.
+fn prepare_body_length(message: &Message<PrepareHeader>) -> u64 {
+    u64::from(message.header().size).saturating_sub(std::mem::size_of::<PrepareHeader>() as u64)
+}
+
 pub fn peek_operation(entry: &Frozen<4096>) -> Operation {
     bytemuck::checked::try_from_bytes::<PrepareHeader>(
         &entry[..std::mem::size_of::<PrepareHeader>()],
@@ -15995,9 +16572,9 @@ pub fn materialization_batch_meta(
     if peek_operation(entry) != Operation::SendMessages {
         return Ok(None);
     }
-    let batch = decode_prepare_slice_trusted(entry.as_slice())
+    let batch = decode_prepare_batch_trusted(entry.as_slice())
         .map_err(|_| IggyError::CannotSaveMessagesToSegment)?;
-    let message_count = batch.message_count();
+    let message_count = batch.header.message_count;
     if message_count == 0 {
         return Ok(None);
     }
@@ -16012,7 +16589,7 @@ pub fn materialization_batch_meta(
     Ok(Some(RetainedBatchMeta {
         base_offset: batch.header.base_offset,
         base_timestamp: batch.header.base_timestamp,
-        total_size: batch.header.total_size() as u64,
+        total_size: batch.body_length,
         message_count,
     }))
 }
@@ -16134,6 +16711,8 @@ struct CommittedBatchStats {
     size_bytes: u64,
     producer: Option<BatchProducer>,
     timestamp: u64,
+    /// The placement of a placed batch, with the placed batch's checksum.
+    placed: Option<(Placement, u64)>,
 }
 
 struct JournaledMessages {
@@ -16288,7 +16867,7 @@ pub struct LocalEnvelope {
 
 /// Counter shortfalls from removing one segment, reported with its offset range.
 #[derive(Debug, Default, Clone, Copy)]
-struct CleanupShortfall {
+pub struct CleanupShortfall {
     size_bytes: u64,
     segments: u32,
     messages: u64,
@@ -16297,7 +16876,7 @@ struct CleanupShortfall {
 impl CleanupShortfall {
     /// Report one removed segment's shortfall and offset range. Silent when the
     /// counters covered its rollback.
-    fn report(self, namespace: IggyNamespace, removed_offsets: Option<(u64, u64)>) {
+    pub fn report(self, namespace: IggyNamespace, removed_offsets: Option<(u64, u64)>) {
         if self.size_bytes == 0 && self.segments == 0 && self.messages == 0 {
             return;
         }
@@ -16324,7 +16903,10 @@ impl CleanupShortfall {
 /// likeliest source of a clamped rollback: a partition on its way out keeps
 /// serving cleanup passes after the delete already settled its counters into
 /// the parents.
-fn settle_cleaned_segment(stats: &PartitionStats, segment: &Segment) -> (u64, CleanupShortfall) {
+pub fn settle_cleaned_segment(
+    stats: &PartitionStats,
+    segment: &Segment,
+) -> (u64, CleanupShortfall) {
     // The removal loop only reaches sealed segments, which always hold at least
     // one message, so the count is inclusive start..=end. A one-message sealed
     // segment has `start_offset == end_offset`, so the `+ 1` is required (a
@@ -16342,18 +16924,18 @@ fn settle_cleaned_segment(stats: &PartitionStats, segment: &Segment) -> (u64, Cl
 /// `None` when none are expired. The last element is the active segment and is
 /// never considered. `expiry` must be resolved; a `ServerDefault` expires
 /// nothing (see [`Segment::is_expired`]).
-fn leading_expired_end(
-    segments: &[Segment],
+fn leading_expired_end<S: RetainedSegment>(
+    segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,
 ) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut up_to = None;
     for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.is_expired(now, expiry) {
+        if idx == last_idx || !segment.has_expired(now, expiry) {
             break;
         }
-        up_to = Some(segment.end_offset);
+        up_to = Some(segment.last_offset());
     }
     up_to
 }
@@ -16403,20 +16985,20 @@ fn walked_segments(segments: &[Segment], count: u32, byte_budget: usize) -> usiz
 /// evict the sealed history instead: at a budget near one segment the active
 /// one alone exceeds it, and every sealed segment is dropped no matter how
 /// small the log is.
-fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
+fn leading_oversized_end<S: RetainedSegment>(segments: &[S], max_bytes: u64) -> Option<u64> {
     let last_idx = segments.len().saturating_sub(1);
     let mut resident: u64 = segments
         .iter()
         .take(last_idx)
-        .map(|segment| segment.size.as_bytes_u64())
+        .map(RetainedSegment::stored_bytes)
         .sum();
     let mut up_to = None;
     for (idx, segment) in segments.iter().enumerate() {
-        if idx == last_idx || !segment.sealed || resident <= max_bytes {
+        if idx == last_idx || !segment.is_closed() || resident <= max_bytes {
             break;
         }
-        resident -= segment.size.as_bytes_u64();
-        up_to = Some(segment.end_offset);
+        resident -= segment.stored_bytes();
+        up_to = Some(segment.last_offset());
     }
     up_to
 }
@@ -16425,8 +17007,8 @@ fn leading_oversized_end(segments: &[Segment], max_bytes: u64) -> Option<u64> {
 /// expired and the over-budget leading runs, cut back to the last segment that
 /// ends at or below `barrier`. `None` when retention removes nothing. The
 /// active segment (last element) is never named.
-fn retention_end(
-    segments: &[Segment],
+pub fn retention_end<S: RetainedSegment>(
+    segments: &[S],
     now: IggyTimestamp,
     expiry: IggyExpiry,
     max_bytes: Option<u64>,
@@ -16439,8 +17021,8 @@ fn retention_end(
     // `up_to` ends a sealed segment, so the walk stops before the active one.
     segments
         .iter()
-        .take_while(|segment| segment.end_offset <= through)
-        .map(|segment| segment.end_offset)
+        .map(RetainedSegment::last_offset)
+        .take_while(|last_offset| *last_offset <= through)
         .last()
 }
 

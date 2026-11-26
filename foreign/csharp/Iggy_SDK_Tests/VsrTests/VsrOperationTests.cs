@@ -39,6 +39,7 @@ public sealed class VsrOperationTests
     [InlineData(CommandCodes.CREATE_TOPIC_CODE, (byte)VsrOperation.CreateTopic)]
     [InlineData(CommandCodes.DELETE_TOPIC_CODE, (byte)VsrOperation.DeleteTopic)]
     [InlineData(CommandCodes.UPDATE_RESOURCE_CODE, (byte)VsrOperation.UpdateResource)]
+    [InlineData(CommandCodes.RETIRE_GEO_ORIGIN_CODE, (byte)VsrOperation.RetireGeoOrigin)]
     [InlineData(CommandCodes.CREATE_PARTITIONS_CODE, (byte)VsrOperation.CreatePartitions)]
     [InlineData(CommandCodes.DELETE_PARTITIONS_CODE, (byte)VsrOperation.DeletePartitions)]
     [InlineData(CommandCodes.DELETE_SEGMENTS_CODE, (byte)VsrOperation.DeleteSegments)]
@@ -145,10 +146,12 @@ public sealed class VsrOperationTests
     [InlineData((byte)VsrOperation.JoinConsumerGroup)]
     [InlineData((byte)VsrOperation.LeaveConsumerGroup)]
     [InlineData((byte)VsrOperation.UpdateResource)]
+    [InlineData((byte)VsrOperation.RetireGeoOrigin)]
     [InlineData((byte)VsrOperation.UpdateStreamResolved)]
     [InlineData((byte)VsrOperation.UpdateTopicResolved)]
     [InlineData((byte)VsrOperation.UpdateUserResolved)]
     [InlineData((byte)VsrOperation.RewrapStreamKeys)]
+    [InlineData((byte)VsrOperation.ShadowTopic)]
     public void IsMetadata_CoversTheWholeControlPlane(byte operation)
     {
         Assert.True(((VsrOperation)operation).IsMetadata());

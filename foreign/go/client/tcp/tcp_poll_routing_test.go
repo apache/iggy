@@ -1692,6 +1692,24 @@ func TestPrimaryMutationLifecycleRetriesKeepContextAndUseNewRequestIDs(t *testin
 	}
 }
 
+func TestPrimaryMutationDoesNotRetryAShadowStreamRefusal(t *testing.T) {
+	var attempts atomic.Uint32
+	fixture := newPrimaryPollFixture(t, func(_, _ int, read request) ([]byte, bool) {
+		if read.operation() != vsr.OperationSendMessages {
+			return nil, false
+		}
+		attempts.Add(1)
+		return statusReplyFrame(read.operation(), uint32(ierror.ShadowStreamReadOnlyCode), nil), true
+	}, nil)
+	stream, topic, _ := groupConsumer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := fixture.client.SendBinaryRequest(ctx, uint32(command.SendMessagesCode),
+		rawSendPayload(t, stream, topic, iggcon.PartitionId(0)))
+	require.ErrorIs(t, err, ierror.ErrShadowStreamReadOnly)
+	assert.Equal(t, uint32(1), attempts.Load())
+}
+
 func TestMetadataNotPrimaryRechecksLeaderWithoutWalkingTheRoster(t *testing.T) {
 	var attempts atomic.Uint32
 	fixture := newPrimaryPollFixture(t, nil, func(_ int, read request) ([]byte, bool) {

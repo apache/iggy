@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	iggcon "github.com/apache/iggy/foreign/go/contracts"
@@ -46,6 +47,34 @@ func TestGetClientMarshalBinary(t *testing.T) {
 			}
 			if !bytes.Equal(got, test.want) {
 				t.Fatalf("GetClient body = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestRetireGeoOriginMarshalBinary(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		origin  string
+		want    []byte
+		wantErr error
+	}{
+		{name: "short origin", origin: "dc-a", want: []byte{4, 'd', 'c', '-', 'a'}},
+		{name: "255-byte origin", origin: strings.Repeat("o", 255), want: append([]byte{255}, bytes.Repeat([]byte{'o'}, 255)...)},
+		{name: "empty origin", origin: "", wantErr: ierror.ErrInvalidFormat},
+		{name: "256-byte origin", origin: strings.Repeat("o", 256), wantErr: ierror.ErrInvalidFormat},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request := &RetireGeoOrigin{Origin: test.origin}
+			if got := request.Code(); got != 18 {
+				t.Fatalf("command code = %d, want 18", got)
+			}
+			got, err := request.MarshalBinary()
+			if !errors.Is(err, test.wantErr) {
+				t.Fatalf("error = %v, want %v", err, test.wantErr)
+			}
+			if !bytes.Equal(got, test.want) {
+				t.Fatalf("command body = %x, want %x", got, test.want)
 			}
 		})
 	}

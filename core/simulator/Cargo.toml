@@ -52,6 +52,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
+iggy_object_store = { workspace = true }
 # Test-only feature on a crate this package already depends on: the fault
 # hooks the partition-driver tests arm must not compile into anything that
 # ships. See `partitions/Cargo.toml`.

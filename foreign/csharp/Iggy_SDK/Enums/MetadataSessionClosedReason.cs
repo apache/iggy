@@ -28,6 +28,6 @@ public enum MetadataSessionClosedReason : byte
     /// <summary>The session lease expired.</summary>
     Expired = 1,
 
-    /// <summary>The user was deactivated or deleted.</summary>
+    /// <summary>A user delete, deactivation, password change, or delete of the session's token.</summary>
     Revoked = 2
 }

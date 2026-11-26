@@ -27,6 +27,7 @@ internal static class CommandCodes
     internal const int BIND_SESSION_CODE = 15;
     internal const int UPDATE_RESOURCE_CODE = 16;
     internal const int GET_METADATA_CHANGES_CODE = 17;
+    internal const int RETIRE_GEO_ORIGIN_CODE = 18;
     internal const int GET_ME_CODE = 20;
     internal const int GET_CLIENT_CODE = 21;
     internal const int GET_CLIENTS_CODE = 22;

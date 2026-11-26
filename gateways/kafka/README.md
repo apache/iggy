@@ -94,6 +94,8 @@ The gateway connects to Iggy at `127.0.0.1:8090` as the user `iggy`. Without
 `IGGY_KAFKA_IGGY_PASSWORD`, it exits at start. To run it without Iggy, in stub mode, set
 `IGGY_KAFKA_BRIDGE_ENABLED=false`.
 
+Changing the password of the bridge's Iggy user ends the bridge's sessions, and the gateway signs in only with `IGGY_KAFKA_IGGY_PASSWORD`, which Iggy now refuses. Requests that need the bridge fail until the gateway restarts. To rotate the password, change it in Iggy, then restart each gateway with the new `IGGY_KAFKA_IGGY_PASSWORD`. Kafka clients reconnect on their own.
+
 Default bind: a `PLAINTEXT` listener on `127.0.0.1:9093`. Environment variables:
 
 | Variable | Default | Description |
@@ -656,14 +658,12 @@ Four things to know before switching it on:
 `kafka-acls.sh --list` works against the gateway. It is read only: `CreateAcls` and `DeleteAcls`
 are not implemented and not advertised.
 
-`--list` here is a snapshot of the caller's own grants, not the broker-wide dump it is against a
-Kafka cluster. A principal sees its own permissions and nobody else's, because the gateway holds no
-administrative credentials, so filtering on another `User:` returns an empty listing whatever that
-user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings. The view starts as a snapshot
-taken when the connection authenticated. A permission changed afterwards shows within about a
-second, once the bridge reads the change in Iggy's metadata change log. A connection whose user is
-deleted or deactivated closes. Without `manage_servers` on the bridge's Iggy user, a permission
-changed afterwards is invisible until the client reconnects.
+`--list` here is a snapshot of the caller's own grants, not the broker-wide dump it is against a Kafka cluster. A principal sees its own permissions and nobody else's, because the gateway holds no administrative credentials, so filtering on another `User:` returns an empty listing whatever that user holds, and root's listing is root's grants rather than a catalog of every binding. Only global permissions are rendered, as wildcard bindings.
+
+The view starts as a snapshot taken when the connection authenticated. Once the bridge reads a permission change from the metadata change log, the new permissions apply. When it reads a user deletion, deactivation or password change, connections for that user close.
+
+If the bridge lacks `manage_servers` or its log position expires before it reads a password change, existing connections can remain open. Restarting the gateway forces those clients to sign in again.
+
 [docs/ACL_MAPPING.md](docs/ACL_MAPPING.md) has the mapping table and what is deliberately left out.
 
 Full reasoning, including what was rejected and why, is in

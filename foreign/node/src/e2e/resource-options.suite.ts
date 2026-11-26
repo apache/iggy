@@ -360,7 +360,7 @@ export const describeResourceOptions = (
     const byKey = new Map(specs.map((spec) => [spec.key, spec]));
     assert.deepEqual([...byKey.keys()], [
       'name', 'encryption_key', 'encryption_key_source',
-      'encryption_key_fingerprint', 'encryption_kek_fingerprint'
+      'encryption_key_fingerprint', 'encryption_kek_fingerprint', 'shadow_origin'
     ]);
     assert.equal(byKey.get('name')?.updatable, true);
     assert.equal(byKey.get('name')?.secret, false);
@@ -368,6 +368,7 @@ export const describeResourceOptions = (
     assert.equal(byKey.get('encryption_key')?.secret, true);
     assert.equal(byKey.get('encryption_key')?.critical, true);
     assert.equal(byKey.get('encryption_key_fingerprint')?.readOnly, true);
+    assert.equal(byKey.get('shadow_origin')?.readOnly, true);
   });
 
   it(`${label}::cleanup`, async () => {

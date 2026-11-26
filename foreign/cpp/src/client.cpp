@@ -74,6 +74,30 @@ rust::Vec<std::uint8_t> ToFfiBytes(const std::vector<std::uint8_t> &bytes) {
     return ffi_bytes;
 }
 
+void SetGeoTopicDuration(bool &has_value, std::uint64_t &micros, std::optional<std::chrono::microseconds> duration) {
+    if (duration) {
+        has_value = true;
+        micros    = static_cast<std::uint64_t>(duration->count());
+    }
+}
+
+template <typename Options>
+ffi::GeoTopicDurations ToFfiGeoTopicDurations(const Options &options) {
+    ffi::GeoTopicDurations durations{};
+    SetGeoTopicDuration(durations.has_fresh_upload_interval, durations.fresh_upload_interval_micros,
+                        options.FreshUploadInterval());
+    SetGeoTopicDuration(durations.has_consumer_offset_upload_interval, durations.consumer_offset_upload_interval_micros,
+                        options.ConsumerOffsetUploadInterval());
+    SetGeoTopicDuration(durations.has_positions_publish_interval, durations.positions_publish_interval_micros,
+                        options.PositionsPublishInterval());
+    SetGeoTopicDuration(durations.has_tombstone_grace, durations.tombstone_grace_micros, options.TombstoneGrace());
+    SetGeoTopicDuration(durations.has_positions_resume_timeout, durations.positions_resume_timeout_micros,
+                        options.PositionsResumeTimeout());
+    SetGeoTopicDuration(durations.has_long_term_rewrite_max_interval, durations.long_term_rewrite_max_interval_micros,
+                        options.LongTermRewriteMaxInterval());
+    return durations;
+}
+
 template <typename FfiOptions, typename Options>
 void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
     if (const auto &value = options.MessageExpiry()) {
@@ -98,7 +122,8 @@ void SetMutableTopicOptions(FfiOptions &ffi_options, const Options &options) {
         ffi_options.has_local_retention_size = true;
         ffi_options.local_retention_size     = std::string(value->Value());
     }
-    ffi_options.raw_options = ToFfiRawOptions(options.RawEntries());
+    ffi_options.geo_durations = ToFfiGeoTopicDurations(options);
+    ffi_options.raw_options   = ToFfiRawOptions(options.RawEntries());
 }
 
 }  // namespace
@@ -371,6 +396,14 @@ TopicDetails IggyBlockingClient::CreateTopic(const Identifier &stream,
             ffi_options.segment_max_age_kind  = std::string(value->Kind());
             ffi_options.segment_max_age_value = value->Value();
         }
+        if (auto value = options.TopicType()) {
+            ffi_options.has_topic_type = true;
+            ffi_options.topic_type     = std::string(iggy::to_string(*value));
+        }
+        if (auto value = options.GeoMode()) {
+            ffi_options.has_geo_mode = true;
+            ffi_options.geo_mode     = std::string(iggy::to_string(*value));
+        }
         return TopicDetails::FromFfi(Handle()->create_topic(stream.ToFfi(), name, std::move(ffi_options), error_info));
     });
 }
@@ -622,6 +655,11 @@ MetadataChanges IggyBlockingClient::GetMetadataChanges(const MetadataChangesQuer
 
 Stats IggyBlockingClient::GetStats() {
     return RethrowAsIggyException([this] { return Stats::FromFfi(Handle()->get_stats()); });
+}
+
+void IggyBlockingClient::RetireGeoOrigin(const std::string &origin) {
+    RethrowAsIggyException(
+        [this, &origin](ffi::ErrorInfo &error_info) { Handle()->retire_geo_origin(origin, error_info); });
 }
 
 IggyBlockingClient::IggyBlockingClient(ffi::Client *client) : client_(client) {

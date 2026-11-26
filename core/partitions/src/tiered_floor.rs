@@ -22,8 +22,9 @@
 //! agrees on what it may evict.
 //!
 //! Every partition registers the machine, so enabling tiered storage on a topic
-//! later needs no registration. Nothing proposes an advance yet, so the floor
-//! stays empty and adds nothing to a partition's checkpoint or transfer.
+//! later needs no registration. Only the primary of a tiered partition proposes
+//! an advance, once an upload stored a segment, so the floor of any other
+//! partition stays empty and adds nothing to its checkpoint or transfer.
 
 use std::fmt;
 

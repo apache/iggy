@@ -599,6 +599,8 @@ enum Mutation<S: DurableStorage> {
         initial: SegmentPosition,
         max_size: u64,
         max_age: Option<u64>,
+        /// Whether the segments hold placed batches.
+        placed: bool,
     },
     ReanchorSegments {
         epoch: u64,
@@ -951,6 +953,24 @@ impl<S: DurableStorage> PartitionPersistence<S> {
             initial,
             max_size,
             max_age,
+            placed: false,
+        });
+    }
+
+    /// [`Self::enable_segment_storage`] for a partition that places its
+    /// batches, whose segments hold placed batches.
+    pub fn enable_placed_segment_storage(
+        &self,
+        initial: SegmentPosition,
+        max_size: u64,
+        max_age: Option<u64>,
+    ) {
+        self.queue.borrow_mut().push_back(Mutation::EnableSegments {
+            epoch: self.epoch.get(),
+            initial,
+            max_size,
+            max_age,
+            placed: true,
         });
     }
 
@@ -1703,10 +1723,11 @@ impl<S: DurableStorage> PartitionPersistence<S> {
                 initial,
                 max_size,
                 max_age,
+                placed,
                 ..
             } => {
                 logs.data
-                    .enable_segment_storage(initial, max_size, max_age)
+                    .enable_segment_storage_of(initial, max_size, max_age, placed)
                     .await
             }
             Mutation::ReanchorSegments { next_offset, .. } => {

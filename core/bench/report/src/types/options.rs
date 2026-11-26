@@ -44,6 +44,10 @@ pub struct BenchmarkTopicOptions {
     pub messages_required_to_save: Option<u32>,
     pub max_topic_size: BenchmarkMaxTopicSize,
     pub message_expiry: BenchmarkMessageExpiry,
+    /// Absent in reports written before the bench could create tiered and geo topics, which all
+    /// ran on local topics.
+    #[serde(default)]
+    pub storage: BenchmarkTopicStorage,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -79,6 +83,19 @@ pub struct BenchmarkTcpOptions {
 pub enum BenchmarkDurability {
     Replicated,
     Persisted,
+}
+
+/// Where the topic keeps its messages.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BenchmarkTopicStorage {
+    /// On the disks of its replicas only.
+    #[default]
+    Local,
+    /// Sealed segments move to the object store.
+    Tiered,
+    /// A geo topic: each send goes to the object store before it commits.
+    Geo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -119,6 +136,7 @@ impl BenchmarkOptions {
                 messages_required_to_save: None,
                 max_topic_size: BenchmarkMaxTopicSize::Unlimited,
                 message_expiry: BenchmarkMessageExpiry::NeverExpire,
+                storage: BenchmarkTopicStorage::Local,
             },
             consumer,
             client: BenchmarkClientOptions {

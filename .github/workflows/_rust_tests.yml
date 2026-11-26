@@ -61,6 +61,14 @@ jobs:
         continue-on-error: true
         run: |
           if compgen -G 'target/*.profraw' > /dev/null; then
+            # cargo-llvm-cov takes an out/ directory with no fingerprint
+            # directory beside it for a build script OUT_DIR and skips it.
+            # The nextest archive unpacks the test binaries into out/ alone,
+            # so without the markers the report loses every test binary.
+            # Drop the markers once the pinned cargo-llvm-cov has the fix
+            # for https://github.com/taiki-e/cargo-llvm-cov/issues/520.
+            find target/debug/build -mindepth 3 -maxdepth 3 -type d -name out \
+              -execdir mkdir -p fingerprint \;
             cargo llvm-cov report --codecov --output-path codecov.json
           else
             echo "::notice::No coverage profiles found; skipping report"

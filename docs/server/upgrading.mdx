@@ -1,0 +1,55 @@
+---
+title: Upgrading from 0.9 to 0.10
+description: "Prepare a fresh data directory, matching clients and updated configuration for Apache Iggy 0.10.0."
+---
+
+Apache Iggy 0.10.0 changes the wire protocol, data directory format and public SDK APIs. Upgrade the server and clients together.
+
+## Preserve data before the upgrade
+
+There is no migration from a 0.9.x data directory. Keep a backup and export messages that you need with the old server and compatible clients. Start 0.10.0 with a separate, empty data directory. Import the retained data through a compatible client. Do not point the new server at the old directory.
+
+Do not use a rolling upgrade between server versions. Every cluster node must run the same server version. Keep the old deployment and its data available until you finish the cutover checks.
+
+## Upgrade clients and tools
+
+Server 0.10.0 uses client protocol 0.12.2. The server rejects incompatible binary clients at login. Use the versions in [Server compatibility](/docs/sdk/introduction#server-compatibility). The [0.9 documentation](/docs/0.9) remains available for the old deployment.
+
+Review API changes before recompiling applications. Resource creation uses typed options. Updates change only the fields supplied through set/reset patches. Stream and topic purge, flush unsaved buffer, and the old UpdateStream, UpdateTopic and UpdateUser wire commands are removed. The SDK update methods use UpdateResource internally.
+
+Rust stream builders take stream and topic names, without caller-assigned IDs. Python requires Python 3.11 or later. The [SDK guides](/docs/sdk/introduction) describe the release APIs and examples.
+
+## Review server configuration
+
+Compare your configuration with the [0.10 reference](/docs/server/configuration). Do not copy obsolete keys into the new deployment.
+
+- Set `IGGY_ROOT_USERNAME` and `IGGY_ROOT_PASSWORD` before first boot. The server no longer generates a root password. Use `--with-default-root-credentials` only for development.
+- Remove `consumer_group.session_timeout`. Session expiry derives from `heartbeat.interval` with a factor of 1.2. `consumer_group.heartbeat_interval` controls membership heartbeat pacing.
+- Replace `user_id` with `username` in `http.jwt.trusted_issuers`. The mapped account must exist and cannot be root. HTTP clients and the Web UI must log in again because old self-issued access and refresh tokens are rejected.
+- Supply a valid `logging.level`. An invalid filter stops startup. Log files rotate by size, with retention and total-size cleanup.
+- Keep `cluster.coordinator.replica_connections_per_peer` identical on all nodes. Cluster membership is limited to 32 nodes.
+- Keep node clocks synchronized. Authenticated HTTP forwarding uses short-lived proofs.
+
+New topics inherit `cluster.default_replication_factor`, which defaults to `all`. Select a different factor at topic creation with `replication_factor`. Existing topics retain their stored value. See [Multi-leader partitions](/docs/clustering/multi-leader).
+
+## Review consumer checkpoints
+
+A checkpoint records how far a consumer processed a partition. The current poll API defaults to manual commits. Rust high-level consumers also default to manual commits, and the stream builder starts with `PollingStrategy::next()`.
+
+Store offsets after processing, or select an explicit automatic commit policy. Without stored offsets, a restarted consumer can read retained messages again. Committing on read can advance the offset before application processing. See [Deferred polling](/docs/sdk/deferred-polling).
+
+Connector sinks use deferred polling. Replace `poll_interval` with `max_wait` and `min_count`. The runtime rejects a sink configuration that still sets `poll_interval`.
+
+## Review encryption
+
+Encryption is selected when a stream is created. Each encrypted stream has its own data key. Enabling server encryption does not encrypt an existing unencrypted stream. Keep all keys required to read retained streams and backups. See [Stream options](/docs/server/stream-options) for key creation and rotation.
+
+## Edge builds after 0.10.0
+
+Server 0.10.1-edge.2 changes the replica wire revision and the storage marker. Start every node with a fresh, empty data directory and upgrade all nodes together, as for 0.10.0. Access tokens issued by an earlier build are refused, so HTTP clients and the web UI sign in again.
+
+The build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
+
+## Check the cutover
+
+Run producers and consumers against the new deployment before moving application traffic. Test resource creation, permissions, message payloads and headers, checkpoints, and reconnects. For a cluster, also test requests to different partition primaries and node failure. An accepted write and a processed message are different events. Select the required [durability policies](/docs/server/durability) and commit behavior explicitly.
