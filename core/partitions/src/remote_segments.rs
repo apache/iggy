@@ -76,6 +76,23 @@ pub trait RemoteObjects {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>>;
+
+    /// As [`Self::get_range`], if `wanted` still says so when the read
+    /// starts. `None` when it does not, and the store is not asked.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            self.get_range(key, range).await.map(Some)
+        }
+        .boxed_local()
+    }
 }
 
 impl<S: ObjectStore> RemoteObjects for S {
@@ -123,8 +140,7 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        let request = TierJobRequest::new(self.class, self.scope.token())
-            .with_bytes(range.end.saturating_sub(range.start));
+        let request = self.request(&range);
         let key = key.to_owned();
         let job = self.executor.submit(request, move |store| async move {
             ObjectStore::get_range(&*store, &key, range).await
@@ -134,6 +150,36 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
                 .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
         }
         .boxed_local()
+    }
+
+    /// `wanted` is asked when the job starts, which can be long after it
+    /// queued.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        let request = self.request(&range);
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            ObjectStore::get_range(&*store, &key, range).await.map(Some)
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+}
+
+impl<E> ExecutorObjects<E> {
+    fn request(&self, range: &Range<u64>) -> TierJobRequest {
+        TierJobRequest::new(self.class, self.scope.token())
+            .with_bytes(range.end.saturating_sub(range.start))
     }
 }
 
@@ -197,6 +243,27 @@ fn slice_at(bytes: &Bytes, position: u64, range: &Range<u64>) -> Option<Bytes> {
     let start = usize::try_from(range.start.checked_sub(position)?).ok()?;
     let end = usize::try_from(range.end.checked_sub(position)?).ok()?;
     (end <= bytes.len()).then(|| bytes.slice(start..end))
+}
+
+/// The reads that fetch `ranges` of one object, in the order of their
+/// positions: ranges within [`FRESH_READ_GAP_BYTES`] of each other in one
+/// read of at most [`FRESH_READ_BYTES_MAX`], and a single range whatever its
+/// size.
+fn coalesced(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut reads: Vec<Range<u64>> = Vec::new();
+    for range in ranges {
+        match reads.last_mut() {
+            Some(read)
+                if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
+                    && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
+            {
+                read.end = read.end.max(range.end);
+            }
+            _ => reads.push(range),
+        }
+    }
+    reads
 }
 
 /// What one fetch read of a fresh object.
@@ -302,6 +369,27 @@ impl RemoteSegments {
             .filter(|blocks| blocks.cache().keeps_fetched())
     }
 
+    /// Whether the cache holds all `len` bytes of the segment in `source`
+    /// from byte `position`, so that a read of them asks the store nothing.
+    pub(crate) fn holds(&self, source: &RemoteRange, position: u64, len: usize) -> bool {
+        let start = source.range.start + position;
+        let end = start + len as u64;
+        end <= source.range.end
+            && self
+                .fetched_into_cache()
+                .is_some_and(|blocks| blocks.holds_segment(source, &(start..end)))
+    }
+
+    /// Drop what the cache holds of the `len` bytes of the segment in
+    /// `source` from byte `position`, which are not the batches that the
+    /// store holds there, so that the next read fetches them again.
+    pub(crate) fn forget_cached(&self, source: &RemoteRange, position: u64, len: usize) {
+        if let Some(blocks) = self.fetched_into_cache() {
+            let start = source.range.start + position;
+            blocks.forget_segment(source, &(start..start + len as u64));
+        }
+    }
+
     /// What the cache that these reads go through did since the last take,
     /// `None` without one.
     #[must_use]
@@ -401,8 +489,8 @@ impl RemoteSegments {
                 return Ok(blob);
             }
             if blocks.cache().keeps_fetched() {
-                let key = self.layout.fresh_key(object_id);
-                return blocks.read_fresh(object_id, &key, range).await;
+                let key_of = || self.layout.fresh_key(object_id);
+                return blocks.read_fresh(object_id, &key_of, range).await;
             }
         }
         self.read_fresh_from_store(object_id, range).await
@@ -460,10 +548,11 @@ impl RemoteSegments {
         log: &RemoteRange,
         cap: u64,
     ) -> Result<Bytes, DiskFault> {
-        let key = self.object_key(log, SegmentObject::Index);
         if let Some(blocks) = self.fetched_into_cache() {
-            return blocks.read_segment_index(log, &key, cap).await;
+            let key_of = || self.object_key(log, SegmentObject::Index);
+            return blocks.read_segment_index(log, &key_of, cap).await;
         }
+        let key = self.object_key(log, SegmentObject::Index);
         self.objects
             .get_range(&key, 0..cap)
             .await
@@ -474,11 +563,11 @@ impl RemoteSegments {
     /// Fetch the blobs at `ranges` of the fresh object `object_id`, and
     /// return what was read, so a poll of many batches of one object asks
     /// the store once and not once a batch. An object this shard holds is
-    /// read from memory. Through a cache that keeps what it fetches, the
-    /// blobs come in its blocks. Otherwise blobs that sit within
+    /// read from memory. Otherwise blobs that sit within
     /// [`FRESH_READ_GAP_BYTES`] of each other come in one read of at most
-    /// [`FRESH_READ_BYTES_MAX`]. The poll takes its blobs from the returned
-    /// reads, which the cache may have had no room to keep.
+    /// [`FRESH_READ_BYTES_MAX`], in the blocks of a cache that keeps what it
+    /// fetches. The poll takes its blobs from the returned reads, which the
+    /// cache may have had no room to keep.
     ///
     /// # Errors
     /// As [`Self::read_fresh`].
@@ -487,51 +576,34 @@ impl RemoteSegments {
         object_id: u128,
         ranges: &[Range<u64>],
     ) -> Result<FreshReads, DiskFault> {
-        let mut missing: Vec<Range<u64>> = ranges
+        if let Some(object) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.held_fresh(object_id))
+        {
+            return Ok(FreshReads {
+                object_id,
+                reads: vec![(0, object)],
+            });
+        }
+        let missing = ranges
             .iter()
             .filter(|range| range.start < range.end)
             .cloned()
             .collect();
-        if let Some(blocks) = &self.blocks {
-            if let Some(object) = blocks.held_fresh(object_id) {
-                return Ok(FreshReads {
-                    object_id,
-                    reads: vec![(0, object)],
-                });
-            }
-            let start = missing.iter().map(|range| range.start).min();
-            let end = missing.iter().map(|range| range.end).max();
-            if blocks.cache().keeps_fetched()
-                && let Some((start, end)) = start.zip(end)
-            {
-                let key = self.layout.fresh_key(object_id);
-                let bytes = blocks.read_fresh(object_id, &key, start..end).await?;
-                return Ok(FreshReads {
-                    object_id,
-                    reads: vec![(start, bytes)],
-                });
-            }
-        }
-        missing.sort_unstable_by_key(|range| range.start);
-        let mut reads: Vec<Range<u64>> = Vec::new();
-        for range in missing {
-            match reads.last_mut() {
-                Some(read)
-                    if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
-                        && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
-                {
-                    read.end = read.end.max(range.end);
-                }
-                _ => reads.push(range),
-            }
-        }
+        let reads = coalesced(missing);
+        let through_cache = self.fetched_into_cache();
+        let key_of = || self.layout.fresh_key(object_id);
         let mut fetched = FreshReads {
             object_id,
             reads: Vec::with_capacity(reads.len()),
         };
         for read in reads {
             let position = read.start;
-            let bytes = self.read_fresh_from_store(object_id, read).await?;
+            let bytes = match through_cache {
+                Some(blocks) => blocks.read_fresh(object_id, &key_of, read).await?,
+                None => self.read_fresh_from_store(object_id, read).await?,
+            };
             fetched.reads.push((position, bytes));
         }
         Ok(fetched)
@@ -565,7 +637,8 @@ impl RemoteSegments {
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
-    /// of the segment. `next` is the segment the reader goes on to, if it
+    /// of the segment, for a poll that reads `poll_offset` next when it
+    /// knows that offset. `next` is the segment the reader goes on to, if it
     /// is in the same store, which readahead may run on into.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
@@ -576,18 +649,20 @@ impl RemoteSegments {
         position: u64,
         len: usize,
         next: Option<&RemoteRange>,
+        poll_offset: Option<u64>,
     ) -> Result<Frozen<4096>, DiskFault> {
-        let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
         if let Some(blocks) = self.fetched_into_cache() {
-            let next_key = next.map(|next| self.object_key(next, next.key.object));
-            let next = next.zip(next_key.as_deref());
-            return blocks.read_segment(source, &key, start..end, next).await;
+            let key_of = |source: &RemoteRange| self.object_key(source, source.key.object);
+            return blocks
+                .read_segment(source, &key_of, start..end, next, poll_offset)
+                .await;
         }
+        let key = self.object_key(source, source.key.object);
         let object = self
             .objects
             .get_range(&key, start..end)

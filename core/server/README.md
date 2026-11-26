@@ -519,27 +519,30 @@ request fails with `FeatureUnavailable`.
 
 A poll reads an object in the store in blocks of `read_cache_block_size`,
 256 KiB by default, and each shard keeps up to `read_cache_size` of them in
-memory: tiered and long-term segments and their indexes, fresh objects, and the
-segments of geo peers. A smaller block wastes less on small or random reads,
-and a larger one suits consumers that read forward. A poll of bytes that
+memory: tiered and long-term segments, the indexes of long-term segments, fresh
+objects, and the segments of geo peers. The index of a tiered segment is not
+kept there: a poll fetches it once into a local index file on disk. A smaller
+block wastes less on small or random reads, and a larger one suits consumers
+that read forward. A poll of bytes that
 another poll read a moment ago takes them from there, and polls that miss the
 same block at once share one read. When polls read a segment in order, the
 shard also fetches up to `read_ahead` bytes past the last poll before any poll
 asks for them, on into the next segment. These fetches take the speculative
-fetch caps of `[tiered_storage.jobs]` and start only while no poll waits for
-the store. The same budget holds the fresh objects a shard uploads for geo
-topics, in up to seven eighths of it, until the long-term rewrite takes their
-messages, so a consumer at the tail reads them from memory, and a rewrite hands
-the end of each long-term segment it stores to the cache. A shard with a high
-upload rate wants 64 MiB or more. With `read_cache_size` at 0, each poll reads
-exactly its bytes from the store and nothing it fetches is kept, but the shard
-still holds what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes
-are served only while the node reads that peer, and never across a change of
-the cluster that owns its root. The counters `remote_read_block_hits`,
-`remote_read_block_misses`, `remote_read_ahead_hits`,
-`remote_read_blocks_fetched_ahead`, `remote_read_demand_bytes`,
-`remote_read_ahead_bytes`, `remote_read_fresh_releases` and
-`remote_read_carried_bytes`, and the gauges `remote_read_cache_bytes` and
+fetch caps of `[tiered_storage.jobs]`. One starts only while no fetch that a
+poll waits for is queued, and it can run beside the ones that already run. The
+same budget holds the fresh objects a shard uploads for geo topics, in up to
+seven eighths of it, until the long-term rewrite takes their messages, so a
+consumer at the tail reads them from memory, and a rewrite hands the end of
+each long-term segment it stores to the cache. A shard with a high upload rate
+wants 64 MiB or more. With `read_cache_size` at 0, each poll reads exactly its
+bytes from the store and nothing it fetches is kept, but the shard still holds
+what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes are served
+only while the node reads that peer, and never across a change of the cluster
+that owns its root. The counters `remote_read_block_hits_total`,
+`remote_read_block_misses_total`, `remote_read_ahead_hits_total`,
+`remote_read_blocks_fetched_ahead_total`, `remote_read_demand_bytes_total`,
+`remote_read_ahead_bytes_total`, `remote_read_fresh_releases_total` and
+`remote_read_carried_bytes_total`, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
 
 Each partition of a tiered topic also has a manifest object,

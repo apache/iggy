@@ -548,6 +548,8 @@ async fn rewritten_partition_reading_through(
         cache_bytes,
         block_bytes: 256 * 1024,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
     });
     partition.set_remote_segments(Rc::new(
         RemoteSegments::new(Rc::clone(&counted) as _, layout())
@@ -622,6 +624,8 @@ async fn given_an_object_this_shard_uploaded_when_the_rewrite_of_its_batches_com
         cache_bytes: 64 * 1024 * 1024,
         block_bytes: 256 * 1024,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
     });
     let remote = Rc::new(
         RemoteSegments::new(Rc::clone(&store) as _, layout())
@@ -656,6 +660,8 @@ async fn given_a_rewrite_that_stored_a_segment_when_polling_it_should_read_it_fr
             cache_bytes,
             block_bytes: 256 * 1024,
             read_ahead: 0,
+            read_ahead_fetches: 4,
+            read_ahead_fetch_bytes: 32 * 1024 * 1024,
         });
         partition.set_remote_segments(Rc::new(
             RemoteSegments::new(Rc::clone(&counted) as _, layout())
