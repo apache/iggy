@@ -102,6 +102,10 @@ pub struct ByteCache<K> {
     lines: [Line<K>; 5],
     budget: usize,
     entered: u64,
+    /// Keys of held entries that the cache let go of by itself since the
+    /// last [`ByteCache::take_let_go`]: released past their share, or
+    /// evicted when nothing else was left.
+    let_go: Vec<K>,
 }
 
 impl<K: Ord + Clone> ByteCache<K> {
@@ -118,6 +122,7 @@ impl<K: Ord + Clone> ByteCache<K> {
             ],
             budget,
             entered: 0,
+            let_go: Vec::new(),
         }
     }
 
@@ -170,12 +175,18 @@ impl<K: Ord + Clone> ByteCache<K> {
 
     /// Keep `bytes` under `key`. `held` is the memory the buffer takes, which
     /// can be more than its length. Bytes that do not fit the whole budget
-    /// are not kept, and neither are bytes of readahead that find no room
-    /// in its share and the small queue.
+    /// are not kept, and neither are held bytes past [`Self::held_limit`]
+    /// nor bytes of readahead that find no room in its share and the small
+    /// queue.
     pub fn insert(&mut self, key: K, bytes: Bytes, held: usize, admission: Admission) {
         // The store's objects never change, so bytes the cache holds already
         // are these bytes.
         if self.holds(&key) || held > self.budget {
+            return;
+        }
+        // Released as they entered, they would first release every older
+        // held entry for nothing.
+        if admission == Admission::Held && held > self.held_limit() {
             return;
         }
         match admission {
@@ -333,18 +344,29 @@ impl<K: Ord + Clone> ByteCache<K> {
         self.budget / AHEAD_SHARE
     }
 
-    /// Drop the oldest entry of `place` with nothing remembered. `false`
-    /// when it has none.
-    fn drop_oldest(&mut self, place: Place) -> bool {
-        self.lines[place as usize]
-            .oldest()
-            .inspect(|key| self.unlink(key))
-            .is_some()
+    /// The keys of the held entries that the cache let go of by itself
+    /// since the last call, in the order it did.
+    pub fn take_let_go(&mut self) -> Vec<K> {
+        std::mem::take(&mut self.let_go)
     }
 
     /// The most bytes that held entries take.
-    const fn held_limit(&self) -> usize {
+    #[must_use]
+    pub const fn held_limit(&self) -> usize {
         self.budget - self.budget / UNHELD_SHARE
+    }
+
+    /// Drop the oldest entry of `place` with nothing remembered. `false`
+    /// when it has none.
+    fn drop_oldest(&mut self, place: Place) -> bool {
+        let Some(key) = self.lines[place as usize].oldest() else {
+            return false;
+        };
+        if place == Place::Kept {
+            self.let_go.push(key.clone());
+        }
+        self.unlink(&key);
+        true
     }
 
     /// Release the oldest held entries until they take at most `limit`.
@@ -354,6 +376,7 @@ impl<K: Ord + Clone> ByteCache<K> {
                 return;
             };
             self.move_keeping_age(&key, Place::Small);
+            self.let_go.push(key);
         }
     }
 
@@ -993,6 +1016,43 @@ mod tests {
         assert_eq!(keys_in(&cache, Place::Small), [2]);
         assert!(!cache.entries.contains_key(&1), "nothing is remembered");
         assert_eq!(cache.held_apart(), 10);
+    }
+
+    /// Bytes past the held share would release every older held entry, and
+    /// then themselves.
+    #[test]
+    fn given_held_bytes_when_bytes_larger_than_the_held_share_are_held_should_refuse_them_and_keep_the_others()
+     {
+        let mut cache = ByteCache::new(80);
+        for key in [1, 2] {
+            cache.insert(key, buffer(10), 10, Admission::Held);
+        }
+
+        cache.insert(3, buffer(75), 75, Admission::Held);
+
+        assert!(!cache.holds(&3));
+        assert_eq!(keys_in(&cache, Place::Kept), [1, 2]);
+        assert_eq!(cache.take_let_go(), [0_u32; 0]);
+        assert_bounds(&cache);
+    }
+
+    /// Whoever holds bytes learns of each one the cache let go of, whether
+    /// past the held share or evicted when nothing else was left.
+    #[test]
+    fn given_held_bytes_that_the_cache_lets_go_of_when_taking_should_name_each_once() {
+        let mut cache = ByteCache::new(80);
+        for key in 1..=7 {
+            cache.insert(key, buffer(10), 10, Admission::Held);
+        }
+        // Nothing but held bytes to make room among.
+        cache.insert(50, buffer(20), 20, Admission::Read);
+        cache.insert(8, buffer(10), 10, Admission::Held);
+        cache.insert(9, buffer(10), 10, Admission::Held);
+
+        assert_eq!(cache.take_let_go(), [1, 2]);
+        assert_eq!(cache.take_let_go(), [0_u32; 0]);
+        assert!(!cache.is_held(&1) && !cache.is_held(&2));
+        assert_bounds(&cache);
     }
 
     /// A node that holds more than its share keeps what readers fetched

@@ -346,17 +346,24 @@ impl PlacedReadPlan {
                 let chunk = self
                     .wait(remote.read(&log, position, read, next.as_ref(), wanted.poll_offset()))
                     .await?;
-                match take_whole_batches(chunk.as_slice(), wanted, batches)? {
-                    Read::Batches(bytes) => {
+                let fault = match take_whole_batches(chunk.as_slice(), wanted, batches) {
+                    Ok(Read::Batches(bytes)) => {
                         position += bytes;
                         len = LONG_TERM_READ_BYTES;
+                        continue;
                     }
                     // The batch at `position` is larger than the chunk.
-                    Read::Needs(bytes) if bytes > len && position + bytes <= segment.size => {
+                    Ok(Read::Needs(bytes)) if bytes > len && position + bytes <= segment.size => {
                         len = bytes;
+                        continue;
                     }
-                    Read::Needs(_) => return Err(DiskFault::Tiered),
-                }
+                    Ok(Read::Needs(_)) => DiskFault::Tiered,
+                    Err(fault) => fault,
+                };
+                // Bytes that are not whole batches may be in the cache, and
+                // the next poll asks the store for them again.
+                remote.forget_cached(&log, position, read);
+                return Err(fault);
             }
         }
         Ok(())

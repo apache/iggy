@@ -358,11 +358,16 @@ where
         slot: StoreSlot,
     ) -> RemoteSegments {
         cache.filter(|cache| cache.keeps_fetched()).map_or_else(
-            || RemoteSegments::new(Rc::new(self.objects()), self.layout.clone()),
+            || {
+                RemoteSegments::new(
+                    Rc::new(self.objects(TierJobClass::DemandFetch)),
+                    self.layout.clone(),
+                )
+            },
             |cache| {
                 RemoteSegments::through_cache(
-                    Rc::new(self.objects()),
-                    Rc::new(self.ahead_objects()),
+                    Rc::new(self.objects(TierJobClass::DemandFetch)),
+                    Rc::new(self.objects(TierJobClass::SpeculativeFetch)),
                     self.layout.clone(),
                     cache,
                     slot,
@@ -387,24 +392,13 @@ where
         })
     }
 
-    fn objects(&self) -> PeerObjects<B> {
+    /// The reads of the polls of this peer's shadow partitions, in `class`
+    /// of the peer's tier service: demand fetches for what a poll waits
+    /// for, speculative fetches for readahead.
+    fn objects(&self, class: TierJobClass) -> PeerObjects<B> {
         PeerObjects {
             origin: self.origin.clone(),
-            reads: ExecutorObjects::new(self.service.clone()),
-            status: self.status.clone(),
-            polls: true,
-        }
-    }
-
-    /// [`Self::objects`] for readahead, in the speculative fetch class of the
-    /// peer's tier service.
-    fn ahead_objects(&self) -> PeerObjects<B> {
-        PeerObjects {
-            origin: self.origin.clone(),
-            reads: ExecutorObjects::with_class(
-                self.service.clone(),
-                TierJobClass::SpeculativeFetch,
-            ),
+            reads: ExecutorObjects::with_class(self.service.clone(), class),
             status: self.status.clone(),
             polls: true,
         }
@@ -803,7 +797,7 @@ mod tests {
         let provider = RecordingStore::new(stored);
         let calls = provider.calls();
         let peer = peer("dc-b", provider);
-        let objects = peer.objects();
+        let objects = peer.objects(TierJobClass::DemandFetch);
 
         let unverified = objects.get_range(&key, 0..5).await;
         assert!(
@@ -893,7 +887,11 @@ mod tests {
         );
         assert_eq!(calls.all(), Vec::new());
 
-        let polled = peer.objects().get_range(&key, 0..5).await.unwrap();
+        let polled = peer
+            .objects(TierJobClass::DemandFetch)
+            .get_range(&key, 0..5)
+            .await
+            .unwrap();
         assert_eq!(polled.bytes.as_ref(), b"bytes");
         assert_eq!(calls.all().len(), 1);
     }
