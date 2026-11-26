@@ -202,7 +202,7 @@ async fn given_a_committed_geo_topic_when_the_metadata_primary_reconciles_should
     let tmp = TempDir::new().unwrap();
     let config = geo_config(&tmp);
     let (shard, objects, key) = geo_primary(&config);
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
     let now = IggyTimestamp::now();
 
     geo_topics_pass(&ctx, now).await;
@@ -246,7 +246,7 @@ async fn given_a_node_that_cannot_publish_when_reconciling_should_store_nothing(
     let tmp = TempDir::new().unwrap();
     // A node without an origin publishes no geo topic.
     let (shard, objects, _) = geo_primary(&test_config(&tmp));
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(test_config(&tmp)));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(test_config(&tmp)));
     geo_topics_pass(&ctx, IggyTimestamp::now()).await;
     assert!(objects.executor().store().is_empty());
 
@@ -258,7 +258,7 @@ async fn given_a_node_that_cannot_publish_when_reconciling_should_store_nothing(
     let backup = build_test_shard(0, &config, mux);
     seed_cluster_uid(&backup, OWN_CLUSTER_UID);
     let objects = install_memory_topic_objects(&backup);
-    let ctx = make_ctx(backup, 1, Rc::new(config));
+    let ctx = make_ctx(backup, Rc::new(config));
     geo_topics_pass(&ctx, IggyTimestamp::now()).await;
     assert!(objects.executor().store().is_empty());
 }
@@ -272,7 +272,7 @@ async fn given_a_deleted_geo_topic_when_the_sweep_runs_should_keep_its_tombstone
     // The deletes of removed incarnations run beside the sweep, and must
     // leave the geo topic to it.
     let deleter = install_memory_deleter(&shard);
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
     reconcile_pass(&ctx).await;
     let store = objects.executor().store();
     let normal = committed_prefix(&shard, IggyNamespace::new(0, 1, 0));
@@ -331,7 +331,7 @@ async fn given_a_deleted_geo_topic_with_its_own_grace_when_the_sweep_runs_should
             ..GeoTopicDurations::default()
         },
     );
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
     reconcile_pass(&ctx).await;
     let start = IggyTimestamp::now();
     geo_topics_pass(&ctx, start).await;
@@ -363,7 +363,7 @@ async fn given_an_object_that_the_store_lost_or_a_deposed_primary_tombstoned_whe
     let tmp = TempDir::new().unwrap();
     let config = geo_config(&tmp);
     let (shard, objects, key) = geo_primary(&config);
-    let ctx = make_ctx(shard, 1, Rc::new(config));
+    let ctx = make_ctx(shard, Rc::new(config));
     let start = IggyTimestamp::now();
     geo_topics_pass(&ctx, start).await;
     let live = stored_object(&objects, key);
@@ -400,7 +400,7 @@ async fn given_a_renamed_stream_when_the_metadata_primary_reconciles_should_stor
     let tmp = TempDir::new().unwrap();
     let config = geo_config(&tmp);
     let (shard, objects, key) = geo_primary(&config);
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
     let start = IggyTimestamp::now();
     geo_topics_pass(&ctx, start).await;
 
@@ -429,7 +429,7 @@ async fn given_a_geo_topic_the_node_cannot_describe_when_the_sweep_runs_should_l
     let tmp = TempDir::new().unwrap();
     let config = geo_config(&tmp);
     let (shard, objects, key) = geo_primary(&config);
-    let ctx = make_ctx(Rc::clone(&shard), 1, Rc::new(config));
+    let ctx = make_ctx(Rc::clone(&shard), Rc::new(config));
     let start = IggyTimestamp::now();
     geo_topics_pass(&ctx, start).await;
     let stored = stored_object(&objects, key);

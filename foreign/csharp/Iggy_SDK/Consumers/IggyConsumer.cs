@@ -30,6 +30,7 @@ namespace Apache.Iggy.Consumers;
 /// <summary>
 ///     Hands over the messages of a topic one at a time, on a <see cref="PartitionReader" />: a standalone consumer
 ///     reads the partitions of its configuration, a consumer group reads the assignment of its member.
+///     A later receive or handler loop resumes the unread remainder of its batch. Use one loop at a time.
 /// </summary>
 /// <remarks>
 ///     <para>
@@ -38,8 +39,8 @@ namespace Apache.Iggy.Consumers;
 ///         <see cref="CommitAsync" />. With <see cref="CommitMode.OnRead" /> the server stores the offset of each read,
 ///         and <see cref="ShutdownAsync(CancellationToken)" /> moves it back to the last message handed over. With
 ///         <see cref="CommitMode.Auto" /> the consumer counts each message, with <see cref="CommitAfter.Delivery" />
-///         when it is handed over, with <see cref="CommitAfter.Processing" /> once the stream is read again, or once
-///         the handler of <see cref="ConsumeAsync" /> returns with success, and with <see cref="CommitAfter.Marked" />
+///         when it is handed over, with <see cref="CommitAfter.Processing" /> when a stream advances, a later loop
+///         starts, or a handler returns with success, and with <see cref="CommitAfter.Marked" />
 ///         on <see cref="Mark" />. It stores the latest counted position at the interval or the event of the policy,
 ///         before a rebalance takes a partition away, and on shutdown.
 ///     </para>
@@ -71,6 +72,9 @@ public partial class IggyConsumer : IAsyncDisposable
     private TaskCompletionSource? _handling;
     private TaskCompletionSource? _shutdown;
     private PartitionReader? _reader;
+    private PolledMessages? _currentBatch;
+    private int _nextMessageIndex;
+    private int _receiving;
     private int _state;
     private (Checkpoint Checkpoint, bool EndsBatch)? _uncounted;
 
@@ -179,22 +183,26 @@ public partial class IggyConsumer : IAsyncDisposable
 
     /// <summary>
     ///     Receives messages one at a time. The stream ends once the consumer shuts down. With
-    ///     <see cref="CommitAfter.Processing" /> a message counts once the stream is read again, or on shutdown.
+    ///     <see cref="CommitAfter.Processing" /> a message counts when this stream advances, a later receive or
+    ///     handler loop starts, or the consumer shuts down.
     /// </summary>
     /// <param name="ct">Cancellation token to stop receiving messages</param>
     /// <exception cref="ConsumerNotInitializedException">Thrown when InitAsync has not been called</exception>
+    /// <exception cref="InvalidOperationException">Another receive or handler loop is active.</exception>
     public async IAsyncEnumerable<ReceivedMessage> ReceiveAsync([EnumeratorCancellation] CancellationToken ct = default)
     {
-        ThrowIfNotReading();
+        using var loop = EnterLoop();
+        CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            for (var index = 0; index < batch.Messages.Count; index++)
+            while (CanDeliver(batch))
             {
                 if (ct.IsCancellationRequested || IsDisposed)
                 {
                     yield break;
                 }
 
+                var index = _nextMessageIndex++;
                 var message = batch.Messages[index];
                 var checkpoint = batch.CheckpointAt(index)!;
                 Hand(checkpoint, index == batch.Messages.Count - 1);
@@ -218,20 +226,23 @@ public partial class IggyConsumer : IAsyncDisposable
     ///     <see cref="ShutdownAsync(CancellationToken)" /> from outside the handler waits for the handler that runs.
     /// </summary>
     /// <exception cref="Exception">The error of the first handler that failed. Its message is not counted.</exception>
+    /// <exception cref="InvalidOperationException">Another receive or handler loop is active.</exception>
     public async Task ConsumeAsync(Func<ReceivedMessage, CancellationToken, Task> handler,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(handler);
-        ThrowIfNotReading();
+        using var loop = EnterLoop();
+        CountProcessed();
         while (await NextBatchAsync(ct) is { } batch)
         {
-            for (var index = 0; index < batch.Messages.Count; index++)
+            while (CanDeliver(batch))
             {
                 if (ct.IsCancellationRequested || IsDisposed)
                 {
                     return;
                 }
 
+                var index = _nextMessageIndex++;
                 var message = batch.Messages[index];
                 var checkpoint = batch.CheckpointAt(index)!;
                 var endsBatch = index == batch.Messages.Count - 1;
@@ -289,9 +300,14 @@ public partial class IggyConsumer : IAsyncDisposable
     }
 
     /// <summary>Sets the next read position of a partition, as <see cref="PartitionReader.SeekAsync" /> does.</summary>
-    public Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
+    public async Task SeekAsync(uint partitionId, PollingStrategy start, CancellationToken ct = default)
     {
-        return Reader.SeekAsync(partitionId, start, ct);
+        await Reader.SeekAsync(partitionId, start, ct);
+        var current = Volatile.Read(ref _currentBatch);
+        if (current?.PartitionId == partitionId && !Reader.Keeps(current))
+        {
+            Interlocked.CompareExchange(ref _currentBatch, null, current);
+        }
     }
 
     /// <summary>
@@ -346,6 +362,7 @@ public partial class IggyConsumer : IAsyncDisposable
 
     private async Task ShutdownOnceAsync(CancellationToken token)
     {
+        Volatile.Write(ref _currentBatch, null);
         await _lifetime.CancelAsync();
         // The message of a running handler counts only once the handler returns with success.
         if (!_handlerRunning.Value && Volatile.Read(ref _handling) is { } handling)
@@ -414,20 +431,39 @@ public partial class IggyConsumer : IAsyncDisposable
     private PartitionReader Reader => _reader ?? throw new ConsumerNotInitializedException();
 
     /// <summary>
-    ///     The next batch of the reader, or null once the consumer shut down or <paramref name="ct" /> was canceled. A
-    ///     read error that the reader retries goes to the error events and the reader goes on. A message that does
+    ///     The current batch while it has unread messages, otherwise the next batch of the reader. Null once the
+    ///     consumer shuts down or <paramref name="ct" /> is canceled. A read error that the reader retries goes to
+    ///     the error events and the reader goes on. A message that does
     ///     not decode, whose <see cref="ReadException.Skip" /> passes it, an error that stops a partition and a lost
     ///     range end the stream with their <see cref="ReadException" />. Only the error tells of a lost range, and
     ///     the error events can have no subscriber.
     /// </summary>
     private protected async Task<PolledMessages?> NextBatchAsync(CancellationToken ct)
     {
+        if (IsDisposed || ct.IsCancellationRequested)
+        {
+            return null;
+        }
+        if (Volatile.Read(ref _currentBatch) is { } current && CanDeliver(current))
+        {
+            return current;
+        }
+        Volatile.Write(ref _currentBatch, null);
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(ct, _lifetime.Token);
         while (!IsDisposed && !ct.IsCancellationRequested)
         {
             try
             {
-                return await Reader.NextAsync(cancellation.Token);
+                var batch = await Reader.NextAsync(cancellation.Token);
+                _nextMessageIndex = 0;
+                Volatile.Write(ref _currentBatch, batch);
+                if (IsDisposed)
+                {
+                    Volatile.Write(ref _currentBatch, null);
+                    return null;
+                }
+
+                return batch;
             }
             catch (ReadException error) when (error.Skip is null && !error.StopsPartition && error.Lost is null)
             {
@@ -446,9 +482,16 @@ public partial class IggyConsumer : IAsyncDisposable
         return null;
     }
 
+    private bool CanDeliver(PolledMessages batch)
+    {
+        return _nextMessageIndex < batch.Messages.Count &&
+               ReferenceEquals(Volatile.Read(ref _currentBatch), batch) && Reader.Keeps(batch);
+    }
+
     /// <summary>
     ///     Records a message as handed over, and counts it there under <see cref="CommitAfter.Delivery" />. Under
-    ///     <see cref="CommitAfter.Processing" /> a message of a stream counts once the stream is read again.
+    ///     <see cref="CommitAfter.Processing" /> a message of a stream counts when the stream advances, a later loop
+    ///     starts, or the consumer shuts down.
     /// </summary>
     private protected void Hand(Checkpoint checkpoint, bool endsBatch, bool streamed = true)
     {
@@ -479,6 +522,25 @@ public partial class IggyConsumer : IAsyncDisposable
         if (!IsInitialized && !IsDisposed)
         {
             throw new ConsumerNotInitializedException();
+        }
+    }
+
+    private ReceiveLoop EnterLoop()
+    {
+        ThrowIfNotReading();
+        if (Interlocked.CompareExchange(ref _receiving, 1, 0) != 0)
+        {
+            throw new InvalidOperationException("Only one receive or handler loop may be active at a time.");
+        }
+
+        return new ReceiveLoop(this);
+    }
+
+    private readonly struct ReceiveLoop(IggyConsumer consumer) : IDisposable
+    {
+        public void Dispose()
+        {
+            Volatile.Write(ref consumer._receiving, 0);
         }
     }
 

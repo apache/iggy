@@ -115,6 +115,10 @@ pub struct Connection {
     /// THIS socket was told, and a client that reconnects re-seeds from the
     /// session it binds.
     pub metadata_watermark: u64,
+    /// The applied metadata frontier when a partition request of this
+    /// connection last waited for it in vain. The drains of the connection
+    /// hand it on, one to the next.
+    frontier_wait_expired_at: Option<u64>,
     consumer_session: Option<(u128, SessionAttachment)>,
     deferred_requests: AHashMap<u64, DeferredRequestEntry>,
 }
@@ -181,6 +185,7 @@ impl SessionManager {
                 last_heartbeat: now,
                 sdk: None,
                 metadata_watermark: 0,
+                frontier_wait_expired_at: None,
                 consumer_session: None,
                 deferred_requests: AHashMap::new(),
             });
@@ -452,6 +457,26 @@ impl SessionManager {
     pub fn record_metadata_watermark(&mut self, connection_id: u128, commit: u64) {
         if let Some(conn) = self.connections.get_mut(&connection_id) {
             conn.metadata_watermark = conn.metadata_watermark.max(commit);
+        }
+    }
+
+    /// The frontier mark that the last drain of the connection left. `None`
+    /// for an unknown connection.
+    pub(crate) fn frontier_wait_expired_at(&self, connection_id: u128) -> Option<u64> {
+        self.connections
+            .get(&connection_id)?
+            .frontier_wait_expired_at
+    }
+
+    /// Keeps the frontier mark of a drain that ended for the next drain of
+    /// the connection. No-op for an unknown connection.
+    pub(crate) fn record_frontier_wait_expired(
+        &mut self,
+        connection_id: u128,
+        expired_at: Option<u64>,
+    ) {
+        if let Some(connection) = self.connections.get_mut(&connection_id) {
+            connection.frontier_wait_expired_at = expired_at;
         }
     }
 

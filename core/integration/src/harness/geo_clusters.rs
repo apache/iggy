@@ -687,23 +687,9 @@ impl Bucket {
     /// The read fails.
     pub async fn object(&self, key: &str) -> Result<Option<Vec<u8>>, TestBinaryError> {
         let (path, key) = (self.path.clone(), key.to_owned());
-        on_compio(move || async move {
-            let store = reader(&path);
-            let size = match store.head(&key).await {
-                Ok(meta) => meta.size,
-                Err(error) if error.class() == ErrorClass::NotFound => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            if size == 0 {
-                return Ok(Some(Vec::new()));
-            }
-            store
-                .get_range(&key, 0..size)
-                .await
-                .map(|range| Some(range.bytes.to_vec()))
-        })
-        .await?
-        .map_err(store_error)
+        on_compio(move || async move { read_current(&reader(&path), &key).await })
+            .await?
+            .map_err(store_error)
     }
 
     /// The bytes of every file in the bucket but scratch files and other
@@ -1117,11 +1103,16 @@ async fn read_whole(
     store: &FsStore,
     listed: &ListedObject,
 ) -> Result<Option<Vec<u8>>, ObjectStoreError> {
-    if listed.size == 0 {
-        return Ok(Some(Vec::new()));
-    }
-    match store.get_range(&listed.key, 0..listed.size).await {
+    read_current(store, &listed.key).await
+}
+
+/// The body of the object under `key` as it is now, `None` when there is
+/// none. A cluster replaces objects such as its manifests under the same key,
+/// so a size that a listing or a head read before can be stale by the read.
+async fn read_current(store: &FsStore, key: &str) -> Result<Option<Vec<u8>>, ObjectStoreError> {
+    match store.get_range(key, 0..u64::MAX).await {
         Ok(range) => Ok(Some(range.bytes.to_vec())),
+        Err(ObjectStoreError::InvalidRange { start: 0, .. }) => Ok(Some(Vec::new())),
         Err(error) if error.class() == ErrorClass::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -1149,4 +1140,48 @@ where
             message: "the bucket reader stopped without an answer".to_owned(),
         })?
         .map_err(TestBinaryError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iggy_object_store::{PutBody, PutOptions};
+
+    const KEY: &str = "iggy/meta/7/manifest.bin";
+
+    async fn put(store: &FsStore, body: &'static [u8]) {
+        store
+            .put(KEY, PutBody::from_bytes(body), &PutOptions::default())
+            .await
+            .expect("put the object");
+    }
+
+    #[test]
+    fn given_an_object_replaced_after_its_listing_when_read_should_return_its_current_body() {
+        let directory = tempfile::tempdir().expect("a directory for the bucket");
+        let runtime = compio::runtime::Runtime::new().expect("a compio runtime");
+        runtime.block_on(async {
+            let writer = FsStore::new(directory.path());
+            put(&writer, b"short").await;
+            let bucket = reader(directory.path());
+            let listed = list(&bucket, "iggy/meta/")
+                .await
+                .expect("list the bucket")
+                .into_iter()
+                .find(|listed| listed.key == KEY)
+                .expect("the object is listed");
+
+            put(&writer, b"grown longer").await;
+
+            assert_eq!(
+                read_whole(&bucket, &listed).await.expect("read the object"),
+                Some(b"grown longer".to_vec())
+            );
+            put(&writer, b"").await;
+            assert_eq!(
+                read_whole(&bucket, &listed).await.expect("read the object"),
+                Some(Vec::new())
+            );
+        });
+    }
 }

@@ -39,7 +39,9 @@ use crate::dispatch::partition::{
     PartitionAdmission, dispatch_partition_request, resolve_delete_segments_truncate,
 };
 use crate::dispatch::session_ops::submit_logout_on_owner;
-use crate::dispatch::submit::{committed_reply_commit, submit_client_request_on_owner};
+use crate::dispatch::submit::{
+    PartitionCreate, await_created_partitions, committed_reply_commit, submit_before_partition_wait,
+};
 use crate::http::admission::admit_partition_write;
 use crate::http::error::{PartitionWriteError, WriteError};
 use crate::http::reply::{classify_partition_reply, committed_payload, eviction_error};
@@ -62,7 +64,8 @@ const TRANSIENT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Total replay budget for one control-plane write, mirroring the binary
 /// SDKs' `RESPONSE_READ_TIMEOUT` bound on the same loop. On exhaustion the op
 /// has still not entered consensus, so the caller gets a retryable 503, never
-/// a terminal error.
+/// a terminal error. The partition wait of a committed create ends with the
+/// same budget, counted from the start of the write.
 const TRANSIENT_RETRY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Run one authenticated control-plane write to commit and hand back the
@@ -101,10 +104,15 @@ pub(in crate::http) async fn submit_committed(
     let shard = Rc::clone(&state.shard);
     let task_session = Rc::clone(session);
     let watermarks = Rc::clone(&state.metadata_watermarks);
+    // Taken before the gate and the commit: a relay cuts its attempt at
+    // `FORWARD_ATTEMPT_TIMEOUT` after it sent the write, so a wait that
+    // starts after a late commit must not run for its full length.
+    let partition_wait_end = Instant::now() + TRANSIENT_RETRY_DEADLINE;
     // Detached so a client disconnect cannot abandon the gate mid-submit;
     // the write runs to completion regardless of handler liveness.
     compio::runtime::spawn(async move {
-        let result = submit_gated(&shard, &task_session, operation, &body).await;
+        let result =
+            submit_gated(&shard, &task_session, operation, &body, partition_wait_end).await;
         // Recorded here rather than after the await below, for the same reason
         // the submit is detached: a caller that disconnected mid-write still
         // committed the op, and its next request as this user must not be
@@ -188,11 +196,18 @@ pub(in crate::http) async fn submit_committed(
 /// current-password check is not a rejection here: the op still commits with an
 /// emptied new-password sentinel that the replicated apply grades to
 /// `InvalidCredentials` (see `verify_and_rewrite_change_password`).
+///
+/// The committed success of a create that adds partitions returns only after
+/// [`await_created_partitions`], as on the binary transports. That wait runs
+/// after the gate is released, and it ends at `partition_wait_end` at the
+/// latest. The create is committed by then, so the reply leaves unchanged and
+/// a request that follows it can find a partition that is not built yet.
 async fn submit_gated(
     shard: &Rc<ServerShard>,
     session: &HttpSession,
     operation: Operation,
     body: &[u8],
+    partition_wait_end: Instant,
 ) -> Result<(RoutedRequestHeader, Message<GenericHeader>, Option<String>), WriteError> {
     let mut next_request_id = session.gate.lock().await;
     ensure_active_user(shard, session.user_id, &session.credential)
@@ -234,6 +249,7 @@ async fn submit_gated(
         message
     };
     let request_header = *message.header();
+    let create = PartitionCreate::named_by(&message);
     let deadline = Instant::now() + TRANSIENT_RETRY_DEADLINE;
     let mut request = message;
     let mut saw_not_committed = false;
@@ -249,7 +265,7 @@ async fn submit_gated(
         }
         let retry_request = request.clone();
         // A missing verdict leaves the outcome unknown, as a canceled prepare does.
-        let transient = match submit_client_request_on_owner(shard, request).await {
+        let transient = match submit_before_partition_wait(shard, request).await {
             Some(reply) => {
                 let transient = (reply.header().command == Command::Reply)
                     .then(|| transient_code(&reply))
@@ -306,6 +322,17 @@ async fn submit_gated(
             // Already burned at stamp time; release the gate so the next
             // write on this session can take its turn.
             drop(next_request_id);
+            // After the release: the wait can last as long as a partition
+            // build, and the gate would stall every write of this login.
+            if let Some(create) = &create {
+                // A wait that ends here drops its reply receivers only: the
+                // owners end their holds as they do after a read timeout.
+                let _ = compio::time::timeout(
+                    partition_wait_end.saturating_duration_since(Instant::now()),
+                    await_created_partitions(shard, create, &reply),
+                )
+                .await;
+            }
             Ok((request_header, reply, raw_token))
         }
         Command::Eviction => Err(WriteError::Evicted(eviction_error(&reply))),
@@ -482,6 +509,7 @@ async fn partition_write(
             PartitionWriteError::Unavailable
         })?;
     let attachment = session.attachment.borrow().clone();
+    let mut admitted = false;
     let outcome =
         compio::time::timeout(deadline.saturating_duration_since(Instant::now()), async {
             let admission = dispatch_partition_request(
@@ -496,10 +524,9 @@ async fn partition_write(
                 None,
             )
             .await;
+            admitted = admission == PartitionAdmission::Admitted;
             // A deny is already in the reply slot, so NoAck answers it below.
-            if admission == PartitionAdmission::Admitted
-                && let Some(dispatched) = dispatched.take()
-            {
+            if admitted && let Some(dispatched) = dispatched.take() {
                 let _ = dispatched.send(Ok(()));
             }
             receiver.await
@@ -511,6 +538,12 @@ async fn partition_write(
             let reply = reply.into_contiguous();
             classify_partition_reply(&reply).map(|header| (reply, header))
         }
+        // The deadline passed in a wait of the dispatch, before the partition
+        // plane took the write. Nothing can commit, so the caller may send
+        // the write again.
+        Err(_) if !admitted => Err(PartitionWriteError::Rejected(
+            IggyError::TransientNotAccepted,
+        )),
         Ok(Err(_)) | Err(_) => Err(PartitionWriteError::Timeout(operation)),
     }
 }
@@ -583,10 +616,32 @@ fn ensure_in_process_reply_target(state: &HttpInner, session: &HttpSession) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dispatch::test_support::{register_reply, request_message};
-    use crate::http::reads::tests::read_state;
+    use crate::consumer_group::lease::SessionActivity;
+    use crate::dispatch::test_support::{prepare_message, register_reply, request_message};
+    use crate::http::reads::tests::{read_state, read_state_on};
+    use crate::http::session::FIRST_REQUEST_ID;
+    use crate::http::state::HttpState;
     use consensus::Plane;
+    use futures::{FutureExt as _, poll};
+    use iggy_binary_protocol::primitives::partition_assignment::CreatedPartitionAssignment;
+    use iggy_binary_protocol::requests::streams::CreateStreamRequest;
+    use iggy_binary_protocol::requests::topics::{
+        CreateTopicRequest, CreateTopicWithAssignmentsRequest,
+    };
+    use iggy_binary_protocol::requests::users::login_register::CredentialProof;
+    use iggy_binary_protocol::{
+        ConsumerSession, PrepareHeader, WireEncode, WireIdentifier, WireName, WireOptions,
+    };
+    use iggy_common::defaults::DEFAULT_ROOT_USER_ID;
+    use metadata::stm::StateMachine as _;
+    use metadata::stm::user::{ROOT_USER_ACCESS_REVISION, ROOT_USER_CREATED_AT_MICROS};
+    use shard::{
+        LifecycleFrame, PartitionRead, PartitionReadReply, Receiver, ShardFrame, shard_channel,
+    };
+    use std::cell::{Cell, RefCell};
     use std::mem::size_of;
+    use std::pin::pin;
+    use tokio::sync::Mutex;
 
     #[compio::test]
     async fn given_no_reply_owner_when_metadata_replays_should_not_fire_http_slot() {
@@ -665,5 +720,316 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reply.header().command, Command::Eviction);
+    }
+
+    /// A login whose create of a one-partition topic is committed under
+    /// `FIRST_REQUEST_ID`, while the owner shard of the new partition has not
+    /// answered for it.
+    struct PendingCreate {
+        state: HttpState,
+        session: HttpSession,
+        owner_inbox: Receiver<ShardFrame>,
+        _owner_replies: Receiver<ShardFrame>,
+        topic_body: Bytes,
+    }
+
+    impl PendingCreate {
+        const CLIENT: u128 = 43;
+        /// The session that `prepare_message` stamps.
+        const SESSION: u64 = 1;
+        const CREATE_OP: u64 = 7;
+
+        fn new() -> Self {
+            let (sender, owner_inbox, owner_replies) = shard_channel(0, 1, 1);
+            let state = read_state_on(Some(sender), None);
+            let metadata = state.shard.plane.metadata();
+            metadata
+                .mux_stm
+                .update(prepare_message(
+                    Operation::CreateStream,
+                    0,
+                    1,
+                    &Self::stream("stream"),
+                ))
+                .unwrap();
+            let attachment = {
+                let mut client_table = metadata.client_table.borrow_mut();
+                client_table
+                    .commit_register(
+                        Self::CLIENT,
+                        DEFAULT_ROOT_USER_ID,
+                        [0x5a; 32],
+                        register_reply(Self::CLIENT, Self::SESSION),
+                    )
+                    .unwrap();
+                client_table
+                    .attach_session(Self::CLIENT, Self::SESSION, DEFAULT_ROOT_USER_ID)
+                    .unwrap()
+            };
+            let session = HttpSession {
+                attachment: RefCell::new(attachment),
+                activity: Rc::new(SessionActivity::new(
+                    ConsumerSession {
+                        client_id: Self::CLIENT,
+                        session: Self::SESSION,
+                    },
+                    u64::MAX,
+                )),
+                key: String::new(),
+                client_id: Self::CLIENT,
+                session: Self::SESSION,
+                user_id: DEFAULT_ROOT_USER_ID,
+                credential: CredentialProof::account(
+                    ROOT_USER_CREATED_AT_MICROS,
+                    ROOT_USER_ACCESS_REVISION,
+                ),
+                expiry: u64::MAX,
+                gate: Mutex::new(FIRST_REQUEST_ID),
+                data_gate: Mutex::new(FIRST_REQUEST_ID),
+                partition_gates: RefCell::default(),
+                registry_token: Cell::new(None),
+                in_flight_writes: Cell::new(0),
+            };
+            let topic = CreateTopicWithAssignmentsRequest {
+                request: CreateTopicRequest {
+                    stream_id: WireIdentifier::numeric(0),
+                    partitions_count: 1,
+                    name: WireName::new("topic").unwrap(),
+                    options: WireOptions::empty(),
+                },
+                derived_options: WireOptions::empty(),
+                partitions: vec![CreatedPartitionAssignment {
+                    initial_view: 0,
+                    partition_id: 0,
+                    consensus_group_id: 1,
+                    members: Vec::new(),
+                }],
+            };
+            let fixture = Self {
+                state,
+                session,
+                owner_inbox,
+                _owner_replies: owner_replies,
+                topic_body: topic.request.to_bytes(),
+            };
+            fixture.commit(
+                Operation::CreateTopicWithAssignments,
+                FIRST_REQUEST_ID,
+                Self::CREATE_OP,
+                &topic.to_bytes(),
+            );
+            fixture
+        }
+
+        /// A `SendMessages` to the partition of the topic. That partition
+        /// has no routing row, so the dispatch asks its owner first.
+        async fn send_messages(
+            &self,
+        ) -> Result<(Frozen<MESSAGE_ALIGN>, ReplyHeader), PartitionWriteError> {
+            const DEADLINE: Duration = Duration::from_millis(50);
+            partition_write_replicated(
+                &self.state,
+                &self.session,
+                Operation::SendMessages,
+                &[],
+                IggyNamespace::new(0, 0, 0),
+                PartitionContext::default(),
+                Instant::now() + DEADLINE,
+            )
+            .await
+        }
+
+        fn stream(name: &str) -> Bytes {
+            CreateStreamRequest {
+                name: WireName::new(name).unwrap(),
+                options: WireOptions::empty(),
+            }
+            .to_bytes()
+        }
+
+        /// Commits a write of the session whose reply never reached the
+        /// caller, so the submit of that request id gets the cached reply.
+        fn commit(&self, operation: Operation, request: u64, op: u64, body: &[u8]) {
+            let metadata = self.state.shard.plane.metadata();
+            let prepare = prepare_message(operation, Self::CLIENT, request, body).transmute_header(
+                |old, header: &mut PrepareHeader| {
+                    *header = old;
+                    header.op = op;
+                },
+            );
+            metadata::apply_committed_prepare(
+                &*metadata.mux_stm,
+                &metadata.client_table,
+                true,
+                |_| {},
+                prepare,
+            );
+        }
+    }
+
+    /// The owner shard of the new partition has not answered, so the create
+    /// waits. The next write of the same login must not wait behind it.
+    #[compio::test]
+    async fn given_committed_create_over_http_when_the_build_is_pending_should_release_the_session_gate()
+     {
+        const NEXT_REQUEST_ID: u64 = FIRST_REQUEST_ID + 1;
+        const NEXT_OP: u64 = PendingCreate::CREATE_OP + 1;
+        let fixture = PendingCreate::new();
+        let mut created = pin!(submit_gated(
+            &fixture.state.shard,
+            &fixture.session,
+            Operation::CreateTopic,
+            &fixture.topic_body,
+            Instant::now() + TRANSIENT_RETRY_DEADLINE,
+        ));
+        assert!(
+            poll!(created.as_mut()).is_pending(),
+            "the create waits for the owner of its partition"
+        );
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            read: PartitionRead::Primary,
+            reply: built,
+            ..
+        })) = fixture.owner_inbox.try_recv()
+        else {
+            panic!("the owner is asked for the new partition");
+        };
+
+        let next_body = PendingCreate::stream("next");
+        fixture.commit(
+            Operation::CreateStream,
+            NEXT_REQUEST_ID,
+            NEXT_OP,
+            &next_body,
+        );
+        let Some(Ok((_, next_reply, _))) = submit_gated(
+            &fixture.state.shard,
+            &fixture.session,
+            Operation::CreateStream,
+            &next_body,
+            Instant::now() + TRANSIENT_RETRY_DEADLINE,
+        )
+        .now_or_never() else {
+            panic!("the next write of the session must pass the gate while the create waits");
+        };
+        assert_eq!(committed_reply_commit(&next_reply), Some(NEXT_OP));
+        assert!(
+            poll!(created.as_mut()).is_pending(),
+            "the create still waits for its partition"
+        );
+
+        built
+            .try_send(PartitionReadReply::Primary {
+                view: 0,
+                primary: 0,
+            })
+            .unwrap();
+        let Ok((_, create_reply, _)) = created.await else {
+            panic!("the create is committed");
+        };
+        assert_eq!(
+            committed_reply_commit(&create_reply),
+            Some(PendingCreate::CREATE_OP)
+        );
+    }
+
+    /// The write waits for the owner of a partition without a routing row. A
+    /// deadline that ends in that wait is before the partition plane took the
+    /// write, so the caller gets the retryable refusal and not the unknown
+    /// outcome.
+    #[compio::test]
+    async fn given_partition_write_over_http_when_the_deadline_ends_before_dispatch_should_refuse_as_transient()
+     {
+        let fixture = PendingCreate::new();
+
+        let outcome = fixture.send_messages().await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(PartitionWriteError::Rejected(
+                    IggyError::TransientNotAccepted
+                ))
+            ),
+            "a write that reached no partition is safe to send again"
+        );
+        let frames: Vec<_> = std::iter::from_fn(|| fixture.owner_inbox.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                frames.as_slice(),
+                [ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+                    read: PartitionRead::Primary,
+                    ..
+                })]
+            ),
+            "the deadline ended in the wait for the owner, before any submit"
+        );
+    }
+
+    /// The partition plane took the write and no reply came before the
+    /// deadline. The write can still commit, so the caller gets the unknown
+    /// outcome and not a refusal that invites a second send.
+    #[compio::test]
+    async fn given_partition_write_over_http_when_the_deadline_ends_after_dispatch_should_report_an_unknown_outcome()
+     {
+        let fixture = PendingCreate::new();
+        let mut write = pin!(fixture.send_messages());
+        assert!(
+            poll!(write.as_mut()).is_pending(),
+            "the write waits for the owner of its partition"
+        );
+        let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
+            read: PartitionRead::Primary,
+            reply: owner,
+            ..
+        })) = fixture.owner_inbox.try_recv()
+        else {
+            panic!("the owner is asked for the partition");
+        };
+        owner
+            .try_send(PartitionReadReply::Primary {
+                view: 0,
+                primary: 0,
+            })
+            .unwrap();
+
+        let outcome = write.await;
+
+        assert!(
+            matches!(
+                outcome,
+                Err(PartitionWriteError::Timeout(Operation::SendMessages))
+            ),
+            "a write that the partition plane took may commit after the deadline"
+        );
+        assert!(
+            fixture.owner_inbox.try_recv().is_ok(),
+            "the owner got the write before the deadline ended"
+        );
+    }
+
+    /// A relay cuts its attempt soon after the budget of the write. A create
+    /// that commits at the end of that budget must not add its partition wait.
+    #[compio::test]
+    async fn given_committed_create_over_http_when_the_wait_budget_ended_should_reply_without_the_build()
+     {
+        /// Far below the read timeout that ends a wait which no budget cut.
+        const NO_WAIT_BOUND: Duration = Duration::from_secs(1);
+        let fixture = PendingCreate::new();
+        let created = submit_gated(
+            &fixture.state.shard,
+            &fixture.session,
+            Operation::CreateTopic,
+            &fixture.topic_body,
+            Instant::now(),
+        );
+        let Ok(Ok((_, create_reply, _))) = compio::time::timeout(NO_WAIT_BOUND, created).await
+        else {
+            panic!("a committed create must not wait for its partition past the budget");
+        };
+        assert_eq!(
+            committed_reply_commit(&create_reply),
+            Some(PendingCreate::CREATE_OP)
+        );
     }
 }

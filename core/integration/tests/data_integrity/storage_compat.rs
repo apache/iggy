@@ -148,16 +148,18 @@ const REFUSAL_DEADLINE: Duration = Duration::from_secs(60);
 const JOURNAL_SLOTS_KEY: &str = "metadata.journal_slots";
 
 /// `metadata.journal_slots` floor for `prepare_queue_depth = 32`
-/// (`4 * max(64, 32)`). With the 64-op checkpoint margin a checkpoint fires
-/// once the journal holds 192 committed ops.
+/// (`4 * max(64, 32)`). A checkpoint starts once half of it, 128 ops,
+/// committed past the last one.
 const JOURNAL_SLOTS: &str = "256";
 
-/// Committed metadata ops between forced checkpoints at [`JOURNAL_SLOTS`].
-const CHECKPOINT_EVERY: u32 = 192;
+/// Committed metadata ops between checkpoints at [`JOURNAL_SLOTS`].
+const CHECKPOINT_EVERY: u32 = 128;
 
 /// Stream creates that drive the metadata plane past its first checkpoint.
-/// Everything seeded before them lands in the snapshot.
-const SEED_STREAMS: u32 = 250;
+/// Everything seeded before them lands in the snapshot. The seed and the WAL
+/// tail end far from the second checkpoint, so no tail record lands in a
+/// snapshot.
+const SEED_STREAMS: u32 = 180;
 
 /// Stream creates issued after the checkpoint, so recovery must fold a
 /// snapshot AND replay a WAL suffix on top of it.
