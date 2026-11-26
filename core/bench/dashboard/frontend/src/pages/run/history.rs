@@ -19,15 +19,16 @@
 //! medians are the same ones that the headline number changes compare.
 
 use bench_dashboard_shared::delta::{Metric, ValueRange};
+use bench_dashboard_shared::history::HistoryLine;
+use bench_dashboard_shared::labels::{metric_name, metric_value_text, version_tag};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use bench_report::group_metrics_kind::GroupMetricsKind;
 use uuid::Uuid;
 use yew::prelude::*;
 use yew_router::prelude::Link;
 
-use super::change::{HistoryLine, metric_name, metric_value_text};
 use super::chart::VersionChart;
-use crate::components::run_labels::{DayLabel, version_tag, version_tag_view};
+use crate::components::run_labels::{DayLabel, version_tag_view};
 use crate::pages::compare::{CompareLink, oldest_first};
 use crate::router::AppRoute;
 

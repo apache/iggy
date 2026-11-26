@@ -20,10 +20,10 @@
 
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::identity::WorkloadField;
+use bench_dashboard_shared::labels::{MachineName, nodes_text, version_tag};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 
 use super::report_of;
-use crate::components::run_labels::{MachineName, nodes_text, version_tag};
 use crate::pages::run::facts::{
     BENCH_HOST_LABELS, MACHINE_LABEL, TOPOLOGY_LABEL, bench_host_values, field_value,
 };

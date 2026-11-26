@@ -417,6 +417,7 @@ impl MetadataSnapshot {
         if let Some(streams) = &self.streams {
             streams.validate_ownership_history(self.sequence_number)?;
             streams.validate_partition_members()?;
+            streams.validate_partition_order()?;
         }
         self.change_log.validate(self.sequence_number)
     }
