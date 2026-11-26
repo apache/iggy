@@ -35,7 +35,7 @@ Options are key-value pairs sent with `CreateTopic`, and some of them can change
 | `positions_resume_timeout` | the node's `[geo]` setting | only on a geo topic | How long, after a node starts, the group polls of the topic wait for the positions of the geo peers. |
 | `long_term_rewrite_max_interval` | the node's `[geo]` setting | only on a geo topic. At least 1 s | The longest wait between two rewrites of a partition's committed messages into long-term segments. |
 | `read_cache_size` | the node's `[tiered_storage]` setting | `0`, or at least 512 KiB | Memory that each node keeps for what the topic's reads fetch from the object store, divided across partitions. See [Read cache](#read-cache). |
-| `read_ahead` | the node's `[tiered_storage]` setting | `0`, or at least 128 KiB. At most an eighth of a `read_cache_size` the topic sets | The most bytes that readahead fetches from the object store in front of a sequential reader of the topic. See [Read cache](#read-cache). |
+| `read_ahead` | the node's `[tiered_storage]` setting | `0`, or at least 128 KiB. At most an eighth of a positive `read_cache_size` the topic sets | The most bytes that readahead fetches from the object store in front of a sequential reader of the topic. See [Read cache](#read-cache). |
 
 Both retention policies can be active at once. The active segment is **never touched**, and its bytes are excluded from the size limit. A segment whose end offset exceeds the lowest stored consumer or consumer-group offset is retained. With no stored offsets, this barrier is absent. Deletion is done by the server's segment cleaner (`[data_maintenance.messages]`, enabled by default).
 

@@ -46,10 +46,9 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 
 ## Upgrading
 
-Deploy matching server and SDK releases together. Rolling upgrades and mixed
-server versions are unsupported. Partition control frames from older servers
-carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
+Deploy compatible server and SDK releases together. A rolling server upgrade requires a pair of stable releases listed in the [release compatibility table](#upgrade-recovery). For example, builds that require partition incarnation numbers reject control frames from older builds that send incarnation zero. Those builds cannot complete partition view changes together.
+
+The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 A partition of a tiered topic keeps a chain file, and its older segments live
 only in the object store. A build from before tiered storage would read such a
@@ -79,12 +78,13 @@ wire change that SDKs from before this release cannot decode.
 
 The preceding storage format, `IGGY-METADATA-CHANGE-LOG-2`, used replica wire revision 3. It introduced batched session finalization (op 70) and refused directories marked `IGGY-METADATA-CHANGE-LOG-1` before writing to them.
 
-Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Its replicated registration and password-change requests use replica wire revision 4. State transfer uses client table format `ICT6` and metadata snapshot format 21.
+Server 0.10.1-edge.2 records the account revision and source personal access token used to establish a session. Replica wire revision 4 introduced its replicated registration and password-change requests. State transfer uses client table format `ICT6` and metadata snapshot format 21.
 
-Every replica needs fresh storage with marker `IGGY-TIERED-SEGMENT-CHAIN-2`. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. Sign in again over HTTP or in the web UI to obtain an access token carrying the account revision.
+When moving from a storage marker older than `IGGY-TIERED-SEGMENT-CHAIN-2`, start each replica with fresh storage. Boot refuses a directory marked `IGGY-METADATA-CHANGE-LOG-2`, `IGGY-METADATA-CHANGE-LOG-3` or `IGGY-TIERED-SEGMENT-CHAIN-1` before changing it. After upgrading from a build that predates the credential change, sign in again over HTTP or in the web UI.
 
-No in-place upgrade, storage conversion tool or retained-data migration is
-provided. Use an offline cutover with logical re-ingestion:
+Replica wire revision 5 lets a ReplicaHello carry the identities of the releases its sender lists as compatible. To move from revision 4 to 5 on `IGGY-TIERED-SEGMENT-CHAIN-2`, stop every node, keep its data directory and restart all nodes on the new build. See [Upgrade recovery](#upgrade-recovery).
+
+For an older storage marker, use an offline cutover with logical re-ingestion:
 
 1. Stop application writes, consumers that advance offsets, and administrative
    changes. While the old cluster is still readable, export the required messages
@@ -520,24 +520,26 @@ request fails with `FeatureUnavailable`.
 
 A poll reads an object in the store in blocks of `read_cache_block_size`,
 256 KiB by default, and each shard keeps up to `read_cache_size` of them in
-memory: tiered and long-term segments and their indexes, fresh objects, and the
-segments of geo peers. A smaller block wastes less on small or random reads,
-and a larger one suits consumers that read forward. A poll of bytes that
+memory: tiered and long-term segments, the indexes of long-term segments, fresh
+objects, and the segments of geo peers. The index of a tiered segment is not
+kept there: a poll fetches it once into a local index file on disk. A smaller
+block wastes less on small or random reads, and a larger one suits consumers
+that read forward. A poll of bytes that
 another poll read a moment ago takes them from there, and polls that miss the
 same block at once share one read. When polls read a segment in order, the
 shard also fetches up to `read_ahead` bytes past the last poll before any poll
 asks for them, on into the next segment. These fetches take the speculative
-fetch caps of `[tiered_storage.jobs]` and start only while no poll waits for
-the store. The same budget holds the fresh objects a shard uploads for geo
-topics, in up to seven eighths of it, until the long-term rewrite takes their
-messages, so a consumer at the tail reads them from memory, and a rewrite hands
-the end of each long-term segment it stores to the cache. A shard with a high
-upload rate wants 64 MiB or more. With `read_cache_size` at 0, each poll reads
-exactly its bytes from the store and nothing it fetches is kept, but the shard
-still holds what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes
-are served only while the node reads that peer, and never across a change of
-the cluster that owns its root. The budget is shared by every partition of the
-shard.
+fetch caps of `[tiered_storage.jobs]`. One starts only while no fetch that a
+poll waits for is queued, and it can run beside the ones that already run. The
+same budget holds the fresh objects a shard uploads for geo topics, in up to
+seven eighths of it, until the long-term rewrite takes their messages, so a
+consumer at the tail reads them from memory, and a rewrite hands the end of
+each long-term segment it stores to the cache. A shard with a high upload rate
+wants 64 MiB or more. With `read_cache_size` at 0, each poll reads exactly its
+bytes from the store and nothing it fetches is kept, but the shard still holds
+what it uploads, in a fixed 64 MiB of its own. A geo peer's bytes are served
+only while the node reads that peer, and never across a change of the cluster
+that owns its root. The budget is shared by every partition of the shard.
 
 A topic can set `read_cache_size` and `read_ahead` for itself, on a normal and
 on a geo topic, and an update can change them without a restart. The topic's
@@ -556,13 +558,18 @@ topic without `tiered_storage` accepts both, and they apply once its reads go
 to the store. A shadow topic reads with the values that the geo topic it
 shadows sets, see [Shadow streams](#shadow-streams), and no client can set
 them on it. The
-counters `remote_read_block_hits`, `remote_read_block_misses`,
-`remote_read_ahead_hits`, `remote_read_blocks_fetched_ahead`,
-`remote_read_demand_bytes`, `remote_read_ahead_bytes`,
-`remote_read_fresh_releases`, `remote_read_carried_bytes` and
-`remote_read_limit_evictions`, the blocks that left because their partition was
-over its limit, and the gauges `remote_read_cache_bytes` and
+counters `remote_read_block_hits_total`, `remote_read_block_misses_total`,
+`remote_read_ahead_hits_total`, `remote_read_blocks_fetched_ahead_total`,
+`remote_read_demand_bytes_total`, `remote_read_ahead_bytes_total`,
+`remote_read_fresh_releases_total`, `remote_read_carried_bytes_total` and
+`remote_read_limit_evictions_total`, the blocks and whole objects, such as a
+segment's `.index`, that left because their partition was over its limit, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
+
+A replica rebuilt by state transfer gets only the records of the segments
+that the store holds, and reads those segments from the store. A replica that
+cannot read its store waits for it before it rebuilds a tiered partition, and
+stays behind its group until then.
 
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
@@ -924,11 +931,29 @@ with `-`. A cluster with peers needs an origin.
 Each `[[geo.peers]]` table gives the peer's `origin` and the keys of the peer's
 `[tiered_storage]` store: `backend`, `prefix`, `path` for `fs`, `bucket`,
 `region`, `endpoint` and `url_style` for `s3`, and a `[geo.peers.gcs]` table
-for `gcs`, with the keys of `[tiered_storage.gcs]`. An `s3` peer needs the
-static keys `access_key_id` and `secret_access_key`. The printed configuration
-never shows them. A `gcs` peer takes its token as the `gcs` backend does, from
-a refresher of its own, and the boot never waits for that token. A cluster
-reads at most 16 peers.
+for `gcs`, with the keys of `[tiered_storage.gcs]`. A cluster reads at most 16
+peers.
+
+An `s3` peer signs with its static keys `access_key_id` and
+`secret_access_key` when both are set. The printed configuration never shows
+them. Without them, it takes the node's credentials in the order of the `s3`
+backend: web identity, then the role of the EC2 instance. That role needs
+`s3:GetObject` and `s3:ListBucket` on the peer's bucket. Web identity calls STS
+in the region of `[tiered_storage]`, or in the peer's region when that is
+empty, unless `AWS_ENDPOINT_URL_STS` is set.
+
+A node on which neither source can be chosen does not start: it has no web
+identity variables and `AWS_EC2_METADATA_DISABLED` is `true`. A node that
+chooses a source which then hands out nothing does start, for example an
+instance with the metadata service on and no role attached, or a role that
+refuses the token. Its refresher keeps fetching, each failure is logged under
+the peer's name, and the peer stays unreachable until a fetch succeeds.
+
+A `gcs` peer takes its token as the `gcs` backend does. The boot never waits
+for a peer's first credentials or token. Stores that take the same role from
+the same service share one refresher, so an `s3` peer without keys signs with
+the credentials of the `s3` backend when both take one role, and several such
+peers make one exchange between them.
 
 The server never writes to a peer's store. Each shard reads a peer through a
 store that refuses every put, conditional create and delete before the request
@@ -952,8 +977,16 @@ peer's root, `<prefix>/meta/recovery/<cluster_uid>/record`, from a recorded
 cluster. A cluster that a recovery rebuilt from the store of a recorded one
 writes such a record, so the node reads the peer as that successor. The node
 reads a record only in this case, and once for each cluster that it finds.
-The node keeps what it found in memory only, so after a restart it judges the
+A check reads a few records at most, and the next check, 5 seconds later,
+goes on where it stopped, until the records end or lead back to a cluster
+that it read. Until the records prove the cluster, also while the store does
+not answer the read of a record, the node reads nothing from the peer. The
+node keeps what it found in memory only, so after a restart it judges the
 object again against what metadata recorded.
+
+When metadata changes the clusters that it records for the peer, and the
+cluster that the node reads is neither one of them nor a successor that the
+records proved, the node stops reading the peer and checks it at once.
 
 A pass that commits what it read of a peer, the manifests of its partitions or
 the positions of its groups, reads the identity object before its other reads
@@ -1094,7 +1127,10 @@ shadow topics on the metadata primary.
 
 If the identity object of a peer names another cluster than the one that the
 shadow streams came from, the server logs it. It leaves those shadow streams
-as they are.
+as they are, unless the node reads the peer as the successor that recovery
+records prove of the only cluster that metadata records of the peer. Then the
+shadow streams follow the successor's topic objects, and a stream of the
+successor without a shadow stream gets none.
 
 An operator retires a peer whose datacenter never returns with
 `iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs
@@ -1373,18 +1409,17 @@ Each ring also keeps at most 128 MiB of record bodies and evicts its oldest reco
 
 ## Upgrade recovery
 
-This release changes protocol and storage formats. Servers and compatible
-clients deploy together; mixed versions and rolling upgrades are unsupported.
-Peers verify protocol, replica wire, release and storage-format identity before
-admission.
-Executable packaging does not affect that identity, so stripping or rebuilding
-the same compatible release does not by itself prevent a replica from joining.
+This release changes protocol and storage formats. Deploy a compatible client with the server. Peers verify the client protocol, replica wire revision, release and storage marker before admission. Stripping the executable or rebuilding the same release with those format identifiers preserves that identity.
 
-This checkout accepts client protocol 0.12.3 at login. Replica wire revision 4 is checked separately when servers connect.
+A peer on another release is admitted only when the release compatibility table of either node lists the other release. The table is `RELEASE_COMPATIBILITY` in `core/server/src/release_compatibility.rs`. It is compiled into the server and ships empty. A release absent from every pair links only with itself.
+
+A node with a row sends the identities of its listed releases in its ReplicaHello and runs the link under the identity of the listed release, so the other node needs no knowledge of the first one.
+
+This checkout accepts client protocol 0.12.3 at login. Replica wire revision 5 is checked separately when servers connect.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Start this release from fresh storage on every replica.
+Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Upgrades from an incompatible storage or snapshot format require fresh storage on every replica. A revision 4 cluster already on the current storage marker and snapshot format can reuse its directories in a coordinated restart to revision 5.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

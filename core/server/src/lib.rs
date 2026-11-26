@@ -44,6 +44,7 @@ pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSI
 // boot: process entry, shard threads, recovery orchestration.
 pub mod boot;
 pub(crate) mod config_writer;
+pub(crate) mod release_compatibility;
 pub(crate) mod shard_allocator;
 
 // spine: the request path - shell vocabulary, dispatch funnel, per-domain ops.
