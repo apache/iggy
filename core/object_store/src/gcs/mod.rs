@@ -213,7 +213,7 @@ impl GcsStore {
     /// atomically, as the tests of the provider do on an emulator for the
     /// cases that never meet an object under the key.
     #[must_use]
-    pub fn with_uploads_in_parts(mut self, on: bool) -> Self {
+    pub const fn with_uploads_in_parts(mut self, on: bool) -> Self {
         self.uploads_in_parts = on;
         self
     }

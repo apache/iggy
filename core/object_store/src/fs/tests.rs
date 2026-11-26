@@ -188,7 +188,7 @@ fn given_a_body_in_small_pieces_when_writing_should_join_them_into_writes_of_the
         .collect();
 
     let writes: Vec<Bytes> = shard_runtime().block_on(
-        coalesced(stream::iter(pieces).chain(stream::iter([Ok(large.clone())])))
+        coalesced(stream::iter(pieces).chain(stream::iter([Ok(large)])))
             .map(Result::unwrap)
             .collect(),
     );

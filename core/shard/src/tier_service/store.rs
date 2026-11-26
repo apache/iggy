@@ -251,7 +251,7 @@ where
 
     /// The slots of [`PartsPolicy::in_flight`] that parts hold now.
     #[cfg(test)]
-    pub(crate) fn parts_in_flight(&self) -> usize {
+    pub(crate) const fn parts_in_flight(&self) -> usize {
         self.parts_in_flight.taken.get()
     }
 
