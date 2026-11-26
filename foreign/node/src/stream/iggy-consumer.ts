@@ -179,7 +179,8 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
   /**
    * The messages as an object mode `Readable`, which shuts the consumer down
    * when it is destroyed. It takes the next message only when its own consumer
-   * asks, so a message counts as processed only after that.
+   * asks, so a message counts as processed only after that. If shutdown
+   * fails, the stream emits that error unless it already has an error.
    */
   toReadable(): Readable {
     const messages = this[Symbol.asyncIterator]();
@@ -195,7 +196,10 @@ export class IggyConsumer implements AsyncIterable<ConsumerMessage> {
         });
       },
       destroy(error, callback) {
-        shutdown().catch(() => undefined).finally(() => callback(error));
+        shutdown().then(
+          () => callback(error),
+          (failure: unknown) => callback(error ?? (failure instanceof Error ? failure : new Error(String(failure))))
+        );
       }
     });
   }
