@@ -20,9 +20,20 @@ set -Eeuo pipefail
 
 # Builds the Dioxus web UI into core/web_ui/dist. iggy-server does not embed
 # this bundle yet, the switch-over from the Svelte app will make it do so.
+# Needs dx on PATH, see scripts/ci/install-dx.sh.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRATE_DIR="${REPO_ROOT}/core/web_ui"
+
+# Deno installs an unrelated dx, which can come first on PATH.
+if [[ "$(dx --version 2>/dev/null)" != dioxus* ]]; then
+    echo "No Dioxus dx on PATH, install it with scripts/ci/install-dx.sh" >&2
+    exit 1
+fi
+
+# rustup picks the toolchain from the working directory, so cargo and rustup
+# use the one rust-toolchain.toml pins only from inside the repo.
+cd "${CRATE_DIR}"
 
 # dx stages under the cargo target directory, which CARGO_TARGET_DIR or a
 # cargo config can move, so ask cargo the same way dx does. Plain bash parses
@@ -38,5 +49,5 @@ TARGET_DIR="${BASH_REMATCH[1]}"
 # all of them into the bundle, so stale builds would end up in the bundle.
 rm -rf "${TARGET_DIR}/dx/iggy-web-ui" "${CRATE_DIR}/dist"
 
-cd "${CRATE_DIR}"
+rustup target add wasm32-unknown-unknown
 dx bundle --platform web --release --out-dir dist

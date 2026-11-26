@@ -25,6 +25,19 @@ publish = false
 [package.metadata.cargo-machete]
 ignored = ["getrandom"]
 
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench-dashboard-frontend"
+path = "src/main.rs"
+
+[features]
+# The dashboard server renders the pages with it.
+ssr = ["yew/ssr"]
+# The browser build hydrates the pages that the server rendered.
+hydration = ["yew/hydration"]
+
 [dependencies]
 bench-dashboard-shared = { workspace = true }
 bench-report = { workspace = true }
@@ -35,6 +48,7 @@ gloo = { workspace = true }
 js-sys = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["js"] }
 wasm-bindgen = { workspace = true }

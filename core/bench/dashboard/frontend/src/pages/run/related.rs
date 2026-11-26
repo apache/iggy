@@ -20,13 +20,13 @@
 
 use bench_dashboard_shared::delta::Metric;
 use bench_dashboard_shared::identity::WorkloadField;
+use bench_dashboard_shared::labels::{metric_name, version_tag};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use yew::prelude::*;
 
-use super::change::metric_name;
 use super::facts::{FieldValue, field_value};
 use super::history::{NO_VALUE, VERSION_HEADER, link_cell, link_header, main_value_text};
-use crate::components::run_labels::{NO_RATE_LIMIT_NOTE, version_tag, version_tag_view};
+use crate::components::run_labels::{NO_RATE_LIMIT_NOTE, version_tag_view};
 
 const NO_RELATED_NOTE: &str = "No run on this machine and topology differs from this run in \
                                exactly one parameter.";
@@ -51,15 +51,8 @@ pub struct RelatedEntry {
 /// The groups, in workload key field order.
 pub fn related_runs(run: &BenchmarkSummary, summaries: &[BenchmarkSummary]) -> Vec<RelatedGroup> {
     let mut groups: Vec<RelatedGroup> = Vec::new();
-    let same_environment = summaries
-        .iter()
-        .filter(|summary| summary.machine == run.machine && summary.nodes == run.nodes);
-    for candidate in same_environment {
-        let &[field] = run
-            .workload_key
-            .differences(&candidate.workload_key)
-            .as_slice()
-        else {
+    for candidate in summaries {
+        let Some(field) = related_field(run, candidate) else {
             continue;
         };
         if !groups.iter().any(|group| group.field == field) {
@@ -96,6 +89,25 @@ pub fn related_runs(run: &BenchmarkSummary, summaries: &[BenchmarkSummary]) -> V
     }
     groups.sort_by_key(|group| group.field);
     groups
+}
+
+/// The one field of the workload key where `candidate` differs from `run`, when both ran on the
+/// same machine with the same number of nodes. `None` for every other run.
+pub fn related_field(
+    run: &BenchmarkSummary,
+    candidate: &BenchmarkSummary,
+) -> Option<WorkloadField> {
+    if candidate.machine != run.machine || candidate.nodes != run.nodes {
+        return None;
+    }
+    match run
+        .workload_key
+        .differences(&candidate.workload_key)
+        .as_slice()
+    {
+        &[field] => Some(field),
+        _ => None,
+    }
 }
 
 /// One card per field, or a note when no run is one field apart from `run`.
