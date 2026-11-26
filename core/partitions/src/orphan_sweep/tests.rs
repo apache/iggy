@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::time::UNIX_EPOCH;
+use std::sync::OnceLock;
 
 use iggy_object_store::{
-    FreshObjectId, GeoLog, LongTermKey, PositionsKey, SegmentKey, SegmentObject, StoreIdentity,
+    FreshObjectId, GeoLog, LongTermKey, PositionsKey, SegmentKey, SegmentObject,
 };
 
 use super::*;
@@ -43,9 +43,11 @@ fn at(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(secs)
 }
 
-/// A moment of this node's clock.
-fn node(secs: u64) -> IggyTimestamp {
-    IggyTimestamp::from(secs * 1_000_000)
+/// A moment of this node's monotonic clock, `secs` after the first one a
+/// test took.
+fn node(secs: u64) -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now) + Duration::from_secs(secs)
 }
 
 /// The claim of the root, at second 100.
@@ -203,7 +205,6 @@ fn given_a_listing_when_taking_its_objects_should_sum_each_incarnation_and_count
         ListedIncarnation {
             objects: 3,
             before_claim: 0,
-            manifest: true,
             long_term: false,
             newest: at(400),
         }
@@ -213,7 +214,6 @@ fn given_a_listing_when_taking_its_objects_should_sum_each_incarnation_and_count
         ListedIncarnation {
             objects: 1,
             before_claim: 0,
-            manifest: false,
             long_term: true,
             newest: at(500),
         }
@@ -380,7 +380,6 @@ fn found(newest: u64, objects: usize) -> BTreeMap<ObjectPrefix, ListedIncarnatio
         ListedIncarnation {
             objects,
             before_claim: 0,
-            manifest: true,
             long_term: false,
             newest: at(newest),
         },
@@ -393,7 +392,7 @@ fn settled(
     candidates: &mut OrphanCandidates,
     stamp: &SweepStamp,
     orphans: &BTreeMap<ObjectPrefix, ListedIncarnation>,
-    starts: &[IggyTimestamp],
+    starts: &[Instant],
 ) -> Vec<(ObjectPrefix, SystemTime)> {
     let mut due = Vec::new();
     for started in starts {
@@ -418,7 +417,7 @@ fn given_sweeps_that_list_an_orphan_the_same_when_settling_should_count_the_grac
  {
     let mut candidates = OrphanCandidates::default();
     let orphan = found(200, 3);
-    let just_short = IggyTimestamp::from(node(10 + 60).as_micros() - 1);
+    let just_short = node(10 + 60) - Duration::from_micros(1);
 
     assert_eq!(
         settled(
@@ -581,7 +580,8 @@ fn given_cleared_candidates_when_settling_should_start_the_count_again() {
 }
 
 #[test]
-fn given_a_node_clock_that_steps_back_when_settling_should_delete_nothing() {
+fn given_sweeps_that_start_before_the_monotonic_clock_reaches_the_grace_when_settling_should_delete_nothing()
+ {
     let mut candidates = OrphanCandidates::default();
     let orphan = found(200, 3);
 
@@ -610,25 +610,64 @@ fn given_a_grace_when_timing_the_sweeps_should_sweep_every_hour_or_every_grace_w
 
 fn guard() -> OrphanGuard {
     OrphanGuard {
+        view: 3,
         claim: claim(),
         newest: at(500),
     }
 }
 
 #[test]
-fn given_the_identity_object_the_delete_reads_when_checking_the_claim_should_take_only_the_same_object()
+fn given_the_claim_the_delete_reads_when_checking_it_should_take_only_the_same_object_at_the_same_moment()
  {
-    let ours = IdentityRead::Found(StoreIdentity { cluster_uid: OURS });
-    let theirs = IdentityRead::Found(StoreIdentity {
+    let replaced = ClaimStamp {
+        etag: "replaced".to_owned(),
+        ..claim()
+    };
+    let theirs = ClaimStamp {
         cluster_uid: OURS + 1,
-    });
+        ..claim()
+    };
+    let same_etag_later = ClaimStamp {
+        claimed_at: at(100) + Duration::from_millis(1),
+        ..claim()
+    };
 
-    assert!(guard().same_claim(&ours, Some("claim")));
-    assert!(!guard().same_claim(&ours, Some("replaced")));
-    assert!(!guard().same_claim(&ours, None));
-    assert!(!guard().same_claim(&theirs, Some("claim")));
-    assert!(!guard().same_claim(&IdentityRead::Missing, Some("claim")));
-    assert!(!guard().same_claim(&IdentityRead::Invalid, Some("claim")));
+    assert!(guard().same_claim(Some(&claim())));
+    for read in [&replaced, &theirs, &same_etag_later] {
+        assert!(!guard().same_claim(Some(read)), "{read:?}");
+    }
+    assert!(!guard().same_claim(None));
+}
+
+#[test]
+fn given_objects_from_the_second_of_the_claim_with_a_finer_moment_when_judging_should_count_them_before_the_claim()
+ {
+    let within = at(100) + Duration::from_millis(700);
+    let next_second = at(101);
+
+    assert!(no_newer_than_claim(within, at(100)));
+    assert!(no_newer_than_claim(at(100), within));
+    assert!(!no_newer_than_claim(next_second, within));
+
+    let mut objects = incarnation(ORPHAN, 200);
+    objects.push((segment(ORPHAN, 10, SegmentObject::Log), 0));
+    let mut listing = listing(&objects);
+    listing.take(
+        &layout(),
+        &ListedObject {
+            last_modified: within,
+            ..listed(segment(ORPHAN, 20, SegmentObject::Log), 0)
+        },
+        claim().claimed_at,
+    );
+    assert_eq!(listing.incarnations[&ORPHAN].before_claim, 2);
+
+    let mut check = OrphanCheck::default();
+    check.take(&guard(), within, false);
+    assert_eq!(check.refusal(false), Some(OrphanRefusal::BeforeClaim));
+    let mut check = OrphanCheck::default();
+    check.take(&guard(), next_second, false);
+    assert_eq!(check.refusal(false), None);
 }
 
 /// The check of objects, each stored at a second and of a long-term

@@ -20,12 +20,13 @@ use super::remote_poll::layout;
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::segment_upload::Recording;
 use super::*;
+use crate::orphan_sweep_job::read_claim;
 use crate::{
     ClaimStamp, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY, IncarnationSettled,
-    MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteWork, ObjectDeleter, OrphanDelete,
-    OrphanGuard, OrphanProgress, OrphanRefusal, RETIRED_OBJECT_GRACE, SegmentLocation,
-    SweptObjects, delete_incarnation, delete_objects, delete_segments, list_segment_starts,
-    read_claim, upload_segment,
+    MAX_QUEUED_INCARNATIONS, MAX_QUEUED_ORPHANS, ObjectDeleteDone, ObjectDeleteWork, ObjectDeleter,
+    OrphanDelete, OrphanGuard, OrphanProgress, OrphanRefusal, RETIRED_OBJECT_GRACE,
+    SegmentLocation, SweptObjects, delete_incarnation, delete_objects, delete_segments,
+    list_segment_starts, upload_segment,
 };
 use iggy_object_store::{
     DeleteFailure, DeleteOutcome, InlineTierExecutor, ListPage, ListRequest, ListedObject,
@@ -63,6 +64,8 @@ pub(super) struct Faulty {
     pub(super) lists_fail: Cell<bool>,
     /// Whether every HEAD fails.
     heads_fail: Cell<bool>,
+    /// The moment a HEAD gives the identity object, in place of its own.
+    identity_moved_to: Cell<Option<std::time::SystemTime>>,
     head_calls: RefCell<Vec<String>>,
 }
 
@@ -89,7 +92,13 @@ impl ObjectStore for Faulty {
         if self.heads_fail.get() {
             return Err(ObjectStoreError::Unavailable("503".to_owned()));
         }
-        self.inner.head(key).await
+        let mut held = self.inner.head(key).await?;
+        if key == layout().identity_key()
+            && let Some(moved) = self.identity_moved_to.get()
+        {
+            held.last_modified = moved;
+        }
+        Ok(held)
     }
 
     async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
@@ -1271,7 +1280,7 @@ async fn incarnation_pass(
     deleter: &dyn ObjectDeleter,
     now: IggyTimestamp,
 ) -> Option<ObjectPrefix> {
-    let (job, scope) = queue.begin(now, |_| false)?;
+    let (job, scope) = queue.begin(now, VIEW, |_| false)?;
     assert_eq!(job.work, ObjectDeleteWork::DeleteIncarnation);
     let (id, prefix) = (job.id, job.prefix);
     let outcome = deleter.run(job, scope).await;
@@ -1598,11 +1607,17 @@ async fn given_a_queued_incarnation_that_is_live_when_a_pass_runs_should_drop_it
     let due = after(observed, grace());
 
     // Committed metadata holds the recreated incarnation.
-    let (job, scope) = queue.begin(due, |prefix| *prefix == RECREATED).unwrap();
+    let (job, scope) = queue
+        .begin(due, VIEW, |prefix| *prefix == RECREATED)
+        .unwrap();
     assert_eq!(job.prefix, PREFIX);
     let outcome = deleter.run(job.clone(), scope).await;
     queue.finish(job.id, outcome, due);
-    assert!(queue.begin(due, |prefix| *prefix == RECREATED).is_none());
+    assert!(
+        queue
+            .begin(due, VIEW, |prefix| *prefix == RECREATED)
+            .is_none()
+    );
 
     assert!(queue.is_empty());
     assert_eq!(store(&deleter).inner.keys(), recreated);
@@ -1618,8 +1633,8 @@ async fn given_a_job_in_flight_when_incarnation_passes_run_should_start_no_other
     queue.queue(RECREATED, observed);
     let due = after(observed, grace());
 
-    let (first, scope) = queue.begin(due, |_| false).unwrap();
-    assert!(queue.begin(due, |_| false).is_none());
+    let (first, scope) = queue.begin(due, VIEW, |_| false).unwrap();
+    assert!(queue.begin(due, VIEW, |_| false).is_none());
 
     queue.clear();
     assert!(scope.is_cancelled());
@@ -1628,7 +1643,7 @@ async fn given_a_job_in_flight_when_incarnation_passes_run_should_start_no_other
     // A queue that filled again must not take the old job's result for its
     // own job.
     queue.queue(RECREATED, observed);
-    let (second, _scope) = queue.begin(due, |_| false).unwrap();
+    let (second, _scope) = queue.begin(due, VIEW, |_| false).unwrap();
     assert_ne!(first.id, second.id);
     queue.finish(
         first.id,
@@ -1636,7 +1651,7 @@ async fn given_a_job_in_flight_when_incarnation_passes_run_should_start_no_other
         due,
     );
     assert!(queue.contains(&RECREATED));
-    assert!(queue.begin(due, |_| false).is_none());
+    assert!(queue.begin(due, VIEW, |_| false).is_none());
 }
 
 #[compio::test]
@@ -1652,7 +1667,7 @@ async fn given_a_cancelled_or_foreign_result_when_an_incarnation_job_finishes_sh
         Ok(ObjectDeleteDone::Deleted { failed: Vec::new() }),
         Ok(ObjectDeleteDone::Swept(Ok(SweptObjects::default()))),
     ] {
-        let (job, _scope) = queue.begin(now, |_| false).unwrap();
+        let (job, _scope) = queue.begin(now, VIEW, |_| false).unwrap();
         queue.finish(job.id, outcome, now);
         assert!(queue.contains(&PREFIX));
         now = after(now, retry());
@@ -1710,15 +1725,24 @@ async fn given_an_incarnation_delete_when_submitted_should_name_the_delete_class
     );
 }
 
-/// Claim the root of `store` for `cluster_uid`, and return the guard of a
-/// sweep that read that claim and lets every object stored after it go.
+/// The metadata view of the primary in these tests.
+const VIEW: Option<u32> = Some(0);
+
+/// Claim the root of `store` for `cluster_uid` at a moment two seconds ago,
+/// as the age checks count in whole seconds, and return the guard of a
+/// sweep in [`VIEW`] that read that claim and lets every object stored after
+/// it go.
 async fn claimed_guard(store: &Faulty, cluster_uid: u128) -> OrphanGuard {
     iggy_object_store::StoreIdentity { cluster_uid }
         .replace(store, &layout())
         .await
         .unwrap();
+    store.identity_moved_to.set(Some(
+        std::time::SystemTime::now() - std::time::Duration::from_secs(2),
+    ));
     let claim: ClaimStamp = read_claim(store, &layout()).await.unwrap().unwrap();
     OrphanGuard {
+        view: 0,
         claim,
         newest: std::time::SystemTime::now() + std::time::Duration::from_secs(3_600),
     }
@@ -1733,7 +1757,7 @@ async fn orphan_pass(
     now: IggyTimestamp,
     holds: impl FnMut(&ObjectPrefix) -> bool,
 ) -> Option<(ObjectDeleteWork, Option<IncarnationSettled>)> {
-    let (job, scope) = queue.begin(now, holds)?;
+    let (job, scope) = queue.begin(now, VIEW, holds)?;
     let (id, work) = (job.id, job.work.clone());
     let outcome = deleter.run(job, scope).await;
     Some((work, queue.finish(id, outcome, now)))
@@ -1862,6 +1886,7 @@ fn given_an_incarnation_a_committed_delete_queued_when_the_sweep_queues_it_shoul
  {
     let mut queue = DeletedIncarnations::default();
     let guard = OrphanGuard {
+        view: 0,
         claim: ClaimStamp {
             cluster_uid: 7,
             etag: "claim".to_owned(),
@@ -1876,15 +1901,18 @@ fn given_an_incarnation_a_committed_delete_queued_when_the_sweep_queues_it_shoul
 
     assert!(!queue.is_orphan(&PREFIX));
     assert!(
-        queue.begin(observed, |_| false).is_none(),
+        queue.begin(observed, VIEW, |_| false).is_none(),
         "the grace holds"
     );
-    let (job, _scope) = queue.begin(past_the_grace_period(), |_| false).unwrap();
+    let (job, _scope) = queue
+        .begin(past_the_grace_period(), VIEW, |_| false)
+        .unwrap();
     assert_eq!(job.work, ObjectDeleteWork::DeleteIncarnation);
 }
 
 fn orphan_guard() -> OrphanGuard {
     OrphanGuard {
+        view: 0,
         claim: ClaimStamp {
             cluster_uid: 7,
             etag: "claim".to_owned(),
@@ -1918,7 +1946,7 @@ fn given_a_refused_or_unfinished_orphan_delete_when_settling_should_drop_the_ref
     ] {
         let mut queue = DeletedIncarnations::default();
         queue.queue_orphan(PREFIX, guard.clone(), now);
-        let (job, _scope) = queue.begin(now, |_| false).unwrap();
+        let (job, _scope) = queue.begin(now, VIEW, |_| false).unwrap();
         let continued = queue.finish(
             job.id,
             Ok(ObjectDeleteDone::OrphanDeleted(Ok(
@@ -1927,7 +1955,7 @@ fn given_a_refused_or_unfinished_orphan_delete_when_settling_should_drop_the_ref
             now,
         );
         assert_eq!(continued, Some(IncarnationSettled::Continues));
-        let (job, _scope) = queue.begin(after(now, 1), |_| false).unwrap();
+        let (job, _scope) = queue.begin(after(now, 1), VIEW, |_| false).unwrap();
         assert_eq!(
             job.work,
             ObjectDeleteWork::DeleteOrphan(guard.clone(), deleting_from("key"))
@@ -1944,8 +1972,12 @@ fn given_a_refused_or_unfinished_orphan_delete_when_settling_should_drop_the_ref
         assert_eq!(queue.is_orphan(&PREFIX), queued);
         assert_eq!(queue.contains(&PREFIX), queued);
         if queued {
-            assert!(queue.begin(after(now, retry() - 1), |_| false).is_none());
-            let (job, _scope) = queue.begin(after(now, retry()), |_| false).unwrap();
+            assert!(
+                queue
+                    .begin(after(now, retry() - 1), VIEW, |_| false)
+                    .is_none()
+            );
+            let (job, _scope) = queue.begin(after(now, retry()), VIEW, |_| false).unwrap();
             assert_eq!(
                 job.work,
                 ObjectDeleteWork::DeleteOrphan(guard.clone(), OrphanProgress::default())
@@ -1966,7 +1998,7 @@ fn given_an_orphan_turn_that_goes_on_when_settling_should_run_its_next_turn_behi
     let mut queue = DeletedIncarnations::default();
     queue.queue_orphan(PREFIX, guard.clone(), now);
     queue.queue_orphan(later, guard.clone(), now);
-    let (first, _scope) = queue.begin(now, |_| false).unwrap();
+    let (first, _scope) = queue.begin(now, VIEW, |_| false).unwrap();
     assert_eq!(first.prefix, PREFIX);
 
     let settled = queue.finish(
@@ -1978,7 +2010,7 @@ fn given_an_orphan_turn_that_goes_on_when_settling_should_run_its_next_turn_behi
     );
 
     assert_eq!(settled, Some(IncarnationSettled::Continues));
-    let (second, _scope) = queue.begin(now, |_| false).unwrap();
+    let (second, _scope) = queue.begin(now, VIEW, |_| false).unwrap();
     assert_eq!(
         second.prefix, later,
         "the other orphan due by then goes first"
@@ -1989,13 +2021,54 @@ fn given_an_orphan_turn_that_goes_on_when_settling_should_run_its_next_turn_behi
         now,
     );
     assert!(
-        queue.begin(now, |_| false).is_none(),
+        queue.begin(now, VIEW, |_| false).is_none(),
         "the next turn waits for a later pass"
     );
-    let (next, _scope) = queue.begin(after(now, 1), |_| false).unwrap();
+    let (next, _scope) = queue.begin(after(now, 1), VIEW, |_| false).unwrap();
     assert_eq!(next.prefix, PREFIX);
     assert_eq!(
         next.work,
         ObjectDeleteWork::DeleteOrphan(guard, deleting_from("key"))
     );
+}
+
+#[test]
+fn given_orphans_up_to_their_share_when_queueing_should_leave_out_the_next_orphan_and_keep_room_for_committed_deletes()
+ {
+    let mut queue = DeletedIncarnations::default();
+    let now = IggyTimestamp::from(1_000);
+    let orphan = |created_revision: u64| ObjectPrefix {
+        created_revision,
+        ..PREFIX
+    };
+    for created_revision in 0..MAX_QUEUED_ORPHANS as u64 {
+        assert!(queue.queue_orphan(orphan(created_revision), orphan_guard(), now));
+    }
+
+    assert!(!queue.queue_orphan(orphan(u64::MAX), orphan_guard(), now));
+    assert!(!queue.contains(&orphan(u64::MAX)));
+    for created_revision in MAX_QUEUED_ORPHANS as u64..MAX_QUEUED_INCARNATIONS as u64 {
+        assert!(queue.queue(orphan(created_revision), now));
+    }
+    assert_eq!(queue.len(), MAX_QUEUED_INCARNATIONS);
+}
+
+#[test]
+fn given_an_orphan_of_an_earlier_view_when_a_pass_runs_in_a_later_view_should_drop_it_and_keep_committed_deletes()
+ {
+    let mut queue = DeletedIncarnations::default();
+    let observed = IggyTimestamp::from(1_000);
+    queue.queue(RECREATED, observed);
+    queue.queue_orphan(PREFIX, orphan_guard(), observed);
+
+    assert!(queue.begin(observed, Some(1), |_| false).is_none());
+    assert!(!queue.contains(&PREFIX));
+    assert!(!queue.is_orphan(&PREFIX));
+    assert!(queue.begin(observed, None, |_| false).is_none());
+
+    let (job, _scope) = queue
+        .begin(past_the_grace_period(), Some(1), |_| false)
+        .unwrap();
+    assert_eq!(job.prefix, RECREATED);
+    assert_eq!(job.work, ObjectDeleteWork::DeleteIncarnation);
 }
