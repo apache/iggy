@@ -61,6 +61,7 @@ use crate::dispatch::reads::{partition_frontier_budget, read_frontier_budget};
 use crate::dispatch::session_ops::warm_dummy_password_hash;
 use crate::geo_peers::PeerAuth;
 use crate::release_compatibility::RELEASE_COMPATIBILITY;
+use crate::s3_credentials::RoleCredentials;
 use crate::server_error::ServerError;
 use crate::shell::{
     ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellShard, heartbeat_timings,
@@ -311,12 +312,14 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
     crate::tiered_storage::preflight(&config.tiered_storage)?;
-    let tiered_store = SharedStore::new(&config.tiered_storage)?;
+    // The node's stores that take the same role share one refresher.
+    let mut s3_roles = RoleCredentials::default();
+    let tiered_store = SharedStore::new(&config.tiered_storage, &mut s3_roles)?;
     let object_store_answered =
         crate::tiered_storage::probe(&config.tiered_storage, &tiered_store)?;
     crate::geo_peers::preflight(&config.geo)?;
     let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
-    let geo_peer_auth = crate::geo_peers::auth(&config.geo)?;
+    let geo_peer_auth = crate::geo_peers::auth(&config.geo, &config.tiered_storage, &mut s3_roles)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());

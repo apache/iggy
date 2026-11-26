@@ -688,11 +688,29 @@ with `-`. A cluster with peers needs an origin.
 Each `[[geo.peers]]` table gives the peer's `origin` and the keys of the peer's
 `[tiered_storage]` store: `backend`, `prefix`, `path` for `fs`, `bucket`,
 `region`, `endpoint` and `url_style` for `s3`, and a `[geo.peers.gcs]` table
-for `gcs`, with the keys of `[tiered_storage.gcs]`. An `s3` peer needs the
-static keys `access_key_id` and `secret_access_key`. The printed configuration
-never shows them. A `gcs` peer takes its token as the `gcs` backend does, from
-a refresher of its own, and the boot never waits for that token. A cluster
-reads at most 16 peers.
+for `gcs`, with the keys of `[tiered_storage.gcs]`. A cluster reads at most 16
+peers.
+
+An `s3` peer signs with its static keys `access_key_id` and
+`secret_access_key` when both are set. The printed configuration never shows
+them. Without them, it takes the node's credentials in the order of the `s3`
+backend: web identity, then the role of the EC2 instance. That role needs
+`s3:GetObject` and `s3:ListBucket` on the peer's bucket. Web identity calls STS
+in the region of `[tiered_storage]`, or in the peer's region when that is
+empty, unless `AWS_ENDPOINT_URL_STS` is set.
+
+A node on which neither source can be chosen does not start: it has no web
+identity variables and `AWS_EC2_METADATA_DISABLED` is `true`. A node that
+chooses a source which then hands out nothing does start, for example an
+instance with the metadata service on and no role attached, or a role that
+refuses the token. Its refresher keeps fetching, each failure is logged under
+the peer's name, and the peer stays unreachable until a fetch succeeds.
+
+A `gcs` peer takes its token as the `gcs` backend does. The boot never waits
+for a peer's first credentials or token. Stores that take the same role from
+the same service share one refresher, so an `s3` peer without keys signs with
+the credentials of the `s3` backend when both take one role, and several such
+peers make one exchange between them.
 
 The server never writes to a peer's store. Each shard reads a peer through a
 store that refuses every put, conditional create and delete before the request
