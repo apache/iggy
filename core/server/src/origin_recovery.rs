@@ -501,8 +501,7 @@ async fn format_marker<S: ObjectStore>(store: &S, layout: &KeyLayout, key: &Topi
     store
         .get_range(&layout.topic_key(key), 0..FORMAT_MARKER_LEN)
         .await
-        .map(|range| range.bytes.escape_ascii().to_string())
-        .unwrap_or_default()
+        .map_or_default(|range| range.bytes.escape_ascii().to_string())
 }
 
 /// Whether replica 0 recovers now: only when the operator named the retired

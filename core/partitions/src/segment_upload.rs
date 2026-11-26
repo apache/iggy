@@ -291,7 +291,7 @@ pub async fn store_segment<S: ObjectStore>(
 /// Whether `held`, the object under a segment's `.log` key, is the one
 /// `record` describes: of the recorded size, with the recorded CRC32C, or
 /// with the recorded hash in its metadata when the store keeps no CRC32C.
-pub(crate) fn is_recorded_log(held: &ObjectMeta, record: &SegmentRecord) -> bool {
+pub fn is_recorded_log(held: &ObjectMeta, record: &SegmentRecord) -> bool {
     let same_bytes = held.crc32c.map_or_else(
         || {
             SegmentMetadata::try_from(&held.metadata)
@@ -305,7 +305,7 @@ pub(crate) fn is_recorded_log(held: &ObjectMeta, record: &SegmentRecord) -> bool
 /// Whether `held`, the object under a segment's `.index` key, holds whole
 /// index entries, at least one. Sparse indexes differ between replicas, so
 /// no record says more of it.
-pub(crate) const fn is_whole_index(held: &ObjectMeta) -> bool {
+pub const fn is_whole_index(held: &ObjectMeta) -> bool {
     held.size != 0 && held.size.is_multiple_of(IGGY_INDEX_SIZE as u64)
 }
 

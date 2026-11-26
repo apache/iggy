@@ -243,7 +243,7 @@ mod tests {
         let resource = br#"{"name":"a","size":"1","generation":"2","storageClass":"COLDLINE",
             "timeCreated":"2026-10-28T00:00:00Z","updated":"2026-11-28T00:00:00Z",
             "timeStorageClassUpdated":"2026-11-28T00:00:00Z"}"#;
-        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_793_145_600);
+        let created = SystemTime::UNIX_EPOCH + Duration::from_hours(498_096);
 
         let meta = parse_object(resource).unwrap().meta().unwrap();
         let listed = parse_list(&[br#"{"items":["#.as_slice(), resource, b"]}"].concat())
