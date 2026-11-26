@@ -45,6 +45,7 @@ use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -960,9 +961,14 @@ where
         !self.keyring.borrow().is_empty()
     }
 
-    /// Drop the encryptors of the stream incarnations `is_live` rejects.
-    pub fn retain_stream_keys(&self, is_live: impl FnMut(StreamKeyIdentity) -> bool) {
-        self.keyring.borrow_mut().retain(is_live);
+    /// Drop the encryptors of the stream incarnations `is_live` rejects, among
+    /// the streams with an id in `streams`.
+    pub fn retain_stream_keys(
+        &self,
+        streams: RangeInclusive<usize>,
+        is_live: impl FnMut(StreamKeyIdentity) -> bool,
+    ) {
+        self.keyring.borrow_mut().retain(streams, is_live);
     }
 
     pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
@@ -1421,6 +1427,20 @@ where
     /// reused slot puts a namespace out of numeric order.
     pub fn namespaces(&self) -> impl Iterator<Item = &IggyNamespace> {
         self.slots().iter().flatten().map(|slot| &slot.namespace)
+    }
+
+    /// One item per slot for up to `limit` slots from `first_slot` on, in
+    /// slot order: the namespace of the partition there, `None` for a vacant
+    /// slot. A walk in parts goes on at the slot after the last one it read.
+    /// Returns copies, so no borrow of the slots outlives the call and an
+    /// insert between two parts cannot invalidate one.
+    pub fn slot_namespaces(&self, first_slot: usize, limit: usize) -> Vec<Option<IggyNamespace>> {
+        self.slots()
+            .iter()
+            .skip(first_slot)
+            .take(limit)
+            .map(|slot| slot.as_ref().map(|slot| slot.namespace))
+            .collect()
     }
 
     /// The partition of `namespace`, tombstoned or not, with what its shard
@@ -2993,6 +3013,25 @@ mod tests {
         assert_eq!(with_hole, [5, 7], "a vacant slot is skipped");
         assert_eq!(reused, [5, 1, 7], "the reused slot keeps its place");
         assert_eq!(replay(), (with_hole, reused));
+    }
+
+    /// A walk in parts reads one item per slot, so it can bound the slots of
+    /// a part and go on at the next slot, vacant slots included.
+    #[test]
+    fn given_a_vacant_slot_when_reading_slots_from_one_should_yield_one_item_per_slot() {
+        let [five, six, seven] = [5, 6, 7].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&[five, six, seven]);
+        drop(partitions.remove(&six));
+
+        let slots = |first_slot, limit| partitions.slot_namespaces(first_slot, limit);
+
+        assert_eq!(slots(0, usize::MAX), [Some(five), None, Some(seven)]);
+        assert_eq!(slots(1, usize::MAX), [None, Some(seven)]);
+        assert_eq!(slots(0, 2), [Some(five), None], "a vacant slot counts");
+        assert_eq!(slots(2, 2), [Some(seven)]);
+        assert_eq!(slots(0, 0), []);
+        assert_eq!(slots(3, usize::MAX), []);
+        assert_eq!(slots(usize::MAX, usize::MAX), []);
     }
 
     /// The slot array holds boxes, so its growth moves pointers and never a
