@@ -703,28 +703,63 @@ fn plan(
     let followed = peers
         .iter()
         .filter(|(origin, _)| !inner.retired_origins.contains_key(*origin));
+    let mut read_cache = ReadCacheChange::default();
     for (origin, view) in followed.clone() {
-        if let Some(proposal) = retire(inner, origin, view, now, tombstone_grace) {
+        if let Some(proposal) = retire(inner, origin, view, now, tombstone_grace, &mut read_cache) {
             plan.proposal = Some(proposal);
             return plan;
         }
     }
     if adoptions == Adoptions::Propose {
-        for (origin, view) in followed.clone() {
+        for (origin, view) in followed {
             if let Some(proposal) = adopt(inner, origin, view, &mut plan.reports) {
                 plan.proposal = Some(proposal);
                 return plan;
             }
         }
     }
-    let keys = ShadowReadCacheKeys::default();
-    for (origin, view) in followed {
-        if let Some(proposal) = follow_read_cache(inner, origin, view, &keys) {
-            plan.proposal = Some(proposal);
-            return plan;
+    plan.proposal = read_cache.first;
+    plan
+}
+
+/// The first change of the read cache settings of a shadow topic that the
+/// retirement scan found, which the plan proposes only after the adoptions.
+#[derive(Default)]
+struct ReadCacheChange {
+    keys: ShadowReadCacheKeys,
+    first: Option<ShadowTopicRequest>,
+}
+
+impl ReadCacheChange {
+    /// Keep the change of `topic` to what `object`, the live object of its
+    /// incarnation read as `read_as`, publishes, unless an earlier topic
+    /// changes first.
+    fn note(
+        &mut self,
+        origin: &str,
+        read_as: u128,
+        topic: &Topic,
+        object: &TopicObject,
+        target: impl FnOnce() -> ShadowTopicTarget,
+    ) {
+        if self.first.is_some()
+            || !object.is_live()
+            || object.origin != origin
+            || object.cluster_uid != read_as
+        {
+            return;
+        }
+        let published = ShadowReadCache {
+            size: object.read_cache_size,
+            read_ahead: object.read_ahead,
+        };
+        if self.keys.stored(&topic.options) != published {
+            self.first = Some(ShadowTopicRequest::SetReadCache {
+                target: target(),
+                read_cache: published,
+            });
         }
     }
-    plan
 }
 
 /// Whether committed metadata holds a shadow stream of a retired origin.
@@ -870,17 +905,25 @@ impl Lineage {
 }
 
 /// A detach or a removal that committed metadata lacks for `origin`.
+///
+/// It notes in `read_cache` the change of the read cache settings of each
+/// adopted topic to what the live object of its incarnation publishes. Only
+/// a peer that is read now changes them, through objects of the cluster that
+/// owns its store: the one the shadow stream came from, or its successor
+/// after a recovery.
 fn retire(
     inner: &StreamsInner,
     origin: &str,
     view: &PeerView,
     now: u64,
     tombstone_grace: u64,
+    read_cache: &mut ReadCacheChange,
 ) -> Option<ShadowTopicRequest> {
     let lineage = Lineage::of(inner, origin, view);
     for (stream_id, stream) in shadow_streams_of(inner, origin) {
         let source = stream.shadow.as_ref()?;
-        let follows = lineage.is_some_and(|lineage| lineage.follows(source.cluster_uid));
+        let followed = lineage.filter(|lineage| lineage.follows(source.cluster_uid));
+        let follows = followed.is_some();
         for (topic_id, topic) in &stream.topics {
             let Some(shadow) = topic.shadow else {
                 continue;
@@ -897,9 +940,9 @@ fn retire(
                 }
                 continue;
             }
-            if !follows {
+            let Some(lineage) = followed else {
                 continue;
-            }
+            };
             let key = TopicKey {
                 stream_id: source.stream_id,
                 topic_id: topic_id as u64,
@@ -925,7 +968,8 @@ fn retire(
                 {
                     return Some(ShadowTopicRequest::RemoveTopic { target: target() });
                 }
-                Some(_) | None => {}
+                Some(object) => read_cache.note(origin, lineage.read_as, topic, object, target),
+                None => {}
             }
         }
         let live_stream = view.objects.values().any(|seen| {
@@ -1060,68 +1104,6 @@ fn adopt(
                     TopicGeoMode::GeoTiered => GeoMode::GeoTiered,
                 },
             });
-        }
-    }
-    None
-}
-
-/// A change of the read cache settings of a shadow topic of `origin` to
-/// what the live object of its incarnation publishes. Only a peer that is
-/// read now changes them, through objects of the cluster that owns its
-/// store: the one the shadow stream came from, or its successor after a
-/// recovery.
-fn follow_read_cache(
-    inner: &StreamsInner,
-    origin: &str,
-    view: &PeerView,
-    keys: &ShadowReadCacheKeys,
-) -> Option<ShadowTopicRequest> {
-    let read_as = view.cluster_uid.filter(|_| !view.stale)?;
-    // A cluster that metadata does not record of the peer is read only as
-    // the proven successor of a recorded one: of the shadow streams' cluster
-    // when metadata records no other.
-    let mut recorded = inner.recorded_cluster_uids(origin).into_iter();
-    let only_recorded = recorded.next().filter(|_| recorded.next().is_none());
-    for (stream_id, stream) in shadow_streams_of(inner, origin) {
-        let Some(source) = stream.shadow.as_ref().filter(|source| {
-            source.cluster_uid == read_as || only_recorded == Some(source.cluster_uid)
-        }) else {
-            continue;
-        };
-        for (topic_id, topic) in &stream.topics {
-            let Some(shadow) = topic.shadow.filter(|shadow| !shadow.is_detached()) else {
-                continue;
-            };
-            let key = TopicKey {
-                stream_id: source.stream_id,
-                topic_id: topic_id as u64,
-                created_revision: shadow.created_revision,
-            };
-            let Some(object) = view
-                .objects
-                .get(&key)
-                .and_then(|seen| seen.object.as_ref())
-                .filter(|object| {
-                    object.is_live() && object.origin == origin && object.cluster_uid == read_as
-                })
-            else {
-                continue;
-            };
-            let published = ShadowReadCache {
-                size: object.read_cache_size,
-                read_ahead: object.read_ahead,
-            };
-            if keys.stored(&topic.options) != published {
-                return Some(ShadowTopicRequest::SetReadCache {
-                    target: ShadowTopicTarget {
-                        stream_id: u32::try_from(stream_id).ok()?,
-                        source: source.clone(),
-                        topic_id: u32::try_from(topic_id).ok()?,
-                        created_revision: shadow.created_revision,
-                    },
-                    read_cache: published,
-                });
-            }
         }
     }
     None
