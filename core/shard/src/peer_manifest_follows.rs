@@ -63,7 +63,7 @@ use crate::{IggyShard, LifecycleFrame, RestorableMetadataStm, ShardFrame, channe
 /// The most manifests that one task reads between its two reads of the
 /// peer's identity object. A slow read holds back the manifests of its own
 /// task alone.
-pub(crate) const MANIFESTS_PER_PASS: usize = 16;
+pub const MANIFESTS_PER_PASS: usize = 16;
 
 /// One manifest a listing of a peer stream found, for the shadow partition
 /// it describes.
@@ -250,7 +250,7 @@ where
             reads.push(manifest);
         }
         if !reads.is_empty() {
-            self.spawn_peer_manifest_reads(source, origin.to_owned(), reads);
+            self.spawn_peer_manifest_reads(&source, origin, reads);
         }
         let (behind, lag) = follows
             .values()
@@ -277,8 +277,8 @@ where
     /// this shard's pump once that task ends.
     fn spawn_peer_manifest_reads(
         &self,
-        source: PeerManifestSource,
-        origin: String,
+        source: &PeerManifestSource,
+        origin: &str,
         manifests: Vec<ListedPeerManifest>,
     ) {
         let Some(sender) = self.senders.get(self.id as usize) else {
@@ -504,16 +504,16 @@ where
 /// manifests between two reads of the peer's identity object of its own,
 /// and ends with what it read. A pass whose first identity read fails reads
 /// no manifest, and ends with that error for each of them.
-pub(crate) fn peer_manifest_passes(
-    source: PeerManifestSource,
-    origin: String,
+pub fn peer_manifest_passes(
+    source: &PeerManifestSource,
+    origin: &str,
     manifests: Vec<ListedPeerManifest>,
-) -> Vec<impl Future<Output = Vec<FinishedPeerManifestRead>>> {
+) -> Vec<impl Future<Output = Vec<FinishedPeerManifestRead>> + use<>> {
     let mut passes = Vec::with_capacity(manifests.len().div_ceil(MANIFESTS_PER_PASS));
     let mut manifests = manifests.into_iter().peekable();
     while manifests.peek().is_some() {
         let pass = manifests.by_ref().take(MANIFESTS_PER_PASS).collect();
-        passes.push(read_peer_manifests(source.clone(), origin.clone(), pass));
+        passes.push(read_peer_manifests(source.clone(), origin.to_owned(), pass));
     }
     passes
 }

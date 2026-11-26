@@ -572,7 +572,7 @@ impl SegmentVerifies {
         false
     }
 
-    fn count_of(&mut self, finding: Finding) -> &mut usize {
+    const fn count_of(&mut self, finding: Finding) -> &mut usize {
         match finding {
             Finding::Missing(_) => &mut self.missing,
             Finding::Diverged(..) => &mut self.diverged,

@@ -154,9 +154,10 @@ pub enum RewriteError {
 pub type RewriteOutcome = Result<Result<ManifestSegment, RewriteError>, TierJobCancelled>;
 
 /// Where a rewrite leaves the copy of the end of its segment into the
-/// shard's cache, for the caller to run once it reported the segment: the
-/// copy keeps to the rewrite's share and can sleep, and the store holds the
-/// segment already. See [`SegmentRewrite::carrying_later`].
+/// shard's cache, for the caller to run once it reported the segment.
+///
+/// The copy keeps to the rewrite's share and can sleep, and the store holds
+/// the segment already. See [`SegmentRewrite::carrying_later`].
 #[derive(Clone, Default)]
 pub struct LaterCarry(Rc<RefCell<Option<CacheCarry>>>);
 

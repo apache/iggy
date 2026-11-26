@@ -52,7 +52,7 @@ use crate::placed_read::{REWRITE_PACED_YIELD_BYTES, REWRITE_YIELD_BYTES};
 /// Redpanda's reconciler, which rewrites the batches of its cloud topics
 /// the same way, runs in a scheduling group of 150 shares against 1000 for
 /// produce: 150 of every 1150 parts of a core that both want.
-pub(crate) const REWRITE_SHARE_PERMILLE: u64 = 130;
+pub const REWRITE_SHARE_PERMILLE: u64 = 130;
 
 /// The time whose share the rewrites may bank, and then work at once when
 /// sends start to wait.
@@ -61,7 +61,7 @@ pub(crate) const REWRITE_SHARE_PERMILLE: u64 = 130;
 /// arrives at rewrites that have not worked for a while waits for one
 /// stride and not for a run of them. A rewrite that sleeps looks again
 /// this often at whether sends still wait.
-pub(crate) const REWRITE_SHARE_WINDOW: Duration = Duration::from_millis(2);
+pub const REWRITE_SHARE_WINDOW: Duration = Duration::from_millis(2);
 
 /// What the rewrites read of their shard to keep to their share.
 pub trait RewriteClock {
@@ -156,7 +156,7 @@ impl fmt::Debug for RewriteBudget {
 ///
 /// Dropped, it counts the work it has not counted yet, without a sleep: the
 /// next rewrite to give way sleeps it off.
-pub(crate) struct RewriteShare {
+pub struct RewriteShare {
     /// `None` for a rewrite that keeps to no share.
     budget: Option<Rc<RewriteBudget>>,
     /// Microseconds the rewrite worked since it last gave way.
