@@ -71,7 +71,7 @@ use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
 use consensus::{MetadataHandle, PartitionsHandle};
 use futures::future::{join_all, select};
 use iggy_object_store::gcs::{GcsAuth, GcsStore};
-use iggy_object_store::s3::{Credentials, S3Store};
+use iggy_object_store::s3::{S3Store, SharedCredentials};
 use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, ObjectStore, ObjectStoreError,
     ReadOnlyStore, RecoveryRead, RecoveryRecord, StoreIdentity,
@@ -86,6 +86,7 @@ use shard::peers::{PeerIdentity, PeerRead, PeerStatus, PeerStore, PeerStores, Sh
 use shard::{Receiver, Sender, channel};
 use tracing::{debug, error, info, warn};
 
+use crate::s3_credentials::RoleCredentials;
 use crate::server_error::ServerError;
 use crate::shell::ServerShard;
 use crate::store_identity::own_cluster_uid;
@@ -110,11 +111,21 @@ const LOOK_WAIT: Duration = Duration::from_secs(1);
 const RECOVERY_READS_PER_CHECK: usize = 8;
 
 /// How the stores of each peer authorize their requests, in the order of
-/// the configuration: the access token of a `gcs` peer, `None` for a peer
-/// on another backend. Built once per node, so every shard's stores of a
-/// peer send the token of one refresher.
+/// the configuration. Built once per node, so every shard's stores of a
+/// peer sign with the credentials or send the token of one refresher.
 #[derive(Clone, Default)]
-pub struct PeerAuth(Vec<Option<GcsAuth>>);
+pub struct PeerAuth(Vec<StoreAuth>);
+
+/// How the stores of one peer authorize their requests.
+#[derive(Clone)]
+enum StoreAuth {
+    /// An `fs` peer needs nothing.
+    None,
+    /// The keys of an `s3` peer: static, or fetched for the node's role.
+    S3(SharedCredentials),
+    /// The access token of a `gcs` peer.
+    Gcs(GcsAuth),
+}
 
 /// Boot-time checks of the peers, after `Validatable::validate`. A peer
 /// whose configuration can never work refuses the boot here, before any
@@ -127,29 +138,38 @@ pub struct PeerAuth(Vec<Option<GcsAuth>>);
 pub fn preflight(config: &GeoConfig) -> Result<(), ServerError> {
     for peer in &config.peers {
         layout(peer)?;
-        store(peer, Some(&GcsAuth::Anonymous))?;
+        store(peer, Some(&StoreAuth::unset(peer.backend)))?;
     }
     Ok(())
 }
 
-/// The access tokens of the `gcs` peers, each from a refresher of its own
-/// that starts here, after [`preflight`]. The boot never waits for a peer's
-/// token.
+/// The credentials of the `s3` peers and the access tokens of the `gcs`
+/// peers. Each peer that takes them from a role or a token service gets a
+/// refresher of its own, which starts here, after [`preflight`]. The boot
+/// never waits for a peer's first credentials.
 ///
 /// # Errors
-/// [`ServerError::GeoPeer`] for a key file that cannot sign.
-pub fn auth(config: &GeoConfig) -> Result<PeerAuth, ServerError> {
+/// [`ServerError::GeoPeer`] for an `s3` peer without keys on a node that
+/// has no role, and for a key file that cannot sign.
+pub fn auth(
+    config: &GeoConfig,
+    tiered: &TieredStorageConfig,
+    roles: &mut RoleCredentials,
+) -> Result<PeerAuth, ServerError> {
     config
         .peers
         .iter()
         .map(|peer| match peer.backend {
+            TieredStorageBackend::S3 => {
+                crate::s3_credentials::peer_credentials(peer, &tiered.region, roles)
+                    .map(StoreAuth::S3)
+            }
             TieredStorageBackend::Gcs => {
-                crate::gcs_credentials::peer_auth(&peer.origin, &peer.gcs).map(Some)
+                crate::gcs_credentials::peer_auth(&peer.origin, &peer.gcs).map(StoreAuth::Gcs)
             }
             TieredStorageBackend::None
             | TieredStorageBackend::Fs
-            | TieredStorageBackend::S3
-            | TieredStorageBackend::MockS3 => Ok(None),
+            | TieredStorageBackend::MockS3 => Ok(StoreAuth::None),
         })
         .collect::<Result<_, _>>()
         .map(PeerAuth)
@@ -896,31 +916,44 @@ fn uid(cluster_uid: u128) -> String {
 }
 
 impl PeerAuth {
-    fn of(&self, index: usize) -> Option<&GcsAuth> {
-        self.0.get(index).and_then(Option::as_ref)
+    fn of(&self, index: usize) -> Option<&StoreAuth> {
+        self.0.get(index)
     }
 }
 
-/// The store of `peer`, which only reads. A `gcs` peer's store sends the
-/// token of `gcs`.
-fn store(peer: &GeoPeerConfig, gcs: Option<&GcsAuth>) -> Result<ReadOnlyStore, ServerError> {
+impl StoreAuth {
+    /// What a store of `backend` is built with before [`auth`] runs. A
+    /// store sends nothing when it is built, so [`preflight`] checks the
+    /// rest of a peer with it and starts no refresher.
+    fn unset(backend: TieredStorageBackend) -> Self {
+        match backend {
+            TieredStorageBackend::S3 => Self::S3(SharedCredentials::refreshed()),
+            TieredStorageBackend::Gcs => Self::Gcs(GcsAuth::Anonymous),
+            TieredStorageBackend::None
+            | TieredStorageBackend::Fs
+            | TieredStorageBackend::MockS3 => Self::None,
+        }
+    }
+}
+
+/// The store of `peer`, which only reads. An `s3` or `gcs` peer's store
+/// authorizes its requests with `auth`.
+fn store(peer: &GeoPeerConfig, auth: Option<&StoreAuth>) -> Result<ReadOnlyStore, ServerError> {
     let backend = match peer.backend {
         TieredStorageBackend::Fs => Backend::Fs(FsStore::foreign(&peer.path)),
         TieredStorageBackend::S3 => {
-            let credentials = Credentials {
-                access_key_id: peer.access_key_id.clone(),
-                secret_access_key: peer.secret_access_key.clone(),
-                session_token: None,
+            let Some(StoreAuth::S3(credentials)) = auth else {
+                return Err(refuse(peer, "has no s3 credentials".to_owned()));
             };
-            let store = S3Store::new(S3Location::from(peer).config(credentials.into()))
+            let store = S3Store::new(S3Location::from(peer).config(credentials.clone()))
                 .map_err(|error| refuse(peer, error.to_string()))?;
             Backend::S3(store)
         }
         TieredStorageBackend::Gcs => {
-            let auth = gcs
-                .cloned()
-                .ok_or_else(|| refuse(peer, "has no gcs credentials".to_owned()))?;
-            let store = GcsStore::new(gcs_config(&peer.gcs, auth))
+            let Some(StoreAuth::Gcs(auth)) = auth else {
+                return Err(refuse(peer, "has no gcs credentials".to_owned()));
+            };
+            let store = GcsStore::new(gcs_config(&peer.gcs, auth.clone()))
                 .map_err(|error| refuse(peer, error.to_string()))?;
             Backend::Gcs(store)
         }
@@ -968,12 +1001,18 @@ impl<'a> From<&'a GeoPeerConfig> for S3Location<'a> {
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::future::{Future, pending};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::ops::Range;
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::SystemTime;
 
     use futures::future::{Either, join};
+    use iggy_object_store::s3::Credentials;
     use iggy_object_store::{
         DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange, PutBody,
         PutOptions, RecordingStore, StoreCalls, TierExecutor, TierJobClass, TierJobRequest,
@@ -1339,12 +1378,13 @@ mod tests {
         let config = geo(vec![s3_peer("dc-b", &endpoint)]);
         let statuses = statuses(&config);
         let metrics = ShardMetrics::for_shard();
+        let tiered = TieredStorageConfig::default();
 
         for mut checker in checkers(
             &config,
-            &TieredStorageConfig::default(),
+            &tiered,
             &statuses,
-            &PeerAuth::default(),
+            &auth(&config, &tiered, &mut RoleCredentials::default()).unwrap(),
         ) {
             checker.step(OWN, &metrics).await;
         }
@@ -1373,10 +1413,18 @@ mod tests {
         gcs.gcs.auth = configs::tiered_storage::GcsAuth::None;
         let config = geo(vec![fs_peer("dc-b", directory.path()), gcs.clone()]);
 
-        let auth = auth(&config).unwrap();
+        let auth = auth(
+            &config,
+            &TieredStorageConfig::default(),
+            &mut RoleCredentials::default(),
+        )
+        .unwrap();
 
-        assert!(auth.of(0).is_none());
-        assert!(matches!(auth.of(1), Some(GcsAuth::Anonymous)));
+        assert!(matches!(auth.of(0), Some(StoreAuth::None)));
+        assert!(matches!(
+            auth.of(1),
+            Some(StoreAuth::Gcs(GcsAuth::Anonymous))
+        ));
         assert!(store(&gcs, auth.of(1)).is_ok());
         assert!(
             matches!(store(&gcs, None), Err(ServerError::GeoPeer { ref origin, .. }) if origin == "dc-c"),
@@ -2031,5 +2079,172 @@ mod tests {
         let _ = metadata.looks(now + LOOK_WAIT);
 
         assert_eq!(reads.get(), 2);
+    }
+    /// An S3 store on a thread of its own that answers one request with the
+    /// identity object of one cluster, keeps the headers of that request,
+    /// and then stops listening.
+    struct FakeS3 {
+        endpoint: String,
+        requests: Arc<Mutex<Vec<BTreeMap<String, String>>>>,
+        worker: JoinHandle<()>,
+    }
+
+    impl FakeS3 {
+        fn start(cluster_uid: u128) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::<Mutex<Vec<_>>>::default();
+            let kept = Arc::clone(&requests);
+            let body = StoreIdentity { cluster_uid }.to_string();
+            let worker = std::thread::spawn(move || {
+                let Ok((mut connection, _)) = listener.accept() else {
+                    return;
+                };
+                kept.lock().unwrap().push(read_headers(&mut connection));
+                let _ = write!(
+                    connection,
+                    "HTTP/1.1 200 OK\r\netag: \"identity\"\r\ncontent-length: {}\r\n\
+                     connection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+            Self {
+                endpoint,
+                requests,
+                worker,
+            }
+        }
+
+        /// The requests so far.
+        fn requests(&self) -> Vec<BTreeMap<String, String>> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        /// The one request the store answered, once its thread has ended
+        /// and its socket is closed.
+        fn finish(self) -> BTreeMap<String, String> {
+            self.worker.join().expect("the fake store panicked");
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "one read per check: {requests:?}");
+            requests.remove(0)
+        }
+    }
+
+    /// The headers of the request on `connection`, by lowercase name. The
+    /// reads of a check carry no body.
+    fn read_headers(connection: &mut TcpStream) -> BTreeMap<String, String> {
+        let mut head = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            match connection.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => head.extend_from_slice(&buffer[..read]),
+            }
+        }
+        String::from_utf8_lossy(&head)
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            .collect()
+    }
+
+    #[compio::test]
+    async fn given_an_s3_peer_with_static_keys_when_checking_should_sign_with_them_and_send_no_session_token()
+     {
+        let store = FakeS3::start(DC_B);
+        let config = geo(vec![s3_peer("dc-b", &store.endpoint)]);
+        let statuses = statuses(&config);
+        let tiered = TieredStorageConfig::default();
+        let auth = auth(&config, &tiered, &mut RoleCredentials::default()).unwrap();
+        let metrics = ShardMetrics::for_shard();
+
+        for mut checker in checkers(&config, &tiered, &statuses, &auth) {
+            checker.step(OWN, &metrics).await;
+        }
+
+        assert!(matches!(
+            auth.of(0),
+            Some(StoreAuth::S3(credentials)) if !credentials.refreshes()
+        ));
+        assert_eq!(
+            statuses[0].get().identity,
+            PeerIdentity::Verified { cluster_uid: DC_B }
+        );
+        let request = store.finish();
+        let authorization = &request["authorization"];
+        assert!(
+            authorization.contains("Credential=AKIDPEEREXAMPLE/"),
+            "{authorization}"
+        );
+        assert!(!request.contains_key("x-amz-security-token"), "{request:?}");
+    }
+
+    /// An `s3` peer without keys reads with what the node's refresher
+    /// fetches. Before the first fetch a check finds the peer unreachable and
+    /// sends nothing. The check after the fetch signs with the fetched keys
+    /// and verifies the peer, without a restart.
+    #[compio::test]
+    async fn given_an_s3_peer_on_the_node_role_when_checking_should_be_unreachable_until_the_first_fetch_then_sign_with_it()
+     {
+        let store = FakeS3::start(DC_B);
+        let peer = GeoPeerConfig {
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            ..s3_peer("dc-b", &store.endpoint)
+        };
+        let config = geo(vec![peer]);
+        let statuses = statuses(&config);
+        let credentials = SharedCredentials::refreshed();
+        let auth = PeerAuth(vec![StoreAuth::S3(credentials.clone())]);
+        let metrics = ShardMetrics::for_shard();
+        let mut checkers = checkers(&config, &TieredStorageConfig::default(), &statuses, &auth);
+        let checker = &mut checkers[0];
+
+        let before = checker.check(OWN).await;
+        checker.record(&before, &metrics);
+
+        assert_eq!(before.read, PeerRead::Unreachable);
+        assert!(
+            matches!(&before.error, Some(ObjectStoreError::Unavailable(reason)) if reason.contains("no credentials")),
+            "{before:?}"
+        );
+        assert_eq!(
+            statuses[0].get(),
+            PeerStatus {
+                identity: PeerIdentity::Unverified,
+                unreachable: true,
+                retired: false,
+            }
+        );
+        assert_eq!(metrics.geo_peer_status_value("dc-b"), (false, true));
+        assert!(store.requests().is_empty(), "a read left without keys");
+
+        credentials.replace(Credentials {
+            access_key_id: "ASIAFETCHED".to_owned(),
+            secret_access_key: "fetchedSecret".to_owned(),
+            session_token: Some("fetched-session".to_owned()),
+        });
+        checker.step(OWN, &metrics).await;
+
+        assert_eq!(
+            statuses[0].get().identity,
+            PeerIdentity::Verified { cluster_uid: DC_B }
+        );
+        assert_eq!(metrics.geo_peer_status_value("dc-b"), (true, false));
+        let request = store.finish();
+        let authorization = &request["authorization"];
+        assert!(
+            authorization.contains("Credential=ASIAFETCHED/"),
+            "{authorization}"
+        );
+        assert!(
+            authorization.contains("x-amz-security-token"),
+            "the signature covers the session token: {authorization}"
+        );
+        assert_eq!(
+            request.get("x-amz-security-token").map(String::as_str),
+            Some("fetched-session")
+        );
     }
 }

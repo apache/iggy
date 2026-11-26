@@ -25,6 +25,7 @@ mod tray;
 use std::rc::Rc;
 
 use bench_dashboard_shared::identity::KindFamily;
+use bench_dashboard_shared::labels::RELEASE_LABEL;
 use gloo::console::error;
 use gloo::events::{EventListener, EventListenerOptions};
 use wasm_bindgen::JsCast;
@@ -39,9 +40,10 @@ use crate::api::{api_name, from_api_name};
 use crate::components::framework::{Framework, framework_line};
 use crate::components::page::{Crumb, breadcrumbs, data_status, page_head, page_shell};
 use crate::components::run_labels::{
-    END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, RELEASE_LABEL, family_mark, version_tag_view,
+    END_TO_END_THROUGHPUT_NOTE, NO_RATE_LIMIT_NOTE, family_mark, version_tag_view,
 };
 use crate::components::select_field::SelectField;
+use crate::pages::compare::runs::opens_elsewhere;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, use_dashboard_data};
 
@@ -312,6 +314,38 @@ fn stat_tiles(stats: &ViewStats) -> Html {
     }
 }
 
+/// A link and not a button, because each scope is a page of its own, and crawlers reach the runs
+/// outside the official suites only through the link to the list of all runs.
+fn scope_link(
+    scope: Scope,
+    query: &ExploreQuery,
+    show: &Callback<(ExploreQuery, HistoryEntry)>,
+) -> Html {
+    let next = ExploreQuery {
+        scope,
+        ..query.clone()
+    };
+    let href = next.href();
+    let show = show.clone();
+    let onclick = Callback::from(move |event: MouseEvent| {
+        if opens_elsewhere(&event) {
+            return;
+        }
+        event.prevent_default();
+        show.emit((next.clone(), HistoryEntry::Push));
+    });
+    html! {
+        <a
+            class="explore-scope-option"
+            {href}
+            aria-current={(query.scope == scope).then_some("page")}
+            {onclick}
+        >
+            { scope.label() }
+        </a>
+    }
+}
+
 fn controls(
     view: &ExploreView,
     search_ref: &NodeRef,
@@ -359,19 +393,7 @@ fn controls(
         <div class="explore-controls">
             <div class="explore-toolbar">
                 <div class="explore-scope" role="group" aria-label="Runs to list">
-                    { for Scope::ALL.map(|scope| {
-                        let next = ExploreQuery { scope, ..query.clone() };
-                        html! {
-                            <button
-                                type="button"
-                                class="explore-scope-option"
-                                aria-pressed={(query.scope == scope).to_string()}
-                                onclick={show.reform(move |_| (next.clone(), HistoryEntry::Push))}
-                            >
-                                { scope.label() }
-                            </button>
-                        }
-                    }) }
+                    { for Scope::ALL.map(|scope| scope_link(scope, query, show)) }
                 </div>
                 <label class="explore-search">
                     <span class="visually-hidden">{"Search runs"}</span>

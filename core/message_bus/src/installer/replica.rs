@@ -210,14 +210,12 @@ where
     C: TransportConn,
     F: FnOnce(S) -> C,
 {
-    let max_message_size = bus.config().max_message_size;
     handshake::acceptor_handshake(
         &mut stream,
         ctx,
         link.replica,
         placement(bus, link),
         binding,
-        max_message_size,
     )
     .await
     .map_err(|e| warn!(peer = %peer, "delegated replica handshake failed: {e}"))?;
@@ -364,14 +362,12 @@ where
     C: TransportConn,
     F: FnOnce(S) -> C,
 {
-    let max_message_size = bus.config().max_message_size;
     handshake::dialer_handshake(
         &mut stream,
         ctx,
         link.replica,
         placement(bus, link),
         binding,
-        max_message_size,
     )
     .await?;
     if !bus.is_shutting_down() {

@@ -17,12 +17,12 @@
 
 //! The compare toggle and tray of the iggy-bench runs, on the shared tray component.
 
+use bench_dashboard_shared::labels::run_name;
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use uuid::Uuid;
 use yew::prelude::*;
 
 use crate::components::compare_tray::{CompareToggleOf, CompareTrayOf, TrayRun};
-use crate::components::run_labels::run_name;
 use crate::pages::compare::oldest_first;
 use crate::state::data::{Loadable, use_dashboard_data};
 use crate::state::selection::use_selection;

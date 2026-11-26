@@ -28,8 +28,15 @@ use uuid::Uuid;
 
 use crate::BenchmarkReportLight;
 use crate::config::Thresholds;
+use crate::delta::Metric;
 use crate::identity::{HistoryKey, KindFamily, RunVersion, VersionOrder, WorkloadKey};
 use crate::metrics::{Badge, GroupMetrics};
+
+/// The headline numbers of a run with a rate limit: its throughput and its latency.
+pub const RATE_LIMITED_HEADLINES: [Metric; 4] =
+    [Metric::Throughput, Metric::P50, Metric::P99, Metric::P999];
+/// A run without a rate limit measures throughput only.
+pub const UNCAPPED_HEADLINES: [Metric; 1] = [Metric::Throughput];
 
 /// Identity, labels, badges and comparable metrics of one run. The workload key holds the
 /// kind, transport, message size, rate limit, options (durability among them) and the
@@ -125,6 +132,15 @@ impl BenchmarkSummary {
         self.groups.iter().find(|group| group.kind == kind)
     }
 
+    /// The numbers that the run page leads with, from the main group.
+    pub fn headline_metrics(&self) -> &'static [Metric] {
+        if self.workload_key.rate_limit.is_some() {
+            &RATE_LIMITED_HEADLINES
+        } else {
+            &UNCAPPED_HEADLINES
+        }
+    }
+
     pub fn comparability(&self, other: &Self) -> Comparability {
         if self.kind_family != other.kind_family {
             Comparability::DifferentWorkloads
@@ -179,19 +195,38 @@ fn title(params: &BenchmarkParams) -> String {
 /// The actors of a run in plain words, for example `8 producers, 8 consumers`.
 /// `BenchmarkParams::format_actors_info` would write "1 Producers".
 pub fn actors(params: &BenchmarkParams) -> String {
-    let end_to_end = KindFamily::from(params.benchmark_kind) == KindFamily::EndToEnd;
+    actor_counts(
+        params.benchmark_kind,
+        params.producers,
+        params.consumers,
+        params.consumer_groups,
+    )
+}
+
+/// The actors of a workload, as [`actors`] writes them.
+pub fn workload_actors(key: &WorkloadKey) -> String {
+    actor_counts(key.kind, key.producers, key.consumers, key.consumer_groups)
+}
+
+fn actor_counts(
+    kind: BenchmarkKind,
+    producers: u32,
+    consumers: u32,
+    consumer_groups: u32,
+) -> String {
+    let end_to_end = KindFamily::from(kind) == KindFamily::EndToEnd;
     // An end-to-end actor both sends and polls, and `producers` counts them.
     let counts = [
         (
-            params.producers,
+            producers,
             if end_to_end {
                 "producing consumer"
             } else {
                 "producer"
             },
         ),
-        (if end_to_end { 0 } else { params.consumers }, "consumer"),
-        (params.consumer_groups, "consumer group"),
+        (if end_to_end { 0 } else { consumers }, "consumer"),
+        (consumer_groups, "consumer group"),
     ];
     let actors: Vec<_> = counts
         .into_iter()

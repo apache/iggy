@@ -28,13 +28,13 @@ use crate::components::headline::{change_chip, headline_card};
 use crate::components::page::{
     data_status, page_head, page_head_with_title_tag, page_shell, section_head,
 };
-use crate::components::run_labels::{MachineName, version_tag_view};
-use crate::format::runs_text;
+use crate::components::run_labels::version_tag_view;
 use crate::pages::methodology::{NOISE_LEAD, PERCENTILE_RULE, THROUGHPUT_RULE};
-use crate::pages::run::change::{metric_name, metric_value_text};
 use crate::pages::run::chart::VersionChart;
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, use_dashboard_data};
+use bench_dashboard_shared::format::runs_text;
+use bench_dashboard_shared::labels::{MachineName, metric_name, metric_value_text};
 
 const EYEBROW: &str = "Overview";
 const PRODUCT: &str = "Apache Iggy";

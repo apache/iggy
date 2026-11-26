@@ -91,7 +91,7 @@ pub fn start_and_wait(refresh: impl Refresh) -> Result<(), ServerError> {
     let name = refresh.source_name();
     let subject = refresh.subject().to_owned();
     let (first_sender, first) = mpsc::sync_channel(1);
-    spawn(refresh, Some(first_sender))?;
+    spawn(refresh, Waiter::FirstFetch(first_sender))?;
     match first.recv_timeout(FIRST_FETCH_TIMEOUT) {
         Ok(Ok(expires_at)) => {
             info!(
@@ -130,60 +130,94 @@ pub fn start_and_wait(refresh: impl Refresh) -> Result<(), ServerError> {
     }
 }
 
-/// Starts the thread that keeps the cell of `refresh` fresh, without
-/// waiting for it. A fetch that fails, even for good, is logged and tried
-/// again, so a store that only some features read never stops the boot.
+/// Starts the thread that keeps the cell of `refresh` fresh, and waits only
+/// until it runs, not for its first fetch. A fetch that fails, even for
+/// good, is logged and tried again, so a store that only some features read
+/// never stops the boot.
+///
+/// A refresher that cannot run at all would leave its cell empty until the
+/// node restarts, with nothing fetching. So the caller hears of it here.
 ///
 /// # Errors
 /// [`ServerError::TieredStorageCredentialsThread`] when the thread does not
-/// start.
+/// start, or cannot build its runtime or the client of the credential
+/// service.
 pub fn start(refresh: impl Refresh) -> Result<(), ServerError> {
-    spawn(refresh, None)
+    let subject = refresh.subject().to_owned();
+    let (started_sender, started) = mpsc::sync_channel(1);
+    spawn(refresh, Waiter::Started(started_sender))?;
+    let reason = match started.recv() {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(reason)) => reason,
+        Err(_) => "the refresher stopped before it ran".to_owned(),
+    };
+    Err(ServerError::TieredStorageCredentialsThread {
+        subject,
+        source: std::io::Error::other(reason),
+    })
 }
 
-fn spawn(refresh: impl Refresh, first: Option<SyncSender<FirstFetch>>) -> Result<(), ServerError> {
+/// What the caller that starts a refresher waits for.
+enum Waiter {
+    /// The outcome of the first fetch.
+    FirstFetch(SyncSender<FirstFetch>),
+    /// That the refresher runs, or why it cannot. Its first fetch comes
+    /// later.
+    Started(SyncSender<Result<(), String>>),
+}
+
+impl Waiter {
+    /// Tells the caller that the refresher cannot run, because of `reason`.
+    fn cannot_run(self, reason: String, failure: impl FnOnce(String) -> CredentialError) {
+        match self {
+            Self::FirstFetch(first) => {
+                let _ = first.send(Err(failure(reason)));
+            }
+            Self::Started(started) => {
+                let _ = started.send(Err(reason));
+            }
+        }
+    }
+}
+
+fn spawn(refresh: impl Refresh, waiter: Waiter) -> Result<(), ServerError> {
     let subject = refresh.subject().to_owned();
     std::thread::Builder::new()
         .name("iggy-credentials".to_owned())
-        .spawn(move || {
-            let runtime = match compio::runtime::Runtime::new() {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    if let Some(first) = first {
-                        let _ = first.send(Err(CredentialError::Unreachable(format!(
-                            "no runtime for the refresher: {error}"
-                        ))));
-                    }
-                    return;
-                }
-            };
-            runtime.block_on(run(refresh, first));
+        .spawn(move || match compio::runtime::Runtime::new() {
+            Ok(runtime) => runtime.block_on(run(refresh, waiter)),
+            Err(error) => waiter.cannot_run(
+                format!("no runtime for the refresher: {error}"),
+                CredentialError::Unreachable,
+            ),
         })
         .map(drop)
         .map_err(|source| ServerError::TieredStorageCredentialsThread { subject, source })
 }
 
 /// The body of the refresher thread.
-async fn run(refresh: impl Refresh, first: Option<SyncSender<FirstFetch>>) {
-    match HttpTransport::new(refresh.endpoint(), REQUEST_TIMEOUT) {
-        Ok(transport) => keep_fresh(&refresh, &transport, first, RetryDelays::DEFAULT).await,
+async fn run(refresh: impl Refresh, waiter: Waiter) {
+    let transport = match HttpTransport::new(refresh.endpoint(), REQUEST_TIMEOUT) {
+        Ok(transport) => transport,
         Err(error) => {
-            let failure = CredentialError::Refused(format!(
-                "the credential service at {:?}: {error}",
-                refresh.endpoint()
-            ));
-            if let Some(first) = first {
-                let _ = first.send(Err(failure));
-            } else {
-                error!(
-                    source = refresh.source_name(),
-                    error = %failure,
-                    "{} gets no credentials",
-                    refresh.subject()
-                );
-            }
+            waiter.cannot_run(
+                format!(
+                    "the credential service at {:?}: {error}",
+                    refresh.endpoint()
+                ),
+                CredentialError::Refused,
+            );
+            return;
         }
-    }
+    };
+    let first = match waiter {
+        Waiter::FirstFetch(first) => Some(first),
+        Waiter::Started(started) => {
+            let _ = started.send(Ok(()));
+            None
+        }
+    };
+    keep_fresh(&refresh, &transport, first, RetryDelays::DEFAULT).await;
 }
 
 /// Fetches credentials for `refresh` for as long as the node runs: the
@@ -243,4 +277,45 @@ pub async fn keep_fresh<R: Refresh>(
 
 pub fn rfc3339(time: SystemTime) -> String {
     DateTime::<Utc>::from(time).to_rfc3339()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A refresher whose credential service has an address that is no URL,
+    /// so its thread ends before its first fetch.
+    struct NoService;
+
+    impl Refresh for NoService {
+        fn subject(&self) -> &'static str {
+            "geo peer \"dc-b\""
+        }
+
+        fn source_name(&self) -> &'static str {
+            "web identity"
+        }
+
+        fn endpoint(&self) -> &'static str {
+            "not a url"
+        }
+
+        async fn fetch(
+            &self,
+            _: &impl CredentialTransport,
+        ) -> Result<Option<SystemTime>, CredentialError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn given_a_refresher_that_cannot_run_when_starting_without_waiting_should_tell_the_caller() {
+        let Err(ServerError::TieredStorageCredentialsThread { subject, source }) = start(NoService)
+        else {
+            panic!("a refresher that cannot run started");
+        };
+
+        assert_eq!(subject, "geo peer \"dc-b\"");
+        assert!(source.to_string().contains("not a URL"), "{source}");
+    }
 }

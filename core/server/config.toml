@@ -927,7 +927,12 @@ shutdown_join_timeout = "30 s"
 # wakes on every metadata commit from shard 0. The tick retries partitions
 # that a pass left unfinished (a backed-off build, an incomplete trim),
 # checks local changes that no commit announces, ages parked requests and
-# covers dropped wake-ups. A full reconcile runs every 10 minutes as a repair.
+# covers dropped wake-ups. The reconciler also compares every partition
+# with committed metadata again in the background, and this tick does not
+# change the pace of that. It reads 1,024 entries (streams, topics,
+# partitions, routing rows) every 250 ms, and starts again 10 minutes after
+# it ended. The time for all partitions grows with their number: about 17
+# minutes at one million streams of one partition each.
 reconcile_periodic_interval = "1 s"
 
 # WebSocket listener configuration. The frame-tuning knobs below are the
@@ -1803,10 +1808,17 @@ handshake_grace = "10 s"
 #region = "us-east-1"
 #endpoint = "https://storage.example.com"
 #url_style = "auto"
-# Static s3 credentials, which an s3 peer needs. Set them in the environment,
-# for the first peer with IGGY_GEO_PEERS_0_ACCESS_KEY_ID and
-# IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather than in this file. The printed
-# configuration never shows them.
+# Static s3 credentials. Set them in the environment, for the first peer with
+# IGGY_GEO_PEERS_0_ACCESS_KEY_ID and IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather
+# than in this file. A variable for one key of a peer replaces the whole list
+# of peers from this file, so set the peer's other keys there too
+# (IGGY_GEO_PEERS_0_ORIGIN, _BACKEND, _BUCKET, _REGION) and leave its table
+# out of this file. The printed configuration never shows the credentials.
+# Without them, an s3 peer reads with the node's web identity or instance
+# role, as the s3 backend does, and that role needs s3:GetObject and
+# s3:ListBucket on the peer's bucket. A peer's credentials never hold up the
+# boot: a role that hands out nothing leaves the peer unreachable, and the
+# node keeps fetching.
 #access_key_id = ""
 #secret_access_key = ""
 # The gcs backend: the peer's bucket and how this node gets a token that
