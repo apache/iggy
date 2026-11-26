@@ -684,7 +684,7 @@ async fn produce(
 ```
 
 `IggyProducer` has an idempotent mode, which `idempotent()` on its builder turns on. The producer then gets an id from `next_producer_id` for each stream and topic as you spell them, picks the partition of each chunk as a plain send does and numbers the chunks of each partition.
-A topic named by number and by name gets two ids, so the two never share a sequence. After an unknown outcome, it sends a chunk again with the same producer section. If that resend gets `ProducerUnknown`, the send fails with `OperationUncertain`. The mode is off by default, because released consumers cannot poll the batches that it writes.
+A topic named by number and by name gets two ids, so the two never share a sequence. After an unknown outcome, it sends a chunk again with the same producer section. If that resend gets `ProducerUnknown`, the send fails with `OperationUncertain`. A send dropped before it returns, for example by a timeout, can still land. The producer then moves to the next epoch, so the next chunk never reuses its sequence. The mode is off by default, because released consumers cannot poll the batches that it writes.
 
 A partition keeps 4096 producers. Past that limit, it drops the producer that was idle the longest. It also drops a producer after 24 hours without a batch. The producer state stays through restarts, checkpoints and state transfer between replicas. HTTP clients get `FeatureUnavailable` from `next_producer_id` and `send_producer_messages`. A client with an encryptor encrypts the messages of `send_producer_messages` in place, so pass the plaintext messages again to resend a batch.
 

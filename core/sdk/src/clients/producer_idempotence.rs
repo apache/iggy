@@ -173,6 +173,57 @@ impl TopicProducer {
     }
 }
 
+/// A chunk of one partition from its first send until written. Holds the
+/// partition's sequence lock. Dropped unwritten, also by a cancelled send, it
+/// moves the producer to the next epoch before the lock goes: the chunk can
+/// still land, so the next chunk must not reuse its sequence.
+pub(crate) struct PendingChunk<'a> {
+    topic_producer: &'a TopicProducer,
+    sequence: tokio::sync::MutexGuard<'a, Sequence>,
+    producer: BatchProducer,
+    written: bool,
+}
+
+impl<'a> PendingChunk<'a> {
+    pub(crate) fn new(
+        topic_producer: &'a TopicProducer,
+        sequence: tokio::sync::MutexGuard<'a, Sequence>,
+        producer: BatchProducer,
+    ) -> Self {
+        Self {
+            topic_producer,
+            sequence,
+            producer,
+            written: false,
+        }
+    }
+
+    /// The producer section that every send of the chunk carries.
+    pub(crate) const fn producer(&self) -> BatchProducer {
+        self.producer
+    }
+
+    /// Numbers the chunk again for the producer's current id and epoch.
+    pub(crate) fn renumber(&mut self, idempotence: &Idempotence) -> Result<(), IggyError> {
+        self.producer = idempotence.next_producer(self.topic_producer, &mut self.sequence)?;
+        Ok(())
+    }
+
+    /// Records the chunk of `count` messages as written.
+    pub(crate) fn written(mut self, count: u32) {
+        Idempotence::advance(&mut self.sequence, self.producer, count);
+        self.written = true;
+    }
+}
+
+impl Drop for PendingChunk<'_> {
+    fn drop(&mut self) {
+        if !self.written {
+            self.topic_producer.next_epoch(self.producer);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
