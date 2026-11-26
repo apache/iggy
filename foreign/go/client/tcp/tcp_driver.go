@@ -560,12 +560,12 @@ func (c *IggyTcpClient) driveOperation(ctx context.Context, operation *pendingOp
 			} else if operation.code != command.GetClusterMetadataCode && operation.replica == nil {
 				_ = c.refreshRoster(ctx, link)
 			}
-		case errors.Is(err, ierror.ErrDeferredPollCapacityExceeded):
-			// The primary parks as many deferred requests of the session as it
-			// admits. The route is right, so the same primary is asked again.
-		case errors.Is(err, ierror.ErrFreeSpaceReserveReached):
-			// The primary has no room on its data disk and stored nothing. The
-			// route is right, so the same primary is asked again.
+		case errors.Is(err, ierror.ErrDeferredPollCapacityExceeded),
+			errors.Is(err, ierror.ErrFreeSpaceReserveReached):
+			// The primary parks no more deferred requests of the session, or
+			// has no room on its data disk, and stored nothing. The route is
+			// right, so the same primary is asked again, and the deadline
+			// reports this refusal, as in the Rust SDK.
 			refusal = err
 		case errors.Is(err, ierror.ErrNotPrimary) && operation.replica != nil:
 			// The caller chose the replica, so its refusal is the answer.
