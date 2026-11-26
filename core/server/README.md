@@ -545,6 +545,11 @@ that owns its root. The counters `remote_read_block_hits_total`,
 `remote_read_carried_bytes_total`, and the gauges `remote_read_cache_bytes` and
 `remote_read_held_bytes`, show what the cache of each shard does.
 
+A replica rebuilt by state transfer gets only the records of the segments
+that the store holds, and reads those segments from the store. A replica that
+cannot read its store waits for it before it rebuilds a tiered partition, and
+stays behind its group until then.
+
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.
 It lists the segments that the store holds, with their offsets, timestamps,
