@@ -29,6 +29,7 @@ pub use self::runs::{CompareLink, RunList, oldest_first};
 use bench_dashboard_shared::BenchmarkReportLight;
 use bench_dashboard_shared::config::DashboardConfig;
 use bench_dashboard_shared::delta::Metric;
+use bench_dashboard_shared::labels::{conditions, run_name, short_id, version_tag};
 use bench_dashboard_shared::series::SeriesMetric;
 use bench_dashboard_shared::summary::{BenchmarkSummary, Comparability};
 use uuid::Uuid;
@@ -49,11 +50,10 @@ use crate::components::headline::{compact_judged_chip, judged_chip};
 use crate::components::page::{
     Crumb, breadcrumbs, data_status, loadable, page_head, page_shell, section_head,
 };
-use crate::components::run_labels::{DayLabel, run_name, short_id, version_tag, version_tag_view};
+use crate::components::run_labels::{DayLabel, version_tag_view};
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
 use crate::pages::run::chart::{CURRENT_COLOR, LATENCY_CHART_NOTE};
-use crate::pages::run::facts::conditions;
 use crate::pages::run::history::NO_VALUE;
 use crate::router::AppRoute;
 use crate::state::data::{DashboardData, Loadable, fetch_into, use_dashboard_data};

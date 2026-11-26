@@ -18,6 +18,7 @@
 use iggy_common::{EncryptorKind, IggyError, ServerKeyContext, StreamEncryption};
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 /// One stream incarnation. A stream id reused after a delete gets a new
@@ -81,9 +82,28 @@ impl StreamKeyring {
         self.encryptors.is_empty()
     }
 
-    /// Drop the encryptors of the stream incarnations `is_live` rejects.
-    pub fn retain(&mut self, mut is_live: impl FnMut(StreamKeyIdentity) -> bool) {
-        self.encryptors.retain(|identity, _| is_live(*identity));
+    /// Drop the encryptors of the stream incarnations `is_live` rejects, among
+    /// the streams with an id in `streams`. A sweep in parts reads the keys of
+    /// one run of stream ids at a time.
+    pub fn retain(
+        &mut self,
+        streams: RangeInclusive<usize>,
+        mut is_live: impl FnMut(StreamKeyIdentity) -> bool,
+    ) {
+        if streams.is_empty() {
+            return;
+        }
+        let first = StreamKeyIdentity {
+            stream_id: *streams.start(),
+            created_op: u64::MIN,
+        };
+        let last = StreamKeyIdentity {
+            stream_id: *streams.end(),
+            created_op: u64::MAX,
+        };
+        self.encryptors
+            .extract_if(first..=last, |identity, _| !is_live(*identity))
+            .for_each(drop);
     }
 }
 
@@ -128,13 +148,49 @@ mod tests {
 
         let ciphertext = old_encryptor.encrypt(b"payload").expect("encrypts");
         assert!(new_encryptor.decrypt(&ciphertext).is_err());
-        keyring.retain(|identity| identity == recreated);
+        keyring.retain(0..=usize::MAX, |identity| identity == recreated);
         assert_eq!(keyring.encryptors.len(), 1);
         let again = keyring
             .resolve(recreated, &wrapped(&context, 2))
             .expect("opens")
             .expect("encrypted");
         assert!(Arc::ptr_eq(&again, &new_encryptor));
+    }
+
+    #[test]
+    fn given_a_run_of_stream_ids_when_retaining_should_leave_the_keys_of_other_streams() {
+        let context = context(CONFIG_KEY);
+        let mut keyring = StreamKeyring::new(Arc::clone(&context));
+        let identities: Vec<_> = [(0, 1), (1, 2), (1, 7), (2, 3), (4, 4)]
+            .into_iter()
+            .map(|(stream_id, created_op)| StreamKeyIdentity {
+                stream_id,
+                created_op,
+            })
+            .collect();
+        for identity in &identities {
+            keyring
+                .resolve(*identity, &wrapped(&context, 1))
+                .expect("opens");
+        }
+        let kept = |keyring: &StreamKeyring| keyring.encryptors.keys().copied().collect::<Vec<_>>();
+
+        let mut asked = Vec::new();
+        keyring.retain(1..=2, |identity| {
+            asked.push(identity);
+            identity.created_op == 7
+        });
+
+        assert_eq!(asked, identities[1..4]);
+        assert_eq!(
+            kept(&keyring),
+            [identities[0], identities[2], identities[4]]
+        );
+        #[allow(clippy::reversed_empty_ranges)]
+        keyring.retain(3..=2, |_| false);
+        assert_eq!(kept(&keyring).len(), 3);
+        keyring.retain(4..=usize::MAX, |_| false);
+        assert_eq!(kept(&keyring), [identities[0], identities[2]]);
     }
 
     #[test]

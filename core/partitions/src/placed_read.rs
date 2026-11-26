@@ -52,13 +52,14 @@ use iggy_object_store::{
 use server_common::iobuf::{Frozen, Owned};
 use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trusted};
 
+use crate::RemoteSegments;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::poll_plan::{DiskFault, PartitionDirResolution};
-use crate::remote_segments::RemoteRange;
-use crate::remote_segments::{FRESH_READ_BYTES_MAX, FRESH_READ_GAP_BYTES, FreshReads};
+use crate::remote_segments::{
+    FRESH_READ_BYTES_MAX, FRESH_READ_GAP_BYTES, FreshReads, ReadPolicy, RemoteRange,
+};
 use crate::rewrite_share::RewriteShare;
-use crate::{PartitionReadSettings, RemoteSegments};
 
 const PREPARE_HEADER_SIZE: usize = size_of::<PrepareHeader>();
 
@@ -135,7 +136,7 @@ pub struct PlacedReadPlan {
     /// poll does not read and readahead may.
     pub(crate) long_term_next: Option<ManifestSegment>,
     /// How the partition's reads of the store use the shard's cache.
-    pub(crate) read_settings: PartitionReadSettings,
+    pub(crate) read_settings: ReadPolicy,
 }
 
 /// What [`PlacedReadPlan::read`] returns.
@@ -355,7 +356,11 @@ impl PlacedReadPlan {
                 .or(self.long_term_next.as_ref())
                 .map(|next| self.long_term_log(next));
             let index = self
-                .wait(remote.read_long_term_index(&log, LONG_TERM_INDEX_BYTES, self.read_settings))
+                .wait(remote.read_long_term_index(
+                    &log,
+                    LONG_TERM_INDEX_BYTES,
+                    &self.read_settings.current(),
+                ))
                 .await?;
             let mut position = wanted.first_position(&index, segment.size);
             let mut len = LONG_TERM_READ_BYTES;
@@ -363,19 +368,33 @@ impl PlacedReadPlan {
                 let end = segment.size.min(position.saturating_add(len));
                 let read = usize::try_from(end - position).map_err(|_| DiskFault::Tiered)?;
                 let chunk = self
-                    .wait(remote.read(&log, position, read, next.as_ref(), self.read_settings))
+                    .wait(remote.read(
+                        &log,
+                        position,
+                        read,
+                        next.as_ref(),
+                        wanted.poll_offset(),
+                        &self.read_settings.current(),
+                    ))
                     .await?;
-                match take_whole_batches(chunk.as_slice(), wanted, batches)? {
-                    Read::Batches(bytes) => {
+                let fault = match take_whole_batches(chunk.as_slice(), wanted, batches) {
+                    Ok(Read::Batches(bytes)) => {
                         position += bytes;
                         len = LONG_TERM_READ_BYTES;
+                        continue;
                     }
                     // The batch at `position` is larger than the chunk.
-                    Read::Needs(bytes) if bytes > len && position + bytes <= segment.size => {
+                    Ok(Read::Needs(bytes)) if bytes > len && position + bytes <= segment.size => {
                         len = bytes;
+                        continue;
                     }
-                    Read::Needs(_) => return Err(DiskFault::Tiered),
-                }
+                    Ok(Read::Needs(_)) => DiskFault::Tiered,
+                    Err(fault) => fault,
+                };
+                // Bytes that are not whole batches may be in the cache, and
+                // the next poll asks the store for them again.
+                remote.forget_cached(&log, position, read);
+                return Err(fault);
             }
         }
         Ok(())
@@ -619,19 +638,16 @@ impl PlacedReadPlan {
         let (Some(remote), [first, _, ..]) = (self.remote.as_deref(), run) else {
             return Ok(FreshReads::default());
         };
-        let blobs: Vec<_> = run
-            .iter()
-            .filter_map(|placed| {
-                let placement = placed.placement;
-                let end = placement.position.checked_add(placement.length)?;
-                Some(placement.position..end)
-            })
-            .collect();
+        let blobs = run.iter().filter_map(|placed| {
+            let placement = placed.placement;
+            let end = placement.position.checked_add(placement.length)?;
+            Some(placement.position..end)
+        });
         self.wait(remote.fetch_fresh(
             first.placement.object_id,
-            &blobs,
+            blobs,
             self.prefix,
-            self.read_settings,
+            &self.read_settings.current(),
         ))
         .await
     }
@@ -660,7 +676,7 @@ impl PlacedReadPlan {
                 placement.object_id,
                 range,
                 self.prefix,
-                self.read_settings,
+                &self.read_settings.current(),
             ))
             .await?
         };
@@ -954,6 +970,19 @@ impl Wanted {
 
     fn is_full(&self) -> bool {
         self.limited || self.messages >= u64::from(self.query.count())
+    }
+
+    /// The offset the poll reads next, when it knows one. A consumer's next
+    /// poll can read some of the same bytes again, and its later offset
+    /// tells it apart from another poll of the same messages.
+    const fn poll_offset(&self) -> Option<u64> {
+        if self.messages > 0 {
+            return Some(self.next_offset);
+        }
+        match self.query {
+            MessageLookup::Offset { offset, .. } => Some(offset),
+            MessageLookup::Timestamp { .. } => None,
+        }
     }
 
     /// Whether taking a batch that the read holds as `held` bytes would pass
@@ -1337,6 +1366,8 @@ mod tests {
                             cache_bytes,
                             block_bytes: 256 * 1024,
                             read_ahead: 0,
+                            read_ahead_fetches: 4,
+                            read_ahead_fetch_bytes: 32 * 1024 * 1024,
                         }),
                     ),
             )),
@@ -1350,7 +1381,7 @@ mod tests {
             long_term: Vec::new(),
             long_term_floor: None,
             long_term_next: None,
-            read_settings: PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
         }
     }
 
@@ -1583,7 +1614,7 @@ mod tests {
         let remote = plan.remote.clone().unwrap();
         let whole = 0..object.len() as u64;
         remote
-            .read_fresh(1, whole.clone(), plan.prefix, plan.read_settings)
+            .read_fresh(1, whole.clone(), plan.prefix, &plan.read_settings.current())
             .await
             .unwrap();
         let asked = store.asked.borrow().len();
@@ -1612,7 +1643,7 @@ mod tests {
                 1,
                 0..object.len() as u64,
                 in_blocks.prefix,
-                in_blocks.read_settings,
+                &in_blocks.read_settings.current(),
             )
             .await
             .unwrap();

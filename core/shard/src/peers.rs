@@ -91,9 +91,10 @@ pub enum PeerIdentity {
     /// and no recovery record leads from it to `found`. The node reads
     /// nothing from the peer until a check finds a cluster that it expects.
     Mismatched { recorded: u128, found: u128 },
-    /// An earlier check verified `cluster_uid`, but the last answer was no
-    /// identity object or a refusal. The node reads nothing until a check
-    /// finds `cluster_uid` again.
+    /// An earlier check verified `cluster_uid`, but the last check found no
+    /// identity object, got a refusal or did not finish proving the claim it
+    /// found, or committed metadata no longer expects `cluster_uid`. The node
+    /// reads nothing until a check accepts a claim again.
     Unconfirmed { cluster_uid: u128 },
     /// A check found a claim other than `cluster_uid`: another cluster's,
     /// this cluster's own, or, as `None`, bytes that no cluster wrote. The
@@ -120,6 +121,12 @@ pub enum PeerRead {
     /// the peer, and no recovery record leads to it from `recorded`, one
     /// that it does.
     Unknown { recorded: u128, found: u128 },
+    /// The object names `found`, which committed metadata does not expect of
+    /// the peer, and the check stopped following the recovery records under
+    /// the root before they proved or refuted it: a read of one got no
+    /// answer, as `unreachable`, or the check read as many as one check
+    /// reads.
+    Unproven { found: u128, unreachable: bool },
     /// The object names this cluster, so the peer's root is this cluster's
     /// own.
     OwnCluster(u128),
@@ -130,8 +137,9 @@ pub enum PeerRead {
     /// The store did not answer, or failed in a way that a retry can get
     /// past.
     Unreachable,
-    /// The store refused the read in a way that only an operator can fix,
-    /// such as rejected credentials or a missing bucket.
+    /// The store refused a read of the check, of the identity object or of a
+    /// recovery record, in a way that only an operator can fix, such as
+    /// rejected credentials or a missing bucket.
     Refused,
 }
 
@@ -260,6 +268,7 @@ impl PeerIdentity {
             (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unknown { recorded, found }) => {
                 Self::Mismatched { recorded, found }
             }
+            (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unproven { .. }) => self,
             (
                 Self::Unverified | Self::Mismatched { .. },
                 PeerRead::OwnCluster(_) | PeerRead::Invalid | PeerRead::Missing | PeerRead::Refused,
@@ -291,9 +300,11 @@ impl PeerIdentity {
                 cluster_uid,
                 found: None,
             },
+            // A claim that the check could not prove stops the reads until a
+            // check proves or refutes it.
             (
                 Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
-                PeerRead::Missing | PeerRead::Refused,
+                PeerRead::Missing | PeerRead::Refused | PeerRead::Unproven { .. },
             ) => Self::Unconfirmed { cluster_uid },
         }
     }
@@ -318,7 +329,14 @@ impl PeerStatus {
     pub const fn after(self, read: PeerRead) -> Self {
         Self {
             identity: self.identity.after(read),
-            unreachable: matches!(read, PeerRead::Unreachable),
+            unreachable: matches!(
+                read,
+                PeerRead::Unreachable
+                    | PeerRead::Unproven {
+                        unreachable: true,
+                        ..
+                    }
+            ),
             retired: self.retired,
         }
     }
@@ -493,11 +511,16 @@ where
         slot: StoreSlot,
     ) -> RemoteSegments {
         cache.filter(|cache| cache.keeps_fetched()).map_or_else(
-            || RemoteSegments::new(Rc::new(self.objects()), self.layout.clone()),
+            || {
+                RemoteSegments::new(
+                    Rc::new(self.objects(TierJobClass::DemandFetch)),
+                    self.layout.clone(),
+                )
+            },
             |cache| {
                 RemoteSegments::through_cache(
-                    Rc::new(self.objects()),
-                    Rc::new(self.ahead_objects()),
+                    Rc::new(self.objects(TierJobClass::DemandFetch)),
+                    Rc::new(self.objects(TierJobClass::SpeculativeFetch)),
                     self.layout.clone(),
                     cache,
                     slot,
@@ -528,24 +551,13 @@ where
         &self.status
     }
 
-    fn objects(&self) -> PeerObjects<B> {
+    /// The reads of the polls of this peer's shadow partitions, in `class`
+    /// of the peer's tier service: demand fetches for what a poll waits
+    /// for, speculative fetches for readahead.
+    fn objects(&self, class: TierJobClass) -> PeerObjects<B> {
         PeerObjects {
             origin: self.origin.clone(),
-            reads: ExecutorObjects::new(self.service.clone()),
-            status: self.status.clone(),
-            polls: true,
-        }
-    }
-
-    /// [`Self::objects`] for readahead, in the speculative fetch class of the
-    /// peer's tier service.
-    fn ahead_objects(&self) -> PeerObjects<B> {
-        PeerObjects {
-            origin: self.origin.clone(),
-            reads: ExecutorObjects::with_class(
-                self.service.clone(),
-                TierJobClass::SpeculativeFetch,
-            ),
+            reads: ExecutorObjects::with_class(self.service.clone(), class),
             status: self.status.clone(),
             polls: true,
         }
@@ -561,8 +573,7 @@ struct PeerGate {
 
 impl ReadGate for PeerGate {
     fn admit(&self) -> Option<u128> {
-        let status = self.status.get();
-        status.identity.readable().filter(|_| status.serves_polls())
+        self.status.get().identity.readable()
     }
 }
 
@@ -907,6 +918,64 @@ mod tests {
         }
     }
 
+    /// A claim of another cluster that a check could not prove stops the
+    /// reads of a verified peer, and only a check that proves or refutes it
+    /// decides what comes next.
+    #[test]
+    fn given_an_unproven_claim_when_moving_the_status_should_read_nothing_until_a_check_proves_it()
+    {
+        let verified = PeerStatus::default().after(PeerRead::Found(PEER));
+        let unconfirmed = PeerIdentity::Unconfirmed { cluster_uid: PEER };
+        let unanswered = PeerRead::Unproven {
+            found: OTHER,
+            unreachable: true,
+        };
+        let walking = PeerRead::Unproven {
+            found: OTHER,
+            unreachable: false,
+        };
+
+        let suspended = verified.after(unanswered);
+        assert_eq!(suspended.identity, unconfirmed);
+        assert!(suspended.unreachable);
+        assert!(!suspended.serves_polls() && !suspended.serves_jobs());
+        assert!(!verified.after(walking).unreachable);
+        assert_eq!(verified.after(walking).identity, unconfirmed);
+        // (row, identity before, read, identity after)
+        for (row, before, read, after) in [
+            ("still unproven", unconfirmed, walking, unconfirmed),
+            (
+                "proven at last",
+                unconfirmed,
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "refuted at last",
+                unconfirmed,
+                unknown(OTHER),
+                PeerIdentity::Changed {
+                    cluster_uid: PEER,
+                    found: Some(OTHER),
+                },
+            ),
+            (
+                "nothing verified yet",
+                PeerIdentity::Unverified,
+                walking,
+                PeerIdentity::Unverified,
+            ),
+            (
+                "a mismatch holds",
+                mismatched(OWN),
+                walking,
+                mismatched(OWN),
+            ),
+        ] {
+            assert_eq!(before.after(read), after, "{row}");
+        }
+    }
+
     #[test]
     fn given_each_identity_when_asking_should_read_only_a_verified_peer() {
         assert_eq!(
@@ -1039,7 +1108,7 @@ mod tests {
                         }
                         let listed = store.list(&ListRequest::new("iggy/")).await;
                         assert!(listed.is_ok());
-                        assert!(store.head(&key).await.is_ok());
+                        assert!(ObjectStore::head(store.as_ref(), &key).await.is_ok());
                         StoreIdentity::read(store.as_ref(), &layout).await
                     },
                 )
@@ -1094,7 +1163,7 @@ mod tests {
         let provider = RecordingStore::new(stored);
         let calls = provider.calls();
         let peer = peer("dc-b", provider);
-        let objects = peer.objects();
+        let objects = peer.objects(TierJobClass::DemandFetch);
 
         let unverified = objects.get_range(&key, 0..5).await;
         assert!(
@@ -1188,7 +1257,11 @@ mod tests {
         );
         assert_eq!(calls.all(), Vec::new());
 
-        let polled = peer.objects().get_range(&key, 0..5).await.unwrap();
+        let polled = peer
+            .objects(TierJobClass::DemandFetch)
+            .get_range(&key, 0..5)
+            .await
+            .unwrap();
         assert_eq!(polled.bytes.as_ref(), b"bytes");
         assert_eq!(calls.all().len(), 1);
     }

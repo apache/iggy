@@ -709,15 +709,16 @@ impl Validatable<ConfigurationError> for TieredStorageConfig {
 }
 
 impl TieredStorageConfig {
-    /// Checks the job caps, timeouts and retries. The tier services of geo
-    /// peers take them too, so they must hold even without a backend of this
+    /// Checks the job caps, timeouts, retries and read cache. The tier
+    /// services of geo peers take them too, and their reads go through the
+    /// read cache, so they must hold even without a backend of this
     /// cluster's own.
     ///
     /// # Errors
     /// [`ConfigurationError::InvalidConfigurationValue`] for a cap of zero, a
     /// duration outside its bounds, no attempt, a backoff cap below its
-    /// start, or a read cache whose block size, size and readahead do not
-    /// fit together.
+    /// start, or a read cache that is on and whose block size, size and
+    /// readahead do not fit together.
     pub fn validate_tuning(&self) -> Result<(), ConfigurationError> {
         let jobs = &self.jobs;
         let counts = [
@@ -831,20 +832,21 @@ impl TieredStorageConfig {
         Ok(())
     }
 
-    /// The block size always, and the size and readahead of a cache that is
-    /// on. The messages give exact bytes: rounded, a value one byte past a
-    /// bound prints as the bound.
+    /// The block size, size and readahead of a cache that is on. A cache
+    /// that is off keeps nothing that reads fetch, and none of them take
+    /// effect. The messages give exact bytes: rounded, a value one byte past
+    /// a bound prints as the bound.
     fn validate_read_cache(&self) -> Result<(), ConfigurationError> {
+        let cache_size = self.read_cache_size.as_bytes_u64();
+        if cache_size == 0 {
+            return Ok(());
+        }
         let block = self.read_cache_block_size.as_bytes_u64();
         if !(READ_CACHE_BLOCK_SIZE_MIN..=READ_CACHE_BLOCK_SIZE_MAX).contains(&block) {
             return refuse(&format!(
                 "read_cache_block_size is {block} B and must be between \
                  {READ_CACHE_BLOCK_SIZE_MIN} B and {READ_CACHE_BLOCK_SIZE_MAX} B"
             ));
-        }
-        let cache_size = self.read_cache_size.as_bytes_u64();
-        if cache_size == 0 {
-            return Ok(());
         }
         if cache_size < READ_AHEAD_CACHE_SHARE * block {
             return refuse(&format!(
@@ -1341,26 +1343,37 @@ mod tests {
     }
 
     #[test]
-    fn given_a_read_cache_block_size_outside_64_kib_to_1_mib_when_validating_should_refuse_even_with_the_cache_off()
-     {
+    fn given_a_read_cache_block_size_outside_64_kib_to_1_mib_when_validating_should_refuse() {
         assert!(read_cache("64 MiB", "64 KiB", "2 MiB").validate().is_ok());
         assert!(read_cache("64 MiB", "1 MiB", "2 MiB").validate().is_ok());
-        for size in ["64 MiB", "0"] {
+        assert!(read_cache("64 MiB", "65535 B", "0").validate().is_err());
+        assert!(read_cache("64 MiB", "1048577 B", "0").validate().is_err());
+        assert!(read_cache("64 MiB", "0", "0").validate().is_err());
+    }
+
+    /// Geo peers' reads go through the read cache, so a node with peers and
+    /// no store of its own checks it too.
+    #[test]
+    fn given_read_cache_settings_that_do_not_fit_when_validating_the_tuning_of_geo_peers_should_refuse()
+     {
+        for (size, block_size, read_ahead) in [
+            ("64 MiB", "2 MiB", "2 MiB"),
+            ("64 MiB", "256 KiB", "9 MiB"),
+            ("1 B", "256 KiB", "0"),
+        ] {
+            let no_backend = TieredStorageConfig {
+                read_cache_size: size.parse().unwrap(),
+                read_cache_block_size: block_size.parse().unwrap(),
+                read_ahead: read_ahead.parse().unwrap(),
+                ..TieredStorageConfig::default()
+            };
+            assert!(no_backend.validate_tuning().is_err(), "{size} {block_size}");
+            assert!(no_backend.validate().is_ok(), "{size} {block_size}");
             assert!(
-                read_cache(size, "65535 B", "0").validate().is_err(),
-                "{size}"
+                read_cache(size, block_size, read_ahead).validate().is_err(),
+                "{size} {block_size}"
             );
-            assert!(
-                read_cache(size, "1048577 B", "0").validate().is_err(),
-                "{size}"
-            );
-            assert!(read_cache(size, "0", "0").validate().is_err(), "{size}");
         }
-        let no_backend = TieredStorageConfig {
-            read_cache_block_size: "2 MiB".parse().unwrap(),
-            ..TieredStorageConfig::default()
-        };
-        assert!(no_backend.validate_tuning().is_err());
     }
 
     /// An eighth of the cache holds what readahead fetched, and it has to
@@ -1408,18 +1421,15 @@ mod tests {
         );
         assert!(read_cache("8 MiB", "256 KiB", "1 MiB").validate().is_ok());
         assert!(read_cache("8 MiB", "256 KiB", "2 MiB").validate().is_err());
-        let no_backend = TieredStorageConfig {
-            read_ahead: "9 MiB".parse().unwrap(),
-            ..TieredStorageConfig::default()
-        };
-        assert!(no_backend.validate_tuning().is_err());
     }
 
     #[test]
-    fn given_the_read_cache_turned_off_when_validating_should_not_check_its_size_or_readahead() {
+    fn given_the_read_cache_turned_off_when_validating_should_not_check_its_settings() {
         assert!(read_cache("0", "256 KiB", "1 B").validate().is_ok());
         assert!(read_cache("0", "256 KiB", "1 GiB").validate().is_ok());
         assert!(read_cache("0", "64 KiB", "0").validate().is_ok());
+        assert!(read_cache("0", "2 MiB", "0").validate().is_ok());
+        assert!(read_cache("0", "0", "0").validate().is_ok());
     }
 
     #[test]

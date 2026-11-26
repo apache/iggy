@@ -45,6 +45,7 @@ use std::cell::Cell;
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
+use std::ops::RangeInclusive;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
@@ -973,9 +974,14 @@ where
         !self.keyring.borrow().is_empty()
     }
 
-    /// Drop the encryptors of the stream incarnations `is_live` rejects.
-    pub fn retain_stream_keys(&self, is_live: impl FnMut(StreamKeyIdentity) -> bool) {
-        self.keyring.borrow_mut().retain(is_live);
+    /// Drop the encryptors of the stream incarnations `is_live` rejects, among
+    /// the streams with an id in `streams`.
+    pub fn retain_stream_keys(
+        &self,
+        streams: RangeInclusive<usize>,
+        is_live: impl FnMut(StreamKeyIdentity) -> bool,
+    ) {
+        self.keyring.borrow_mut().retain(streams, is_live);
     }
 
     pub fn set_persistence_notifier(&self, notifier: crate::PersistenceNotifier) {
@@ -1452,6 +1458,20 @@ where
         self.slots().iter().flatten().map(|slot| &slot.namespace)
     }
 
+    /// One item per slot for up to `limit` slots from `first_slot` on, in
+    /// slot order: the namespace of the partition there, `None` for a vacant
+    /// slot. A walk in parts goes on at the slot after the last one it read.
+    /// Returns copies, so no borrow of the slots outlives the call and an
+    /// insert between two parts cannot invalidate one.
+    pub fn slot_namespaces(&self, first_slot: usize, limit: usize) -> Vec<Option<IggyNamespace>> {
+        self.slots()
+            .iter()
+            .skip(first_slot)
+            .take(limit)
+            .map(|slot| slot.as_ref().map(|slot| slot.namespace))
+            .collect()
+    }
+
     /// The partition of `namespace`, tombstoned or not, with what its shard
     /// last reported of it. Wakes it.
     pub fn sent_report(
@@ -1669,26 +1689,20 @@ where
         consumer: PollingConsumer,
         args: &PollingArgs,
     ) -> Option<PollPlan> {
-        self.build_poll_snapshot_within(
-            namespace,
-            consumer,
-            args,
-            usize::MAX,
-            crate::PartitionReadSettings::SHARD,
-        )
+        self.build_poll_snapshot_within(namespace, consumer, args, usize::MAX)
     }
 
     /// [`Self::build_poll_snapshot`] for a poll whose reply holds at most
     /// `byte_budget` bytes of messages, so the snapshot stops at the segment
-    /// that covers them instead of at the partition's tail, and whose reads
-    /// of the store use the shard's cache with `read_settings`.
+    /// that covers them instead of at the partition's tail. The caller hands
+    /// the settings of its reads of the store to
+    /// [`PollPlan::read_store_with`].
     pub fn build_poll_snapshot_within(
         &self,
         namespace: &IggyNamespace,
         consumer: PollingConsumer,
         args: &PollingArgs,
         byte_budget: usize,
-        read_settings: crate::PartitionReadSettings,
     ) -> Option<PollPlan> {
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
@@ -1696,13 +1710,7 @@ where
         // Read the knob first: the `&mut` borrow below covers `self.config` too.
         let validate_checksum = self.config.validate_checksum;
         let partition = self.get_mut_with_remote(namespace)?;
-        Some(partition.build_poll_plan_reading(
-            consumer,
-            args,
-            validate_checksum,
-            byte_budget,
-            read_settings,
-        ))
+        Some(partition.build_poll_plan_within(consumer, args, validate_checksum, byte_budget))
     }
 
     /// Validate and accept a poll synchronously on the owning pump.
@@ -2299,6 +2307,8 @@ mod tests {
                 cache_bytes: 64 * 1024 * 1024,
                 block_bytes: 4096,
                 read_ahead: 0,
+                read_ahead_fetches: 4,
+                read_ahead_fetch_bytes: 32 * 1024 * 1024,
             });
             let remote = Rc::new(
                 crate::RemoteSegments::new(
@@ -2310,6 +2320,13 @@ mod tests {
             partitions.set_remote_segments(Rc::clone(&remote));
             partitions.insert(namespace, build_partition());
             let created_revision = partitions.get_by_ns(&namespace).unwrap().created_revision();
+            // The settings that the partition's polls read with.
+            let settings = partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .placed_read_plan(None)
+                .read_settings
+                .current();
             let segment = crate::remote_segments::RemoteRange {
                 key: iggy_object_store::SegmentKey {
                     prefix: crate::object_prefix(namespace, created_revision),
@@ -2319,8 +2336,7 @@ mod tests {
                 keyed_end_offset: None,
                 range: 0..4096,
             };
-            let mut read =
-                Box::pin(remote.read(&segment, 0, 100, None, crate::PartitionReadSettings::SHARD));
+            let mut read = Box::pin(remote.read(&segment, 0, 100, None, None, &settings));
             assert!(futures::poll!(read.as_mut()).is_pending());
 
             if removed {
@@ -3139,6 +3155,25 @@ mod tests {
         assert_eq!(with_hole, [5, 7], "a vacant slot is skipped");
         assert_eq!(reused, [5, 1, 7], "the reused slot keeps its place");
         assert_eq!(replay(), (with_hole, reused));
+    }
+
+    /// A walk in parts reads one item per slot, so it can bound the slots of
+    /// a part and go on at the next slot, vacant slots included.
+    #[test]
+    fn given_a_vacant_slot_when_reading_slots_from_one_should_yield_one_item_per_slot() {
+        let [five, six, seven] = [5, 6, 7].map(|id| IggyNamespace::new(1, 1, id));
+        let partitions = shard_with(&[five, six, seven]);
+        drop(partitions.remove(&six));
+
+        let slots = |first_slot, limit| partitions.slot_namespaces(first_slot, limit);
+
+        assert_eq!(slots(0, usize::MAX), [Some(five), None, Some(seven)]);
+        assert_eq!(slots(1, usize::MAX), [None, Some(seven)]);
+        assert_eq!(slots(0, 2), [Some(five), None], "a vacant slot counts");
+        assert_eq!(slots(2, 2), [Some(seven)]);
+        assert_eq!(slots(0, 0), []);
+        assert_eq!(slots(3, usize::MAX), []);
+        assert_eq!(slots(usize::MAX, usize::MAX), []);
     }
 
     /// The slot array holds boxes, so its growth moves pointers and never a

@@ -21,7 +21,6 @@
 //! yield. Execution returns facts about that snapshot. Only the partition
 //! owner validates its history and accepts progress.
 
-use crate::PartitionReadSettings;
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
 use crate::iggy_index_reader::IggyIndexReader;
 use crate::journal::{
@@ -29,7 +28,9 @@ use crate::journal::{
     unpin_sparse_source,
 };
 use crate::placed_read::PlacedReadPlan;
-use crate::remote_segments::{IndexFetch, IndexFetchFence, RemoteRange, RemoteSegments};
+use crate::remote_segments::{
+    IndexFetch, IndexFetchFence, ReadPolicy, RemoteRange, RemoteSegments,
+};
 use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
 use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader, BatchRef};
@@ -207,7 +208,7 @@ pub struct DiskReadPlan {
     /// buys nothing and costs the re-read it triggers.
     pub(crate) widest_batch_bytes: u64,
     /// How the partition's reads of remote segments use the shard's cache.
-    pub(crate) read_settings: PartitionReadSettings,
+    pub(crate) read_settings: ReadPolicy,
 }
 
 pub struct DiskSegment {
@@ -292,6 +293,15 @@ impl SegmentBytes<'_> {
         match self {
             Self::File(_) => DiskFault::Unreadable,
             Self::Remote { .. } => DiskFault::Tiered,
+        }
+    }
+
+    /// Drop what the read cache holds of the `len` bytes at `position`,
+    /// which are not a segment's batches, so that the next poll asks the
+    /// store for them again.
+    fn forget(&self, position: u64, len: usize) {
+        if let Self::Remote { remote, range, .. } = self {
+            remote.forget_cached(range, position, len);
         }
     }
 }
@@ -606,6 +616,18 @@ impl PollPlan {
             PollTier::Placed { .. } => true,
             PollTier::Empty | PollTier::Resident { .. } => false,
         }
+    }
+
+    /// Read the object store with what `settings` returns, which only a plan
+    /// that reads the store asks for. They become the partition's, so the
+    /// reads still to come of its older plans use them too.
+    pub fn read_store_with(&self, settings: impl FnOnce() -> crate::PartitionReadSettings) {
+        let policy = match &self.tier {
+            PollTier::Disk { disk, .. } if disk.reads_remote() => &disk.read_settings,
+            PollTier::Placed { placed, .. } => &placed.read_settings,
+            PollTier::Disk { .. } | PollTier::Empty | PollTier::Resident { .. } => return,
+        };
+        policy.set(&settings());
     }
 
     /// Stop waiting for the object store at `deadline`. The read then returns
@@ -1238,7 +1260,7 @@ impl DiskReadPlan {
                 }
                 len = len.min(room);
             }
-            let chunk = match self.read_chunk(bytes, len, walk).await {
+            let chunk = match self.read_chunk(bytes, len, query, walk).await {
                 Ok(chunk) => chunk,
                 // Same fail-closed reason as a failed open.
                 Err(fault) => return SegmentWalk::Faulted(fault),
@@ -1246,6 +1268,7 @@ impl DiskReadPlan {
             if let Some(entry) = walk.unproven_entry.take()
                 && !entry_names_batch(&entry, &chunk)
             {
+                bytes.forget(walk.position, len);
                 error!(
                     target: "iggy.partitions.diag",
                     plane = "partitions",
@@ -1300,6 +1323,7 @@ impl DiskReadPlan {
                 // A batch that does not match its own checksum. Fail closed like
                 // an IO fault: serving it hands a consumer data provably not what
                 // was written, and skipping ahead punches a silent gap.
+                bytes.forget(walk.position, len);
                 return SegmentWalk::Faulted(bytes.unreadable());
             }
             if consumed == 0 {
@@ -1308,12 +1332,14 @@ impl DiskReadPlan {
                     // corrupt batch in this segment. Fail-closed like an IO
                     // fault so a later segment is never served over the corrupt
                     // run, which would punch a silent gap into the poll.
+                    bytes.forget(walk.position, len);
                     return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 // A single batch larger than the chunk. Its own header says
                 // how wide it is, so re-read exactly that; only a header this
                 // read could not reach leaves the old quadrupling.
                 if needed as u64 > persisted - walk.position {
+                    bytes.forget(walk.position, len);
                     return SegmentWalk::Faulted(bytes.unreadable());
                 }
                 chunk_len = if needed > len {
@@ -1412,6 +1438,7 @@ impl DiskReadPlan {
         &self,
         bytes: &SegmentBytes<'_>,
         len: usize,
+        query: MessageLookup,
         walk: &mut DiskWalk,
     ) -> Result<Frozen<4096>, DiskFault> {
         match bytes {
@@ -1431,9 +1458,19 @@ impl DiskReadPlan {
                     walk.requested_bytes += len as u64;
                     walk.chunk_reads += 1;
                 }
+                // A consumer's next poll can read some of the same bytes
+                // again, and its later offset tells it apart from another
+                // poll of the same messages.
+                let poll_offset = match (walk.last_matching_offset, query) {
+                    (Some(last), _) => last.checked_add(1),
+                    (None, MessageLookup::Offset { offset, .. }) => Some(offset),
+                    (None, MessageLookup::Timestamp { .. }) => None,
+                };
+                let settings = self.read_settings.current();
+                let cached = remote.holds(range, walk.position, len, &settings);
                 let read = async {
                     remote
-                        .read(range, walk.position, len, *next, self.read_settings)
+                        .read(range, walk.position, len, *next, poll_offset, &settings)
                         .await
                         .map_err(|fault| {
                             // A `.log` that was gone without an eviction was
@@ -1446,6 +1483,11 @@ impl DiskReadPlan {
                             }
                         })
                 };
+                // A failure of the store stands in the way of requests to it,
+                // and bytes in memory need none.
+                if cached {
+                    return read.await;
+                }
                 self.wait_for_store(state, read).await
             }
         }
@@ -2085,7 +2127,7 @@ mod tests {
             deadline: None,
             bytes_per_message,
             widest_batch_bytes,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2182,7 +2224,7 @@ mod tests {
             deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2361,7 +2403,7 @@ mod tests {
             deadline: None,
             bytes_per_message: None,
             widest_batch_bytes: 0,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: ReadPolicy::default(),
             segments: Vec::new(),
             start_position: 0,
             start_index_offset: None,
@@ -2514,7 +2556,7 @@ mod tests {
                         deadline: None,
                         bytes_per_message: None,
                         widest_batch_bytes: 0,
-                        read_settings: crate::PartitionReadSettings::SHARD,
+                        read_settings: ReadPolicy::default(),
                         segments: vec![DiskSegment {
                             start_offset: 0,
                             persisted: bytes.len() as u64,
@@ -2652,7 +2694,7 @@ mod tests {
                     deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
-                    read_settings: crate::PartitionReadSettings::SHARD,
+                    read_settings: ReadPolicy::default(),
                     segments: vec![DiskSegment {
                         start_offset: 0,
                         persisted: bytes.len() as u64,
@@ -2881,7 +2923,7 @@ mod tests {
                     deadline: None,
                     bytes_per_message: None,
                     widest_batch_bytes: 0,
-                    read_settings: crate::PartitionReadSettings::SHARD,
+                    read_settings: ReadPolicy::default(),
                     segments: vec![DiskSegment {
                         start_offset: 0,
                         persisted: persisted as u64,

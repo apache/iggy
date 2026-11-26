@@ -67,7 +67,7 @@ use crate::journal::MessageLookup;
 use crate::long_term::{LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration, REGISTER_OBJECT};
 use crate::placed_read::{BatchPiece, PlacedReadPlan, REWRITE_PACED_YIELD_BYTES};
 use crate::poll_plan::DiskFault;
-use crate::remote_segments::{RemoteRange, RemoteSegments};
+use crate::remote_segments::{ReadPolicy, RemoteRange, RemoteSegments};
 use crate::rewrite_share::{RewriteBudget, RewriteShare};
 use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
 use crate::segment_upload::{LogPut, UploadError, memory_body, store_segment};
@@ -175,6 +175,8 @@ pub struct CacheCarry {
     segment: RemoteRange,
     log: Bytes,
     index: Bytes,
+    /// What the segment's partition reads with when the copy runs.
+    policy: ReadPolicy,
     budget: Option<Rc<RewriteBudget>>,
 }
 
@@ -185,7 +187,13 @@ impl CacheCarry {
             .budget
             .map_or_else(RewriteShare::unpaced, RewriteShare::paced);
         self.remote
-            .carry_long_term(&self.segment, &self.log, &self.index, &mut share)
+            .carry_long_term(
+                &self.segment,
+                &self.log,
+                &self.index,
+                &self.policy.current(),
+                &mut share,
+            )
             .await;
     }
 }
@@ -346,6 +354,7 @@ impl SegmentRewrite {
             },
             log,
             index,
+            policy: self.read.read_settings.clone(),
             budget: share.budget(),
         });
         match (self.later_carry, carry) {
@@ -957,6 +966,13 @@ where
             self.long_term_backlog.take(size);
         }
         self.prune_proof_rows();
+        self.note_long_term_floor_to_cache();
+    }
+
+    /// Tell the shard's cache where the long-term floor stands, so it lets go
+    /// of the fresh objects whose batches of this partition the floor
+    /// passed.
+    pub(crate) fn note_long_term_floor_to_cache(&self) {
         if let (Some(remote), Some(floor)) = (self.remote_segments(), self.long_term_floor()) {
             remote.note_long_term_floor(self.namespace(), floor);
         }
@@ -1029,9 +1045,7 @@ mod tests {
     use crate::placed_read::{PlacedSegment, REWRITE_YIELD_BYTES};
     use crate::poll_plan::PartitionDirResolution;
     use crate::rewrite_share::{ManualClock, RewriteClock};
-    use crate::{
-        PartitionReadSettings, ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments,
-    };
+    use crate::{ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments};
 
     fn batch(base_offset: u64, blob: &[u8]) -> PlacedBatch {
         let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, 1);
@@ -1159,7 +1173,7 @@ mod tests {
                 long_term: Vec::new(),
                 long_term_floor: None,
                 long_term_next: None,
-                read_settings: PartitionReadSettings::SHARD,
+                read_settings: ReadPolicy::default(),
             },
         }
     }
@@ -1225,6 +1239,8 @@ mod tests {
                     cache_bytes: 0,
                     block_bytes: 256 * 1024,
                     read_ahead: 0,
+                    read_ahead_fetches: 4,
+                    read_ahead_fetch_bytes: 32 * 1024 * 1024,
                 });
                 let remote = Rc::new(
                     RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache),
@@ -1288,7 +1304,7 @@ mod tests {
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
-            self.store.head(key).await
+            ObjectStore::head(&self.store, key).await
         }
 
         async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
@@ -1323,6 +1339,8 @@ mod tests {
             cache_bytes,
             block_bytes: 256 * 1024,
             read_ahead: 0,
+            read_ahead_fetches: 4,
+            read_ahead_fetch_bytes: 32 * 1024 * 1024,
         });
         let remote =
             Rc::new(RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache));

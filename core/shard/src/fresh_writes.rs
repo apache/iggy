@@ -1551,9 +1551,16 @@ where
             self.metrics.record_fresh_confirmation();
         }
         // A consumer at the tail polls these batches next, and this shard
-        // holds their messages already.
+        // holds their messages already. Sends answered while the object
+        // uploaded, as those behind an object the store failed for good, are
+        // no longer awaited, and an object with none left nobody reads.
         if stored
             && !object.partitions.is_empty()
+            && self
+                .fresh_writes
+                .awaited
+                .borrow()
+                .contains_key(&object.id.get())
             && let Some(remote) = self.plane.partitions().remote_segments()
         {
             remote.cache_fresh_object(
