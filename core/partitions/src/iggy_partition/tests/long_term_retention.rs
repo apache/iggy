@@ -36,6 +36,7 @@ use iggy_object_store::{
 };
 use std::cell::RefCell;
 use std::ops::Range;
+use std::path::Path;
 use std::time::Duration;
 
 const SECOND_OBJECT: u128 = 0x52;
@@ -722,7 +723,9 @@ async fn given_a_damaged_long_term_segment_in_the_cache_when_the_store_holds_it_
     let mut logs: Vec<String> = store
         .keys()
         .into_iter()
-        .filter(|key| key.contains('-') && key.ends_with(".log"))
+        .filter(|key| {
+            key.contains('-') && Path::new(key).extension().is_some_and(|ext| ext == "log")
+        })
         .collect();
     logs.sort();
     let key = logs.first().unwrap().clone();
