@@ -153,12 +153,11 @@ impl HttpJwtConfig {
             return Err(IggyError::InvalidJwtSecret);
         }
 
-        Ok(match self.get_decoding_secret() {
+        match self.get_decoding_secret() {
             JwtSecret::Default(ref secret) => DecodingKey::from_secret(secret.as_ref()),
-            JwtSecret::Base64(ref secret) => {
-                DecodingKey::from_base64_secret(secret).map_err(|_| IggyError::InvalidJwtSecret)?
-            }
-        })
+            JwtSecret::Base64(ref secret) => DecodingKey::from_base64_secret(secret),
+        }
+        .map_err(|_| IggyError::InvalidJwtSecret)
     }
 
     pub fn get_encoding_key(&self) -> Result<EncodingKey, IggyError> {
@@ -166,12 +165,11 @@ impl HttpJwtConfig {
             return Err(IggyError::InvalidJwtSecret);
         }
 
-        Ok(match self.get_encoding_secret() {
+        match self.get_encoding_secret() {
             JwtSecret::Default(ref secret) => EncodingKey::from_secret(secret.as_ref()),
-            JwtSecret::Base64(ref secret) => {
-                EncodingKey::from_base64_secret(secret).map_err(|_| IggyError::InvalidJwtSecret)?
-            }
-        })
+            JwtSecret::Base64(ref secret) => EncodingKey::from_base64_secret(secret),
+        }
+        .map_err(|_| IggyError::InvalidJwtSecret)
     }
 
     fn get_secret(&self, secret: &str) -> JwtSecret {

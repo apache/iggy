@@ -620,6 +620,15 @@ class TestSharedVectors:
     """The binding against the vectors the Rust encoders generated."""
 
     @pytest.mark.unit
+    def test_given_released_option_keys_when_converted_to_int_should_keep_their_values(
+        self,
+    ):
+        """Keys added later come after `ShadowOrigin` and renumber none."""
+        assert int(OptionKey.ShadowOrigin) == 30
+        assert int(OptionKey.ReadCacheSize) == 31
+        assert int(OptionKey.ReadAhead) == 32
+
+    @pytest.mark.unit
     def test_given_shared_vectors_when_encoding_should_match_server_contract(
         self,
     ):

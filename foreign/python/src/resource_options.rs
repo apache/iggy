@@ -137,14 +137,16 @@ pub enum OptionKey {
     /// Longest wait between two long-term rewrites of a geo topic's
     /// partition. An update can set it, not reset it.
     LongTermRewriteMaxInterval,
+    /// The geo origin a shadow stream serves, computed by the server.
+    ShadowOrigin,
+    // Appended after the keys of earlier releases, so that each of those
+    // keeps its integer value.
     /// Memory each node keeps for what a topic's reads fetch from the object
     /// store. An update can set it, not reset it.
     ReadCacheSize,
     /// Most bytes readahead fetches in front of a sequential reader of a
     /// topic. An update can set it, not reset it.
     ReadAhead,
-    /// The geo origin a shadow stream serves, computed by the server.
-    ShadowOrigin,
 }
 
 /// Whether partitions can be added to or deleted from a topic after creation.

@@ -380,7 +380,7 @@ Server OTLP export is unavailable in this revision: `grpc` prevents startup, and
 | `shutdown_drain_timeout` | `"10 s"` | Per-shard bus drain budget on shutdown. Slow-fsync hosts may need more. |
 | `shutdown_poll_interval` | `"50 ms"` | Poll cadence for the shutdown flag. Must be less than or equal to `shutdown_drain_timeout`. |
 | `shutdown_join_timeout` | `"30 s"` | Hard deadline for joining shard threads at exit. A wedged shard is abandoned with an error log. Must be at least `shutdown_drain_timeout`. |
-| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. |
+| `reconcile_periodic_interval` | `"1 s"` | Safety tick for the partition reconciliation loop, which also wakes on every metadata commit. The loop also compares every partition with committed metadata again in the background, and the tick does not change the pace of that. It reads 1,024 entries (streams, topics, partitions, routing rows) every 250 ms, and starts again 10 minutes after it ended. The time for all partitions grows with their number: about 17 minutes at one million streams of one partition each. |
 
 Valid `cpu_allocation` syntaxes:
 
@@ -457,6 +457,18 @@ Tunables for the internal bus that ships consensus traffic between replicas and 
 |-----|---------|-------------|
 | `rebalancing_timeout` | `"30s"` | Maximum time a partition can remain in pending revocation before being force-transferred to the target member. |
 | `heartbeat_interval` | `"5s"` | Membership heartbeat interval advertised to consumers. Session expiry derives separately from `heartbeat.interval`. |
+
+### `[tiered_storage]`
+
+Tiered storage keeps sealed segments in an object store. It is off until `backend` is set. The server's embedded `config.toml` lists every key of the section. The keys below set how each shard reads back from object stores: its own store and the stores of its geo peers.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `read_cache_size` | `"64 MiB"` | Bytes of what one shard reads from object stores that it keeps in memory. The same budget holds the fresh objects the shard uploads for geo topics, in up to seven eighths of it. Each shard has its own cache, so a node uses up to this times its number of shards. `"0"` keeps nothing that reads fetch and turns readahead off. The shard then holds what it uploads in a fixed 64 MiB of its own. Otherwise at least 8 blocks of `read_cache_block_size`. |
+| `read_cache_block_size` | `"256 KiB"` | The piece of a segment that the cache fetches and keeps. From `"64 KiB"` to `"1 MiB"`. |
+| `read_ahead` | `"2 MiB"` | Bytes that a shard fetches past the last poll when polls read a segment in order. `"0"` turns readahead off. Otherwise at least 2 blocks, and at most an eighth of `read_cache_size`. |
+
+Readahead takes the speculative fetch caps of `[tiered_storage.jobs]`: at most `speculative_fetches` (default `4`) fetches at once, each at most `speculative_fetch_bytes` (default `"32 MiB"`). A readahead fetch starts only while no fetch that a poll waits for is queued. The server checks these keys while the cache is on, on a node with a `backend` or with geo peers, whose reads go through the same cache.
 
 ### `[node]`
 

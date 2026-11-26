@@ -19,6 +19,7 @@ pub mod chart;
 pub mod clipboard;
 pub mod command_block;
 pub mod compare_tray;
+pub mod document_head;
 pub mod embed;
 pub mod footer;
 pub mod framework;
