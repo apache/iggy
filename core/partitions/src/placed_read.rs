@@ -342,7 +342,7 @@ impl PlacedReadPlan {
                 .wait(remote.read_long_term_index(
                     &log,
                     LONG_TERM_INDEX_BYTES,
-                    self.read_settings.current(),
+                    &self.read_settings.current(),
                 ))
                 .await?;
             let mut position = wanted.first_position(&index, segment.size);
@@ -356,20 +356,28 @@ impl PlacedReadPlan {
                         position,
                         read,
                         next.as_ref(),
-                        self.read_settings.current(),
+                        wanted.poll_offset(),
+                        &self.read_settings.current(),
                     ))
                     .await?;
-                match take_whole_batches(chunk.as_slice(), wanted, batches)? {
-                    Read::Batches(bytes) => {
+                let fault = match take_whole_batches(chunk.as_slice(), wanted, batches) {
+                    Ok(Read::Batches(bytes)) => {
                         position += bytes;
                         len = LONG_TERM_READ_BYTES;
+                        continue;
                     }
                     // The batch at `position` is larger than the chunk.
-                    Read::Needs(bytes) if bytes > len && position + bytes <= segment.size => {
+                    Ok(Read::Needs(bytes)) if bytes > len && position + bytes <= segment.size => {
                         len = bytes;
+                        continue;
                     }
-                    Read::Needs(_) => return Err(DiskFault::Tiered),
-                }
+                    Ok(Read::Needs(_)) => DiskFault::Tiered,
+                    Err(fault) => fault,
+                };
+                // Bytes that are not whole batches may be in the cache, and
+                // the next poll asks the store for them again.
+                remote.forget_cached(&log, position, read);
+                return Err(fault);
             }
         }
         Ok(())
@@ -613,19 +621,16 @@ impl PlacedReadPlan {
         let (Some(remote), [first, _, ..]) = (self.remote.as_deref(), run) else {
             return Ok(FreshReads::default());
         };
-        let blobs: Vec<_> = run
-            .iter()
-            .filter_map(|placed| {
-                let placement = placed.placement;
-                let end = placement.position.checked_add(placement.length)?;
-                Some(placement.position..end)
-            })
-            .collect();
+        let blobs = run.iter().filter_map(|placed| {
+            let placement = placed.placement;
+            let end = placement.position.checked_add(placement.length)?;
+            Some(placement.position..end)
+        });
         self.wait(remote.fetch_fresh(
             first.placement.object_id,
-            &blobs,
+            blobs,
             self.prefix,
-            self.read_settings.current(),
+            &self.read_settings.current(),
         ))
         .await
     }
@@ -654,7 +659,7 @@ impl PlacedReadPlan {
                 placement.object_id,
                 range,
                 self.prefix,
-                self.read_settings.current(),
+                &self.read_settings.current(),
             ))
             .await?
         };
@@ -879,6 +884,19 @@ impl Wanted {
 
     fn is_full(&self) -> bool {
         self.limited || self.messages >= u64::from(self.query.count())
+    }
+
+    /// The offset the poll reads next, when it knows one. A consumer's next
+    /// poll can read some of the same bytes again, and its later offset
+    /// tells it apart from another poll of the same messages.
+    const fn poll_offset(&self) -> Option<u64> {
+        if self.messages > 0 {
+            return Some(self.next_offset);
+        }
+        match self.query {
+            MessageLookup::Offset { offset, .. } => Some(offset),
+            MessageLookup::Timestamp { .. } => None,
+        }
     }
 
     /// Whether taking a batch that the read holds as `held` bytes would pass
@@ -1256,6 +1274,8 @@ mod tests {
                             cache_bytes,
                             block_bytes: 256 * 1024,
                             read_ahead: 0,
+                            read_ahead_fetches: 4,
+                            read_ahead_fetch_bytes: 32 * 1024 * 1024,
                         }),
                     ),
             )),

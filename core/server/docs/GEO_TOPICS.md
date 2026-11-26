@@ -144,7 +144,9 @@ shadow topic. A message becomes readable in another datacenter once its origin p
    Polls in this cluster read it at once. The shard that stored the object holds it in memory
    until the long-term segment below takes its messages, even with `read_cache_size` at 0, and
    other polls read the bucket through the shard's read cache, `[tiered_storage] read_cache_size`,
-   within the topic's own `read_cache_size` when it sets one.
+   within the topic's own `read_cache_size` when it sets one. When the cache needs the room for
+   newer objects first, it lets an object go before that, and polls of its messages read them from
+   the bucket.
 5. In the background, the partition's primary rewrites committed messages into **long-term
    segments** in the bucket, at most 64 MiB each, and commits each one to the partition's
    long-term log. It then stores the partition's **manifest**,
@@ -915,7 +917,11 @@ stops writing. A peer that follows the lost cluster's fresh objects takes its ba
 below each partition's cutover in the record: from there on the partition's log is the
 rebuilt cluster's. A peer whose shadow streams came from the lost cluster follows the record
 from it to the rebuilt cluster, and reads the bucket as that cluster's. It reads no record of a
-bucket whose identity object names a cluster that its shadow streams came from.
+bucket whose identity object names a cluster that its shadow streams came from. When the lost
+cluster is the only one that the peer's metadata records of the origin, those shadow streams
+also follow the rebuilt cluster's topic objects: a tombstone detaches its topic, and a new topic
+of a shadowed stream gets a shadow topic. A stream that has no shadow stream gets none, and the
+peer logs it.
 
 The report lists, per partition:
 
@@ -947,9 +953,9 @@ per peer:
   check does not pass, and a recovery record under the peer's root only when the object names a
   cluster that the shadow streams did not come from;
 - each manifest or positions pass that reads an object of the peer reads the identity object
-  before and after it: two more gets at most every `[geo] manifest_poll_interval` per shard that
-  reads a changed manifest, and every `[geo] positions_poll_interval` per node while the peer's
-  positions change;
+  before and after it: two more gets at most every `[geo] manifest_poll_interval` per shard for
+  each 16 changed manifests that it reads, and every `[geo] positions_poll_interval` per node
+  while the peer's positions change;
 - the metadata primary lists the peer's topic objects every 5 seconds, reads each new object,
   and reads each known object again every 30 seconds;
 - every `[geo] positions_poll_interval`, shard 0 of each node that leads a partition of a geo or

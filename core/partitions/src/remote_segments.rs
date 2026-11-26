@@ -40,9 +40,11 @@ use compio::io::AsyncWriteAtExt;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::{self, Either, LocalBoxFuture, Shared};
+use futures::{StreamExt, stream};
 use iggy_object_store::{
-    ErrorClass, KeyLayout, LongTermKey, ObjectPrefix, ObjectRange, ObjectStore, ObjectStoreError,
-    SegmentKey, SegmentObject, TierExecutor, TierJobClass, TierJobRequest, TierScope,
+    ErrorClass, KeyLayout, LongTermKey, ObjectMeta, ObjectPrefix, ObjectRange, ObjectStore,
+    ObjectStoreError, SegmentKey, SegmentObject, TierExecutor, TierJobClass, TierJobRequest,
+    TierScope,
 };
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
@@ -50,12 +52,15 @@ use server_common::poll::PollHistoryId;
 use server_common::sharding::IggyNamespace;
 use tracing::{error, warn};
 
+use crate::PartitionLeft;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
 use crate::remote_blocks::{
     PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks, RemoteReadMetrics, StoreSlot,
 };
+use crate::segment_chain::SegmentRecord;
+use crate::segment_upload::{is_recorded_log, is_whole_index};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
 
 /// Bytes of an index object that one GET asks for: a whole number of entries,
@@ -69,8 +74,16 @@ const INDEX_FETCH_CHUNK: u64 = (IGGY_INDEX_SIZE as u64) * 32 * 1024;
 /// joins it, for good.
 const INDEX_GET_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The ranged read of an [`ObjectStore`], behind a pointer, so a partition
-/// does not carry the provider's type.
+/// How long the store may take to answer for one segment that a state
+/// transfer would send without its bytes.
+const STORED_SEGMENT_HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many segments one check of a stored front asks the store about at a
+/// time.
+const STORED_SEGMENT_CHECKS: usize = 4;
+
+/// The reads of an [`ObjectStore`], behind a pointer, so a partition does not
+/// carry the provider's type.
 pub trait RemoteObjects {
     /// See [`ObjectStore::get_range`].
     fn get_range<'a>(
@@ -78,6 +91,32 @@ pub trait RemoteObjects {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>>;
+
+    /// As [`Self::get_range`], if `wanted` still says so when the read
+    /// starts. `None` when it does not, and the store is not asked.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            self.get_range(key, range).await.map(Some)
+        }
+        .boxed_local()
+    }
+
+    /// See [`ObjectStore::head`]. A source that does not implement it answers
+    /// [`ObjectStoreError::Unsupported`].
+    fn head<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        future::ready(Err(ObjectStoreError::Unsupported("head".to_owned()))).boxed_local()
+    }
 }
 
 impl<S: ObjectStore> RemoteObjects for S {
@@ -87,6 +126,13 @@ impl<S: ObjectStore> RemoteObjects for S {
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
         ObjectStore::get_range(self, key, range).boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        ObjectStore::head(self, key).boxed_local()
     }
 }
 
@@ -125,8 +171,7 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        let request = TierJobRequest::new(self.class, self.scope.token())
-            .with_bytes(range.end.saturating_sub(range.start));
+        let request = self.request(&range);
         let key = key.to_owned();
         let job = self.executor.submit(request, move |store| async move {
             ObjectStore::get_range(&*store, &key, range).await
@@ -136,6 +181,52 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
                 .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
         }
         .boxed_local()
+    }
+
+    /// `wanted` is asked when the job starts, which can be long after it
+    /// queued.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        let request = self.request(&range);
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            ObjectStore::get_range(&*store, &key, range).await.map(Some)
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+
+    fn head<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> LocalBoxFuture<'a, Result<ObjectMeta, ObjectStoreError>> {
+        let request = TierJobRequest::new(self.class, self.scope.token());
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            ObjectStore::head(&*store, &key).await
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+}
+
+impl<E> ExecutorObjects<E> {
+    fn request(&self, range: &Range<u64>) -> TierJobRequest {
+        TierJobRequest::new(self.class, self.scope.token())
+            .with_bytes(range.end.saturating_sub(range.start))
     }
 }
 
@@ -201,6 +292,27 @@ fn slice_at(bytes: &Bytes, position: u64, range: &Range<u64>) -> Option<Bytes> {
     (end <= bytes.len()).then(|| bytes.slice(start..end))
 }
 
+/// The reads that fetch `ranges` of one object, in the order of their
+/// positions: ranges within [`FRESH_READ_GAP_BYTES`] of each other in one
+/// read of at most [`FRESH_READ_BYTES_MAX`], and a single range whatever its
+/// size.
+fn coalesced(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut reads: Vec<Range<u64>> = Vec::new();
+    for range in ranges {
+        match reads.last_mut() {
+            Some(read)
+                if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
+                    && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
+            {
+                read.end = read.end.max(range.end);
+            }
+            _ => reads.push(range),
+        }
+    }
+    reads
+}
+
 /// What one fetch read of a fresh object.
 #[derive(Default)]
 pub struct FreshReads {
@@ -229,33 +341,36 @@ impl FreshReads {
 ///
 /// A plan runs off the pump, after plans built later may have run. Reading
 /// the shared value keeps an older plan from putting back a limit that the
-/// partition's topic changed since, and the end of the incarnation keeps a
-/// plan that outlived it from registering one for a partition that is gone.
-#[derive(Debug, Clone)]
-pub(crate) struct ReadPolicy(Rc<Cell<Option<PartitionReadSettings>>>);
-
-impl Default for ReadPolicy {
-    fn default() -> Self {
-        Self(Rc::new(Cell::new(Some(PartitionReadSettings::SHARD))))
-    }
+/// partition's topic changed since, and the flag set at the end of the
+/// incarnation keeps a plan that outlived it from reading for a partition
+/// that is gone.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReadPolicy {
+    topic: Rc<Cell<(Option<usize>, Option<u64>)>>,
+    left: PartitionLeft,
 }
 
 impl ReadPolicy {
-    /// The incarnation reads with `settings` from now on, unless it ended.
-    pub(crate) fn set(&self, settings: PartitionReadSettings) {
-        if self.0.get().is_some() {
-            self.0.set(Some(settings));
-        }
+    /// The incarnation reads with the limit and readahead of `settings`
+    /// from now on.
+    pub(crate) fn set(&self, settings: &PartitionReadSettings) {
+        self.topic.set((settings.limit, settings.read_ahead));
     }
 
-    /// The incarnation left the shard, so its reads go past the cache.
+    /// The incarnation left the shard, so its reads start no GET and keep
+    /// nothing.
     pub(crate) fn end(&self) {
-        self.0.set(None);
+        self.left.set();
     }
 
-    /// What a read reads with now, `None` once the incarnation ended.
-    pub(crate) fn current(&self) -> Option<PartitionReadSettings> {
-        self.0.get()
+    /// What a read reads with now.
+    pub(crate) fn current(&self) -> PartitionReadSettings {
+        let (limit, read_ahead) = self.topic.get();
+        PartitionReadSettings {
+            limit,
+            read_ahead,
+            left: Some(self.left.clone()),
+        }
     }
 }
 
@@ -339,6 +454,36 @@ impl RemoteSegments {
             .filter(|blocks| blocks.cache().keeps_fetched())
     }
 
+    /// Whether the cache holds all `len` bytes of the segment in `source`
+    /// from byte `position`, for the partition that reads them with
+    /// `settings`, so that a read of them asks the store nothing.
+    pub(crate) fn holds(
+        &self,
+        source: &RemoteRange,
+        position: u64,
+        len: usize,
+        settings: &PartitionReadSettings,
+    ) -> bool {
+        let start = source.range.start + position;
+        let end = start + len as u64;
+        end <= source.range.end
+            && self
+                .reading(source.key.prefix, settings)
+                .ok()
+                .flatten()
+                .is_some_and(|(blocks, _)| blocks.holds_segment(source, &(start..end)))
+    }
+
+    /// Drop what the cache holds of the `len` bytes of the segment in
+    /// `source` from byte `position`, which are not the batches that the
+    /// store holds there, so that the next read fetches them again.
+    pub(crate) fn forget_cached(&self, source: &RemoteRange, position: u64, len: usize) {
+        if let Some(blocks) = self.fetched_into_cache() {
+            let start = source.range.start + position;
+            blocks.forget_segment(source, &(start..start + len as u64));
+        }
+    }
+
     /// What the cache that these reads go through did since the last take,
     /// `None` without one.
     #[must_use]
@@ -396,10 +541,16 @@ impl RemoteSegments {
 
     /// Keep the end of the long-term segment that a rewrite just stored, its
     /// `.log` bytes `log` read by `segment`, and its `index`, when the cache
-    /// keeps what reads fetch.
-    pub(crate) fn carry_long_term(&self, segment: &RemoteRange, log: &[u8], index: &[u8]) {
+    /// keeps what reads fetch, for the partition that reads with `settings`.
+    pub(crate) async fn carry_long_term(
+        &self,
+        segment: &RemoteRange,
+        log: &[u8],
+        index: &[u8],
+        settings: &PartitionReadSettings,
+    ) {
         if let Some(blocks) = self.fetched_into_cache() {
-            blocks.carry_segment(segment, log, index);
+            blocks.carry_segment(segment, log, index, settings).await;
         }
     }
 
@@ -420,8 +571,8 @@ impl RemoteSegments {
     }
 
     /// The partition whose incarnation `prefix` names in this store left the
-    /// shard: what its reads keep goes, and what its GETs in flight fetch is
-    /// not kept.
+    /// shard: what its reads keep goes. What its GETs in flight fetch is not
+    /// kept once its [`PartitionReadSettings::left`] is set.
     pub(crate) fn forget_reader(&self, prefix: ObjectPrefix) {
         if let Some(blocks) = &self.blocks {
             blocks.forget_reader(prefix);
@@ -435,10 +586,19 @@ impl RemoteSegments {
     fn reading(
         &self,
         prefix: ObjectPrefix,
-        settings: Option<PartitionReadSettings>,
-    ) -> Option<(&RemoteBlocks, Reading)> {
-        let blocks = self.fetched_into_cache()?;
-        Some((blocks, blocks.reading(prefix, settings?)?))
+        settings: &PartitionReadSettings,
+    ) -> Result<Option<(&RemoteBlocks, Reading)>, DiskFault> {
+        // A poll or a rewrite that outlives its partition starts no GET for
+        // it, through the cache or past it.
+        if settings.left_shard() {
+            return Err(DiskFault::Retryable);
+        }
+        let Some(blocks) = self.fetched_into_cache() else {
+            return Ok(None);
+        };
+        Ok(blocks
+            .reading(prefix, settings)
+            .map(|reading| (blocks, reading)))
     }
 
     /// The bytes at `range` of the fresh object `object_id`: the blob of one
@@ -455,7 +615,7 @@ impl RemoteSegments {
         object_id: u128,
         range: Range<u64>,
         prefix: ObjectPrefix,
-        settings: impl Into<Option<PartitionReadSettings>>,
+        settings: &PartitionReadSettings,
     ) -> Result<Bytes, DiskFault> {
         if let Some(blob) = self
             .blocks
@@ -465,9 +625,9 @@ impl RemoteSegments {
         {
             return Ok(blob);
         }
-        if let Some((blocks, reading)) = self.reading(prefix, settings.into()) {
-            let key = self.layout.fresh_key(object_id);
-            return blocks.read_fresh(reading, object_id, &key, range).await;
+        if let Some((blocks, reading)) = self.reading(prefix, settings)? {
+            let key_of = || self.layout.fresh_key(object_id);
+            return blocks.read_fresh(reading, object_id, &key_of, range).await;
         }
         self.read_fresh_from_store(object_id, range).await
     }
@@ -523,12 +683,13 @@ impl RemoteSegments {
         &self,
         log: &RemoteRange,
         cap: u64,
-        settings: impl Into<Option<PartitionReadSettings>>,
+        settings: &PartitionReadSettings,
     ) -> Result<Bytes, DiskFault> {
-        let key = self.object_key(log, SegmentObject::Index);
-        if let Some((blocks, reading)) = self.reading(log.key.prefix, settings.into()) {
-            return blocks.read_segment_index(reading, log, &key, cap).await;
+        if let Some((blocks, reading)) = self.reading(log.key.prefix, settings)? {
+            let key_of = || self.object_key(log, SegmentObject::Index);
+            return blocks.read_segment_index(reading, log, &key_of, cap).await;
         }
+        let key = self.object_key(log, SegmentObject::Index);
         self.objects
             .get_range(&key, 0..cap)
             .await
@@ -539,27 +700,22 @@ impl RemoteSegments {
     /// Fetch the blobs at `ranges` of the fresh object `object_id`, and
     /// return what was read, so a poll of many batches of one object asks
     /// the store once and not once a batch. An object this shard holds is
-    /// read from memory. Through a cache that keeps what it fetches, the
-    /// blobs come in its blocks. Otherwise blobs that sit within
+    /// read from memory. Otherwise blobs that sit within
     /// [`FRESH_READ_GAP_BYTES`] of each other come in one read of at most
-    /// [`FRESH_READ_BYTES_MAX`]. The poll takes its blobs from the returned
-    /// reads, which the cache may have had no room to keep. The reader is as
-    /// in [`Self::read_fresh`].
+    /// [`FRESH_READ_BYTES_MAX`], in the blocks of a cache that keeps what it
+    /// fetches. The poll takes its blobs from the returned reads, which the
+    /// cache may have had no room to keep. The reader is as in
+    /// [`Self::read_fresh`].
     ///
     /// # Errors
     /// As [`Self::read_fresh`].
     pub(crate) async fn fetch_fresh(
         &self,
         object_id: u128,
-        ranges: &[Range<u64>],
+        ranges: impl IntoIterator<Item = Range<u64>>,
         prefix: ObjectPrefix,
-        settings: impl Into<Option<PartitionReadSettings>>,
+        settings: &PartitionReadSettings,
     ) -> Result<FreshReads, DiskFault> {
-        let mut missing: Vec<Range<u64>> = ranges
-            .iter()
-            .filter(|range| range.start < range.end)
-            .cloned()
-            .collect();
         if let Some(object) = self
             .blocks
             .as_ref()
@@ -570,40 +726,27 @@ impl RemoteSegments {
                 reads: vec![(0, object)],
             });
         }
-        let start = missing.iter().map(|range| range.start).min();
-        let end = missing.iter().map(|range| range.end).max();
-        if let Some((start, end)) = start.zip(end)
-            && let Some((blocks, reading)) = self.reading(prefix, settings.into())
-        {
-            let key = self.layout.fresh_key(object_id);
-            let bytes = blocks
-                .read_fresh(reading, object_id, &key, start..end)
-                .await?;
-            return Ok(FreshReads {
-                object_id,
-                reads: vec![(start, bytes)],
-            });
-        }
-        missing.sort_unstable_by_key(|range| range.start);
-        let mut reads: Vec<Range<u64>> = Vec::new();
-        for range in missing {
-            match reads.last_mut() {
-                Some(read)
-                    if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
-                        && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
-                {
-                    read.end = read.end.max(range.end);
-                }
-                _ => reads.push(range),
-            }
-        }
+        let missing = ranges
+            .into_iter()
+            .filter(|range| range.start < range.end)
+            .collect();
+        let reads = coalesced(missing);
+        let through_cache = self.reading(prefix, settings)?;
+        let key_of = || self.layout.fresh_key(object_id);
         let mut fetched = FreshReads {
             object_id,
             reads: Vec::with_capacity(reads.len()),
         };
         for read in reads {
             let position = read.start;
-            let bytes = self.read_fresh_from_store(object_id, read).await?;
+            let bytes = match &through_cache {
+                Some((blocks, reading)) => {
+                    blocks
+                        .read_fresh(reading.clone(), object_id, &key_of, read)
+                        .await?
+                }
+                None => self.read_fresh_from_store(object_id, read).await?,
+            };
             fetched.reads.push((position, bytes));
         }
         Ok(fetched)
@@ -637,9 +780,10 @@ impl RemoteSegments {
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
-    /// of the segment, for the partition that reads it with `settings`.
-    /// `next` is the segment the reader goes on to, if it is in the same
-    /// store, which readahead may run on into.
+    /// of the segment, for the partition that reads it with `settings` and a
+    /// poll that reads `poll_offset` next when it knows that offset. `next`
+    /// is the segment the reader goes on to, if it is in the same store,
+    /// which readahead may run on into.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the segment holds.
@@ -649,21 +793,21 @@ impl RemoteSegments {
         position: u64,
         len: usize,
         next: Option<&RemoteRange>,
-        settings: impl Into<Option<PartitionReadSettings>>,
+        poll_offset: Option<u64>,
+        settings: &PartitionReadSettings,
     ) -> Result<Frozen<4096>, DiskFault> {
-        let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
-        if let Some((blocks, reading)) = self.reading(source.key.prefix, settings.into()) {
-            let next_key = next.map(|next| self.object_key(next, next.key.object));
-            let next = next.zip(next_key.as_deref());
+        if let Some((blocks, reading)) = self.reading(source.key.prefix, settings)? {
+            let key_of = |source: &RemoteRange| self.object_key(source, source.key.object);
             return blocks
-                .read_segment(reading, source, &key, start..end, next)
+                .read_segment(reading, source, &key_of, start..end, next, poll_offset)
                 .await;
         }
+        let key = self.object_key(source, source.key.object);
         let object = self
             .objects
             .get_range(&key, start..end)
@@ -682,6 +826,56 @@ impl RemoteSegments {
             return Err(DiskFault::Tiered);
         }
         Ok(Frozen::from(Owned::<4096>::copy_from_slice(&object.bytes)))
+    }
+
+    /// The leading run of `segments` whose `.log` and `.index` the store holds
+    /// under `prefix` as their records describe. The run ends at the first
+    /// segment the store lacks, holds otherwise, or does not answer for in
+    /// [`STORED_SEGMENT_HEAD_TIMEOUT`].
+    pub(crate) async fn stored_front(
+        &self,
+        prefix: ObjectPrefix,
+        segments: Vec<SegmentRecord>,
+    ) -> Vec<SegmentRecord> {
+        stream::iter(segments)
+            .map(
+                |record| async move { self.holds_segment(prefix, &record).await.then_some(record) },
+            )
+            .buffered(STORED_SEGMENT_CHECKS)
+            .take_while(|held| future::ready(held.is_some()))
+            .filter_map(future::ready)
+            .collect()
+            .await
+    }
+
+    async fn holds_segment(&self, prefix: ObjectPrefix, record: &SegmentRecord) -> bool {
+        let key = |object| {
+            self.layout.segment_key(&SegmentKey {
+                prefix,
+                start_offset: record.start_offset,
+                object,
+            })
+        };
+        let (log_key, index_key) = (key(SegmentObject::Log), key(SegmentObject::Index));
+        let heads = future::join(self.objects.head(&log_key), self.objects.head(&index_key));
+        let reason = match compio::time::timeout(STORED_SEGMENT_HEAD_TIMEOUT, heads).await {
+            Ok((Ok(log), Ok(index))) => {
+                if is_recorded_log(&log, record) && is_whole_index(&index) {
+                    return true;
+                }
+                "the store holds other objects than the record describes".to_owned()
+            }
+            Ok((Err(error), _) | (_, Err(error))) => error.to_string(),
+            Err(_) => "the store did not answer in time".to_owned(),
+        };
+        warn!(
+            target: "iggy.partitions.diag",
+            plane = "partitions",
+            key = log_key,
+            reason,
+            "state transfer: a stored segment is not confirmed in the store, so its bytes travel"
+        );
+        false
     }
 
     /// Fetch the `.index` object next to the `.log` in `log` and put it at
@@ -1500,7 +1694,12 @@ mod tests {
         let blobs = [100..200, 200..300, 1000..1100];
 
         let fetched = remote
-            .fetch_fresh(7, &blobs, log().key.prefix, PartitionReadSettings::SHARD)
+            .fetch_fresh(
+                7,
+                blobs.clone(),
+                log().key.prefix,
+                &PartitionReadSettings::SHARD,
+            )
             .await
             .unwrap();
 
@@ -1528,7 +1727,12 @@ mod tests {
         let blobs = [third..third + 100, 0..100, far..far + 100];
 
         remote
-            .fetch_fresh(7, &blobs, log().key.prefix, PartitionReadSettings::SHARD)
+            .fetch_fresh(
+                7,
+                blobs.clone(),
+                log().key.prefix,
+                &PartitionReadSettings::SHARD,
+            )
             .await
             .unwrap();
 
@@ -1547,9 +1751,9 @@ mod tests {
             remote
                 .fetch_fresh(
                     7,
-                    &[100..200, 200..300],
+                    [100..200, 200..300],
                     log().key.prefix,
-                    PartitionReadSettings::SHARD
+                    &PartitionReadSettings::SHARD
                 )
                 .await
                 .err(),

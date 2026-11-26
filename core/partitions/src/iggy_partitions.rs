@@ -2278,6 +2278,8 @@ mod tests {
                 cache_bytes: 64 * 1024 * 1024,
                 block_bytes: 4096,
                 read_ahead: 0,
+                read_ahead_fetches: 4,
+                read_ahead_fetch_bytes: 32 * 1024 * 1024,
             });
             let remote = Rc::new(
                 crate::RemoteSegments::new(
@@ -2289,6 +2291,13 @@ mod tests {
             partitions.set_remote_segments(Rc::clone(&remote));
             partitions.insert(namespace, build_partition());
             let created_revision = partitions.get_by_ns(&namespace).unwrap().created_revision();
+            // The settings that the partition's polls read with.
+            let settings = partitions
+                .get_by_ns(&namespace)
+                .unwrap()
+                .placed_read_plan(None)
+                .read_settings
+                .current();
             let segment = crate::remote_segments::RemoteRange {
                 key: iggy_object_store::SegmentKey {
                     prefix: crate::object_prefix(namespace, created_revision),
@@ -2298,8 +2307,7 @@ mod tests {
                 keyed_end_offset: None,
                 range: 0..4096,
             };
-            let mut read =
-                Box::pin(remote.read(&segment, 0, 100, None, crate::PartitionReadSettings::SHARD));
+            let mut read = Box::pin(remote.read(&segment, 0, 100, None, None, &settings));
             assert!(futures::poll!(read.as_mut()).is_pending());
 
             if removed {

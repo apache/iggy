@@ -19,7 +19,7 @@ use super::eviction::{KEEP_NOTHING, confirm, evict};
 use super::segment_chain::{PREFIX, tiered_partition};
 use super::*;
 use crate::iggy_index::IGGY_INDEX_SIZE;
-use crate::poll_plan::{PollPlan, PollReadResult, PollTier};
+use crate::poll_plan::{DiskFault, PollPlan, PollReadResult, PollTier, RemoteFailure};
 use crate::{
     LIMIT_BLOCKS_MIN, PartitionReadSettings, ReadCache, ReadCacheSettings, RemoteObjects,
     RemoteSegments, SegmentLocation,
@@ -97,7 +97,7 @@ fn plan(partition: &mut IggyPartition<IggyMessageBus>, strategy: PollingStrategy
 /// [`polled_all`] with the read settings `settings` for the partition.
 pub(super) async fn polled_all_reading(
     partition: &mut IggyPartition<IggyMessageBus>,
-    settings: PartitionReadSettings,
+    settings: &PartitionReadSettings,
 ) -> Vec<(Option<u64>, Vec<u8>)> {
     let mut polls = Vec::new();
     for strategy in strategies() {
@@ -108,7 +108,7 @@ pub(super) async fn polled_all_reading(
                 &args,
                 false,
                 usize::MAX,
-                settings,
+                settings.clone(),
             )
             .execute()
             .await;
@@ -143,11 +143,7 @@ async fn polled(
 pub(super) async fn polled_all(
     partition: &mut IggyPartition<IggyMessageBus>,
 ) -> Vec<(Option<u64>, Vec<u8>)> {
-    let mut polls = Vec::new();
-    for strategy in strategies() {
-        polls.push(Box::pin(polled(partition, strategy)).await);
-    }
-    polls
+    Box::pin(polled_all_reading(partition, &PartitionReadSettings::SHARD)).await
 }
 
 async fn failed(
@@ -182,6 +178,20 @@ pub(super) fn attach(
     objects: Rc<dyn RemoteObjects>,
 ) {
     partition.set_remote_segments(Rc::new(RemoteSegments::new(objects, layout())));
+}
+
+/// Like [`attach`], with a cache of the blocks of the `.log` objects that
+/// polls read, and no readahead.
+fn attach_cached(partition: &mut IggyPartition<IggyMessageBus>, objects: Rc<dyn RemoteObjects>) {
+    let cache = ReadCache::new(ReadCacheSettings {
+        cache_bytes: 1024 * 1024,
+        block_bytes: 4096,
+        read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 1024 * 1024,
+    });
+    let remote = RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache);
+    partition.set_remote_segments(Rc::new(remote));
 }
 
 async fn evict_sealed(partition: &mut IggyPartition<IggyMessageBus>, directory: &Path) {
@@ -235,7 +245,7 @@ impl RemoteObjects for Counted {
 async fn fetched(
     partition: &mut IggyPartition<IggyMessageBus>,
     counted: &Counted,
-    settings: PartitionReadSettings,
+    settings: &PartitionReadSettings,
 ) -> (Vec<(Option<u64>, Vec<u8>)>, usize) {
     let before = counted.gets.get();
     let polled = Box::pin(polled_all_reading(partition, settings)).await;
@@ -258,6 +268,8 @@ async fn given_evicted_segments_polled_with_each_limit_when_polling_twice_should
         cache_bytes: 64 * 1024 * 1024,
         block_bytes: BLOCK_BYTES,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
     });
     partition.set_remote_segments(Rc::new(
         RemoteSegments::new(Rc::clone(&counted) as _, layout())
@@ -267,25 +279,26 @@ async fn given_evicted_segments_polled_with_each_limit_when_polling_twice_should
     let under = PartitionReadSettings {
         limit: Some(usize::try_from((LIMIT_BLOCKS_MIN - 1) * BLOCK_BYTES).unwrap()),
         read_ahead: None,
+        left: None,
     };
     let shard = PartitionReadSettings::SHARD;
 
-    let (cold, cold_gets) = Box::pin(fetched(&mut partition, &counted, shard)).await;
-    let (warm, warm_gets) = Box::pin(fetched(&mut partition, &counted, shard)).await;
+    let (cold, cold_gets) = Box::pin(fetched(&mut partition, &counted, &shard)).await;
+    let (warm, warm_gets) = Box::pin(fetched(&mut partition, &counted, &shard)).await;
     assert!(cache.take_metrics().cached_bytes > 0);
-    let (limited, limited_gets) = Box::pin(fetched(&mut partition, &counted, under)).await;
+    let (limited, limited_gets) = Box::pin(fetched(&mut partition, &counted, &under)).await;
     assert_eq!(
         cache.take_metrics().cached_bytes,
         0,
         "the limit evicted what it held"
     );
-    let (again, again_gets) = Box::pin(fetched(&mut partition, &counted, under)).await;
+    let (again, again_gets) = Box::pin(fetched(&mut partition, &counted, &under)).await;
 
     assert_eq!([&cold, &warm, &limited, &again], [&local; 4]);
     assert!(cold_gets > 0);
     assert_eq!(warm_gets, 0, "a second pass reads the cache");
     assert!(limited_gets > 0 && again_gets == limited_gets);
-    Box::pin(fetched(&mut partition, &counted, shard)).await;
+    Box::pin(fetched(&mut partition, &counted, &shard)).await;
     assert!(cache.take_metrics().cached_bytes > 0);
     partition.forget_reads();
     assert_eq!(cache.take_metrics().cached_bytes, 0);
@@ -304,6 +317,8 @@ async fn cached_partition() -> (
         cache_bytes: 64 * 1024 * 1024,
         block_bytes: 4096,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 1024 * 1024,
     });
     partition.set_remote_segments(Rc::new(
         RemoteSegments::new(Rc::clone(&store) as _, layout()).with_cache(store as _, &cache),
@@ -333,6 +348,7 @@ async fn given_a_plan_built_before_a_smaller_limit_when_it_reads_after_should_re
     let keeps_nothing = PartitionReadSettings {
         limit: Some(0),
         read_ahead: None,
+        left: None,
     };
     let older = plan_reading(&mut partition, PartitionReadSettings::SHARD);
     let newer = plan_reading(&mut partition, keeps_nothing);
@@ -369,13 +385,14 @@ async fn given_a_plan_that_reads_no_store_when_handed_read_settings_should_not_l
 #[compio::test]
 async fn given_a_plan_of_a_partition_that_left_the_shard_when_it_reads_should_keep_nothing_in_the_cache()
  {
-    let (_directory, mut partition, cache, local) = Box::pin(cached_partition()).await;
+    let (_directory, mut partition, cache, _local) = Box::pin(cached_partition()).await;
     let detached = plan_reading(&mut partition, PartitionReadSettings::SHARD);
     partition.forget_reads();
 
     let result = detached.execute().await;
 
-    assert_eq!(accepted(&mut partition, result), local[0]);
+    assert_eq!(result.message_count, 0);
+    assert_eq!(result.read_error, Some(IggyError::TransientNotAccepted));
     assert_eq!(cache.take_metrics().cached_bytes, 0);
 }
 
@@ -526,6 +543,37 @@ async fn given_a_damaged_object_when_polling_without_checksum_validation_should_
         .await;
     assert!(result.truncated);
     assert_eq!(result.last_matching_offset, Some(0));
+}
+
+/// The store returned damaged bytes of the right length once, and whole ones
+/// since.
+#[compio::test]
+async fn given_a_damaged_block_in_the_read_cache_when_the_object_is_whole_again_should_fetch_it_again()
+ {
+    let (directory, mut partition, store, local) = Box::pin(uploaded_partition()).await;
+    attach_cached(&mut partition, store.clone());
+    Box::pin(evict_sealed(&mut partition, directory.path())).await;
+    let key = object_key(0, SegmentObject::Log);
+    let whole = ObjectStore::get_range(&*store, &key, 0..u64::MAX)
+        .await
+        .unwrap()
+        .bytes
+        .to_vec();
+    let mut damaged = whole.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0xff;
+    put(&store, &key, damaged).await;
+    let result = plan(&mut partition, PollingStrategy::offset(0))
+        .execute()
+        .await;
+    assert!(result.truncated);
+
+    put(&store, &key, whole).await;
+
+    assert_eq!(
+        Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await,
+        local[0]
+    );
 }
 
 #[compio::test]
@@ -759,6 +807,35 @@ async fn given_a_store_outage_when_clients_retry_should_answer_at_once_without_a
             .get()
             .is_none()
     );
+}
+
+#[compio::test]
+async fn given_bytes_in_the_read_cache_when_a_failure_of_the_store_is_remembered_should_serve_them_without_asking_it()
+ {
+    let (_directory, mut partition, outage, local) = Box::pin(partition_on_outage()).await;
+    attach_cached(&mut partition, outage.clone());
+    assert_eq!(
+        Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await,
+        local[0]
+    );
+    let gets = outage.gets.get();
+    outage
+        .failure
+        .set(Some(|_| ObjectStoreError::Unavailable("503".to_owned())));
+    // What a failed read of other bytes of the segments leaves behind.
+    for state in partition.log.sealed_read_state() {
+        state.remote_failure.set(Some(RemoteFailure {
+            fault: DiskFault::Retryable,
+            failures: 1,
+            until: Instant::now() + Duration::from_secs(60),
+        }));
+    }
+
+    assert_eq!(
+        Box::pin(polled(&mut partition, PollingStrategy::offset(0))).await,
+        local[0]
+    );
+    assert_eq!(outage.gets.get(), gets);
 }
 
 #[compio::test]

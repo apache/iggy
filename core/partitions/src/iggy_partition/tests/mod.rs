@@ -1218,17 +1218,37 @@ pub(super) fn recording_partition_at(
     recording_partition_with_pipeline(replica, replica_count, LocalPipeline::new())
 }
 
-/// The offer `partition` serves once the I/O turn pinned its plan.
+/// The offer `partition` serves once the store answered its check and the I/O
+/// turn pinned its plan.
 async fn serve_offer(
     partition: &mut IggyPartition<IggyMessageBus>,
 ) -> Rc<crate::state_transfer::PartitionStateTransferOffer> {
     let config = repair_config();
-    assert!(matches!(
-        partition.state_transfer_offer(&config).await,
-        Err(PartitionTransferUnavailable::FlushPending)
-    ));
+    let first = after_store_check(partition, &config).await;
+    assert!(
+        matches!(first, Err(PartitionTransferUnavailable::FlushPending)),
+        "{first:?}"
+    );
     settle_partition_io(partition, &config).await;
     partition.state_transfer_offer(&config).await.unwrap()
+}
+
+/// The first offer round of `partition` that does not wait for the store.
+async fn after_store_check(
+    partition: &mut IggyPartition<IggyMessageBus>,
+    config: &PartitionsConfig,
+) -> Result<Rc<crate::state_transfer::PartitionStateTransferOffer>, PartitionTransferUnavailable> {
+    const ROUNDS_MAX: usize = 100;
+    for _ in 0..ROUNDS_MAX {
+        match partition.state_transfer_offer(config).await {
+            // The check runs in a detached task.
+            Err(PartitionTransferUnavailable::StoreCheckPending) => {
+                compio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+            round => return round,
+        }
+    }
+    panic!("the store check did not answer in {ROUNDS_MAX} rounds");
 }
 
 /// `count` one-message records. Each call gives its messages new random

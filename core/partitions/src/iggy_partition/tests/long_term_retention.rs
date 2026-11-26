@@ -548,6 +548,8 @@ async fn rewritten_partition_reading_through(
         cache_bytes,
         block_bytes: 256 * 1024,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
     });
     partition.set_remote_segments(Rc::new(
         RemoteSegments::new(Rc::clone(&counted) as _, layout())
@@ -599,12 +601,13 @@ async fn given_long_term_segments_polled_through_a_cache_when_limited_or_gone_sh
     let under = PartitionReadSettings {
         limit: Some(1),
         read_ahead: None,
+        left: None,
     };
 
     let first = Box::pin(polled_all(&mut partition)).await;
     assert!(cached(&partition) > 0);
     let asked = counted.keys.borrow().len();
-    let limited = Box::pin(polled_all_reading(&mut partition, under)).await;
+    let limited = Box::pin(polled_all_reading(&mut partition, &under)).await;
     assert_eq!(cached(&partition), 0);
     let keys = counted.keys.borrow().clone();
     let (cached_pass, limited_pass) = keys.split_at(asked);
@@ -614,7 +617,7 @@ async fn given_long_term_segments_polled_through_a_cache_when_limited_or_gone_sh
     );
     Box::pin(polled_all_reading(
         &mut partition,
-        PartitionReadSettings::SHARD,
+        &PartitionReadSettings::SHARD,
     ))
     .await;
     assert!(cached(&partition) > 0);
@@ -641,11 +644,15 @@ async fn given_long_term_segments_polled_twice_when_the_cache_keeps_nothing_fetc
     assert_eq!(counted.keys.borrow().len(), 2 * asked);
 }
 
-/// The polls of a partition read what the shard uploaded until the rewrite
-/// of those batches commits, and its long-term segment after that.
-#[compio::test]
-async fn given_an_object_this_shard_uploaded_when_the_rewrite_of_its_batches_commits_should_release_it()
- {
+/// A leader that committed batches in [`FRESH_OBJECT`] and then in
+/// [`SECOND_OBJECT`], which its shard uploaded and holds, with the store that
+/// holds both objects and the reads of the partition.
+async fn leader_holding_second_object() -> (
+    tempfile::TempDir,
+    IggyPartition<IggyMessageBus>,
+    Rc<MemoryStore>,
+    Rc<RemoteSegments>,
+) {
     let (_first_whole, first_placed, first_object) = whole_and_placed(2);
     let (_second_whole, second_placed, second_object) = whole_and_placed_in(SECOND_OBJECT, 2);
     let store = Box::pin(store_with(first_object)).await;
@@ -657,12 +664,14 @@ async fn given_an_object_this_shard_uploaded_when_the_rewrite_of_its_batches_com
         )
         .await
         .unwrap();
-    let (_directory, mut partition) =
+    let (directory, mut partition) =
         Box::pin(placing_leader_of_three_with(&first_placed, &store)).await;
     let cache = ReadCache::new(ReadCacheSettings {
         cache_bytes: 64 * 1024 * 1024,
         block_bytes: 256 * 1024,
         read_ahead: 0,
+        read_ahead_fetches: 4,
+        read_ahead_fetch_bytes: 32 * 1024 * 1024,
     });
     let remote = Rc::new(
         RemoteSegments::new(Rc::clone(&store) as _, layout())
@@ -673,11 +682,82 @@ async fn given_an_object_this_shard_uploaded_when_the_rewrite_of_its_batches_com
     Box::pin(commit_records(&mut partition, 3, &second_placed)).await;
     remote.settle_fresh_object(SECOND_OBJECT);
     assert!(remote.holds_fresh_object(SECOND_OBJECT));
+    (directory, partition, store, remote)
+}
+
+/// The polls of a partition read what the shard uploaded until the rewrite
+/// of those batches commits, and its long-term segment after that.
+#[compio::test]
+async fn given_an_object_this_shard_uploaded_when_the_rewrite_of_its_batches_commits_should_release_it()
+ {
+    let (_directory, mut partition, store, remote) = Box::pin(leader_holding_second_object()).await;
 
     Box::pin(rewrite_up_to(&mut partition, &store, &[1, 3])).await;
 
     assert_eq!(partition.long_term_floor(), Some(3));
     assert!(!remote.holds_fresh_object(SECOND_OBJECT));
+}
+
+/// A transfer can restore a long-term floor that passed an object this
+/// shard holds, and the shard lets it go as when the rewrite commits here.
+#[compio::test]
+async fn given_an_object_this_shard_holds_when_a_restored_floor_passes_it_should_release_it() {
+    let (_rewritten_directory, mut rewritten, store, _) =
+        Box::pin(leader_holding_second_object()).await;
+    Box::pin(rewrite_up_to(&mut rewritten, &store, &[1, 3])).await;
+    let op = rewritten.state_machines().applied_op();
+    let snapshot = rewritten.machines_snapshot_at(op).unwrap();
+    let (_directory, mut behind, _store, remote) = Box::pin(leader_holding_second_object()).await;
+
+    behind.restore_machines(snapshot.as_ref(), op).unwrap();
+
+    assert_eq!(behind.long_term_floor(), Some(3));
+    assert!(!remote.holds_fresh_object(SECOND_OBJECT));
+}
+
+/// A long-term segment that the store returned damaged once is read again
+/// on the next poll, once the store holds it whole.
+#[compio::test]
+async fn given_a_damaged_long_term_segment_in_the_cache_when_the_store_holds_it_whole_again_should_read_it_again()
+ {
+    let (_directory, mut partition, counted) =
+        Box::pin(rewritten_partition_reading_through(64 * 1024 * 1024)).await;
+    let store = Rc::clone(&counted.store);
+    let mut logs: Vec<String> = store
+        .keys()
+        .into_iter()
+        .filter(|key| key.contains('-') && key.ends_with(".log"))
+        .collect();
+    logs.sort();
+    let key = logs.first().unwrap().clone();
+    let whole = ObjectStore::get_range(&*store, &key, 0..u64::MAX)
+        .await
+        .unwrap()
+        .bytes;
+    let mut damaged = whole.to_vec();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0xff;
+    let put = |bytes: Bytes| {
+        let store = Rc::clone(&store);
+        let key = key.clone();
+        async move {
+            store
+                .put(&key, PutBody::from_bytes(bytes), &PutOptions::default())
+                .await
+                .unwrap();
+        }
+    };
+    put(Bytes::from(damaged)).await;
+    let args = PollingArgs::new(PollingStrategy::offset(0), 10, false);
+    let failed = partition
+        .build_poll_plan(PollingConsumer::Consumer(1, 0), &args, false)
+        .execute()
+        .await;
+    assert!(failed.read_error.is_some());
+
+    put(whole).await;
+
+    Box::pin(polled_all(&mut partition)).await;
 }
 
 /// A rewrite hands the segment it stored to the cache, so a consumer just
@@ -697,6 +777,8 @@ async fn given_a_rewrite_that_stored_a_segment_when_polling_it_should_read_it_fr
             cache_bytes,
             block_bytes: 256 * 1024,
             read_ahead: 0,
+            read_ahead_fetches: 4,
+            read_ahead_fetch_bytes: 32 * 1024 * 1024,
         });
         partition.set_remote_segments(Rc::new(
             RemoteSegments::new(Rc::clone(&counted) as _, layout())
