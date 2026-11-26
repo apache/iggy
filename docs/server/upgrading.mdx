@@ -50,6 +50,8 @@ Server 0.10.1-edge.2 changes the replica wire revision and the storage marker. S
 
 The build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
 
+Later builds of 0.10.1-edge.2 add a `read_cache` field of type `TopicReadCache` to the Rust SDK's `TopicCreateOptions` and `TopicUpdateOptions`. A struct literal that names every field of either one stops compiling. Add `read_cache: TopicReadCache::default()`, which leaves both settings to each node, or end the literal with `..TopicCreateOptions::default()` or `..TopicUpdateOptions::default()`, so that a later field needs no change either. A pattern that destructures every field of `TopicResolvedOptions` adds `read_cache` or `..` the same way.
+
 ## Check the cutover
 
 Run producers and consumers against the new deployment before moving application traffic. Test resource creation, permissions, message payloads and headers, checkpoints, and reconnects. For a cluster, also test requests to different partition primaries and node failure. An accepted write and a processed message are different events. Select the required [durability policies](/docs/server/durability) and commit behavior explicitly.

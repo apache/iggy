@@ -1220,6 +1220,7 @@ impl ShardMetrics {
     }
 
     /// The count of stale shadow topics of the geo peer `origin`.
+    #[cfg(any(test, feature = "simulator"))]
     #[must_use]
     pub fn geo_shadow_topics_stale_value(&self, origin: &str) -> i64 {
         let label = GeoPeerLabel {
@@ -3066,8 +3067,9 @@ impl ShardMetrics {
         );
         registry.register(
             "remote_read_fresh_releases",
-            "fresh objects the read cache stopped holding once the long-term floors of their \
-             partitions passed them",
+            "fresh objects the read cache stopped holding: once the long-term floors of their \
+             partitions passed them, once every send in them was answered and none committed, \
+             or once their partitions left the shard",
             self.remote_read_fresh_releases_total.clone(),
         );
         registry.register(

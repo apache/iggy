@@ -1573,7 +1573,6 @@ where
             waiter.request.consumer,
             &waiter.request.args,
             max_selected_bytes,
-            self.partition_read_settings(waiter.namespace),
         ) else {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;
@@ -1584,6 +1583,7 @@ where
             self.accept_deferred_result(id, waiter, result).await;
             return;
         }
+        plan.read_store_with(|| self.partition_read_settings(waiter.namespace));
         let Ok(cold) = self.poll_completions.admit(plan.reads_remote()) else {
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;

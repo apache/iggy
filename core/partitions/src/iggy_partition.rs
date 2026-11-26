@@ -185,6 +185,9 @@ where
     pub(crate) segment_chain: Option<Box<crate::segment_chain::SegmentChain>>,
     /// Where polls read segments whose `.log` left the disk.
     remote_segments: Option<Rc<crate::RemoteSegments>>,
+    /// How the polls of this incarnation read the store through the shard's
+    /// cache, shared with each plan so that it reads the latest.
+    read_policy: crate::remote_segments::ReadPolicy,
     /// The other cluster's log that this partition serves in place of its
     /// own, `None` for a partition that holds its own messages.
     pub(crate) peer_log: Option<Box<crate::peer_log::PeerLog>>,
@@ -522,6 +525,9 @@ where
     /// Drives log escalation only -- never the backoff. See
     /// [`Self::record_transfer_refusal`].
     transfer_refusals: u32,
+    /// The last transfer arm found this node unable to read its object store,
+    /// so it did not request. Kept so each wait logs once.
+    transfer_waits_for_store: bool,
     /// A scheduled transfer re-arm: try `peer` again once `after_ticks`
     /// consensus ticks elapse. Owned by the shard tick sweep; while one is
     /// pending, the repair-refusal trigger must not arm concurrently.
@@ -556,6 +562,9 @@ where
     /// the build ends, with the offer cache, and with the history it
     /// describes.
     pub(crate) transfer_plan: RefCell<Option<TransferPlanSlot>>,
+    /// What the store answered for the offer build in progress. Released
+    /// when the build ends and with the offer cache.
+    pub(crate) stored_front_check: RefCell<Option<crate::state_transfer::StoredFrontCheck>>,
 }
 
 // Cold state stays behind one pointer per field. Inline, one of these fields
@@ -1179,6 +1188,7 @@ where
             state_machines: StateMachines::default(),
             segment_chain: None,
             remote_segments: None,
+            read_policy: crate::remote_segments::ReadPolicy::default(),
             peer_log: None,
             retired_peer_indexes: Vec::new(),
             pending_advances: VecDeque::new(),
@@ -1295,6 +1305,7 @@ where
             repair_charged_view: 0,
             transfer_failures: 0,
             transfer_refusals: 0,
+            transfer_waits_for_store: false,
             transfer_rearm: None,
             segment_checksum_cache: RefCell::new(std::collections::HashMap::new()),
             reuse_scan_memo: RefCell::new(None),
@@ -1302,6 +1313,7 @@ where
             spilled_hasher: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
             transfer_plan: RefCell::new(None),
+            stored_front_check: RefCell::new(None),
         };
         if single_replica {
             partition.log.journal().inner.set_repair_retention(false);
@@ -4242,6 +4254,23 @@ where
         self.transfer_refusals
     }
 
+    /// Whether a state transfer can leave segments of this partition in the
+    /// object store, for this replica to read there afterwards. A replica
+    /// rebuilt by transfer may hold no chain yet, so the topic's option counts
+    /// as well as the chain.
+    #[must_use]
+    pub fn transfer_reads_store(&self) -> bool {
+        self.runtime_options.tiered_storage || self.is_tiered() || self.pending_tiering().is_some()
+    }
+
+    /// Record whether this partition waits for its node's object store before
+    /// it requests a transfer, and say whether that changed.
+    pub const fn note_transfer_waits_for_store(&mut self, waits: bool) -> bool {
+        let changed = self.transfer_waits_for_store != waits;
+        self.transfer_waits_for_store = waits;
+        changed
+    }
+
     /// A fresh re-arm is scheduled: the stall budget starts over for it.
     ///
     /// Carrying an exhausted budget into the next attempt left every later
@@ -6473,6 +6502,7 @@ where
     /// The partition leaves the shard: what its reads keep in the shard's
     /// cache goes, and what its GETs in flight fetch is not kept.
     pub(crate) fn forget_reads(&self) {
+        self.read_policy.end();
         if let Some(remote) = &self.remote_segments {
             let prefix = self
                 .read_prefix()
@@ -6481,33 +6511,10 @@ where
         }
     }
 
-    /// [`Self::build_poll_plan`] for a poll whose reply holds at most
-    /// `byte_budget` bytes of messages.
-    #[cfg(test)]
-    pub(crate) fn build_poll_plan_within(
-        &mut self,
-        consumer: PollingConsumer,
-        args: &PollingArgs,
-        validate_checksum: bool,
-        byte_budget: usize,
-    ) -> PollPlan {
-        self.build_poll_plan_reading(
-            consumer,
-            args,
-            validate_checksum,
-            byte_budget,
-            crate::PartitionReadSettings::SHARD,
-        )
-    }
-
     /// [`Self::build_poll_plan_within`] whose reads of the store use the
-    /// shard's cache with `read_settings`.
-    ///
-    /// The snapshot ends at the segment that covers the poll's count or its
-    /// budget, whichever comes first. Remote segments make the list as long
-    /// as total retention, so a snapshot that ran to the tail would cost a
-    /// poll near the front of a long topic a clone per segment.
-    #[allow(clippy::too_many_lines)]
+    /// shard's cache with `read_settings`, as the shard sets them through
+    /// [`PollPlan::read_store_with`].
+    #[cfg(test)]
     pub(crate) fn build_poll_plan_reading(
         &mut self,
         consumer: PollingConsumer,
@@ -6516,6 +6523,28 @@ where
         byte_budget: usize,
         read_settings: crate::PartitionReadSettings,
     ) -> PollPlan {
+        let plan = self.build_poll_plan_within(consumer, args, validate_checksum, byte_budget);
+        plan.read_store_with(|| read_settings);
+        plan
+    }
+
+    /// [`Self::build_poll_plan`] for a poll whose reply holds at most
+    /// `byte_budget` bytes of messages. Its reads of the store use the
+    /// partition's read settings as they are at each read.
+    ///
+    /// The snapshot ends at the segment that covers the poll's count or its
+    /// budget, whichever comes first. Remote segments make the list as long
+    /// as total retention, so a snapshot that ran to the tail would cost a
+    /// poll near the front of a long topic a clone per segment.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn build_poll_plan_within(
+        &mut self,
+        consumer: PollingConsumer,
+        args: &PollingArgs,
+        validate_checksum: bool,
+        byte_budget: usize,
+    ) -> PollPlan {
+        let read_settings = self.read_policy.clone();
         // Reads the durable commit frontier (`self.offset`, stored only on
         // commit). Also used below as the poll's high-water bound: this function
         // is fully synchronous, so the single load cannot drift mid-plan.
@@ -6781,7 +6810,7 @@ where
             long_term,
             long_term_floor: self.long_term_floor(),
             long_term_next,
-            read_settings: crate::PartitionReadSettings::SHARD,
+            read_settings: self.read_policy.clone(),
         }
     }
 
@@ -13269,11 +13298,10 @@ where
             proofs.want();
         }
         if let Some(remote) = &self.remote_segments {
-            let last = u64::from(batch_stats.message_count).saturating_sub(1);
             remote.note_fresh_commit(
                 self.namespace(),
                 placement.object_id,
-                batch_stats.base_offset + last,
+                batch_stats.end_offset(),
             );
         }
     }

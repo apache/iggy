@@ -50,6 +50,7 @@ pub use persistence::{
 };
 pub use repair_memory::{RepairMemoryBudget, RepairRingBudget, RepairRingShed, RepairRingUsage};
 mod remote_blocks;
+pub(crate) use remote_blocks::PartitionLeft;
 pub use remote_blocks::{
     FRESH_CACHE_BYTES, LIMIT_BLOCKS_MIN, OWN_STORE, PartitionReadSettings, READ_AHEAD_START_BLOCKS,
     ReadCache, ReadCacheSettings, ReadGate, RemoteReadMetrics, StoreSlot,

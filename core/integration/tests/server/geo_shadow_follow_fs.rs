@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use iggy::prelude::*;
-use iggy_object_store::KeyLayout;
+use iggy_object_store::{KeyLayout, LongTermKey, SegmentKey, SegmentObject};
 use integration::harness::{
     Bucket, BucketEvent, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide,
 };
@@ -694,17 +694,33 @@ async fn send_batch(client: &IggyClient, cluster: &str) {
         .expect("dc-a takes the send");
 }
 
-/// The offsets of every long-term segment that a manifest in `bucket`
-/// lists, which name their objects.
-async fn long_term_segments(bucket: &Bucket) -> Vec<(u64, u64)> {
-    bucket
-        .manifests()
-        .await
-        .expect("read the manifests")
-        .iter()
-        .flat_map(|manifest| &manifest.segments)
-        .map(|segment| (segment.start_offset, segment.end_offset))
-        .collect()
+/// The keys of the objects of every long-term segment that a manifest in
+/// `bucket` lists, sorted.
+async fn long_term_segments(bucket: &Bucket) -> Vec<String> {
+    let layout = bucket.layout();
+    let mut keys = Vec::new();
+    for manifest in bucket.manifests().await.expect("read the manifests") {
+        for segment in &manifest.segments {
+            for object in SegmentObject::ALL {
+                keys.push(if manifest.segments_keyed_by_both_offsets {
+                    layout.long_term_key(&LongTermKey {
+                        prefix: manifest.prefix,
+                        start_offset: segment.start_offset,
+                        end_offset: segment.end_offset,
+                        object,
+                    })
+                } else {
+                    layout.segment_key(&SegmentKey {
+                        prefix: manifest.prefix,
+                        start_offset: segment.start_offset,
+                        object,
+                    })
+                });
+            }
+        }
+    }
+    keys.sort();
+    keys
 }
 
 /// Send to the geo topic of `dc-a`, one message at a time, until `producing`
