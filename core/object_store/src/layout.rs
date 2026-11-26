@@ -289,12 +289,15 @@ impl KeyLayout {
         (parts.next()? == MANIFEST && parts.next().is_none()).then_some(prefix)
     }
 
-    /// The listing prefix of every key of the root that is not an object of
-    /// a segment, with a trailing `/`: the manifests, the identity object,
-    /// fresh objects, geo topic objects, positions and recovery records.
+    /// Whether `key` is a key of the root that is not an object of a
+    /// segment: a manifest, the identity object, a fresh object, a geo topic
+    /// object, positions or a recovery record.
     #[must_use]
-    pub fn meta_prefix(&self) -> String {
-        format!("{}/{META}/", self.root)
+    pub fn is_meta_key(&self, key: &str) -> bool {
+        key.strip_prefix(self.root.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.strip_prefix(META))
+            .is_some_and(|rest| rest.starts_with('/'))
     }
 
     /// The key of the store identity object, which names the cluster that
@@ -416,14 +419,14 @@ impl KeyLayout {
     }
 
     /// Whether this layout builds `key`: an object of a segment or of a
-    /// long-term segment, or a key under [`Self::meta_prefix`], which no
+    /// long-term segment, or a key that [`Self::is_meta_key`] takes, which no
     /// other root can continue with. A longer root shares every listing
     /// prefix of this one, and its keys fail this test.
     #[must_use]
     pub fn owns_key(&self, key: &str) -> bool {
         self.parse_segment_key(key).is_some()
             || self.parse_long_term_key(key).is_some()
-            || key.starts_with(self.meta_prefix().as_str())
+            || self.is_meta_key(key)
     }
 
     /// The listing prefix of what the recovery of the cluster
@@ -907,10 +910,8 @@ mod tests {
     }
 
     #[test]
-    fn given_keys_of_the_root_when_matching_the_meta_prefix_should_take_only_those_outside_segments()
-     {
+    fn given_keys_of_the_root_when_matching_meta_keys_should_take_only_those_outside_segments() {
         let layout = layout();
-        let meta = layout.meta_prefix();
         let segment = layout.segment_key(&SegmentKey {
             prefix: PREFIX,
             start_offset: 1_000,
@@ -923,19 +924,25 @@ mod tests {
             object: SegmentObject::Index,
         });
 
-        assert_eq!(meta, "tenant/iggy/meta/");
-        assert!(validate_prefix(&meta).is_ok());
         for key in [
             layout.manifest_key(&PREFIX),
             layout.identity_key(),
             layout.fresh_key(7),
             layout.topic_key(&TOPIC),
             layout.recovery_key(7),
+            "tenant/iggy/meta/notes".to_owned(),
         ] {
-            assert!(key.starts_with(&meta), "{key}");
+            assert!(layout.is_meta_key(&key), "{key}");
         }
-        for key in [segment, long_term] {
-            assert!(!key.starts_with(&meta), "{key}");
+        for key in [
+            segment,
+            long_term,
+            "tenant/iggy/meta".to_owned(),
+            "tenant/iggy/metadata/1".to_owned(),
+            "tenant/iggymeta/1".to_owned(),
+            "tenant/other/meta/1".to_owned(),
+        ] {
+            assert!(!layout.is_meta_key(&key), "{key}");
         }
     }
 
@@ -1231,7 +1238,7 @@ mod tests {
         );
         assert!(key.starts_with(&layout.upload_prefix(0x1f)));
         assert!(key.starts_with(&layout.uploads_prefix()));
-        assert!(key.starts_with(&layout.meta_prefix()));
+        assert!(layout.is_meta_key(&key));
         assert!(validate_key(&key).is_ok());
         assert_eq!(layout.parse_upload_part_key(&key), Some((0x1f, 7)));
         assert_eq!(

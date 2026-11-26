@@ -24,6 +24,7 @@ use iggy_object_store::{
     ObjectMeta, ObjectRange, PutBody, PutOptions, SEGMENT_HASH_LEN, TierScope, UserMetadata,
 };
 use server_common::yield_to_reactor;
+use std::future::Future;
 
 use super::*;
 
@@ -138,6 +139,7 @@ struct Local {
     stems: Vec<u64>,
     anchors: BTreeMap<u64, SegmentAnchor>,
     sealed: Vec<(u64, u64)>,
+    checkpoint_start: Option<u64>,
 }
 
 impl Local {
@@ -149,6 +151,7 @@ impl Local {
             stems: Vec::new(),
             anchors: BTreeMap::new(),
             sealed: Vec::new(),
+            checkpoint_start: None,
         }
     }
 
@@ -159,33 +162,37 @@ impl Local {
                 watermark: self.watermark,
                 floor: self.floor,
                 stems_without_log: &self.stems,
-                replicated: false,
             },
             created_revision: PREFIX.created_revision,
             anchors: &self.anchors,
             local_sealed: &self.sealed,
+            checkpoint_start: self.checkpoint_start,
         }
     }
 
     fn rebuild(&self, view: &StoreView) -> Result<RebuiltFront, ChainLost> {
-        rebuild_front(view, &self.input())
+        rebuild_front(view, &self.input()).map_err(|failure| match failure {
+            RebuildFailure::Lost(lost) => lost,
+            unread @ RebuildFailure::Unread { .. } => panic!("{unread:?}"),
+        })
     }
 }
 
-fn local_front(
-    front: Option<u64>,
-    watermark: u64,
-    floor: Option<u64>,
-    stems: &[u64],
-    replicated: bool,
-) -> ChainLoss {
+fn local_front(front: Option<u64>, watermark: u64, floor: Option<u64>, stems: &[u64]) -> ChainLoss {
     chain_loss(&LocalFront {
         front,
         watermark,
         floor,
         stems_without_log: stems,
-        replicated,
     })
+}
+
+fn anchor(planted_start: u64, sealed_start: u64, sealed_end: u64) -> SegmentAnchor {
+    SegmentAnchor {
+        planted_start,
+        sealed_start,
+        sealed_end,
+    }
 }
 
 fn lost(from: u64, to: u64, reason: ChainLostReason) -> ChainLost {
@@ -194,76 +201,55 @@ fn lost(from: u64, to: u64, reason: ChainLostReason) -> ChainLost {
 
 #[test]
 fn given_no_local_log_when_deciding_should_refuse() {
-    for (floor, stems, replicated) in [
-        (None, &[][..], false),
-        (Some(99), &[0, 50][..], false),
-        (Some(99), &[][..], true),
+    for (floor, stems) in [
+        (None, &[][..]),
+        (Some(99), &[0, 50][..]),
+        (Some(99), &[][..]),
     ] {
         assert_eq!(
-            local_front(None, 0, floor, stems, replicated),
+            local_front(None, 0, floor, stems),
             ChainLoss::Refuse(lost(0, u64::MAX, ChainLostReason::NoLocalLog))
         );
     }
     assert_eq!(
-        local_front(None, 41, Some(99), &[], false),
+        local_front(None, 41, Some(99), &[]),
         ChainLoss::Refuse(lost(42, u64::MAX, ChainLostReason::NoLocalLog))
     );
 }
 
 #[test]
 fn given_a_front_at_or_below_the_first_kept_offset_when_deciding_should_open_a_fresh_chain() {
-    for replicated in [false, true] {
-        assert_eq!(
-            local_front(Some(0), 0, Some(99), &[], replicated),
-            ChainLoss::Fresh
-        );
-        assert_eq!(
-            local_front(Some(42), 41, Some(99), &[10, 20], replicated),
-            ChainLoss::Fresh
-        );
-        assert_eq!(
-            local_front(Some(30), 41, Some(99), &[10], replicated),
-            ChainLoss::Fresh
-        );
-    }
-}
-
-#[test]
-fn given_a_front_above_the_trim_with_no_trace_of_an_eviction_on_one_replica_when_deciding_should_open_a_fresh_chain()
- {
-    assert_eq!(local_front(Some(50), 0, None, &[], false), ChainLoss::Fresh);
-    // Files of segments retention removed say nothing about an eviction.
+    assert_eq!(local_front(Some(0), 0, Some(99), &[]), ChainLoss::Fresh);
     assert_eq!(
-        local_front(Some(50), 20, None, &[10, 20], false),
+        local_front(Some(42), 41, Some(99), &[10, 20]),
         ChainLoss::Fresh
     );
+    assert_eq!(local_front(Some(30), 41, Some(99), &[10]), ChainLoss::Fresh);
 }
 
 #[test]
-fn given_a_front_above_the_trim_with_no_trace_of_an_eviction_on_a_replicated_partition_when_deciding_should_refuse()
+fn given_a_front_above_the_trim_with_no_trace_of_an_eviction_when_deciding_should_open_a_fresh_chain()
  {
-    assert_eq!(
-        local_front(Some(50), 20, None, &[], true),
-        ChainLoss::Refuse(lost(21, 49, ChainLostReason::UncommittedTrim))
-    );
+    assert_eq!(local_front(Some(50), 0, None, &[]), ChainLoss::Fresh);
+    // Files of segments retention removed say nothing about an eviction.
+    assert_eq!(local_front(Some(50), 20, None, &[10, 20]), ChainLoss::Fresh);
+}
+
+/// Retention of a topic that is not tiered yet trims each replica on its
+/// own and commits no watermark. Tiering can commit before a replica writes
+/// its first chain, so a replica of a replicated partition that lost that
+/// chain finds its front above the watermark with nothing evicted.
+#[test]
+fn given_untiered_retention_before_tiering_took_effect_when_deciding_should_open_a_fresh_chain() {
+    assert_eq!(local_front(Some(50), 20, None, &[]), ChainLoss::Fresh);
+    assert_eq!(local_front(Some(50), 0, None, &[]), ChainLoss::Fresh);
 }
 
 #[test]
 fn given_a_front_above_the_trim_and_a_floor_or_a_stem_when_deciding_should_rebuild() {
-    for replicated in [false, true] {
-        assert_eq!(
-            local_front(Some(50), 0, Some(49), &[], replicated),
-            ChainLoss::Rebuild
-        );
-        assert_eq!(
-            local_front(Some(50), 0, None, &[10], replicated),
-            ChainLoss::Rebuild
-        );
-        assert_eq!(
-            local_front(Some(50), 20, None, &[21], replicated),
-            ChainLoss::Rebuild
-        );
-    }
+    assert_eq!(local_front(Some(50), 0, Some(49), &[]), ChainLoss::Rebuild);
+    assert_eq!(local_front(Some(50), 0, None, &[10]), ChainLoss::Rebuild);
+    assert_eq!(local_front(Some(50), 20, None, &[21]), ChainLoss::Rebuild);
 }
 
 #[test]
@@ -1090,11 +1076,10 @@ async fn given_more_logs_than_heads_in_flight_when_reading_the_view_should_head_
 }
 
 #[compio::test]
-async fn given_heads_that_fail_out_of_order_when_reading_the_view_should_return_the_error_of_the_lowest_start()
- {
+async fn given_heads_that_fail_when_reading_the_view_should_keep_each_failure_with_its_object() {
     let layout = KeyLayout::new("iggy").unwrap();
     // The HEAD at 20 fails first. The one at 0 finds no object, which is no
-    // error.
+    // failure.
     let store = SlowHeads::new([
         (log_key(&layout, 0), (1, not_found)),
         (log_key(&layout, 10), (3, ObjectStoreError::Unavailable)),
@@ -1110,12 +1095,260 @@ async fn given_heads_that_fail_out_of_order_when_reading_the_view_should_return_
         local_sealed: Vec::new(),
     };
 
-    let error = read_store_view(&store, &layout, request).await.unwrap_err();
+    let view = read_store_view(&store, &layout, request).await.unwrap();
 
+    assert_eq!(view.logs.get(&0), Some(&StoredLog::Gone));
     assert!(
-        matches!(&error, ObjectStoreError::Unavailable(key) if *key == log_key(&layout, 10)),
-        "{error:?}"
+        matches!(view.logs.get(&10), Some(StoredLog::Failed(error)) if error.contains(&log_key(&layout, 10))),
+        "{:?}",
+        view.logs.get(&10)
     );
+    assert!(
+        matches!(view.logs.get(&20), Some(StoredLog::Failed(_))),
+        "{:?}",
+        view.logs.get(&20)
+    );
+    assert!(matches!(view.logs.get(&30), Some(StoredLog::Found { .. })));
+}
+
+#[test]
+fn given_a_failed_head_of_an_object_the_walk_skips_when_rebuilding_should_rebuild_without_it() {
+    // A deposed primary sealed at 5 and uploaded. The walk never takes it, so
+    // the failure of its HEAD says nothing about the chain.
+    let mut view = view(&[(0, 9), (5, 14), (10, 19)], 0, 20);
+    view.logs
+        .insert(5, StoredLog::Failed("the store is unavailable".to_owned()));
+    let local = Local::new(20, 0, Some(19));
+
+    let rebuilt = local.rebuild(&view).unwrap();
+
+    assert_eq!(rebuilt.records, vec![remote(0, 9), remote(10, 19)]);
+}
+
+#[test]
+fn given_a_failed_head_of_an_object_the_walk_needs_when_rebuilding_should_read_again_and_not_refuse()
+ {
+    let mut view = view(&[(0, 9), (10, 19)], 0, 20);
+    view.logs
+        .insert(10, StoredLog::Failed("the store is unavailable".to_owned()));
+    let local = Local::new(20, 0, Some(19));
+
+    assert_eq!(
+        rebuild_front(&view, &local.input()),
+        Err(RebuildFailure::Unread {
+            start: 10,
+            error: "the store is unavailable".to_owned(),
+        })
+    );
+}
+
+/// What a recorded job asked of its executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RecordedJob {
+    class: TierJobClass,
+    bytes: u64,
+}
+
+/// An [`InlineTierExecutor`] that records the class and the bytes of every
+/// job submitted to it.
+struct RecordingExecutor {
+    inner: InlineTierExecutor<MemoryStore>,
+    jobs: Rc<std::cell::RefCell<Vec<RecordedJob>>>,
+}
+
+impl TierExecutor for RecordingExecutor {
+    type Store = MemoryStore;
+
+    fn submit<T, F, Fut>(
+        &self,
+        request: TierJobRequest,
+        job: F,
+    ) -> iggy_object_store::TierJobHandle<T>
+    where
+        T: 'static,
+        F: FnOnce(Rc<MemoryStore>) -> Fut + 'static,
+        Fut: Future<Output = T> + 'static,
+    {
+        self.jobs.borrow_mut().push(RecordedJob {
+            class: request.class(),
+            bytes: request.bytes(),
+        });
+        self.inner.submit(request, job)
+    }
+}
+
+#[compio::test]
+async fn given_a_rebuild_when_reading_the_view_should_hold_the_manifest_bytes_only_in_its_own_job()
+{
+    let store = MemoryStore::new();
+    let layout = KeyLayout::new("iggy").unwrap();
+    put_segment(&store, &layout, 0, 9).await;
+    let jobs = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let reader = ExecutorStoreViewReader::new(
+        RecordingExecutor {
+            inner: InlineTierExecutor::new(store),
+            jobs: Rc::clone(&jobs),
+        },
+        layout,
+    );
+    let request = StoreViewRequest {
+        prefix: PREFIX,
+        from: 0,
+        front: 10,
+        local_sealed: Vec::new(),
+    };
+    let scope = TierScope::new();
+
+    let view = reader.read(request, scope.token()).await.unwrap().unwrap();
+
+    assert_eq!(view.logs.keys().copied().collect::<Vec<_>>(), vec![0]);
+    assert_eq!(
+        *jobs.borrow(),
+        vec![
+            RecordedJob {
+                class: TierJobClass::DemandFetch,
+                bytes: 0,
+            },
+            RecordedJob {
+                class: TierJobClass::DemandFetch,
+                bytes: MANIFEST_CROSS_CHECK_BYTES_MAX,
+            },
+        ]
+    );
+}
+
+/// Retention removed the segment before a gap that an anchor names, so no
+/// object holds the first offset it kept, and the offsets up to the anchored
+/// segment were never written.
+#[test]
+fn given_a_trim_that_removed_the_segment_before_an_anchored_gap_when_rebuilding_should_start_past_the_gap()
+ {
+    let view = view(&[(100, 109), (110, 119)], 10, 120);
+    let mut local = Local::new(120, 9, Some(119));
+    local.anchors.insert(100, anchor(100, 0, 9));
+    local.stems = vec![100, 110];
+
+    let rebuilt = local.rebuild(&view).unwrap();
+
+    // Recovery refuses a chain that starts above the offset after its trim
+    // point, so the trim point closes the gap.
+    assert_eq!(
+        rebuilt.records,
+        vec![
+            ChainRecord::TrimPoint(99),
+            remote(100, 109),
+            remote(110, 119)
+        ]
+    );
+    assert_eq!(rebuilt.trim_point, Some(99));
+}
+
+#[test]
+fn given_a_trim_that_removed_the_segment_before_an_anchored_gap_up_to_the_front_when_rebuilding_should_chain_no_segment()
+ {
+    let view = view(&[], 10, 100);
+    let mut local = Local::new(100, 9, Some(99));
+    local.anchors.insert(100, anchor(100, 0, 9));
+
+    let rebuilt = local.rebuild(&view).unwrap();
+
+    assert_eq!(rebuilt.records, vec![ChainRecord::TrimPoint(99)]);
+}
+
+#[test]
+fn given_a_leading_anchor_that_does_not_prove_the_gap_when_rebuilding_should_refuse() {
+    // The segment the anchor names ends above the trim, at 14.
+    let view = view(&[(100, 109)], 10, 110);
+    let mut local = Local::new(110, 9, Some(109));
+    local.anchors.insert(100, anchor(100, 0, 14));
+    assert_eq!(
+        local.rebuild(&view),
+        Err(lost(10, 99, ChainLostReason::MissingObject))
+    );
+
+    // The store lists a segment inside the gap the anchor names.
+    let view = self::view(&[(50, 59), (100, 109)], 10, 110);
+    local.anchors.insert(100, anchor(100, 0, 9));
+    assert_eq!(
+        local.rebuild(&view),
+        Err(lost(10, 49, ChainLostReason::MissingObject))
+    );
+}
+
+#[test]
+fn given_a_stem_inside_an_anchored_leading_gap_when_rebuilding_should_refuse() {
+    let view = view(&[(100, 109)], 10, 110);
+    let mut local = Local::new(110, 9, Some(109));
+    local.anchors.insert(100, anchor(100, 0, 9));
+    local.stems = vec![50, 100];
+
+    assert_eq!(
+        local.rebuild(&view),
+        Err(lost(50, 99, ChainLostReason::StrayFile { start: 50 }))
+    );
+}
+
+#[test]
+fn given_an_empty_object_when_rebuilding_should_refuse_it() {
+    let mut view = view(&[(0, 9), (10, 19)], 0, 20);
+    let empty = SegmentMetadata {
+        size: 0,
+        ..metadata(10, 19)
+    };
+    view.listed.insert(
+        10,
+        ListedSegment {
+            log_size: Some(0),
+            index_size: Some(INDEX_BYTES),
+        },
+    );
+    view.logs.insert(
+        10,
+        StoredLog::Found {
+            size: 0,
+            crc32c: Some(crc(10)),
+            metadata: Ok(empty),
+        },
+    );
+    let local = Local::new(20, 0, Some(19));
+
+    assert_eq!(
+        local.rebuild(&view),
+        Err(lost(10, 19, ChainLostReason::EmptyObject { start: 10 }))
+    );
+}
+
+#[test]
+fn given_an_object_that_reaches_the_checkpoint_segment_when_rebuilding_should_refuse_it() {
+    let view = view(&[(0, 9), (10, 19)], 0, 20);
+    let mut local = Local::new(20, 0, Some(19));
+    local.checkpoint_start = Some(15);
+
+    assert_eq!(
+        local.rebuild(&view),
+        Err(lost(
+            10,
+            19,
+            ChainLostReason::AtCheckpoint {
+                start: 10,
+                checkpoint_start: 15,
+            }
+        ))
+    );
+}
+
+#[test]
+fn given_a_request_when_the_incarnation_or_the_trim_changes_should_no_longer_be_asked() {
+    let request = StoreViewRequest {
+        prefix: PREFIX,
+        from: 20,
+        front: 40,
+        local_sealed: Vec::new(),
+    };
+
+    assert!(request.is_for(PREFIX.created_revision, 19));
+    assert!(!request.is_for(PREFIX.created_revision + 1, 19));
+    assert!(!request.is_for(PREFIX.created_revision, 29));
 }
 
 /// A store whose HEADs each wait a turn before they answer, so HEADs that run

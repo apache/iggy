@@ -23,20 +23,26 @@
 //! Shard 0 of the caught-up metadata primary sweeps, while the shard holds
 //! an object deleter, which it does only while its node passes the store
 //! identity check of [`crate::store_identity`]. A sweep reads the revision
-//! of committed metadata first. Then it reads the store identity object,
-//! and lists the root in housekeeping jobs of
-//! [`partitions::ORPHAN_LIST_PAGES_PER_JOB`] pages each. An identity object
-//! that names another cluster ends the sweep. An orphan that is due goes to
-//! the queue of [`crate::incarnation_deletes`], whose delete checks
-//! committed metadata and reads the identity object again.
+//! of committed metadata and the incarnations it holds first. Then it reads
+//! the store identity object, and lists the root in housekeeping jobs of a
+//! few pages each, and drops the incarnations committed metadata holds from
+//! what each job listed as the job ends. An identity object that names
+//! another cluster ends the sweep. An orphan that is due goes to the queue
+//! of [`crate::incarnation_deletes`], whose delete checks committed metadata
+//! and the view, and reads the claim of the root again.
+//!
+//! The sweeps time their cadence and the grace with the monotonic clock of
+//! the node, so a step of its wall clock neither starts a sweep early nor
+//! ends a grace early.
 //!
 //! What the sweeps found lives in memory only. It is dropped when the node
 //! stops being the metadata primary, its view changes, it loses its object
 //! deleter, or a sweep does not list the whole root.
 
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use configs::tiered_storage::{TieredStorageBackend, TieredStorageConfig};
 use consensus::{MetadataHandle, VsrConsensus};
@@ -44,13 +50,14 @@ use iggy_common::IggyTimestamp;
 use iggy_object_store::{ObjectPrefix, TierJobCancelled, TierScope, TierScopeToken};
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
+use metadata::stm::stream::StreamsInner;
 use partitions::{
     ClaimStamp, ObjectDeleter, OrphanCandidates, OrphanGuard, RootListing, SweepFindings,
     SweepStamp, sweep_interval,
 };
 use tracing::{debug, info, warn};
 
-use crate::incarnation_deletes::{IncarnationDeletes, holds_incarnation};
+use crate::incarnation_deletes::{IncarnationDeletes, namespace_of};
 use crate::shell::ServerShard;
 use crate::store_identity::own_cluster_uid;
 
@@ -74,9 +81,9 @@ struct State {
     running: Option<(u64, TierScope)>,
     /// Number of the last sweep this node started.
     sweeps: u64,
-    /// When the next sweep may start, in microseconds since the Unix epoch.
-    /// The first pass of a primary sweeps.
-    next_sweep_at: u64,
+    /// When the next sweep may start, by the monotonic clock. `None` before
+    /// the first, so the first pass of a primary sweeps.
+    next_sweep_at: Option<Instant>,
     /// Whether the gauges show what a sweep found.
     reported: bool,
 }
@@ -92,11 +99,18 @@ impl OrphanSweep {
         }
     }
 
-    /// Queue the orphans the last sweep found due with `deletes`, and start
-    /// a sweep in a detached task when one is due at `now`. A pass while
-    /// that task runs starts nothing. A shard that may not sweep drops what
-    /// the sweeps found and stops its task.
-    pub fn pass(&self, shard: &Rc<ServerShard>, deletes: &IncarnationDeletes, now: IggyTimestamp) {
+    /// Queue the orphans the last sweep found due with `deletes` at `now`,
+    /// and start a sweep in a detached task when one is due at `monotonic`,
+    /// the same moment by the monotonic clock. A pass while that task runs
+    /// starts nothing. A shard that may not sweep drops what the sweeps found
+    /// and stops its task.
+    pub fn pass(
+        &self,
+        shard: &Rc<ServerShard>,
+        deletes: &IncarnationDeletes,
+        now: IggyTimestamp,
+        monotonic: Instant,
+    ) {
         let Some(grace) = self.grace else {
             return;
         };
@@ -116,20 +130,18 @@ impl OrphanSweep {
                 queued, "queued the delete of orphan incarnations that the sweeps found due"
             );
         }
-        if state.running.is_some() || now.as_micros() < state.next_sweep_at {
+        if state.running.is_some() || state.next_sweep_at.is_some_and(|next| monotonic < next) {
             return;
         }
-        state.next_sweep_at = now
-            .as_micros()
-            .saturating_add(micros(sweep_interval(grace)));
-        // Read before any listing: an incarnation above it may have been
-        // created while the listing ran.
-        let revision = shard
+        state.next_sweep_at = Some(monotonic + sweep_interval(grace));
+        // Read before any listing: an incarnation above the revision may have
+        // been created while the listing ran.
+        let committed = shard
             .plane
             .metadata()
             .mux_stm
             .streams()
-            .read(|inner| inner.revision);
+            .read(Committed::read);
         let scope = TierScope::new();
         state.sweeps += 1;
         let sweep = Sweep {
@@ -139,9 +151,9 @@ impl OrphanSweep {
             token: scope.token(),
             view,
             cluster_uid,
-            revision,
+            committed,
             grace,
-            now,
+            started: monotonic,
         };
         state.running = Some((sweep.id, scope));
         drop(state);
@@ -200,12 +212,47 @@ struct Sweep {
     token: TierScopeToken,
     view: u32,
     cluster_uid: u128,
-    /// The revision committed metadata had reached before the listing.
-    revision: u64,
+    committed: Committed,
     grace: Duration,
-    /// When the pass that started the sweep ran, which the previous sweep
-    /// ended before.
-    now: IggyTimestamp,
+    /// When the pass that started the sweep ran, by the monotonic clock,
+    /// which the previous sweep ended before.
+    started: Instant,
+}
+
+/// What committed metadata held before the listing: its revision, and the
+/// incarnations of its partitions, read together.
+struct Committed {
+    revision: u64,
+    incarnations: BTreeSet<ObjectPrefix>,
+}
+
+impl Committed {
+    fn read(inner: &StreamsInner) -> Self {
+        let mut incarnations = BTreeSet::new();
+        for (stream_id, stream) in inner.items.iter() {
+            for (topic_id, topic) in stream.topics.iter() {
+                for partition in &topic.partitions {
+                    incarnations.insert(ObjectPrefix {
+                        stream_id: stream_id as u64,
+                        topic_id: topic_id as u64,
+                        partition_id: partition.id as u64,
+                        created_revision: partition.created_revision,
+                    });
+                }
+            }
+        }
+        Self {
+            revision: inner.revision,
+            incarnations,
+        }
+    }
+
+    /// Whether committed metadata held a partition of exactly the
+    /// incarnation `prefix`. Ids that name no namespace cannot be checked,
+    /// so they count as held, and nothing deletes them.
+    fn holds(&self, prefix: &ObjectPrefix) -> bool {
+        namespace_of(prefix).is_none() || self.incarnations.contains(prefix)
+    }
 }
 
 /// Why a sweep did not list the whole root.
@@ -234,19 +281,20 @@ impl Sweep {
         let metrics = self.owner.metrics();
         match swept {
             Ok((claim, listing)) => {
-                let streams = self.owner.plane.metadata().mux_stm.streams();
-                let findings = SweepFindings::of(&listing, self.revision, |prefix| {
-                    holds_incarnation(streams, prefix)
+                let findings = SweepFindings::of(&listing, self.committed.revision, |prefix| {
+                    self.committed.holds(prefix)
                 });
                 let stamp = SweepStamp {
                     view: self.view,
                     claim: claim.clone(),
                 };
-                let due = state
-                    .candidates
-                    .settle(stamp, &findings.orphans, self.now, self.grace);
+                let due =
+                    state
+                        .candidates
+                        .settle(stamp, &findings.orphans, self.started, self.grace);
                 state.due.extend(due.into_iter().map(|(prefix, newest)| {
                     let guard = OrphanGuard {
+                        view: self.view,
                         claim: claim.clone(),
                         newest,
                     };
@@ -258,8 +306,9 @@ impl Sweep {
                 state.reported = true;
                 log_findings(&listing, &findings, state.due.len());
             }
-            Err(Stopped::Cancelled) => {}
-            Err(Stopped::NotFull) => {
+            // A sweep that stopped early, cancelled or not, must not let the
+            // next full sweep count on the one before it.
+            Err(Stopped::Cancelled | Stopped::NotFull) => {
                 state.candidates.clear();
                 metrics.set_orphan_findings(0, 0);
                 state.reported = false;
@@ -307,7 +356,10 @@ impl Sweep {
                     return Err(Stopped::NotFull);
                 }
             };
-            listing.merge(pages.listing);
+            let mut part = pages.listing;
+            part.incarnations
+                .retain(|prefix, _| !self.committed.holds(prefix));
+            listing.merge(part);
             after = pages.next;
             if after.is_none() {
                 break;
@@ -329,7 +381,7 @@ impl Sweep {
 
 fn log_findings(listing: &RootListing, findings: &SweepFindings, due: usize) {
     debug!(
-        incarnations = listing.incarnations.len(),
+        unheld = listing.incarnations.len(),
         orphans = findings.orphans.len(),
         due,
         unrecognised = listing.unrecognised,
@@ -361,12 +413,11 @@ fn log_findings(listing: &RootListing, findings: &SweepFindings, due: usize) {
             objects = findings.objects_before_claim(),
             ?sample,
             "found partition incarnations that committed metadata does not hold with objects no \
-             newer than this cluster's claim of the object store root, which a cluster before \
-             it left; the sweep never deletes them, and an operator may"
+             newer than this cluster's claim of the object store root, in whole seconds, so a \
+             cluster before it may have left them; the sweep never deletes them, and an operator \
+             may. The claim is when the store committed the identity object, and a repair or a \
+             recovery that puts it again moves the claim later, so objects this cluster wrote \
+             before then count as older than the claim too"
         );
     }
-}
-
-fn micros(duration: Duration) -> u64 {
-    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }

@@ -590,65 +590,92 @@ what is left on disk:
   can be missing: the partition starts a new chain, as when a topic turns
   tiering on.
 - The first `.log` starts later, and the partition has no tiered floor and no
-  `.index` or `.anchor` left below it, so nothing left the disk: a partition
-  with one replica starts a new chain, and a replicated one is refused and
-  rejoins by state transfer.
+  `.index` or `.anchor` left below it, so nothing left the disk: retention
+  that ran before tiering took effect commits no truncation and leaves such a
+  front. The partition starts a new chain that records that front.
 - Otherwise the node rebuilds the chain from the store before the partition
   serves. It lists the partition's objects, reads the metadata of each segment
   from the first offset retention kept up to the first local `.log`, and
   follows each segment to the next one. Every segment it takes must start where
   the one before it ended, or past a gap that a local `.anchor` names, end at or
-  below the tiered floor and below the first local `.log`, have an index, and
-  agree with the manifest when the manifest lists it. The manifest is only a
-  check: it can trail the store by a minute, so a segment it does not list yet
-  is taken from the store. The trim point of the rebuilt chain is the
-  truncation that metadata committed, so the rebuild drives no truncation and
-  no delete.
+  below the tiered floor and below the first local `.log` and the segment the
+  WAL checkpoint names, hold bytes, have an index, and agree with the manifest
+  when the manifest lists it. The manifest is only a check: it can trail the
+  store by a minute, so a segment it does not list yet is taken from the
+  store. The trim point of the rebuilt chain is the truncation that metadata
+  committed, so the rebuild drives no truncation and no delete. When
+  retention removed the segment before a gap that an `.anchor` names, the walk
+  starts past the gap, and the trim point is the offset before it.
 
 The rebuild waits until the node passes the store identity check, and costs
 one listing of the partition's objects, one HEAD of each segment it reads,
 several at a time, and one read of at most the first 16 MiB of the manifest.
-A manifest larger than that is not decoded, and the rebuild goes on without
-checking against it. A range of offsets below the first local `.log` that the
-store does not account for refuses the partition, and the log names it. A
-partition with one replica then stays down with its files as they were and no
-new chain file. A replicated one sets its files aside and rejoins by state
-transfer. Each shard exports
+The reads run in the background, at most two partitions at a time on a shard,
+as jobs of the demand fetch class, and the 16 MiB are held only while the
+manifest is read. A failed HEAD of a segment the walk takes, or a store that
+does not answer, makes the partition wait and read again later. A manifest
+larger than 16 MiB is not decoded, and the rebuild goes on without checking
+against it. A deletion of the topic does not wait for the store: a partition
+that waits for it is retired like one recovery refused. A range of offsets
+below the first local `.log` that the store does not account for refuses the
+partition, and the log names it. A partition with one replica then stays down
+with its files as they were and no new chain file. A replicated one sets its
+files aside and rejoins by state transfer. Each shard exports
 `partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
 `partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
 The primary of each partition of a tiered topic checks once a day that the
 store still holds the segments its chain records as stored, and once more each
-time it becomes the primary, as after a restart. The check sends one HEAD for
-the `.log` and one for the `.index` of each segment, at most 64 segments a job,
-in the housekeeping jobs that wait for fetches and uploads. It lists nothing,
-reads no object and leaves the read cache alone. An object the store does not
-hold counts as missing. A `.log` of another size than the chain records, or
-with another CRC32C than the one the store computed when it took the upload,
-or, on a store that keeps no CRC32C, with another hash in its metadata, counts
-as diverged, and so does an `.index` that is not a whole number of entries. The
-node logs each such segment once as an error when it finds it, and once more
-when a later check finds it as recorded again. It repairs, deletes and fences
-nothing. A store error is no finding, and the segment counts as neither
-missing nor verified. After a timeout, a 5xx answer or throttling, the next
-job asks for the segment again, until 3 jobs in a row got no answer for it.
-The pass then goes on with the next segments, and asks for it once more after
-the last of them. After any other error, or when that last ask fails too, the
-next pass checks the segment. Each shard exports
-`partition_segment_verify_passes_total`,
-`partition_stored_segments_verified_total`, and the gauges
-`partition_stored_segments_missing` and `partition_stored_segments_diverged`
-over the partitions it leads, which drop to 0 when it stops leading them. No
-provider computes a CRC32C again on a HEAD, so the check compares what the
-store recorded when it took the object, not the bytes it holds now: a byte that
-flips inside an object file of the `fs` backend is not found.
+time it becomes the primary, as after a restart. A pass checks the segments
+stored when it started, and the ones stored later wait for the next pass. The
+check sends one HEAD for the `.log` and one for the `.index` of each segment,
+at most 64 segments a job, in the housekeeping jobs that wait for fetches and
+uploads. Each shard runs at most 4 such jobs at once, and a partition that
+finds them all running waits its turn behind the ones that found them running
+before it. The check lists nothing and leaves the read cache alone. On the
+`fs` backend a HEAD reads the first 8 KiB of the object's file, which holds
+its header and can hold the first bytes of the segment. On the other backends
+it reads no byte of the object. An object the store does not hold counts as
+missing, and the `.index` of a missing `.log` is not asked for. A `.log` of
+another size than the chain records, with another CRC32C than the one the
+store computed when it took the upload, or with metadata that does not decode
+or describes another segment than the chain records, counts as diverged, and
+so does an `.index` that is not a whole number of entries. The metadata is
+compared even when the CRC32C matches, as rebuilding a lost chain from the
+store reads it. The node logs each such segment once as an error when it finds
+it, and once more when a later check finds it as recorded again. It repairs,
+deletes and fences nothing.
+
+A store error is no finding, and the segment counts as neither missing nor
+verified, unless the HEAD of the `.log` already showed a finding, which counts.
+After a timeout, a 5xx answer or throttling, the next job asks for the segment
+again, until 3 jobs in a row got no answer for it. The pass then goes on with
+the next segments, and asks for it once more after the last of them. After any
+other error, or when that last ask fails too, the next pass checks the
+segment. A pass that left segments without an answer still ends and counts as
+a pass. When the node fails the store identity check, the jobs in flight count
+for nothing, and once it passes again each partition starts a new pass.
+
+Each shard exports `partition_segment_verify_passes_total`,
+`partition_stored_segments_verified_total`,
+`partition_segment_verify_unanswered_total`, the jobs that got no answer for a
+HEAD, and the gauges `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` over the partitions it leads, which drop
+to 0 when it stops leading them. No provider computes a CRC32C again on a
+HEAD, so the check compares what the store recorded when it took the object,
+not the bytes it holds now: a byte that flips inside an object file of the
+`fs` backend is not found.
+
+On an S3 general purpose bucket, the server needs `s3:ListBucket` on the
+bucket besides `s3:GetObject` for a HEAD of a missing object to answer 404.
+Without it S3 answers 403, which the check takes for an error, not for a
+missing object, so it finds no missing segment.
 
 Each run of the message cleaner starts the next job of each partition's pass,
-as it starts the manifest publish, the object deletes and the retention of a
-tiered topic. A node with `cleaner_enabled = false` in
-`[data_maintenance.messages]` checks no segment, and its
-`partition_stored_segments_missing` and `partition_stored_segments_diverged`
-stay at 0 whatever the store lost.
+from the same request that starts its object deletes. A node with
+`cleaner_enabled = false` in `[data_maintenance.messages]` checks no segment,
+and its `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` stay at 0 whatever the store lost.
 
 A committed delete of a partition, or of the topic or stream that holds it,
 queues the delete of the partition's objects in the memory of the metadata
@@ -658,9 +685,9 @@ deletes them. So shard 0 of the caught-up metadata primary sweeps
 the root of the store, while its node passes the store identity check
 described below:
 
-- It reads the revision that committed metadata reached, then the store
-  identity object, then lists every key under the prefix, in housekeeping
-  jobs of at most 16 pages of 1,000 keys.
+- It reads the revision that committed metadata reached and the partition
+  incarnations it holds, then the store identity object, then lists every key
+  under the prefix, in housekeeping jobs of at most 16 pages of 1,000 keys.
 - It sorts the keys by partition incarnation: stream, topic, partition and
   the revision the partition was created at. An incarnation is an orphan when
   committed metadata holds no partition of it and its revision is not above
@@ -668,17 +695,26 @@ described below:
 - It deletes an orphan only once full sweeps in a row of the same primary
   process found the same objects of it, by their number and the time the
   store gives the newest, for `[tiered_storage] orphan_grace`, 6 hours by
-  default. The grace runs on the clock of the primary, from the start of the
-  second of those sweeps, so a clock of the primary that is ahead of the
-  store's does not shorten it, and a new object of the orphan starts it again.
+  default. The grace runs on the monotonic clock of the primary, from the
+  start of the second of those sweeps, so neither a clock of the primary that
+  is ahead of the store's nor a step of its wall clock shortens it, and a new
+  object of the orphan starts it again.
 - The delete goes through the same queue as a committed delete, in turns
   that each list at most 4 pages of the incarnation and give the delete slot
-  back between them. Every turn checks committed metadata and reads the store
-  identity object again, and deletes nothing when it changed. The first turns
-  list the whole incarnation and delete nothing. The turns after them list it
-  again and delete what they listed, each `.index` before any `.log` and the
-  manifest last. A turn that finds a long-term segment, a geo topic object, or
-  an object newer than the sweeps found or no newer than the claim ends the
+  back between them. Orphans take at most a quarter of the queue, so the rest
+  stays free for committed deletes. Every turn checks committed metadata and
+  the view of the primary, and reads the claim of the store identity object
+  again: a turn whose claim names another cluster, sits in another object, or
+  was committed at another moment deletes nothing. The first turns list the
+  whole incarnation and delete nothing. The turns after them list it again
+  and delete what each of them listed, in this order within the turn: every
+  `.index` it listed, then every `.log` it listed. The manifest goes after the
+  last of those turns, once its listing ended and every segment object it
+  listed is gone, so the manifest is the last object of the incarnation to go.
+  That turn deletes the manifest by its key even when the listing found none,
+  so an unlink of the filesystem backend whose directory sync failed is made
+  durable. A turn that finds a long-term segment, a geo topic object, or an
+  object newer than the sweeps found or no newer than the claim ends the
   delete.
 - The primary sweeps every hour, or every `orphan_grace` when that is shorter.
   `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
@@ -699,9 +735,13 @@ The sweep never deletes:
   store identity check, and stops when the identity object it reads names
   another cluster.
 - An incarnation with an object that is no newer than this cluster's claim of
-  the prefix, the time the store gives the identity object, as what a retired
-  cluster left before a recovery. The node logs such incarnations as a warning
-  and leaves them to an operator.
+  the prefix, the time the store gives the identity object, compared in whole
+  seconds, as what a retired cluster left before a recovery. An object from
+  the second of the claim counts as older than it, as a store can give a
+  listing a finer time than a HEAD. A repair or a recovery that puts the
+  identity object again moves the claim later, so objects that this cluster
+  wrote before then count as older than the claim as well. The node logs such
+  incarnations as a warning and leaves them to an operator.
 - A key that is not the key of a segment object or a manifest.
 
 Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
@@ -713,10 +753,12 @@ stopped at a store identity object other than the one they expected. Only
 shard 0 of the metadata primary moves them. A sweep costs a HEAD and a read of
 the identity object and one listing request per 1,000 keys under the prefix,
 fresh objects and the keys of other prefixes nested in it included. The delete
-of an orphan lists the incarnation twice, and costs a read of the identity
-object per turn, a HEAD of its geo topic object per turn that deletes and at
-the end of the first listing, a HEAD of its manifest at the end of each
-listing, and the deletes.
+of an orphan lists the incarnation twice, and costs a HEAD and a read of the
+identity object per turn, a listing of the key of its geo topic object per
+turn that deletes and at the end of the first listing, a listing of the key
+of its manifest at the end of each listing, and the deletes. It lists those
+keys rather than asking for a HEAD, as a policy scoped to a prefix can refuse
+the HEAD of an absent key.
 
 Restoring metadata while tiered storage is in use is not supported. If
 metadata is rolled back or restored under the same cluster id, the

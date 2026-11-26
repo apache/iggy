@@ -27,14 +27,15 @@
 //! missing. [`rebuild_front`] walks what the store holds from the first offset
 //! retention kept up to the local front, and returns the records of a chain
 //! that describes it, or the first range it cannot account for. Neither does
-//! any I/O. [`read_store_view`] reads what the walk needs, in one job.
+//! any I/O. [`ExecutorStoreViewReader`] reads what the walk needs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::rc::Rc;
 
 use bytes::Bytes;
 use futures::future::LocalBoxFuture;
-use futures::{FutureExt, StreamExt, TryStreamExt, stream};
+use futures::{FutureExt, StreamExt, stream};
 use iggy_object_store::{
     KeyLayout, ManifestError, ObjectPrefix, ObjectStore, ObjectStoreError, PartitionManifest,
     SegmentKey, SegmentMetadata, SegmentMetadataError, SegmentObject, TierExecutor,
@@ -70,19 +71,22 @@ pub struct LocalFront<'a> {
     /// The start offsets of the `.index` and `.anchor` files below the front
     /// that have no `.log`, ascending.
     pub stems_without_log: &'a [u64],
-    /// Whether other replicas store the partition.
-    pub replicated: bool,
 }
 
 impl LocalFront<'_> {
     /// The first offset retention kept.
     #[must_use]
     pub const fn first_kept(&self) -> u64 {
-        if self.watermark == 0 {
-            0
-        } else {
-            self.watermark.saturating_add(1)
-        }
+        first_kept(self.watermark)
+    }
+}
+
+/// The first offset retention kept under the truncation `watermark`.
+const fn first_kept(watermark: u64) -> u64 {
+    if watermark == 0 {
+        0
+    } else {
+        watermark.saturating_add(1)
     }
 }
 
@@ -113,10 +117,6 @@ pub struct ChainLost {
 pub enum ChainLostReason {
     /// No `.log` is left on disk.
     NoLocalLog,
-    /// Nothing left the disk, yet the local front starts above what metadata
-    /// committed as trimmed. A replica commits no trim that its peers may
-    /// still hold offsets of.
-    UncommittedTrim,
     /// The store holds no object that covers the range, and no anchor on
     /// disk makes it a gap.
     MissingObject,
@@ -136,6 +136,11 @@ pub enum ChainLostReason {
         listed: u64,
         recorded: u64,
     },
+    /// The `.log` object starting at `start` holds no bytes.
+    EmptyObject { start: u64 },
+    /// The object starting at `start` reaches the segment that the WAL
+    /// checkpoint names, which recovery keeps on disk.
+    AtCheckpoint { start: u64, checkpoint_start: u64 },
     /// The range reaches past the tiered floor, so no advance confirmed it.
     AboveFloor { floor: Option<u64> },
     /// The object starting at `start` reaches the local front.
@@ -158,10 +163,6 @@ impl fmt::Display for ChainLostReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NoLocalLog => f.write_str("no segment log is left on disk"),
-            Self::UncommittedTrim => f.write_str(
-                "no segment left the disk, and metadata never committed the trim of the offsets \
-                 below the local front, which other replicas may still hold",
-            ),
             Self::MissingObject => {
                 f.write_str("the store holds no segment for them, and no anchor makes them a gap")
             }
@@ -191,6 +192,17 @@ impl fmt::Display for ChainLostReason {
                 f,
                 "the segment {start} in the store holds {listed} bytes, and its metadata records \
                  {recorded}"
+            ),
+            Self::EmptyObject { start } => {
+                write!(f, "the segment {start} in the store holds no bytes")
+            }
+            Self::AtCheckpoint {
+                start,
+                checkpoint_start,
+            } => write!(
+                f,
+                "the segment {start} in the store reaches the segment {checkpoint_start} that \
+                 the WAL checkpoint keeps on disk"
             ),
             Self::AboveFloor { floor: Some(floor) } => write!(
                 f,
@@ -232,7 +244,9 @@ impl fmt::Display for ChainLostReason {
 /// An eviction needs an applied floor advance, and leaves the `.index` and
 /// the `.anchor` of the segment behind, so a front that starts above the
 /// first offset retention kept with neither a floor nor such a file was
-/// never evicted.
+/// never evicted. Retention that ran before tiering took effect commits no
+/// watermark and leaves such a front, so the partition recovers as it would
+/// untiered, and its new chain records that front.
 #[must_use]
 pub fn chain_loss(local: &LocalFront<'_>) -> ChainLoss {
     let from = local.first_kept();
@@ -249,13 +263,6 @@ pub fn chain_loss(local: &LocalFront<'_>) -> ChainLoss {
     if local.floor.is_some() || local.stems_without_log.iter().any(|stem| *stem >= from) {
         return ChainLoss::Rebuild;
     }
-    if local.replicated {
-        return ChainLoss::Refuse(ChainLost {
-            from,
-            to: front - 1,
-            reason: ChainLostReason::UncommittedTrim,
-        });
-    }
     ChainLoss::Fresh
 }
 
@@ -270,6 +277,16 @@ pub struct StoreViewRequest {
     /// The start offsets of the local sealed segments at or below the floor,
     /// whose objects the rebuilt chain lets the replica confirm again.
     pub local_sealed: Vec<u64>,
+}
+
+impl StoreViewRequest {
+    /// Whether the partition of incarnation `created_revision`, trimmed
+    /// through `watermark`, may still ask this. Another incarnation or trim
+    /// asks another range, or nothing of the store at all.
+    #[must_use]
+    pub const fn is_for(&self, created_revision: u64, watermark: u64) -> bool {
+        self.prefix.created_revision == created_revision && self.from == first_kept(watermark)
+    }
 }
 
 /// What the store holds of one incarnation, as far as a rebuild reads it.
@@ -295,6 +312,9 @@ pub enum StoredLog {
     },
     /// Deleted between the listing and the HEAD.
     Gone,
+    /// The HEAD failed with this error. Only a walk that needs the object
+    /// fails on it.
+    Failed(String),
 }
 
 /// What a rebuild read of the incarnation's manifest.
@@ -321,6 +341,25 @@ pub struct RebuildInput<'a> {
     /// The first and the last offset of every local sealed segment at or
     /// below the floor.
     pub local_sealed: &'a [(u64, u64)],
+    /// The first offset of the segment the WAL checkpoint names, which
+    /// recovery keeps on disk.
+    pub checkpoint_start: Option<u64>,
+}
+
+/// Why a rebuild wrote no chain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildFailure {
+    /// A range the view does not account for.
+    Lost(ChainLost),
+    /// The HEAD of the object starting at `start`, which the walk needs,
+    /// failed, so the view says nothing of it yet.
+    Unread { start: u64, error: String },
+}
+
+impl From<ChainLost> for RebuildFailure {
+    fn from(lost: ChainLost) -> Self {
+        Self::Lost(lost)
+    }
 }
 
 /// The chain a rebuild writes, and what it holds.
@@ -339,18 +378,25 @@ pub struct RebuiltFront {
 /// describes it.
 ///
 /// The walk stays at or below the floor and stops exactly at the front. A gap
-/// is taken only where an anchor on disk names the segment before it. The
-/// manifest cross-checks what the walk took, and is never its source: every
-/// segment it lists in the walked range must be one the walk took, as the
-/// walk took it. The trim point is the committed watermark, whatever the
-/// store or the manifest hold below it.
+/// is taken only where an anchor on disk names the segment before it, or,
+/// before the first segment, where an anchor names a segment that ended at or
+/// below the watermark. The manifest cross-checks what the walk took, and is
+/// never its source: every segment it lists in the walked range must be one
+/// the walk took, as the walk took it.
+///
+/// The trim point is the committed watermark, whatever the store or the
+/// manifest hold below it, or the offset before the first segment when an
+/// anchor proves the offsets between them a gap. Recovery refuses a chain
+/// whose first segment starts above the offset after its trim point, so the
+/// chain it writes opens by the same rules as any other.
 ///
 /// # Errors
-/// The first range the walk cannot account for.
+/// The first range the walk cannot account for, or the failed read of an
+/// object it needs.
 pub fn rebuild_front(
     view: &StoreView,
     input: &RebuildInput<'_>,
-) -> Result<RebuiltFront, ChainLost> {
+) -> Result<RebuiltFront, RebuildFailure> {
     let local = input.local;
     let from = local.first_kept();
     let Some(front) = local.front else {
@@ -358,36 +404,40 @@ pub fn rebuild_front(
             from,
             to: u64::MAX,
             reason: ChainLostReason::NoLocalLog,
-        });
+        }
+        .into());
     };
     let walk = Walk {
         view,
         anchors: input.anchors,
         front,
         floor: local.floor,
+        checkpoint_start: input.checkpoint_start,
     };
     let mut walked = walk.objects(from)?;
     walk.cross_check(&mut walked, from)?;
     walk.check_stems(&walked, from, local.stems_without_log)?;
-    let checksums = walked
-        .iter()
-        .map(|object| {
-            object.crc32c.ok_or_else(|| ChainLost {
-                from: object.metadata.start_offset.max(from),
-                to: object.metadata.end_offset,
-                reason: ChainLostReason::NoChecksum {
-                    start: object.metadata.start_offset,
-                },
-            })
-        })
-        .collect::<Result<Vec<u32>, ChainLost>>()?;
 
-    let trim_point = (local.watermark > 0).then_some(local.watermark);
+    let first_start = walked
+        .first()
+        .map_or(front, |object| object.metadata.start_offset);
+    let trim_point = if first_start > from {
+        Some(first_start - 1)
+    } else {
+        (local.watermark > 0).then_some(local.watermark)
+    };
     let mut records = Vec::with_capacity(walked.len() + input.local_sealed.len() + 1);
     records.extend(trim_point.map(ChainRecord::TrimPoint));
-    records.extend(walked.iter().zip(checksums).map(|(object, crc32c)| {
+    for object in &walked {
         let metadata = &object.metadata;
-        ChainRecord::Remote(SegmentRecord {
+        let crc32c = object.crc32c.ok_or_else(|| ChainLost {
+            from: metadata.start_offset.max(from),
+            to: metadata.end_offset,
+            reason: ChainLostReason::NoChecksum {
+                start: metadata.start_offset,
+            },
+        })?;
+        records.push(ChainRecord::Remote(SegmentRecord {
             start_offset: metadata.start_offset,
             end_offset: metadata.end_offset,
             start_timestamp: metadata.start_timestamp,
@@ -398,20 +448,20 @@ pub fn rebuild_front(
             hash: metadata.hash,
             crc32c,
             source: HashSource::Disk,
-        })
-    }));
-    let confirmed: Vec<ChainRecord> = input
-        .local_sealed
-        .iter()
-        .filter_map(|&(start, end)| walk.stored_end(start, end))
-        .map(ChainRecord::Advanced)
-        .collect();
-    let confirmed_local = confirmed.len();
-    records.extend(confirmed);
+        }));
+    }
+    let remote_end = records.len();
+    records.extend(
+        input
+            .local_sealed
+            .iter()
+            .filter_map(|&(start, end)| walk.stored_end(start, end))
+            .map(ChainRecord::Advanced),
+    );
     Ok(RebuiltFront {
+        confirmed_local: records.len() - remote_end,
         records,
         remote_segments: walked.len(),
-        confirmed_local,
         trim_point,
     })
 }
@@ -431,52 +481,101 @@ pub trait StoreViewReader {
 /// cancelled first.
 pub type StoreViewOutcome = Result<Result<StoreView, ObjectStoreError>, TierJobCancelled>;
 
-/// Reads through a tier executor, as one job of its demand fetch class: a
-/// partition waits for it before it serves anything. The job never goes
-/// through the read cache.
+/// Reads through a tier executor, in jobs of its demand fetch class: a
+/// partition waits for them before it serves anything. One job lists the
+/// incarnation and reads the metadata of its objects, and holds no bytes of
+/// the class. A second reads the manifest, and holds the bytes it may read
+/// only while it runs. The jobs never go through the read cache.
 pub struct ExecutorStoreViewReader<E> {
-    executor: E,
+    executor: Rc<E>,
     layout: KeyLayout,
 }
 
 impl<E> ExecutorStoreViewReader<E> {
     #[must_use]
-    pub const fn new(executor: E, layout: KeyLayout) -> Self {
-        Self { executor, layout }
+    pub fn new(executor: E, layout: KeyLayout) -> Self {
+        Self {
+            executor: Rc::new(executor),
+            layout,
+        }
     }
 }
 
-impl<E: TierExecutor> StoreViewReader for ExecutorStoreViewReader<E> {
+impl<E: TierExecutor + 'static> StoreViewReader for ExecutorStoreViewReader<E> {
     fn read(
         &self,
         request: StoreViewRequest,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, StoreViewOutcome> {
+        let executor = Rc::clone(&self.executor);
         let layout = self.layout.clone();
-        let job = TierJobRequest::new(TierJobClass::DemandFetch, scope)
-            .with_bytes(MANIFEST_CROSS_CHECK_BYTES_MAX);
-        self.executor
-            .submit(job, move |store| async move {
-                read_store_view(&*store, &layout, request).await
-            })
-            .boxed_local()
+        async move {
+            let listing = {
+                let layout = layout.clone();
+                let request = request.clone();
+                executor
+                    .submit(
+                        TierJobRequest::new(TierJobClass::DemandFetch, scope.clone()),
+                        move |store| async move { read_listing(&*store, &layout, &request).await },
+                    )
+                    .await
+            };
+            let (listed, logs) = match listing? {
+                Ok(listing) => listing,
+                Err(error) => return Ok(Err(error)),
+            };
+            let prefix = request.prefix;
+            let manifest = executor
+                .submit(
+                    TierJobRequest::new(TierJobClass::DemandFetch, scope)
+                        .with_bytes(MANIFEST_CROSS_CHECK_BYTES_MAX),
+                    move |store| async move { read_manifest(&*store, &layout, &prefix).await },
+                )
+                .await?;
+            Ok(manifest.map(|manifest| StoreView {
+                request,
+                listed,
+                logs,
+                manifest,
+            }))
+        }
+        .boxed_local()
     }
 }
 
-/// Read what `request` asks for: one listing of the incarnation, one HEAD of
-/// each `.log` object from the one that holds `request.from` up to the front
-/// and of each local sealed segment, up to [`STORE_VIEW_HEADS`] at once, and
-/// one read of the manifest.
+/// Read what `request` asks for in one go: the listing and the HEADs of
+/// [`read_listing`], then one read of the manifest.
 ///
 /// # Errors
-/// The store's error for any call that failed, other than a HEAD or a read
-/// that found no object. Of the HEADs that failed, the one of the lowest
-/// start.
-pub async fn read_store_view<S: ObjectStore>(
+/// As [`read_listing`] and [`read_manifest`].
+#[cfg(test)]
+async fn read_store_view<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
     request: StoreViewRequest,
 ) -> Result<StoreView, ObjectStoreError> {
+    let (listed, logs) = read_listing(store, layout, &request).await?;
+    let manifest = read_manifest(store, layout, &request.prefix).await?;
+    Ok(StoreView {
+        request,
+        listed,
+        logs,
+        manifest,
+    })
+}
+
+/// What the store lists of an incarnation, by start, and what a HEAD finds of
+/// each `.log` object from the one that holds `request.from` up to the front
+/// and of each local sealed segment, up to [`STORE_VIEW_HEADS`] at once.
+///
+/// # Errors
+/// The error of the listing. A HEAD that failed is kept as
+/// [`StoredLog::Failed`], and fails the rebuild only if the walk needs it.
+async fn read_listing<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    request: &StoreViewRequest,
+) -> Result<(BTreeMap<u64, ListedSegment>, BTreeMap<u64, StoredLog>), ObjectStoreError> {
     let listed = list_incarnation(store, layout, &request.prefix)
         .await?
         .segments;
@@ -498,15 +597,9 @@ pub async fn read_store_view<S: ObjectStore>(
     let logs = stream::iter(wanted)
         .map(|start| head_log(store, layout, prefix, start))
         .buffered(STORE_VIEW_HEADS)
-        .try_collect()
-        .await?;
-    let manifest = read_manifest(store, layout, &request.prefix).await?;
-    Ok(StoreView {
-        request,
-        listed,
-        logs,
-        manifest,
-    })
+        .collect()
+        .await;
+    Ok((listed, logs))
 }
 
 /// What a HEAD finds of the `.log` object of the segment keyed `start`.
@@ -515,7 +608,7 @@ async fn head_log<S: ObjectStore>(
     layout: &KeyLayout,
     prefix: ObjectPrefix,
     start: u64,
-) -> Result<(u64, StoredLog), ObjectStoreError> {
+) -> (u64, StoredLog) {
     let key = layout.segment_key(&SegmentKey {
         prefix,
         start_offset: start,
@@ -528,9 +621,9 @@ async fn head_log<S: ObjectStore>(
             metadata: SegmentMetadata::try_from(&meta.metadata),
         },
         Err(ObjectStoreError::NotFound { .. }) => StoredLog::Gone,
-        Err(error) => return Err(error),
+        Err(error) => StoredLog::Failed(error.to_string()),
     };
-    Ok((start, stored))
+    (start, stored)
 }
 
 async fn read_manifest<S: ObjectStore>(
@@ -573,22 +666,30 @@ struct Walk<'a> {
     anchors: &'a BTreeMap<u64, SegmentAnchor>,
     front: u64,
     floor: Option<u64>,
+    checkpoint_start: Option<u64>,
 }
 
 impl Walk<'_> {
     /// The objects from the one that holds `from` up to the front, each
     /// starting right after the one before it or past a gap an anchor names.
-    fn objects(&self, from: u64) -> Result<Vec<Walked>, ChainLost> {
+    fn objects(&self, from: u64) -> Result<Vec<Walked>, RebuildFailure> {
         let mut walked: Vec<Walked> = Vec::new();
         let mut next = from;
         while next < self.front {
             let start = match walked.last() {
-                None => self
-                    .view
-                    .listed
-                    .range(..=next)
-                    .next_back()
-                    .map(|(start, _)| *start),
+                None => match self.leading_gap(next) {
+                    Some(planted) if planted == self.front => break,
+                    Some(planted) => {
+                        next = planted;
+                        self.view.listed.contains_key(&planted).then_some(planted)
+                    }
+                    None => self
+                        .view
+                        .listed
+                        .range(..=next)
+                        .next_back()
+                        .map(|(start, _)| *start),
+                },
                 Some(_) if self.view.listed.contains_key(&next) => Some(next),
                 Some(previous) => match self.anchored_gap(&previous.metadata) {
                     Some(planted) if planted == self.front => break,
@@ -600,14 +701,18 @@ impl Walk<'_> {
                 },
             };
             if self.floor.is_none_or(|floor| next > floor) {
-                return Err(self.lost(
-                    next,
-                    self.last_below_front(),
-                    ChainLostReason::AboveFloor { floor: self.floor },
-                ));
+                return Err(self
+                    .lost(
+                        next,
+                        self.last_below_front(),
+                        ChainLostReason::AboveFloor { floor: self.floor },
+                    )
+                    .into());
             }
             let Some(start) = start else {
-                return Err(self.lost(next, self.gap_end(next), ChainLostReason::MissingObject));
+                return Err(self
+                    .lost(next, self.gap_end(next), ChainLostReason::MissingObject)
+                    .into());
             };
             let object = self.object(start, next)?;
             next = object.metadata.end_offset.saturating_add(1);
@@ -618,9 +723,28 @@ impl Walk<'_> {
 
     /// The object keyed `start`, which must hold `covers`, end at or below
     /// the floor, and end before the front.
-    fn object(&self, start: u64, covers: u64) -> Result<Walked, ChainLost> {
+    fn object(&self, start: u64, covers: u64) -> Result<Walked, RebuildFailure> {
         let unknown_end = self.gap_end(covers);
         let listed = self.view.listed.get(&start).copied().unwrap_or_default();
+        if let (Some(_), Some(StoredLog::Failed(error))) =
+            (listed.log_size, self.view.logs.get(&start))
+        {
+            return Err(RebuildFailure::Unread {
+                start,
+                error: error.clone(),
+            });
+        }
+        Ok(self.found_object(start, covers, unknown_end, listed)?)
+    }
+
+    /// [`Self::object`] once the store answered the HEAD of the object.
+    fn found_object(
+        &self,
+        start: u64,
+        covers: u64,
+        unknown_end: u64,
+        listed: ListedSegment,
+    ) -> Result<Walked, ChainLost> {
         let (
             Some(log_size),
             Some(StoredLog::Found {
@@ -664,6 +788,9 @@ impl Walk<'_> {
                 },
             ));
         }
+        if log_size == 0 {
+            return Err(self.lost(covers, end, ChainLostReason::EmptyObject { start }));
+        }
         if let Some(reason) = index_fault(start, &listed) {
             return Err(self.lost(covers, end, reason));
         }
@@ -684,10 +811,44 @@ impl Walk<'_> {
                 },
             ));
         }
+        if let Some(checkpoint_start) = self
+            .checkpoint_start
+            .filter(|checkpoint_start| metadata.end_offset >= *checkpoint_start)
+        {
+            return Err(self.lost(
+                covers,
+                end,
+                ChainLostReason::AtCheckpoint {
+                    start,
+                    checkpoint_start,
+                },
+            ));
+        }
         Ok(Walked {
             metadata: *metadata,
             crc32c: *crc32c,
         })
+    }
+
+    /// Where the first segment above `from` stands, when an anchor beside it
+    /// names a segment that ended below `from` and the store lists nothing
+    /// between them: retention removed that segment, and the offsets up to
+    /// the anchored one were never written.
+    fn leading_gap(&self, from: u64) -> Option<u64> {
+        let (planted, anchor) = self
+            .anchors
+            .range(from.saturating_add(1)..=self.front)
+            .next()?;
+        let proves = anchor.planted_start == *planted
+            && anchor.sealed_start <= anchor.sealed_end
+            && anchor.sealed_end < from
+            && self
+                .view
+                .listed
+                .range(anchor.sealed_end.saturating_add(1)..*planted)
+                .next()
+                .is_none();
+        proves.then_some(*planted)
     }
 
     /// Where the anchor that names `previous` as the segment before its gap
@@ -762,11 +923,13 @@ impl Walk<'_> {
     }
 
     /// Every `.index` or `.anchor` left on disk from the first walked segment
-    /// on belongs to a segment the walk took.
+    /// or from `from`, whichever is lower, belongs to a segment the walk
+    /// took. One inside a leading gap contradicts the anchor of that gap.
     fn check_stems(&self, walked: &[Walked], from: u64, stems: &[u64]) -> Result<(), ChainLost> {
         let first = walked
             .first()
-            .map_or(from, |object| object.metadata.start_offset);
+            .map_or(from, |object| object.metadata.start_offset)
+            .min(from);
         for &stem in stems.iter().filter(|stem| **stem >= first) {
             let at = walked.partition_point(|object| object.metadata.start_offset < stem);
             if walked

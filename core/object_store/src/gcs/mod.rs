@@ -1726,7 +1726,7 @@ mod tests {
                         "name": name,
                         "size": "1",
                         "generation": "7",
-                        "updated": "2026-10-28T00:00:00Z",
+                        "timeCreated": "2026-10-28T00:00:00Z",
                     }))
                     .collect::<Vec<_>>(),
                 "nextPageToken": token,

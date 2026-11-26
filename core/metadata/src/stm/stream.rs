@@ -563,8 +563,8 @@ impl Topic {
     /// Replace the stored options and rebuild the typed view from them, with
     /// the durability that the topic's mode fixes.
     pub fn set_options(&mut self, mut options: ResourceOptions) {
-        store_fixed_durability(&mut options, self.shadow.map(|shadow| shadow.geo_mode));
-        self.resolved = TopicResolvedOptions::from(&options);
+        self.resolved =
+            store_fixed_durability(&mut options, self.shadow.map(|shadow| shadow.geo_mode));
         self.options = options;
     }
 
@@ -3978,12 +3978,12 @@ pub(crate) fn create_topic(
     };
 
     let shadow = fixed.and_then(FixedTopic::shadow);
-    store_fixed_durability(&mut options, shadow.map(|shadow| shadow.geo_mode));
+    let resolved = store_fixed_durability(&mut options, shadow.map(|shadow| shadow.geo_mode));
     let topic = Topic {
         id: topic_id,
         name: name_arc.clone(),
         created_at: timestamp,
-        resolved: TopicResolvedOptions::from(&options),
+        resolved,
         options,
         stats: topic_stats,
         partitions: Vec::new(),
@@ -5260,7 +5260,7 @@ impl StreamsInner {
                     stats_registry.topic(slab_key, topic_slab_key, stream_stats.clone());
                 let topic_name: Arc<str> = Arc::from(topic_snap.name.as_str());
                 let mut options = topic_snap.options;
-                store_fixed_durability(
+                let resolved = store_fixed_durability(
                     &mut options,
                     topic_snap.shadow.map(|shadow| shadow.geo_mode),
                 );
@@ -5268,7 +5268,7 @@ impl StreamsInner {
                     id: topic_snap.id,
                     name: topic_name.clone(),
                     created_at: topic_snap.created_at,
-                    resolved: TopicResolvedOptions::from(&options),
+                    resolved,
                     options,
                     stats: topic_stats,
                     partitions: topic_snap

@@ -85,8 +85,8 @@ use iggy_object_store::{
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::shadow::{
-    RetiredOrigin, ShadowReadCache, ShadowRetention, ShadowStream, ShadowTopicRequest,
-    ShadowTopicTarget, shadow_stream_name,
+    RetiredOrigin, ShadowReadCache, ShadowReadCacheKeys, ShadowRetention, ShadowStream,
+    ShadowTopicRequest, ShadowTopicTarget, shadow_stream_name,
 };
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::{ExecutorTopicObjects, TopicObjects};
@@ -528,6 +528,7 @@ impl Task {
                 .streams()
                 .read(|inner| note_absences(inner, &mut state.peers, self.now.as_micros()));
         }
+        let mut adoptions = Adoptions::Propose;
         for _ in 0..MAX_PROPOSALS_PER_PASS {
             if self.token.is_cancelled() || !self.current() {
                 return;
@@ -540,6 +541,7 @@ impl Task {
                         &state.peers,
                         self.now.as_micros(),
                         self.settings.tombstone_grace,
+                        adoptions,
                     )
                 })
             };
@@ -547,6 +549,12 @@ impl Task {
             let Some(proposal) = plan.proposal else {
                 break;
             };
+            let adopting = matches!(
+                proposal,
+                ShadowTopicRequest::CreateStream { .. }
+                    | ShadowTopicRequest::RenameStream { .. }
+                    | ShadowTopicRequest::AdoptTopic { .. }
+            );
             let described = describe(&proposal);
             match metadata.submit_shadow_topic_in_process(proposal).await {
                 Ok(0) => info!(proposal = described, "applied a shadow topic operation"),
@@ -555,6 +563,10 @@ impl Task {
                         proposal: described,
                         code,
                     }]);
+                    if adopting {
+                        adoptions = Adoptions::Skip;
+                        continue;
+                    }
                     break;
                 }
                 Err(error) => {
@@ -645,15 +657,27 @@ struct Plan {
     reports: Vec<Report>,
 }
 
+/// Whether a plan proposes stream and topic adoptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Adoptions {
+    Propose,
+    /// The pass skips them once the metadata primary refused one, such as a
+    /// topic over the partition cap, which would come first again in every
+    /// plan and keep the read cache changes behind it from being proposed.
+    Skip,
+}
+
 /// The first operation that brings committed metadata closer to the peers.
 /// Removals and detaches come first, so a topic id or name an old
 /// incarnation holds frees up before an adoption needs it. The read cache
-/// settings of adopted topics come last.
+/// settings of adopted topics come last. `adoptions` says whether it
+/// proposes adoptions.
 fn plan(
     inner: &StreamsInner,
     peers: &BTreeMap<String, PeerView>,
     now: u64,
     tombstone_grace: u64,
+    adoptions: Adoptions,
 ) -> Plan {
     let mut plan = Plan::default();
     for (origin, retired) in &inner.retired_origins {
@@ -671,14 +695,17 @@ fn plan(
             return plan;
         }
     }
-    for (origin, view) in followed.clone() {
-        if let Some(proposal) = adopt(inner, origin, view, &mut plan.reports) {
-            plan.proposal = Some(proposal);
-            return plan;
+    if adoptions == Adoptions::Propose {
+        for (origin, view) in followed.clone() {
+            if let Some(proposal) = adopt(inner, origin, view, &mut plan.reports) {
+                plan.proposal = Some(proposal);
+                return plan;
+            }
         }
     }
+    let keys = ShadowReadCacheKeys::default();
     for (origin, view) in followed {
-        if let Some(proposal) = follow_read_cache(inner, origin, view) {
+        if let Some(proposal) = follow_read_cache(inner, origin, view, &keys) {
             plan.proposal = Some(proposal);
             return plan;
         }
@@ -989,6 +1016,7 @@ fn follow_read_cache(
     inner: &StreamsInner,
     origin: &str,
     view: &PeerView,
+    keys: &ShadowReadCacheKeys,
 ) -> Option<ShadowTopicRequest> {
     let read_as = view.cluster_uid.filter(|_| !view.stale)?;
     // A cluster that metadata does not record of the peer is read only as
@@ -1021,8 +1049,11 @@ fn follow_read_cache(
             else {
                 continue;
             };
-            let published = read_cache_of(object);
-            if ShadowReadCache::stored(&topic.options) != published {
+            let published = ShadowReadCache {
+                size: object.read_cache_size,
+                read_ahead: object.read_ahead,
+            };
+            if keys.stored(&topic.options) != published {
                 return Some(ShadowTopicRequest::SetReadCache {
                     target: ShadowTopicTarget {
                         stream_id: u32::try_from(stream_id).ok()?,
@@ -1070,14 +1101,6 @@ const fn retention_of(object: &TopicObject) -> ShadowRetention {
     ShadowRetention {
         message_expiry: object.message_expiry,
         max_topic_size: object.max_topic_size,
-    }
-}
-
-/// The read cache settings that the topic of `object` sets in the peer.
-const fn read_cache_of(object: &TopicObject) -> ShadowReadCache {
-    ShadowReadCache {
-        size: object.read_cache_size,
-        read_ahead: object.read_ahead,
     }
 }
 
@@ -1229,7 +1252,9 @@ mod tests {
     /// Apply what `plan` proposes, giving an adoption the assignments that
     /// the metadata primary would.
     fn apply_plan(inner: &mut StreamsInner, peers: &BTreeMap<String, PeerView>) {
-        let mut proposal = plan(inner, peers, NOW, GRACE).proposal.expect("a proposal");
+        let mut proposal = plan(inner, peers, NOW, GRACE, Adoptions::Propose)
+            .proposal
+            .expect("a proposal");
         if let ShadowTopicRequest::AdoptTopic { create, .. } = &mut proposal {
             create.partitions = (0..create.request.partitions_count)
                 .map(|partition_id| CreatedPartitionAssignment {
@@ -1313,7 +1338,13 @@ mod tests {
     fn given_a_live_object_of_a_new_stream_when_planning_should_create_its_shadow_stream() {
         let inner = StreamsInner::new();
 
-        let plan = plan(&inner, &view([object(key(), "orders", 10)]), NOW, GRACE);
+        let plan = plan(
+            &inner,
+            &view([object(key(), "orders", 10)]),
+            NOW,
+            GRACE,
+            Adoptions::Propose,
+        );
 
         assert_eq!(
             plan.proposal,
@@ -1336,7 +1367,14 @@ mod tests {
             CompressionAlgorithm::Gzip
         );
         assert_eq!(
-            plan(&inner, &view([object(key(), "orders", 10)]), NOW, GRACE).proposal,
+            plan(
+                &inner,
+                &view([object(key(), "orders", 10)]),
+                NOW,
+                GRACE,
+                Adoptions::Propose
+            )
+            .proposal,
             None,
             "nothing more to do"
         );
@@ -1396,7 +1434,7 @@ mod tests {
             }
         );
         assert_eq!(
-            plan(&inner, &view([published]), NOW, GRACE).proposal,
+            plan(&inner, &view([published]), NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "the shadow topic holds what the peer sets"
         );
@@ -1417,13 +1455,13 @@ mod tests {
         for (size, read_ahead) in steps {
             let peers = view([cached(size, read_ahead)]);
             assert_eq!(
-                plan(&inner, &peers, NOW, GRACE).proposal,
+                plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
                 Some(set_read_cache(stream_id, size, read_ahead)),
                 "{size:?}, {read_ahead:?}"
             );
             apply_plan(&mut inner, &peers);
             assert_eq!(
-                plan(&inner, &peers, NOW, GRACE).proposal,
+                plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
                 None,
                 "applied {size:?}, {read_ahead:?}"
             );
@@ -1439,12 +1477,16 @@ mod tests {
         let peer = stale.get_mut(PEER).unwrap();
         peer.stale = true;
         peer.complete = false;
-        assert_eq!(plan(&inner, &stale, NOW, GRACE).proposal, None, "stale");
+        assert_eq!(
+            plan(&inner, &stale, NOW, GRACE, Adoptions::Propose).proposal,
+            None,
+            "stale"
+        );
 
         let mut taken = view([changed.clone()]);
         taken.get_mut(PEER).unwrap().cluster_uid = Some(PEER_CLUSTER + 1);
         assert_eq!(
-            plan(&inner, &taken, NOW, GRACE).proposal,
+            plan(&inner, &taken, NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "an object of another cluster than the one that owns the store now"
         );
@@ -1457,7 +1499,7 @@ mod tests {
             ..changed.clone()
         };
         assert_eq!(
-            plan(&inner, &view([recreated]), NOW, GRACE).proposal,
+            plan(&inner, &view([recreated]), NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "another incarnation"
         );
@@ -1465,15 +1507,46 @@ mod tests {
         let (mut retired, _) = adopted();
         retire_origin(&mut retired, PEER, NOW);
         assert_eq!(
-            plan(&retired, &view([changed.clone()]), NOW, GRACE).proposal,
+            plan(
+                &retired,
+                &view([changed.clone()]),
+                NOW,
+                GRACE,
+                Adoptions::Propose
+            )
+            .proposal,
             None,
             "a retired origin"
         );
 
         assert_eq!(
-            plan(&inner, &view([changed]), NOW, GRACE).proposal,
+            plan(&inner, &view([changed]), NOW, GRACE, Adoptions::Propose).proposal,
             Some(set_read_cache(stream_id, Some(16 * MIB), Some(MIB))),
             "the same change from the followed peer"
+        );
+    }
+
+    #[test]
+    fn given_an_adoption_that_the_primary_refused_when_planning_again_should_propose_the_read_cache_change()
+     {
+        let (inner, stream_id) = adopted();
+        let new_topic = object(
+            TopicKey {
+                topic_id: PEER_TOPIC + 1,
+                ..key()
+            },
+            "orders",
+            10,
+        );
+        let peers = view([cached(Some(16 * MIB), Some(MIB)), new_topic]);
+        assert!(matches!(
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
+            Some(ShadowTopicRequest::AdoptTopic { .. })
+        ));
+
+        assert_eq!(
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Skip).proposal,
+            Some(set_read_cache(stream_id, Some(16 * MIB), Some(MIB)))
         );
     }
 
@@ -1493,12 +1566,15 @@ mod tests {
 
         let recovered = read_as_successor(vec![cached(Some(16 * MIB), Some(MIB))]);
         assert_eq!(
-            plan(&inner, &recovered, NOW, GRACE).proposal,
+            plan(&inner, &recovered, NOW, GRACE, Adoptions::Propose).proposal,
             Some(set_read_cache(stream_id, Some(16 * MIB), Some(MIB))),
             "the successor of the cluster that the shadow stream came from"
         );
         apply_plan(&mut inner, &recovered);
-        assert_eq!(plan(&inner, &recovered, NOW, GRACE).proposal, None);
+        assert_eq!(
+            plan(&inner, &recovered, NOW, GRACE, Adoptions::Propose).proposal,
+            None
+        );
 
         let other_stream = TopicKey {
             stream_id: PEER_STREAM + 1,
@@ -1520,7 +1596,7 @@ mod tests {
             object(other_stream, "payments", 10),
         ]);
         assert_eq!(
-            plan(&inner, &recorded_too, NOW, GRACE).proposal,
+            plan(&inner, &recorded_too, NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "a cluster that metadata records too proves no succession"
         );
@@ -1531,7 +1607,13 @@ mod tests {
         let mut inner = StreamsInner::new();
         retire_origin(&mut inner, PEER, NOW);
 
-        let plan = plan(&inner, &view([object(key(), "orders", 10)]), NOW, GRACE);
+        let plan = plan(
+            &inner,
+            &view([object(key(), "orders", 10)]),
+            NOW,
+            GRACE,
+            Adoptions::Propose,
+        );
 
         assert_eq!(plan.proposal, None);
         assert_eq!(plan.reports, Vec::new());
@@ -1546,9 +1628,12 @@ mod tests {
         retire_origin(&mut late, PEER, NOW - expiry);
         let no_peers = BTreeMap::new();
 
-        assert_eq!(plan(&early, &no_peers, NOW, GRACE).proposal, None);
         assert_eq!(
-            plan(&late, &no_peers, NOW, GRACE).proposal,
+            plan(&early, &no_peers, NOW, GRACE, Adoptions::Propose).proposal,
+            None
+        );
+        assert_eq!(
+            plan(&late, &no_peers, NOW, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveTopic {
                 target: target(stream_id),
             })
@@ -1561,7 +1646,10 @@ mod tests {
         let (mut inner, _) = adopted();
         retire_origin(&mut inner, PEER, 0);
 
-        assert_eq!(plan(&inner, &BTreeMap::new(), NOW, GRACE).proposal, None);
+        assert_eq!(
+            plan(&inner, &BTreeMap::new(), NOW, GRACE, Adoptions::Propose).proposal,
+            None
+        );
     }
 
     #[test]
@@ -1571,7 +1659,7 @@ mod tests {
         retire_origin(&mut inner, PEER, NOW);
 
         assert_eq!(
-            plan(&inner, &BTreeMap::new(), NOW, GRACE).proposal,
+            plan(&inner, &BTreeMap::new(), NOW, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveTopic {
                 target: target(stream_id),
             })
@@ -1587,7 +1675,7 @@ mod tests {
         retire_origin(&mut inner, PEER, NOW);
 
         assert_eq!(
-            plan(&inner, &BTreeMap::new(), NOW, GRACE).proposal,
+            plan(&inner, &BTreeMap::new(), NOW, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveStream {
                 stream_id,
                 source: source(),
@@ -1602,17 +1690,24 @@ mod tests {
         let peers = view([tombstone(deleted_at)]);
 
         assert!(matches!(
-            plan(&inner, &peers, NOW, GRACE).proposal,
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::DetachTopic { deleted_at: at, .. }) if at == deleted_at
         ));
         detach(&mut inner, stream_id, deleted_at);
         assert_eq!(
-            plan(&inner, &peers, NOW, GRACE).proposal,
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "within the grace"
         );
         assert!(matches!(
-            plan(&inner, &peers, deleted_at + GRACE, GRACE).proposal,
+            plan(
+                &inner,
+                &peers,
+                deleted_at + GRACE,
+                GRACE,
+                Adoptions::Propose
+            )
+            .proposal,
             Some(ShadowTopicRequest::RemoveTopic { .. })
         ));
     }
@@ -1626,13 +1721,13 @@ mod tests {
         peer.complete = false;
 
         assert_eq!(
-            plan(&inner, &peers, NOW, GRACE).proposal,
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "an object a failed listing lacks is not gone"
         );
         detach(&mut inner, stream_id, NOW - GRACE);
         assert!(matches!(
-            plan(&inner, &peers, NOW, GRACE).proposal,
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveTopic { .. })
         ));
     }
@@ -1645,13 +1740,13 @@ mod tests {
 
         note_absences(&inner, &mut peers, NOW);
         assert_eq!(
-            plan(&inner, &peers, NOW, GRACE).proposal,
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
             None,
             "an empty root lists nothing until the peer reads as unverified"
         );
         note_absences(&inner, &mut peers, confirmed);
         assert!(matches!(
-            plan(&inner, &peers, confirmed, GRACE).proposal,
+            plan(&inner, &peers, confirmed, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveTopic { .. })
         ));
 
@@ -1673,7 +1768,7 @@ mod tests {
         );
 
         assert!(matches!(
-            plan(&inner, &view([]), NOW, GRACE).proposal,
+            plan(&inner, &view([]), NOW, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveStream { .. })
         ));
     }
@@ -1682,7 +1777,13 @@ mod tests {
     fn given_a_renamed_peer_stream_when_planning_should_rename_the_shadow_stream() {
         let (inner, stream_id) = adopted();
 
-        let plan = plan(&inner, &view([object(key(), "billing", 20)]), NOW, GRACE);
+        let plan = plan(
+            &inner,
+            &view([object(key(), "billing", 20)]),
+            NOW,
+            GRACE,
+            Adoptions::Propose,
+        );
 
         assert_eq!(
             plan.proposal,
@@ -1709,7 +1810,13 @@ mod tests {
             },
         );
 
-        let plan = plan(&inner, &view([object(key(), "orders", 10)]), NOW, GRACE);
+        let plan = plan(
+            &inner,
+            &view([object(key(), "orders", 10)]),
+            NOW,
+            GRACE,
+            Adoptions::Propose,
+        );
 
         assert_eq!(plan.proposal, None);
         assert_eq!(
@@ -1727,7 +1834,7 @@ mod tests {
         let mut foreign = object(key(), "orders", 10);
         foreign.cluster_uid = PEER_CLUSTER + 1;
 
-        let plan = plan(&inner, &view([foreign]), NOW, GRACE);
+        let plan = plan(&inner, &view([foreign]), NOW, GRACE, Adoptions::Propose);
 
         assert_eq!(plan.proposal, None);
         assert_eq!(
@@ -1753,7 +1860,7 @@ mod tests {
         let mut peers = view([tombstone(NOW - GRACE), object(another_topic, "billing", 20)]);
         peers.get_mut(PEER).unwrap().cluster_uid = Some(PEER_CLUSTER + 1);
 
-        let plan = plan(&inner, &peers, NOW, GRACE);
+        let plan = plan(&inner, &peers, NOW, GRACE, Adoptions::Propose);
 
         assert_eq!(plan.proposal, None);
         assert_eq!(
@@ -1775,9 +1882,12 @@ mod tests {
         };
         let peers = view([tombstone(NOW - 10), object(recreated, "orders", 30)]);
 
-        assert_eq!(plan(&inner, &peers, NOW, GRACE).proposal, None);
+        assert_eq!(
+            plan(&inner, &peers, NOW, GRACE, Adoptions::Propose).proposal,
+            None
+        );
         assert!(matches!(
-            plan(&inner, &peers, NOW + GRACE, GRACE).proposal,
+            plan(&inner, &peers, NOW + GRACE, GRACE, Adoptions::Propose).proposal,
             Some(ShadowTopicRequest::RemoveTopic { target }) if target.created_revision == PEER_REVISION
         ));
     }

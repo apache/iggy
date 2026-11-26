@@ -52,11 +52,11 @@ use partitions::segment_chain::{Chain, HEADER_SIZE, ObjectPrefix, RECORD_SIZE, w
 use partitions::{
     ChainLoss, ChainLost, IggyPartition, IggyPartitions, LocalFront,
     MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, PartitionPersistence, PartitionRecoveryError,
-    PartitionRecoveryRefusal, PartitionsConfig, RebuildInput, RecoveredLog, StoreView,
-    StoreViewRequest, chain_loss, clamp_consumer_offsets, create_partition_file_hierarchy,
-    ensure_initial_segment, holds_neither_chain_nor_log, hydrate_partition_log,
-    load_persisted_segments, load_persisted_segments_with_checkpoint, load_placed_segments,
-    load_tiered_segments, rebuild_front, recover_consumer_offsets,
+    PartitionRecoveryRefusal, PartitionsConfig, RebuildFailure, RebuildInput, RecoveredLog,
+    StoreView, StoreViewRequest, chain_loss, clamp_consumer_offsets,
+    create_partition_file_hierarchy, ensure_initial_segment, holds_neither_chain_nor_log,
+    hydrate_partition_log, load_persisted_segments, load_persisted_segments_with_checkpoint,
+    load_placed_segments, load_tiered_segments, rebuild_front, recover_consumer_offsets,
 };
 use server_common::fatal::is_descriptor_exhaustion;
 use server_common::fs_utils::run_blocking;
@@ -719,7 +719,6 @@ async fn load_partition(
             watermark: partition_metadata.deleted_up_to_offset,
             floor: None,
             stems_without_log: &[],
-            replicated: replica_count > 1,
         };
         if let ChainLoss::Refuse(lost) = chain_loss(&local) {
             return Err(chain_lost(&partition_dir, namespace, lost));
@@ -818,13 +817,14 @@ async fn load_partition(
             source,
         },
     };
-    let history_published = !first_initialization
-        && journal::PartitionPrepareJournal::has_published_frontier(&wal_directory)
-            .await
-            .map_err(wal_error)?;
     let recovered_persistence = {
         let directory = wal_directory.clone();
-        if replica_count == 1 && !first_initialization && !history_published {
+        if replica_count == 1
+            && !first_initialization
+            && !journal::PartitionPrepareJournal::has_published_frontier(&directory)
+                .await
+                .map_err(wal_error)?
+        {
             return Err(wal_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "existing singleton partition is missing its prepare WAL frontier",
@@ -863,6 +863,7 @@ async fn load_partition(
         (persistence, prepares)
     };
     let segment_checkpoint = recovered_persistence.0.segment_checkpoint();
+    let history_published = !first_initialization && recovered_persistence.0.recovered_frontier();
     let mut partition = IggyPartition::new(stats.clone(), consensus);
     partition
         .register_builtin_state_machines()
@@ -914,10 +915,9 @@ async fn load_partition(
                 .map(|recovered| recovered.segment.start_offset),
             stems_without_log: recovered.stems_without_log.clone(),
             watermark: partition_metadata.deleted_up_to_offset,
+            checkpoint_start: segment_checkpoint.map(|checkpoint| checkpoint.start_offset),
             namespace,
-            created_revision: partition_metadata.created_revision,
             prefix: partitions::object_prefix(namespace, partition_metadata.created_revision),
-            replicated: replica_count > 1,
         });
     hydrate_partition_log(
         &mut partition,
@@ -1003,10 +1003,10 @@ struct LostChain {
     front: Option<u64>,
     stems_without_log: Vec<u64>,
     watermark: u64,
+    /// The first offset of the segment the WAL checkpoint names.
+    checkpoint_start: Option<u64>,
     namespace: IggyNamespace,
-    created_revision: u64,
     prefix: ObjectPrefix,
-    replicated: bool,
 }
 
 impl LostChain {
@@ -1016,7 +1016,6 @@ impl LostChain {
             watermark: self.watermark,
             floor,
             stems_without_log: &self.stems_without_log,
-            replicated: self.replicated,
         }
     }
 
@@ -1061,25 +1060,41 @@ async fn rebuild_lost_chain(
         front,
         local_sealed: local_sealed.iter().map(|(start, _)| *start).collect(),
     };
+    let missing = |request: StoreViewRequest| ServerError::PartitionChainMissing {
+        stream_id: namespace.stream_id(),
+        topic_id: namespace.topic_id(),
+        partition_id: namespace.partition_id(),
+        request: Box::new(request),
+    };
     let Some(view) = store_view.filter(|view| view.request == request) else {
-        return Err(ServerError::PartitionChainMissing {
-            stream_id: namespace.stream_id(),
-            topic_id: namespace.topic_id(),
-            partition_id: namespace.partition_id(),
-            request: Box::new(request),
-        });
+        return Err(missing(request));
     };
     let anchors = read_anchors(partition_dir, &lost.stems_without_log, front).await?;
-    let rebuilt = rebuild_front(
+    let rebuilt = match rebuild_front(
         view,
         &RebuildInput {
             local,
-            created_revision: lost.created_revision,
+            created_revision: lost.prefix.created_revision,
             anchors: &anchors,
             local_sealed: &local_sealed,
+            checkpoint_start: lost.checkpoint_start,
         },
-    )
-    .map_err(|refusal| chain_lost(partition_dir, namespace, refusal))?;
+    ) {
+        Ok(rebuilt) => rebuilt,
+        Err(RebuildFailure::Lost(refusal)) => {
+            return Err(chain_lost(partition_dir, namespace, refusal));
+        }
+        Err(RebuildFailure::Unread { start, error }) => {
+            warn!(
+                namespace_raw = namespace.inner(),
+                start,
+                %error,
+                "the object store did not answer for a segment that the rebuild of a lost \
+                 segment chain needs; it is read again"
+            );
+            return Err(missing(request));
+        }
+    };
     match &view.manifest {
         ManifestRead::TooLarge { size } => warn!(
             namespace_raw = namespace.inner(),

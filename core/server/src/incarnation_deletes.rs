@@ -43,7 +43,7 @@
 //! identity check of [`crate::store_identity`].
 
 use crate::shell::ServerShard;
-use consensus::MetadataHandle;
+use consensus::{MetadataHandle, VsrConsensus};
 use iggy_common::IggyTimestamp;
 use iggy_object_store::ObjectPrefix;
 use message_bus::MessageBus;
@@ -181,16 +181,18 @@ impl IncarnationDeletes {
 /// `prefix`. An id that names no namespace cannot be checked, so it counts
 /// as held, and nothing deletes it.
 pub fn holds_incarnation(streams: &Streams, prefix: &ObjectPrefix) -> bool {
-    let (Ok(stream_id), Ok(topic_id), Ok(partition_id)) = (
-        usize::try_from(prefix.stream_id),
-        usize::try_from(prefix.topic_id),
-        usize::try_from(prefix.partition_id),
-    ) else {
-        return true;
-    };
-    IggyNamespace::try_new(stream_id, topic_id, partition_id).is_none_or(|namespace| {
+    namespace_of(prefix).is_none_or(|namespace| {
         streams.created_revision_for_namespace(namespace) == Some(prefix.created_revision)
     })
+}
+
+/// The namespace the ids of `prefix` name, `None` when they name none.
+pub fn namespace_of(prefix: &ObjectPrefix) -> Option<IggyNamespace> {
+    IggyNamespace::try_new(
+        usize::try_from(prefix.stream_id).ok()?,
+        usize::try_from(prefix.topic_id).ok()?,
+        usize::try_from(prefix.partition_id).ok()?,
+    )
 }
 
 /// Count and log what a delete job of an orphan settled.
@@ -230,7 +232,9 @@ fn next_job(
         return None;
     }
     let deleter = shard.object_deleter()?;
-    let streams = shard.plane.metadata().mux_stm.streams();
-    let start = queue.begin(now, |prefix| holds_incarnation(streams, prefix))?;
+    let metadata = shard.plane.metadata();
+    let view = metadata.consensus.as_ref().map(VsrConsensus::view);
+    let streams = metadata.mux_stm.streams();
+    let start = queue.begin(now, view, |prefix| holds_incarnation(streams, prefix))?;
     Some((deleter, start))
 }

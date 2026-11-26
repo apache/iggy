@@ -72,6 +72,11 @@ pub const INCARNATION_DELETE_RETRY: Duration = Duration::from_mins(1);
 /// rest in the store.
 pub const MAX_QUEUED_INCARNATIONS: usize = 65_536;
 
+/// The most orphans of the sweep that wait at once, so the rest of
+/// [`MAX_QUEUED_INCARNATIONS`] stays free for the incarnations of committed
+/// deletes.
+pub const MAX_QUEUED_ORPHANS: usize = MAX_QUEUED_INCARNATIONS / 4;
+
 /// The most segments whose objects of one kind fit one delete call to the
 /// store.
 const SEGMENTS_PER_DELETE_CALL: usize = MAX_KEYS_PER_REQUEST;
@@ -884,7 +889,8 @@ impl DeletedIncarnations {
     /// Queue an orphan that the sweep of the store found, due at `now`: the
     /// sweep waited out its own grace period already. Its delete checks the
     /// store against `guard` first. An incarnation that waits already keeps
-    /// its entry. `false` when the queue is full and the orphan was left out.
+    /// its entry. `false` when the queue is full, or holds
+    /// [`MAX_QUEUED_ORPHANS`] orphans already, and the orphan was left out.
     pub fn queue_orphan(
         &mut self,
         prefix: ObjectPrefix,
@@ -894,7 +900,8 @@ impl DeletedIncarnations {
         if self.due_at.contains_key(&prefix) {
             return true;
         }
-        if self.due_at.len() >= MAX_QUEUED_INCARNATIONS {
+        if self.due_at.len() >= MAX_QUEUED_INCARNATIONS || self.orphans.len() >= MAX_QUEUED_ORPHANS
+        {
             return false;
         }
         let due_at = now.as_micros();
@@ -910,10 +917,14 @@ impl DeletedIncarnations {
     ///
     /// `is_live` says whether committed metadata holds a partition of exactly
     /// that incarnation. Such an incarnation is dropped from the queue and
-    /// never deleted: its queueing was wrong, whatever caused it.
+    /// never deleted: its queueing was wrong, whatever caused it. An orphan
+    /// whose sweeps ran in a view other than `view`, the metadata view of
+    /// this node now, is dropped as well: a node that became the primary
+    /// again in a later view sweeps again first.
     pub fn begin(
         &mut self,
         now: IggyTimestamp,
+        view: Option<u32>,
         mut is_live: impl FnMut(&ObjectPrefix) -> bool,
     ) -> Option<ObjectDeleteStart> {
         if self.running.is_some() {
@@ -928,6 +939,19 @@ impl DeletedIncarnations {
                 warn!(
                     ?prefix,
                     "a live partition incarnation was queued for the delete of its objects and is dropped from the queue"
+                );
+                self.forget(&prefix);
+                continue;
+            }
+            if self
+                .orphans
+                .get(&prefix)
+                .is_some_and(|(guard, _)| Some(guard.view) != view)
+            {
+                warn!(
+                    ?prefix,
+                    ?view,
+                    "an orphan incarnation that the sweeps of another view found is dropped from the queue"
                 );
                 self.forget(&prefix);
                 continue;
@@ -1065,15 +1089,17 @@ impl DeletedIncarnations {
         self.orphans.remove(prefix);
     }
 
-    /// Queue `prefix` again, due at `due_at`. An orphan keeps its guard and
-    /// goes on from `progress`.
+    /// Move the entry of `prefix` to `due_at`. An orphan keeps its guard and
+    /// goes on from `progress`. An entry no longer queued stays out.
     fn requeue(&mut self, prefix: ObjectPrefix, due_at: u64, progress: OrphanProgress) {
-        let guard = self.orphans.remove(&prefix).map(|(guard, _)| guard);
-        self.forget(&prefix);
-        self.due_at.insert(prefix, due_at);
+        let Some(queued_at) = self.due_at.get_mut(&prefix) else {
+            return;
+        };
+        self.by_due.remove(&(*queued_at, prefix));
+        *queued_at = due_at;
         self.by_due.insert((due_at, prefix));
-        if let Some(guard) = guard {
-            self.orphans.insert(prefix, (guard, progress));
+        if let Some((_, held)) = self.orphans.get_mut(&prefix) {
+            *held = progress;
         }
     }
 }

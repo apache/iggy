@@ -427,7 +427,9 @@ server stores `partition_resize_policy` as `fixed` on a geo topic.
 A geo topic in the `geo` mode has no durability choice: its messages and its consumer offsets
 are always `persisted`. The server ignores the `durability` and `consumer_offset_durability`
 options on create, which the CLI and every SDK send as `replicated` unless told otherwise, and
-`GetTopic` reports both as `persisted`, derived. A send to a geo topic already waits for its
+`GetTopic` reports both as `persisted`, derived. The server still checks a value it ignores, so
+a create that names one that is not `replicated` or `persisted` fails with `InvalidOptionValue`
+(4042). A send to a geo topic already waits for its
 upload to the bucket. With `persisted` it also waits until the record that places its batch is
 on disk on a quorum of the cluster's nodes. Without that record no datacenter can read the
 batch. On GCP, a power loss of every node of a cluster lost 70 of 10,500 acknowledged messages
@@ -455,6 +457,7 @@ acknowledged before that load has the guarantee of `replicated` only.
 | A duration of a geo topic on a normal topic                          | `InvalidOptionValue` (4042)   |
 | `tiered_storage=true` on a geo topic                                 | `InvalidOptionValue` (4042)   |
 | `partition_resize_policy` other than `fixed` on a geo topic          | `InvalidOptionValue` (4042)   |
+| A `durability` or `consumer_offset_durability` that is not valid     | `InvalidOptionValue` (4042)   |
 | Any topic create in a shadow stream                                  | `ShadowStreamReadOnly` (1021) |
 
 After the create, the topic refuses changes, all but a change of its durations and of its
