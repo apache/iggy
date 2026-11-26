@@ -338,11 +338,7 @@ impl PlacedReadPlan {
                 .or(self.long_term_next.as_ref())
                 .map(|next| self.long_term_log(next));
             let index = self
-                .wait(remote.read_long_term_index(
-                    &log,
-                    LONG_TERM_INDEX_BYTES,
-                    &&self.read_settings,
-                ))
+                .wait(remote.read_long_term_index(&log, LONG_TERM_INDEX_BYTES, &self.read_settings))
                 .await?;
             let mut position = wanted.first_position(&index, segment.size);
             let mut len = LONG_TERM_READ_BYTES;

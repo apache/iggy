@@ -448,7 +448,7 @@ where
                     consumer,
                     &args,
                     usize::MAX,
-                    self.partition_read_settings(namespace),
+                    &self.partition_read_settings(namespace),
                 ) {
                     None => PartitionReadReply::NotFound,
                     Some(plan) if plan.needs_off_pump_io() => {

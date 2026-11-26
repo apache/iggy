@@ -108,7 +108,7 @@ pub(super) async fn polled_all_reading(
                 &args,
                 false,
                 usize::MAX,
-                settings.clone(),
+                settings,
             )
             .execute()
             .await;

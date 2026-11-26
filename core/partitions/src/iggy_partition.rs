@@ -6526,7 +6526,7 @@ where
             args,
             validate_checksum,
             byte_budget,
-            crate::PartitionReadSettings::SHARD,
+            &crate::PartitionReadSettings::SHARD,
         )
     }
 
@@ -6544,7 +6544,7 @@ where
         args: &PollingArgs,
         validate_checksum: bool,
         byte_budget: usize,
-        read_settings: crate::PartitionReadSettings,
+        read_settings: &crate::PartitionReadSettings,
     ) -> PollPlan {
         let read_settings = self.reads_with(read_settings);
         // Reads the durable commit frontier (`self.offset`, stored only on
@@ -6812,16 +6812,17 @@ where
             long_term,
             long_term_floor: self.long_term_floor(),
             long_term_next,
-            read_settings: self.reads_with(crate::PartitionReadSettings::SHARD),
+            read_settings: self.reads_with(&crate::PartitionReadSettings::SHARD),
         }
     }
 
     /// `settings` for the reads of this partition, which stop once it leaves
     /// the shard.
-    fn reads_with(&self, settings: crate::PartitionReadSettings) -> crate::PartitionReadSettings {
+    fn reads_with(&self, settings: &crate::PartitionReadSettings) -> crate::PartitionReadSettings {
         crate::PartitionReadSettings {
+            limit: settings.limit,
+            read_ahead: settings.read_ahead,
             left: Some(self.reads_left.clone()),
-            ..settings
         }
     }
 

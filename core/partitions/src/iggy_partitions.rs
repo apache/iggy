@@ -1685,7 +1685,7 @@ where
             consumer,
             args,
             usize::MAX,
-            crate::PartitionReadSettings::SHARD,
+            &crate::PartitionReadSettings::SHARD,
         )
     }
 
@@ -1699,7 +1699,7 @@ where
         consumer: PollingConsumer,
         args: &PollingArgs,
         byte_budget: usize,
-        read_settings: crate::PartitionReadSettings,
+        read_settings: &crate::PartitionReadSettings,
     ) -> Option<PollPlan> {
         // `build_poll_plan` touches the partition's sealed-read-handle LRU, so it
         // needs `&mut`. Sound on the pump: it is fully synchronous (no `.await`
