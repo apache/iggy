@@ -716,7 +716,7 @@ One partition, one Iggy send. Each partition answers for itself.
 | 35 | Transactional or control batch | Fails. |
 | 6 | Request budget ran out. Or the send did not reach Iggy by the deadline, or Iggy refused it: no primary, partition busy or recreated, client shut down. Nothing written. | Retries. |
 | 7 | Deadline passed: after the send went out, waiting for decode memory, or behind the producer's own earlier send. Or connection lost mid-send. Possibly written. | Retries. Can duplicate. |
-| 56 | The data disk of the partition primary stayed below `node.free_space_reserve` until the deadline. Nothing written. | Retries. |
+| 56 | The data disk of the partition primary stayed below `node.free_space_reserve` until the deadline. Nothing written. Produce v3 gets 6 instead, because it predates 56. | Retries. |
 
 Partition cap: `max_frame_size` decompressed bytes, `max_frame_size / 64` record slots, 3 headers
 per slot. Past it: 10.
@@ -1078,7 +1078,8 @@ costs about 10 `get_topic` calls per second per topic. `ListOffsets` probes on t
   (44). See `metadata.partitions_max` below
 - A send refused below the free-space reserve of the partition primary
   (`FreeSpaceReserveReached`, 4109) → `KAFKA_STORAGE_ERROR` (56), which Kafka clients retry.
-  Nothing was written. The SDK already retried it until its deadline. See `node.free_space_reserve`
+  Nothing was written. The SDK already retried it until its deadline. Produce v3 predates 56 and
+  gets `NOT_LEADER_OR_FOLLOWER` (6), as a Kafka broker answers it. See `node.free_space_reserve`
   below
 - Anything else → `UNKNOWN_SERVER_ERROR` (-1)
 

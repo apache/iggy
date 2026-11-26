@@ -35,11 +35,11 @@ use crate::bridge::{
 use crate::error::Result;
 use crate::protocol::api::{
     API_KEY_PRODUCE, ApiVersionRange, ConnectionState, ERROR_INVALID_RECORD,
-    ERROR_INVALID_REQUIRED_ACKS, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE, ERROR_NOT_LEADER_OR_FOLLOWER,
-    ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_PRODUCER_ID, ERROR_UNKNOWN_SERVER_ERROR,
-    ERROR_UNKNOWN_TOPIC_OR_PARTITION, ERROR_UNSUPPORTED_COMPRESSION_TYPE,
-    ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome, REQUEST_DEADLINE, UNKNOWN_OFFSET,
-    supported_max_version,
+    ERROR_INVALID_REQUIRED_ACKS, ERROR_KAFKA_STORAGE_ERROR, ERROR_MESSAGE_TOO_LARGE, ERROR_NONE,
+    ERROR_NOT_LEADER_OR_FOLLOWER, ERROR_REQUEST_TIMED_OUT, ERROR_UNKNOWN_PRODUCER_ID,
+    ERROR_UNKNOWN_SERVER_ERROR, ERROR_UNKNOWN_TOPIC_OR_PARTITION,
+    ERROR_UNSUPPORTED_COMPRESSION_TYPE, ERROR_UNSUPPORTED_VERSION, GatewayState, HandleOutcome,
+    REQUEST_DEADLINE, UNKNOWN_OFFSET, supported_max_version,
 };
 use crate::protocol::bounds_guard::validate_produce_shape;
 use crate::protocol::handlers::{
@@ -65,6 +65,11 @@ const ACKS_ALL: i16 = -1;
 
 /// First Produce version that may carry zstd batches.
 const ZSTD_MIN_VERSION: i16 = 7;
+
+/// First Produce version whose clients know `KAFKA_STORAGE_ERROR` (56), from KIP-112. An older
+/// client fails the batch on it without a retry, so it gets `NOT_LEADER_OR_FOLLOWER` (6), as a
+/// Kafka broker answers it.
+const KAFKA_STORAGE_ERROR_MIN_VERSION: i16 = 4;
 
 /// Frame bytes per record slot. Caps one partition at 131,072 slots, about 40 MB, at the default
 /// 8 MiB frame.
@@ -712,7 +717,19 @@ fn encode_uniform_response(version: i16, req: &ProduceRequest, error_code: i16) 
 /// # Errors
 ///
 /// Returns an error when `kafka_protocol` cannot encode the response at `version`.
-fn encode_written_response(version: i16, responses: Vec<TopicProduceResponse>) -> Result<Bytes> {
+fn encode_written_response(
+    version: i16,
+    mut responses: Vec<TopicProduceResponse>,
+) -> Result<Bytes> {
+    if version < KAFKA_STORAGE_ERROR_MIN_VERSION {
+        for partition in responses
+            .iter_mut()
+            .flat_map(|topic| topic.partition_responses.iter_mut())
+            .filter(|partition| partition.error_code == ERROR_KAFKA_STORAGE_ERROR)
+        {
+            partition.error_code = ERROR_NOT_LEADER_OR_FOLLOWER;
+        }
+    }
     let resp = ProduceResponse::default().with_responses(responses);
     encode_message(&resp, version, RESPONSE_BASE_BYTES)
 }
@@ -814,6 +831,31 @@ mod tests {
             })
             .collect();
         compressed_batch(&records, Compression::None)
+    }
+
+    #[test]
+    fn given_a_storage_error_when_answering_a_produce_v3_client_should_send_not_leader_or_follower()
+    {
+        for (version, expected) in [
+            (3, ERROR_NOT_LEADER_OR_FOLLOWER),
+            (4, ERROR_KAFKA_STORAGE_ERROR),
+            (9, ERROR_KAFKA_STORAGE_ERROR),
+        ] {
+            let topic = TopicProduceResponse::default().with_partition_responses(vec![
+                partition_response(0, ERROR_KAFKA_STORAGE_ERROR),
+                partition_response(1, ERROR_NONE),
+            ]);
+
+            let mut answer = encode_written_response(version, vec![topic]).unwrap();
+
+            let response = ProduceResponse::decode(&mut answer, version).unwrap();
+            let codes: Vec<i16> = response.responses[0]
+                .partition_responses
+                .iter()
+                .map(|partition| partition.error_code)
+                .collect();
+            assert_eq!(codes, [expected, ERROR_NONE], "Produce v{version}");
+        }
     }
 
     #[test]
