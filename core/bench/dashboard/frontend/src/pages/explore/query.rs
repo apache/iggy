@@ -18,23 +18,16 @@
 //! The Explore page's view as the URL holds it: the scope, the search text, one value per facet and
 //! the sort. A link is never an error, because the page ignores what it can't use.
 
+/// The server reads the scope of a request with the same type, for the head of the page.
+pub use bench_dashboard_shared::pages::ExploreScope as Scope;
 use serde::{Deserialize, Serialize};
+use yew_router::Routable;
 
 use crate::api::{api_name, from_api_name};
+use crate::router::AppRoute;
 
-const SCOPE_PARAM: &str = "scope";
 const SEARCH_PARAM: &str = "q";
 const SORT_PARAM: &str = "sort";
-
-/// Which runs the page lists.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Scope {
-    /// The runs whose suite the dashboard configuration names.
-    #[default]
-    Official,
-    All,
-}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -67,21 +60,6 @@ pub struct ExploreQuery {
     /// empty values out.
     pub(super) facets: [Option<String>; Facet::COUNT],
     pub sort: Sort,
-}
-
-impl Scope {
-    pub const ALL: [Self; 2] = [Self::Official, Self::All];
-
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Official => "Official",
-            Self::All => "All runs",
-        }
-    }
-
-    pub const fn includes(self, official: bool) -> bool {
-        official || matches!(self, Self::All)
-    }
 }
 
 impl Sort {
@@ -158,7 +136,7 @@ impl ExploreQuery {
         for (key, value) in pairs {
             let (key, value) = (key.as_ref(), value.as_ref());
             match key {
-                SCOPE_PARAM => query.scope = from_api_name(value).unwrap_or(query.scope),
+                Scope::PARAM => query.scope = value.parse().unwrap_or(query.scope),
                 SEARCH_PARAM => query.search = value.to_owned(),
                 SORT_PARAM => query.sort = from_api_name(value).unwrap_or(query.sort),
                 _ => {
@@ -178,7 +156,7 @@ impl ExploreQuery {
     pub fn to_pairs(&self) -> Vec<(&'static str, String)> {
         let mut pairs = Vec::new();
         if self.scope != Scope::default() {
-            pairs.extend(api_name(self.scope).map(|scope| (SCOPE_PARAM, scope)));
+            pairs.push((Scope::PARAM, self.scope.to_string()));
         }
         if !self.search.is_empty() {
             pairs.push((SEARCH_PARAM, self.search.clone()));
@@ -192,6 +170,16 @@ impl ExploreQuery {
             pairs.extend(api_name(self.sort).map(|sort| (SORT_PARAM, sort)));
         }
         pairs
+    }
+
+    /// The path and query of the view, for a link to it. The router writes and reads the query
+    /// with the same encoding.
+    pub fn href(&self) -> String {
+        let path = AppRoute::Explore.to_path();
+        match serde_urlencoded::to_string(self.to_pairs()) {
+            Ok(query) if !query.is_empty() => format!("{path}?{query}"),
+            _ => path,
+        }
     }
 
     pub fn facet(&self, facet: Facet) -> Option<&str> {
@@ -264,6 +252,22 @@ mod tests {
             ]
         );
         assert_eq!(ExploreQuery::from_pairs(pairs), query);
+    }
+
+    #[test]
+    fn given_views_when_linked_should_write_path_and_encoded_query() {
+        let all = ExploreQuery {
+            scope: Scope::All,
+            ..ExploreQuery::default()
+        };
+
+        assert_eq!(ExploreQuery::default().href(), "/explore");
+        assert_eq!(all.href(), Scope::All.path());
+        assert_eq!(
+            full_query().href(),
+            "/explore?scope=all&q=pinned++0.9.0+&machine=aws_i4i_4xlarge&version=0.10.0+at+\
+             91e020636&kind=end_to_end&nodes=3&durability=persisted&size=100..1000&sort=p99"
+        );
     }
 
     #[test]

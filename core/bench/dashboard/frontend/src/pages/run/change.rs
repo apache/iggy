@@ -20,43 +20,12 @@
 
 use bench_dashboard_shared::config::Thresholds;
 use bench_dashboard_shared::delta::{DeltaVerdict, Metric, ValueRange};
+use bench_dashboard_shared::format::runs_text;
+use bench_dashboard_shared::history::VersionStep;
+use bench_dashboard_shared::labels::{metric_name, metric_value_text};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 
-use crate::components::run_labels::milliseconds;
-use crate::format::{format_throughput_mb_s, runs_text};
-
 const PERCENT: f64 = 100.0;
-pub const RATE_LIMITED_HEADLINES: [Metric; 4] =
-    [Metric::Throughput, Metric::P50, Metric::P99, Metric::P999];
-/// A run without a rate limit measures throughput only.
-const UNCAPPED_HEADLINES: [Metric; 1] = [Metric::Throughput];
-
-/// The runs of one workload on one machine and topology, grouped by version. A version is a
-/// summary's version text, and it takes the place of its first run in version order, so interleaved
-/// runs of two builds still give one order.
-#[derive(Debug)]
-pub struct HistoryLine<'a> {
-    /// Oldest first.
-    pub versions: Vec<LineVersion<'a>>,
-}
-
-#[derive(Debug)]
-pub struct LineVersion<'a> {
-    pub version: &'a str,
-    /// In version order.
-    pub runs: Vec<&'a BenchmarkSummary>,
-}
-
-/// The runs that a change compares.
-#[derive(Debug)]
-pub struct VersionStep<'a> {
-    /// The version that the change compares with. On the run page, that's the version right before
-    /// the run's own version on its history line.
-    pub previous: &'a str,
-    pub base: Vec<&'a BenchmarkSummary>,
-    /// The runs of the run's own version, the run itself included.
-    pub head: Vec<&'a BenchmarkSummary>,
-}
 
 /// One headline number of a run, from its main group.
 #[derive(Debug, Clone, PartialEq)]
@@ -79,72 +48,6 @@ pub struct Change {
     pub ranges: String,
 }
 
-impl<'a> HistoryLine<'a> {
-    /// The history line of `run` within `summaries`.
-    pub fn of(run: &BenchmarkSummary, summaries: &'a [BenchmarkSummary]) -> Self {
-        let line_key = run.history_key();
-        Self::from_runs(
-            summaries
-                .iter()
-                .filter(|summary| summary.history_key() == line_key),
-        )
-    }
-
-    /// Groups `runs`, which share one history key, by version.
-    pub fn from_runs(runs: impl IntoIterator<Item = &'a BenchmarkSummary>) -> Self {
-        let mut line: Vec<_> = runs.into_iter().collect();
-        line.sort_by(|left, right| {
-            left.version_order
-                .cmp(&right.version_order)
-                .then_with(|| left.version.cmp(&right.version))
-                .then_with(|| left.uuid.cmp(&right.uuid))
-        });
-        let mut versions: Vec<LineVersion<'a>> = Vec::new();
-        for summary in line {
-            match versions
-                .iter_mut()
-                .find(|known| known.version == summary.version)
-            {
-                Some(known) => known.runs.push(summary),
-                None => versions.push(LineVersion {
-                    version: &summary.version,
-                    runs: vec![summary],
-                }),
-            }
-        }
-        Self { versions }
-    }
-
-    /// `None` when no version comes before the version of `run`.
-    pub fn step(&self, run: &BenchmarkSummary) -> Option<VersionStep<'a>> {
-        let index = self
-            .versions
-            .iter()
-            .position(|version| version.version == run.version)?;
-        let base = self.versions.get(index.checked_sub(1)?)?;
-        let head = self.versions.get(index)?;
-        Some(VersionStep::between(base, head))
-    }
-}
-
-impl LineVersion<'_> {
-    /// The median of `metric` over the runs' main group.
-    pub fn median(&self, metric: Metric) -> Option<f64> {
-        let group = self.runs.first()?.kind_family.primary_group();
-        ValueRange::of(&self.runs, metric, group).map(|range| range.median)
-    }
-}
-
-impl<'a> VersionStep<'a> {
-    pub fn between(base: &LineVersion<'a>, head: &LineVersion<'a>) -> Self {
-        Self {
-            previous: base.version,
-            base: base.runs.clone(),
-            head: head.runs.clone(),
-        }
-    }
-}
-
 impl Change {
     /// For example `+4.6% vs 0.9.0`.
     pub fn text(&self) -> String {
@@ -155,19 +58,14 @@ impl Change {
     }
 }
 
-/// Throughput, P50, P99 and P99.9 of the main group, or throughput only without a rate limit.
+/// The [`BenchmarkSummary::headline_metrics`] of the main group.
 pub fn headlines(
     run: &BenchmarkSummary,
     step: Option<&VersionStep<'_>>,
     thresholds: &Thresholds,
 ) -> Vec<Headline> {
-    let metrics: &[Metric] = if run.workload_key.rate_limit.is_some() {
-        &RATE_LIMITED_HEADLINES
-    } else {
-        &UNCAPPED_HEADLINES
-    };
     let group = run.group(run.kind_family.primary_group());
-    metrics
+    run.headline_metrics()
         .iter()
         .map(|&metric| Headline {
             metric,
@@ -233,25 +131,6 @@ pub fn regression_text(headlines: &[Headline]) -> Option<String> {
     ))
 }
 
-pub const fn metric_name(metric: Metric) -> &'static str {
-    match metric {
-        Metric::Throughput => "Throughput",
-        Metric::P50 => "P50",
-        Metric::P90 => "P90",
-        Metric::P95 => "P95",
-        Metric::P99 => "P99",
-        Metric::P999 => "P99.9",
-    }
-}
-
-/// A value of `metric` in its unit, for example `2.07 GB/s` or `1.28 ms`.
-pub fn metric_value_text(metric: Metric, value: f64) -> String {
-    match metric {
-        Metric::Throughput => format_throughput_mb_s(value),
-        Metric::P50 | Metric::P90 | Metric::P95 | Metric::P99 | Metric::P999 => milliseconds(value),
-    }
-}
-
 /// The change from `base` to `head` in percent of `base`. `None` when `base` is 0.
 pub fn percent_change(base: f64, head: f64) -> Option<f64> {
     (base > 0.0).then(|| (head - base) / base * PERCENT)
@@ -288,6 +167,7 @@ mod tests {
         CANDIDATE, COMMIT, MACHINE, OLD_RELEASE, RELEASE, THRESHOLDS, build, limited, producer,
         rate_limited, run, with_numbers,
     };
+    use bench_dashboard_shared::history::HistoryLine;
     use uuid::Uuid;
 
     const OTHER_MACHINE: &str = "iggy-ci";

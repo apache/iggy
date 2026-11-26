@@ -157,6 +157,17 @@ impl<T> IdSlab<T> {
         Iter { inner }
     }
 
+    /// Every slot from `key` on, ascending by key, `None` for an unoccupied
+    /// one. A walk that must bound the slots it reads uses this:
+    /// [`Self::iter_from`] passes any run of unoccupied slots in one step.
+    pub fn slots_from(&self, key: usize) -> impl Iterator<Item = (usize, Option<&T>)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .skip(key)
+            .map(|(key, slot)| (key, slot.as_ref()))
+    }
+
     /// Occupied keys below `key`, ascending; `.rev()` walks them descending.
     #[must_use]
     pub fn iter_before(&self, key: usize) -> Iter<'_, T> {
@@ -352,6 +363,30 @@ mod tests {
         assert_eq!(keys(3), [3]);
         assert_eq!(keys(4), [] as [usize; 0]);
         assert_eq!(keys(usize::MAX), [] as [usize; 0]);
+    }
+
+    #[test]
+    fn given_gaps_when_reading_slots_from_a_key_should_yield_unoccupied_slots_too() {
+        let mut slab: IdSlab<char> = IdSlab::new();
+        for value in ['a', 'b', 'c', 'd'] {
+            slab.insert(value);
+        }
+        slab.remove(1);
+        slab.remove(3);
+
+        let slots = |from| {
+            slab.slots_from(from)
+                .map(|(key, slot)| (key, slot.copied()))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            slots(0),
+            [(0, Some('a')), (1, None), (2, Some('c')), (3, None)]
+        );
+        assert_eq!(slots(3), [(3, None)]);
+        assert_eq!(slots(4), []);
+        assert_eq!(slots(usize::MAX), []);
     }
 
     #[test]

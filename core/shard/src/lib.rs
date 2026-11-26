@@ -4836,7 +4836,8 @@ const fn superblock_wedged(failures: u64, fatal_after: u64) -> bool {
 /// survive before it is answered rather than held.
 ///
 /// Passes, not seconds, and deliberately not described in seconds: a pass fires
-/// on the periodic interval OR on a commit-tick wake, and a large work set
+/// on the periodic interval, on a commit-tick wake OR for a due slice of the
+/// reconciler's repair (four a second while a cycle runs), and a large work set
 /// spreads one round over many passes, so the wall-clock window this maps to
 /// spans orders of magnitude. `reconcile_periodic_interval` legally
 /// reaches 30s, which would put four passes at 120s -- four times the SDK's
