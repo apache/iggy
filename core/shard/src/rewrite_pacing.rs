@@ -197,7 +197,7 @@ pub struct RewritePacing {
     /// Whether a partition the shard leads was past the backlog limit at
     /// the last tick.
     behind: Rc<Cell<bool>>,
-    /// Whether the store the rewrites read is on this node.
+    /// Whether the store the rewrites use is on this node.
     store_on_node: bool,
     /// The share of the shard's time that its rewrites keep to, once the
     /// first of them asked for it.
@@ -417,7 +417,7 @@ impl RewritePacing {
         Rc::clone(&self.behind)
     }
 
-    /// Note whether the store the rewrites read is on this node. A rewrite
+    /// Note whether the store the rewrites use is on this node. A rewrite
     /// started after this keeps to a budget that knows it.
     pub fn set_store_on_node(&mut self, on_node: bool) {
         self.store_on_node = on_node;

@@ -116,8 +116,8 @@ pub struct PartitionReadSettings {
     /// exactly its range.
     pub limit: Option<usize>,
     /// Bytes that readahead fetches in front of the partition's sequential
-    /// readers at most, and never more than an eighth of its limit. Below
-    /// [`READ_AHEAD_START_BLOCKS`] blocks, none.
+    /// readers at most, and never more than an eighth of its limit or of the
+    /// shard's cache. Below [`READ_AHEAD_START_BLOCKS`] blocks, none.
     pub read_ahead: Option<u64>,
 }
 
@@ -271,7 +271,7 @@ impl ReadCache {
                 limit
             }
         });
-        {
+        let budget = {
             let mut cache = self.cache.borrow_mut();
             if cache.limit(&owner) != limit {
                 if let (Some(0), Some(share @ 1..)) = (limit, settings.limit) {
@@ -286,7 +286,8 @@ impl ReadCache {
                 }
                 cache.set_limit(owner, limit);
             }
-        }
+            cache.budget()
+        };
         if limit == Some(0) {
             return None;
         }
@@ -297,9 +298,8 @@ impl ReadCache {
             let wanted = settings
                 .read_ahead
                 .map_or(self.ahead_blocks_max, |bytes| bytes / self.block_bytes);
-            let within = limit.map_or(wanted, |limit| {
-                wanted.min(limit as u64 / AHEAD_SHARE as u64 / self.block_bytes)
-            });
+            let room = limit.map_or(budget, |limit| limit.min(budget));
+            let within = wanted.min(room as u64 / AHEAD_SHARE as u64 / self.block_bytes);
             if within < READ_AHEAD_START_BLOCKS {
                 0
             } else {
@@ -710,31 +710,20 @@ impl RemoteBlocks {
     }
 
     /// `range` of the fresh object `object_id` when the cache holds it,
-    /// whole or in blocks, without counting a read of it, and where those
-    /// bytes came from.
-    pub(crate) fn peek_fresh(
-        &self,
-        object_id: u128,
-        range: &Range<u64>,
-    ) -> Option<(Bytes, FreshOrigin)> {
+    /// whole or in blocks, without counting a read of it.
+    pub(crate) fn peek_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
         let owner = self.admit().ok()?;
         let object = self.fresh(owner, object_id);
         let cache = self.cache.cache.borrow();
         if let Some(whole) = cache.peek(&CacheKey::Whole(object)) {
-            let origin = if self.store == OWN_STORE {
-                FreshOrigin::Uploaded
-            } else {
-                FreshOrigin::Fetched
-            };
-            return Some((slice_of(&whole, 0, range)?, origin));
+            return slice_of(&whole, 0, range);
         }
         let blocks = object.blocks_of(range, self.cache.block_bytes)?;
         let first = *blocks.start();
         let found = blocks
             .map(|index| cache.peek(&CacheKey::Block { object, index }))
             .collect::<Option<Vec<_>>>()?;
-        let bytes = assemble_bytes(&found, first, self.cache.block_bytes, range).ok()?;
-        Some((bytes, FreshOrigin::Fetched))
+        assemble_bytes(&found, first, self.cache.block_bytes, range).ok()
     }
 
     const fn fresh(&self, owner: u128, object_id: u128) -> ObjectId {
@@ -898,12 +887,6 @@ impl RemoteBlocks {
         key: &str,
         cap: u64,
     ) -> Result<Bytes, DiskFault> {
-        // A whole fresh object in the cache passes for the shard's own
-        // upload, which a rewrite takes without checking it.
-        debug_assert!(
-            !matches!(object.name, ObjectName::Fresh(_)),
-            "a fetched fresh object is kept in blocks"
-        );
         let whole = CacheKey::Whole(object);
         let cached = self.cache.cache.borrow_mut().read(&whole);
         let mut counted = self.cache.counted.get();
@@ -1208,16 +1191,6 @@ struct ObjectId {
     /// Where the bytes that reads take end, which is where the last block
     /// ends. `None` for an object whose end the store tells.
     end: Option<u64>,
-}
-
-/// Where the bytes of a fresh object that the cache holds came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreshOrigin {
-    /// The shard built the object and the node's own store took it: the
-    /// whole object, which only [`RemoteBlocks::hold_fresh`] keeps.
-    Uploaded,
-    /// A GET brought them from a store.
-    Fetched,
 }
 
 /// Which object of a store.
@@ -3170,6 +3143,46 @@ mod tests {
             assert_eq!(
                 reach.div_ceil(BLOCK).saturating_sub(12),
                 blocks_ahead,
+                "{row}"
+            );
+        }
+    }
+
+    /// A partition's own readahead keeps within an eighth of the shard's
+    /// cache when its limit is unset or above that cache.
+    #[compio::test]
+    async fn given_a_partition_readahead_above_an_eighth_of_the_shard_cache_when_reading_in_order_should_fetch_ahead_within_it()
+     {
+        const SHARD_CACHE_BYTES: usize = 32 * BLOCK_LEN;
+        for (row, limit) in [
+            ("no limit", None),
+            ("a limit above the cache", Some(2 * SHARD_CACHE_BYTES)),
+        ] {
+            let len = 40 * BLOCK;
+            let (store, ahead) = (Store::holding(len), Store::holding(len));
+            let remote = remote(&store, Rc::clone(&ahead) as _, SHARD_CACHE_BYTES, 2 * BLOCK);
+            let source = partition_source(1, len);
+            let settings = PartitionReadSettings {
+                limit,
+                read_ahead: Some(16 * BLOCK),
+            };
+            for block in 0..12 {
+                read_as(
+                    &remote,
+                    &source,
+                    block * BLOCK..(block + 1) * BLOCK,
+                    settings,
+                )
+                .await
+                .unwrap();
+                settle().await;
+            }
+
+            let reach = ahead.asked().iter().map(|(_, end)| *end).max().unwrap_or(0);
+            let an_eighth_of_the_cache = (SHARD_CACHE_BYTES / AHEAD_SHARE / BLOCK_LEN) as u64;
+            assert_eq!(
+                reach.div_ceil(BLOCK).saturating_sub(12),
+                an_eighth_of_the_cache,
                 "{row}"
             );
         }

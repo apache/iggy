@@ -105,7 +105,7 @@ fn sorted(keys: impl IntoIterator<Item = String>) -> Vec<String> {
 }
 
 #[compio::test]
-async fn given_an_orphan_when_two_sweeps_found_it_past_its_grace_should_delete_it_and_leave_everything_else()
+async fn given_an_orphan_when_sweeps_found_it_unchanged_for_its_grace_should_delete_it_and_leave_everything_else()
  {
     let tmp = TempDir::new().unwrap();
     let config = sweep_config(&tmp, GRACE);
@@ -163,43 +163,73 @@ async fn given_an_orphan_when_two_sweeps_found_it_past_its_grace_should_delete_i
         sorted([kept.clone(), orphan_keys].concat())
     );
 
+    // The grace counts from the start of the second sweep.
     let second = later(first, GRACE);
     sweep_pass(&ctx, second).await;
-    assert!(stored_keys(&deleter).len() > kept.len(), "queued, not run");
-    // The next pass queues what the sweep found due, then deletes it.
     sweep_pass(&ctx, second).await;
+    assert!(!ctx.incarnation_deletes.is_queued_orphan(&orphan));
+
+    let third = later(first, GRACE * 2);
+    sweep_pass(&ctx, third).await;
+    assert!(stored_keys(&deleter).len() > kept.len(), "queued, not run");
+    // The next pass queues what the sweep found due, then its turns delete
+    // it, each in a pass of its own.
+    sweep_pass(&ctx, third).await;
     assert!(ctx.incarnation_deletes.is_queued_orphan(&orphan));
-    incarnation_delete_pass(&ctx, second).await;
+    incarnation_delete_pass(&ctx, third).await;
+    assert!(
+        stored_keys(&deleter).len() > kept.len(),
+        "checked, not deleted"
+    );
+    incarnation_delete_pass(&ctx, later(third, Duration::from_micros(1))).await;
 
     assert_eq!(stored_keys(&deleter), kept);
     assert_eq!(ctx.incarnation_deletes.queued(), 0);
     assert_eq!(
         ctx.shard.metrics().orphan_sweep_values(),
-        (2, 1, 1, 0, 0),
+        (3, 1, 1, 0, 0),
         "sweeps, orphans of the last, deleted, objects before the claim, identity skips"
     );
 }
 
 #[compio::test]
-async fn given_an_orphan_whose_newest_object_is_inside_the_grace_when_two_sweeps_find_it_should_keep_it()
+async fn given_a_node_clock_ahead_of_the_store_when_an_orphan_gains_an_object_between_sweeps_should_wait_the_full_grace_again()
  {
     let tmp = TempDir::new().unwrap();
     let config = sweep_config(&tmp, GRACE);
     let (ctx, deleter) = sweeping_primary(&config, OWN_CLUSTER_UID).await;
-    let first = IggyTimestamp::now();
-    compio::time::sleep(Duration::from_millis(2)).await;
+    let store = deleter.executor().store();
     let orphan = absent(5, revision(&ctx));
-    store_objects(deleter.executor().store(), orphan).await;
+    store_objects(store, orphan).await;
+    let ahead = later(IggyTimestamp::now(), Duration::from_hours(24));
+    for wait in [Duration::ZERO, GRACE, GRACE] {
+        sweep_pass(&ctx, later(ahead, wait)).await;
+    }
+    assert!(!ctx.incarnation_deletes.is_queued_orphan(&orphan));
+
+    compio::time::sleep(Duration::from_millis(2)).await;
+    let gained = object_layout().segment_key(&SegmentKey {
+        prefix: orphan,
+        start_offset: 10,
+        object: SegmentObject::Log,
+    });
+    put_key(store, &gained).await;
     let stored = stored_keys(&deleter);
+    for wait in [GRACE * 2, GRACE * 3, GRACE * 3] {
+        sweep_pass(&ctx, later(ahead, wait)).await;
+    }
+    incarnation_delete_pass(&ctx, later(ahead, GRACE * 3)).await;
 
-    sweep_pass(&ctx, first).await;
-    sweep_pass(&ctx, later(first, GRACE)).await;
-    sweep_pass(&ctx, later(first, GRACE)).await;
-    incarnation_delete_pass(&ctx, later(first, GRACE)).await;
-
-    assert_eq!(ctx.orphan_sweep.candidates(), 1);
-    assert_eq!(ctx.incarnation_deletes.queued(), 0);
+    assert!(!ctx.incarnation_deletes.is_queued_orphan(&orphan));
     assert_eq!(stored_keys(&deleter), stored);
+
+    let due = later(ahead, GRACE * 4);
+    sweep_pass(&ctx, due).await;
+    sweep_pass(&ctx, due).await;
+    assert!(ctx.incarnation_deletes.is_queued_orphan(&orphan));
+    incarnation_delete_pass(&ctx, due).await;
+    incarnation_delete_pass(&ctx, later(due, Duration::from_micros(1))).await;
+    assert_eq!(stored_keys(&deleter), [object_layout().identity_key()]);
 }
 
 #[compio::test]

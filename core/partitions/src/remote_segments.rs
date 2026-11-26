@@ -54,8 +54,7 @@ use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::io::PartitionIoQuiescence;
 use crate::poll_plan::DiskFault;
 use crate::remote_blocks::{
-    FreshOrigin, PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks,
-    RemoteReadMetrics, StoreSlot,
+    PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks, RemoteReadMetrics, StoreSlot,
 };
 use crate::rewrite_share::RewriteShare;
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
@@ -445,14 +444,9 @@ impl RemoteSegments {
     }
 
     /// `range` of the fresh object `object_id` when this shard holds it in
-    /// memory, and where those bytes came from, not counted as a read of
-    /// it: a rewrite reads each blob once, and what it read is in its
-    /// long-term segment from then on.
-    pub(crate) fn cached_fresh(
-        &self,
-        object_id: u128,
-        range: &Range<u64>,
-    ) -> Option<(Bytes, FreshOrigin)> {
+    /// memory, not counted as a read of it: a rewrite reads each blob once,
+    /// and what it read is in its long-term segment from then on.
+    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
         self.blocks.as_ref()?.peek_fresh(object_id, range)
     }
 

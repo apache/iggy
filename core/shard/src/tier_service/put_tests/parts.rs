@@ -207,6 +207,31 @@ fn given_a_lost_answer_on_completion_when_the_retry_finds_its_object_should_coun
     assert_eq!(parts_counted(&store), (1, 1, 0, 0, 2));
 }
 
+/// The error the S3 provider returns for a 200 that holds neither the result
+/// of the completion nor an error.
+#[test]
+fn given_a_completion_whose_200_holds_no_result_when_it_created_the_object_should_count_as_stored()
+{
+    let (bus, store) = parts_store();
+    let bytes = large(2);
+    store
+        .provider()
+        .complete_scripts
+        .borrow_mut()
+        .push_back(Script::of(Outcome::LoseAnswer(|| {
+            ObjectStoreError::Unavailable("a 200 that holds no result".to_owned())
+        })));
+
+    bus.run(store.put("a/b", body(&bytes), &in_parts(&bytes)))
+        .unwrap();
+
+    let provider = store.provider();
+    assert_eq!(provider.completions.get(), 1, "the object decided");
+    assert_eq!(provider.heads.get(), 1);
+    assert_eq!(counted(&store).3, 1, "own object found");
+    assert_eq!(stored(&store, "a/b"), bytes);
+}
+
 #[test]
 fn given_a_lost_answer_on_completion_when_another_writer_holds_the_key_should_refuse_and_abort() {
     let (bus, store) = parts_store();

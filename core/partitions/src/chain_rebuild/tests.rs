@@ -15,12 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::ops::Range;
 
 use iggy_object_store::{
     DeleteOutcome, InlineTierExecutor, ListPage, ListRequest, ManifestSegment, MemoryStore,
     ObjectMeta, ObjectRange, PutBody, PutOptions, SEGMENT_HASH_LEN, TierScope, UserMetadata,
 };
+use server_common::yield_to_reactor;
 
 use super::*;
 
@@ -635,6 +638,33 @@ fn given_a_manifest_that_records_a_segment_differently_when_rebuilding_should_re
 }
 
 #[test]
+fn given_a_manifest_that_records_other_timestamps_when_rebuilding_should_refuse() {
+    let shifts: [(&str, fn(&mut ManifestSegment)); 3] = [
+        ("start", |segment| segment.start_timestamp += 1),
+        ("end", |segment| segment.end_timestamp += 1),
+        ("max", |segment| segment.max_timestamp += 1),
+    ];
+    for (timestamp, shift) in shifts {
+        let mut view = view(&[(0, 9), (10, 19)], 0, 20);
+        view.manifest = manifest(&[(0, 9), (10, 19)], None);
+        if let ManifestRead::Read(manifest) = &mut view.manifest {
+            shift(&mut manifest.segments[1]);
+        }
+        let local = Local::new(20, 0, Some(19));
+
+        assert_eq!(
+            local.rebuild(&view),
+            Err(lost(
+                10,
+                19,
+                ChainLostReason::ManifestDisagrees { start: 10 }
+            )),
+            "{timestamp} timestamp"
+        );
+    }
+}
+
+#[test]
 fn given_a_manifest_that_lists_a_segment_the_walk_skips_when_rebuilding_should_refuse() {
     let mut view = view(&[(0, 9), (20, 29)], 0, 30);
     view.manifest = manifest(&[(0, 9), (10, 19), (20, 29)], None);
@@ -844,6 +874,24 @@ fn given_local_sealed_segments_stored_as_they_end_when_rebuilding_should_record_
 }
 
 #[test]
+fn given_a_local_sealed_segment_whose_stored_index_is_missing_empty_or_partial_when_rebuilding_should_not_confirm_it()
+ {
+    for index_size in [None, Some(0), Some(INDEX_BYTES + 1)] {
+        let mut view = view(&[(0, 9), (10, 19)], 0, 10);
+        if let Some(listed) = view.listed.get_mut(&10) {
+            listed.index_size = index_size;
+        }
+        let mut local = Local::new(10, 0, Some(19));
+        local.sealed = vec![(10, 19)];
+
+        let rebuilt = local.rebuild(&view).unwrap();
+
+        assert_eq!(rebuilt.records, vec![remote(0, 9)], "{index_size:?}");
+        assert_eq!(rebuilt.confirmed_local, 0, "{index_size:?}");
+    }
+}
+
+#[test]
 fn given_a_rebuilt_chain_when_reading_it_back_should_count_every_remote_segment_as_live() {
     let view = view(&[(10, 19), (20, 29)], 15, 30);
     let local = Local::new(30, 14, Some(29));
@@ -935,7 +983,7 @@ async fn given_a_store_when_reading_its_view_should_list_head_and_read_the_manif
 }
 
 #[compio::test]
-async fn given_a_manifest_above_the_limit_when_reading_the_view_should_not_read_it() {
+async fn given_a_manifest_above_the_limit_when_reading_the_view_should_not_decode_it() {
     let store = MemoryStore::new();
     let layout = KeyLayout::new("iggy").unwrap();
     let size = usize::try_from(MANIFEST_CROSS_CHECK_BYTES_MAX).unwrap() + 1;
@@ -997,6 +1045,154 @@ async fn given_a_stale_manifest_size_from_a_head_when_reading_the_view_should_re
     let view = read_store_view(&store, &layout, request).await.unwrap();
 
     assert_eq!(view.manifest, ManifestRead::Read(current));
+}
+
+#[compio::test]
+async fn given_more_logs_than_heads_in_flight_when_reading_the_view_should_head_them_several_at_a_time()
+ {
+    let layout = KeyLayout::new("iggy").unwrap();
+    let segments: Vec<(u64, u64)> = (0..2 * STORE_VIEW_HEADS as u64 + 1)
+        .map(|segment| (segment * 10, segment * 10 + 9))
+        .collect();
+    let gone = log_key(&layout, 10);
+    let store = SlowHeads::new([(gone, (1, not_found))]);
+    for &(start, end) in &segments {
+        put_segment(&store.store, &layout, start, end).await;
+    }
+    let front = segments.last().map_or(0, |(_, end)| end + 1);
+    let request = StoreViewRequest {
+        prefix: PREFIX,
+        from: 0,
+        front,
+        local_sealed: Vec::new(),
+    };
+
+    let view = read_store_view(&store, &layout, request).await.unwrap();
+
+    assert_eq!(store.most_in_flight.get(), STORE_VIEW_HEADS);
+    let expected: BTreeMap<u64, StoredLog> = segments
+        .iter()
+        .map(|&(start, end)| {
+            let metadata = metadata(start, end);
+            let stored = if start == 10 {
+                StoredLog::Gone
+            } else {
+                StoredLog::Found {
+                    size: metadata.size,
+                    crc32c: Some(zeros_crc32c(metadata.size)),
+                    metadata: Ok(metadata),
+                }
+            };
+            (start, stored)
+        })
+        .collect();
+    assert_eq!(view.logs, expected);
+}
+
+#[compio::test]
+async fn given_heads_that_fail_out_of_order_when_reading_the_view_should_return_the_error_of_the_lowest_start()
+ {
+    let layout = KeyLayout::new("iggy").unwrap();
+    // The HEAD at 20 fails first. The one at 0 finds no object, which is no
+    // error.
+    let store = SlowHeads::new([
+        (log_key(&layout, 0), (1, not_found)),
+        (log_key(&layout, 10), (3, ObjectStoreError::Unavailable)),
+        (log_key(&layout, 20), (1, ObjectStoreError::Transport)),
+    ]);
+    for (start, end) in [(0, 9), (10, 19), (20, 29), (30, 39)] {
+        put_segment(&store.store, &layout, start, end).await;
+    }
+    let request = StoreViewRequest {
+        prefix: PREFIX,
+        from: 0,
+        front: 40,
+        local_sealed: Vec::new(),
+    };
+
+    let error = read_store_view(&store, &layout, request).await.unwrap_err();
+
+    assert!(
+        matches!(&error, ObjectStoreError::Unavailable(key) if *key == log_key(&layout, 10)),
+        "{error:?}"
+    );
+}
+
+/// A store whose HEADs each wait a turn before they answer, so HEADs that run
+/// at the same time are seen to. A HEAD of a key in `failing` waits the turns
+/// given there, then fails with the error made from its key.
+struct SlowHeads {
+    store: MemoryStore,
+    failing: HashMap<String, (usize, fn(String) -> ObjectStoreError)>,
+    in_flight: Cell<usize>,
+    most_in_flight: Cell<usize>,
+}
+
+impl SlowHeads {
+    fn new<const N: usize>(
+        failing: [(String, (usize, fn(String) -> ObjectStoreError)); N],
+    ) -> Self {
+        Self {
+            store: MemoryStore::new(),
+            failing: HashMap::from(failing),
+            in_flight: Cell::new(0),
+            most_in_flight: Cell::new(0),
+        }
+    }
+}
+
+impl ObjectStore for SlowHeads {
+    async fn put(
+        &self,
+        key: &str,
+        body: PutBody,
+        options: &PutOptions,
+    ) -> Result<(), ObjectStoreError> {
+        ObjectStore::put(&self.store, key, body, options).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<ObjectRange, ObjectStoreError> {
+        ObjectStore::get_range(&self.store, key, range).await
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+        self.in_flight.set(self.in_flight.get() + 1);
+        self.most_in_flight
+            .set(self.most_in_flight.get().max(self.in_flight.get()));
+        let failing = self.failing.get(key).copied();
+        for _ in 0..failing.map_or(1, |(turns, _)| turns) {
+            yield_to_reactor().await;
+        }
+        self.in_flight.set(self.in_flight.get() - 1);
+        match failing {
+            Some((_, error)) => Err(error(key.to_owned())),
+            None => ObjectStore::head(&self.store, key).await,
+        }
+    }
+
+    async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+        ObjectStore::delete(&self.store, keys).await
+    }
+
+    async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+        ObjectStore::list(&self.store, request).await
+    }
+}
+
+fn not_found(key: String) -> ObjectStoreError {
+    ObjectStoreError::NotFound { key }
+}
+
+fn log_key(layout: &KeyLayout, start: u64) -> String {
+    layout.segment_key(&SegmentKey {
+        prefix: PREFIX,
+        start_offset: start,
+        object: SegmentObject::Log,
+    })
 }
 
 /// A store whose head of `key` reports `size`, as a head that ran before the

@@ -59,8 +59,9 @@ pub struct StoreCallPolicy {
     pub progress_timeout: Duration,
     /// The most attempts at a call that keeps failing with a transient
     /// error, the first one included: a head, a get, a list, a delete, and a
-    /// put whose body is held in memory. A value of 1 or less retries
-    /// nothing.
+    /// create-only put whose body is held in memory. An overwrite held in
+    /// memory is sent again only when its request never left. A value of 1
+    /// or less retries nothing.
     pub max_attempts: u32,
     /// The wait before the first retry, doubled for each retry after it.
     pub retry_delay: Duration,
@@ -162,9 +163,12 @@ pub struct StoreWriter {
 /// after the last piece. A put that moves less than one piece in that time
 /// counts as stalled.
 ///
-/// A put whose body is held in memory is sent again, with the same backoff
-/// and up to the same number of attempts. Each attempt carries the same
-/// [`PUT_ID_METADATA`] entry. An attempt at a create-only put is given up
+/// A create-only put whose body is held in memory is sent again, with the
+/// same backoff and up to the same number of attempts. An overwrite is sent
+/// again only after [`ObjectStoreError::NotSent`]: an attempt that may have
+/// reached the store can land after a later overwrite of its key and roll it
+/// back, so any other failure goes to the caller. Each attempt carries the
+/// same [`PUT_ID_METADATA`] entry. An attempt at a create-only put is given up
 /// after [`StoreCallPolicy::attempt_stall_timeout`] without a piece taken, or
 /// [`StoreCallPolicy::attempt_answer_timeout`] without an answer after the
 /// last piece. An attempt at an overwrite is given up only after
@@ -437,7 +441,7 @@ where
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
-            if !worth_another_attempt(&error, options) || attempt >= self.policy.max_attempts {
+            if !worth_sending_again(&error, options) || attempt >= self.policy.max_attempts {
                 return Err(error);
             }
             debug!(
@@ -742,6 +746,17 @@ async fn next_event<T>(
         Poll::Pending
     })
     .await
+}
+
+/// Whether a whole put held in memory that failed with `error` is sent again.
+/// An overwrite that may have left can land after a later overwrite of its
+/// key, so only one that never left is.
+fn worth_sending_again(error: &ObjectStoreError, options: &PutOptions) -> bool {
+    if options.mode == PutMode::IfAbsent {
+        worth_another_attempt(error, options)
+    } else {
+        matches!(error, ObjectStoreError::NotSent(_))
+    }
 }
 
 /// Whether a put that failed with `error` can succeed when its body is sent

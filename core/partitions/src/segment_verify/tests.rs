@@ -122,6 +122,35 @@ fn transient() -> ObjectStoreError {
     ObjectStoreError::Unavailable("503".to_owned())
 }
 
+/// What a store that answers every HEAD but those of the segment at
+/// `failing`, with a transient error, reports for `segments`.
+fn failing_at(segments: &[SegmentRecord], failing: u64) -> SegmentVerifyReport {
+    let answered: Vec<SegmentHeads> = segments
+        .iter()
+        .copied()
+        .take_while(|segment| segment.start_offset != failing)
+        .map(held)
+        .collect();
+    if answered.len() == segments.len() {
+        report(answered)
+    } else {
+        unanswered(answered, failing, transient())
+    }
+}
+
+/// Run the jobs that end with the store not answering for the segment at
+/// `failing`, until the pass sets it aside.
+fn set_aside(state: &mut SegmentVerifies, stored: &[SegmentRecord], failing: u64) {
+    for id in 1..=u64::from(SEGMENT_VERIFY_ATTEMPTS) {
+        let (id, segments) = next_job(state, at(0), id, stored).expect("a job");
+        assert_eq!(segments[0].start_offset, failing);
+        let settled = state
+            .finish(id, &Ok(failing_at(&segments, failing)), chain(stored))
+            .expect("the awaited job");
+        assert!(!settled.postponed);
+    }
+}
+
 fn at(micros: u64) -> IggyTimestamp {
     IggyTimestamp::from(micros)
 }
@@ -396,6 +425,104 @@ fn given_a_transient_error_when_a_job_ends_should_find_nothing_and_check_that_se
 }
 
 #[test]
+fn given_a_segment_the_store_never_answers_when_a_pass_runs_should_check_the_others_and_count_it_neither_missing_nor_checked()
+ {
+    let stored = records(3);
+    let failing = stored[1].start_offset;
+    let mut state = SegmentVerifies::new(VIEW);
+    let mut asked = 0;
+    let mut checked = 0;
+    let mut postponed = 0;
+
+    for id in 1.. {
+        let Some((id, segments)) = next_job(&mut state, at(0), id, &stored) else {
+            break;
+        };
+        asked += segments
+            .iter()
+            .filter(|segment| segment.start_offset == failing)
+            .count();
+        let settled = state
+            .finish(id, &Ok(failing_at(&segments, failing)), chain(&stored))
+            .unwrap();
+        checked += settled.checked;
+        postponed += usize::from(settled.postponed);
+    }
+
+    assert_eq!(asked, SEGMENT_VERIFY_ATTEMPTS as usize + 1);
+    assert_eq!(checked, 2);
+    assert_eq!(postponed, 1);
+    assert_eq!((state.missing(), state.diverged()), (0, 0));
+    let (_, next_pass) = next_job(&mut state, at(interval_micros()), 99, &stored).unwrap();
+    assert_eq!(starts(&next_pass), starts(&stored));
+}
+
+#[test]
+fn given_a_segment_set_aside_when_the_store_answers_it_after_the_others_should_check_it_in_the_same_pass()
+ {
+    let stored = records(2);
+    let failing = stored[0].start_offset;
+    let mut state = SegmentVerifies::new(VIEW);
+    set_aside(&mut state, &stored, failing);
+
+    let (id, rest) = next_job(&mut state, at(0), 10, &stored).unwrap();
+    assert_eq!(starts(&rest), starts(&stored[1..]));
+    state
+        .finish(
+            id,
+            &Ok(report(rest.into_iter().map(held).collect())),
+            chain(&stored),
+        )
+        .unwrap();
+    let (id, again) = next_job(&mut state, at(0), 11, &stored).unwrap();
+    assert_eq!(starts(&again), [failing]);
+    let settled = state
+        .finish(
+            id,
+            &Ok(report(again.into_iter().map(log_missing).collect())),
+            chain(&stored),
+        )
+        .unwrap();
+
+    assert_eq!(settled.checked, 1);
+    assert_eq!(
+        settled.transitions,
+        [Transition::Found {
+            record: stored[0],
+            finding: Finding::Missing(SegmentObject::Log)
+        }]
+    );
+    assert!(matches!(
+        state.begin(at(0), 12, PREFIX, |_| Vec::new()),
+        VerifyBegin::PassEnded
+    ));
+}
+
+#[test]
+fn given_a_segment_set_aside_when_retention_trims_it_should_not_ask_for_it_again() {
+    let stored = records(2);
+    let failing = stored[0].start_offset;
+    let mut state = SegmentVerifies::new(VIEW);
+    set_aside(&mut state, &stored, failing);
+
+    state.trim(stored[0].end_offset);
+
+    let (id, rest) = next_job(&mut state, at(0), 10, &stored[1..]).unwrap();
+    assert_eq!(starts(&rest), starts(&stored[1..]));
+    state
+        .finish(
+            id,
+            &Ok(report(rest.into_iter().map(held).collect())),
+            chain(&stored[1..]),
+        )
+        .unwrap();
+    assert!(matches!(
+        state.begin(at(0), 11, PREFIX, |_| Vec::new()),
+        VerifyBegin::PassEnded
+    ));
+}
+
+#[test]
 fn given_a_permanent_error_when_a_job_ends_should_find_nothing_and_leave_that_segment_for_the_next_pass()
  {
     let stored = records(3);
@@ -619,9 +746,10 @@ fn given_findings_when_retention_trims_their_segments_should_drop_them() {
     run_job(&mut state, 1, &stored, log_missing);
     assert_eq!(state.missing(), 3);
 
-    assert_eq!(state.retain_stored(chain(&stored[2..])), 2);
+    assert_eq!(state.trim(stored[1].end_offset), 2);
 
     assert_eq!((state.missing(), state.diverged()), (1, 0));
+    assert_eq!(state.trim(stored[1].end_offset), 0);
 }
 
 #[test]

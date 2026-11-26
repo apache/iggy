@@ -149,8 +149,9 @@ where
         self.rewrite_pacing.borrow_mut().set_backlog_limit(bytes);
     }
 
-    /// Note whether the store that this shard's rewrites read is on this
-    /// node, so that its reads take this node's cores, as a filesystem does.
+    /// Note whether the store that this shard's rewrites use is on this
+    /// node, so that its reads and puts take this node's cores, as a
+    /// filesystem does.
     pub fn set_rewrite_store_on_node(&self, on_node: bool) {
         self.rewrite_pacing.borrow_mut().set_store_on_node(on_node);
     }

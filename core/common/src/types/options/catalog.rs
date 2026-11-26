@@ -976,6 +976,30 @@ pub fn drop_options_fixed_by_type(explicit: &mut ResourceOptions) -> bool {
     dropped
 }
 
+/// Store the durability that a topic's mode fixes, if it fixes one, as the
+/// derived entry of each of [`Durability::KEYS`] in the topic's stored
+/// options, which its partitions and every read of it take.
+///
+/// A topic created before its mode fixed them holds another value in a
+/// snapshot or in the log, so this runs whenever a topic's options are
+/// loaded, not only on a create. `shadow` is the mode of the peer's topic
+/// for a topic of a shadow stream, which is stored as a normal topic.
+pub fn store_fixed_durability(options: &mut ResourceOptions, shadow: Option<GeoMode>) {
+    let fixed = match shadow {
+        Some(geo_mode) => geo_mode.fixed_durability(),
+        None => TopicCreateOptions::from_resource_options(options).fixed_durability(),
+    };
+    let Some(durability) = fixed else {
+        return;
+    };
+    for key in Durability::KEYS {
+        options.insert(
+            HeaderKey::from(key),
+            OptionValue::derived(HeaderValue::from(durability)),
+        );
+    }
+}
+
 /// Validate and canonicalize a create or update options block.
 ///
 /// Checks run in a fixed order so every transport and SDK observes the same
@@ -1276,14 +1300,17 @@ pub fn project_shadow_origin(public: &mut ResourceOptions, origin: &str) -> Resu
 }
 
 /// Report a topic of a shadow stream as the geo topic it shadows, with the
-/// peer's `geo_mode` and the durability that mode fixes for messages and
-/// consumer offsets, as derived entries. The topic is stored as a normal
+/// peer's `geo_mode`, as derived entries. The topic is stored as a normal
 /// topic, so this cluster runs none of a geo topic's write path for it.
+///
+/// The durability that the mode fixes is not added here: the stored options
+/// hold it (see [`store_fixed_durability`]), so a read reports the value the
+/// topic's partitions run with.
 ///
 /// # Errors
 ///
-/// `InvalidFormat` when a value does not encode, which no topic type, mode
-/// or durability does.
+/// `InvalidFormat` when a value does not encode, which no topic type or mode
+/// does.
 pub fn project_shadow_topic(
     public: &mut ResourceOptions,
     geo_mode: GeoMode,
@@ -1296,12 +1323,6 @@ pub fn project_shadow_topic(
         HeaderKey::from(OptionKey::GeoMode),
         OptionValue::derived(geo_mode.encode()?),
     );
-    if let Some(durability) = geo_mode.fixed_durability() {
-        let value = durability.encode()?;
-        for key in Durability::KEYS {
-            public.insert(HeaderKey::from(key), OptionValue::derived(value.clone()));
-        }
-    }
     Ok(())
 }
 
@@ -1990,29 +2011,57 @@ mod tests {
     }
 
     #[test]
-    fn given_a_shadow_topic_when_projected_should_report_the_durability_its_mode_fixes() {
-        let stored: ResourceOptions = Durability::KEYS
-            .into_iter()
-            .map(|key| {
-                (
-                    HeaderKey::from(key),
-                    OptionValue::explicit(HeaderValue::try_from("replicated").unwrap()),
-                )
-            })
-            .collect();
+    fn given_stored_replicated_durabilities_when_storing_the_fixed_durability_should_replace_them_only_where_the_mode_fixes_them()
+     {
+        let stored = |entries: &[(OptionKey, &str)]| -> ResourceOptions {
+            entries
+                .iter()
+                .chain(&[
+                    (OptionKey::Durability, "replicated"),
+                    (OptionKey::ConsumerOffsetDurability, "replicated"),
+                ])
+                .map(|(key, value)| {
+                    (
+                        HeaderKey::from(*key),
+                        OptionValue::explicit(HeaderValue::try_from(*value).unwrap()),
+                    )
+                })
+                .collect()
+        };
+        let geo = stored(&[(OptionKey::TopicType, "geo")]);
+        let geo_tiered = stored(&[
+            (OptionKey::TopicType, "geo"),
+            (OptionKey::GeoMode, "geo_tiered"),
+        ]);
+        let normal = stored(&[]);
 
-        let mut geo = stored.clone();
-        project_shadow_topic(&mut geo, GeoMode::Geo).unwrap();
-        let mut geo_tiered = stored.clone();
-        project_shadow_topic(&mut geo_tiered, GeoMode::GeoTiered).unwrap();
-        for key in Durability::KEYS {
-            let key = HeaderKey::from(key);
-            assert_eq!(
-                geo.get(&key).cloned(),
-                derived_entry("persisted"),
-                "{key:?}"
-            );
-            assert_eq!(geo_tiered.get(&key), stored.get(&key), "{key:?}");
+        for (case, mut options, shadow, fixed) in [
+            ("geo", geo, None, true),
+            ("geo_tiered", geo_tiered, None, false),
+            ("normal", normal.clone(), None, false),
+            ("shadow of geo", normal.clone(), Some(GeoMode::Geo), true),
+            (
+                "shadow of geo_tiered",
+                normal,
+                Some(GeoMode::GeoTiered),
+                false,
+            ),
+        ] {
+            let before = options.clone();
+            store_fixed_durability(&mut options, shadow);
+            if let Some(geo_mode) = shadow {
+                // A read of a shadow topic reports what is stored.
+                project_shadow_topic(&mut options, geo_mode).unwrap();
+            }
+            for key in Durability::KEYS {
+                let key = HeaderKey::from(key);
+                let expected = if fixed {
+                    derived_entry("persisted")
+                } else {
+                    before.get(&key).cloned()
+                };
+                assert_eq!(options.get(&key).cloned(), expected, "{case} {key:?}");
+            }
         }
     }
 
