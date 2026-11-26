@@ -625,15 +625,26 @@ or, on a store that keeps no CRC32C, with another hash in its metadata, counts
 as diverged, and so does an `.index` that is not a whole number of entries. The
 node logs each such segment once as an error when it finds it, and once more
 when a later check finds it as recorded again. It repairs, deletes and fences
-nothing. A store error is no finding: after a timeout, a 5xx answer or
-throttling the next job checks the segment again, and after any other error
-the next pass does. Each shard exports `partition_segment_verify_passes_total`,
+nothing. A store error is no finding, and the segment counts as neither
+missing nor verified. After a timeout, a 5xx answer or throttling, the next
+job asks for the segment again, until 3 jobs in a row got no answer for it.
+The pass then goes on with the next segments, and asks for it once more after
+the last of them. After any other error, or when that last ask fails too, the
+next pass checks the segment. Each shard exports
+`partition_segment_verify_passes_total`,
 `partition_stored_segments_verified_total`, and the gauges
 `partition_stored_segments_missing` and `partition_stored_segments_diverged`
 over the partitions it leads, which drop to 0 when it stops leading them. No
 provider computes a CRC32C again on a HEAD, so the check compares what the
 store recorded when it took the object, not the bytes it holds now: a byte that
 flips inside an object file of the `fs` backend is not found.
+
+Each run of the message cleaner starts the next job of each partition's pass,
+as it starts the manifest publish, the object deletes and the retention of a
+tiered topic. A node with `cleaner_enabled = false` in
+`[data_maintenance.messages]` checks no segment, and its
+`partition_stored_segments_missing` and `partition_stored_segments_diverged`
+stay at 0 whatever the store lost.
 
 The `fs` backend keeps the objects in a directory. The `s3` backend keeps them
 in a bucket on AWS S3 or on a store with its API, such as Ceph RGW or R2. With
