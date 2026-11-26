@@ -144,6 +144,8 @@ shadow topic. A message becomes readable in another datacenter once its origin p
    Polls in this cluster read it at once. The shard that stored the object holds it in memory
    until the long-term segment below takes its messages, even with `read_cache_size` at 0, and
    other polls read the bucket through the shard's read cache, `[tiered_storage] read_cache_size`.
+   When the cache needs the room for newer objects first, it lets an object go before that, and
+   polls of its messages read them from the bucket.
 5. In the background, the partition's primary rewrites committed messages into **long-term
    segments** in the bucket, at most 64 MiB each, and commits each one to the partition's
    long-term log. It then stores the partition's **manifest**,

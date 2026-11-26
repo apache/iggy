@@ -13269,11 +13269,10 @@ where
             proofs.want();
         }
         if let Some(remote) = &self.remote_segments {
-            let last = u64::from(batch_stats.message_count).saturating_sub(1);
             remote.note_fresh_commit(
                 self.namespace(),
                 placement.object_id,
-                batch_stats.base_offset + last,
+                batch_stats.end_offset(),
             );
         }
     }

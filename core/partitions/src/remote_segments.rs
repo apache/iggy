@@ -457,9 +457,9 @@ impl RemoteSegments {
     /// Keep the end of the long-term segment that a rewrite just stored, its
     /// `.log` bytes `log` read by `segment`, and its `index`, when the cache
     /// keeps what reads fetch.
-    pub(crate) fn carry_long_term(&self, segment: &RemoteRange, log: &[u8], index: &[u8]) {
+    pub(crate) async fn carry_long_term(&self, segment: &RemoteRange, log: &[u8], index: &[u8]) {
         if let Some(blocks) = self.fetched_into_cache() {
-            blocks.carry_segment(segment, log, index);
+            blocks.carry_segment(segment, log, index).await;
         }
     }
 

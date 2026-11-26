@@ -53,8 +53,10 @@ use iggy_object_store::{
 };
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
+use server_common::yield_to_reactor;
 use tracing::error;
 
+use crate::placed_read::REWRITE_YIELD_BYTES;
 use crate::poll_plan::DiskFault;
 use crate::remote_segments::{RemoteObjects, RemoteRange, fault};
 
@@ -151,8 +153,9 @@ pub struct RemoteReadMetrics {
     /// Bytes of the fresh objects the shard uploaded that the cache holds
     /// now for the polls of their partitions.
     pub held_bytes: u64,
-    /// Fresh objects that the cache stopped holding once the long-term
-    /// floors of their partitions passed them.
+    /// Fresh objects that the cache stopped holding: once the long-term
+    /// floors of their partitions passed them, once every send in them was
+    /// answered and none committed, or once their partitions left the shard.
     pub fresh_releases: u64,
     /// Bytes of long-term segments that rewrites handed to the cache as they
     /// stored them.
@@ -207,6 +210,10 @@ pub struct ReadCache {
     readers: RefCell<Readers>,
     counted: Cell<RemoteReadMetrics>,
     held: RefCell<HeldFresh>,
+    /// The blocks and objects that rewrites handed over and nobody read yet.
+    /// They wait in the part of readahead, and their first reads are no
+    /// readahead hits.
+    carried: RefCell<BTreeSet<CacheKey>>,
     /// The partitions with GETs in flight, by how many, and whether the
     /// partition left the shard since, so what those GETs fetch is not kept.
     fetches_of: RefCell<BTreeMap<ReadOwner, OwnerFetches>>,
@@ -246,6 +253,7 @@ impl ReadCache {
             readers: RefCell::default(),
             counted: Cell::default(),
             held: RefCell::default(),
+            carried: RefCell::default(),
             fetches_of: RefCell::default(),
         })
     }
@@ -398,18 +406,21 @@ impl ReadCache {
         partitions: impl IntoIterator<Item = IggyNamespace>,
     ) {
         let mut cache = self.cache.borrow_mut();
-        let Some((bytes, taken)) = held_within(bytes, cache.budget()) else {
+        let Some((bytes, taken)) = held_within(bytes, cache.held_limit()) else {
             return;
         };
         cache.insert(key, bytes, taken, Admission::Held);
         let mut held = self.held.borrow_mut();
-        // The cache releases held objects on its own once they take too much
-        // of it, the oldest first, so the oldest rows are the ones it let go.
-        while let Some((oldest, _)) = held.objects.first_key_value()
-            && !cache.is_held(&CacheKey::Whole(ObjectId::own_fresh(*oldest)))
-        {
-            let oldest = *oldest;
-            held.drop_object(oldest);
+        // Uploads end in any order, so the objects the cache let go of are
+        // not the ones with the lowest ids.
+        for let_go in cache.take_let_go() {
+            if let CacheKey::Whole(ObjectId {
+                name: ObjectName::Fresh(object_id),
+                ..
+            }) = let_go
+            {
+                held.drop_object(object_id);
+            }
         }
         if cache.is_held(&key) {
             held.objects.insert(
@@ -465,7 +476,9 @@ impl ReadCache {
                 match cache.read(&key) {
                     Lookup::Hit(bytes) => Some(bytes),
                     Lookup::AheadHit(bytes) => {
-                        counted.read_ahead_hits += 1;
+                        if !self.first_carried_read(&key) {
+                            counted.read_ahead_hits += 1;
+                        }
                         sequential |= index == first;
                         Some(bytes)
                     }
@@ -496,11 +509,16 @@ impl ReadCache {
 
     /// Whether a GET of readahead for `keys` would fetch anything that the
     /// cache or a GET that reads wait for does not hold already.
-    fn wants_ahead(&self, keys: &[CacheKey]) -> bool {
+    fn wants_ahead(&self, mut keys: impl Iterator<Item = CacheKey>) -> bool {
         let cache = self.cache.borrow();
         let fetching = self.fetching.borrow();
-        keys.iter()
-            .any(|key| !cache.holds(key) && !fetching.contains_key(key))
+        keys.any(|key| !cache.holds(&key) && !fetching.contains_key(&key))
+    }
+
+    /// Whether `key` is a first read of what a rewrite handed over, which
+    /// readahead did not fetch. Its next reads are none.
+    fn first_carried_read(&self, key: &CacheKey) -> bool {
+        self.carried.borrow_mut().remove(key)
     }
 
     /// Keep what a GET of `kind` for `owner` fetched of `object`, unless the
@@ -524,13 +542,15 @@ impl ReadCache {
             .is_some_and(|fetches| fetches.gone);
         if !gone {
             let mut cache = self.cache.borrow_mut();
-            fetched.for_each_key(object, blocks, |key, bytes| {
+            let mut carried = self.carried.borrow_mut();
+            for (key, bytes) in fetched.keys(object).zip(blocks) {
                 // Readahead may have fetched it meanwhile, and then the read
                 // that this GET was for is its first.
                 if kind == FetchKind::Ahead || matches!(cache.read(&key), Lookup::Miss) {
+                    carried.remove(&key);
                     cache.insert_owned(key, bytes.clone(), bytes.len(), admission, owner);
                 }
-            });
+            }
         }
         let bytes: u64 = blocks.iter().map(|bytes| bytes.len() as u64).sum();
         let mut counted = self.counted.get();
@@ -781,11 +801,17 @@ impl RemoteBlocks {
     /// Keep what a reader just behind a rewrite reads next of the long-term
     /// segment the rewrite stored: its whole `index`, and the end of its
     /// `log`, as much as waits for a reader in the part of the cache that
-    /// readahead takes. `source` reads the segment's `.log`.
+    /// readahead takes beside the index. `source` reads the segment's
+    /// `.log`.
     ///
     /// They count towards the limit of the segment's partition, as of its
     /// last read, and take at most an eighth of it.
-    pub(crate) fn carry_segment(&self, source: &RemoteRange, log: &[u8], index: &[u8]) {
+    ///
+    /// The tail is copied [`REWRITE_YIELD_BYTES`] at a time, with a yield to
+    /// the shard's other tasks between two, and the cache free for them. The
+    /// index goes in last, so it is the newest of what waits there and the
+    /// last of it to go.
+    pub(crate) async fn carry_segment(&self, source: &RemoteRange, log: &[u8], index: &[u8]) {
         let Ok(identity) = self.admit() else {
             return;
         };
@@ -803,11 +829,13 @@ impl RemoteBlocks {
             ..object
         };
         let block_bytes = self.cache.block_bytes;
-        let mut cache = self.cache.cache.borrow_mut();
-        let budget = cache.budget();
-        let room = cache
-            .limit(&owner)
-            .map_or(budget, |limit| limit.min(budget));
+        let room = {
+            let cache = self.cache.cache.borrow();
+            let budget = cache.budget();
+            cache
+                .limit(&owner)
+                .map_or(budget, |limit| limit.min(budget))
+        };
         if (room as u64) < LIMIT_BLOCKS_MIN.saturating_mul(block_bytes) {
             return;
         }
@@ -823,23 +851,47 @@ impl RemoteBlocks {
         else {
             return;
         };
+        let block_len = usize::try_from(block_bytes).unwrap_or(usize::MAX);
+        let mut blocks = (first..).zip(tail.chunks(block_len)).peekable();
+        while blocks.peek().is_some() {
+            {
+                let mut cache = self.cache.cache.borrow_mut();
+                let mut carried = self.cache.carried.borrow_mut();
+                let mut copied = 0;
+                for (index, block) in blocks.by_ref() {
+                    let key = CacheKey::Block { object, index };
+                    carried.insert(key);
+                    cache.insert_owned(
+                        key,
+                        Bytes::copy_from_slice(block),
+                        block.len(),
+                        Admission::Ahead,
+                        owner,
+                    );
+                    copied += block.len();
+                    if copied >= REWRITE_YIELD_BYTES {
+                        break;
+                    }
+                }
+            }
+            if blocks.peek().is_some() {
+                yield_to_reactor().await;
+            }
+        }
+        let index_key = CacheKey::Whole(index_object);
+        let mut cache = self.cache.cache.borrow_mut();
+        let mut carried = self.cache.carried.borrow_mut();
+        carried.insert(index_key);
         cache.insert_owned(
-            CacheKey::Whole(index_object),
+            index_key,
             Bytes::copy_from_slice(index),
             index.len(),
             Admission::Ahead,
             owner,
         );
-        let block_len = usize::try_from(block_bytes).unwrap_or(usize::MAX);
-        for (index, block) in (first..).zip(tail.chunks(block_len)) {
-            cache.insert_owned(
-                CacheKey::Block { object, index },
-                Bytes::copy_from_slice(block),
-                block.len(),
-                Admission::Ahead,
-                owner,
-            );
-        }
+        // Only what the cache still holds may be read as handed over.
+        carried.retain(|key| cache.holds(key));
+        drop((cache, carried));
         let mut counted = self.cache.counted.get();
         counted.carried_bytes += (index.len() + tail.len()) as u64;
         self.cache.counted.set(counted);
@@ -926,7 +978,9 @@ impl RemoteBlocks {
         let found = match cached {
             Lookup::Hit(bytes) => Some(bytes),
             Lookup::AheadHit(bytes) => {
-                counted.read_ahead_hits += 1;
+                if !self.cache.first_carried_read(&whole) {
+                    counted.read_ahead_hits += 1;
+                }
                 Some(bytes)
             }
             Lookup::Miss => None,
@@ -1011,7 +1065,10 @@ impl RemoteBlocks {
         let reach = last.saturating_add(window);
         let through = reach.min(last_block);
         self.fetch_ahead(owner, object, key_of, last + 1..=through);
-        let Some((next, next_key_of)) = next.filter(|_| reach > through) else {
+        // A reader that reached the end of the object, or whose readahead
+        // did, goes on in `next`, even one that takes each object in one
+        // read and so never had a window.
+        let Some((next, next_key_of)) = next.filter(|_| reach >= last_block) else {
             return;
         };
         let Some(next_last) = next.last_block(block_bytes) else {
@@ -1024,12 +1081,14 @@ impl RemoteBlocks {
             poll_offset,
             window,
         });
-        self.fetch_ahead(
-            owner,
-            next,
-            next_key_of,
-            0..=(reach - through - 1).min(next_last),
-        );
+        if reach > through {
+            self.fetch_ahead(
+                owner,
+                next,
+                next_key_of,
+                0..=(reach - through - 1).min(next_last),
+            );
+        }
     }
 
     /// Fetch the ones of `blocks` of `object` that no cache or GET holds,
@@ -1327,37 +1386,15 @@ impl Fetched {
         }
     }
 
-    /// The keys this lists in the flights of `object`.
-    fn keys(&self, object: ObjectId) -> Vec<CacheKey> {
-        match self {
-            Self::Blocks(run) => run
-                .clone()
-                .map(|index| CacheKey::Block { object, index })
-                .collect(),
-            Self::Whole { .. } => vec![CacheKey::Whole(object)],
-        }
-    }
-
-    /// Hand `each` the key of every block or object this fetched of
-    /// `object`, with its bytes.
-    fn for_each_key(
-        &self,
-        object: ObjectId,
-        blocks: &[Bytes],
-        mut each: impl FnMut(CacheKey, &Bytes),
-    ) {
-        match self {
-            Self::Blocks(run) => {
-                for (index, bytes) in run.clone().zip(blocks) {
-                    each(CacheKey::Block { object, index }, bytes);
-                }
-            }
-            Self::Whole { .. } => {
-                if let Some(bytes) = blocks.first() {
-                    each(CacheKey::Whole(object), bytes);
-                }
-            }
-        }
+    /// The key of every block or object this fetches of `object`, in the
+    /// order of the bytes a GET of it returns.
+    fn keys(&self, object: ObjectId) -> impl Iterator<Item = CacheKey> + use<> {
+        let (run, whole) = match self {
+            Self::Blocks(run) => (run.clone(), None),
+            Self::Whole { .. } => (0..0, Some(CacheKey::Whole(object))),
+        };
+        run.map(move |index| CacheKey::Block { object, index })
+            .chain(whole)
     }
 }
 
@@ -1424,7 +1461,7 @@ impl Flight {
             FetchKind::Demand => cache
                 .fetching
                 .borrow_mut()
-                .extend(keys.into_iter().map(|key| (key, fetch.clone()))),
+                .extend(keys.map(|key| (key, fetch.clone()))),
             FetchKind::Ahead => {
                 cache.fetching_ahead.borrow_mut().extend(keys);
                 cache.ahead_fetches.set(cache.ahead_fetches.get() + 1);
@@ -1463,7 +1500,7 @@ impl Flight {
             FetchKind::Ahead => {
                 let cache = Rc::clone(&self.cache);
                 let keys = self.fetched.keys(self.object);
-                let wanted = Box::new(move || cache.wants_ahead(&keys));
+                let wanted = Box::new(move || cache.wants_ahead(keys));
                 match self.objects.get_range_if(key, range.clone(), wanted).await {
                     Ok(Some(fetched)) => fetched,
                     Ok(None) | Err(_) => return Err(DiskFault::Retryable),
@@ -2592,7 +2629,9 @@ mod tests {
         };
         let index = vec![7_u8; 4096];
 
-        remote.carry_long_term(&source, &object(LOG_LEN), &index);
+        remote
+            .carry_long_term(&source, &object(LOG_LEN), &index)
+            .await;
 
         assert_eq!(
             remote
@@ -2601,6 +2640,99 @@ mod tests {
             Ok(Bytes::from(index))
         );
         assert_eq!(store.asked(), []);
+    }
+
+    /// A rewrite hands a long tail over a stride at a time, and the cache is
+    /// free for the shard's other tasks between two.
+    #[compio::test]
+    async fn given_a_tail_of_three_strides_when_carrying_it_should_yield_between_them_with_the_cache_free()
+     {
+        const STRIDES: usize = 3;
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let log_len = (STRIDES * REWRITE_YIELD_BYTES) as u64;
+        let source = RemoteRange {
+            keyed_end_offset: Some(9),
+            ..source_of(0, log_len)
+        };
+        let log = object(log_len);
+        let mut carrying = std::pin::pin!(remote.carry_long_term(&source, &log, b"index"));
+
+        let mut polls = 0;
+        loop {
+            polls += 1;
+            if futures::poll!(carrying.as_mut()).is_ready() {
+                break;
+            }
+            // Another task of the shard reads the cache meanwhile.
+            assert_eq!(read_cache(&remote).take_metrics().carried_bytes, 0);
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(polls, STRIDES);
+        assert_eq!(
+            read_cache(&remote).take_metrics().carried_bytes,
+            log_len + 5
+        );
+    }
+
+    /// What a rewrite handed over is no readahead, so its first reads count
+    /// as plain hits.
+    #[compio::test]
+    async fn given_a_carried_segment_when_reading_it_should_count_no_readahead_hits() {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let source = RemoteRange {
+            keyed_end_offset: Some(9),
+            ..source()
+        };
+        remote
+            .carry_long_term(&source, &object(OBJECT_LEN), b"index")
+            .await;
+        let _ = read_cache(&remote).take_metrics();
+
+        assert_eq!(
+            read_of(&remote, &source, 0..OBJECT_LEN).await,
+            Ok(expected(0..OBJECT_LEN))
+        );
+        assert_eq!(
+            remote
+                .read_long_term_index(&source, 5, PartitionReadSettings::SHARD)
+                .await,
+            Ok(Bytes::from_static(b"index"))
+        );
+
+        let metrics = read_cache(&remote).take_metrics();
+        assert_eq!(metrics.read_ahead_hits, 0);
+        assert_eq!(metrics.block_hits, 7);
+        assert_eq!(store.asked(), []);
+    }
+
+    /// A reader that takes each object in one read reaches the end of each,
+    /// and goes on into the next with readahead.
+    #[compio::test]
+    async fn given_a_reader_that_reads_each_object_whole_when_it_names_the_next_should_fetch_ahead_into_the_one_after()
+     {
+        let store = Store::holding(OBJECT_LEN);
+        let ahead = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, ahead.clone(), CACHE_BYTES, READ_AHEAD);
+        let first = source_of(0, 2 * BLOCK);
+        let second = source_of(1000, 2 * BLOCK);
+        let third = source_of(2000, 4 * BLOCK);
+
+        for (source, next) in [(&first, &second), (&second, &third)] {
+            assert_eq!(
+                read_on(&remote, source, 0..2 * BLOCK, next).await,
+                Ok(expected(0..2 * BLOCK))
+            );
+        }
+        settle().await;
+
+        assert_eq!(
+            *ahead.asked_keys.borrow(),
+            [layout().segment_key(&third.key)]
+        );
+        assert_eq!(ahead.asked(), [(0, 2 * BLOCK)]);
     }
 
     #[compio::test]
@@ -3018,6 +3150,29 @@ mod tests {
         let shared = Bytes::from(vec![0; 10]);
         let _other_owner = shared.clone();
         assert_eq!(held_within(shared, 10).map(|(_, taken)| taken), Some(10));
+    }
+
+    /// Uploads end in any order, so the object the cache lets go of past
+    /// the held share can be any of those it holds. Its rows go with it.
+    #[compio::test]
+    async fn given_objects_held_out_of_id_order_when_the_cache_lets_one_go_should_drop_its_rows() {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), 8 * BLOCK_LEN, 0);
+        for object_id in [10, 3, 4, 5, 6, 7, 8] {
+            remote.cache_fresh_object(object_id, object(BLOCK), [partition(1)]);
+        }
+
+        remote.cache_fresh_object(9, object(BLOCK), [partition(1)]);
+
+        let rows: Vec<u128> = read_cache(&remote)
+            .held
+            .borrow()
+            .objects
+            .keys()
+            .copied()
+            .collect();
+        assert_eq!(rows, [3, 4, 5, 6, 7, 8, 9]);
+        assert!(!remote.holds_fresh_object(10));
     }
 
     #[compio::test]
@@ -3592,15 +3747,15 @@ mod tests {
         let segment = source_of(0, 40 * BLOCK);
         let log = object(40 * BLOCK);
 
-        remote.carry_long_term(&segment, &log, b"index");
+        remote.carry_long_term(&segment, &log, b"index").await;
         let unlimited = read_cache(&remote).take_metrics().carried_bytes;
         read_as(&remote, &segment, 0..10, limited(16))
             .await
             .unwrap();
-        remote.carry_long_term(&segment, &log, b"index");
+        remote.carry_long_term(&segment, &log, b"index").await;
         let within_limit = read_cache(&remote).take_metrics().carried_bytes;
         read_as(&remote, &segment, 0..10, limited(7)).await.unwrap();
-        remote.carry_long_term(&segment, &log, b"index");
+        remote.carry_long_term(&segment, &log, b"index").await;
 
         // The index takes its room in the eighth, a block of the tail.
         assert_eq!(unlimited, CACHE_BYTES as u64 / 8 - BLOCK + 5);
