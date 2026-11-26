@@ -732,7 +732,7 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     // Before the delete pass, so it starts the orphans the last sweep found
     // due.
     ctx.orphan_sweep
-        .pass(&ctx.shard, &ctx.incarnation_deletes, now);
+        .pass(&ctx.shard, &ctx.incarnation_deletes, now, Instant::now());
     ctx.incarnation_deletes.pass(&ctx.shard, now);
     ctx.geo_topics.pass(&ctx.shard, now);
     ctx.shadow_topics.pass(&ctx.shard, now);

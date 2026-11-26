@@ -657,9 +657,9 @@ deletes them. So shard 0 of the caught-up metadata primary sweeps
 the root of the store, while its node passes the store identity check
 described below:
 
-- It reads the revision that committed metadata reached, then the store
-  identity object, then lists every key under the prefix, in housekeeping
-  jobs of at most 16 pages of 1,000 keys.
+- It reads the revision that committed metadata reached and the partition
+  incarnations it holds, then the store identity object, then lists every key
+  under the prefix, in housekeeping jobs of at most 16 pages of 1,000 keys.
 - It sorts the keys by partition incarnation: stream, topic, partition and
   the revision the partition was created at. An incarnation is an orphan when
   committed metadata holds no partition of it and its revision is not above
@@ -667,17 +667,26 @@ described below:
 - It deletes an orphan only once full sweeps in a row of the same primary
   process found the same objects of it, by their number and the time the
   store gives the newest, for `[tiered_storage] orphan_grace`, 6 hours by
-  default. The grace runs on the clock of the primary, from the start of the
-  second of those sweeps, so a clock of the primary that is ahead of the
-  store's does not shorten it, and a new object of the orphan starts it again.
+  default. The grace runs on the monotonic clock of the primary, from the
+  start of the second of those sweeps, so neither a clock of the primary that
+  is ahead of the store's nor a step of its wall clock shortens it, and a new
+  object of the orphan starts it again.
 - The delete goes through the same queue as a committed delete, in turns
   that each list at most 4 pages of the incarnation and give the delete slot
-  back between them. Every turn checks committed metadata and reads the store
-  identity object again, and deletes nothing when it changed. The first turns
-  list the whole incarnation and delete nothing. The turns after them list it
-  again and delete what they listed, each `.index` before any `.log` and the
-  manifest last. A turn that finds a long-term segment, a geo topic object, or
-  an object newer than the sweeps found or no newer than the claim ends the
+  back between them. Orphans take at most a quarter of the queue, so the rest
+  stays free for committed deletes. Every turn checks committed metadata and
+  the view of the primary, and reads the claim of the store identity object
+  again: a turn whose claim names another cluster, sits in another object, or
+  was committed at another moment deletes nothing. The first turns list the
+  whole incarnation and delete nothing. The turns after them list it again
+  and delete what each of them listed, in this order within the turn: every
+  `.index` it listed, then every `.log` it listed. The manifest goes after the
+  last of those turns, once its listing ended and every segment object it
+  listed is gone, so the manifest is the last object of the incarnation to go.
+  That turn deletes the manifest by its key even when the listing found none,
+  so an unlink of the filesystem backend whose directory sync failed is made
+  durable. A turn that finds a long-term segment, a geo topic object, or an
+  object newer than the sweeps found or no newer than the claim ends the
   delete.
 - The primary sweeps every hour, or every `orphan_grace` when that is shorter.
   `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
@@ -698,9 +707,13 @@ The sweep never deletes:
   store identity check, and stops when the identity object it reads names
   another cluster.
 - An incarnation with an object that is no newer than this cluster's claim of
-  the prefix, the time the store gives the identity object, as what a retired
-  cluster left before a recovery. The node logs such incarnations as a warning
-  and leaves them to an operator.
+  the prefix, the time the store gives the identity object, compared in whole
+  seconds, as what a retired cluster left before a recovery. An object from
+  the second of the claim counts as older than it, as a store can give a
+  listing a finer time than a HEAD. A repair or a recovery that puts the
+  identity object again moves the claim later, so objects that this cluster
+  wrote before then count as older than the claim as well. The node logs such
+  incarnations as a warning and leaves them to an operator.
 - A key that is not the key of a segment object or a manifest.
 
 Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
@@ -712,10 +725,12 @@ stopped at a store identity object other than the one they expected. Only
 shard 0 of the metadata primary moves them. A sweep costs a HEAD and a read of
 the identity object and one listing request per 1,000 keys under the prefix,
 fresh objects and the keys of other prefixes nested in it included. The delete
-of an orphan lists the incarnation twice, and costs a read of the identity
-object per turn, a HEAD of its geo topic object per turn that deletes and at
-the end of the first listing, a HEAD of its manifest at the end of each
-listing, and the deletes.
+of an orphan lists the incarnation twice, and costs a HEAD and a read of the
+identity object per turn, a listing of the key of its geo topic object per
+turn that deletes and at the end of the first listing, a listing of the key
+of its manifest at the end of each listing, and the deletes. It lists those
+keys rather than asking for a HEAD, as a policy scoped to a prefix can refuse
+the HEAD of an absent key.
 
 Restoring metadata while tiered storage is in use is not supported. If
 metadata is rolled back or restored under the same cluster id, the
