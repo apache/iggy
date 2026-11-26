@@ -1586,10 +1586,13 @@ handshake_grace = "10 s"
 #read_cache_block_size = "256 KiB"
 # When polls read a segment in order, the shard fetches up to this many bytes
 # past the last poll before a poll asks for them, in whole blocks. These
-# fetches take the speculative fetch caps of [tiered_storage.jobs] and start
-# only while no poll waits for the store. "0" turns readahead off. Otherwise
-# at least 2 blocks, and at most an eighth of 'read_cache_size', the part of
-# the cache where the fetched bytes wait for their poll.
+# fetches take the speculative fetch caps of [tiered_storage.jobs]: at most
+# 'speculative_fetches' of them at once, each at most
+# 'speculative_fetch_bytes'. One starts only while no fetch that a poll waits
+# for is queued, and it can run beside the ones that already run. "0" turns
+# readahead off. Otherwise at least 2 blocks, and at most an eighth of
+# 'read_cache_size', the part of the cache where the fetched bytes wait for
+# their poll.
 #read_ahead = "2 MiB"
 # The shortest time between the starts of two uploads of fresh objects on one
 # shard, so a shard creates at most one object per interval, plus the objects

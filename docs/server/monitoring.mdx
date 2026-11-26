@@ -39,6 +39,21 @@ Each shard also exports its own lower-level metrics, labelled `shard="<id>"`. Th
 curl -s -H "Authorization: Bearer <token>" http://localhost:3000/metrics | grep '^# HELP'
 ```
 
+With tiered storage or geo peers, the `remote_read_*` series show the cache of what each shard read from object stores:
+
+| Metric | Type | What it counts |
+|--------|------|----------------|
+| `remote_read_block_hits_total` | counter | Blocks that polls took from the cache |
+| `remote_read_block_misses_total` | counter | Blocks that polls fetched, or waited for while another poll fetched them |
+| `remote_read_ahead_hits_total` | counter | First reads of blocks that readahead fetched |
+| `remote_read_blocks_fetched_ahead_total` | counter | Blocks that readahead fetched |
+| `remote_read_demand_bytes_total` | counter | Bytes of the store reads that polls waited for |
+| `remote_read_ahead_bytes_total` | counter | Bytes of the store reads of readahead |
+| `remote_read_fresh_releases_total` | counter | Fresh objects the cache stopped holding once the long-term floors of their partitions passed them |
+| `remote_read_carried_bytes_total` | counter | Bytes of long-term segments that rewrites handed to the cache as they stored them |
+| `remote_read_cache_bytes` | gauge | Bytes that the cache holds |
+| `remote_read_held_bytes` | gauge | Bytes of the fresh objects the shard uploaded that the cache holds for the polls of their partitions |
+
 ## What to alert on
 
 - **`frame_drops_total{variant="forward_client_send"}`.** Any increase means a client never got a reply to a request. Most other `frame_drops_total` variants are retried or repaired automatically. This series only appears after the first drop, so on a healthy server it won't be in the scrape at all. Write the alert so that a missing series counts as no drops.
