@@ -4120,7 +4120,7 @@ mod tests {
         }
 
         // The index takes its room in the eighth, a block of the tail.
-        let tail = CACHE_BYTES / 8 - LARGE_BLOCK as usize;
+        let tail = CACHE_BYTES / 8 - usize::try_from(LARGE_BLOCK).unwrap();
         assert_eq!(
             read_cache(&remote).take_metrics().carried_bytes,
             tail as u64 + 5

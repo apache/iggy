@@ -368,7 +368,7 @@ where
     /// Run a rewrite pass over `namespace` on the pump, and set when its
     /// next one is due. A shard without a writer, and a partition that is
     /// gone, drop out of the passes the tick starts.
-    #[allow(clippy::future_not_send)]
+    #[allow(clippy::future_not_send, clippy::too_many_lines)]
     async fn run_rewrite_pass(&self, namespace: IggyNamespace, created_revision: u64)
     where
         B: Clone,
