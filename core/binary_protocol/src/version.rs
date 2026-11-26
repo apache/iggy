@@ -133,8 +133,16 @@ pub const IGGY_PROTOCOL_VERSION: u32 = pack_protocol_version(0, 12, 3);
 /// table transfer carries each session's token. Revision 5 lets a `ReplicaHello`
 /// carry, as its body, the identities of the releases its sender lists as
 /// compatible. An earlier build ignores that body, so it must never match a
-/// listed identity.
-pub const REPLICA_WIRE_REVISION: u32 = 5;
+/// listed identity. Revision 6 adds a `ShadowTopic` kind that sets the read
+/// cache options of a shadow topic, lets an update of a geo topic set
+/// `read_cache_size` and `read_ahead`, refuses at commit a topic update that
+/// leaves that pair invalid, stores persisted durability for the consumer
+/// offsets of geo and shadow topics, and sends in a partition state transfer
+/// every segment of the stored front as its chain record alone, even while
+/// its `.log` is still on the sender's disk. An earlier build cannot decode
+/// the new kind, and it reaches other verdicts and stores other options for
+/// the same metadata operations.
+pub const REPLICA_WIRE_REVISION: u32 = 6;
 
 /// Oldest protocol version this build accepts at login.
 ///

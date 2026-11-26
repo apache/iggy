@@ -84,6 +84,8 @@ When moving from a storage marker older than `IGGY-TIERED-SEGMENT-CHAIN-2`, star
 
 Replica wire revision 5 lets a ReplicaHello carry the identities of the releases its sender lists as compatible. To move from revision 4 to 5 on `IGGY-TIERED-SEGMENT-CHAIN-2`, stop every node, keep its data directory and restart all nodes on the new build. See [Upgrade recovery](#upgrade-recovery).
 
+Replica wire revision 6 replicates the read cache options of topics and shadow topics and the persisted consumer offset durability of geo topics, and its partition state transfer sends every segment that the store holds as its chain record alone. To move from revision 4 or 5 to 6 on `IGGY-TIERED-SEGMENT-CHAIN-2`, stop every node, keep its data directory and restart all nodes on the new build.
+
 For an older storage marker, use an offline cutover with logical re-ingestion:
 
 1. Stop application writes, consumers that advance offsets, and administrative
@@ -1525,11 +1527,11 @@ A peer on another release is admitted only when the release compatibility table 
 
 A node with a row sends the identities of its listed releases in its ReplicaHello and runs the link under the identity of the listed release, so the other node needs no knowledge of the first one.
 
-This checkout accepts client protocol 0.12.3 at login. Replica wire revision 5 is checked separately when servers connect.
+This checkout accepts client protocol 0.12.3 at login. Replica wire revision 6 is checked separately when servers connect.
 
 REST has no version handshake, so a 0.11 HTTP client is not refused at login. A create body that sends an option beside `options`, such as a top-level `message_expiry`, and an update body with a nested member, such as the `{"name": ..., "options": {}}` stream update older SDKs send, are refused with `InvalidCommand` (3), and the error's `field` names the member.
 
-Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Upgrades from an incompatible storage or snapshot format require fresh storage on every replica. A revision 4 cluster already on the current storage marker and snapshot format can reuse its directories in a coordinated restart to revision 5.
+Metadata snapshot format 21 is the only readable format. Registration, password changes and client-table receipts use the new replicated layouts. Upgrades from an incompatible storage or snapshot format require fresh storage on every replica. A revision 4 or 5 cluster already on the current storage marker and snapshot format can reuse its directories in a coordinated restart to revision 6.
 
 The protocol number is independent of server and SDK package versions. Its
 current and minimum values are maintained manually for stable releases. The

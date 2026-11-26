@@ -273,7 +273,7 @@ mod tests {
                 consensus::client_table::CLIENT_TABLE_MAGIC,
                 consensus::state_manifest::STATE_MANIFEST_MAGIC
             ),
-            (5, 21, 21, *b"ICT6", *b"ISM1")
+            (6, 21, 21, *b"ICT6", *b"ISM1")
         );
     }
 
