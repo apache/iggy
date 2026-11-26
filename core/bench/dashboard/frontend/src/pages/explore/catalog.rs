@@ -23,7 +23,13 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::format::format_throughput_mb_s;
 use bench_dashboard_shared::identity::{KindFamily, VersionOrder};
+use bench_dashboard_shared::labels::{
+    CONDITION_SEPARATOR, CpuName, MachineName, batch_size_text, data_volume_text, durability_text,
+    logical_cpus_text, memory_text, message_size_text, messages_text, milliseconds, nodes_text,
+    numeric_text, rate_limit_text, topic_durability, version_tag,
+};
 use bench_dashboard_shared::metrics::{Badge, GroupMetrics};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use bench_report::hardware::BenchmarkHardware;
@@ -32,12 +38,7 @@ use uuid::Uuid;
 
 use super::query::{ExploreQuery, Facet, Sort};
 use crate::api::api_name;
-use crate::components::run_labels::{
-    CONDITION_SEPARATOR, CpuName, DayLabel, MachineName, batch_size_text, data_volume_text,
-    durability_text, logical_cpus_text, memory_text, message_size_text, messages_text,
-    milliseconds, nodes_text, numeric_text, rate_limit_text, topic_durability, version_tag,
-};
-use crate::format::format_throughput_mb_s;
+use crate::components::run_labels::DayLabel;
 
 pub struct Catalog {
     rows: Vec<Rc<RunRow>>,

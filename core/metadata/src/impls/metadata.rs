@@ -3051,8 +3051,8 @@ where
     /// consensus groups. Topology changes the snapshot carries below the
     /// receiver's old frontier (topics created/deleted while it was down)
     /// fire no commit notifier -- convergence rests on the partition
-    /// reconciler's periodic full diff against the committed STM, which
-    /// reads the restored state on its next tick.
+    /// reconciler, whose next tick finds that the restore broke its change
+    /// feed and checks every partition against the committed STM.
     ///
     /// Returns an [`InstallOutcome`]: the installed frontier, plus whether
     /// the transferred checkpoint's pairing reached the durable superblock.

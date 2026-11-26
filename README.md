@@ -146,7 +146,7 @@ The server, SDKs and CLI are versioned independently. For example, server 0.9.0 
 
 We also publish edge releases (versions with an `-edge.N` suffix, and `apache/iggy:edge`) for the SDKs and the Docker images. They track the latest changes, but are not guaranteed to be stable and are not recommended for production use.
 
-This checkout uses client protocol 0.12.3, replica wire revision 4 and metadata snapshot format 21. Upgrade all replicas together using fresh storage. Access tokens issued by an earlier build are refused, so sign in again over HTTP. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
+This checkout uses client protocol 0.12.3, replica wire revision 5 and metadata snapshot format 21. Upgrade all replicas together. Moving from replica wire revision 4 alone preserves existing data directories. Upgrades from an incompatible storage format require fresh storage. When upgrading across the credential change introduced in revision 4, sign in again over HTTP. The server refuses access tokens issued before that change. See [Upgrade recovery](core/server/README.md#upgrade-recovery).
 
 ---
 
@@ -268,7 +268,7 @@ What each policy survives in a cluster of `n` replicas. A partition gets the `pe
   After a full-cluster restart that means every replica must be back. A replica whose partition awaits a state transfer still reports without a log while it is recovering; once it has joined a view it stays out of later elections until its transfer completes. A replica that never returns halts the partition indefinitely (no operator override yet).
   A view that starts only because every replica reported leaves out the first write that no replica can still serve, and every write after it. It does not start while a replica reports that write as committed or cannot tell whether it holds it. The partition then stays unavailable even with every replica back. With `n - q + 1` or more unmarked logs nothing is left out: a write that no replica can serve or prove uncommitted keeps the partition unavailable.
   A replica reports commits only up to the last write it holds. A replica that learned of a commit before the write reached it therefore does not stop such a view, and the view leaves that write out.
-  Mixed versions can drop acknowledged writes, see [Upgrading](core/server/README.md#upgrading).
+  Running two releases together when neither lists the other as compatible can drop acknowledged writes. See [Upgrading](core/server/README.md#upgrading).
 - When a replica adopts a view whose headers contradict partition history it already applied, it sets that partition's local files aside in `.fenced.N` and fetches it again from a peer instead of stopping the node. A contradiction outside the headers the view carries, and a WAL append whose parent check fails, still stop the node.
 
 The data directory is configured with `path` or `IGGY_PATH`. The layout beneath it is `streams/<stream>/topics/<topic>/partitions/<partition>`, with fixed directory names.

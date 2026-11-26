@@ -1015,7 +1015,7 @@ pub(crate) async fn assert_manifest_lists_stored_segments(store: &Path) {
 
 /// The manifest of the one partition, read through the provider on a compio
 /// runtime, as the provider does not run on the harness's.
-async fn read_manifest(store: PathBuf) -> Option<PartitionManifest> {
+pub(crate) async fn read_manifest(store: PathBuf) -> Option<PartitionManifest> {
     let path = files_named(&store, "manifest.bin").pop()?;
     let key = path
         .strip_prefix(&store)

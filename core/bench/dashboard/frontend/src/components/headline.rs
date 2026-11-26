@@ -20,9 +20,10 @@
 //! on every page.
 
 use bench_dashboard_shared::delta::{DeltaVerdict, Metric};
+use bench_dashboard_shared::labels::metric_value_text;
 use yew::prelude::*;
 
-use crate::pages::run::change::{Change, Headline, metric_value_text};
+use crate::pages::run::change::{Change, Headline};
 use crate::pages::run::history::NO_VALUE;
 
 const NOISE_NOTE: &str = "within run-to-run noise";
