@@ -35,9 +35,9 @@ use futures::channel::oneshot;
 use futures::future::{self, LocalBoxFuture};
 use futures::{FutureExt, StreamExt};
 use iggy_object_store::{
-    DeleteOutcome, KeyLayout, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange,
-    ObjectStore, ObjectStoreError, PartsLimits, PartsUpload, PutBody, PutMode, PutOptions,
-    PutParts, StoredPart, SweptUploads, UserMetadata,
+    DeleteOutcome, FreshObjectId, KeyLayout, ListPage, ListRequest, MemoryStore, ObjectMeta,
+    ObjectRange, ObjectStore, ObjectStoreError, PartsLimits, PartsUpload, PutBody, PutMode,
+    PutOptions, PutParts, StoredPart, SweptUploads, UserMetadata,
 };
 use message_bus::{
     BusMessage, ConnectionLostFn, JoinHandle, MessageBus, ReplicaForwardFn, SendError,
@@ -324,6 +324,14 @@ struct ScriptedStore {
     most_parts_running: Rc<Cell<usize>>,
     completions: Cell<usize>,
     aborts: Cell<usize>,
+    /// Reads of an object's bytes.
+    gets: Cell<usize>,
+    /// How long a begin of an upload in parts takes.
+    begin_delay: Cell<Duration>,
+    /// Releases of completed uploads in parts.
+    releases: Cell<usize>,
+    /// Whether a release never answers.
+    release_hangs: Cell<bool>,
 }
 
 /// An upload in parts that the store holds.
@@ -377,6 +385,10 @@ impl ScriptedStore {
             most_parts_running: Rc::default(),
             completions: Cell::new(0),
             aborts: Cell::new(0),
+            gets: Cell::new(0),
+            begin_delay: Cell::new(Duration::ZERO),
+            releases: Cell::new(0),
+            release_hangs: Cell::new(false),
         }
     }
 
@@ -511,6 +523,7 @@ impl ObjectStore for ScriptedStore {
         key: &str,
         range: Range<u64>,
     ) -> Result<ObjectRange, ObjectStoreError> {
+        self.gets.set(self.gets.get() + 1);
         self.objects.get_range(key, range).await
     }
 
@@ -535,13 +548,14 @@ impl ObjectStore for ScriptedStore {
         self.limits.get()
     }
 
-    fn begin_parts(
+    async fn begin_parts(
         &self,
         key: &str,
         _options: &PutOptions,
         _layout: &KeyLayout,
-    ) -> impl Future<Output = Result<PartsUpload, ObjectStoreError>> {
-        future::ready(self.begin(key))
+    ) -> Result<PartsUpload, ObjectStoreError> {
+        self.bus.sleep(self.begin_delay.get()).await;
+        self.begin(key)
     }
 
     async fn put_part(
@@ -682,6 +696,14 @@ impl ObjectStore for ScriptedStore {
         lost.map_or(created, |error| Err(error()))
     }
 
+    async fn release_parts(&self, _upload: &PartsUpload) -> Result<(), ObjectStoreError> {
+        self.releases.set(self.releases.get() + 1);
+        if self.release_hangs.get() {
+            future::pending::<()>().await;
+        }
+        Ok(())
+    }
+
     fn abort_parts(
         &self,
         upload: &PartsUpload,
@@ -697,6 +719,7 @@ impl ObjectStore for ScriptedStore {
         _layout: &KeyLayout,
         older_than: Duration,
         _after: Option<&str>,
+        _request_timeout: Duration,
     ) -> impl Future<Output = Result<SweptUploads, ObjectStoreError>> {
         future::ready(Ok(self.sweep(older_than)))
     }
@@ -787,26 +810,10 @@ fn body(bytes: &Bytes) -> PutBody {
     PutBody::from_bytes_in_pieces(bytes.clone(), PIECE)
 }
 
-/// The CRC32C of `bytes`, as a memory store computes it.
-fn crc32c_of(bytes: &Bytes) -> u32 {
-    let store = MemoryStore::new();
-    futures::executor::block_on(async {
-        store
-            .put(
-                "crc",
-                PutBody::from_bytes(bytes.clone()),
-                &PutOptions::default(),
-            )
-            .await
-            .unwrap();
-        store.head("crc").await.unwrap().crc32c.unwrap()
-    })
-}
-
 fn create_only(bytes: &Bytes) -> PutOptions {
     PutOptions {
         mode: PutMode::IfAbsent,
-        crc32c: Some(crc32c_of(bytes)),
+        crc32c: Some(crc32c::crc32c(bytes)),
         ..PutOptions::default()
     }
 }
@@ -925,7 +932,7 @@ fn given_a_lost_answer_when_the_object_found_has_another_put_id_should_refuse() 
 }
 
 #[test]
-fn given_a_lost_answer_when_the_store_keeps_no_crc32c_should_take_the_id_and_size() {
+fn given_a_lost_answer_when_the_store_keeps_no_crc32c_should_compare_the_bytes_it_holds() {
     let (bus, store) = store();
     let bytes = object(1);
     store
@@ -939,7 +946,41 @@ fn given_a_lost_answer_when_the_store_keeps_no_crc32c_should_take_the_id_and_siz
     bus.run(store.put("a/b", body(&bytes), &create_only(&bytes)))
         .unwrap();
 
+    assert_eq!(store.provider().gets.get(), 1);
     assert_eq!(counted(&store).3, 1);
+}
+
+/// The id of the first put of a store of replica 1 and shard 2 that started
+/// at the bus's first instant.
+fn first_put_id(bus: &VirtualBus) -> String {
+    let id = FreshObjectId::new(1, 2, bus.realtime_micros(), 0).unwrap();
+    format!("{:032x}", id.get())
+}
+
+/// Another writer stored other bytes of the same length under the put's id,
+/// and the store reports no CRC32C: only the bytes tell them apart.
+#[test]
+fn given_a_lost_answer_when_the_store_keeps_no_crc32c_and_holds_other_bytes_should_refuse() {
+    let (bus, store) = store();
+    let bytes = object(1);
+    let put_id = first_put_id(&bus);
+    let metadata = UserMetadata::from([(PUT_ID_METADATA.to_owned(), put_id.clone())]);
+    put_by_another_writer(&store, "a/b", &object(2), metadata);
+    store.provider().script([Script::of(Outcome::Refuse(lost))]);
+    store.provider().disguise.set(Some(|held| ObjectMeta {
+        crc32c: None,
+        ..held
+    }));
+
+    let refused = bus.run(store.put("a/b", body(&bytes), &create_only(&bytes)));
+
+    assert!(
+        matches!(refused, Err(ObjectStoreError::PreconditionFailed { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(store.provider().put_ids()[0], put_id);
+    assert_eq!(store.provider().gets.get(), 1);
+    assert_eq!(counted(&store).3, 0);
 }
 
 /// Another writer stored the same bytes under the key, between an attempt
@@ -1001,7 +1042,7 @@ fn given_a_body_that_misses_the_callers_crc32c_when_putting_should_not_send_agai
     let (bus, store) = store();
     let bytes = object(1);
     let options = PutOptions {
-        crc32c: Some(crc32c_of(&bytes) ^ 1),
+        crc32c: Some(crc32c::crc32c(&bytes) ^ 1),
         ..create_only(&bytes)
     };
 
@@ -1484,6 +1525,54 @@ fn given_second_attempts_turned_off_when_a_put_is_slow_should_wait_for_its_one_a
     assert_eq!(bus.now(), Duration::from_secs(2));
     assert_eq!(counted(&store).1, 0);
     assert_eq!(store.provider().puts.borrow().len(), 1);
+}
+
+#[test]
+fn given_one_attempt_allowed_when_a_put_is_slow_should_send_no_second_attempt() {
+    let (bus, store) = store_with(StoreCallPolicy {
+        max_attempts: 1,
+        ..policy()
+    });
+    let bytes = object(1);
+    store
+        .provider()
+        .script([Script::commit_after(Duration::from_secs(2))]);
+
+    bus.run(store.put("a/b", body(&bytes), &create_only(&bytes)))
+        .unwrap();
+
+    assert_eq!(bus.now(), Duration::from_secs(2));
+    assert_eq!(counted(&store).1, 0);
+    assert_eq!(store.provider().puts.borrow().len(), 1);
+}
+
+/// The second attempt of the first round takes the second request of the
+/// budget, so no round follows.
+#[test]
+fn given_two_attempts_allowed_when_both_of_a_round_fail_should_send_no_further_round() {
+    let (bus, store) = store_with(StoreCallPolicy {
+        max_attempts: 2,
+        ..policy()
+    });
+    let bytes = object(1);
+    let throttled = || ObjectStoreError::Throttled("slow down".to_owned());
+    store.provider().script([
+        Script {
+            commit_after: Duration::from_secs(1),
+            ..Script::of(Outcome::Refuse(throttled))
+        },
+        Script::of(Outcome::Refuse(throttled)),
+    ]);
+    store.provider().otherwise.set(Script::of(Outcome::Commit));
+
+    let failed = bus.run(store.put("a/b", body(&bytes), &create_only(&bytes)));
+
+    assert!(
+        matches!(failed, Err(ObjectStoreError::Throttled(_))),
+        "{failed:?}"
+    );
+    assert_eq!(store.provider().puts.borrow().len(), 2);
+    assert_eq!(counted(&store), (0, 1, 0, 0));
 }
 
 /// A dropped first attempt of an overwrite can land after a later put of

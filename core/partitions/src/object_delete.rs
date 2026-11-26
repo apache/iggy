@@ -336,9 +336,11 @@ impl<E: TierExecutor> ObjectDeleter for ExecutorDeleter<E> {
         self.executor
             .submit(
                 TierJobRequest::new(TierJobClass::Housekeeping, scope),
+                // The tier store bounds each request of the page by its own
+                // request timeout.
                 move |store| async move {
                     store
-                        .sweep_uploads(&layout, older_than, after.as_deref())
+                        .sweep_uploads(&layout, older_than, after.as_deref(), Duration::MAX)
                         .await
                 },
             )

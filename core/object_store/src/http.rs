@@ -23,6 +23,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -72,6 +73,24 @@ pub fn streamed(
     });
     // The client polls the body on the shard thread that sends it.
     cyper::Body::stream(SendWrapper::new(pieces))
+}
+
+/// `call`, which fails as [`ObjectStoreError::Transport`] when it gets no
+/// answer within `timeout`. `what` names it in the error. For the requests
+/// of a call that sends many and must not stall on one, such as a sweep:
+/// the caller of [`crate::ObjectStore`] bounds each call, not its requests.
+pub async fn within<T>(
+    timeout: Duration,
+    what: &str,
+    call: impl Future<Output = Result<T, ObjectStoreError>>,
+) -> Result<T, ObjectStoreError> {
+    compio::time::timeout(timeout, call)
+        .await
+        .unwrap_or_else(|_| {
+            Err(ObjectStoreError::Transport(format!(
+                "{what} got no answer within {timeout:?}"
+            )))
+        })
 }
 
 /// The error of a request that the client failed. A failure to connect, in

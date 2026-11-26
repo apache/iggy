@@ -32,7 +32,7 @@ use message_bus::MessageBus;
 use server_common::yield_to_reactor;
 use tracing::{debug, warn};
 
-use super::{Holder, TierStore, take_slot, worth_another_attempt};
+use super::{Holder, TierStore, worth_another_attempt};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -43,16 +43,17 @@ const HASH_STRIDE: u64 = MIB;
 ///
 /// Each part is sent, and sent again after a failure, as a create-only put
 /// whose body is held in memory is: a part with the same number and the same
-/// bytes replaces itself, so no part needs a check of what the store holds.
-/// A part gets no second attempt beside its first one. A part replaces what
-/// is under its name, so the attempt that loses could still land after the
-/// object exists: on GCS it would leave its temporary object behind, or
-/// replace the one that the compose names. The request that creates the
-/// object is the create-only one. It is
-/// sent again after a failure, and an object that an earlier completion may
-/// have created is checked as a put checks it. An upload that ends without
-/// its object is aborted, and one that a crash left is removed by the sweep
-/// of abandoned uploads.
+/// bytes stores itself again or is found stored, so no part needs a check of
+/// what the store holds. A part gets no second attempt beside its first one,
+/// so no attempt that loses a race can land after the object exists and
+/// leave a temporary object behind on GCS. The request that creates the
+/// object is the create-only one. It is sent again after a failure, and an
+/// object that an earlier completion may have created is checked as a put
+/// checks it. An upload that ends without its object is aborted, and one
+/// that a crash left is removed by the sweep of abandoned uploads. What a
+/// completed upload keeps apart from its object, the temporary objects on
+/// GCS, is released after the put has its answer, within the request
+/// timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartsPolicy {
     /// The bytes of one part. A long-term segment of at least twice this
@@ -65,7 +66,8 @@ pub struct PartsPolicy {
     /// in parts. An upload with no part in flight sends one even when every
     /// slot is taken, so no upload waits for the others to end.
     pub in_flight: usize,
-    /// The longest an upload in parts runs from its begin. Past it, the put
+    /// The longest an upload in parts runs from the request that begins it,
+    /// as the sweep of abandoned uploads counts its age. Past it, the put
     /// aborts the upload and fails as transient, so the sweep of abandoned
     /// uploads, whose grace is longer, never meets a live one. `None` for no
     /// limit.
@@ -86,7 +88,8 @@ impl Default for PartsPolicy {
 
 /// How one upload in parts ended without its object.
 enum UploadEnd {
-    /// The store does not take uploads in parts.
+    /// The store does not take uploads in parts, at the begin or at the
+    /// completion.
     Refused,
     /// The store lost the upload, so another one can succeed.
     Gone(ObjectStoreError),
@@ -196,6 +199,7 @@ where
         let Some(layout) = self.layout.as_ref() else {
             return Err(UploadEnd::Refused);
         };
+        let begun_at = self.bus.monotonic_micros();
         let upload = match self
             .retried("BEGIN", key, || {
                 self.provider.begin_parts(key, options, layout)
@@ -214,7 +218,9 @@ where
         let ended = match self.policy.parts.deadline {
             None => work.await,
             Some(deadline) => {
-                let late = pin!(self.bus.sleep(deadline));
+                let since_begin = self.bus.monotonic_micros().saturating_sub(begun_at);
+                let left = deadline.saturating_sub(Duration::from_micros(since_begin));
+                let late = pin!(self.bus.sleep(left));
                 match future::select(work, late).await {
                     Either::Left((ended, _)) => ended,
                     Either::Right(((), work)) => {
@@ -231,6 +237,7 @@ where
         match ended {
             Ok(Completed::Clean) => {
                 self.counters.record_parts_upload_completed();
+                self.release(&upload).await;
                 Ok(())
             }
             Ok(Completed::Found) => {
@@ -257,6 +264,23 @@ where
         self.complete(upload, &parts, options, body.len()).await
     }
 
+    /// Removes what a completed `upload` kept apart from its object, within
+    /// the request timeout, so a stalled delete never holds the put. What
+    /// stays goes with the sweep of abandoned uploads.
+    async fn release(&self, upload: &PartsUpload) {
+        if let Err(error) = self
+            .bounded("RELEASE", self.provider.release_parts(upload))
+            .await
+        {
+            debug!(
+                key = upload.key,
+                %error,
+                "releasing a completed upload in parts failed; the sweep of abandoned uploads \
+                 removes what it kept"
+            );
+        }
+    }
+
     /// Removes what `upload` kept, as far as the store lets it. What it
     /// keeps goes with the sweep of abandoned uploads.
     async fn abort(&self, upload: &PartsUpload, parts: u32) {
@@ -273,8 +297,10 @@ where
     }
 
     /// Sends the parts of `body`, side by side within the budget of the
-    /// store, and returns them in order. The first part that fails for good
-    /// ends the upload, and the parts in flight are dropped.
+    /// store, and returns them in order. A part that waits for a slot takes
+    /// the first one that comes free, from this upload or another. The first
+    /// part that fails for good ends the upload, and the parts in flight are
+    /// dropped.
     async fn send_parts(
         &self,
         upload: &PartsUpload,
@@ -286,7 +312,7 @@ where
         let mut running = FuturesUnordered::new();
         loop {
             while let Some((number, range)) = pending.pop_front() {
-                let slot = take_slot(&self.parts_in_flight, self.policy.parts.in_flight);
+                let slot = self.parts_in_flight.take(self.policy.parts.in_flight);
                 if slot.is_none() && !running.is_empty() {
                     pending.push_front((number, range));
                     break;
@@ -299,17 +325,25 @@ where
                 running.push(
                     async move {
                         let _slot = slot;
-                        let sent = match crc32c_in_strides(&part).await {
+                        match crc32c_in_strides(&part).await {
                             Some(crc32c) => self.send_part(upload, number, &part, crc32c).await,
                             None => Err(not_in_body(upload, number)),
-                        };
-                        (number, sent)
+                        }
                     }
                     .boxed_local(),
                 );
             }
-            let Some((_, sent)) = running.next().await else {
-                break;
+            let sent = if pending.is_empty() {
+                match running.next().await {
+                    Some(sent) => sent,
+                    None => break,
+                }
+            } else {
+                let freed = pin!(self.parts_in_flight.freed());
+                match future::select(running.next(), freed).await {
+                    Either::Left((Some(sent), _)) => sent,
+                    Either::Left((None, _)) | Either::Right(((), _)) => continue,
+                }
             };
             match sent {
                 Ok(part) => stored.push(part),
@@ -405,7 +439,7 @@ where
         let mut last = None;
         loop {
             if reached {
-                match self.holder(key, len, options).await {
+                match self.holder(key, len, options, options.crc32c).await {
                     Ok(Holder::Ours) => {
                         debug!(key, "an upload in parts found the object it created");
                         self.counters.record_own_object_found();
@@ -449,6 +483,33 @@ where
                 ObjectStoreError::NotFound { .. } if !reached => {
                     return Err(UploadEnd::Gone(error));
                 }
+                // The upload can create nothing any more: S3 asks for a new
+                // upload after a conditional conflict, and a store that does
+                // not complete uploads in parts takes the object whole. An
+                // earlier attempt may have created it first.
+                ObjectStoreError::UploadConflict { .. } | ObjectStoreError::Unsupported(_) => {
+                    if reached {
+                        match self.holder(key, len, options, options.crc32c).await {
+                            Ok(Holder::Ours) => {
+                                self.counters.record_own_object_found();
+                                return Ok(Completed::Found);
+                            }
+                            Ok(Holder::Another) => {
+                                return Err(UploadEnd::Failed(
+                                    ObjectStoreError::PreconditionFailed {
+                                        key: key.to_owned(),
+                                    },
+                                ));
+                            }
+                            Ok(Holder::Nothing) => {}
+                            Err(error) => return Err(UploadEnd::Failed(error)),
+                        }
+                    }
+                    return Err(match error {
+                        ObjectStoreError::Unsupported(_) => UploadEnd::Refused,
+                        error => UploadEnd::Gone(error),
+                    });
+                }
                 // An earlier attempt may have created the object, and the
                 // object decides at the top of the loop.
                 ObjectStoreError::PreconditionFailed { .. } | ObjectStoreError::NotFound { .. } => {
@@ -478,7 +539,7 @@ where
 /// The CRC32C of a body held in memory, summed [`HASH_STRIDE`] bytes at a
 /// time with a yield to the shard's other tasks between two strides. `None`
 /// for a body that streams.
-async fn crc32c_in_strides(body: &PutBody) -> Option<u32> {
+pub(super) async fn crc32c_in_strides(body: &PutBody) -> Option<u32> {
     let len = body.len();
     let mut crc32c = body.try_slice(0..len.min(HASH_STRIDE))?.crc32c()?;
     let mut start = HASH_STRIDE;

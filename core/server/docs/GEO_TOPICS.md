@@ -182,9 +182,11 @@ about an hour later.
   cannot check this rule.
 - **Credentials.** Each cluster needs read and write access to its own bucket: get, put, list
   and delete. On S3 that is `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject` and
-  `s3:ListBucket`, and `s3:ListBucketMultipartUploads` and `s3:AbortMultipartUpload` for the
-  multipart uploads of long-term segments. A node aborts a multipart upload that fails, and the
-  sweep of abandoned uploads lists and aborts the ones that a crash or a cancelled put left.
+  `s3:ListBucket`, and for the multipart uploads of long-term segments
+  `s3:ListBucketMultipartUploads` on the bucket (`arn:aws:s3:::<bucket>`) and
+  `s3:AbortMultipartUpload` on its objects (`arn:aws:s3:::<bucket>/*`). A node aborts a
+  multipart upload that fails, and the sweep of abandoned uploads lists and aborts the ones
+  that a crash or a cancelled put left.
   Without these two actions the sweep removes nothing and logs why, and S3 keeps charging for
   the parts of every abandoned upload. A bucket lifecycle rule that aborts incomplete multipart
   uploads is the alternative: it deletes no object. Each cluster needs only read access to the

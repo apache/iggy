@@ -151,6 +151,15 @@ impl ObjectStore for Backend {
         }
     }
 
+    async fn release_parts(&self, upload: &PartsUpload) -> Result<(), ObjectStoreError> {
+        match self {
+            Self::Fs(store) => store.release_parts(upload).await,
+            Self::S3(store) => store.release_parts(upload).await,
+            Self::Gcs(store) => store.release_parts(upload).await,
+            Self::MockS3(store) => store.release_parts(upload).await,
+        }
+    }
+
     async fn abort_parts(&self, upload: &PartsUpload, parts: u32) -> Result<(), ObjectStoreError> {
         match self {
             Self::Fs(store) => store.abort_parts(upload, parts).await,
@@ -165,12 +174,29 @@ impl ObjectStore for Backend {
         layout: &KeyLayout,
         older_than: Duration,
         after: Option<&str>,
+        request_timeout: Duration,
     ) -> Result<SweptUploads, ObjectStoreError> {
         match self {
-            Self::Fs(store) => store.sweep_uploads(layout, older_than, after).await,
-            Self::S3(store) => store.sweep_uploads(layout, older_than, after).await,
-            Self::Gcs(store) => store.sweep_uploads(layout, older_than, after).await,
-            Self::MockS3(store) => store.sweep_uploads(layout, older_than, after).await,
+            Self::Fs(store) => {
+                store
+                    .sweep_uploads(layout, older_than, after, request_timeout)
+                    .await
+            }
+            Self::S3(store) => {
+                store
+                    .sweep_uploads(layout, older_than, after, request_timeout)
+                    .await
+            }
+            Self::Gcs(store) => {
+                store
+                    .sweep_uploads(layout, older_than, after, request_timeout)
+                    .await
+            }
+            Self::MockS3(store) => {
+                store
+                    .sweep_uploads(layout, older_than, after, request_timeout)
+                    .await
+            }
         }
     }
 }

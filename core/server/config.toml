@@ -1573,7 +1573,7 @@ handshake_grace = "10 s"
 # its request never left the node, for example when the connection was
 # refused: an attempt that may have reached the store can land after a later
 # overwrite of the same key and roll it back, so any other failure goes to
-# the caller.
+# the caller. Every request of a put counts, a second attempt too.
 #max_attempts = 3
 #retry_delay = "200 ms"
 #max_retry_delay = "5 s"
@@ -1582,8 +1582,8 @@ handshake_grace = "10 s"
 # takes no piece of its body (64 KiB) for 'put_attempt_stall_timeout', or gives
 # no answer for 'put_attempt_answer_timeout' after the last piece. A late
 # create finds the object and stores nothing. An overwrite cut early could land
-# after a later put of other bytes, so it waits 'progress_timeout' instead.
-# Each from 100 ms to 1 h.
+# after a later put of other bytes, so it waits 'progress_timeout' instead,
+# and so does every put on the "fs" backend. Each from 100 ms to 1 h.
 #put_attempt_stall_timeout = "1 s"
 #put_attempt_answer_timeout = "5 s"
 # A create-only put whose body the node holds in memory, such as the upload of
@@ -1593,8 +1593,9 @@ handshake_grace = "10 s"
 # to store the object wins, and the other is dropped. The defaults are about
 # the 99th percentile of a put of each size measured on GCS, so about one put
 # in a hundred costs a second request. 'jobs.second_attempts' bounds how many
-# run at once. "disabled" sends no second attempt. Otherwise from 1 ms to 1 h,
-# and up to 1 h per MiB.
+# run at once. The "fs" backend sends none, since a slow put there means a busy
+# volume. "disabled" sends no second attempt. Otherwise from 1 ms to 1 h, and
+# up to 1 h per MiB.
 #second_attempt_after = "300 ms"
 #second_attempt_after_per_mib = "60 ms"
 # A long-term segment of at least twice 'part_size' goes up in parts on "s3"
@@ -1604,7 +1605,9 @@ handshake_grace = "10 s"
 # checks. Every other put goes whole, such as a fresh object that producers
 # wait for. On s3 it is a multipart upload with a full object CRC32C. On gcs
 # each part is a temporary object under "<prefix>/meta/uploads/", which a
-# compose joins and the node then deletes. gcs composes at most 32 parts, so a
+# compose joins into a composite whose CRC32C the node checks before a second
+# compose creates the object, and the node then deletes them. Only an https
+# endpoint of Google takes uploads in parts. gcs composes at most 32 parts, so a
 # part takes at least a 32nd of its object there. On gcs, a bucket with soft
 # delete on keeps deleted objects billable for its retention, 7 days by
 # default, so each long-term segment stored in parts is billed about twice for
@@ -1625,7 +1628,8 @@ handshake_grace = "10 s"
 # lifecycle rule that aborts incomplete multipart uploads does the same work.
 # Otherwise at least 30 min, so that the half that covers the skew of the
 # clocks takes the 15 minutes that S3 accepts. On s3 the sweep needs
-# s3:ListBucketMultipartUploads and s3:AbortMultipartUpload on the bucket.
+# s3:ListBucketMultipartUploads on the bucket (arn:aws:s3:::<bucket>) and
+# s3:AbortMultipartUpload on its objects (arn:aws:s3:::<bucket>/*).
 # Without them it removes nothing, and S3 keeps charging for the parts of
 # every abandoned upload unless such a lifecycle rule aborts them.
 #abandoned_upload_grace = "1 h"

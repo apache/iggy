@@ -20,13 +20,13 @@
 
 mod parts;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::{Future, poll_fn};
 use std::io;
 use std::ops::Range;
 use std::pin::{Pin, pin};
 use std::rc::Rc;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll, Waker, ready};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -60,8 +60,9 @@ pub struct StoreCallPolicy {
     /// The most attempts at a call that keeps failing with a transient
     /// error, the first one included: a head, a get, a list, a delete, and a
     /// create-only put whose body is held in memory. An overwrite held in
-    /// memory is sent again only when its request never left. A value of 1
-    /// or less retries nothing.
+    /// memory is sent again only when its request never left. Every request
+    /// of a put counts, a second attempt beside a slow one too. A value of 1
+    /// or less retries nothing and starts no second attempt.
     pub max_attempts: u32,
     /// The wait before the first retry, doubled for each retry after it.
     pub retry_delay: Duration,
@@ -177,12 +178,14 @@ pub struct StoreWriter {
 /// a create that lands late finds the object and stores nothing. An attempt
 /// that may have reached the store can have stored the
 /// object, so a create-only put that the store then refuses counts as stored
-/// when the object under its key carries its id, its size and, where both
-/// sides know it, its CRC32C. A refusal of a put that nothing could have
-/// stored before is the caller's to handle. A create-only put that runs past
-/// [`SecondAttempts::threshold`] gets one second attempt on another
-/// connection, while one of [`SecondAttempts::slots`] is free, and the first
-/// attempt to store the object wins.
+/// when the object under its key carries its id, its size and its CRC32C,
+/// which the store reports or the bytes it holds give. A refusal of a put
+/// that nothing could have stored before is the caller's to handle. A
+/// create-only put that runs past [`SecondAttempts::threshold`] gets one
+/// second attempt on another connection, while one of
+/// [`SecondAttempts::slots`] is free and the budget of
+/// [`StoreCallPolicy::max_attempts`] has room for it, and the first attempt
+/// to store the object wins.
 ///
 /// A long-term segment of at least twice [`PartsPolicy::part_len`] goes up
 /// in parts, on a provider that takes them, see [`PartsPolicy`]. Only a
@@ -202,10 +205,10 @@ pub struct TierStore<S, B> {
     layout: Option<KeyLayout>,
     counters: TierStoreCounters,
     /// Second attempts that run now.
-    second_attempts: Cell<usize>,
+    second_attempts: Slots,
     /// Parts of uploads in parts that run now and hold a slot of
     /// [`PartsPolicy::in_flight`].
-    parts_in_flight: Cell<usize>,
+    parts_in_flight: Slots,
     /// Whether the store refused an upload in parts, so every put goes whole.
     parts_refused: Cell<bool>,
 }
@@ -230,8 +233,8 @@ where
             ids,
             layout: writer.layout,
             counters: writer.counters,
-            second_attempts: Cell::new(0),
-            parts_in_flight: Cell::new(0),
+            second_attempts: Slots::default(),
+            parts_in_flight: Slots::default(),
             parts_refused: Cell::new(false),
         }
     }
@@ -248,8 +251,8 @@ where
 
     /// The slots of [`PartsPolicy::in_flight`] that parts hold now.
     #[cfg(test)]
-    pub(crate) const fn parts_in_flight(&self) -> usize {
-        self.parts_in_flight.get()
+    pub(crate) fn parts_in_flight(&self) -> usize {
+        self.parts_in_flight.taken.get()
     }
 
     /// `call` until it succeeds, fails for a reason other than a transient
@@ -265,10 +268,26 @@ where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, ObjectStoreError>>,
     {
+        self.retried_unbounded(operation, target, || self.bounded(operation, call()))
+            .await
+    }
+
+    /// [`Self::retried`] without the request timeout, for a call whose
+    /// provider bounds each of its requests.
+    async fn retried_unbounded<T, F, Fut>(
+        &self,
+        operation: &'static str,
+        target: &str,
+        mut call: F,
+    ) -> Result<T, ObjectStoreError>
+    where
+        F: FnMut() -> Fut,
+        Fut: Future<Output = Result<T, ObjectStoreError>>,
+    {
         let mut delay = self.policy.retry_delay;
         let mut attempt = 1;
         loop {
-            match self.bounded(operation, call()).await {
+            match call().await {
                 Err(error)
                     if error.class() == ErrorClass::Transient
                         && attempt < self.policy.max_attempts =>
@@ -426,27 +445,30 @@ where
 
     /// A put whose body is held in memory: rounds of attempts until one
     /// stores the object, or a round fails for a reason that another round
-    /// does not change, or the rounds run out.
+    /// does not change, or the requests of the rounds reach
+    /// [`StoreCallPolicy::max_attempts`].
     async fn put_repeatable(
         &self,
         key: &str,
         body: &PutBody,
         options: &PutOptions,
     ) -> Result<(), ObjectStoreError> {
+        let budget = self.policy.max_attempts.max(1);
         let mut delay = self.policy.retry_delay;
         let mut reached = false;
-        let mut attempt = 1;
+        let mut sent = 0;
         loop {
-            let error = match self.round(key, body, options, &mut reached).await {
+            let round = self.round(key, body, options, &mut reached, budget, &mut sent);
+            let error = match round.await {
                 Ok(()) => return Ok(()),
                 Err(error) => error,
             };
-            if !worth_sending_again(&error, options) || attempt >= self.policy.max_attempts {
+            if !worth_sending_again(&error, options) || sent >= budget {
                 return Err(error);
             }
             debug!(
                 key,
-                attempt,
+                sent,
                 retry_in_ms = delay.as_millis(),
                 may_have_stored = reached,
                 %error,
@@ -455,24 +477,27 @@ where
             self.counters.record_put_retry();
             self.bus.sleep(delay).await;
             delay = delay.saturating_mul(2).min(self.policy.max_retry_delay);
-            attempt += 1;
         }
     }
 
     /// One attempt, and a second one beside it once the first runs past the
-    /// threshold of a create-only put. The round ends with the first attempt
-    /// that stores the object, or once every attempt failed. `reached` says
-    /// whether an attempt before this one may have reached the store, and the
-    /// round adds its own.
+    /// threshold of a create-only put, while `sent` leaves room for it in
+    /// `budget`. The round ends with the first attempt that stores the
+    /// object, or once every attempt failed, and adds its requests to `sent`.
+    /// `reached` says whether an attempt before this one may have reached the
+    /// store, and the round adds its own.
     async fn round(
         &self,
         key: &str,
         body: &PutBody,
         options: &PutOptions,
         reached: &mut bool,
+        budget: u32,
+        sent: &mut u32,
     ) -> Result<(), ObjectStoreError> {
         let if_absent = options.mode == PutMode::IfAbsent;
-        let threshold = if if_absent {
+        *sent += 1;
+        let threshold = if if_absent && *sent < budget {
             self.policy.second_attempts.threshold(body.len())
         } else {
             None
@@ -494,6 +519,9 @@ where
                 },
             )
             .await;
+        if raced.second_started {
+            *sent += 1;
+        }
         match raced.result {
             Ok(()) => {
                 if raced.by_second {
@@ -503,15 +531,21 @@ where
             }
             // The object under the key decides, and the other attempt is
             // dropped already, which cancels it.
-            Err(refused) if raced.decided => match self.holder(key, body.len(), options).await {
-                Ok(Holder::Ours) => {
-                    debug!(key, "tier store put found the object it stored");
-                    self.counters.record_own_object_found();
-                    Ok(())
+            Err(refused) if raced.decided => {
+                let crc32c = match options.crc32c {
+                    Some(crc32c) => Some(crc32c),
+                    None => parts::crc32c_in_strides(body).await,
+                };
+                match self.holder(key, body.len(), options, crc32c).await {
+                    Ok(Holder::Ours) => {
+                        debug!(key, "tier store put found the object it stored");
+                        self.counters.record_own_object_found();
+                        Ok(())
+                    }
+                    Ok(Holder::Another | Holder::Nothing) => Err(refused),
+                    Err(error) => Err(error),
                 }
-                Ok(Holder::Another | Holder::Nothing) => Err(refused),
-                Err(error) => Err(error),
-            },
+            }
             Err(error) => Err(error),
         }
     }
@@ -533,14 +567,15 @@ where
         let mut second: Option<LocalBoxFuture<'a, Result<T, ObjectStoreError>>> = None;
         let mut slow: Option<LocalBoxFuture<'a, ()>> =
             threshold.map(|after| self.bus.sleep(after).boxed_local());
+        let mut second_started = false;
         loop {
             let (result, by_second) = match next_event(&mut first, &mut second, &mut slow).await {
                 Event::Slow => {
                     slow = None;
-                    if let Some(slot) =
-                        take_slot(&self.second_attempts, self.policy.second_attempts.slots)
+                    if let Some(slot) = self.second_attempts.take(self.policy.second_attempts.slots)
                     {
                         debug!(key, "tier store put is slow, sending a second attempt");
+                        second_started = true;
                         self.counters.record_second_attempt();
                         let again = attempt();
                         second = Some(
@@ -570,6 +605,7 @@ where
                         result: Ok(value),
                         by_second,
                         decided: false,
+                        second_started,
                     };
                 }
                 Err(error) if decisive(&error, other_runs) => {
@@ -577,6 +613,7 @@ where
                         result: Err(error),
                         by_second,
                         decided: true,
+                        second_started,
                     };
                 }
                 Err(error) if !other_runs => {
@@ -584,6 +621,7 @@ where
                         result: Err(error),
                         by_second,
                         decided: false,
+                        second_started,
                     };
                 }
                 Err(error) => {
@@ -594,14 +632,19 @@ where
     }
 
     /// Who stored the object under `key`: the put of `len` bytes with
-    /// `options`, as an earlier attempt of it, another writer, or nobody.
+    /// `options`, as an earlier attempt of it, another writer, or nobody. The
+    /// object is the put's own only with its put id, its size and its
+    /// CRC32C, `crc32c`: the one that the store reports, or, from a store
+    /// that reports none, the one of the bytes it holds. Without `crc32c`,
+    /// no object is the put's own.
     async fn holder(
         &self,
         key: &str,
         len: u64,
         options: &PutOptions,
+        crc32c: Option<u32>,
     ) -> Result<Holder, ObjectStoreError> {
-        let Some(id) = options.metadata.get(PUT_ID_METADATA) else {
+        let (Some(id), Some(crc32c)) = (options.metadata.get(PUT_ID_METADATA), crc32c) else {
             return Ok(Holder::Another);
         };
         let held = match self.head(key).await {
@@ -609,13 +652,19 @@ where
             Err(ObjectStoreError::NotFound { .. }) => return Ok(Holder::Nothing),
             Err(error) => return Err(error),
         };
-        let same_id = held.metadata.get(PUT_ID_METADATA) == Some(id);
-        let same_size = held.size == len;
-        let same_crc32c = held
-            .crc32c
-            .zip(options.crc32c)
-            .is_none_or(|(stored, sent)| stored == sent);
-        Ok(if same_id && same_size && same_crc32c {
+        if held.metadata.get(PUT_ID_METADATA) != Some(id) || held.size != len {
+            return Ok(Holder::Another);
+        }
+        let stored = match held.crc32c {
+            Some(stored) => Some(stored),
+            None if len == 0 => Some(0),
+            None => match self.get_range(key, 0..len).await {
+                Ok(range) => parts::crc32c_in_strides(&PutBody::from_bytes(range.bytes)).await,
+                Err(ObjectStoreError::NotFound { .. }) => return Ok(Holder::Nothing),
+                Err(error) => return Err(error),
+            },
+        };
+        Ok(if stored == Some(crc32c) {
             Holder::Ours
         } else {
             Holder::Another
@@ -685,9 +734,14 @@ where
         layout: &KeyLayout,
         older_than: Duration,
         after: Option<&str>,
+        request_timeout: Duration,
     ) -> Result<SweptUploads, ObjectStoreError> {
-        self.retried("SWEEP", layout.root(), || {
-            self.provider.sweep_uploads(layout, older_than, after)
+        // A page sends many requests, so a bound on the whole page would cut
+        // it short at the first one that stalls.
+        let request_timeout = request_timeout.min(self.policy.request_timeout);
+        self.retried_unbounded("SWEEP", layout.root(), || {
+            self.provider
+                .sweep_uploads(layout, older_than, after, request_timeout)
         })
         .await
     }
@@ -700,6 +754,8 @@ struct Raced<T> {
     by_second: bool,
     /// The result is a failure that ended the race at once.
     decided: bool,
+    /// The race sent a second attempt.
+    second_started: bool,
 }
 
 /// Who stored the object under a key, as a put that the store refused finds
@@ -770,15 +826,45 @@ fn worth_another_attempt(error: &ObjectStoreError, options: &PutOptions) -> bool
     }
 }
 
-/// One of the `limit` slots that `running` counts, given back when it drops,
-/// `None` when every slot is taken.
-fn take_slot(running: &Cell<usize>, limit: usize) -> Option<Slot<'_>> {
-    let taken = running.get();
-    if taken >= limit {
-        return None;
+/// The slots that calls of one kind hold while they run, up to a limit.
+#[derive(Default)]
+struct Slots {
+    taken: Cell<usize>,
+    /// How many slots were given back so far.
+    released: Cell<u64>,
+    /// The tasks that wait for a slot to come free.
+    waiters: RefCell<Vec<Waker>>,
+}
+
+impl Slots {
+    /// One of `limit` slots, given back when it drops, `None` when every
+    /// slot is taken.
+    fn take(&self, limit: usize) -> Option<Slot<'_>> {
+        let taken = self.taken.get();
+        if taken >= limit {
+            return None;
+        }
+        self.taken.set(taken + 1);
+        Some(Slot(self))
     }
-    running.set(taken + 1);
-    Some(Slot(running))
+
+    /// Resolves once a slot comes free after this call.
+    fn freed(&self) -> impl Future<Output = ()> + '_ {
+        let seen = self.released.get();
+        poll_fn(move |context| {
+            if self.released.get() != seen {
+                return Poll::Ready(());
+            }
+            let mut waiters = self.waiters.borrow_mut();
+            if !waiters
+                .iter()
+                .any(|waiter| waiter.will_wake(context.waker()))
+            {
+                waiters.push(context.waker().clone());
+            }
+            Poll::Pending
+        })
+    }
 }
 
 /// Mints the ids of the puts of one store in the layout of a
@@ -802,12 +888,18 @@ impl PutIds {
     }
 }
 
-/// A slot that [`take_slot`] took, which it gives back when it drops.
-struct Slot<'a>(&'a Cell<usize>);
+/// A slot that [`Slots::take`] took, which it gives back when it drops.
+struct Slot<'a>(&'a Slots);
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
-        self.0.set(self.0.get().saturating_sub(1));
+        let slots = self.0;
+        slots.taken.set(slots.taken.get().saturating_sub(1));
+        slots.released.set(slots.released.get().wrapping_add(1));
+        let waiters = std::mem::take(&mut *slots.waiters.borrow_mut());
+        for waiter in waiters {
+            waiter.wake();
+        }
     }
 }
 

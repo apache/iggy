@@ -64,6 +64,12 @@ pub enum ObjectStoreError {
     /// again on every retry while the body differs from that value.
     #[error("the store received a body for {key:?} whose CRC32C does not match")]
     ChecksumMismatch { key: String },
+    /// The store refused to complete an upload in parts for a conditional
+    /// write that raced it, and the upload cannot complete any more: S3 asks
+    /// for a new upload that sends every part again. The completion created
+    /// nothing.
+    #[error("the upload in parts of {key:?} met a conditional conflict and must begin again")]
+    UploadConflict { key: String },
     #[error("the store refused the credentials: {0}")]
     Auth(String),
     #[error("the bucket does not exist: {0}")]
@@ -112,7 +118,8 @@ impl ObjectStoreError {
             | Self::Unavailable(_)
             | Self::Transport(_)
             | Self::NotSent(_)
-            | Self::ChecksumMismatch { .. } => ErrorClass::Transient,
+            | Self::ChecksumMismatch { .. }
+            | Self::UploadConflict { .. } => ErrorClass::Transient,
             Self::Auth(_)
             | Self::BucketNotFound(_)
             | Self::Archived { .. }
@@ -172,6 +179,10 @@ mod tests {
             ),
             (
                 ObjectStoreError::ChecksumMismatch { key: key() },
+                ErrorClass::Transient,
+            ),
+            (
+                ObjectStoreError::UploadConflict { key: key() },
                 ErrorClass::Transient,
             ),
             (
@@ -243,6 +254,7 @@ mod tests {
         let stored_nothing = [
             ObjectStoreError::NotSent("refused".to_owned()),
             ObjectStoreError::ChecksumMismatch { key: key() },
+            ObjectStoreError::UploadConflict { key: key() },
             ObjectStoreError::PreconditionFailed { key: key() },
             ObjectStoreError::Auth("denied".to_owned()),
             ObjectStoreError::InvalidRequest("metadata".to_owned()),
