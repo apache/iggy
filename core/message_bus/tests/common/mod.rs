@@ -98,16 +98,15 @@ pub fn set_replica_ctx(
     replica_count: u8,
     auth: Option<ReplicaAuth>,
 ) {
-    bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
-        binary_identity: [0x5a; 32],
-        compatible_releases: Rc::default(),
+    install_replica_ctx(
+        bus,
         cluster_id,
         self_id,
         replica_count,
-        heartbeat: message_bus::replica::auth::HeartbeatTimings::default(),
-        auth: auth.map(Rc::new),
-        tls: None,
-    });
+        auth,
+        None,
+        ([0x5a; 32], Rc::default()),
+    );
 }
 
 /// A release a test node runs, with what its row of the release
@@ -128,13 +127,35 @@ pub fn set_replica_ctx_of_release(
     tls: Option<Rc<ReplicaTlsCtx>>,
     release: TestRelease<'_>,
 ) {
+    let identity = release_identity(release.release);
+    let compatible_releases = release
+        .compatible_with
+        .iter()
+        .map(|release| CompatibleRelease::new(release, STORAGE_FORMAT))
+        .collect();
+    install_replica_ctx(
+        bus,
+        cluster_id,
+        self_id,
+        replica_count,
+        auth,
+        tls,
+        (identity, compatible_releases),
+    );
+}
+
+fn install_replica_ctx(
+    bus: &IggyMessageBus,
+    cluster_id: u128,
+    self_id: u8,
+    replica_count: u8,
+    auth: Option<ReplicaAuth>,
+    tls: Option<Rc<ReplicaTlsCtx>>,
+    (binary_identity, compatible_releases): ([u8; 32], Rc<[CompatibleRelease]>),
+) {
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
-        binary_identity: release_identity(release.release),
-        compatible_releases: release
-            .compatible_with
-            .iter()
-            .map(|release| CompatibleRelease::new(release, STORAGE_FORMAT))
-            .collect(),
+        binary_identity,
+        compatible_releases,
         cluster_id,
         self_id,
         replica_count,
@@ -159,16 +180,15 @@ pub fn set_replica_ctx_with_tls(
     auth: Option<ReplicaAuth>,
     tls: Rc<ReplicaTlsCtx>,
 ) {
-    bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
-        binary_identity: [0x5a; 32],
-        compatible_releases: Rc::default(),
+    install_replica_ctx(
+        bus,
         cluster_id,
         self_id,
         replica_count,
-        heartbeat: message_bus::replica::auth::HeartbeatTimings::default(),
-        auth: auth.map(Rc::new),
-        tls: Some(tls),
-    });
+        auth,
+        Some(tls),
+        ([0x5a; 32], Rc::default()),
+    );
 }
 
 /// Build a self-signed-mode replica TLS context mirroring the production
@@ -298,7 +318,6 @@ pub async fn spawn_stalled_replica(
                     link: preamble.link,
                 },
                 ChannelBinding::Plaintext,
-                HEADER_SIZE,
             )
             .await
             .expect("stalled replica must complete replica admission");

@@ -315,6 +315,7 @@ pub enum HandshakeStatus {
     AuthRequired = 4,
     /// The dialer's finish MAC did not verify (log-only).
     MacMismatch = 5,
+    /// Neither peer accepts the other's build identity, or the hello body ends in a partial identity.
     IncompatibleBuild = 6,
     /// The hello names a link count other than the acceptor's.
     LinkCountMismatch = 7,

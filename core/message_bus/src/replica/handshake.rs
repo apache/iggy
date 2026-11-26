@@ -112,8 +112,7 @@ pub struct ReplicaHandshakeCtx {
 
 impl ReplicaHandshakeCtx {
     /// The identity a link runs under when this node accepts `hello`, or
-    /// `None` when the release compatibility table links the two releases
-    /// on neither side.
+    /// `None` if the body ends in a partial identity or neither node accepts the other's identity.
     ///
     /// It is the identity of the dialer when the dialer runs this release
     /// or one that this release lists, and the identity of this node when
@@ -122,14 +121,14 @@ impl ReplicaHandshakeCtx {
     /// identity and needs no knowledge of the other release.
     fn link_identity_of_hello(
         &self,
-        hello: &Message<GenericHeader>,
+        dialer_identity: [u8; auth::IDENTITY_LEN],
+        body: &[u8],
     ) -> Option<[u8; auth::IDENTITY_LEN]> {
-        let (listed, rest) = hello.body().as_chunks::<{ auth::IDENTITY_LEN }>();
+        let (listed, rest) = body.as_chunks::<{ auth::IDENTITY_LEN }>();
         if !rest.is_empty() {
             return None;
         }
-        let dialer_identity = auth::read_identity(&hello.header().reserved_command);
-        if dialer_identity == self.binary_identity || self.listed(&dialer_identity).is_some() {
+        if self.accepts(&dialer_identity) {
             return Some(dialer_identity);
         }
         listed
@@ -137,16 +136,8 @@ impl ReplicaHandshakeCtx {
             .then_some(self.binary_identity)
     }
 
-    /// The identity a link runs under when this node dialed and got
-    /// `challenge`: its own, or that of a release it lists. `None` for any
-    /// other, which this node did not offer.
-    fn link_identity_of_challenge(
-        &self,
-        challenge: &Message<GenericHeader>,
-    ) -> Option<[u8; auth::IDENTITY_LEN]> {
-        let link_identity = auth::read_identity(&challenge.header().reserved_command);
-        (link_identity == self.binary_identity || self.listed(&link_identity).is_some())
-            .then_some(link_identity)
+    fn accepts(&self, identity: &[u8; auth::IDENTITY_LEN]) -> bool {
+        *identity == self.binary_identity || self.listed(identity).is_some()
     }
 
     fn listed(&self, identity: &[u8; auth::IDENTITY_LEN]) -> Option<&CompatibleRelease> {
@@ -257,13 +248,12 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     expected_peer: u8,
     placement: LinkPlacement,
     binding: ChannelBinding,
-    max_message_size: usize,
 ) -> Result<(), IggyError> {
     let our_cluster = ctx.cluster_id;
     let self_id = ctx.self_id;
     let auth = ctx.auth.as_deref();
     let hello_limit = HEADER_SIZE + MAX_COMPATIBLE_RELEASES * auth::IDENTITY_LEN;
-    let msg = framing::read_message(stream, max_message_size.min(hello_limit)).await?;
+    let msg = framing::read_message(stream, hello_limit).await?;
     let header = msg.header();
     let peer_id = header.replica;
     let has_nonce = auth::has_nonce(&header.reserved_command);
@@ -292,8 +282,8 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
         )
         .await;
     }
-    let hello_identity = auth::read_identity(&msg.header().reserved_command);
-    let Some(link_identity) = ctx.link_identity_of_hello(&msg) else {
+    let hello_identity = auth::read_identity(&header.reserved_command);
+    let Some(link_identity) = ctx.link_identity_of_hello(hello_identity, msg.body()) else {
         return reject(
             stream,
             our_cluster,
@@ -428,7 +418,7 @@ pub async fn acceptor_handshake<S: AsyncRead + AsyncWrite>(
     )
     .await?;
 
-    let finish = framing::read_message(stream, max_message_size.min(HEADER_SIZE)).await?;
+    let finish = framing::read_message(stream, HEADER_SIZE).await?;
     // Past this point the dialer has been installed on its owning shard (or
     // bailed on `mac_a`) and is no longer reading handshake frames, so every
     // reject here is log-only (no frame).
@@ -492,7 +482,6 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
     peer_id: u8,
     placement: LinkPlacement,
     binding: ChannelBinding,
-    max_message_size: usize,
 ) -> Result<(), ()> {
     let cluster_id = ctx.cluster_id;
     let self_id = ctx.self_id;
@@ -527,7 +516,7 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
         return Err(());
     }
 
-    let challenge = match framing::read_message(stream, max_message_size.min(HEADER_SIZE)).await {
+    let challenge = match framing::read_message(stream, HEADER_SIZE).await {
         Ok(msg) => msg,
         Err(e) => {
             warn!(replica = peer_id, "handshake read failed: {e}");
@@ -563,18 +552,15 @@ pub(crate) async fn dialer_handshake<S: AsyncRead + AsyncWrite>(
         );
         return Err(());
     }
-    let from_peer =
-        challenge.header().cluster == cluster_id && challenge.header().replica == peer_id;
-    let Some(link_identity) = from_peer
-        .then(|| ctx.link_identity_of_challenge(&challenge))
-        .flatten()
-    else {
+    let header = challenge.header();
+    let link_identity = auth::read_identity(&header.reserved_command);
+    if header.cluster != cluster_id || header.replica != peer_id || !ctx.accepts(&link_identity) {
         warn!(
             replica = peer_id,
             "incompatible replica identity in handshake response"
         );
         return Err(());
-    };
+    }
     let Some(auth) = auth else {
         ctx.log_other_release(peer_id, &link_identity, &ctx.binary_identity);
         return Ok(());

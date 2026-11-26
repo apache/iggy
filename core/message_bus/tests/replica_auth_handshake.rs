@@ -86,14 +86,7 @@ async fn spawn_acceptor_as(
     auth: Option<ReplicaAuth>,
 ) -> std::net::SocketAddr {
     set_replica_ctx(bus, CLUSTER, self_id, replica_count, auth);
-    let (listener, addr) = bind(loopback()).await.expect("bind acceptor");
-    let token = bus.token();
-    let delegate = install_replicas_locally(bus.clone(), noop_handler());
-    let handle = compio::runtime::spawn(async move {
-        run(listener, token, delegate).await;
-    });
-    bus.track_background(handle);
-    addr
+    spawn_listener(bus).await
 }
 
 /// Build a dialer bus (replica 0) with the given auth and start its
@@ -105,14 +98,7 @@ async fn spawn_dialer(
     addr: std::net::SocketAddr,
 ) {
     set_replica_ctx(bus, CLUSTER, 0, 2, auth);
-    start_connector(
-        bus,
-        0,
-        vec![(1, addr)],
-        install_dialed_replicas_locally(bus.clone(), noop_handler()),
-        LONG_PERIOD,
-    )
-    .await;
+    spawn_connector(bus, addr).await;
 }
 
 #[compio::test]
@@ -400,7 +386,13 @@ async fn acceptor_refuses_a_hello_whose_listed_identities_are_cut_short() {
 #[compio::test]
 async fn acceptor_enforces_the_hello_identity_limit() {
     for count in [MAX_COMPATIBLE_RELEASES, MAX_COMPATIBLE_RELEASES + 1] {
-        let acceptor = Rc::new(IggyMessageBus::new(0));
+        let acceptor = Rc::new(IggyMessageBus::with_tunables(
+            0,
+            MessageBusConfig {
+                max_message_size: 2048,
+                ..MessageBusConfig::default()
+            },
+        ));
         let addr = spawn_acceptor_of_release(&acceptor, None, OLDER_RELEASE, &[]).await;
         let mut stream = connect_link(addr, LINK_0_OF_REPLICA_0).await;
         let listed = release_identity(OLDER_RELEASE).repeat(count);
@@ -1048,7 +1040,7 @@ async fn spawn_dialer_of_release(
     spawn_connector(bus, addr).await;
 }
 
-/// Run the inbound listener of replica 1 on `bus`, whose handshake context
+/// Run the inbound listener on `bus`, whose handshake context
 /// is already set, and return its address.
 #[allow(clippy::future_not_send)]
 async fn spawn_listener(bus: &Rc<IggyMessageBus>) -> std::net::SocketAddr {

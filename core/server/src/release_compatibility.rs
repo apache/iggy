@@ -21,7 +21,7 @@
 ///
 /// Before listing a pair, verify both directions of replica traffic, state transfer (metadata snapshots, client tables, manifests and partition transfers), object storage formats, replicated operations and the HTTP relay between nodes, including route headers, relay proofs and the metadata floor endpoint. Check defaults that affect peers, such as the metadata journal capacity. When defaults change, pin a common supported value across the cluster before the first replacement and change it only after the last node rejoins. For a larger metadata journal, increase the backups first and the metadata primary last. If the releases cannot interoperate under that configuration, omit the pair.
 ///
-/// At each stable release, freeze the row (including an empty one), client protocol, replica wire revision and storage marker in the test's published release records. Use the version in `core/server/Cargo.toml` at the release commit. Never add, edit or remove a row retroactively. Carry published records and rows from release branches into master and reconcile sibling branches before publishing another pair.
+/// At each stable release, freeze the row (including an empty one), client protocol, replica wire revision, storage marker and metadata transfer formats in the test's published release records. Use the version in `core/server/Cargo.toml` at the release commit. Never add, edit or remove a row retroactively. Carry published records and rows from release branches into master and reconcile sibling branches before publishing another pair.
 ///
 /// For example, `ReleaseCompatibility { release: "1.2.1", compatible_with: &["1.2.0"] }` lets the two releases link in either direction.
 pub const RELEASE_COMPATIBILITY: ReleaseCompatibilityTable = ReleaseCompatibilityTable(&[]);
@@ -55,14 +55,24 @@ mod tests {
         client_protocol: u32,
         replica_wire_revision: u32,
         storage_marker: &'static [u8],
+        min_readable_snapshot_version: u32,
+        snapshot_version: u32,
+        client_table_magic: [u8; 4],
+        state_manifest_magic: [u8; 4],
     }
 
     const BUILD_FORMATS: Formats = Formats {
         client_protocol: iggy_binary_protocol::IGGY_PROTOCOL_VERSION,
         replica_wire_revision: iggy_binary_protocol::REPLICA_WIRE_REVISION,
         storage_marker: crate::boot::STORAGE_FORMAT,
+        min_readable_snapshot_version:
+            metadata::stm::snapshot::MIN_READABLE_SNAPSHOT_FORMAT_VERSION,
+        snapshot_version: metadata::stm::snapshot::SNAPSHOT_FORMAT_VERSION,
+        client_table_magic: consensus::client_table::CLIENT_TABLE_MAGIC,
+        state_manifest_magic: consensus::state_manifest::STATE_MANIFEST_MAGIC,
     };
 
+    #[derive(Clone, Copy)]
     struct PublishedRelease {
         version: &'static str,
         listed: &'static [&'static str],
@@ -71,6 +81,33 @@ mod tests {
 
     // Record literal values from each stable release starting with the first that supports compatibility rows.
     const PUBLISHED: &[PublishedRelease] = &[];
+
+    const RELEASE_FORMATS: Formats = Formats {
+        client_protocol: iggy_binary_protocol::version::pack_protocol_version(0, 12, 3),
+        replica_wire_revision: 5,
+        storage_marker: b"IGGY-TIERED-SEGMENT-CHAIN-2\n",
+        min_readable_snapshot_version: 21,
+        snapshot_version: 21,
+        client_table_magic: *b"ICT6",
+        state_manifest_magic: *b"ISM1",
+    };
+    const RELEASES: [PublishedRelease; 3] = [
+        PublishedRelease {
+            version: "1.2.0",
+            listed: &[],
+            formats: RELEASE_FORMATS,
+        },
+        PublishedRelease {
+            version: "1.2.1",
+            listed: &["1.2.0"],
+            formats: RELEASE_FORMATS,
+        },
+        PublishedRelease {
+            version: "1.2.2",
+            listed: &["1.2.0", "1.2.1"],
+            formats: RELEASE_FORMATS,
+        },
+    ];
 
     const TABLE: ReleaseCompatibilityTable = ReleaseCompatibilityTable(&[
         ReleaseCompatibility {
@@ -241,26 +278,10 @@ mod tests {
     }
 
     #[test]
-    fn published_pairs_require_the_original_rows_and_matching_formats() {
-        let mut records = [
-            PublishedRelease {
-                version: "1.2.0",
-                listed: &[],
-                formats: BUILD_FORMATS,
-            },
-            PublishedRelease {
-                version: "1.2.1",
-                listed: &["1.2.0"],
-                formats: BUILD_FORMATS,
-            },
-            PublishedRelease {
-                version: "1.2.2",
-                listed: &["1.2.0", "1.2.1"],
-                formats: BUILD_FORMATS,
-            },
-        ];
+    fn published_pairs_require_the_original_rows() {
+        let mut records = RELEASES;
         let check = |records: &[PublishedRelease]| {
-            published_defect(&TABLE, records, "1.2.2", BUILD_FORMATS)
+            published_defect(&TABLE, records, "1.2.2", RELEASE_FORMATS)
         };
         assert_eq!(check(&records), None);
         assert!(
@@ -273,6 +294,22 @@ mod tests {
                 .unwrap()
                 .contains("1.2.2 needs a release record")
         );
+        assert_eq!(
+            check(&[records[0], records[2]]).as_deref(),
+            Some("1.2.1 has no release record")
+        );
+        assert_eq!(
+            check(&[records[0], records[0]]).as_deref(),
+            Some("invalid or duplicate published release 1.2.0")
+        );
+        assert_eq!(
+            check(&[PublishedRelease {
+                version: "1.2.0-edge.1",
+                ..records[0]
+            }])
+            .as_deref(),
+            Some("invalid or duplicate published release 1.2.0-edge.1")
+        );
         records[1].listed = &[];
         assert!(
             check(&records)
@@ -282,27 +319,48 @@ mod tests {
         records[1].listed = &["1.2.0"];
         let removed = ReleaseCompatibilityTable(&[]);
         assert!(
-            published_defect(&removed, &records, "1.2.3-edge.1", BUILD_FORMATS)
+            published_defect(&removed, &records, "1.2.3-edge.1", RELEASE_FORMATS)
                 .unwrap()
                 .contains("1.2.1 differs from its published row")
         );
+    }
+
+    #[test]
+    fn published_pairs_require_matching_formats() {
+        let mut records = RELEASES;
         for formats in [
             Formats {
-                client_protocol: BUILD_FORMATS.client_protocol + 1,
-                ..BUILD_FORMATS
+                client_protocol: RELEASE_FORMATS.client_protocol + 1,
+                ..RELEASE_FORMATS
             },
             Formats {
-                replica_wire_revision: BUILD_FORMATS.replica_wire_revision + 1,
-                ..BUILD_FORMATS
+                replica_wire_revision: RELEASE_FORMATS.replica_wire_revision + 1,
+                ..RELEASE_FORMATS
             },
             Formats {
                 storage_marker: b"older format",
-                ..BUILD_FORMATS
+                ..RELEASE_FORMATS
+            },
+            Formats {
+                min_readable_snapshot_version: 20,
+                ..RELEASE_FORMATS
+            },
+            Formats {
+                snapshot_version: 22,
+                ..RELEASE_FORMATS
+            },
+            Formats {
+                client_table_magic: *b"ICT5",
+                ..RELEASE_FORMATS
+            },
+            Formats {
+                state_manifest_magic: *b"ISM2",
+                ..RELEASE_FORMATS
             },
         ] {
             records[0].formats = formats;
             assert!(
-                check(&records)
+                published_defect(&TABLE, &records, "1.2.2", RELEASE_FORMATS)
                     .unwrap()
                     .contains("1.2.1 and 1.2.0 have different")
             );
@@ -347,7 +405,7 @@ mod tests {
                 };
                 if peer.formats != release.formats {
                     return Some(format!(
-                        "{} and {listed} have different protocol or storage formats",
+                        "{} and {listed} have different protocol, storage or state transfer formats",
                         row.release
                     ));
                 }

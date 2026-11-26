@@ -46,10 +46,9 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 
 ## Upgrading
 
-Deploy matching server and SDK releases together. Rolling upgrades and mixed
-server versions are unsupported. Partition control frames from older servers
-carry incarnation zero and are rejected, so a mixed-version cluster cannot
-complete partition view changes. The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
+Deploy compatible server and SDK releases together. A rolling server upgrade requires a pair of stable releases listed in the [release compatibility table](#upgrade-recovery). For example, builds that require partition incarnation numbers reject control frames from older builds that send incarnation zero. Those builds cannot complete partition view changes together.
+
+The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 A partition of a tiered topic keeps a chain file, and its older segments live
 only in the object store. A build from before tiered storage would read such a
@@ -1095,12 +1094,7 @@ Each ring also keeps at most 128 MiB of record bodies and evicts its oldest reco
 
 ## Upgrade recovery
 
-This release changes protocol and storage formats. Servers and compatible
-clients deploy together; mixed versions and rolling upgrades are unsupported.
-Peers verify protocol, replica wire, release and storage-format identity before
-admission.
-Executable packaging does not affect that identity, so stripping or rebuilding
-the same compatible release does not by itself prevent a replica from joining.
+This release changes protocol and storage formats. Deploy a compatible client with the server. Peers verify the client protocol, replica wire revision, release and storage marker before admission. Stripping the executable or rebuilding the same release with those format identifiers preserves that identity.
 
 A peer on another release is admitted only when the release compatibility table of either node lists the other release. The table is `RELEASE_COMPATIBILITY` in `core/server/src/release_compatibility.rs`. It is compiled into the server and ships empty. A release absent from every pair links only with itself.
 
