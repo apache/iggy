@@ -70,7 +70,7 @@ pub fn sweep_interval(grace: Duration) -> Duration {
 
 /// Whether the store committed an object at `modified` no later than the
 /// claim of the root it committed at `claimed_at`. A head can give the claim
-/// to the second while a listing gives the object finer, as MinIO does, so
+/// to the second while a listing gives the object finer, as `MinIO` does, so
 /// both count in whole seconds, and an object from the second of the claim
 /// counts as before it.
 #[must_use]
@@ -459,7 +459,7 @@ impl OrphanCheck {
     /// A long-term segment comes first, then a topic object, then the first
     /// object outside the moments of the guard.
     #[must_use]
-    pub const fn refusal(&self, topic_object: bool) -> Option<OrphanRefusal> {
+    pub const fn refusal(self, topic_object: bool) -> Option<OrphanRefusal> {
         if self.long_term {
             Some(OrphanRefusal::LongTerm)
         } else if topic_object {

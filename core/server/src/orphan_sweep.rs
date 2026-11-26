@@ -229,8 +229,8 @@ struct Committed {
 impl Committed {
     fn read(inner: &StreamsInner) -> Self {
         let mut incarnations = BTreeSet::new();
-        for (stream_id, stream) in inner.items.iter() {
-            for (topic_id, topic) in stream.topics.iter() {
+        for (stream_id, stream) in &inner.items {
+            for (topic_id, topic) in &stream.topics {
                 for partition in &topic.partitions {
                     incarnations.insert(ObjectPrefix {
                         stream_id: stream_id as u64,

@@ -1693,6 +1693,8 @@ mod tests {
             let owner = u8::try_from(key % 5).unwrap();
             let fits = cache.held() + len <= cache.budget()
                 && cache.limit(&owner).is_none_or(|limit| len <= limit);
+            // What the cache held before this step changes it.
+            #[allow(clippy::needless_collect)]
             let others: Vec<(u32, bool)> = cache
                 .entries
                 .iter()

@@ -850,7 +850,7 @@ mod tests {
         let store = Deletes::default();
         let claim = claimed_earlier(&store, OURS);
         store_incarnation(&store, ORPHAN);
-        let outcome = block_on(store.inner.delete(&[manifest.clone()])).unwrap();
+        let outcome = block_on(store.inner.delete(std::slice::from_ref(&manifest))).unwrap();
         assert!(outcome.is_complete());
         for start in [0, 10] {
             let outcome = block_on(
