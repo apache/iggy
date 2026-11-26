@@ -91,6 +91,7 @@ use iggy_common::{
     NodeStatsSample, OptionKey, OptionValue, OptionsProvenance, OptionsScope,
     PartitionResizePolicy, PartitionStats, ResourceOptions, StreamStats, TopicCreateOptions,
     TopicResolvedOptions, TopicStats, TopicType, WrapSet, public_options, stream_wrap_set,
+    validate_read_cache,
 };
 use serde::{Deserialize, Serialize};
 use server_common::sharding::{IggyNamespace, MAX_PARTITIONS, MAX_STREAMS, MAX_TOPICS};
@@ -4211,6 +4212,11 @@ impl StateHandler for UpdateTopicResolvedRequest {
         {
             return ApplyReply::err(UpdateTopicResult::InvalidTopicSize);
         }
+        // Two patches admitted on the same stored pair can each meet the rule
+        // and break it together, so the pair this commit leaves decides.
+        if validate_read_cache(&options).is_err() {
+            return ApplyReply::err(UpdateTopicResult::InvalidOptionValue);
+        }
         // An equal patch stores nothing new, so it must not copy a stream
         // that a checkpoint capture shares.
         if options == topic.options && new_name.as_ref().is_none_or(|name| *name == topic.name) {
@@ -6840,6 +6846,68 @@ pub(crate) mod tests {
             inner.items[0].topics[0].resolved.read_cache.read_ahead,
             Some(iggy_common::IggyByteSize::from(MIB))
         );
+    }
+
+    /// Two patches that each meet the readahead rule against the stored pair
+    /// break it together, in either order, so the one applied second is
+    /// refused and the topic keeps what the first left.
+    #[test]
+    fn given_two_patches_that_each_fit_the_stored_read_cache_when_applying_both_should_refuse_the_second()
+     {
+        const MIB: u64 = 1 << 20;
+        let bytes = |value: u64| Some(iggy_common::IggyByteSize::from(value));
+        let read_cache = |size: u64, read_ahead: u64| iggy_common::TopicReadCache {
+            size: bytes(size),
+            read_ahead: bytes(read_ahead),
+        };
+        let patch = |topic_id: u32, (key, value): (OptionKey, u64)| UpdateTopicResolvedRequest {
+            stream_id: WireIdentifier::numeric(0),
+            topic_id: WireIdentifier::numeric(topic_id),
+            name: None,
+            explicit_options: resource_options_to_wire(
+                &[(
+                    HeaderKey::from(key),
+                    OptionValue::explicit(HeaderValue::from(value)),
+                )]
+                .into(),
+                OptionsProvenance::All,
+            )
+            .unwrap(),
+            derived_options: WireOptions::empty(),
+        };
+        let smaller_cache = (OptionKey::ReadCacheSize, 8 * MIB);
+        let larger_read_ahead = (OptionKey::ReadAhead, 4 * MIB);
+        let refused = u32::from(UpdateTopicResult::InvalidOptionValue);
+
+        for (first, second, kept) in [
+            (smaller_cache, larger_read_ahead, read_cache(8 * MIB, MIB)),
+            (
+                larger_read_ahead,
+                smaller_cache,
+                read_cache(64 * MIB, 4 * MIB),
+            ),
+        ] {
+            let mut inner = StreamsInner::new();
+            create_stream(&mut inner, "stream");
+            let created = TopicCreateOptions {
+                read_cache: read_cache(64 * MIB, MIB),
+                ..TopicCreateOptions::default()
+            };
+            for (group, name) in [(1, "both"), (2, "second alone")] {
+                assert_eq!(
+                    apply_create_topic(&mut inner, 0, name, &created, group).code,
+                    0
+                );
+            }
+            let mut apply = |topic_id: u32, entry: (OptionKey, u64)| {
+                StateHandler::apply(&patch(topic_id, entry), &mut inner, IggyTimestamp::now()).code
+            };
+
+            assert_eq!(apply(1, second), 0, "{} alone fits", second.0);
+            assert_eq!(apply(0, first), 0);
+            assert_eq!(apply(0, second), refused, "{} after {}", second.0, first.0);
+            assert_eq!(inner.items[0].topics[0].resolved.read_cache, kept);
+        }
     }
 
     #[test]
