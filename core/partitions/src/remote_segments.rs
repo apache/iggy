@@ -245,6 +245,27 @@ fn slice_at(bytes: &Bytes, position: u64, range: &Range<u64>) -> Option<Bytes> {
     (end <= bytes.len()).then(|| bytes.slice(start..end))
 }
 
+/// The reads that fetch `ranges` of one object, in the order of their
+/// positions: ranges within [`FRESH_READ_GAP_BYTES`] of each other in one
+/// read of at most [`FRESH_READ_BYTES_MAX`], and a single range whatever its
+/// size.
+fn coalesced(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
+    ranges.sort_unstable_by_key(|range| range.start);
+    let mut reads: Vec<Range<u64>> = Vec::new();
+    for range in ranges {
+        match reads.last_mut() {
+            Some(read)
+                if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
+                    && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
+            {
+                read.end = read.end.max(range.end);
+            }
+            _ => reads.push(range),
+        }
+    }
+    reads
+}
+
 /// What one fetch read of a fresh object.
 #[derive(Default)]
 pub struct FreshReads {
@@ -542,11 +563,11 @@ impl RemoteSegments {
     /// Fetch the blobs at `ranges` of the fresh object `object_id`, and
     /// return what was read, so a poll of many batches of one object asks
     /// the store once and not once a batch. An object this shard holds is
-    /// read from memory. Through a cache that keeps what it fetches, the
-    /// blobs come in its blocks. Otherwise blobs that sit within
+    /// read from memory. Otherwise blobs that sit within
     /// [`FRESH_READ_GAP_BYTES`] of each other come in one read of at most
-    /// [`FRESH_READ_BYTES_MAX`]. The poll takes its blobs from the returned
-    /// reads, which the cache may have had no room to keep.
+    /// [`FRESH_READ_BYTES_MAX`], in the blocks of a cache that keeps what it
+    /// fetches. The poll takes its blobs from the returned reads, which the
+    /// cache may have had no room to keep.
     ///
     /// # Errors
     /// As [`Self::read_fresh`].
@@ -555,51 +576,34 @@ impl RemoteSegments {
         object_id: u128,
         ranges: &[Range<u64>],
     ) -> Result<FreshReads, DiskFault> {
-        let mut missing: Vec<Range<u64>> = ranges
+        if let Some(object) = self
+            .blocks
+            .as_ref()
+            .and_then(|blocks| blocks.held_fresh(object_id))
+        {
+            return Ok(FreshReads {
+                object_id,
+                reads: vec![(0, object)],
+            });
+        }
+        let missing = ranges
             .iter()
             .filter(|range| range.start < range.end)
             .cloned()
             .collect();
-        if let Some(blocks) = &self.blocks {
-            if let Some(object) = blocks.held_fresh(object_id) {
-                return Ok(FreshReads {
-                    object_id,
-                    reads: vec![(0, object)],
-                });
-            }
-            let start = missing.iter().map(|range| range.start).min();
-            let end = missing.iter().map(|range| range.end).max();
-            if blocks.cache().keeps_fetched()
-                && let Some((start, end)) = start.zip(end)
-            {
-                let key_of = || self.layout.fresh_key(object_id);
-                let bytes = blocks.read_fresh(object_id, &key_of, start..end).await?;
-                return Ok(FreshReads {
-                    object_id,
-                    reads: vec![(start, bytes)],
-                });
-            }
-        }
-        missing.sort_unstable_by_key(|range| range.start);
-        let mut reads: Vec<Range<u64>> = Vec::new();
-        for range in missing {
-            match reads.last_mut() {
-                Some(read)
-                    if range.start <= read.end.saturating_add(FRESH_READ_GAP_BYTES)
-                        && range.end.max(read.end) - read.start <= FRESH_READ_BYTES_MAX =>
-                {
-                    read.end = read.end.max(range.end);
-                }
-                _ => reads.push(range),
-            }
-        }
+        let reads = coalesced(missing);
+        let through_cache = self.fetched_into_cache();
+        let key_of = || self.layout.fresh_key(object_id);
         let mut fetched = FreshReads {
             object_id,
             reads: Vec::with_capacity(reads.len()),
         };
         for read in reads {
             let position = read.start;
-            let bytes = self.read_fresh_from_store(object_id, read).await?;
+            let bytes = match through_cache {
+                Some(blocks) => blocks.read_fresh(object_id, &key_of, read).await?,
+                None => self.read_fresh_from_store(object_id, read).await?,
+            };
             fetched.reads.push((position, bytes));
         }
         Ok(fetched)

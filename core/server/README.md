@@ -519,9 +519,11 @@ request fails with `FeatureUnavailable`.
 
 A poll reads an object in the store in blocks of `read_cache_block_size`,
 256 KiB by default, and each shard keeps up to `read_cache_size` of them in
-memory: tiered and long-term segments and their indexes, fresh objects, and the
-segments of geo peers. A smaller block wastes less on small or random reads,
-and a larger one suits consumers that read forward. A poll of bytes that
+memory: tiered and long-term segments, the indexes of long-term segments, fresh
+objects, and the segments of geo peers. The index of a tiered segment is not
+kept there: a poll fetches it once into a local index file on disk. A smaller
+block wastes less on small or random reads, and a larger one suits consumers
+that read forward. A poll of bytes that
 another poll read a moment ago takes them from there, and polls that miss the
 same block at once share one read. When polls read a segment in order, the
 shard also fetches up to `read_ahead` bytes past the last poll before any poll

@@ -294,7 +294,9 @@ impl ReadCache {
         partitions: impl IntoIterator<Item = IggyNamespace>,
     ) {
         let mut cache = self.cache.borrow_mut();
-        let (bytes, taken) = held_within(bytes, cache.budget());
+        let Some((bytes, taken)) = held_within(bytes, cache.budget()) else {
+            return;
+        };
         cache.insert(key, bytes, taken, Admission::Held);
         let mut held = self.held.borrow_mut();
         // The cache releases held objects on its own once they take too much
@@ -1431,22 +1433,27 @@ fn slice_of(bytes: &Bytes, at: u64, range: &Range<u64>) -> Option<Bytes> {
     (start <= end && end <= bytes.len()).then(|| bytes.slice(start..end))
 }
 
-/// `bytes` as the cache holds them, and the memory they take.
+/// `bytes` as the cache holds them, and the memory they take, or `None`
+/// for bytes longer than `limit`, which the cache would refuse, so they are
+/// not copied first.
 ///
 /// A buffer that grew by doubling takes up to twice its length. One with no
 /// other owner is kept as it is while its capacity is within `limit`, so
 /// holding it copies nothing. Any other buffer is copied to its length: one
 /// that is shared can take more memory than this owner can measure.
-fn held_within(bytes: Bytes, limit: usize) -> (Bytes, usize) {
+fn held_within(bytes: Bytes, limit: usize) -> Option<(Bytes, usize)> {
+    if bytes.len() > limit {
+        return None;
+    }
     let exact = |bytes: &[u8]| (Bytes::copy_from_slice(bytes), bytes.len());
-    match bytes.try_into_mut() {
+    Some(match bytes.try_into_mut() {
         Ok(unique) if unique.capacity() <= limit => {
             let held = unique.capacity();
             (unique.freeze(), held)
         }
         Ok(unique) => exact(&unique),
         Err(shared) => exact(&shared),
-    }
+    })
 }
 
 /// The part of `range` of an object that `block`, which starts at byte `at`
@@ -2680,6 +2687,31 @@ mod tests {
             assert_eq!(fetched.get(7, &(400..500)).unwrap(), expected(400..500));
             assert_eq!(store.asked(), [], "a cache of {cache_bytes} bytes");
         }
+    }
+
+    /// A poll of batches far apart in a fresh object fetches the blocks of
+    /// those batches, not the messages of other partitions between them.
+    #[compio::test]
+    async fn given_blobs_far_apart_in_a_fresh_object_when_fetching_them_through_the_cache_should_fetch_only_their_blocks()
+     {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let far = 4 * BLOCK + 10..4 * BLOCK + 20;
+
+        let fetched = remote.fetch_fresh(7, &[far.clone(), 10..20]).await.unwrap();
+
+        assert_eq!(fetched.get(7, &(10..20)).unwrap(), expected(10..20));
+        assert_eq!(fetched.get(7, &far).unwrap(), expected(far));
+        assert_eq!(store.asked(), [(0, BLOCK), (4 * BLOCK, 5 * BLOCK)]);
+    }
+
+    /// Bytes the cache would refuse are not copied for it first.
+    #[test]
+    fn given_bytes_longer_than_the_cache_when_holding_them_should_take_nothing() {
+        assert_eq!(held_within(Bytes::from(vec![0; 11]), 10), None);
+        let shared = Bytes::from(vec![0; 10]);
+        let _other_owner = shared.clone();
+        assert_eq!(held_within(shared, 10).map(|(_, taken)| taken), Some(10));
     }
 
     #[compio::test]
