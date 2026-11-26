@@ -44,6 +44,11 @@ impl PngSize {
         width: 1600,
         height: 1200,
     };
+    /// The size of a link preview image, as Open Graph and the large Twitter card want it.
+    pub const OPEN_GRAPH: Self = Self {
+        width: 1200,
+        height: 630,
+    };
     pub const ALL: [Self; 4] = [
         Self::DEFAULT,
         Self {
@@ -54,10 +59,7 @@ impl PngSize {
             width: 1920,
             height: 1080,
         },
-        Self {
-            width: 1200,
-            height: 630,
-        },
+        Self::OPEN_GRAPH,
     ];
 
     pub const fn width(self) -> u32 {

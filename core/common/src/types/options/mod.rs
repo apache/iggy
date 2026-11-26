@@ -1189,13 +1189,6 @@ impl TopicReadCache {
         *slot = Some(bytes);
     }
 
-    /// The keys of the settings that are set, in catalog order.
-    pub fn keys(&self) -> impl Iterator<Item = OptionKey> + '_ {
-        Self::KEYS
-            .into_iter()
-            .filter(|key| self.get(*key).is_some())
-    }
-
     /// Each setting that `self` sets, the others from `defaults`.
     #[must_use]
     pub const fn or(self, defaults: Self) -> Self {
@@ -2720,11 +2713,6 @@ mod tests {
         let merged = sized.or(defaults);
         assert_eq!(merged.size, Some(IggyByteSize::from(MIB)));
         assert_eq!(merged.read_ahead, Some(IggyByteSize::from(0u64)));
-        assert_eq!(
-            merged.keys().collect::<Vec<_>>(),
-            TopicReadCache::KEYS.to_vec()
-        );
-        assert_eq!(sized.keys().collect::<Vec<_>>(), [OptionKey::ReadCacheSize]);
         let mut set = TopicReadCache::default();
         set.set(OptionKey::TombstoneGrace, IggyByteSize::from(MIB));
         assert_eq!(set, TopicReadCache::default(), "no other key lands in it");

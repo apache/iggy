@@ -351,6 +351,9 @@ where
                 found: snapshot.op(),
             });
         }
-        self.state_machines.restore(snapshot)
+        self.state_machines.restore(snapshot)?;
+        // The restored floor can stand above fresh objects the shard holds.
+        self.note_long_term_floor_to_cache();
+        Ok(())
     }
 }
