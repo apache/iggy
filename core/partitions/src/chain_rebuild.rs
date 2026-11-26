@@ -481,8 +481,9 @@ pub trait StoreViewReader {
 /// cancelled first.
 pub type StoreViewOutcome = Result<Result<StoreView, ObjectStoreError>, TierJobCancelled>;
 
-/// Reads through a tier executor, in jobs of its demand fetch class: a
-/// partition waits for them before it serves anything. One job lists the
+/// Reads through a tier executor, in jobs of its demand fetch class.
+///
+/// A partition waits for them before it serves anything. One job lists the
 /// incarnation and reads the metadata of its objects, and holds no bytes of
 /// the class. A second reads the manifest, and holds the bytes it may read
 /// only while it runs. The jobs never go through the read cache.
@@ -1001,7 +1002,7 @@ impl Walk<'_> {
 
 /// Why the `.index` listed for the segment keyed `start` is of no use to a
 /// reader, `None` when it holds one or more whole entries.
-fn index_fault(start: u64, listed: &ListedSegment) -> Option<ChainLostReason> {
+const fn index_fault(start: u64, listed: &ListedSegment) -> Option<ChainLostReason> {
     match listed.index_size {
         None => Some(ChainLostReason::MissingIndex { start }),
         Some(size) if size == 0 || size % IGGY_INDEX_SIZE as u64 != 0 => {
