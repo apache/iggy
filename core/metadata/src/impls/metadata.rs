@@ -30,12 +30,14 @@ use crate::stm::consumer_group::CompleteConsumerGroupRevocationRequest;
 use crate::stm::result::RevokedToken;
 use crate::stm::shadow::ShadowTopicRequest;
 use crate::stm::snapshot::{
-    FillSnapshot, MetadataSnapshot, PersistStage, RestoreSnapshotInPlace, Snapshot, SnapshotError,
+    CaptureEncoder, FillSnapshot, MetadataCapture, MetadataSnapshot, PersistStage,
+    RestoreSnapshotInPlace, Snapshot, SnapshotError, peek_sequence_number,
 };
 use crate::stm::stream::{Streams, StreamsInner, TruncatePartitionRequest};
 use crate::stm::user::{CreatePersonalAccessTokenRequest, DeletePersonalAccessTokenRequest, Users};
 use crate::stm::{ApplyContext, ConsensusGroupAllocator, StateMachine};
 use bytes::Bytes;
+use compio::BufResult;
 use compio::io::AsyncWriteAtExt;
 use consensus::{
     CLIENTS_TABLE_MAX, Canceled, ClientTable, ClientTableSnapshot, CommitLogEvent, CommitReply,
@@ -88,7 +90,7 @@ use iggy_common::{
     stream_wrap_set, topic_option_keys, validate_geo_topic, validate_local_retention,
     validate_segment_max_age, validate_topic_segment_size,
 };
-use journal::local_gate::{LocalGate, LocalGateAcquire};
+use journal::local_gate::{LocalGate, LocalGateAcquire, OwnedLocalGateGuard};
 use journal::superblock::{
     PingPongSuperblock, SUPERBLOCK_RETRY_BACKOFF_BASE_MICROS, SUPERBLOCK_RETRY_BACKOFF_MAX_MICROS,
     SUPERBLOCK_RETRY_BACKOFF_MAX_SHIFT, SuperblockStore,
@@ -99,20 +101,119 @@ use server_common::Message;
 use server_common::fatal::NoteDescriptorExhaustion;
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
+use server_common::yield_to_reactor;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
+#[cfg(any(test, feature = "simulator"))]
+use std::future::poll_fn;
+use std::hash::Hasher;
 use std::io;
-#[cfg(feature = "simulator")]
-use std::io::Write;
 use std::mem::size_of;
+#[cfg(feature = "simulator")]
+use std::os::unix::fs::FileExt;
 use std::path::Path;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
-use std::thread;
+#[cfg(any(test, feature = "simulator"))]
+use std::task::Poll;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
+use twox_hash::XxHash3_64;
 
 // The writer retains this gate after caller cancellation, until the rename is durable.
 static SNAPSHOT_IO: Mutex<()> = Mutex::new(());
+
+/// Snapshot bytes encoded and written between two yields to the runtime. Encoding
+/// one chunk holds the core for a few milliseconds, so the chunk size bounds each
+/// stall, not the catalog size.
+const SNAPSHOT_CHUNK_BYTES: usize = 1 << 20;
+
+/// A checkpoint job starts once `slot_count / CHECKPOINT_JOB_TRIGGER_DIVISOR`
+/// ops committed above the checkpoint the superblock pairs: half the WAL, so the
+/// job ends long before appends reach the forced-checkpoint margin.
+const CHECKPOINT_JOB_TRIGGER_DIVISOR: u64 = 2;
+
+/// After a failed job, the next one waits for `slot_count /
+/// CHECKPOINT_JOB_RETRY_DIVISOR` more commits, so a failing disk does not start
+/// a full snapshot write on every commit.
+const CHECKPOINT_JOB_RETRY_DIVISOR: u64 = 16;
+
+/// Starts a checkpoint job off the commit path, see
+/// [`IggyMetadata::set_checkpoint_spawner`].
+pub type CheckpointSpawner = Rc<dyn Fn(CheckpointJob)>;
+
+/// A captured checkpoint that [`IggyMetadata::run_checkpoint_job`] makes durable
+/// and trims the WAL to.
+///
+/// It holds `checkpoint_lock` until its snapshot and superblock writes end. A
+/// job dropped before it runs keeps that lock closed, so a spawner drops one only
+/// once the metadata it came from is gone.
+pub struct CheckpointJob {
+    lease: OwnedLocalGateGuard,
+    capture: MetadataCapture,
+    capture_time: Duration,
+    /// Whether a requester held an offer of the snapshot that this job
+    /// replaces. The job then leaves the WAL in place, see
+    /// [`IggyMetadata::run_checkpoint_job`].
+    keeps_wal: bool,
+}
+
+/// A WAL trim that waits for the journal gate or holds it, from
+/// [`IggyMetadata::announce_checkpoint_trim`]. The trim stops being pending
+/// when this drops, also when the job future is dropped at an await.
+pub struct PendingTrim<'a>(&'a Cell<u32>);
+
+impl Drop for PendingTrim<'_> {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
+
+/// Who took a checkpoint and how long each step took, for its completion log.
+#[derive(Clone, Copy, Debug, Default)]
+struct CheckpointTimings {
+    origin: CheckpointOrigin,
+    capture: Duration,
+    write: Duration,
+    superblock: Duration,
+}
+
+/// Who captured and wrote a checkpoint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CheckpointOrigin {
+    Job,
+    Inline,
+    /// The checkpoint has no stored timings, for example one that was paired
+    /// before a restart or by a later superblock write.
+    #[default]
+    Unknown,
+}
+
+impl std::fmt::Display for CheckpointOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Job => "job",
+            Self::Inline => "inline",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// Which path trimmed the WAL to a checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointTrimmer {
+    Job,
+    Margin,
+}
+
+impl std::fmt::Display for CheckpointTrimmer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Job => "job",
+            Self::Margin => "margin",
+        })
+    }
+}
 
 fn freeze_client_reply(
     message: Message<GenericHeader>,
@@ -210,6 +311,9 @@ enum CheckpointBoundary {
 #[cfg(test)]
 thread_local! {
     static STOP_CHECKPOINT_AFTER: Cell<Option<CheckpointBoundary>> = const { Cell::new(None) };
+    static COMPLETED_CHECKPOINTS: Cell<u64> = const { Cell::new(0) };
+    static LAST_COMPLETED_CHECKPOINT: Cell<Option<(CheckpointOrigin, CheckpointTrimmer)>> =
+        const { Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -245,7 +349,7 @@ impl IggySnapshot {
     }
 
     /// Mutable view for tests that need to fold state into a checkpoint by hand,
-    /// the way [`Self::persist_snapshot`] does on the live path.
+    /// the way [`SnapshotCoordinator::capture`] does on the live path.
     #[cfg(test)]
     pub(crate) const fn snapshot_mut(&mut self) -> &mut MetadataSnapshot {
         &mut self.snapshot
@@ -256,26 +360,31 @@ impl IggySnapshot {
     /// # Errors
     /// Returns `SnapshotError` if serialization or I/O fails.
     pub async fn persist(&self, path: &Path) -> Result<(), SnapshotError> {
-        Self::write_durably(path, self.encode()?).await
+        Self::write_durably(path, self.encode()?).await?;
+        Ok(())
     }
 
-    /// Write already-encoded snapshot bytes to `path` durably: temp, fsync,
-    /// rename, parent-dir fsync, with the integrity trailer appended.
+    /// Write `payload` to `path` durably with [`write_snapshot_file`] in a task of
+    /// its own, and return the payload's [`checkpoint_checksum`].
     ///
-    /// Split from [`Self::persist`] so the checkpoint path can hash and write one
-    /// buffer instead of encoding the whole snapshot twice under the durability
-    /// lock (the client table is folded in, so a second encode is a full
-    /// re-serialization).
+    /// The task holds [`SNAPSHOT_IO`] until the rename is durable, also after the
+    /// caller stops waiting, so the next writer cannot rename under it.
     ///
     /// # Errors
-    /// `SnapshotError::Persist` if any write, fsync, or rename fails.
-    pub(super) async fn write_durably(path: &Path, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+    /// `SnapshotError::Persist` if any write, fsync, or rename fails, or
+    /// `SnapshotError::Io` if the task ends without a result.
+    pub(super) async fn write_durably(
+        path: &Path,
+        payload: impl SnapshotPayload + 'static,
+    ) -> Result<u128, SnapshotError> {
         let permit = SNAPSHOT_IO.lock().await;
         let path = path.to_path_buf();
         let (sender, receiver) = oneshot::channel();
         compio::runtime::spawn(async move {
             let _permit = permit;
-            let result = Self::write_durably_inner(&path, encoded, SnapshotIo::Compio).await;
+            let result =
+                write_snapshot_file(&path, payload, SnapshotIo::Compio, SNAPSHOT_CHUNK_BYTES)
+                    .await;
             if let Err(Err(error)) = sender.send(result) {
                 warn!(path = %path.display(), %error, "snapshot write failed after its caller stopped");
             }
@@ -284,75 +393,6 @@ impl IggySnapshot {
         receiver
             .await
             .map_err(|_| SnapshotError::Io(io::Error::other("snapshot writer stopped")))?
-    }
-
-    #[allow(clippy::future_not_send)]
-    async fn write_durably_inner(
-        path: &Path,
-        mut encoded: Vec<u8>,
-        storage: SnapshotIo,
-    ) -> Result<(), SnapshotError> {
-        let trailer = snapshot_trailer(&encoded);
-        // TODO: Write payload and trailer as separate buffers to avoid growing the payload.
-        encoded.extend_from_slice(&trailer);
-        let tmp_path = path.with_extension("bin.tmp");
-
-        let mut file = storage
-            .create(&tmp_path)
-            .await
-            .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
-            .map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::Write,
-                source: e,
-            })?;
-        #[cfg(test)]
-        checkpoint_boundary(CheckpointBoundary::TemporaryCreated)?;
-        file.write_all(encoded)
-            .await
-            .map_err(|source| SnapshotError::Persist {
-                stage: PersistStage::Write,
-                source,
-            })?;
-        #[cfg(test)]
-        checkpoint_boundary(CheckpointBoundary::Written)?;
-        file.sync_all().await.map_err(|e| SnapshotError::Persist {
-            stage: PersistStage::Sync,
-            source: e,
-        })?;
-        #[cfg(test)]
-        checkpoint_boundary(CheckpointBoundary::FileSynced)?;
-        drop(file);
-
-        storage
-            .rename(&tmp_path, path)
-            .await
-            .map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::Rename,
-                source: e,
-            })?;
-
-        #[cfg(test)]
-        checkpoint_boundary(CheckpointBoundary::Renamed)?;
-
-        // Fsync the parent directory to ensure the rename is durable.
-        if let Some(parent) = path.parent() {
-            let dir = storage
-                .open(parent)
-                .await
-                .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
-                .map_err(|e| SnapshotError::Persist {
-                    stage: PersistStage::DirSync,
-                    source: e,
-                })?;
-            dir.sync_all().await.map_err(|e| SnapshotError::Persist {
-                stage: PersistStage::DirSync,
-                source: e,
-            })?;
-        }
-
-        #[cfg(test)]
-        checkpoint_boundary(CheckpointBoundary::DirectorySynced)?;
-        Ok(())
     }
 
     /// Load a snapshot from disk, with the [`checkpoint_checksum`] of the exact bytes
@@ -377,6 +417,142 @@ impl IggySnapshot {
         let (payload, checksum) = split_trailer(&data)?;
         Ok((Self::decode(payload)?, checksum))
     }
+
+    /// The sequence number of the snapshot at `path`. The trailer is verified as
+    /// [`Self::load`] does, but the state sections are neither decoded nor
+    /// validated, see [`peek_sequence_number`].
+    ///
+    /// # Errors
+    /// As [`Self::load`], from the trailer and the leading fields only.
+    pub fn load_sequence_number(path: &Path) -> Result<u64, SnapshotError> {
+        let data = std::fs::read(path)?;
+        let (payload, _) = split_trailer(&data)?;
+        peek_sequence_number(payload)
+    }
+}
+
+/// Bytes a snapshot file holds ahead of its integrity trailer, produced a chunk at
+/// a time.
+pub(super) trait SnapshotPayload {
+    /// Move the next bytes into the empty `chunk`, cutting where the payload can
+    /// be cut once `chunk` holds at least `chunk_bytes`. Returns whether bytes
+    /// remain.
+    fn fill(&mut self, chunk: &mut Vec<u8>, chunk_bytes: usize) -> Result<bool, SnapshotError>;
+}
+
+impl SnapshotPayload for Vec<u8> {
+    fn fill(&mut self, chunk: &mut Vec<u8>, _chunk_bytes: usize) -> Result<bool, SnapshotError> {
+        std::mem::swap(self, chunk);
+        Ok(false)
+    }
+}
+
+impl SnapshotPayload for CaptureEncoder {
+    fn fill(&mut self, chunk: &mut Vec<u8>, chunk_bytes: usize) -> Result<bool, SnapshotError> {
+        while self.encode_next(chunk)? {
+            if chunk.len() >= chunk_bytes {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+fn persist_failure(stage: PersistStage) -> impl FnOnce(io::Error) -> SnapshotError {
+    move |source| SnapshotError::Persist { stage, source }
+}
+
+/// Write `payload` and its integrity trailer to `path` durably: a temporary file,
+/// fsync, rename, then a parent directory fsync. Returns the payload's
+/// [`checkpoint_checksum`], hashed as the bytes go to the file, so the pairing is
+/// over exactly what the file holds.
+///
+/// The payload is encoded, hashed and written in chunks of about `chunk_bytes`,
+/// with a yield after each chunk, so the other tasks of this core run in
+/// between.
+#[allow(clippy::future_not_send)]
+async fn write_snapshot_file(
+    path: &Path,
+    mut payload: impl SnapshotPayload,
+    io: SnapshotIo,
+    chunk_bytes: usize,
+) -> Result<u128, SnapshotError> {
+    let tmp_path = path.with_extension("bin.tmp");
+    let mut file = io
+        .create(&tmp_path)
+        .await
+        .note_descriptor_exhaustion(|| format!("creating {}", tmp_path.display()))
+        .map_err(persist_failure(PersistStage::Write))?;
+    #[cfg(test)]
+    checkpoint_boundary(CheckpointBoundary::TemporaryCreated)?;
+    let mut hasher = XxHash3_64::new();
+    let mut chunk = Vec::new();
+    let mut offset = 0;
+    loop {
+        let more = payload.fill(&mut chunk, chunk_bytes)?;
+        hasher.write(&chunk);
+        chunk = file
+            .write_all_at(chunk, offset)
+            .await
+            .map_err(persist_failure(PersistStage::Write))?;
+        offset += chunk.len() as u64;
+        chunk.clear();
+        io.yield_between_chunks().await;
+        if !more {
+            break;
+        }
+    }
+    let checksum = u128::from(hasher.finish());
+    // A separate write: appending to a payload handed over whole would copy it.
+    chunk.extend_from_slice(&snapshot_trailer(checksum));
+    file.write_all_at(chunk, offset)
+        .await
+        .map_err(persist_failure(PersistStage::Write))?;
+    #[cfg(test)]
+    checkpoint_boundary(CheckpointBoundary::Written)?;
+    file.sync_all()
+        .await
+        .map_err(persist_failure(PersistStage::Sync))?;
+    #[cfg(test)]
+    checkpoint_boundary(CheckpointBoundary::FileSynced)?;
+    drop(file);
+
+    io.rename(&tmp_path, path)
+        .await
+        .map_err(persist_failure(PersistStage::Rename))?;
+    #[cfg(test)]
+    checkpoint_boundary(CheckpointBoundary::Renamed)?;
+
+    // Fsync the parent directory to ensure the rename is durable.
+    if let Some(parent) = path.parent() {
+        let dir = io
+            .open(parent)
+            .await
+            .note_descriptor_exhaustion(|| format!("opening directory {}", parent.display()))
+            .map_err(persist_failure(PersistStage::DirSync))?;
+        dir.sync_all()
+            .await
+            .map_err(persist_failure(PersistStage::DirSync))?;
+    }
+    #[cfg(test)]
+    checkpoint_boundary(CheckpointBoundary::DirectorySynced)?;
+    Ok(checksum)
+}
+
+/// Pending once, after waking its own task, so any executor polls it again. On
+/// compio that is not a turn of the reactor, see [`SnapshotIo::yield_between_chunks`].
+#[cfg(any(test, feature = "simulator"))]
+async fn yield_now() {
+    let mut yielded = false;
+    poll_fn(|context| {
+        if yielded {
+            return Poll::Ready(());
+        }
+        yielded = true;
+        context.waker().wake_by_ref();
+        Poll::Pending
+    })
+    .await;
 }
 
 #[derive(Clone, Copy)]
@@ -427,15 +603,30 @@ impl SnapshotIo {
             Self::Synchronous => std::fs::rename(source, target),
         }
     }
+
+    /// Hand the core back between chunks. On compio a task that wakes itself runs
+    /// again in the same executor pass, before the reactor reaps any I/O, so the
+    /// pump would wait for many chunks. The simulator has no compio timer.
+    async fn yield_between_chunks(self) {
+        match self {
+            Self::Compio => yield_to_reactor().await,
+            #[cfg(feature = "simulator")]
+            Self::Synchronous => yield_now().await,
+        }
+    }
 }
 
 #[allow(clippy::future_not_send)]
 impl SnapshotFile {
-    async fn write_all(&mut self, encoded: Vec<u8>) -> io::Result<()> {
+    /// Write all of `buf` at `offset` and hand `buf` back for reuse.
+    async fn write_all_at(&mut self, buf: Vec<u8>, offset: u64) -> io::Result<Vec<u8>> {
         match self {
-            Self::Compio(file) => file.write_all_at(encoded, 0).await.0,
+            Self::Compio(file) => {
+                let BufResult(result, buf) = file.write_all_at(buf, offset).await;
+                result.map(|()| buf)
+            }
             #[cfg(feature = "simulator")]
-            Self::Synchronous(file) => file.write_all(&encoded),
+            Self::Synchronous(file) => file.write_all_at(&buf, offset).map(|()| buf),
         }
     }
 
@@ -487,14 +678,16 @@ pub enum CommitWalkStop {
 /// Integrity framing is mandatory because the superblock can lag snapshot publication.
 const SNAPSHOT_TRAILER_MAGIC: u32 = 0x4953_4E50;
 
-/// `magic` + the payload's [`checkpoint_checksum`].
-const SNAPSHOT_TRAILER_LEN: usize = size_of::<u32>() + size_of::<u128>();
+const SNAPSHOT_TRAILER_MAGIC_LEN: usize = size_of::<u32>();
 
-/// The integrity trailer for an encoded snapshot.
-fn snapshot_trailer(encoded: &[u8]) -> [u8; SNAPSHOT_TRAILER_LEN] {
+/// `magic` + the payload's [`checkpoint_checksum`].
+const SNAPSHOT_TRAILER_LEN: usize = SNAPSHOT_TRAILER_MAGIC_LEN + size_of::<u128>();
+
+/// The integrity trailer for a payload with this [`checkpoint_checksum`].
+fn snapshot_trailer(checksum: u128) -> [u8; SNAPSHOT_TRAILER_LEN] {
     let mut trailer = [0u8; SNAPSHOT_TRAILER_LEN];
-    trailer[..4].copy_from_slice(&SNAPSHOT_TRAILER_MAGIC.to_le_bytes());
-    trailer[4..].copy_from_slice(&checkpoint_checksum(encoded).to_le_bytes());
+    trailer[..SNAPSHOT_TRAILER_MAGIC_LEN].copy_from_slice(&SNAPSHOT_TRAILER_MAGIC.to_le_bytes());
+    trailer[SNAPSHOT_TRAILER_MAGIC_LEN..].copy_from_slice(&checksum.to_le_bytes());
     trailer
 }
 
@@ -507,11 +700,11 @@ fn split_trailer(data: &[u8]) -> Result<(&[u8], u128), SnapshotError> {
     }
 
     let (payload, trailer) = data.split_at(data.len() - SNAPSHOT_TRAILER_LEN);
-    if trailer[..size_of::<u32>()] != SNAPSHOT_TRAILER_MAGIC.to_le_bytes() {
+    if trailer[..SNAPSHOT_TRAILER_MAGIC_LEN] != SNAPSHOT_TRAILER_MAGIC.to_le_bytes() {
         return Err(SnapshotError::InvalidTrailer);
     }
     let expected = u128::from_le_bytes(
-        trailer[4..]
+        trailer[SNAPSHOT_TRAILER_MAGIC_LEN..]
             .try_into()
             .expect("a sealed trailer holds 16 checksum bytes"),
     );
@@ -527,37 +720,13 @@ fn split_trailer(data: &[u8]) -> Result<(&[u8], u128), SnapshotError> {
 /// reserves.
 ///
 /// Both sides of the pairing hash BYTES rather than a state: the checkpoint hashes
-/// what it wrote (`SnapshotCoordinator::persist_snapshot`), recovery hashes what it
+/// what it wrote (`SnapshotCoordinator::persist_capture`), recovery hashes what it
 /// read ([`IggySnapshot::load`]). Nothing re-serializes a decoded snapshot, so the
 /// cross-check does not depend on decode-then-encode being byte-identical across
 /// builds.
 #[must_use]
 pub fn checkpoint_checksum(encoded: &[u8]) -> u128 {
     u128::from(calculate_checksum(encoded))
-}
-
-/// The encoded snapshot and the checksum over exactly those bytes.
-fn encode_with_checksum(snapshot: &IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
-    snapshot.snapshot.validate()?;
-    let encoded = snapshot.encode()?;
-    let checksum = checkpoint_checksum(&encoded);
-    Ok((encoded, checksum))
-}
-
-/// [`encode_with_checksum`] on a dedicated thread. The runtime has no blocking
-/// pool, and a full change log alone keeps a core busy for milliseconds.
-async fn encode_on_own_thread(snapshot: IggySnapshot) -> Result<(Vec<u8>, u128), SnapshotError> {
-    let (sender, receiver) = oneshot::channel();
-    thread::Builder::new()
-        .name("iggy-checkpoint-encode".to_owned())
-        .spawn(move || {
-            // The receiver is gone only with its checkpoint, which then needs no result.
-            let _ = sender.send(encode_with_checksum(&snapshot));
-        })
-        .map_err(SnapshotError::Io)?;
-    receiver.await.map_err(|_| {
-        SnapshotError::InvalidState("checkpoint encode thread ended without a result")
-    })?
 }
 
 /// The highest resident WAL entry at or above the snapshot floor and below
@@ -581,6 +750,31 @@ where
                 .map(|header| (op, header.checksum))
         })
         .unwrap_or((floor, 0))
+}
+
+/// Refuses state transfer frontiers that no caught-up primary offers.
+///
+/// `commit_op` and `table_frontier` come from the serving peer and would move
+/// the frontiers of this replica. A peer cannot have committed less than its
+/// own snapshot contains, nor encode a table outside the range from the
+/// snapshot to its commit point: `state_transfer_offer` builds all three from
+/// one caught-up-primary read.
+///
+/// # Errors
+/// [`SnapshotError::IncoherentManifest`].
+pub const fn verify_state_transfer_manifest(
+    snapshot_seq: u64,
+    commit_op: u64,
+    table_frontier: u64,
+) -> Result<(), SnapshotError> {
+    if commit_op < snapshot_seq || table_frontier < snapshot_seq || table_frontier > commit_op {
+        return Err(SnapshotError::IncoherentManifest {
+            snapshot_seq,
+            commit_op,
+            table_frontier,
+        });
+    }
+    Ok(())
 }
 
 impl Snapshot for IggySnapshot {
@@ -623,12 +817,13 @@ impl Snapshot for IggySnapshot {
 ///
 /// Owns the data directory path and the snapshot creation function. The
 /// three-phase checkpoint (persist snapshot, record the pairing durably, drain the
-/// WAL) is orchestrated one layer up in `IggyMetadata::checkpoint_if_needed`, so
-/// the superblock write can sit between persist and drain; this type owns only the
-/// snapshot I/O and the last-checkpoint bookkeeping.
+/// WAL) is orchestrated one layer up in `IggyMetadata`, by a checkpoint job or
+/// inline at the margin (`checkpoint_if_needed`), so the superblock write can sit
+/// between persist and drain; this type owns only the snapshot I/O and the
+/// checkpoint bookkeeping.
 pub struct SnapshotCoordinator<M> {
     data_dir: std::path::PathBuf,
-    create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+    capture: fn(&M, u64, u64) -> Result<MetadataCapture, SnapshotError>,
     io: SnapshotIo,
     /// Remaining-journal-slots threshold at which a checkpoint is forced.
     /// Defaults to [`Self::CHECKPOINT_MARGIN`]; bootstrap raises it to at
@@ -642,13 +837,28 @@ pub struct SnapshotCoordinator<M> {
     // The snapshot pairing is published before superblock persistence and WAL drain.
     // An incomplete attempt must remain retryable at the same applied frontier.
     checkpoint_pending: Cell<bool>,
+    /// Op of the checkpoint whose pairing the superblock durably holds, `0` when
+    /// none. [`Self::last_checkpoint`] moves before the superblock write, so only
+    /// this one bounds a WAL trim: a failed superblock write then trims nothing.
+    /// Boot seeds it from the recovered snapshot, which the superblock may lag,
+    /// see [`IggyMetadata::seed_checkpoint_ref`].
+    superblock_checkpoint_op: Cell<u64>,
+    /// Failed checkpoint jobs. A margin waiter that sees this move while it waits
+    /// appends into the margin instead of retrying at once.
+    failed_jobs: Cell<u64>,
+    /// No job starts while `commit_min` is below this op, see
+    /// [`CHECKPOINT_JOB_RETRY_DIVISOR`].
+    job_retry_op: Cell<u64>,
+    /// Timings of the durable checkpoint at this op, taken by the side that trims
+    /// the WAL to it and logs its completion.
+    untrimmed_timings: Cell<Option<(u64, CheckpointTimings)>>,
 }
 
 impl<M> SnapshotCoordinator<M> {
     /// Default number of remaining journal slots at which a checkpoint is
-    /// forced. Must stay >= the prepare-queue depth: the ops already
-    /// pipelined while a checkpoint runs skip it and append into this
-    /// margin.
+    /// forced. Must stay >= the prepare-queue depth: after a failed
+    /// checkpoint the ops already pipelined append into this margin without
+    /// one.
     ///
     /// Public so a caller sizing a journal can refuse a slot count at or below it:
     /// such a journal checkpoints on every commit rather than on occupancy.
@@ -657,20 +867,25 @@ impl<M> SnapshotCoordinator<M> {
     #[must_use]
     pub fn new(
         data_dir: std::path::PathBuf,
-        create_snapshot: fn(&M, u64, u64) -> Result<IggySnapshot, SnapshotError>,
+        capture: fn(&M, u64, u64) -> Result<MetadataCapture, SnapshotError>,
     ) -> Self {
         Self {
             data_dir,
-            create_snapshot,
+            capture,
             io: SnapshotIo::Compio,
             checkpoint_margin: Cell::new(Self::CHECKPOINT_MARGIN),
             last_checkpoint: Cell::new((0, 0)),
             checkpoint_pending: Cell::new(false),
+            superblock_checkpoint_op: Cell::new(0),
+            failed_jobs: Cell::new(0),
+            job_retry_op: Cell::new(0),
+            untrimmed_timings: Cell::new(None),
         }
     }
 
-    /// Complete snapshot I/O within one poll so host completions cannot change
-    /// the deterministic simulator's schedule. Select during replica construction.
+    /// Do snapshot I/O with blocking calls, so host completions cannot change the
+    /// deterministic simulator's schedule: the writer suspends only at its own
+    /// yields. Select during replica construction.
     #[cfg(feature = "simulator")]
     pub const fn use_synchronous_io(&mut self) {
         self.io = SnapshotIo::Synchronous;
@@ -678,7 +893,7 @@ impl<M> SnapshotCoordinator<M> {
 
     /// Raise (never lower) the forced-checkpoint margin. Bootstrap calls
     /// this with the configured prepare-queue depth so a deeper pipeline
-    /// keeps its guarantee of journal room while a checkpoint runs; the
+    /// keeps its guarantee of journal room after a failed checkpoint; the
     /// default margin stays the floor.
     pub fn set_checkpoint_margin(&self, margin: usize) {
         self.checkpoint_margin
@@ -699,6 +914,13 @@ impl<M> SnapshotCoordinator<M> {
         self.last_checkpoint.get()
     }
 
+    /// Whether the superblock write of the last persisted checkpoint is still
+    /// owed: its snapshot is durable, and no write that succeeded pairs it.
+    fn checkpoint_unpaired(&self) -> bool {
+        let checkpoint = self.last_checkpoint();
+        checkpoint != (0, 0) && self.superblock_checkpoint_op.get() != checkpoint.0
+    }
+
     /// Seed the last-checkpoint pairing at boot from the recovered snapshot, so the
     /// first post-boot view-change superblock write records the real pairing rather
     /// than `(0, 0)`.
@@ -717,54 +939,67 @@ impl<M> SnapshotCoordinator<M> {
             .is_some_and(|c| c <= self.checkpoint_margin.get())
     }
 
-    /// Create and durably persist a snapshot at `commit_op`, record the pairing, and
-    /// return its checksum. Does NOT drain the WAL: the caller must durably record
-    /// the pairing in the superblock first, so a crash between persist and drain
-    /// recovers a consistent checkpoint with the WAL intact. Snapshot creation
-    /// finishes before the first await, preserving the captured frontier. The owned
-    /// capture is then encoded on its own thread, so a large catalog or change log
-    /// does not stall this core.
-    #[allow(clippy::future_not_send)]
-    async fn persist_snapshot(
+    /// Capture the state at `commit_op` for [`Self::persist_capture`]. Synchronous,
+    /// so every part belongs to the same frontier.
+    fn capture(
         &self,
         stm: &M,
         commit_op: u64,
         created_at: u64,
         client_table: Option<ClientTableSnapshot>,
         change_log: ChangeLogSnapshot,
-    ) -> Result<u128, SnapshotError> {
-        let mut snapshot = (self.create_snapshot)(stm, commit_op, created_at)?;
-        // Fold in the client table and the change log, which `create_snapshot`
-        // does not see since neither is a state machine. Recovery restores the
-        // table as the reconstruction floor for the drained WAL prefix.
-        snapshot.snapshot.client_table = client_table;
-        snapshot.snapshot.change_log = change_log;
-        // Encode once: the checksum and the on-disk record share one buffer, so the
-        // pairing is provably over the bytes that reach the file.
-        let (encoded, checksum) = match self.io {
-            SnapshotIo::Compio => encode_on_own_thread(snapshot).await?,
-            #[cfg(feature = "simulator")]
-            SnapshotIo::Synchronous => encode_with_checksum(&snapshot)?,
-        };
-        self.write_snapshot(encoded).await?;
+    ) -> Result<MetadataCapture, SnapshotError> {
+        let mut capture = (self.capture)(stm, commit_op, created_at)?;
+        // Fold in the client table and the change log, which the capture does not
+        // see since neither is a state machine. Recovery restores the table as the
+        // reconstruction floor for the drained WAL prefix.
+        capture.client_table = client_table;
+        capture.change_log = change_log;
+        Ok(capture)
+    }
+
+    /// Durably persist `capture`, record its pairing, and return its checksum. Does
+    /// NOT drain the WAL: the caller must durably record the pairing in the
+    /// superblock first, so a crash between persist and drain recovers a consistent
+    /// checkpoint with the WAL intact. The capture is encoded and written in chunks
+    /// with a yield after each, so a large catalog does not stall this core.
+    #[allow(clippy::future_not_send)]
+    async fn persist_capture(&self, capture: MetadataCapture) -> Result<u128, SnapshotError> {
+        capture.validate_credentials()?;
+        let commit_op = capture.sequence_number;
+        let checksum = self.write_snapshot(capture.into_encoder()).await?;
         self.last_checkpoint.set((commit_op, checksum));
         Ok(checksum)
     }
 
+    /// Back off job starts after a job failed with `commit_min` committed.
+    /// Counted from the failure, not from the capture: the commits during a
+    /// slow write would otherwise use the backoff up.
+    fn record_failed_job(&self, commit_min: u64, slot_count: u64) {
+        self.failed_jobs.set(self.failed_jobs.get() + 1);
+        self.job_retry_op
+            .set(commit_min.saturating_add(slot_count / CHECKPOINT_JOB_RETRY_DIVISOR));
+    }
+
+    /// Write `payload` to [`Self::snapshot_path`] durably and return its
+    /// [`checkpoint_checksum`], taken over the bytes as they reach the file.
     #[allow(clippy::future_not_send)]
-    async fn write_snapshot(&self, encoded: Vec<u8>) -> Result<(), SnapshotError> {
+    async fn write_snapshot(
+        &self,
+        payload: impl SnapshotPayload + 'static,
+    ) -> Result<u128, SnapshotError> {
         let path = self.snapshot_path();
         match self.io {
-            SnapshotIo::Compio => IggySnapshot::write_durably(&path, encoded).await,
+            SnapshotIo::Compio => IggySnapshot::write_durably(&path, payload).await,
             #[cfg(feature = "simulator")]
             SnapshotIo::Synchronous => {
-                IggySnapshot::write_durably_inner(&path, encoded, self.io).await
+                write_snapshot_file(&path, payload, self.io, SNAPSHOT_CHUNK_BYTES).await
             }
         }
     }
 
     /// Drain the snapshotted prefix below `last_op` to reclaim WAL space. Runs
-    /// only after the pairing is durable (see [`Self::persist_snapshot`]).
+    /// only after the pairing is durable (see [`Self::persist_capture`]).
     ///
     /// `last_op` itself is retained, one entry the snapshot has already
     /// superseded. It is this replica's commit point, and a `DoViewChange`
@@ -792,10 +1027,10 @@ impl<M> SnapshotCoordinator<M> {
     }
 }
 
-// A checkpoint pauses journal reclamation, not admission: while one runs,
-// up to a full prepare queue of already-pipelined ops still needs journal
-// room (their `on_replicate` drivers skip the in-flight checkpoint and
-// append). The margin must cover them or the journal wraps mid-checkpoint.
+// A checkpoint job runs beside appends. At the margin an append waits for the
+// job's durable part and trims, but a failed job leaves nothing to trim, and
+// that append and the ones already pipelined behind it go into the margin
+// without a checkpoint. The margin must cover a full prepare queue of them.
 const _: () =
     assert!(SnapshotCoordinator::<()>::CHECKPOINT_MARGIN >= consensus::PIPELINE_PREPARE_QUEUE_MAX);
 
@@ -1319,13 +1554,16 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// shard is never `Sync`, so a `tokio::sync::Mutex` would only add an
     /// atomic RMW per gated send for exclusion that `Cell` state already provides.
     superblock_lock: LocalGate,
-    /// Serializes whole checkpoints against each other: `persist_snapshot` renames
+    /// Serializes whole checkpoints against each other: `persist_capture` renames
     /// over the single `snapshot.bin` and `drain` rewrites the WAL through a shared
     /// `wal.tmp`, so two concurrent checkpoints would race both. Distinct from
     /// [`Self::superblock_lock`], which a checkpoint takes only for its own pairing
     /// write. A checkpoint holds this one and then acquires that one; nothing takes
     /// them in the other order.
-    checkpoint_lock: LocalGate,
+    ///
+    /// Shared so a checkpoint job can hold it as an owned lease from its capture to
+    /// the end of its superblock write. Every WAL trim also runs under it.
+    checkpoint_lock: Rc<LocalGate>,
     /// Consecutive failed superblock writes, and the clock reading after which the
     /// next attempt may run. A persistent `ENOSPC` / `EIO` would otherwise re-run a
     /// full `atomic_replace` (create, write, fsync, rename, dir fsync) on every 10 ms
@@ -1347,9 +1585,12 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     pub coordinator: Option<SnapshotCoordinator<M>>,
     /// Serializes `on_replicate`'s journal-mutation section (forced
     /// checkpoint + WAL append) across concurrent drivers (the pump loop
-    /// and the detached per-client submit tasks), and with the shard's WAL
-    /// rewrites, which take it through [`Self::hold_journal_writes`]. Lock
-    /// order: `journal_gate`, `checkpoint_lock`, `superblock_lock`. Waiters
+    /// and the detached per-client submit tasks), with the shard's WAL
+    /// rewrites and repair appends, which take it through
+    /// [`Self::hold_journal_writes`], with a state transfer install, and with the
+    /// WAL trim of a checkpoint job. Lock order: `journal_gate`,
+    /// `checkpoint_lock`, `superblock_lock`. A job holds `checkpoint_lock` only
+    /// before it takes this gate, never while it waits for it. Waiters
     /// take it in arrival order, so a primary appends in op order. Ungated
     /// they race `SnapshotCoordinator::checkpoint`: every driver crossing the
     /// `remaining_capacity <= CHECKPOINT_MARGIN` boundary runs a full
@@ -1359,6 +1600,11 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// as unsound: the drain's live-set partition misses an append landing
     /// mid-rewrite and the rewrite silently discards it. See [`LocalGate`].
     journal_gate: LocalGate,
+    /// Checkpoint jobs that wait for `journal_gate` or hold it for their WAL
+    /// trim. The gate serves its waiters in arrival order, so an append that
+    /// arrives behind such a job waits for the whole rewrite. The shard 0 pump
+    /// must not wait that long: see [`Self::checkpoint_trim_pending`].
+    pending_trims: Cell<u32>,
     /// Per-client session state (sessions, dedup, eviction). Metadata-only.
     pub client_table: RefCell<ClientTable>,
     /// Late-bound post-commit notifier. Fires once per committed normal op
@@ -1368,6 +1614,10 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// [`Self::set_commit_notifier`] runs (the server bootstrap on shard
     /// 0 sets it; peer shards and tests leave it `None`).
     commit_notifier: RefCell<Option<CommitNotifier>>,
+    /// Late-bound starter of checkpoint jobs, `None` until
+    /// [`Self::set_checkpoint_spawner`] runs. Without it every checkpoint runs
+    /// inline at the forced-checkpoint margin.
+    checkpoint_spawner: RefCell<Option<CheckpointSpawner>>,
     /// Client-table mutations at or below this op are already reflected in a
     /// state-transferred table, so the tail-repair commit walk must skip
     /// them to preserve newer receipts and incarnations. `0`
@@ -1378,10 +1628,22 @@ pub struct IggyMetadata<C, J, S, M, SB = PingPongSuperblock> {
     /// effects still need replaying. Dropped once replay reaches that table.
     replay_client_table: RefCell<Option<RefCell<ClientTable>>>,
     /// Last built [`StateTransferOffer`], shared by every requester of the same
-    /// snapshot generation. Rebuilding per request re-reads and re-decodes the
-    /// whole snapshot on shard 0's pump, and hands each requester its own
-    /// multi-MB copy.
+    /// snapshot generation. Rebuilding per request re-reads the whole snapshot
+    /// on shard 0's pump, and hands each requester its own multi-MB copy. A
+    /// checkpoint clears it at its capture and each writer of `snapshot.bin`
+    /// after its rename, so it never serves a replaced file to a later requester.
     transfer_offer_cache: RefCell<Option<Rc<StateTransferOffer>>>,
+    /// Every offer built, to tell which snapshots a requester can still pull:
+    /// the shard that serves an offer holds it until it expires. See
+    /// [`Self::offer_needs_wal_above`].
+    served_offers: RefCell<Vec<Weak<StateTransferOffer>>>,
+    /// Moves on every clear of `transfer_offer_cache`. An offer whose read of
+    /// `snapshot.bin` spans a move may hold a file that is replaced or about to
+    /// be, so it refuses rather than reach the cache or a peer.
+    snapshot_generation: Cell<u64>,
+    /// See [`Self::refuse_state_transfer_offers`].
+    #[cfg(feature = "simulator")]
+    state_transfer_offers_refused: Cell<bool>,
     /// Prepares the backup gap check destroyed since `tick_metadata` last
     /// drained the count into `metadata_prepare_gap_drops_total`. What it does
     /// and does not prove is `IggyPartition::prepare_gap_drops`, verbatim; what
@@ -1439,11 +1701,11 @@ where
 
 impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB>
 where
-    M: StreamsFrontend + FillSnapshot<MetadataSnapshot>,
+    M: StreamsFrontend + FillSnapshot<MetadataCapture>,
 {
     /// Create a new `IggyMetadata` instance.
     ///
-    /// The `FillSnapshot<MetadataSnapshot>` bound is captured here via a
+    /// The `FillSnapshot<MetadataCapture>` bound is captured here via a
     /// function pointer so that no downstream caller needs the bound.
     #[must_use]
     pub fn new(
@@ -1457,14 +1719,15 @@ where
         let mux_stm = mux_stm.into();
         let allocator =
             ConsensusGroupAllocator::new(mux_stm.streams().highest_partition_consensus_group_id());
-        let coordinator = data_dir.map(|dir| SnapshotCoordinator::new(dir, IggySnapshot::create));
+        let coordinator =
+            data_dir.map(|dir| SnapshotCoordinator::new(dir, MetadataCapture::create));
         Self {
             consensus,
             journal,
             snapshot,
             superblock,
             superblock_lock: LocalGate::new(),
-            checkpoint_lock: LocalGate::new(),
+            checkpoint_lock: Rc::new(LocalGate::new()),
             superblock_write_failures: Cell::new(0),
             superblock_retry_after_micros: Cell::new(0),
             mux_stm,
@@ -1472,11 +1735,17 @@ where
             placement: RefCell::default(),
             coordinator,
             journal_gate: LocalGate::new(),
+            pending_trims: Cell::new(0),
             client_table: RefCell::new(ClientTable::new(CLIENTS_TABLE_MAX)),
             commit_notifier: RefCell::new(None),
+            checkpoint_spawner: RefCell::new(None),
             client_table_frontier: Cell::new(0),
             replay_client_table: RefCell::new(None),
             transfer_offer_cache: RefCell::new(None),
+            served_offers: RefCell::new(Vec::new()),
+            snapshot_generation: Cell::new(0),
+            #[cfg(feature = "simulator")]
+            state_transfer_offers_refused: Cell::new(false),
             prepare_gap_drops: Cell::new(0),
             partitions_max: Cell::new(0),
             max_tokens_per_user: Cell::new(0),
@@ -1629,13 +1898,39 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
         self.client_table.borrow().capacity()
     }
 
-    /// Drop the cached state-transfer offer, releasing its snapshot copy.
+    /// Drop the cached state-transfer offer, releasing its snapshot copy, and
+    /// start a new snapshot generation.
     ///
-    /// Called by the shard's expiry sweep once no requester holds an offer:
-    /// the cache exists to collapse repeat builds within one rejoin, not to
-    /// pin a snapshot for the life of the process.
+    /// Called at each checkpoint capture, after each replacement of
+    /// `snapshot.bin`, and by the shard's expiry sweep once no requester holds
+    /// an offer: the cache exists to collapse repeat builds within one rejoin,
+    /// not to pin a snapshot for the life of the process. The sweep and the
+    /// offer build both run on the pump, so a sweep never lands inside an
+    /// offer's read.
     pub fn clear_state_transfer_offer_cache(&self) {
         self.transfer_offer_cache.borrow_mut().take();
+        self.snapshot_generation
+            .set(self.snapshot_generation.get().wrapping_add(1));
+    }
+
+    /// Whether an offer that is still held, by a shard that serves it or by
+    /// the cache, needs the WAL above `floor`, the last op that the journal
+    /// trimmed. A requester installs the snapshot of its offer and then
+    /// repairs from the op after it.
+    fn offer_needs_wal_above(&self, floor: u64) -> bool {
+        self.served_offers
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .any(|offer| offer.snapshot_seq >= floor)
+    }
+
+    /// Whether `checkpoint_lock` is held: by a checkpoint job from its capture to
+    /// its superblock write and again during its WAL trim, by a checkpoint at the
+    /// forced-checkpoint margin, or by an install.
+    #[must_use]
+    pub fn checkpoint_running(&self) -> bool {
+        self.checkpoint_lock.try_acquire().is_none()
     }
 
     /// Install (or replace) the post-commit notifier. Passing `None`
@@ -1643,6 +1938,13 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     /// only; peer shards never commit metadata locally.
     pub fn set_commit_notifier(&self, notifier: Option<CommitNotifier>) {
         *self.commit_notifier.borrow_mut() = notifier;
+    }
+
+    /// Install (or replace) the starter of checkpoint jobs. Passing `None` removes
+    /// it. The spawner must run each job with [`Self::run_checkpoint_job`] on this
+    /// shard. It is called from the commit path, so it must not run the job inline.
+    pub fn set_checkpoint_spawner(&self, spawner: Option<CheckpointSpawner>) {
+        *self.checkpoint_spawner.borrow_mut() = spawner;
     }
 
     /// Seed the coordinator's last-checkpoint pairing at boot from the recovered
@@ -1653,6 +1955,11 @@ impl<C, J, S, M, SB> IggyMetadata<C, J, S, M, SB> {
     pub fn seed_checkpoint_ref(&self, checkpoint_op: u64, checkpoint_checksum: u128) {
         if let Some(coordinator) = &self.coordinator {
             coordinator.seed_last_checkpoint(checkpoint_op, checkpoint_checksum);
+            // The snapshot op, even when the superblock pairing lags it: boot
+            // accepts that lag and opens the journal with this op as its floor.
+            // So the seed itself trims nothing, and it counts the commits to
+            // the first job from the state that boot recovered.
+            coordinator.superblock_checkpoint_op.set(checkpoint_op);
         }
     }
 
@@ -1961,8 +2268,11 @@ where
 
         // Two-queue admission: prepare slot then project+replicate; prepare
         // full + request room then buffer; both full then drop+warn (SDK
-        // retries via read-timeout).
-        if consensus.pipeline_is_full() {
+        // retries via read-timeout). A pending WAL trim buffers too: the
+        // append would wait for it on the pump, see
+        // [`Self::checkpoint_trim_pending`]. No await separates this test
+        // from the gate acquire in `on_replicate`.
+        if consensus.pipeline_is_full() || self.checkpoint_trim_pending() {
             let push_result = consensus.push_queued_request(consensus::RequestEntry::new(message));
             if push_result.is_err() {
                 warn!(
@@ -1971,7 +2281,7 @@ where
                     replica_id = consensus.replica(),
                     client = client_id,
                     request = request,
-                    "on_request: prepare and request queues both full, dropping"
+                    "on_request: request queue full behind a full prepare queue or a pending WAL trim, dropping"
                 );
             }
             return;
@@ -2470,8 +2780,9 @@ pub enum StateTransferUnavailable {
     /// No snapshot has ever been persisted. The WAL still holds the full
     /// history, so the requester's journal repair covers its whole gap.
     NoSnapshot,
-    /// A checkpoint or detached snapshot writer still owns the snapshot.
-    CheckpointInProgress,
+    /// A checkpoint or an install is replacing `snapshot.bin`, or did so while
+    /// the offer read it. Transient: a request after it reads the new file.
+    SnapshotReplaced,
     /// `snapshot.bin` exists but could not be read, or failed its integrity
     /// trailer. Refusing is strictly better than shipping it: the receiver
     /// would re-seal the corruption under a fresh valid trailer.
@@ -2484,7 +2795,10 @@ impl std::fmt::Display for StateTransferUnavailable {
             Self::NotCaughtUpPrimary => write!(f, "not a caught-up primary"),
             Self::NoCoordinator => write!(f, "no snapshot coordinator on this shard"),
             Self::NoSnapshot => write!(f, "no snapshot has been persisted yet"),
-            Self::CheckpointInProgress => write!(f, "snapshot checkpoint is in progress"),
+            Self::SnapshotReplaced => write!(
+                f,
+                "snapshot is being replaced, or was replaced while it was read"
+            ),
             Self::SnapshotUnreadable(source) => {
                 write!(f, "persisted snapshot is unreadable: {source}")
             }
@@ -2562,8 +2876,20 @@ where
     /// so they are mutually consistent.
     ///
     /// The result is cached and shared: a repeat request for the same snapshot
-    /// generation reuses it instead of re-reading and re-decoding the file on
-    /// shard 0's pump.
+    /// generation reuses it instead of re-reading the file on shard 0's pump.
+    ///
+    /// No offer is built while a checkpoint or an install holds
+    /// `checkpoint_lock`: the holder trims the WAL to its own op once that op is
+    /// durable, and a peer installing the file it replaces could find its repair
+    /// range evicted. A read already in flight refuses for the same reason when
+    /// a checkpoint captures or a writer returns from its rename, because both
+    /// start a new snapshot generation. So an offer never ships a file that a
+    /// checkpoint here has begun to replace. The refusal is transient and ends
+    /// with the checkpoint.
+    ///
+    /// A checkpoint can also start after the offer left, while its requester
+    /// still pulls it. The job of that checkpoint then leaves the WAL in place,
+    /// see [`Self::run_checkpoint_job`].
     ///
     /// Served below the recovery barrier too, see
     /// [`consensus::is_caught_up_primary_except_barrier`]: everything shipped is at
@@ -2576,23 +2902,10 @@ where
     pub async fn state_transfer_offer(
         &self,
     ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
-        let _checkpoint = self
-            .checkpoint_lock
-            .try_acquire()
-            .ok_or(StateTransferUnavailable::CheckpointInProgress)?;
-        let _snapshot_io = if self
-            .coordinator
-            .as_ref()
-            .is_none_or(|coordinator| matches!(coordinator.io, SnapshotIo::Compio))
-        {
-            Some(
-                SNAPSHOT_IO
-                    .try_lock()
-                    .ok_or(StateTransferUnavailable::CheckpointInProgress)?,
-            )
-        } else {
-            None
-        };
+        #[cfg(feature = "simulator")]
+        if self.state_transfer_offers_refused.get() {
+            return Err(StateTransferUnavailable::SnapshotReplaced);
+        }
         let consensus = self
             .consensus
             .as_ref()
@@ -2604,11 +2917,20 @@ where
             .coordinator
             .as_ref()
             .ok_or(StateTransferUnavailable::NoCoordinator)?;
+        if self.checkpoint_running() {
+            return Err(StateTransferUnavailable::SnapshotReplaced);
+        }
         if let Some(cached) = self.transfer_offer_cache.borrow().as_ref() {
             return Ok(Rc::clone(cached));
         }
         let path = coordinator.snapshot_path();
-        let sealed = coordinator.io.read(&path).await.map_err(|source| {
+        let generation = self.snapshot_generation.get();
+        let read = coordinator.io.read(&path).await;
+        // Every await is behind this point, so nothing below can see a replacement.
+        if self.snapshot_generation.get() != generation {
+            return Err(StateTransferUnavailable::SnapshotReplaced);
+        }
+        let sealed = read.map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
                 StateTransferUnavailable::NoSnapshot
             } else {
@@ -2621,13 +2943,18 @@ where
         // Verifies the trailer and hands back the payload alone.
         let (payload, _) =
             split_trailer(&sealed).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
-        // Still decoded rather than read off `last_checkpoint()`: `write_durably`
+        // Still read from the file rather than off `last_checkpoint()`: the writer
         // renames before the parent-dir fsync, so a DirSync failure leaves the new
         // file live with that cell stale, and the offer would then under-advertise
         // the frontier it is actually shipping.
-        let snapshot_seq = IggySnapshot::decode(payload)
-            .map_err(StateTransferUnavailable::SnapshotUnreadable)?
-            .sequence_number();
+        //
+        // Only the leading fields are read. A full decode stalls shard 0 for as
+        // long as the catalog is large, and only a writer bug produces a payload
+        // with a valid trailer that does not decode. Each receiver decodes the
+        // whole snapshot at the start of `install_state_transfer`, before it moves
+        // any state, and refuses it there.
+        let snapshot_seq =
+            peek_sequence_number(payload).map_err(StateTransferUnavailable::SnapshotUnreadable)?;
 
         let commit_op = consensus.commit_min();
         let table = self.client_table.borrow().encode();
@@ -2654,16 +2981,60 @@ where
             ],
         });
         *self.transfer_offer_cache.borrow_mut() = Some(Rc::clone(&offer));
+        let mut served = self.served_offers.borrow_mut();
+        served.retain(|offer| offer.strong_count() > 0);
+        served.push(Rc::downgrade(&offer));
+        drop(served);
         Ok(offer)
     }
 
-    /// Hold the checkpoint gate as a checkpoint that never finishes would: every
-    /// state transfer offer is refused as `CheckpointInProgress` until the guard
-    /// drops. `None` while a checkpoint holds it.
+    /// Refuse every later state transfer offer as
+    /// [`StateTransferUnavailable::SnapshotReplaced`], as a primary whose
+    /// snapshot is replaced during each read would. Simulated snapshot reads
+    /// finish within one poll, so no replacement can land inside one.
     #[cfg(feature = "simulator")]
-    #[must_use]
-    pub const fn hold_checkpoint_gate(&self) -> Option<journal::local_gate::LocalGateGuard<'_>> {
-        self.checkpoint_lock.try_acquire()
+    pub fn refuse_state_transfer_offers(&self) {
+        self.state_transfer_offers_refused.set(true);
+    }
+
+    /// Whether the WAL here can hold the tail of a state transfer: every op
+    /// above the journal floor that the install leaves, up to `table_frontier`.
+    ///
+    /// No checkpoint is captured below the frontier of a transferred client
+    /// table, so the floor stays until the commit walk reaches that frontier,
+    /// and an append refuses a slot whose op is above the floor. A replica with
+    /// a longer tail stops below the frontier for good. The floor moves to
+    /// `snapshot_seq` when the snapshot is ahead of `commit_min`. It stays when
+    /// only the table installs.
+    ///
+    /// # Errors
+    /// [`SnapshotError::TransferTailExceedsJournal`], which names
+    /// `metadata.journal_slots`.
+    pub fn verify_state_transfer_tail(
+        &self,
+        snapshot_seq: u64,
+        table_frontier: u64,
+    ) -> Result<(), SnapshotError> {
+        let (Some(consensus), Some(journal)) = (self.consensus.as_ref(), self.journal.as_ref())
+        else {
+            return Ok(());
+        };
+        let journal = journal.handle();
+        let Some(journal_slots) = journal.slot_count() else {
+            return Ok(());
+        };
+        let mut floor = journal.snapshot_op();
+        if snapshot_seq > consensus.commit_min() {
+            floor = floor.max(snapshot_seq);
+        }
+        let tail = table_frontier.saturating_sub(floor);
+        if tail > journal_slots as u64 {
+            return Err(SnapshotError::TransferTailExceedsJournal {
+                tail,
+                journal_slots,
+            });
+        }
+        Ok(())
     }
 
     /// Install a fetched state transfer without rewinding either the state
@@ -2687,7 +3058,8 @@ where
     /// the transferred checkpoint's pairing reached the durable superblock.
     ///
     /// # Errors
-    /// [`SnapshotError`] when the snapshot bytes do not decode, the persist
+    /// [`SnapshotError`] when the snapshot bytes do not decode, the tail does
+    /// not fit the WAL (see [`Self::verify_state_transfer_tail`]), the persist
     /// fails, or the in-place restore is rejected. An `Err` leaves the state
     /// machine, client table and frontiers as they were. The snapshot file, the
     /// superblock record and the WAL suffix above the incoming floor can already
@@ -2726,27 +3098,11 @@ where
             "decoded a transferred metadata snapshot"
         );
 
-        // Manifest coherence. `commit_op` and `table_frontier` arrive from the
-        // serving peer and are applied to THIS replica's frontiers, so a
-        // malformed descriptor would move them somewhere the artifacts do not
-        // justify. A peer cannot have committed less than its own snapshot
-        // contains, nor have encoded a table below its commit point: both are
-        // built from one caught-up-primary read in `state_transfer_offer`.
-        // Refuse rather than install, which drops the caller back to journal
-        // repair with the local state untouched.
-        if commit_op < snapshot_seq || table_frontier < snapshot_seq || table_frontier > commit_op {
-            tracing::error!(
-                snapshot_seq,
-                commit_op,
-                table_frontier,
-                "incoherent state transfer manifest; refusing to install"
-            );
-            return Err(SnapshotError::IncoherentManifest {
-                snapshot_seq,
-                commit_op,
-                table_frontier,
-            });
-        }
+        // The descriptor gate checked the frontier that the manifest declares
+        // for the snapshot, not the op of the decoded snapshot. Refuse rather
+        // than install, which drops the caller back to journal repair with the
+        // local state untouched.
+        verify_state_transfer_manifest(snapshot_seq, commit_op, table_frontier)?;
 
         // Checkpoints are node-local, so a healthy serving primary can offer
         // a snapshot BEHIND this replica's own applied frontier (each node
@@ -2762,13 +3118,16 @@ where
         // binding decision is re-derived under them below.
         let snapshot_ahead = snapshot_seq > consensus.commit_min();
 
-        // Serialize the whole install against a concurrent checkpoint, in the
-        // checkpoint's own lock order (`checkpoint_lock` then
-        // `superblock_lock`), so the two cannot deadlock against each other.
+        // Serialize the whole install against a concurrent checkpoint and every
+        // other WAL writer, in the documented lock order (`journal_gate`,
+        // `checkpoint_lock`, `superblock_lock`), so none of them can deadlock
+        // against it. `journal_gate` covers the WAL truncate, the boundary removal
+        // and the floor move below: an append landing inside one of those rewrites
+        // is lost from the WAL, and a checkpoint trim fails one of them as busy.
         //
         // Both do the same pair of steps -- rewrite `snapshot.bin`, record
-        // `(checkpoint_op, checksum)` -- and `checkpoint_if_needed` holds
-        // `checkpoint_lock` across BOTH while taking `superblock_lock` only
+        // `(checkpoint_op, checksum)` -- and a checkpoint, inline or as a job,
+        // holds `checkpoint_lock` across BOTH while taking `superblock_lock` only
         // around the pairing write. `superblock_lock` alone therefore
         // serializes nothing against the checkpoint's file rewrite: interleave
         // them and the file comes from one while the durable pairing describes
@@ -2782,13 +3141,14 @@ where
         //
         // `write_superblock` takes no lock of its own.
         let _install_gates = if snapshot_ahead {
+            let journal_writes = self.journal_gate.acquire().await;
             let checkpoint = self.checkpoint_lock.acquire().await;
             let superblock = if self.superblock.is_some() {
                 Some(self.superblock_lock.acquire().await)
             } else {
                 None
             };
-            Some((checkpoint, superblock))
+            Some((journal_writes, checkpoint, superblock))
         } else {
             None
         };
@@ -2803,6 +3163,9 @@ where
         // assert with the damage already durable.
         let mut local_applied = consensus.commit_min();
         let mut snapshot_ahead = snapshot_seq > local_applied;
+
+        // Ahead of every durable step, so a refusal leaves this replica as it was.
+        self.verify_state_transfer_tail(snapshot_seq, table_frontier)?;
 
         let snapshot_table = if snapshot_ahead {
             let table = snapshot
@@ -2833,21 +3196,40 @@ where
                 // A failed earlier install can leave the durable checkpoint ahead
                 // of the STM. Replacing it with an older snapshot would make a
                 // crash before the next superblock write refuse recovery.
-                if snapshot_seq < coordinator.last_checkpoint().0 {
+                let checkpoint_op = coordinator.last_checkpoint().0;
+                if snapshot_seq < checkpoint_op {
                     return Err(SnapshotError::InvalidState(
                         "state transfer snapshot is older than the durable checkpoint",
                     ));
                 }
-                let checksum = checkpoint_checksum(snapshot_bytes);
-                self.clear_state_transfer_offer_cache();
-                let mut encoded = Vec::with_capacity(snapshot_bytes.len() + SNAPSHOT_TRAILER_LEN);
-                encoded.extend_from_slice(snapshot_bytes);
-                coordinator.write_snapshot(encoded).await?;
-                coordinator.seed_last_checkpoint(snapshot_seq, checksum);
-                tracing::info!(
-                    checkpoint_op = snapshot_seq,
-                    "state transfer recorded its checkpoint pairing"
-                );
+                // Nor may another snapshot of the durable checkpoint's op replace
+                // it: a superblock write may pair it on disk, also a write that
+                // reported an error, and another primary stamps its own
+                // `created_at`, so another checksum. The replicated state of one op
+                // is the same on every replica, so the file and its pairing stay,
+                // and the restore below still reads the received bytes.
+                // The change log is node-local, so the two snapshots can differ
+                // in its depth. A restart then loads the kept one, and a reader
+                // below its floor rebuilds from current state.
+                if snapshot_seq == checkpoint_op {
+                    tracing::info!(
+                        checkpoint_op,
+                        "state transfer kept the durable snapshot of its op"
+                    );
+                } else {
+                    let written = coordinator.write_snapshot(snapshot_bytes.to_vec()).await;
+                    // Also on an error, which can come after the rename.
+                    self.clear_state_transfer_offer_cache();
+                    let checksum = written?;
+                    coordinator.seed_last_checkpoint(snapshot_seq, checksum);
+                    tracing::info!(
+                        checkpoint_op = snapshot_seq,
+                        "state transfer recorded its checkpoint pairing"
+                    );
+                }
+                if self.superblock.is_none() {
+                    coordinator.superblock_checkpoint_op.set(snapshot_seq);
+                }
             } else {
                 tracing::warn!(
                     snapshot_seq,
@@ -2929,8 +3311,8 @@ where
                 // would deadlock on the same non-reentrant gate.
                 pairing_durable = self.write_superblock(consensus, superblock.as_ref()).await;
                 // A failed write is only DEGRADED while the durable binding survives
-                // the truncate: the snapshot on disk subsumes the recorded pairing,
-                // which `verify_checkpoint_pairing` accepts as a lagging checkpoint.
+                // the truncate: the snapshot on disk is the one the recorded pairing
+                // names or a newer one, and `verify_checkpoint_pairing` accepts both.
                 if !pairing_durable {
                     if consensus.history_certificate_needs_persist() {
                         return Err(SnapshotError::HistoryBindingNotDurable { snapshot_seq });
@@ -4429,6 +4811,7 @@ where
             // sound.
             let reply = self.apply_prepare(prepare);
             consensus.advance_commit_min(prepare_header.op);
+            self.start_checkpoint_job_if_due(consensus, journal);
             // Partition primaries on metadata backups act on this op (fences,
             // joins, revocations), so the backups must not wait for the heartbeat.
             consensus.request_eager_commit();
@@ -4564,7 +4947,11 @@ where
         // one commit window drains the moment the window closes. Promoted
         // prepares are un-quorum'd, so they never re-close the gate here.
         loop {
-            if consensus.pipeline_is_full() {
+            // A pending WAL trim ends the promotion as a full pipeline does,
+            // and the tick promotes the rest once the trim ended. A request
+            // that passes its preflight reaches the gate acquire in
+            // `on_replicate` without an await after this test.
+            if consensus.pipeline_is_full() || self.checkpoint_trim_pending() {
                 break;
             }
             let req = consensus.pop_queued_request();
@@ -4690,7 +5077,8 @@ where
     SB: SuperblockStore,
 {
     /// Wait for the journal writes in flight and keep new ones out until the
-    /// guard drops, for a shard-side caller that truncates the journal.
+    /// guard drops, for a shard-side caller that truncates or appends to the
+    /// journal.
     ///
     /// An in-process submit appends on its caller's task, so it can run under
     /// the WAL rewrite. Landing after a view's reconcile, its entry would sit
@@ -4698,6 +5086,25 @@ where
     /// have decided differently.
     pub const fn hold_journal_writes(&self) -> LocalGateAcquire<'_> {
         self.journal_gate.acquire()
+    }
+
+    /// Whether a checkpoint job waits for `journal_gate` or holds it for its
+    /// WAL trim. A journal write that starts now waits for the whole rewrite.
+    ///
+    /// The shard 0 pump reads this before each step that appends, and keeps
+    /// the step for later while it is set. A short hold of the gate, as by the
+    /// append of an in-process submit, does not set it.
+    #[must_use]
+    pub const fn checkpoint_trim_pending(&self) -> bool {
+        self.pending_trims.get() > 0
+    }
+
+    /// Counts a WAL trim as pending until the returned guard drops. A
+    /// checkpoint job calls this before it waits for `journal_gate`.
+    #[must_use]
+    pub fn announce_checkpoint_trim(&self) -> PendingTrim<'_> {
+        self.pending_trims.set(self.pending_trims.get() + 1);
+        PendingTrim(&self.pending_trims)
     }
 
     /// Persist the current VSR state to the superblock when the view changed since
@@ -4792,6 +5199,9 @@ where
         let state = consensus.vsr_state(checkpoint_op, checkpoint_checksum);
         match superblock.write(&state.to_bytes()).await {
             Ok(()) => {
+                if let Some(coordinator) = &self.coordinator {
+                    coordinator.superblock_checkpoint_op.set(checkpoint_op);
+                }
                 consensus.mark_superblock_durable(state.view, state.log_view);
                 consensus.mark_adopted_view_durable(state.adopted_view.as_ref());
                 consensus.mark_history_certificate_durable(state.history_certificate());
@@ -4850,85 +5260,257 @@ where
             Error = iggy_common::IggyError,
         >,
 {
-    /// Run a forced checkpoint when the journal is low on capacity.
+    /// Make journal room at the forced-checkpoint margin. Runs under `journal_gate`,
+    /// before each append.
     ///
-    /// Diagnostic-only outcome: the caller holds the `journal_gate`, so this
-    /// is single-flight by construction, and a failure is deliberately not
-    /// surfaced as control flow — the prepare being replicated must proceed
-    /// to its append regardless (see the phantom-op comment at the call
-    /// site). The next prepare over the boundary simply retries.
+    /// Above the margin it takes no lock. At the margin it waits for
+    /// `checkpoint_lock`, so for the durable part of a running job or for an
+    /// install, and trims the WAL to the checkpoint the superblock pairs. If the
+    /// journal is still at the margin, it checkpoints inline. Without a checkpoint
+    /// spawner that is the only path.
+    ///
+    /// Diagnostic-only outcome: a failure is deliberately not surfaced as control
+    /// flow, the prepare being replicated must proceed to its append regardless
+    /// (see the phantom-op comment at the call site). A job that failed during the
+    /// wait also skips the inline attempt, so that prepare appends into the margin
+    /// and the next one retries.
     #[allow(clippy::future_not_send)]
-    #[allow(clippy::too_many_lines)]
     async fn checkpoint_if_needed(&self, consensus: &VsrConsensus<B, P>, journal: &J) {
         let Some(coordinator) = &self.coordinator else {
             return;
         };
-        // Serialize whole checkpoints against each other. In-process metadata submits
-        // each run on their own spawned task (`bus.spawn` in the server's metadata submit
-        // handler), so at the checkpoint margin two can enter here concurrently; without
-        // this lock they would run concurrent `persist_snapshot`s over the single
-        // `snapshot.bin` and concurrently `drain` the WAL, which rewrites through a
-        // shared `wal.tmp`. Acquire BEFORE `should_checkpoint` so check and sequence are
-        // atomic: the second caller re-checks under the lock, finds the margin restored
-        // by the first's drain, and coalesces away the redundant work.
-        //
-        // The superblock write below takes `superblock_lock` for itself, so a
-        // concurrent view persist (and with it every gated send, including the ack
-        // path) waits only for that write and not for this whole sequence.
-        let _checkpoint = self.checkpoint_lock.acquire().await;
         if !coordinator.should_checkpoint(journal) {
             return;
         }
+        let failed_jobs = coordinator.failed_jobs.get();
+        let wait_started = Instant::now();
+        // In-process submits each run on their own task, so several can reach the
+        // margin together. Under the lock the later ones find the margin restored
+        // by the first and coalesce away.
+        let _checkpoint = self.checkpoint_lock.acquire().await;
+        let lock_wait = wait_started.elapsed();
+        self.pair_checkpoint_at_commit(consensus, coordinator).await;
+        self.trim_to_superblock_checkpoint(
+            consensus,
+            journal,
+            coordinator,
+            lock_wait,
+            CheckpointTrimmer::Margin,
+        )
+        .await;
+        if !coordinator.should_checkpoint(journal) || coordinator.failed_jobs.get() != failed_jobs {
+            return;
+        }
 
+        let capture_started = Instant::now();
+        let Some(capture) = self.capture_checkpoint(consensus, coordinator) else {
+            return;
+        };
+        let checkpoint_op = capture.sequence_number;
+        let Some(timings) = self
+            .persist_checkpoint(
+                consensus,
+                coordinator,
+                capture,
+                capture_started.elapsed(),
+                CheckpointOrigin::Inline,
+            )
+            .await
+        else {
+            return;
+        };
+        #[cfg(test)]
+        if checkpoint_boundary(CheckpointBoundary::SuperblockWritten).is_err() {
+            return;
+        }
+        coordinator
+            .untrimmed_timings
+            .set(Some((checkpoint_op, timings)));
+        self.drain_checkpointed_prefix(
+            consensus,
+            journal,
+            coordinator,
+            checkpoint_op,
+            lock_wait,
+            CheckpointTrimmer::Margin,
+        )
+        .await;
+    }
+
+    /// Start a checkpoint job once half the WAL committed above the checkpoint the
+    /// superblock pairs. Runs right after `advance_commit_min`, with no await in
+    /// between, so the capture belongs to that commit.
+    ///
+    /// Counts committed ops, not journaled ones: a lagging backup that counted its
+    /// WAL would stay over the threshold after each job. The journaled ops are the
+    /// margin path's concern, so at the margin no job starts. Nor during a state
+    /// transfer: its install waits for a running job's write on the shard-0 pump.
+    fn start_checkpoint_job_if_due(&self, consensus: &VsrConsensus<B, P>, journal: &J) {
+        let Some(coordinator) = &self.coordinator else {
+            return;
+        };
+        let Some(slot_count) = journal.handle().slot_count() else {
+            return;
+        };
+        let commit_min = consensus.commit_min();
+        let committed = commit_min.saturating_sub(coordinator.superblock_checkpoint_op.get());
+        if committed < slot_count as u64 / CHECKPOINT_JOB_TRIGGER_DIVISOR
+            || commit_min < coordinator.job_retry_op.get()
+            || coordinator.should_checkpoint(journal)
+            || consensus.is_transferring()
+        {
+            return;
+        }
+        let Some(spawner) = self.checkpoint_spawner.borrow().as_ref().map(Rc::clone) else {
+            return;
+        };
+        // Held by a running job or by an install.
+        let Some(lease) = self.checkpoint_lock.try_acquire_owned() else {
+            return;
+        };
+        let capture_started = Instant::now();
+        let Some(capture) = self.capture_checkpoint(consensus, coordinator) else {
+            lease.release();
+            return;
+        };
+        spawner(CheckpointJob {
+            lease,
+            capture,
+            capture_time: capture_started.elapsed(),
+            // After the capture, which dropped the cache: only a shard that
+            // serves an offer holds one now, and no offer is built before the
+            // superblock write of this job.
+            keeps_wal: self.offer_needs_wal_above(journal.handle().snapshot_op()),
+        });
+    }
+
+    /// Make a captured checkpoint durable, then trim the WAL to it. The server
+    /// spawns this on shard 0 through [`Self::set_checkpoint_spawner`].
+    ///
+    /// The job trims nothing when a requester held an offer of the replaced
+    /// snapshot at the capture. That requester installs the snapshot and then
+    /// repairs from the op after it, also when its offer expires during the
+    /// writes of this job. A trim past that op sends it into another transfer,
+    /// and under a steady load into one after the other. The trim falls to the
+    /// margin, which the journal reaches before the next job is due: that trim
+    /// is short, and it bounds the time that the requester has.
+    ///
+    /// The job holds its lease of `checkpoint_lock` through the snapshot and
+    /// superblock writes and releases it before it waits for `journal_gate`. A margin
+    /// waiter holds that gate while it waits for the lock, so the job never waits
+    /// for the gate while holding the lock.
+    #[allow(clippy::future_not_send)]
+    pub async fn run_checkpoint_job(&self, job: CheckpointJob) {
+        let CheckpointJob {
+            lease,
+            capture,
+            capture_time,
+            keeps_wal,
+        } = job;
+        let (Some(consensus), Some(journal), Some(coordinator)) = (
+            self.consensus.as_ref(),
+            self.journal.as_ref(),
+            self.coordinator.as_ref(),
+        ) else {
+            lease.release();
+            return;
+        };
+        let checkpoint_op = capture.sequence_number;
+        let Some(timings) = self
+            .persist_checkpoint(
+                consensus,
+                coordinator,
+                capture,
+                capture_time,
+                CheckpointOrigin::Job,
+            )
+            .await
+        else {
+            let slot_count = journal.handle().slot_count().unwrap_or(0);
+            coordinator.record_failed_job(consensus.commit_min(), slot_count as u64);
+            lease.release();
+            return;
+        };
+        coordinator
+            .untrimmed_timings
+            .set(Some((checkpoint_op, timings)));
+        lease.release();
+        #[cfg(test)]
+        if checkpoint_boundary(CheckpointBoundary::SuperblockWritten).is_err() {
+            return;
+        }
+        if keeps_wal {
+            return;
+        }
+
+        let _trim = self.announce_checkpoint_trim();
+        let wait_started = Instant::now();
+        let _journal_writes = self.journal_gate.acquire().await;
+        // Margin waiters and installs take `journal_gate` first, so only a newer job
+        // can hold the lock here. It trims further itself, and a trim here would
+        // mark its pending checkpoint complete.
+        let Some(_checkpoint) = self.checkpoint_lock.try_acquire() else {
+            return;
+        };
+        self.trim_to_superblock_checkpoint(
+            consensus,
+            journal,
+            coordinator,
+            wait_started.elapsed(),
+            CheckpointTrimmer::Job,
+        )
+        .await;
+    }
+
+    /// Capture a checkpoint at `commit_min`, or `None` when none is due. The caller
+    /// holds `checkpoint_lock`.
+    fn capture_checkpoint(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        coordinator: &SnapshotCoordinator<M>,
+    ) -> Option<MetadataCapture> {
         // Use commit_min (locally executed), not commit_max. WAL entries
         // between commit_min+1 and commit_max haven't been applied to the
         // state machine yet, draining them would lose data on crash.
         let snap_op = consensus.commit_min();
-        let checkpoint_op = coordinator.last_checkpoint().0;
-        if snap_op < checkpoint_op
-            || (snap_op == checkpoint_op && !coordinator.checkpoint_pending.get())
-        {
-            return;
+        let checkpoint = coordinator.last_checkpoint();
+        // The snapshot of the last checkpoint is durable. A second capture of
+        // its op gets another `created_at`, so another checksum, and replaces
+        // that snapshot. A superblock write may pair the first one on disk, also
+        // a write that reported an error. A crash before the next superblock
+        // write then leaves a pairing that recovery refuses. So a pending
+        // checkpoint retries its superblock write and its trim, never its
+        // capture.
+        if snap_op <= checkpoint.0 {
+            return None;
         }
         // A transferred table may include replies above the restored STM floor.
         // Recovery must never replay that interval against its later protection.
         if snap_op < self.client_table_frontier.get() {
-            return;
+            return None;
         }
         coordinator.checkpoint_pending.set(true);
+        // An offer whose read is in flight holds the file that this checkpoint
+        // replaces and trims past.
+        self.clear_state_transfer_offer_cache();
         // Stamp created_at from the injected consensus clock (seed-derived
         // under the simulator), not the wall clock, so replayed snapshots are
         // byte-identical.
         let created_at = consensus.clock_realtime_micros();
-
-        // Durability ordering, must not be reordered: persist the snapshot, durably
-        // record the (checkpoint_op, checksum, commit_max) pairing in the superblock,
-        // THEN drain the snapshotted prefix from the WAL. A crash before the
-        // superblock write recovers the prior checkpoint with the WAL intact; a crash
-        // after it recovers the new one. Draining before the superblock points at the
-        // new snapshot could strand committed ops on a crash. Each fallible step
-        // withholds the rest and returns early, leaving the WAL undrained, so
-        // `should_checkpoint` stays true and the next tick retries from the top at the
-        // then-current commit_min. The prepare being replicated appends regardless
-        // (see the phantom-op comment at the call site).
         let client_table = self.client_table.borrow().to_snapshot();
         let change_log = self.change_log.snapshot();
         #[cfg(test)]
         if checkpoint_boundary(CheckpointBoundary::TableCaptured).is_err() {
-            return;
+            return None;
         }
-        self.clear_state_transfer_offer_cache();
-        let checksum = match coordinator
-            .persist_snapshot(
-                &*self.mux_stm,
-                snap_op,
-                created_at,
-                Some(client_table),
-                change_log,
-            )
-            .await
-        {
-            Ok(checksum) => checksum,
+        match coordinator.capture(
+            &*self.mux_stm,
+            snap_op,
+            created_at,
+            Some(client_table),
+            change_log,
+        ) {
+            Ok(capture) => Some(capture),
             Err(e) => {
                 error!(
                     target: "iggy.metadata.diag",
@@ -4936,22 +5518,63 @@ where
                     replica_id = consensus.replica(),
                     checkpoint_op = snap_op,
                     error = %e,
+                    "checkpoint snapshot capture failed"
+                );
+                None
+            }
+        }
+    }
+
+    /// Persist `capture`, then durably record its pairing in the superblock.
+    /// Returns the step timings, or `None` after a logged failure. The caller holds
+    /// `checkpoint_lock`.
+    ///
+    /// Durability ordering, must not be reordered: persist the snapshot, durably
+    /// record the `(checkpoint_op, checksum, commit_max)` pairing in the superblock,
+    /// THEN drain the snapshotted prefix from the WAL. A crash before the superblock
+    /// write recovers the prior checkpoint with the WAL intact; a crash after it
+    /// recovers the new one. Draining before the superblock points at the new
+    /// snapshot could strand committed ops on a crash. A failure leaves the
+    /// checkpoint pending, so a later attempt retries it from the top.
+    #[allow(clippy::future_not_send)]
+    async fn persist_checkpoint(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        coordinator: &SnapshotCoordinator<M>,
+        capture: MetadataCapture,
+        capture_time: Duration,
+        origin: CheckpointOrigin,
+    ) -> Option<CheckpointTimings> {
+        let checkpoint_op = capture.sequence_number;
+        let write_started = Instant::now();
+        let persisted = coordinator.persist_capture(capture).await;
+        // Also on an error, which can come after the rename.
+        self.clear_state_transfer_offer_cache();
+        let write = write_started.elapsed();
+        let checksum = match persisted {
+            Ok(checksum) => checksum,
+            Err(e) => {
+                error!(
+                    target: "iggy.metadata.diag",
+                    plane = "metadata",
+                    replica_id = consensus.replica(),
+                    checkpoint_op,
+                    error = %e,
                     "checkpoint snapshot persist failed"
                 );
-                return;
+                return None;
             }
         };
 
+        let superblock_started = Instant::now();
         if let Some(superblock) = self.superblock.as_ref() {
-            // `persist_snapshot` already recorded the new pairing on the coordinator, so
+            // `persist_capture` already recorded the new pairing on the coordinator, so
             // `write_superblock` picks it up from there. A view persist that interleaves
             // between those two steps writes the same new pairing, which only makes it
             // durable sooner.
             debug_assert_eq!(
-                self.coordinator
-                    .as_ref()
-                    .map(SnapshotCoordinator::last_checkpoint),
-                Some((snap_op, checksum)),
+                coordinator.last_checkpoint(),
+                (checkpoint_op, checksum),
                 "the checkpoint's pairing must be what the superblock write records"
             );
             let _superblock = self.superblock_lock.acquire().await;
@@ -4960,51 +5583,156 @@ where
                     target: "iggy.metadata.diag",
                     plane = "metadata",
                     replica_id = consensus.replica(),
-                    checkpoint_op = snap_op,
+                    checkpoint_op,
                     "checkpoint superblock write failed; withholding WAL drain"
                 );
-                return;
+                return None;
             }
+        } else {
+            coordinator.superblock_checkpoint_op.set(checkpoint_op);
         }
+        Some(CheckpointTimings {
+            origin,
+            capture: capture_time,
+            write,
+            superblock: superblock_started.elapsed(),
+        })
+    }
 
-        #[cfg(test)]
-        if checkpoint_boundary(CheckpointBoundary::SuperblockWritten).is_err() {
+    /// Write the superblock again for a checkpoint at `commit_min` whose earlier
+    /// write failed. No capture replaces the snapshot of that op, see
+    /// [`Self::capture_checkpoint`], so this write is its retry. A checkpoint
+    /// below `commit_min` is left to the next capture. The caller holds
+    /// `checkpoint_lock`.
+    #[allow(clippy::future_not_send)]
+    async fn pair_checkpoint_at_commit(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        coordinator: &SnapshotCoordinator<M>,
+    ) {
+        if !coordinator.checkpoint_pending.get()
+            || !coordinator.checkpoint_unpaired()
+            || coordinator.last_checkpoint().0 != consensus.commit_min()
+        {
             return;
         }
-        let drained = coordinator.drain(journal, snap_op).await;
+        let Some(superblock) = self.superblock.as_ref() else {
+            return;
+        };
+        let _superblock = self.superblock_lock.acquire().await;
+        if !self.write_superblock(consensus, superblock.as_ref()).await {
+            error!(
+                target: "iggy.metadata.diag",
+                plane = "metadata",
+                replica_id = consensus.replica(),
+                checkpoint_op = coordinator.last_checkpoint().0,
+                "checkpoint superblock write failed again; withholding WAL drain"
+            );
+        }
+    }
+
+    /// Trim the WAL to the checkpoint the superblock pairs, if the floor is still
+    /// below it. The caller holds `journal_gate` and `checkpoint_lock`.
+    #[allow(clippy::future_not_send)]
+    async fn trim_to_superblock_checkpoint(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        journal: &J,
+        coordinator: &SnapshotCoordinator<M>,
+        gate_wait: Duration,
+        trimmed_by: CheckpointTrimmer,
+    ) {
+        let checkpoint_op = coordinator.superblock_checkpoint_op.get();
+        // A failed install can leave the pairing ahead of the applied state, and a
+        // drain there would remove this replica's commit point.
+        if checkpoint_op > consensus.commit_min() {
+            return;
+        }
+        let Some(drain_to) = checkpoint_op.checked_sub(1) else {
+            return;
+        };
+        if journal.handle().snapshot_op() >= drain_to {
+            // An install trims by itself. Nothing is left of a checkpoint that
+            // is paired and trimmed.
+            if coordinator.last_checkpoint().0 == checkpoint_op {
+                coordinator.checkpoint_pending.set(false);
+            }
+            return;
+        }
+        self.drain_checkpointed_prefix(
+            consensus,
+            journal,
+            coordinator,
+            checkpoint_op,
+            gate_wait,
+            trimmed_by,
+        )
+        .await;
+    }
+
+    /// Drain the WAL below `checkpoint_op`, whose pairing is durable, and log the
+    /// checkpoint as completed. The caller holds `journal_gate` and `checkpoint_lock`.
+    #[allow(clippy::future_not_send)]
+    async fn drain_checkpointed_prefix(
+        &self,
+        consensus: &VsrConsensus<B, P>,
+        journal: &J,
+        coordinator: &SnapshotCoordinator<M>,
+        checkpoint_op: u64,
+        gate_wait: Duration,
+        trimmed_by: CheckpointTrimmer,
+    ) {
+        let trim_started = Instant::now();
+        let drained = coordinator.drain(journal, checkpoint_op).await;
         // On the error path too: a drain that fails part-way still removed
         // whatever it reached, and a snapshot left offering those bodies strands
         // the peer that picks this replica as a repair source.
         consensus.note_journal_mutation();
-        if drained.is_ok() {
-            coordinator.checkpoint_pending.set(false);
-        }
         if let Err(e) = drained {
             error!(
                 target: "iggy.metadata.diag",
                 plane = "metadata",
                 replica_id = consensus.replica(),
-                checkpoint_op = snap_op,
+                checkpoint_op,
                 error = %e,
                 "checkpoint WAL drain failed"
             );
             return;
+        }
+        if coordinator.last_checkpoint().0 == checkpoint_op {
+            coordinator.checkpoint_pending.set(false);
         }
 
         #[cfg(test)]
         if checkpoint_boundary(CheckpointBoundary::WalDrained).is_err() {
             return;
         }
-
+        let timings = coordinator
+            .untrimmed_timings
+            .take()
+            .filter(|(op, _)| *op == checkpoint_op)
+            .map_or_else(CheckpointTimings::default, |(_, timings)| timings);
+        #[cfg(test)]
+        {
+            COMPLETED_CHECKPOINTS.set(COMPLETED_CHECKPOINTS.get() + 1);
+            LAST_COMPLETED_CHECKPOINT.set(Some((timings.origin, trimmed_by)));
+        }
         // Info, not debug: checkpoints are rare and change what a restart can
         // recover locally, and spec tests pin checkpoint placement by grepping
         // this line off stdout at the default `info` level
-        // (`metadata_checkpoint_restart`, `metadata_state_transfer`).
+        // (`metadata_checkpoint_restart`, `metadata_changes`).
         info!(
             target: "iggy.metadata.diag",
             plane = "metadata",
             replica_id = consensus.replica(),
-            checkpoint_op = snap_op,
+            checkpoint_op,
+            origin = %timings.origin,
+            trimmed_by = %trimmed_by,
+            capture = ?timings.capture,
+            write = ?timings.write,
+            superblock = ?timings.superblock,
+            trim = ?trim_started.elapsed(),
+            gate_wait = ?gate_wait,
             "forced checkpoint completed"
         );
     }
@@ -5703,7 +6431,10 @@ where
                 return CommitWalkStop::PipelineHead;
             }
 
-            let Some(header) = journal.handle().header(op as usize) else {
+            // Copied out of its guard: the body read below awaits, and a
+            // checkpoint job that trims the WAL meanwhile borrows the index
+            // mutably.
+            let Some(header) = journal.handle().header(op as usize).map(|header| *header) else {
                 // Gap-stop: the walk halts at the first missing prepare and
                 // resumes once it is refilled -- by the primary's retransmit
                 // while the op still lacks quorum, otherwise by a
@@ -5713,7 +6444,6 @@ where
                 // traffic reaches.
                 return CommitWalkStop::HeaderMissing { op };
             };
-            let header = *header;
 
             let Some(prepare) = journal.handle().entry(&header).await else {
                 warn!("commit_journal: prepare body missing for op={op}, stopping");
@@ -5731,6 +6461,7 @@ where
             // retains newer protection for client admission.
             self.apply_prepare(prepare);
             consensus.advance_commit_min(op);
+            self.start_checkpoint_job_if_due(consensus, journal);
             self.advance_applied_frontier(op);
             debug!("commit_journal: committed op={op}");
         }
@@ -6687,7 +7418,7 @@ mod tests {
         let mut metadata = metadata_plane();
         metadata.coordinator = Some(SnapshotCoordinator::new(
             directory.path().to_path_buf(),
-            IggySnapshot::create,
+            MetadataCapture::create,
         ));
         let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
         IggySnapshot::create(&TestMux::default(), 0, 1)
@@ -6696,17 +7427,17 @@ mod tests {
             .await
             .unwrap();
         let checkpoint = metadata.checkpoint_lock.acquire().await;
-        {
-            let mut blocked_offer = std::pin::pin!(metadata.state_transfer_offer());
-            assert!(matches!(
-                futures::poll!(&mut blocked_offer),
-                std::task::Poll::Ready(Err(StateTransferUnavailable::CheckpointInProgress))
-            ));
-        }
+        assert!(
+            matches!(
+                metadata.state_transfer_offer().await,
+                Err(StateTransferUnavailable::SnapshotReplaced)
+            ),
+            "a running checkpoint must refuse an offer of the file it replaces"
+        );
         drop(checkpoint);
-        let first = settled_transfer_offer(&metadata).await.unwrap();
+        let first = metadata.state_transfer_offer().await.unwrap();
         std::fs::remove_file(&path).unwrap();
-        let cached = settled_transfer_offer(&metadata).await.unwrap();
+        let cached = metadata.state_transfer_offer().await.unwrap();
         assert!(
             Rc::ptr_eq(&first, &cached),
             "a cache hit must need no disk read"
@@ -6719,7 +7450,7 @@ mod tests {
             .install_state_transfer(&incoming, ClientTable::new(CLIENTS_TABLE_MAX), 1, 1)
             .await
             .unwrap();
-        let replaced = settled_transfer_offer(&metadata).await.unwrap();
+        let replaced = metadata.state_transfer_offer().await.unwrap();
         assert_eq!(replaced.snapshot_seq, 1);
         assert!(!Rc::ptr_eq(&first, &replaced));
 
@@ -6728,9 +7459,83 @@ mod tests {
         damaged[0] ^= 1;
         std::fs::write(&path, damaged).unwrap();
         assert!(matches!(
-            settled_transfer_offer(&metadata).await,
+            metadata.state_transfer_offer().await,
             Err(StateTransferUnavailable::SnapshotUnreadable(_))
         ));
+    }
+
+    #[compio::test]
+    async fn given_a_snapshot_replacement_when_offering_should_never_serve_the_replaced_file_after_it()
+     {
+        const OLD_SEQ: u64 = 1;
+        const NEW_SEQ: u64 = 2;
+        const NEWER_SEQ: u64 = 3;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+        let mut metadata = metadata_plane();
+        metadata.coordinator = Some(SnapshotCoordinator::new(
+            directory.path().to_path_buf(),
+            MetadataCapture::create,
+        ));
+        let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
+        IggySnapshot::create(&TestMux::default(), OLD_SEQ, 1)
+            .unwrap()
+            .persist(&path)
+            .await
+            .unwrap();
+        let transferred = |seq| {
+            let mut snapshot = IggySnapshot::create(&TestMux::default(), seq, seq).unwrap();
+            snapshot.snapshot_mut().client_table =
+                Some(metadata.client_table.borrow().to_snapshot());
+            snapshot.encode().unwrap()
+        };
+        let table = || ClientTable::new(CLIENTS_TABLE_MAX);
+
+        // An offer cached before the install is refused while the install writes
+        // and dropped at its rename.
+        let before = metadata.state_transfer_offer().await.unwrap();
+        assert_eq!(before.snapshot_seq, OLD_SEQ);
+        let new_bytes = transferred(NEW_SEQ);
+        let held = SNAPSHOT_IO.lock().await;
+        let mut installing =
+            Box::pin(metadata.install_state_transfer(&new_bytes, table(), NEW_SEQ, NEW_SEQ));
+        assert!(futures::poll!(&mut installing).is_pending());
+        assert!(matches!(
+            metadata.state_transfer_offer().await,
+            Err(StateTransferUnavailable::SnapshotReplaced)
+        ));
+        drop(held);
+        installing.await.unwrap();
+        assert_eq!(
+            metadata.state_transfer_offer().await.unwrap().snapshot_seq,
+            NEW_SEQ,
+            "the cache must not outlive the file it was read from"
+        );
+
+        // A read that spans a rename is refused and leaves the cache empty.
+        metadata.clear_state_transfer_offer_cache();
+        let newer_bytes = transferred(NEWER_SEQ);
+        let mut offer = Box::pin(metadata.state_transfer_offer());
+        assert!(
+            futures::poll!(&mut offer).is_pending(),
+            "the read must suspend"
+        );
+        metadata
+            .install_state_transfer(&newer_bytes, table(), NEWER_SEQ, NEWER_SEQ)
+            .await
+            .unwrap();
+        assert!(matches!(
+            offer.await,
+            Err(StateTransferUnavailable::SnapshotReplaced)
+        ));
+        assert!(
+            metadata.transfer_offer_cache.borrow().is_none(),
+            "a refused offer must not reach the cache"
+        );
+        assert_eq!(
+            metadata.state_transfer_offer().await.unwrap().snapshot_seq,
+            NEWER_SEQ
+        );
     }
 
     #[test]
@@ -6894,7 +7699,7 @@ mod tests {
         let mut metadata = metadata_plane();
         metadata.coordinator = Some(SnapshotCoordinator::new(
             directory.path().to_path_buf(),
-            IggySnapshot::create,
+            MetadataCapture::create,
         ));
         let path = metadata.coordinator.as_ref().unwrap().snapshot_path();
         IggySnapshot::create(&TestMux::default(), SNAPSHOT_OP, 1)
@@ -6906,7 +7711,8 @@ mod tests {
         consensus.restore_commit_state(COMMITTED, COMMITTED);
         consensus.set_recovery_barrier(COMMITTED + 1);
 
-        let offer = settled_transfer_offer(&metadata)
+        let offer = metadata
+            .state_transfer_offer()
             .await
             .expect("a primary below its recovery barrier must still serve committed state");
         assert_eq!(offer.snapshot_seq, SNAPSHOT_OP);
@@ -6914,25 +7720,6 @@ mod tests {
             offer.commit_op, COMMITTED,
             "the offer must stop at the applied commit point, below the barrier"
         );
-    }
-
-    #[allow(clippy::future_not_send)]
-    async fn settled_transfer_offer(
-        metadata: &IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux>,
-    ) -> Result<Rc<StateTransferOffer>, StateTransferUnavailable> {
-        const TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        compio::time::timeout(TEST_TIMEOUT, async {
-            loop {
-                match metadata.state_transfer_offer().await {
-                    Err(StateTransferUnavailable::CheckpointInProgress) => {
-                        compio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    result => return result,
-                }
-            }
-        })
-        .await
-        .expect("concurrent snapshot writers settle")
     }
 
     #[compio::test]
@@ -6949,7 +7736,7 @@ mod tests {
             let mut metadata = metadata_plane();
             metadata.coordinator = Some(SnapshotCoordinator::new(
                 directory.path().to_path_buf(),
-                IggySnapshot::create,
+                MetadataCapture::create,
             ));
             let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
             table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
@@ -7044,7 +7831,26 @@ mod tests {
         // covered by
         // `crate::stm::stream::tests::populated_streams_snapshot_reencode_is_byte_stable`.
         let mut snapshot = IggySnapshot::new(7);
-        snapshot.snapshot.client_table = Some(consensus::ClientTableSnapshot {
+        snapshot.snapshot.client_table = Some(two_session_client_table());
+
+        let encoded = snapshot.encode().unwrap();
+        let decoded = IggySnapshot::decode(&encoded).unwrap();
+        assert_eq!(
+            encoded,
+            decoded.encode().unwrap(),
+            "a populated snapshot must re-encode byte-identically after a decode; an \
+             unordered collection in the serialized form would make two replicas with \
+             identical state serialize differently"
+        );
+        assert_ne!(
+            checkpoint_checksum(&encoded),
+            checkpoint_checksum(&IggySnapshot::new(7).encode().unwrap()),
+            "the checksum must track content, else it could not detect a torn snapshot"
+        );
+    }
+
+    fn two_session_client_table() -> consensus::ClientTableSnapshot {
+        consensus::ClientTableSnapshot {
             capacity: 4,
             slots: vec![
                 (
@@ -7074,22 +7880,231 @@ mod tests {
                     },
                 ),
             ],
-        });
+        }
+    }
 
-        let encoded = snapshot.encode().unwrap();
-        let decoded = IggySnapshot::decode(&encoded).unwrap();
+    /// One user holding one token (more tokens encode in hash order), the
+    /// populated stream catalog, two sessions and change log records in both
+    /// rings.
+    fn populated_checkpoint_state() -> (TestMux, ClientTableSnapshot, ChangeLogSnapshot) {
+        let mut users = UsersInner::new();
+        let timestamp = IggyTimestamp::from(1);
+        // The op of an apply is the access revision of its user and the id of
+        // its token, and a checkpoint refuses either at zero.
+        users.apply_context.metadata_op = 1;
+        let created = StateHandler::apply(
+            &CreateUserRequest {
+                username: WireName::new("token-owner").unwrap(),
+                password: "hash".to_owned(),
+                status: UserStatus::Active.as_code(),
+                permissions: None,
+                options: WireOptions::empty(),
+            },
+            &mut users,
+            timestamp,
+        );
+        assert_eq!(created.code, 0);
+        let token = CreatePersonalAccessTokenRequest {
+            user_id: 0,
+            ..token_create(TOKEN_NAME)
+        };
+        users.apply_context.metadata_op = 3;
+        assert_eq!(StateHandler::apply(&token, &mut users, timestamp).code, 0);
+        let streams = Streams::from(crate::stm::stream::tests::populated_catalog());
+
+        let change_log = MetadataChangeLog::new(ChangeLogCapacities::default());
+        let header = |op| PrepareHeader {
+            op,
+            checksum: 0x5eed + u128::from(op),
+            timestamp: op,
+            ..PrepareHeader::default()
+        };
+        let change = |kind, body: &'static [u8]| AppliedChange {
+            kind,
+            actor_user_id: Some(0),
+            body: Bytes::from_static(body),
+        };
+        change_log
+            .append(
+                &header(1),
+                vec![change(WireMetadataChangeKind::UserCreated, b"user")],
+            )
+            .unwrap();
+        change_log
+            .append(
+                &header(2),
+                vec![
+                    change(WireMetadataChangeKind::StreamCreated, b"stream"),
+                    change(WireMetadataChangeKind::SessionRegistered, b"session"),
+                ],
+            )
+            .unwrap();
+
+        (
+            TestMux::new((users.into(), (streams, ()))),
+            two_session_client_table(),
+            change_log.snapshot(),
+        )
+    }
+
+    #[compio::test]
+    async fn given_empty_or_populated_state_when_persisting_a_checkpoint_should_write_the_encoded_snapshot()
+     {
+        // Above every op the fixtures record, which `IggySnapshot::load` validates.
+        const SEQUENCE_NUMBER: u64 = 1_000;
+        const CREATED_AT: u64 = 1_700_000_000_000_000;
+        let empty = (
+            TestMux::default(),
+            ClientTable::new(CLIENTS_TABLE_MAX).to_snapshot(),
+            ChangeLogSnapshot::default(),
+        );
+        for (mux, client_table, change_log) in [empty, populated_checkpoint_state()] {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::create_dir(directory.path().join(crate::impls::METADATA_DIR)).unwrap();
+            let coordinator =
+                SnapshotCoordinator::new(directory.path().to_path_buf(), MetadataCapture::create);
+            let mut snapshot = IggySnapshot::create(&mux, SEQUENCE_NUMBER, CREATED_AT).unwrap();
+            snapshot.snapshot.client_table = Some(client_table.clone());
+            snapshot.snapshot.change_log = change_log.clone();
+            let expected = snapshot.encode().unwrap();
+            let mut one_step_chunks =
+                MetadataCapture::create(&mux, SEQUENCE_NUMBER, CREATED_AT).unwrap();
+            one_step_chunks.client_table = Some(client_table.clone());
+            one_step_chunks.change_log = change_log.clone();
+
+            let capture = coordinator
+                .capture(
+                    &mux,
+                    SEQUENCE_NUMBER,
+                    CREATED_AT,
+                    Some(client_table),
+                    change_log,
+                )
+                .unwrap();
+            let checksum = coordinator.persist_capture(capture).await.unwrap();
+
+            let path = coordinator.snapshot_path();
+            let file = std::fs::read(&path).unwrap();
+            let (payload, trailer) = file.split_at(file.len() - SNAPSHOT_TRAILER_LEN);
+            assert_eq!(
+                payload, expected,
+                "the streamed payload must be the encoded snapshot"
+            );
+            assert_eq!(checksum, checkpoint_checksum(&expected));
+            assert_eq!(trailer, snapshot_trailer(checksum));
+            assert_eq!(coordinator.last_checkpoint(), (SEQUENCE_NUMBER, checksum));
+            let (loaded, loaded_checksum) = IggySnapshot::load(&path).unwrap();
+            assert_eq!(loaded_checksum, checksum);
+            assert_eq!(loaded.sequence_number(), SEQUENCE_NUMBER);
+            assert!(!path.with_extension("bin.tmp").exists());
+
+            // One byte per chunk cuts after every step. Spawned as the server runs
+            // it: a yield whose wake got lost would hang here.
+            let chunked_path = directory.path().join("one-step-chunks.bin");
+            let chunked_checksum = compio::runtime::spawn({
+                let chunked_path = chunked_path.clone();
+                async move {
+                    write_snapshot_file(
+                        &chunked_path,
+                        one_step_chunks.into_encoder(),
+                        SnapshotIo::Compio,
+                        1,
+                    )
+                    .await
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(chunked_checksum, checksum);
+            assert_eq!(
+                std::fs::read(&chunked_path).unwrap(),
+                file,
+                "chunk boundaries must not change a byte"
+            );
+        }
+    }
+
+    /// Synchronous I/O never suspends, so every `Pending` of the write is a yield
+    /// after a chunk, and each must wake its own task first or no executor polls it
+    /// again.
+    #[cfg(feature = "simulator")]
+    #[test]
+    fn given_one_byte_chunks_when_writing_a_checkpoint_should_yield_after_every_step() {
+        const SEQUENCE_NUMBER: u64 = 1_000;
+        const CREATED_AT: u64 = 1_700_000_000_000_000;
+
+        struct CountingWaker(std::sync::atomic::AtomicUsize);
+
+        impl std::task::Wake for CountingWaker {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let (mux, client_table, change_log) = populated_checkpoint_state();
+        let mut snapshot = IggySnapshot::create(&mux, SEQUENCE_NUMBER, CREATED_AT).unwrap();
+        snapshot.snapshot.client_table = Some(client_table.clone());
+        snapshot.snapshot.change_log = change_log.clone();
+        let expected = snapshot.encode().unwrap();
+        let capture = || {
+            let mut capture = MetadataCapture::create(&mux, SEQUENCE_NUMBER, CREATED_AT).unwrap();
+            capture.client_table = Some(client_table.clone());
+            capture.change_log = change_log.clone();
+            capture
+        };
+        // A step that writes a byte ends its chunk.
+        let mut steps = 0;
+        let mut encoder = capture().into_encoder();
+        let mut written = Vec::new();
+        loop {
+            let before = written.len();
+            let more = encoder.encode_next(&mut written).unwrap();
+            steps += usize::from(written.len() > before);
+            if !more {
+                break;
+            }
+        }
+        let streams = snapshot.snapshot.streams.as_ref().unwrap().items.len();
+        assert!(
+            steps > streams,
+            "the fixture must hold streams of several steps"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(crate::impls::SNAPSHOT_FILE_NAME);
+
+        let wake_count = Arc::new(CountingWaker(std::sync::atomic::AtomicUsize::new(0)));
+        let waker = std::task::Waker::from(Arc::clone(&wake_count));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut write = std::pin::pin!(write_snapshot_file(
+            &path,
+            capture().into_encoder(),
+            SnapshotIo::Synchronous,
+            1
+        ));
+        let mut pending_polls = 0;
+        let checksum = loop {
+            match write.as_mut().poll(&mut context) {
+                Poll::Ready(result) => break result.unwrap(),
+                Poll::Pending => pending_polls += 1,
+            }
+        };
+
+        assert!(
+            pending_polls >= steps,
+            "{pending_polls} yields for {steps} steps in chunks of their own"
+        );
         assert_eq!(
-            encoded,
-            decoded.encode().unwrap(),
-            "a populated snapshot must re-encode byte-identically after a decode; an \
-             unordered collection in the serialized form would make two replicas with \
-             identical state serialize differently"
+            wake_count.0.load(std::sync::atomic::Ordering::Relaxed),
+            pending_polls
         );
-        assert_ne!(
-            checkpoint_checksum(&encoded),
-            checkpoint_checksum(&IggySnapshot::new(7).encode().unwrap()),
-            "the checksum must track content, else it could not detect a torn snapshot"
-        );
+        let file = std::fs::read(&path).unwrap();
+        assert_eq!(file[..file.len() - SNAPSHOT_TRAILER_LEN], expected);
+        assert_eq!(checksum, checkpoint_checksum(&expected));
     }
 
     #[test]
@@ -11114,7 +12129,27 @@ mod tests {
             let committed = consensus.commit_min();
             metadata.set_checkpoint_margin(usize::MAX);
             STOP_CHECKPOINT_AFTER.set(Some(boundary));
-            metadata.checkpoint_if_needed(consensus, journal).await;
+            if boundary == CheckpointBoundary::TableCaptured {
+                metadata.checkpoint_if_needed(consensus, journal).await;
+            } else {
+                metadata.state_transfer_offer().await.unwrap();
+                let held = SNAPSHOT_IO.lock().await;
+                let mut checkpoint = Box::pin(metadata.checkpoint_if_needed(consensus, journal));
+                assert!(futures::poll!(&mut checkpoint).is_pending());
+                assert!(
+                    matches!(
+                        metadata.state_transfer_offer().await,
+                        Err(StateTransferUnavailable::SnapshotReplaced)
+                    ),
+                    "{boundary:?}: the snapshot write must refuse an offer"
+                );
+                drop(held);
+                checkpoint.await;
+                assert!(
+                    metadata.transfer_offer_cache.borrow().is_none(),
+                    "{boundary:?}: an offer cached before the snapshot write must not outlive it"
+                );
+            }
             assert!(
                 STOP_CHECKPOINT_AFTER.get().is_none(),
                 "{boundary:?} must be reached"
@@ -11265,7 +12300,7 @@ mod tests {
     /// `checkpoint_if_needed` runs inside `on_replicate`, once per submit.
     /// Under a concurrent login/create burst, several `on_replicate` futures
     /// cross the forced-checkpoint boundary (journal `remaining_capacity <=
-    /// CHECKPOINT_MARGIN`, i.e. op `SLOT_COUNT - MARGIN = 960`) together, and
+    /// CHECKPOINT_MARGIN`, i.e. op `SLOTS - MARGIN = 960`) together, and
     /// every one of them runs a full checkpoint concurrently. The concurrent
     /// `journal.drain()` calls race on the one fixed `wal.tmp`: the losers
     /// surface `snapshot I/O error: No such file or directory` (or a short
@@ -11285,18 +12320,23 @@ mod tests {
         const CLIENT: u128 = 1;
         const SESSION: u64 = 1;
         const ACTING_USER: u32 = 7;
+        /// Few enough that the fill below stays short.
+        const SLOTS: usize = 1024;
         /// One op below the forced-checkpoint trigger: the journal holds
-        /// 1024 slots and forces a checkpoint when 64 or fewer remain.
+        /// `SLOTS` slots and forces a checkpoint when 64 or fewer remain.
         const FILL: u64 = 960;
 
         let dir = tempfile::tempdir().unwrap();
         // Bootstrap creates the metadata dir; the coordinator's snapshot
         // persist expects it to exist.
         std::fs::create_dir_all(dir.path().join(crate::impls::METADATA_DIR)).unwrap();
-        let journal =
-            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
-                .await
-                .unwrap();
+        let journal = journal::prepare_journal::PrepareJournal::open_with_slots(
+            &dir.path().join("journal.wal"),
+            0,
+            SLOTS,
+        )
+        .await
+        .unwrap();
         let consensus = VsrConsensus::new(
             1,
             0,
@@ -11419,20 +12459,6 @@ mod tests {
         );
     }
 
-    /// Lets the spawned tasks run once.
-    async fn yield_now() {
-        let mut yielded = false;
-        std::future::poll_fn(|context| {
-            if yielded {
-                return std::task::Poll::Ready(());
-            }
-            yielded = true;
-            context.waker().wake_by_ref();
-            std::task::Poll::Pending
-        })
-        .await;
-    }
-
     /// Each submit claims its op and then waits on `journal_gate`. A submit that
     /// arrives after a release must not take the gate ahead of the submits that
     /// wait for it: a backup takes only the next op, so it drops a prepare that
@@ -11487,16 +12513,21 @@ mod tests {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
         let consensus = metadata.consensus.as_ref().unwrap();
+        commit_on_spy_bus_primary(&metadata, create_stream_request(CLIENT, 1, "committed")).await;
+        assert_eq!(
+            consensus.commit_min(),
+            1,
+            "op 1 gives a checkpoint a subject"
+        );
+        // Each prepare from here on finds the journal at the margin.
         metadata.set_checkpoint_margin(usize::MAX);
-        let coordinator = metadata.coordinator.as_ref().unwrap();
-        coordinator.checkpoint_pending.set(true);
 
         let held = metadata.journal_gate.try_acquire().unwrap();
         let waiting = compio::runtime::spawn({
             let metadata = Rc::clone(&metadata);
             async move {
                 metadata
-                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .submit_request_in_process(create_stream_request(CLIENT, 2, "stale"))
                     .await
             }
         });
@@ -11504,9 +12535,9 @@ mod tests {
         assert_eq!(
             consensus.pipeline_len(),
             1,
-            "the submit claims op 1 and waits on the gate"
+            "the submit claims op 2 and waits on the gate"
         );
-        adopt_view(consensus, 1);
+        adopt_view(consensus, 1, 1);
         drop(held);
         let reply = waiting.await.unwrap().unwrap();
 
@@ -11521,17 +12552,19 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .handle()
-                .header(1)
+                .header(2)
                 .is_none(),
             "a prepare of view 0 must not enter the journal of view 1"
         );
-        assert!(
-            coordinator.checkpoint_pending.get(),
+        assert_eq!(
+            metadata.coordinator.as_ref().unwrap().last_checkpoint().0,
+            0,
             "a prepare of view 0 must not run a checkpoint in view 1"
         );
         for backup in 1..=2 {
-            assert!(
-                sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+            assert_eq!(
+                sent_prepare_ops(consensus.message_bus(), backup),
+                [1],
                 "backup {backup} must not be sent a prepare of the view that ended"
             );
         }
@@ -11546,20 +12579,20 @@ mod tests {
         const CLIENT: u128 = 1;
         let (_dir, metadata) = primary_on_spy_bus([CLIENT]).await;
         let consensus = metadata.consensus.as_ref().unwrap();
-        // An interrupted checkpoint stays pending, and the next prepare retries it.
+        commit_on_spy_bus_primary(&metadata, create_stream_request(CLIENT, 1, "committed")).await;
+        assert_eq!(
+            consensus.commit_min(),
+            1,
+            "op 1 gives the checkpoint a subject"
+        );
+        // Each prepare from here on finds the journal at the margin.
         metadata.set_checkpoint_margin(usize::MAX);
-        metadata
-            .coordinator
-            .as_ref()
-            .unwrap()
-            .checkpoint_pending
-            .set(true);
 
         let checkpointing = compio::runtime::spawn({
             let metadata = Rc::clone(&metadata);
             async move {
                 metadata
-                    .submit_request_in_process(create_stream_request(CLIENT, 1, "stale"))
+                    .submit_request_in_process(create_stream_request(CLIENT, 2, "stale"))
                     .await
             }
         });
@@ -11568,7 +12601,7 @@ mod tests {
             metadata.checkpoint_lock.try_acquire().is_none(),
             "the submit must be inside its checkpoint"
         );
-        adopt_view(consensus, 1);
+        adopt_view(consensus, 1, 1);
         let reply = checkpointing.await.unwrap().unwrap();
 
         assert_eq!(
@@ -11582,18 +12615,19 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .handle()
-                .header(1)
+                .header(2)
                 .is_none(),
             "a prepare of view 0 must not enter the journal of view 1"
         );
         assert_eq!(
             consensus.sequencer().current_sequence(),
-            0,
+            1,
             "a prepare of view 0 must not move the sequencer of view 1"
         );
         for backup in 1..=2 {
-            assert!(
-                sent_prepare_ops(consensus.message_bus(), backup).is_empty(),
+            assert_eq!(
+                sent_prepare_ops(consensus.message_bus(), backup),
+                [1],
                 "backup {backup} must not be sent a prepare of the view that ended"
             );
         }
@@ -11653,7 +12687,7 @@ mod tests {
             journal.handle().header(1).is_none(),
             "the write must still be in flight"
         );
-        adopt_view(consensus, NEXT_VIEW);
+        adopt_view(consensus, NEXT_VIEW, 0);
         appending.await.unwrap().unwrap();
 
         assert!(
@@ -11664,6 +12698,818 @@ mod tests {
             consensus.sequencer().current_sequence(),
             0,
             "a prepare of view 0 must not move the sequencer of view {NEXT_VIEW}"
+        );
+    }
+
+    type JobMetadata =
+        IggyMetadata<VsrConsensus<NoopBus>, PrepareJournal, (), TestMux, CheckpointSuperblock>;
+    type JobHandles = Rc<RefCell<Vec<compio::runtime::JoinHandle<()>>>>;
+
+    /// Journal slots of the checkpoint job tests: a job starts at
+    /// [`JOB_TRIGGER_OP`] committed ops, the margin path at [`JOB_MARGIN_OP`]
+    /// journaled ones.
+    const JOB_SLOTS: usize = 256;
+    const JOB_TRIGGER_OP: u64 = JOB_SLOTS as u64 / CHECKPOINT_JOB_TRIGGER_DIVISOR;
+    const JOB_MARGIN_OP: u64 = (JOB_SLOTS - SnapshotCoordinator::<()>::CHECKPOINT_MARGIN) as u64;
+    const JOB_RETRY_OPS: u64 = JOB_SLOTS as u64 / CHECKPOINT_JOB_RETRY_DIVISOR;
+    const JOB_CLIENT: u128 = 1;
+    /// Polls before a parked job counts as hung. Each one waits a millisecond.
+    const JOB_POLL_BUDGET: usize = 10_000;
+
+    /// Replica `replica` of `replica_count` on a [`JOB_SLOTS`] journal, with a
+    /// session for [`JOB_CLIENT`] and a spawner that keeps each job's task so the
+    /// test can await it.
+    #[allow(clippy::future_not_send)]
+    async fn job_metadata(
+        dir: &Path,
+        replica: u8,
+        replica_count: u8,
+        superblock: Option<Rc<CheckpointSuperblock>>,
+    ) -> (Rc<JobMetadata>, JobHandles) {
+        let metadata_dir = dir.join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_dir).unwrap();
+        let journal =
+            PrepareJournal::open_with_slots(&metadata_dir.join("journal.wal"), 0, JOB_SLOTS)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            replica,
+            replica_count,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md = Rc::new(IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            superblock,
+            TestMux::default(),
+            Some(dir.to_path_buf()),
+        ));
+        md.client_table
+            .borrow_mut()
+            .commit_register(JOB_CLIENT, 0, [0x5a; 32], register_reply(JOB_CLIENT, 1))
+            .unwrap();
+        let jobs = JobHandles::default();
+        let spawned = Rc::clone(&jobs);
+        let weak = Rc::downgrade(&md);
+        md.set_checkpoint_spawner(Some(Rc::new(move |job| {
+            let weak = weak.clone();
+            spawned
+                .borrow_mut()
+                .push(compio::runtime::spawn(async move {
+                    if let Some(md) = weak.upgrade() {
+                        md.run_checkpoint_job(job).await;
+                    }
+                }));
+        })));
+        COMPLETED_CHECKPOINTS.set(0);
+        LAST_COMPLETED_CHECKPOINT.set(None);
+        (md, jobs)
+    }
+
+    /// Await every job started so far and return how many there were.
+    #[allow(clippy::future_not_send)]
+    async fn await_jobs(jobs: &JobHandles) -> usize {
+        let started: Vec<_> = jobs.borrow_mut().drain(..).collect();
+        let count = started.len();
+        for job in started {
+            job.await.unwrap();
+        }
+        count
+    }
+
+    fn job_prepare(md: &JobMetadata, op: u64) -> Message<PrepareHeader> {
+        md.prepare_request(create_stream_request(JOB_CLIENT, op, &format!("s{op}")))
+            .unwrap()
+    }
+
+    fn primary_prepare(md: &JobMetadata, op: u64) -> Message<PrepareHeader> {
+        let prepare = job_prepare(md, op);
+        md.consensus
+            .as_ref()
+            .unwrap()
+            .pipeline_message(PlaneKind::Metadata, &prepare);
+        prepare
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn ack_self(md: &JobMetadata) {
+        let mut loopback = Vec::new();
+        md.consensus
+            .as_ref()
+            .unwrap()
+            .drain_loopback_into(&mut loopback);
+        for message in loopback {
+            md.on_ack(message.try_into_typed::<PrepareOkHeader>().unwrap())
+                .await;
+        }
+    }
+
+    /// Replicate and commit `ops` one by one on a single-replica primary.
+    #[allow(clippy::future_not_send)]
+    async fn commit_on_primary(md: &JobMetadata, ops: std::ops::RangeInclusive<u64>) {
+        for op in ops {
+            md.on_replicate(primary_prepare(md, op)).await;
+            ack_self(md).await;
+        }
+    }
+
+    fn spawn_replicate(md: &Rc<JobMetadata>, op: u64) -> compio::runtime::JoinHandle<()> {
+        let prepare = primary_prepare(md, op);
+        let md = Rc::clone(md);
+        compio::runtime::spawn(async move { md.on_replicate(prepare).await })
+    }
+
+    fn journal_floor(md: &JobMetadata) -> u64 {
+        md.journal.as_ref().unwrap().handle().snapshot_op()
+    }
+
+    fn journaled(md: &JobMetadata, op: u64) -> bool {
+        md.journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .header(usize::try_from(op).unwrap())
+            .is_some()
+    }
+
+    #[compio::test]
+    async fn given_half_the_wal_committed_when_the_job_write_is_parked_should_keep_appending_and_trim_once()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        let coordinator = md.coordinator.as_ref().unwrap();
+        let held = SNAPSHOT_IO.lock().await;
+
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP - 1).await;
+        assert!(jobs.borrow().is_empty(), "no job below half the WAL");
+        commit_on_primary(&md, JOB_TRIGGER_OP..=JOB_MARGIN_OP - 1).await;
+
+        assert_eq!(
+            md.consensus.as_ref().unwrap().commit_min(),
+            JOB_MARGIN_OP - 1
+        );
+        assert_eq!(jobs.borrow().len(), 1, "one job, started at half the WAL");
+        assert!(
+            md.checkpoint_lock.try_acquire().is_none(),
+            "the parked job holds its lease"
+        );
+        assert_eq!(journal_floor(&md), 0);
+        drop(held);
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+        assert_eq!(coordinator.superblock_checkpoint_op.get(), JOB_TRIGGER_OP);
+        assert!(!coordinator.checkpoint_pending.get());
+        let (snapshot, _) = IggySnapshot::load(&coordinator.snapshot_path()).unwrap();
+        assert_eq!(snapshot.sequence_number(), JOB_TRIGGER_OP);
+        assert_eq!(COMPLETED_CHECKPOINTS.get(), 1);
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Job))
+        );
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn persist_initial_snapshot(md: &JobMetadata) {
+        IggySnapshot::create(&TestMux::default(), 0, 1)
+            .unwrap()
+            .persist(&md.coordinator.as_ref().unwrap().snapshot_path())
+            .await
+            .unwrap();
+    }
+
+    #[compio::test]
+    async fn given_a_parked_checkpoint_job_when_offering_should_refuse_until_the_job_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        persist_initial_snapshot(&md).await;
+        let held = SNAPSHOT_IO.lock().await;
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(jobs.borrow().len(), 1, "the job waits in its write");
+
+        assert!(
+            matches!(
+                md.state_transfer_offer().await,
+                Err(StateTransferUnavailable::SnapshotReplaced)
+            ),
+            "the job trims the WAL past the snapshot that is still on disk"
+        );
+        drop(held);
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        let offer = md.state_transfer_offer().await.unwrap();
+        assert_eq!(offer.snapshot_seq, JOB_TRIGGER_OP);
+        assert!(journal_floor(&md) <= offer.snapshot_seq);
+    }
+
+    /// A requester that pulls an offer installs its snapshot and then repairs
+    /// from the op after it. A job that trims the WAL to its own, newer
+    /// checkpoint meanwhile leaves the requester nothing to repair from, and it
+    /// starts over. The shard drops a pulled offer after a short time, which
+    /// can be before the job ends its writes and before the requester asks.
+    #[compio::test]
+    async fn given_an_offer_held_at_the_capture_when_it_is_dropped_during_the_job_should_leave_the_wal_to_the_margin()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        let coordinator = md.coordinator.as_ref().unwrap();
+        persist_initial_snapshot(&md).await;
+        let served = md.state_transfer_offer().await.unwrap();
+        let served_op = served.snapshot_seq;
+        let held = SNAPSHOT_IO.lock().await;
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(jobs.borrow().len(), 1, "the job waits in its write");
+
+        drop(served);
+        drop(held);
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(coordinator.superblock_checkpoint_op.get(), JOB_TRIGGER_OP);
+        assert_eq!(
+            journal_floor(&md),
+            served_op,
+            "the requester repairs from the op after the snapshot that it pulled"
+        );
+        assert_eq!(COMPLETED_CHECKPOINTS.get(), 0);
+
+        commit_on_primary(&md, JOB_TRIGGER_OP + 1..=JOB_MARGIN_OP + 1).await;
+
+        assert_eq!(
+            journal_floor(&md),
+            JOB_TRIGGER_OP - 1,
+            "the journal must not run out of slots for a requester"
+        );
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Margin))
+        );
+        assert!(jobs.borrow().is_empty(), "the margin trims without a job");
+    }
+
+    /// An offer that nobody holds at the capture needs no WAL.
+    #[compio::test]
+    async fn given_an_offer_dropped_before_the_capture_when_a_checkpoint_job_ends_should_trim_the_wal()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        persist_initial_snapshot(&md).await;
+        drop(md.state_transfer_offer().await.unwrap());
+
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Job))
+        );
+    }
+
+    /// The journal already trimmed past the snapshot of this offer, so its
+    /// requester cannot repair here any more, and a kept WAL gives it nothing.
+    #[compio::test]
+    async fn given_a_held_offer_below_the_journal_floor_when_a_checkpoint_job_ends_should_trim_the_wal()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        persist_initial_snapshot(&md).await;
+        let served = md.state_transfer_offer().await.unwrap();
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP).await;
+        assert_eq!(await_jobs(&jobs).await, 1);
+        commit_on_primary(&md, JOB_TRIGGER_OP + 1..=JOB_MARGIN_OP + 1).await;
+        assert!(served.snapshot_seq < journal_floor(&md));
+
+        commit_on_primary(&md, JOB_MARGIN_OP + 2..=2 * JOB_TRIGGER_OP).await;
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(journal_floor(&md), 2 * JOB_TRIGGER_OP - 1);
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Job))
+        );
+    }
+
+    #[compio::test]
+    async fn given_an_offer_read_in_flight_when_a_checkpoint_job_captures_should_refuse_the_offer()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        persist_initial_snapshot(&md).await;
+        commit_on_primary(&md, 1..=JOB_TRIGGER_OP - 1).await;
+        let mut offer = Box::pin(md.state_transfer_offer());
+        assert!(
+            futures::poll!(&mut offer).is_pending(),
+            "the read must suspend"
+        );
+        let held = SNAPSHOT_IO.lock().await;
+        commit_on_primary(&md, JOB_TRIGGER_OP..=JOB_TRIGGER_OP).await;
+        assert_eq!(jobs.borrow().len(), 1, "the job captured during the read");
+
+        assert!(matches!(
+            offer.await,
+            Err(StateTransferUnavailable::SnapshotReplaced)
+        ));
+        assert!(
+            md.transfer_offer_cache.borrow().is_none(),
+            "a refused offer must not reach the cache"
+        );
+        drop(held);
+        assert_eq!(await_jobs(&jobs).await, 1);
+    }
+
+    /// The snapshot file holds the live state at its op, with the client table and
+    /// change log of that commit. Call it before anything commits past the op.
+    fn assert_snapshot_holds_live_state(md: &JobMetadata) {
+        let path = md.coordinator.as_ref().unwrap().snapshot_path();
+        let file = std::fs::read(&path).unwrap();
+        let (payload, _) = file.split_at(file.len() - SNAPSHOT_TRAILER_LEN);
+        let (loaded, _) = IggySnapshot::load(&path).unwrap();
+        assert_eq!(
+            loaded.sequence_number(),
+            md.consensus.as_ref().unwrap().commit_min()
+        );
+        let mut expected =
+            IggySnapshot::create(&*md.mux_stm, loaded.sequence_number(), loaded.created_at())
+                .unwrap();
+        expected.snapshot.client_table = Some(md.client_table.borrow().to_snapshot());
+        expected.snapshot.change_log = md.change_log.snapshot();
+        assert_eq!(
+            payload,
+            expected.encode().unwrap(),
+            "the job captured a state other than its commit's"
+        );
+    }
+
+    /// A job stopped at any crash boundary releases its lease, and an unstopped one
+    /// captures exactly the state of the commit that started it.
+    #[compio::test]
+    async fn given_a_job_when_it_stops_at_each_boundary_should_release_its_lease() {
+        for boundary in [
+            None,
+            Some(CheckpointBoundary::TableCaptured),
+            Some(CheckpointBoundary::TemporaryCreated),
+            Some(CheckpointBoundary::Written),
+            Some(CheckpointBoundary::FileSynced),
+            Some(CheckpointBoundary::Renamed),
+            Some(CheckpointBoundary::DirectorySynced),
+            Some(CheckpointBoundary::SuperblockWritten),
+            Some(CheckpointBoundary::WalDrained),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let superblock = Some(Rc::new(CheckpointSuperblock::default()));
+            let (md, jobs) = job_metadata(dir.path(), 0, 1, superblock).await;
+            let coordinator = md.coordinator.as_ref().unwrap();
+            commit_on_primary(&md, 1..=JOB_TRIGGER_OP - 1).await;
+            STOP_CHECKPOINT_AFTER.set(boundary);
+            commit_on_primary(&md, JOB_TRIGGER_OP..=JOB_TRIGGER_OP).await;
+            let started = await_jobs(&jobs).await;
+
+            assert!(
+                STOP_CHECKPOINT_AFTER.get().is_none(),
+                "{boundary:?} must be reached"
+            );
+            assert!(
+                md.checkpoint_lock.try_acquire().is_some(),
+                "{boundary:?}: the lease must be released"
+            );
+            let captured = boundary != Some(CheckpointBoundary::TableCaptured);
+            assert_eq!(started, usize::from(captured), "{boundary:?}");
+            let paired = matches!(
+                boundary,
+                None | Some(CheckpointBoundary::SuperblockWritten | CheckpointBoundary::WalDrained)
+            );
+            assert_eq!(
+                coordinator.superblock_checkpoint_op.get(),
+                if paired { JOB_TRIGGER_OP } else { 0 },
+                "{boundary:?}"
+            );
+            let trimmed = matches!(boundary, None | Some(CheckpointBoundary::WalDrained));
+            assert_eq!(
+                journal_floor(&md),
+                if trimmed { JOB_TRIGGER_OP - 1 } else { 0 },
+                "{boundary:?}"
+            );
+            assert_eq!(
+                COMPLETED_CHECKPOINTS.get(),
+                u64::from(boundary.is_none()),
+                "{boundary:?}"
+            );
+            if boundary.is_none() {
+                assert_snapshot_holds_live_state(&md);
+            }
+        }
+    }
+
+    #[compio::test]
+    async fn given_a_parked_job_when_appends_reach_the_margin_should_wait_and_trim_to_the_job_checkpoint_once()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        let held = SNAPSHOT_IO.lock().await;
+        commit_on_primary(&md, 1..=JOB_MARGIN_OP).await;
+
+        let waiter = spawn_replicate(&md, JOB_MARGIN_OP + 1);
+        yield_now().await;
+        assert!(
+            !journaled(&md, JOB_MARGIN_OP + 1),
+            "the append at the margin waits for the job"
+        );
+        drop(held);
+        waiter.await.unwrap();
+
+        assert!(journaled(&md, JOB_MARGIN_OP + 1));
+        assert_eq!(
+            journal_floor(&md),
+            JOB_TRIGGER_OP - 1,
+            "the waiter trims to the job's checkpoint instead of checkpointing inline"
+        );
+        assert_eq!(COMPLETED_CHECKPOINTS.get(), 1);
+        assert_eq!(await_jobs(&jobs).await, 1);
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+        assert_eq!(
+            COMPLETED_CHECKPOINTS.get(),
+            1,
+            "the job must not trim or log a checkpoint the waiter completed"
+        );
+        assert_eq!(
+            LAST_COMPLETED_CHECKPOINT.get(),
+            Some((CheckpointOrigin::Job, CheckpointTrimmer::Margin))
+        );
+        assert!(!md.coordinator.as_ref().unwrap().checkpoint_pending.get());
+    }
+
+    /// A job that fails backs off the next job, and a margin waiter that saw it fail
+    /// appends into the margin. Nobody trims, and the next prepare at the margin
+    /// checkpoints inline.
+    #[compio::test]
+    async fn given_a_failed_job_when_commits_continue_should_back_off_and_retry_inline_at_the_margin()
+     {
+        for superblock_fails in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let superblock = Rc::new(CheckpointSuperblock::default());
+            let (md, jobs) = job_metadata(dir.path(), 0, 1, Some(Rc::clone(&superblock))).await;
+            let coordinator = md.coordinator.as_ref().unwrap();
+            let fail_next_job = || {
+                if superblock_fails {
+                    superblock.fail.set(true);
+                } else {
+                    STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::Written));
+                }
+            };
+            let failed_checkpoint = |op| if superblock_fails { op } else { 0 };
+
+            commit_on_primary(&md, 1..=JOB_TRIGGER_OP - 1).await;
+            fail_next_job();
+            commit_on_primary(&md, JOB_TRIGGER_OP..=JOB_TRIGGER_OP).await;
+            assert_eq!(await_jobs(&jobs).await, 1);
+            assert_eq!(
+                coordinator.last_checkpoint().0,
+                failed_checkpoint(JOB_TRIGGER_OP)
+            );
+            assert_eq!(coordinator.superblock_checkpoint_op.get(), 0);
+            assert_eq!(journal_floor(&md), 0, "a failed job trims nothing");
+            assert!(coordinator.checkpoint_pending.get());
+
+            let retry_op = JOB_TRIGGER_OP + JOB_RETRY_OPS;
+            commit_on_primary(&md, JOB_TRIGGER_OP + 1..=retry_op - 1).await;
+            assert!(jobs.borrow().is_empty(), "no job during the backoff");
+            let held = SNAPSHOT_IO.lock().await;
+            commit_on_primary(&md, retry_op..=JOB_MARGIN_OP).await;
+            assert_eq!(
+                jobs.borrow().len(),
+                1,
+                "the next job starts after the backoff"
+            );
+
+            let waiter = spawn_replicate(&md, JOB_MARGIN_OP + 1);
+            yield_now().await;
+            fail_next_job();
+            drop(held);
+            waiter.await.unwrap();
+            assert_eq!(await_jobs(&jobs).await, 1);
+            assert!(
+                journaled(&md, JOB_MARGIN_OP + 1),
+                "the prepare appends into the margin"
+            );
+            assert_eq!(
+                coordinator.last_checkpoint().0,
+                failed_checkpoint(retry_op),
+                "the waiter must not checkpoint inline after the job failed during its wait"
+            );
+            assert_eq!(journal_floor(&md), 0, "nobody trims after a failed job");
+            assert_eq!(COMPLETED_CHECKPOINTS.get(), 0);
+
+            superblock.fail.set(false);
+            ack_self(&md).await;
+            commit_on_primary(&md, JOB_MARGIN_OP + 2..=JOB_MARGIN_OP + 2).await;
+            assert_eq!(coordinator.last_checkpoint().0, JOB_MARGIN_OP + 1);
+            assert_eq!(journal_floor(&md), JOB_MARGIN_OP, "the inline retry trims");
+            assert_eq!(COMPLETED_CHECKPOINTS.get(), 1);
+            assert_eq!(
+                LAST_COMPLETED_CHECKPOINT.get(),
+                Some((CheckpointOrigin::Inline, CheckpointTrimmer::Margin))
+            );
+            assert!(jobs.borrow().is_empty());
+        }
+    }
+
+    /// The backoff of a failed job counts from the commit at its failure, so
+    /// the commits during a slow write do not use it up.
+    #[compio::test]
+    async fn given_a_job_that_fails_after_more_commits_when_committing_should_back_off_from_the_failure()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 0, 1, None).await;
+        let failed_at = JOB_TRIGGER_OP + JOB_RETRY_OPS;
+        let retry_op = failed_at + JOB_RETRY_OPS;
+        assert!(retry_op < JOB_MARGIN_OP, "the retry must stay a job");
+
+        let held = SNAPSHOT_IO.lock().await;
+        commit_on_primary(&md, 1..=failed_at).await;
+        assert_eq!(jobs.borrow().len(), 1, "the job waits in its write");
+        STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::Written));
+        drop(held);
+        assert_eq!(await_jobs(&jobs).await, 1);
+        assert_eq!(md.coordinator.as_ref().unwrap().failed_jobs.get(), 1);
+
+        commit_on_primary(&md, failed_at + 1..=retry_op - 1).await;
+        assert!(jobs.borrow().is_empty(), "no job during the backoff");
+        commit_on_primary(&md, retry_op..=retry_op).await;
+        assert_eq!(await_jobs(&jobs).await, 1, "a job starts after the backoff");
+    }
+
+    /// A backup whose commits lag its journal starts one job per half WAL of
+    /// commits, not one per commit while its journal stays over half full.
+    #[compio::test]
+    async fn given_commits_lagging_the_journal_when_committing_should_start_one_job_per_half_wal() {
+        const HEAD: u64 = JOB_MARGIN_OP - 2;
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        for op in 1..=HEAD {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        let mut started = 0;
+        for op in 1..=HEAD {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+            started += await_jobs(&jobs).await;
+            if op < JOB_TRIGGER_OP {
+                assert_eq!(started, 0, "op {op}: a full journal alone starts no job");
+            }
+            if op == JOB_TRIGGER_OP {
+                assert_snapshot_holds_live_state(&md);
+            }
+        }
+        assert_eq!(consensus.commit_min(), HEAD);
+        assert_eq!(started, 1);
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+    }
+
+    /// A journal at the margin gets its room from the next append, which trims
+    /// or checkpoints inline, so a commit there starts no job.
+    #[compio::test]
+    async fn given_a_journal_at_the_margin_when_half_the_wal_commits_should_start_no_job() {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        for op in 1..=JOB_MARGIN_OP {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        for op in 1..=JOB_TRIGGER_OP {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+        }
+        assert_eq!(consensus.commit_min(), JOB_TRIGGER_OP);
+        assert!(jobs.borrow().is_empty(), "no job at the margin");
+        assert!(!md.checkpoint_running());
+
+        md.on_replicate(job_prepare(&md, JOB_MARGIN_OP + 1)).await;
+        assert_eq!(
+            journal_floor(&md),
+            JOB_TRIGGER_OP - 1,
+            "the next append checkpoints inline"
+        );
+        assert!(jobs.borrow().is_empty());
+    }
+
+    /// The install of a state transfer waits for a running job's write on the
+    /// shard-0 pump, so no job starts while a transfer is armed.
+    #[compio::test]
+    async fn given_an_armed_state_transfer_when_half_the_wal_commits_should_start_no_job() {
+        const HEAD: u64 = JOB_TRIGGER_OP + 1;
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        for op in 1..=HEAD {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        consensus.begin_state_transfer_await();
+        for op in 1..=JOB_TRIGGER_OP {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+        }
+        assert_eq!(consensus.commit_min(), JOB_TRIGGER_OP);
+        assert!(
+            jobs.borrow().is_empty(),
+            "no job while the transfer is armed"
+        );
+        assert!(!md.checkpoint_running());
+
+        consensus.set_state_transfer_stage(consensus::StateTransferStage::Idle);
+        consensus.advance_commit_max(HEAD);
+        md.commit_journal().await;
+        assert_eq!(
+            await_jobs(&jobs).await,
+            1,
+            "a job starts once the transfer ended"
+        );
+    }
+
+    /// A commit walk that waits for a prepare body keeps no borrow of the
+    /// journal index, so the trim of a checkpoint job can rebuild the index
+    /// meanwhile.
+    #[compio::test]
+    async fn given_a_commit_walk_reading_a_body_when_the_wal_is_trimmed_should_finish_the_walk() {
+        const WALKED: u64 = 2;
+        const HEAD: u64 = WALKED + 2;
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        for op in 1..=HEAD {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        consensus.advance_commit_max(WALKED);
+        assert_eq!(md.commit_journal().await, CommitWalkStop::CaughtUp);
+
+        consensus.advance_commit_max(HEAD);
+        let mut walk = std::pin::pin!(md.commit_journal());
+        assert!(
+            futures::poll!(walk.as_mut()).is_pending(),
+            "the walk waits for the body of its first op"
+        );
+        md.journal
+            .as_ref()
+            .unwrap()
+            .handle()
+            .drain(1..=WALKED - 1)
+            .await
+            .unwrap();
+
+        assert_eq!(walk.await, CommitWalkStop::CaughtUp);
+        assert_eq!(consensus.commit_min(), HEAD);
+        assert_eq!(journal_floor(&md), WALKED - 1);
+        assert!(
+            jobs.borrow().is_empty(),
+            "no job this far below half the WAL"
+        );
+    }
+
+    /// A job that finds `checkpoint_lock` taken once it holds `journal_gate`
+    /// leaves the trim to the holder.
+    #[compio::test]
+    async fn given_a_job_waiting_on_the_journal_gate_when_the_checkpoint_lock_is_taken_should_skip_its_trim()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let coordinator = md.coordinator.as_ref().unwrap();
+        for op in 1..=JOB_TRIGGER_OP {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        let gate = md.journal_gate.try_acquire().unwrap();
+        for op in 1..=JOB_TRIGGER_OP {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+        }
+        for _ in 0..JOB_POLL_BUDGET {
+            if coordinator.superblock_checkpoint_op.get() == JOB_TRIGGER_OP {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            coordinator.superblock_checkpoint_op.get(),
+            JOB_TRIGGER_OP,
+            "the job's checkpoint must be durable while it waits on the gate"
+        );
+        let newer_job = md.checkpoint_lock.try_acquire().unwrap();
+        drop(gate);
+
+        let mut ended = Box::pin(await_jobs(&jobs));
+        let mut started = None;
+        for _ in 0..JOB_POLL_BUDGET {
+            if let std::task::Poll::Ready(count) = futures::poll!(&mut ended) {
+                started = Some(count);
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(started, Some(1), "the job must end without the lock");
+        assert_eq!(journal_floor(&md), 0, "the trim is the lock holder's");
+        assert_eq!(COMPLETED_CHECKPOINTS.get(), 0);
+        drop(newer_job);
+    }
+
+    /// The shard 0 pump keeps its appends for later only while a trim is
+    /// pending. The gate serves its waiters in arrival order, so the job must
+    /// report its trim before it waits: an append that arrives behind the
+    /// waiting job waits for the whole rewrite.
+    #[compio::test]
+    async fn given_a_job_waiting_on_the_journal_gate_when_asked_should_report_a_pending_trim_until_it_ends()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        for op in 1..=JOB_TRIGGER_OP {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        let gate = md.journal_gate.try_acquire().unwrap();
+        for op in 1..=JOB_TRIGGER_OP {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+        }
+        assert!(
+            !md.checkpoint_trim_pending(),
+            "a held gate alone is no pending trim"
+        );
+        for _ in 0..JOB_POLL_BUDGET {
+            if md.checkpoint_trim_pending() {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            md.checkpoint_trim_pending(),
+            "a job that waits for the gate must report its trim"
+        );
+
+        drop(gate);
+        assert_eq!(await_jobs(&jobs).await, 1);
+        assert!(!md.checkpoint_trim_pending());
+        assert_eq!(journal_floor(&md), JOB_TRIGGER_OP - 1);
+    }
+
+    /// An install waits for a running job's durable part, then moves the floor past
+    /// the job's checkpoint, so the job's later trim does nothing.
+    #[compio::test]
+    async fn given_a_running_job_when_a_snapshot_is_installed_should_wait_for_its_writes_and_skip_its_trim()
+     {
+        const HEAD: u64 = JOB_MARGIN_OP - 2;
+        const INSTALLED: u64 = JOB_TRIGGER_OP + 10;
+        let dir = tempfile::tempdir().unwrap();
+        let (md, jobs) = job_metadata(dir.path(), 1, 3, None).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let coordinator = md.coordinator.as_ref().unwrap();
+        for op in 1..=HEAD {
+            md.on_replicate(job_prepare(&md, op)).await;
+        }
+        let held = SNAPSHOT_IO.lock().await;
+        for op in 1..=JOB_TRIGGER_OP {
+            consensus.advance_commit_max(op);
+            md.commit_journal().await;
+        }
+        assert_eq!(jobs.borrow().len(), 1);
+
+        let table = ClientTable::new(CLIENTS_TABLE_MAX);
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), INSTALLED, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        let bytes = snapshot.encode().unwrap();
+        let install = compio::runtime::spawn({
+            let md = Rc::clone(&md);
+            async move {
+                md.install_state_transfer(&bytes, table, INSTALLED, INSTALLED)
+                    .await
+            }
+        });
+        yield_now().await;
+        assert!(
+            md.journal_gate.try_acquire().is_none() && md.checkpoint_lock.try_acquire().is_none(),
+            "the install holds the gate and waits for the job's lease"
+        );
+        drop(held);
+        install.await.unwrap().unwrap();
+        assert_eq!(await_jobs(&jobs).await, 1);
+
+        assert_eq!(consensus.commit_min(), INSTALLED);
+        assert_eq!(journal_floor(&md), INSTALLED);
+        assert_eq!(coordinator.last_checkpoint().0, INSTALLED);
+        assert_eq!(coordinator.superblock_checkpoint_op.get(), INSTALLED);
+        let (snapshot, _) = IggySnapshot::load(&coordinator.snapshot_path()).unwrap();
+        assert_eq!(
+            snapshot.sequence_number(),
+            INSTALLED,
+            "the job's rename must not land over the installed snapshot"
+        );
+        assert_eq!(
+            COMPLETED_CHECKPOINTS.get(),
+            0,
+            "the install moved the floor past the job's checkpoint"
         );
     }
 
@@ -11708,9 +13554,41 @@ mod tests {
         (dir, metadata)
     }
 
-    /// Adopts `view` from its primary with an empty log, as the shard does on a
-    /// `StartView`.
-    fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32) {
+    /// Commits `request` as the next op of that primary: its own ack and the
+    /// ack of backup 1 make the quorum.
+    #[allow(clippy::future_not_send)]
+    async fn commit_on_spy_bus_primary(
+        metadata: &IggyMetadata<VsrConsensus<ReplicaSendSpyBus>, PrepareJournal, (), TestMux>,
+        request: Message<RoutedRequestHeader>,
+    ) {
+        const BACKUP: u8 = 1;
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let prepare = metadata.prepare_request(request).unwrap();
+        consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+        metadata.on_replicate(prepare).await;
+        let mut loopback = Vec::new();
+        consensus.drain_loopback_into(&mut loopback);
+        let own_ack = loopback
+            .pop()
+            .unwrap()
+            .try_into_typed::<PrepareOkHeader>()
+            .unwrap();
+        let backup_ack: Message<PrepareOkHeader> = Message::<PrepareOkHeader>::new(size_of::<
+            PrepareOkHeader,
+        >())
+        .transmute_header(|_, ack| {
+            *ack = PrepareOkHeader {
+                replica: BACKUP,
+                ..*own_ack.header()
+            };
+        });
+        metadata.on_ack(own_ack).await;
+        metadata.on_ack(backup_ack).await;
+    }
+
+    /// Adopts `view` from its primary with a log that ends at the committed
+    /// `head`, as the shard does on a `StartView`.
+    fn adopt_view(consensus: &VsrConsensus<ReplicaSendSpyBus>, view: u32, head: u64) {
         let start_view = StartViewHeader {
             checksum: 0,
             checksum_body: 0,
@@ -11721,8 +13599,8 @@ mod tests {
             command: Command::StartView,
             replica: consensus.primary_index(view),
             reserved_frame: [0; 66],
-            op: 0,
-            commit: 0,
+            op: head,
+            commit: head,
             group: server_common::sharding::METADATA_GROUP,
             partition_incarnation: 0,
             reserved: [0; 80],
@@ -13474,6 +15352,47 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_durable_pairing_and_a_failed_trim_when_retrying_at_the_same_op_should_keep_the_paired_snapshot()
+     {
+        const COMMITTED: u64 = 3;
+        let dir = tempfile::tempdir().unwrap();
+        let superblock = Rc::new(CheckpointSuperblock::default());
+        let (md, _jobs) = job_metadata(dir.path(), 0, 1, Some(Rc::clone(&superblock))).await;
+        commit_on_primary(&md, 1..=COMMITTED).await;
+        let consensus = md.consensus.as_ref().unwrap();
+        let journal = md.journal.as_ref().unwrap();
+        let coordinator = md.coordinator.as_ref().unwrap();
+        // The journal refuses a trim while another drain is in flight.
+        let mut other_drain = std::pin::pin!(journal.handle().drain(1..=1));
+        assert!(futures::poll!(other_drain.as_mut()).is_pending());
+        md.set_checkpoint_margin(usize::MAX);
+        md.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(coordinator.superblock_checkpoint_op.get(), COMMITTED);
+        assert!(coordinator.checkpoint_pending.get(), "the trim failed");
+        assert_eq!(journal_floor(&md), 0);
+        let paired = std::fs::read(coordinator.snapshot_path()).unwrap();
+
+        md.checkpoint_if_needed(consensus, journal).await;
+
+        assert_eq!(
+            superblock.writes.get(),
+            1,
+            "a second capture of the paired op must not start"
+        );
+        assert_eq!(
+            std::fs::read(coordinator.snapshot_path()).unwrap(),
+            paired,
+            "the superblock pairs the checksum of the first snapshot of this op"
+        );
+
+        other_drain.await.unwrap();
+        md.checkpoint_if_needed(consensus, journal).await;
+        assert!(!coordinator.checkpoint_pending.get());
+        assert_eq!(journal_floor(&md), COMMITTED - 1);
+        assert_eq!(superblock.writes.get(), 1);
+    }
+
+    #[compio::test]
     async fn given_a_saved_snapshot_and_failed_superblock_when_retrying_should_finish_the_same_checkpoint()
      {
         let directory = tempfile::tempdir().unwrap();
@@ -13538,12 +15457,28 @@ mod tests {
         assert!(coordinator.snapshot_path().exists());
         assert!(coordinator.checkpoint_pending.get());
         assert_eq!(superblock.writes.get(), 1);
+        // A failed write may have reached the disk, so each retry must keep
+        // the snapshot that it paired: a capture here would trip the boundary.
+        STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::TableCaptured));
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(
+            superblock.writes.get(),
+            2,
+            "the retry writes the superblock"
+        );
+        assert!(coordinator.checkpoint_pending.get());
         superblock.fail.set(false);
         metadata.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(
+            STOP_CHECKPOINT_AFTER.take(),
+            Some(CheckpointBoundary::TableCaptured),
+            "no retry may capture the op again"
+        );
         assert!(!coordinator.checkpoint_pending.get());
-        assert_eq!(superblock.writes.get(), 2);
+        assert_eq!(coordinator.superblock_checkpoint_op.get(), 1);
+        assert_eq!(superblock.writes.get(), 3);
         metadata.checkpoint_if_needed(consensus, journal).await;
-        assert_eq!(superblock.writes.get(), 2);
+        assert_eq!(superblock.writes.get(), 3);
     }
 
     #[compio::test]
@@ -13600,15 +15535,16 @@ mod tests {
         metadata.mux_stm.users().ensure_root_user("root", "hash");
         let coordinator = metadata.coordinator.as_ref().unwrap();
 
-        let persisted = coordinator
-            .persist_snapshot(
+        let capture = coordinator
+            .capture(
                 &*metadata.mux_stm,
                 0,
                 0,
                 None,
                 metadata.change_log.snapshot(),
             )
-            .await;
+            .unwrap();
+        let persisted = coordinator.persist_capture(capture).await;
 
         assert!(matches!(persisted, Err(SnapshotError::InvalidState(_))));
         assert!(!coordinator.snapshot_path().exists());
@@ -13734,6 +15670,178 @@ mod tests {
             recovered.client_table.get_watermark(CLIENT),
             Some(TABLE_FRONTIER - 1)
         );
+    }
+
+    const TAIL_CLIENT: u128 = 9;
+    const TAIL_USER: u32 = 7;
+
+    /// The snapshot at `snapshot_op` and the client table of a primary that
+    /// committed `tail` requests of [`TAIL_CLIENT`] above it.
+    fn transfer_with_tail(snapshot_op: u64, tail: u64) -> (Vec<u8>, ClientTable) {
+        let mut table = ClientTable::new(CLIENTS_TABLE_MAX);
+        table.commit_capacity(CLIENTS_TABLE_MAX).unwrap();
+        table
+            .commit_register(
+                TAIL_CLIENT,
+                TAIL_USER,
+                [0x5a; 32],
+                register_reply(TAIL_CLIENT, snapshot_op),
+            )
+            .unwrap();
+        let mut snapshot =
+            <IggySnapshot as Snapshot>::create(&TestMux::default(), snapshot_op, 1).unwrap();
+        snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+        for request in 1..=tail {
+            let reply = build_reply_message(
+                &PrepareHeader {
+                    client: TAIL_CLIENT,
+                    user_id: TAIL_USER,
+                    session: snapshot_op,
+                    request,
+                    op: snapshot_op + request,
+                    operation: Operation::CreateStream,
+                    ..Default::default()
+                },
+                &bytes::Bytes::new(),
+            );
+            assert_eq!(
+                table.commit_reply(TAIL_CLIENT, TAIL_USER, reply),
+                CommitReply::Cached
+            );
+        }
+        (snapshot.encode().unwrap(), table)
+    }
+
+    /// No checkpoint runs below the frontier of a transferred client table, so
+    /// the journal must hold every op from the floor of the install up to it.
+    #[compio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn given_a_transfer_tail_when_it_exceeds_the_journal_slots_should_refuse_the_install() {
+        const SLOTS: usize = 4;
+        const SNAPSHOT_OP: u64 = 1;
+        const FRONTIER: u64 = SNAPSHOT_OP + SLOTS as u64;
+        const NEXT_SNAPSHOT_OP: u64 = FRONTIER + 2;
+        let directory = tempfile::tempdir().unwrap();
+        let metadata_directory = directory.path().join(crate::impls::METADATA_DIR);
+        std::fs::create_dir_all(&metadata_directory).unwrap();
+        let journal =
+            PrepareJournal::open_with_slots(&metadata_directory.join("journal.wal"), 0, SLOTS)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let metadata: IggyMetadata<_, PrepareJournal, (), TestMux> = IggyMetadata::new(
+            Some(consensus),
+            Some(journal),
+            None,
+            None,
+            TestMux::default(),
+            Some(directory.path().to_path_buf()),
+        );
+        let consensus = metadata.consensus.as_ref().unwrap();
+        let journal = metadata.journal.as_ref().unwrap();
+        let coordinator = metadata.coordinator.as_ref().unwrap();
+        metadata.set_checkpoint_margin(usize::MAX);
+
+        // One op per slot is the largest tail that fits.
+        let (snapshot, table) = transfer_with_tail(SNAPSHOT_OP, SLOTS as u64);
+        metadata
+            .install_state_transfer(&snapshot, table, FRONTIER, FRONTIER)
+            .await
+            .unwrap();
+        for request in 1..=SLOTS as u64 {
+            let prepare = metadata
+                .prepare_request(create_stream_request(
+                    TAIL_CLIENT,
+                    request,
+                    &format!("s{request}"),
+                ))
+                .unwrap();
+            consensus.pipeline_message(PlaneKind::Metadata, &prepare);
+            journal.handle().append(prepare).await.unwrap();
+        }
+        metadata.resume_stranded_commits().await;
+        assert_eq!(consensus.commit_min(), FRONTIER);
+        let above = metadata
+            .prepare_request(create_stream_request(
+                TAIL_CLIENT,
+                SLOTS as u64 + 1,
+                "above",
+            ))
+            .unwrap();
+        assert!(
+            journal.handle().append(above.clone()).await.is_err(),
+            "the tail fills the journal, so one more op needs a checkpoint"
+        );
+        metadata.checkpoint_if_needed(consensus, journal).await;
+        assert_eq!(coordinator.last_checkpoint().0, FRONTIER);
+        journal.handle().append(above).await.unwrap();
+
+        let durable_state = || {
+            (
+                std::fs::read(coordinator.snapshot_path()).unwrap(),
+                coordinator.last_checkpoint(),
+                coordinator.superblock_checkpoint_op.get(),
+                journal.handle().snapshot_op(),
+                journal.handle().last_op(),
+                metadata.client_table_frontier.get(),
+                consensus.commit_min(),
+                consensus.commit_max(),
+            )
+        };
+        let before = durable_state();
+
+        // One more op than slots above a snapshot that is ahead.
+        let tail = SLOTS as u64 + 1;
+        let frontier = NEXT_SNAPSHOT_OP + tail;
+        let (snapshot, table) = transfer_with_tail(NEXT_SNAPSHOT_OP, tail);
+        let error = metadata
+            .install_state_transfer(&snapshot, table, frontier, frontier)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SnapshotError::TransferTailExceedsJournal {
+                    tail: refused,
+                    journal_slots: SLOTS,
+                } if refused == tail
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("`metadata.journal_slots`"));
+        assert_eq!(
+            durable_state(),
+            before,
+            "a refused install must leave the replica as it was"
+        );
+
+        // A snapshot at the commit point is not ahead and installs its table
+        // only, so the floor stays below the entry of the last checkpoint.
+        let floor = journal.handle().snapshot_op();
+        assert_eq!(floor, FRONTIER - 1);
+        let fitting = floor + SLOTS as u64;
+        let (snapshot, table) = transfer_with_tail(FRONTIER, fitting + 1 - FRONTIER);
+        assert!(matches!(
+            metadata
+                .install_state_transfer(&snapshot, table, fitting + 1, fitting + 1)
+                .await,
+            Err(SnapshotError::TransferTailExceedsJournal { .. })
+        ));
+        assert_eq!(durable_state(), before);
+        let (snapshot, table) = transfer_with_tail(FRONTIER, fitting - FRONTIER);
+        metadata
+            .install_state_transfer(&snapshot, table, fitting, fitting)
+            .await
+            .unwrap();
+        assert_eq!(metadata.client_table_frontier.get(), fitting);
     }
 
     /// The commit loop and the promotion of queued requests run at the tail
@@ -14605,8 +16713,79 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_failed_install_when_an_offer_of_the_same_op_arrives_should_keep_the_durable_snapshot()
+     {
+        let directory = tempfile::tempdir().unwrap();
+        let md = transfer_receiver(directory.path(), true).await;
+        let metadata_dir = directory.path().join(crate::impls::METADATA_DIR);
+        let wal_path = metadata_dir.join("journal.wal");
+        let saved_wal = metadata_dir.join("journal.saved");
+        let incoming_state = TestMux::default();
+        incoming_state.users().ensure_root_user("restored", "hash");
+        let offer = |created_at| {
+            let table = ClientTable::new(CLIENTS_TABLE_MAX);
+            let mut snapshot =
+                IggySnapshot::create(&incoming_state, TRANSFER_FLOOR, created_at).unwrap();
+            snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
+            (snapshot.encode().unwrap(), table)
+        };
+
+        // Keep the open WAL readable but make the truncate's rename fail, after
+        // the snapshot and its superblock pairing have reached disk.
+        let (first, table) = offer(1);
+        std::fs::rename(&wal_path, &saved_wal).unwrap();
+        std::fs::create_dir(&wal_path).unwrap();
+        let failed = md
+            .install_state_transfer(&first, table, TRANSFER_FLOOR, TRANSFER_FLOOR)
+            .await;
+        std::fs::remove_dir(&wal_path).unwrap();
+        std::fs::rename(&saved_wal, &wal_path).unwrap();
+        assert!(matches!(failed, Err(SnapshotError::Io(_))), "{failed:?}");
+        let durable = std::fs::read(metadata_dir.join("snapshot.bin")).unwrap();
+
+        // The checkpoint of another primary at the same op, stamped at another time.
+        let (second, table) = offer(2);
+        assert_ne!(first, second);
+        // A crash once a rewritten snapshot is durable, before its superblock write.
+        STOP_CHECKPOINT_AFTER.set(Some(CheckpointBoundary::DirectorySynced));
+        let installed = md
+            .install_state_transfer(&second, table, TRANSFER_FLOOR, TRANSFER_FLOOR)
+            .await;
+        let image = crash_image(directory.path());
+        let boundary = STOP_CHECKPOINT_AFTER.take();
+        let recovered = recover::<TestMux>(
+            image.path(),
+            TRANSFER_RECEIVER,
+            DEFAULT_SLOT_COUNT,
+            CLIENTS_TABLE_MAX,
+            |_| {},
+            ChangeLogCapacities::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read(metadata_dir.join("snapshot.bin")).unwrap(),
+            durable
+        );
+        assert_eq!(
+            recovered.snapshot_checkpoint,
+            md.coordinator.as_ref().unwrap().last_checkpoint()
+        );
+        assert_eq!(
+            boundary,
+            Some(CheckpointBoundary::DirectorySynced),
+            "an offer of the durable op must not rewrite its snapshot"
+        );
+        assert!(installed.is_ok(), "{installed:?}");
+        assert_eq!(md.consensus.as_ref().unwrap().commit_min(), TRANSFER_FLOOR);
+    }
+
+    #[compio::test]
     async fn given_a_pending_checkpoint_after_failed_transfer_when_retried_should_keep_the_newer_snapshot()
      {
+        /// Two ops above the commit point, so a trim to it would drain an op
+        /// above that point too.
+        const INSTALLED: u64 = TRANSFER_FLOOR + 1;
         let directory = tempfile::tempdir().unwrap();
         let md = transfer_receiver(directory.path(), true).await;
         let consensus = md.consensus.as_ref().unwrap();
@@ -14626,27 +16805,33 @@ mod tests {
         let wal_path = metadata_dir.join("journal.wal");
         let saved_wal = metadata_dir.join("journal.saved");
         let table = ClientTable::new(CLIENTS_TABLE_MAX);
-        let mut snapshot = IggySnapshot::create(&TestMux::default(), TRANSFER_FLOOR, 1).unwrap();
+        let mut snapshot = IggySnapshot::create(&TestMux::default(), INSTALLED, 1).unwrap();
         snapshot.snapshot_mut().client_table = Some(table.to_snapshot());
         std::fs::rename(&wal_path, &saved_wal).unwrap();
         std::fs::create_dir(&wal_path).unwrap();
         let failed = md
-            .install_state_transfer(
-                &snapshot.encode().unwrap(),
-                table,
-                TRANSFER_FLOOR,
-                TRANSFER_FLOOR,
-            )
+            .install_state_transfer(&snapshot.encode().unwrap(), table, INSTALLED, INSTALLED)
             .await;
         std::fs::remove_dir(&wal_path).unwrap();
         std::fs::rename(&saved_wal, &wal_path).unwrap();
         assert!(matches!(failed, Err(SnapshotError::Io(_))), "{failed:?}");
         assert_eq!(consensus.commit_min(), TRANSFER_FLOOR - 1);
-        assert_eq!(coordinator.last_checkpoint().0, TRANSFER_FLOOR);
+        assert_eq!(coordinator.last_checkpoint().0, INSTALLED);
         assert!(coordinator.checkpoint_pending.get());
         let before = std::fs::read(coordinator.snapshot_path()).unwrap();
 
         md.checkpoint_if_needed(consensus, journal).await;
+        for op in consensus.commit_min()..INSTALLED {
+            assert!(
+                journal
+                    .handle()
+                    .header(usize::try_from(op).unwrap())
+                    .is_some(),
+                "op {op}: the pairing is ahead of the commit point, so no trim may reach it"
+            );
+        }
+        assert_eq!(journal.handle().snapshot_op(), 0);
+        assert!(coordinator.checkpoint_pending.get());
         assert_eq!(std::fs::read(coordinator.snapshot_path()).unwrap(), before);
         let recovered = recover::<TestMux>(
             crash_image(directory.path()).path(),
@@ -14658,19 +16843,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(recovered.snapshot_checkpoint.0, TRANSFER_FLOOR);
+        assert_eq!(recovered.snapshot_checkpoint.0, INSTALLED);
 
         let table = ClientTable::new(CLIENTS_TABLE_MAX);
-        md.install_state_transfer(
-            &snapshot.encode().unwrap(),
-            table,
-            TRANSFER_FLOOR,
-            TRANSFER_FLOOR,
-        )
-        .await
-        .unwrap();
+        md.install_state_transfer(&snapshot.encode().unwrap(), table, INSTALLED, INSTALLED)
+            .await
+            .unwrap();
         md.checkpoint_if_needed(consensus, journal).await;
-        assert_eq!(consensus.commit_min(), TRANSFER_FLOOR);
+        assert_eq!(consensus.commit_min(), INSTALLED);
         assert!(!coordinator.checkpoint_pending.get());
     }
 
@@ -14942,6 +17122,77 @@ mod tests {
         assert!(
             journaled.is_none(),
             "the append failed, so the WAL must hold nothing at that op"
+        );
+    }
+
+    /// A checkpoint job holds `journal_gate` while it rewrites the WAL. A
+    /// request that the primary prepared meanwhile waited for the rewrite on
+    /// the shard 0 pump, and so did the promotion of a queued one.
+    #[compio::test]
+    async fn given_a_pending_wal_trim_when_a_request_arrives_should_queue_it_until_the_trim_ends() {
+        const CLIENT: u128 = 1;
+        const SESSION: u64 = 1;
+        const ACTING_USER: u32 = 7;
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal =
+            journal::prepare_journal::PrepareJournal::open(&dir.path().join("journal.wal"), 0)
+                .await
+                .unwrap();
+        let consensus = VsrConsensus::new(
+            1,
+            0,
+            1,
+            server_common::sharding::METADATA_GROUP,
+            NoopBus,
+            LocalPipeline::new(),
+        );
+        consensus.init();
+        let md: IggyMetadata<_, journal::prepare_journal::PrepareJournal, (), TestMux> =
+            IggyMetadata::new(
+                Some(consensus),
+                Some(journal),
+                None,
+                None,
+                TestMux::default(),
+                None,
+            );
+        let consensus = md.consensus.as_ref().unwrap();
+        md.client_table
+            .borrow_mut()
+            .commit_register(
+                CLIENT,
+                ACTING_USER,
+                [0x5a; 32],
+                register_reply(CLIENT, SESSION),
+            )
+            .unwrap();
+        let journal = md.journal.as_ref().unwrap().handle();
+
+        // As a checkpoint job: it announces its trim, then takes the gate.
+        let trim = md.announce_checkpoint_trim();
+        let rewrite = md.hold_journal_writes().await;
+        futures::FutureExt::now_or_never(md.on_request(create_stream_request(CLIENT, 1, "s1")))
+            .expect("a request must not wait for the WAL trim on the pump");
+        assert_eq!(consensus.request_queue_len(), 1);
+        futures::FutureExt::now_or_never(md.resume_stranded_commits())
+            .expect("the promotion must not wait for the WAL trim on the pump");
+        assert_eq!(
+            consensus.request_queue_len(),
+            1,
+            "no request is promoted while the trim is pending"
+        );
+        assert_eq!(journal.last_op(), None);
+
+        drop(rewrite);
+        drop(trim);
+        md.resume_stranded_commits().await;
+
+        assert_eq!(consensus.request_queue_len(), 0);
+        assert_eq!(
+            journal.last_op(),
+            Some(consensus.sequencer().current_sequence()),
+            "the tick promotes the queued request once the trim ended"
         );
     }
 }

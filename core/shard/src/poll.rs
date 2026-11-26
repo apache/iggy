@@ -29,14 +29,18 @@
 //! Completion validation and progress updates run synchronously on the owner,
 //! before any replication wait.
 
+use std::collections::BTreeMap;
+
 use crate::shards_table::ShardsTable;
 use crate::{
-    COLD_POLL_BUDGET, ConsumerOffsetRead, ExternalGroupRead, IggyShard, PartitionRead,
-    PartitionReadReply, Sender,
+    COLD_POLL_BUDGET, ConsumerOffsetRead, ExternalGroupRead, IggyShard, LifecycleFrame,
+    MAX_HELD_READS, MAX_HELD_READS_PER_NAMESPACE, PARTITION_BUILD_HOLD, PartitionRead,
+    PartitionReadReply, ReadHold, Sender, ShardFrame,
 };
 use consensus::client_table::SessionAttachment;
 use consensus::{Consensus, MetadataHandle, PartitionsHandle, is_partition_receipt_operation};
 use iggy_binary_protocol::primitives::partition_history::ConsumerGroupOwner;
+use iggy_binary_protocol::requests::messages::FETCH_REPLY_MARGIN_US;
 use iggy_binary_protocol::requests::users::login_register::CredentialProof;
 use iggy_binary_protocol::{Operation, RoutedRequestHeader};
 use iggy_common::{IggyError, IggyTimestamp};
@@ -44,7 +48,7 @@ use journal::superblock::SuperblockStore;
 use message_bus::MessageBus;
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::PollMetadata;
-use partitions::{PollCompletion, PollPlan, PollReadResult, PollingConsumer};
+use partitions::{IggyPartition, PollCompletion, PollPlan, PollReadResult, PollingConsumer};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
@@ -121,6 +125,99 @@ pub enum PollTarget {
     },
 }
 
+/// A read that waits on the owner shard until its partition can serve it.
+struct HeldRead {
+    read: PartitionRead,
+    reply: Sender<PartitionReadReply>,
+    /// Committed `created_revision` when the read arrived. A partition built
+    /// at another revision is another incarnation and does not answer it.
+    created_revision: u64,
+    /// Bus-clock micros at which the hold ends.
+    deadline: u64,
+}
+
+impl HeldRead {
+    /// What this read takes of [`MAX_HELD_READS`]: a batch stores each of its
+    /// offset reads, and the end of its hold answers each of them.
+    fn cost(&self) -> usize {
+        match &self.read {
+            PartitionRead::ConsumerOffsetsOnPrimary { reads, .. } => reads.len().max(1),
+            _ => 1,
+        }
+    }
+}
+
+/// The held reads of a shard by namespace.
+///
+/// [`BTreeMap`], not `HashMap`: expiry and shutdown answer in map order, and
+/// a per-process hash seed would change that order between simulator runs of
+/// one seed.
+#[derive(Default)]
+pub struct HeldReads {
+    by_namespace: BTreeMap<IggyNamespace, Vec<HeldRead>>,
+    /// The [`HeldRead::cost`] of every held read. Carried, not summed again:
+    /// the shard cap reads it for every arriving read.
+    cost: usize,
+}
+
+impl HeldReads {
+    #[cfg(any(test, feature = "simulator"))]
+    pub fn count(&self) -> usize {
+        self.by_namespace.values().map(Vec::len).sum()
+    }
+
+    /// Stores `read`, or hands it back when a cap is spent.
+    fn hold(&mut self, namespace: IggyNamespace, read: HeldRead) -> Option<HeldRead> {
+        let cost = read.cost();
+        if self.cost.saturating_add(cost) > MAX_HELD_READS {
+            return Some(read);
+        }
+        // A new entry is below the namespace cap, so a refusal leaves no
+        // empty entry behind.
+        let reads = self.by_namespace.entry(namespace).or_default();
+        if reads.len() >= MAX_HELD_READS_PER_NAMESPACE {
+            return Some(read);
+        }
+        reads.push(read);
+        self.cost += cost;
+        None
+    }
+
+    fn take(&mut self, namespace: IggyNamespace) -> Vec<HeldRead> {
+        let reads = self.by_namespace.remove(&namespace).unwrap_or_default();
+        let cost = reads.iter().map(HeldRead::cost).sum();
+        self.cost = self.cost.saturating_sub(cost);
+        reads
+    }
+
+    /// Removes the reads whose hold ended by `now`. A read whose requester
+    /// stopped waiting leaves without being returned.
+    fn take_expired(&mut self, now: u64) -> Vec<(IggyNamespace, HeldRead)> {
+        let mut expired = Vec::new();
+        self.by_namespace.retain(|namespace, reads| {
+            reads.retain(|read| !read.reply.is_disconnected());
+            expired.extend(
+                reads
+                    .extract_if(.., |read| read.deadline <= now)
+                    .map(|read| (*namespace, read)),
+            );
+            !reads.is_empty()
+        });
+        self.cost = self
+            .by_namespace
+            .values()
+            .flatten()
+            .map(HeldRead::cost)
+            .sum();
+        expired
+    }
+
+    fn take_all(&mut self) -> BTreeMap<IggyNamespace, Vec<HeldRead>> {
+        self.cost = 0;
+        std::mem::take(&mut self.by_namespace)
+    }
+}
+
 impl<B, MJ, S, M, T, SB> IggyShard<B, MJ, S, M, T, SB>
 where
     B: MessageBus + 'static,
@@ -167,23 +264,78 @@ where
     /// Execute a routed read on the partition owner's pump.
     /// Partitions missing materialized data reject the read. Resident polls finish
     /// inline. Disk polls return to the pump for acceptance after detached I/O.
+    /// A lookup of the primary, or a read of messages or offsets, gets no
+    /// answer here while its partition cannot serve yet: see
+    /// [`Self::read_hold`]. It is held until the partition can, and not past
+    /// the deadline of `hold`, the end that its requester or an earlier hold
+    /// of the read set. A read that an earlier hold handed back to the inbox
+    /// runs only on the incarnation that the hold waited for.
     #[allow(clippy::future_not_send, clippy::too_many_lines)]
     pub(crate) async fn on_partition_read(
         &self,
         namespace: IggyNamespace,
         read: PartitionRead,
         reply: Sender<PartitionReadReply>,
+        hold: Option<ReadHold>,
     ) {
+        let awaited = self.read_hold(namespace, &read);
+        // The pump can remove the partition that a hold ended for, and build
+        // the next incarnation of its ids, before the read that the hold
+        // handed back runs. Not every read carries a fence of its own.
+        if let Some(waited_for) = hold.and_then(|hold| hold.created_revision) {
+            let incarnation = awaited
+                .map(|(_, created_revision)| created_revision)
+                .or_else(|| {
+                    self.plane
+                        .partitions()
+                        .with_partition(&namespace, IggyPartition::created_revision)
+                });
+            if incarnation.is_some_and(|incarnation| incarnation != waited_for) {
+                let _ = reply.try_send(PartitionReadReply::Rejected(
+                    IggyError::TransientNotAccepted,
+                ));
+                return;
+            }
+        }
+        if let Some((awaited, created_revision)) = awaited {
+            self.hold_read(
+                awaited,
+                created_revision,
+                read,
+                reply,
+                hold.map(|hold| hold.deadline),
+            );
+            return;
+        }
         if let PartitionRead::DeferredPoll(request) = read {
             self.admit_deferred_poll(namespace, *request, &reply);
             return;
         }
-        if let PartitionRead::ConsumerOffsetsOnPrimary { reads } = read {
-            let offsets = reads
-                .into_iter()
-                .map(|read| self.consumer_offset_on_primary(read))
-                .collect();
-            let _ = reply.try_send(PartitionReadReply::ConsumerOffsets(offsets));
+        if let PartitionRead::ConsumerOffsetsOnPrimary { reads, .. } = read {
+            let _ = reply.try_send(self.consumer_offsets_reply(reads));
+            return;
+        }
+        if matches!(read, PartitionRead::Primary | PartitionRead::PrimaryNow) {
+            // The caller of `PrimaryNow` serves at the primary that the answer
+            // names. A primary here that still starts refuses that read, and
+            // so does the owner for an older incarnation of the ids.
+            let cannot_serve = matches!(read, PartitionRead::PrimaryNow)
+                && self
+                    .plane
+                    .partitions()
+                    .with_partition(&namespace, |partition| {
+                        self.superseding_revision(namespace, partition)
+                            .or_else(|| Self::starting_revision(partition))
+                    })
+                    .flatten()
+                    .is_some();
+            let answer = if cannot_serve {
+                PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+            } else {
+                self.primary_read_reply(namespace)
+                    .unwrap_or(PartitionReadReply::NotFound)
+            };
+            let _ = reply.try_send(answer);
             return;
         }
         let partitions = self.plane.partitions();
@@ -203,7 +355,18 @@ where
         }
         let rejection = self
             .partition_read_rejection(namespace, &read)
-            .or_else(|| self.geo_read_refusal(namespace, &read));
+            .or_else(|| self.geo_read_refusal(namespace, &read))
+            .or_else(|| {
+                // Metadata lists the partition and it is not here: not built yet,
+                // or behind a tombstone. `NotFound` would read as a permanent
+                // miss on HTTP. A read that needs the primary was refused above
+                // when its partition is not here.
+                (read.reads_messages_or_offset()
+                    && !read.requires_primary()
+                    && !self.plane.partitions().contains(&namespace)
+                    && self.stored_partition_revision(namespace).is_some())
+                .then_some(IggyError::TransientNotAccepted)
+            });
         if let Some(error) = rejection {
             let _ = reply.try_send(PartitionReadReply::Rejected(error));
             return;
@@ -270,28 +433,13 @@ where
                 .flatten()
                 .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::DeferredPoll(_) => unreachable!("deferred admission handled above"),
+            PartitionRead::Primary | PartitionRead::PrimaryNow => {
+                unreachable!("primary read answered above")
+            }
             // Answered above, entry by entry.
             PartitionRead::ConsumerOffsetsOnPrimary { .. } => {
                 PartitionReadReply::Rejected(IggyError::InvalidCommand)
             }
-            PartitionRead::Primary => partitions
-                .with_partition(&namespace, |partition| {
-                    let consensus = partition.consensus();
-                    let view = consensus.view();
-                    if consensus.is_normal()
-                        && !consensus.is_transferring()
-                        && !(consensus.has_ceded_primaryship()
-                            && consensus.primary_index(view) == consensus.replica())
-                    {
-                        PartitionReadReply::Primary {
-                            view,
-                            primary: consensus.primary_node(view),
-                        }
-                    } else {
-                        PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
-                    }
-                })
-                .unwrap_or(PartitionReadReply::NotFound),
             PartitionRead::Poll { consumer, args, .. }
             | PartitionRead::PollOnPrimary { consumer, args, .. }
             | PartitionRead::UnboundPollOnPrimary { consumer, args, .. } => {
@@ -411,6 +559,401 @@ where
                 ),
         };
         let _ = reply.try_send(result);
+    }
+
+    /// Ends the holds of `namespace` when its partition can serve: after the
+    /// insert or the removal of a partition, and on the tick. The holds of a
+    /// primary that still starts stay until the tick finds it started. Those
+    /// of an older incarnation stay until the insert of the committed one.
+    ///
+    /// Every insert and removal of a partition passes here, so the committed
+    /// lookup runs only for a namespace with held reads.
+    pub(crate) fn release_settled_reads(&self, namespace: IggyNamespace) {
+        if !self
+            .held_reads
+            .borrow()
+            .by_namespace
+            .contains_key(&namespace)
+        {
+            return;
+        }
+        let waits = self.awaits_start(namespace)
+            || self
+                .plane
+                .partitions()
+                .with_partition(&namespace, |partition| {
+                    self.superseding_revision(namespace, partition)
+                })
+                .flatten()
+                .is_some();
+        if !waits {
+            self.release_held_reads(namespace);
+        }
+    }
+
+    /// Whether the partition of `namespace` cannot serve yet and will
+    /// without a new request: this shard is due to build it, or it is a
+    /// primary that still starts.
+    pub(crate) fn awaits_start(&self, namespace: IggyNamespace) -> bool {
+        // One lookup for a partition that is here: a fetch asks it for each
+        // of its targets on this shard.
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                Self::starting_revision(partition).is_some()
+            })
+            .unwrap_or_else(|| self.awaited_build(namespace).is_some())
+    }
+
+    /// Ends the holds of `namespace`. A lookup gets its answer, and every
+    /// other read runs again, unless its hold ended or another incarnation
+    /// took the place of the one it waited for: not every read carries a
+    /// fence of its own.
+    ///
+    /// A build can land after the end of a hold and before the sweep that
+    /// expires it. The requester of that read no longer waits long enough
+    /// for a run to reach it, and a poll that runs then can commit an offset
+    /// whose messages nobody receives.
+    fn release_held_reads(&self, namespace: IggyNamespace) {
+        let held = self.held_reads.borrow_mut().take(namespace);
+        let built = self
+            .plane
+            .partitions()
+            .with_partition(&namespace, IggyPartition::created_revision);
+        let now = self.bus.monotonic_micros();
+        for held in held {
+            if matches!(held.read, PartitionRead::Primary) {
+                let answer = self.lookup_answer(namespace, held.created_revision);
+                let _ = held.reply.try_send(answer);
+            } else if held.deadline <= now {
+                self.metrics.record_partition_held_read_expired();
+                self.answer_unheld(namespace, held);
+            } else if built.is_some_and(|built| built != held.created_revision) {
+                self.answer_unheld(namespace, held);
+            } else {
+                self.resubmit_held_read(namespace, held);
+            }
+        }
+    }
+
+    /// Hands a held read back to the inbox of this shard, where it runs as a
+    /// read that arrives now, except that a new hold ends where this one does
+    /// and that it runs only on the incarnation that this hold waited for.
+    /// A node whose metadata is no longer fresh refuses it.
+    fn resubmit_held_read(&self, namespace: IggyNamespace, held: HeldRead) {
+        let HeldRead {
+            read,
+            reply,
+            created_revision,
+            deadline,
+        } = held;
+        // A read whose requester left must not run: it can commit an offset
+        // that nobody receives.
+        if reply.is_disconnected() {
+            return;
+        }
+        let refused = reply.clone();
+        // A batch waits for one partition after the other, and each of its
+        // reads has a fence of its own.
+        let created_revision = (!matches!(read, PartitionRead::ConsumerOffsetsOnPrimary { .. }))
+            .then_some(created_revision);
+        let frame = ShardFrame::lifecycle(LifecycleFrame::PartitionRead {
+            namespace,
+            read,
+            reply,
+            hold: Some(ReadHold {
+                deadline,
+                created_revision,
+            }),
+        });
+        let sent = self.partition_requests_allowed()
+            && self
+                .senders
+                .get(self.id as usize)
+                .is_some_and(|sender| sender.try_send(frame).is_ok());
+        if !sent {
+            let _ = refused.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+        }
+    }
+
+    /// Whether this node still has proof that its metadata is fresh. Dispatch
+    /// tests that before a read reaches this shard, and a hold can end after
+    /// the proof does. Session and permission tests on stale metadata prove
+    /// nothing, so a held read must not serve then.
+    fn partition_requests_allowed(&self) -> bool {
+        self.plane
+            .metadata()
+            .applied_frontier()
+            .partition_requests_allowed(self.bus.monotonic_now())
+    }
+
+    /// Ends the holds whose partition can serve now, and those that reached
+    /// their deadline. On the bus clock, so the virtual clock of the
+    /// simulator governs it.
+    pub(crate) fn expire_held_reads(&self) {
+        let cost = self.held_reads.borrow().cost;
+        self.metrics.set_partition_held_reads(cost);
+        if cost == 0 {
+            return;
+        }
+        let held: Vec<IggyNamespace> = self
+            .held_reads
+            .borrow()
+            .by_namespace
+            .keys()
+            .copied()
+            .collect();
+        for namespace in held {
+            self.release_settled_reads(namespace);
+        }
+        let expired = self
+            .held_reads
+            .borrow_mut()
+            .take_expired(self.bus.monotonic_micros());
+        for (namespace, read) in expired {
+            self.metrics.record_partition_held_read_expired();
+            self.answer_unheld(namespace, read);
+        }
+    }
+
+    /// Answers every held read when the shard stops, as the deferred polls
+    /// are answered: no build lands after the stop.
+    pub(crate) fn reject_held_reads(&self) {
+        let held = self.held_reads.borrow_mut().take_all();
+        for read in held.into_values().flatten() {
+            let _ = read.reply.try_send(PartitionReadReply::Rejected(
+                IggyError::TransientNotAccepted,
+            ));
+        }
+    }
+
+    /// The answer to a [`PartitionRead::Primary`] of `namespace`, or `None`
+    /// when this shard has no partition to answer from.
+    fn primary_read_reply(&self, namespace: IggyNamespace) -> Option<PartitionReadReply> {
+        if let Some(error) = self.partition_read_rejection(namespace, &PartitionRead::Primary) {
+            return Some(PartitionReadReply::Rejected(error));
+        }
+        self.plane
+            .partitions()
+            .with_partition(&namespace, |partition| {
+                let consensus = partition.consensus();
+                let view = consensus.view();
+                if consensus.is_normal()
+                    && !consensus.is_transferring()
+                    && !(consensus.has_ceded_primaryship()
+                        && consensus.primary_index(view) == consensus.replica())
+                {
+                    PartitionReadReply::Primary {
+                        view,
+                        primary: consensus.primary_node(view),
+                    }
+                } else {
+                    PartitionReadReply::Rejected(IggyError::TransientNotAccepted)
+                }
+            })
+    }
+
+    /// The namespace and `created_revision` to hold `read` under, when its
+    /// partition cannot serve it yet and will without a new request.
+    ///
+    /// A client reaches this node through the lookup that another member
+    /// answered after its own start, so a read can arrive before the build
+    /// here, or before the primary here can serve. A refusal would reach a
+    /// client that has no reason to expect one right after a create. A lookup
+    /// of the primary also waits out an older incarnation, see
+    /// [`Self::superseding_revision`].
+    fn read_hold(
+        &self,
+        namespace: IggyNamespace,
+        read: &PartitionRead,
+    ) -> Option<(IggyNamespace, u64)> {
+        if self.shutting_down.get() {
+            return None;
+        }
+        let lookup = matches!(read, PartitionRead::Primary);
+        let hold = |namespace: IggyNamespace, needs_primary: bool| {
+            // One lookup for a partition that is here, which every read
+            // finds but the first ones after a create. A lookup of the
+            // primary also reads committed metadata.
+            self.plane
+                .partitions()
+                .with_partition(&namespace, |partition| {
+                    // Before the start test, which holds under the revision
+                    // of this partition: the insert of the committed one
+                    // would answer that hold with `NotFound`.
+                    lookup
+                        .then(|| self.superseding_revision(namespace, partition))
+                        .flatten()
+                        .or_else(|| {
+                            needs_primary
+                                .then(|| Self::starting_revision(partition))
+                                .flatten()
+                        })
+                })
+                .unwrap_or_else(|| self.awaited_build(namespace))
+                .map(|created_revision| (namespace, created_revision))
+        };
+        match read {
+            PartitionRead::Primary => hold(namespace, true),
+            PartitionRead::ConsumerOffsetsOnPrimary { reads, hold_until } => {
+                // A batch past its hold end is answered at once, so its
+                // entries need no lookup.
+                if *hold_until <= self.bus.monotonic_micros() {
+                    return None;
+                }
+                reads.iter().find_map(|read| hold(read.namespace, true))
+            }
+            PartitionRead::DeferredPoll(request) => request
+                .holdable
+                .then(|| hold(namespace, request.context.primary))
+                .flatten(),
+            read if read.reads_messages_or_offset() => hold(namespace, read.requires_primary()),
+            _ => None,
+        }
+    }
+
+    /// Committed `created_revision` of the partition of `namespace` when this
+    /// shard is due to build it: local metadata holds it as committed, this
+    /// node stores it and it hashes here.
+    ///
+    /// A tombstone counts where the reconciler is seen to build the committed
+    /// partition after it: a partition still here, in teardown or quarantine,
+    /// or the fence of an older incarnation without a partition, whose files
+    /// it removes first. A fence of the committed incarnation or a newer one
+    /// stays. Nor does a fenced partition that is still here count: the
+    /// reconciler waits for a removal that only a teardown sends. Another
+    /// tombstone without a partition does not count either: only the records
+    /// of the reconciler tell whether a build follows it.
+    fn awaited_build(&self, namespace: IggyNamespace) -> Option<u64> {
+        let partitions = self.plane.partitions();
+        let built = partitions.contains(&namespace);
+        let tombstoned = partitions.is_tombstoned(&namespace);
+        if (built && !tombstoned) || self.partition_shards.shard_for(&namespace) != self.id {
+            return None;
+        }
+        let committed = self.stored_partition_revision(namespace)?;
+        if !tombstoned {
+            return Some(committed);
+        }
+        partitions
+            .failed_revision(&namespace)
+            .map_or(built, |failed| !built && failed < committed)
+            .then_some(committed)
+    }
+
+    /// Committed `created_revision` of `namespace` when `partition` is an
+    /// older incarnation, which the reconciler of this owner shard replaces.
+    /// A delete and a create reuse the ids of a partition, and a lookup must
+    /// not get the primary of the group that is torn down. Revisions only
+    /// grow, so a partition above local metadata is newer and stays.
+    fn superseding_revision(
+        &self,
+        namespace: IggyNamespace,
+        partition: &IggyPartition<B, SB>,
+    ) -> Option<u64> {
+        if self.partition_shards.shard_for(&namespace) != self.id {
+            return None;
+        }
+        self.stored_partition_revision(namespace)
+            .filter(|committed| partition.created_revision() < *committed)
+    }
+
+    /// `created_revision` of `partition` when it is the primary of a normal
+    /// view that refuses reads until its view write and its view start land.
+    /// A partition created in a view above 0 starts so.
+    fn starting_revision(partition: &IggyPartition<B, SB>) -> Option<u64> {
+        let consensus = partition.consensus();
+        (consensus.is_primary()
+            && consensus.is_normal()
+            && !consensus.is_transferring()
+            && (consensus.needs_superblock_persist() || !consensus.applied_view_start()))
+        .then(|| partition.created_revision())
+    }
+
+    /// Holds `read` until the partition of `namespace` can serve it, or
+    /// answers it at once when a cap is spent or its requester left no time
+    /// for a hold. A read with a `hold_deadline` keeps it: the end that its
+    /// requester set, or the end of the hold before this one.
+    fn hold_read(
+        &self,
+        namespace: IggyNamespace,
+        created_revision: u64,
+        read: PartitionRead,
+        reply: Sender<PartitionReadReply>,
+        hold_deadline: Option<u64>,
+    ) {
+        let hold = u64::try_from(PARTITION_BUILD_HOLD.as_micros()).unwrap_or(u64::MAX);
+        let now = self.bus.monotonic_micros();
+        let mut deadline = hold_deadline.unwrap_or_else(|| now.saturating_add(hold));
+        // The requester of these reads stops its wait at a moment of its own,
+        // and it must get the answer of the owner before that.
+        match &read {
+            PartitionRead::ConsumerOffsetsOnPrimary { hold_until, .. } => {
+                deadline = deadline.min(*hold_until);
+            }
+            PartitionRead::DeferredPoll(request) => {
+                deadline = deadline.min(
+                    request
+                        .request_deadline
+                        .saturating_sub(FETCH_REPLY_MARGIN_US),
+                );
+            }
+            _ => {}
+        }
+        let read = HeldRead {
+            read,
+            reply,
+            created_revision,
+            deadline,
+        };
+        if deadline <= now {
+            self.answer_unheld(namespace, read);
+            return;
+        }
+        let refused = self.held_reads.borrow_mut().hold(namespace, read);
+        if let Some(read) = refused {
+            self.metrics.record_partition_held_read_refused();
+            tracing::debug!(
+                shard = self.id,
+                namespace_raw = namespace.inner(),
+                "held partition reads at capacity; answering without the wait"
+            );
+            self.answer_unheld(namespace, read);
+        }
+    }
+
+    /// Answers a read whose wait ended without a partition that can serve.
+    /// A lookup gets what the partition says now. A batch of offset reads is
+    /// answered entry by entry, so the partition that cannot serve refuses
+    /// only its own entry. Every other read is refused as transient, never
+    /// `NotFound`: HTTP maps the `NotFound` of those reads to a permanent 404.
+    /// So is a batch on a node whose metadata is no longer fresh.
+    fn answer_unheld(&self, namespace: IggyNamespace, held: HeldRead) {
+        let answer = match held.read {
+            PartitionRead::Primary => self.lookup_answer(namespace, held.created_revision),
+            PartitionRead::ConsumerOffsetsOnPrimary { reads, .. }
+                if self.partition_requests_allowed() =>
+            {
+                self.consumer_offsets_reply(reads)
+            }
+            _ => PartitionReadReply::Rejected(IggyError::TransientNotAccepted),
+        };
+        let _ = held.reply.try_send(answer);
+    }
+
+    /// The answer to a held lookup: that of the partition that is here when
+    /// it is the incarnation the lookup waited for, and `NotFound` otherwise.
+    fn lookup_answer(&self, namespace: IggyNamespace, created_revision: u64) -> PartitionReadReply {
+        let built_revision = self
+            .plane
+            .partitions()
+            .with_partition(&namespace, IggyPartition::created_revision);
+        (built_revision == Some(created_revision))
+            .then(|| self.primary_read_reply(namespace))
+            .flatten()
+            .unwrap_or(PartitionReadReply::NotFound)
     }
 
     /// The condition of this shard that refuses `read` of `namespace` before
@@ -552,6 +1095,17 @@ where
                     current_offset,
                 }
             })
+    }
+
+    /// The reply to [`PartitionRead::ConsumerOffsetsOnPrimary`]: each read
+    /// answered alone, in order.
+    fn consumer_offsets_reply(&self, reads: Vec<ConsumerOffsetRead>) -> PartitionReadReply {
+        PartitionReadReply::ConsumerOffsets(
+            reads
+                .into_iter()
+                .map(|read| self.consumer_offset_on_primary(read))
+                .collect(),
+        )
     }
 
     /// Discard a read if its reply receiver is already disconnected at the check.

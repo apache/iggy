@@ -137,6 +137,10 @@ pub struct DeferredPollRequest {
     /// started from. `None` means from its admission. A fetch that resolved
     /// its starts before it waited sets that time.
     pub stores_fenced_from: Option<u64>,
+    /// Whether the owner holds this read for a partition that cannot serve
+    /// yet. A fetch clears it for a read beside others, because a held read
+    /// keeps back the replies of the reads beside it.
+    pub holdable: bool,
     pub(crate) deadline: u64,
     pub(crate) request_deadline: u64,
 }
@@ -159,6 +163,7 @@ impl DeferredPollRequest {
             commit_gate: None,
             oversized_turn: None,
             stores_fenced_from: None,
+            holdable: true,
             deadline: 0,
             request_deadline: 0,
         }

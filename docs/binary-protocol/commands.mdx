@@ -181,6 +181,8 @@ The fixed fields are the shape of the operation: which stream, how many partitio
 [stream_id: Identifier][topic_id: Identifier][partitions_count: u32]
 ```
 
+The server answers Create topic and Create partitions after the commit. The node that answers then waits until it can serve the new partitions that it stores. That wait takes 3 seconds at most in normal operation and never more than 10 seconds. The reply does not wait for the other nodes. If a client stops its wait before the reply, the create can be committed. A retry with the same request number returns the stored reply, see [Request numbering](/docs/binary-protocol/framing#request-numbering).
+
 **Delete partitions. Code: 403.**
 
 ```text

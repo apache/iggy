@@ -664,7 +664,7 @@ where
                 .get(stream_id)
                 .ok_or(IggyError::InvalidIdentifier)?;
             Ok(Some((
-                StoredEntry::from(stream).into_owned(),
+                StoredEntry::from(stream.as_ref()).into_owned(),
                 stored_topics(stream),
             )))
         },
@@ -1275,7 +1275,12 @@ fn streams_page(
                 ReadGrants::granted_streams(permissions, after, query.descending) =>
         {
             collect_page(
-                ids.filter_map(|id| Some((WirePageCursor::Id(id as u64), streams.items.get(id)?))),
+                ids.filter_map(|id| {
+                    Some((
+                        WirePageCursor::Id(id as u64),
+                        streams.items.get(id)?.as_ref(),
+                    ))
+                }),
                 limit,
                 budget,
                 project,
@@ -1286,7 +1291,9 @@ fn streams_page(
         {
             let keys = ordered.map_or(&[][..], |ordered| ordered.streams.as_slice());
             collect_page(
-                created_grant_walk(keys, after, query.descending, |id| streams.items.get(id)),
+                created_grant_walk(keys, after, query.descending, |id| {
+                    streams.items.get(id).map(Arc::as_ref)
+                }),
                 limit,
                 budget,
                 project,
@@ -1296,7 +1303,7 @@ fn streams_page(
             streams
                 .items
                 .walk(after, query.descending)
-                .map(|(id, stream)| (WirePageCursor::Id(id as u64), stream)),
+                .map(|(id, stream)| (WirePageCursor::Id(id as u64), stream.as_ref())),
             limit,
             budget,
             project,
@@ -1696,8 +1703,8 @@ mod tests {
         }
         let mut hidden = Stream::new(Arc::from("hidden"), created_at);
         hidden.options = unreadable();
-        let readable_slot = streams.items.insert(readable);
-        let hidden_slot = streams.items.insert(hidden);
+        let readable_slot = streams.items.insert(Arc::new(readable));
+        let hidden_slot = streams.items.insert(Arc::new(hidden));
 
         let names = |names: Vec<&WireName>| -> Vec<String> {
             names.iter().map(|name| name.as_str().to_owned()).collect()
@@ -1752,7 +1759,7 @@ mod tests {
         );
         let hidden = streams.items.get(hidden_slot).expect("stream stored");
         assert!(matches!(
-            stream_response(&StoredEntry::from(hidden)),
+            stream_response(&StoredEntry::from(hidden.as_ref())),
             Err(IggyError::UnsupportedCriticalOption(_))
         ));
     }
@@ -2146,7 +2153,7 @@ mod tests {
             .map(|id| Partition::new(id, id as u64, created_at, 0, 0))
             .collect();
         stream.topics.insert(topic);
-        streams.items.insert(stream);
+        streams.items.insert(Arc::new(stream));
         streams
     }
 

@@ -671,9 +671,9 @@ pub(in crate::http) mod tests {
         IggyByteSize, IggyError, IggyTimestamp, MetadataChangeCursor, MetadataChangePhase,
         MetadataChangeStatus, UserStatus,
     };
-    use message_bus::IggyMessageBus;
     use message_bus::installer::conn_info::ClientTransportKind;
     use message_bus::transports::tls::install_default_crypto_provider;
+    use message_bus::{IggyMessageBus, MessageBus};
     use metadata::AppliedFrontier;
     use metadata::impls::metadata::StreamsFrontend;
     use metadata::stm::StateHandler;
@@ -688,9 +688,9 @@ pub(in crate::http) mod tests {
     use server_common::sharding::{METADATA_GROUP, PartitionLocation, ShardId};
     use shard::shards_table::{PapayaShardsTable, ShardsTable};
     use shard::{
-        ConnectedClientInfo, LifecycleFrame, ListClientsReply, PartitionConsensusConfig,
-        PartitionRead, PartitionReadReply, ReplicaTopology, ShardFrame, ShardIdentity,
-        TaggedSender, shard_channel,
+        ConnectedClientInfo, LifecycleFrame, ListClientsReply, PARTITION_BUILD_HOLD,
+        PartitionConsensusConfig, PartitionRead, PartitionReadReply, ReplicaTopology, ShardFrame,
+        ShardIdentity, TaggedSender, shard_channel,
     };
     use tokio::sync::Mutex;
 
@@ -1080,7 +1080,7 @@ pub(in crate::http) mod tests {
                         .unwrap();
                     assert!(poll!(response.as_mut()).is_pending());
                     let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                        read: PartitionRead::Primary,
+                        read: PartitionRead::PrimaryNow,
                         reply,
                         ..
                     })) = shard_inbox.try_recv()
@@ -1391,7 +1391,7 @@ pub(in crate::http) mod tests {
                 .unwrap();
             assert!(poll!(response.as_mut()).is_pending());
             let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead {
-                read: PartitionRead::Primary,
+                read: PartitionRead::PrimaryNow,
                 reply,
                 ..
             })) = shard_inbox.try_recv()
@@ -1415,7 +1415,7 @@ pub(in crate::http) mod tests {
                 panic!("{uri} must resolve its freshness refusal against the primary");
             };
             assert!(
-                matches!(read, PartitionRead::Primary),
+                matches!(read, PartitionRead::PrimaryNow),
                 "{uri} retried its data read after freshness expired"
             );
             reply
@@ -1429,6 +1429,65 @@ pub(in crate::http) mod tests {
                 StatusCode::SERVICE_UNAVAILABLE
             );
             assert!(shard_inbox.try_recv().is_err());
+        }
+    }
+
+    /// The node that relays a read stops its wait at the request deadline,
+    /// so the owner must not hold the read past it.
+    #[compio::test]
+    async fn given_an_immediate_partition_read_when_it_reaches_its_owner_should_carry_the_end_of_its_hold()
+     {
+        for uri in [
+            "/streams/stream/topics/topic/messages?consumer_id=1&partition_id=0&kind=offset&value=0&count=1",
+            "/streams/stream/topics/topic/consumer-offsets?consumer_id=1&partition_id=0",
+        ] {
+            let (sender, shard_inbox, _shard_replies) = shard_channel(0, 1, 1);
+            let state = read_state_on(Some(sender), None);
+            let namespace = create_one_partition_in(&state.shard.plane.metadata().mux_stm);
+            state
+                .shard
+                .shards_table()
+                .insert(namespace, PartitionLocation::new(ShardId::new(0), 0));
+            commit_user_request(
+                &state,
+                READER_CREATED_AT,
+                Operation::CreateUser,
+                &create_reader_request().to_bytes(),
+            );
+            let token = state
+                .jwt
+                .generate(
+                    READER_ID,
+                    CredentialProof::account(READER_CREATED_AT, READER_CREATED_AT),
+                    CLUSTER_UID,
+                    u64::MAX,
+                )
+                .unwrap();
+            let service = TowerToHyperService::new(router(
+                state.clone(),
+                state.forward.body_limit,
+                None,
+                None,
+                false,
+            ));
+            let request = Request::builder()
+                .uri(uri)
+                .header(AUTHORIZATION, format!("Bearer {}", token.access_token))
+                .body(Body::empty())
+                .unwrap();
+            let mut response = pin!(service.call(request));
+            assert!(poll!(response.as_mut()).is_pending());
+            let Ok(ShardFrame::Lifecycle(LifecycleFrame::PartitionRead { hold, .. })) =
+                shard_inbox.try_recv()
+            else {
+                panic!("{uri} must wait for its partition data");
+            };
+            let latest = state.shard.bus.monotonic_micros()
+                + u64::try_from(PARTITION_BUILD_HOLD.as_micros()).unwrap();
+            assert!(
+                hold.is_some_and(|hold| hold.deadline <= latest),
+                "{uri} must end a hold of its read by {latest}, got {hold:?}"
+            );
         }
     }
 
@@ -1726,7 +1785,7 @@ pub(in crate::http) mod tests {
             ..Default::default()
         };
         let topic_id = stream.topics.insert(topic);
-        let stream_id = inner.items.insert(stream);
+        let stream_id = inner.items.insert(Arc::new(stream));
         let original = super::TopicDurability {
             stream_id,
             topic_id,
@@ -1739,7 +1798,7 @@ pub(in crate::http) mod tests {
         );
         inner
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .unwrap()
             .topics
             .get_mut(topic_id)
@@ -1751,7 +1810,7 @@ pub(in crate::http) mod tests {
         );
         inner
             .items
-            .get_mut(stream_id)
+            .make_mut(stream_id)
             .unwrap()
             .topics
             .get_mut(topic_id)
