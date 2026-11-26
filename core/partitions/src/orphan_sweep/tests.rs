@@ -417,7 +417,7 @@ fn given_sweeps_that_list_an_orphan_the_same_when_settling_should_count_the_grac
  {
     let mut candidates = OrphanCandidates::default();
     let orphan = found(200, 3);
-    let just_short = node(10 + 60) - Duration::from_micros(1);
+    let just_short = node(10 + 60).checked_sub(Duration::from_micros(1)).unwrap();
 
     assert_eq!(
         settled(
