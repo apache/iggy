@@ -43,7 +43,9 @@ use message_bus::IggyMessageBus;
 use metadata::impls::metadata::{IggySnapshot, StreamsFrontend};
 use metadata::stm::snapshot::Snapshot;
 use metadata::stm::stream::{Partition, Streams};
-use partitions::{IggyPartitions, PartitionsConfig, RepairRingBudget, StreamKeyIdentity};
+use partitions::{
+    IggyPartitions, PartitionsConfig, RepairRingBudget, StoreViewRequest, StreamKeyIdentity,
+};
 use server_common::sharding::{IggyNamespace, PartitionLocation, ShardId};
 use shard::builder::IggyShardBuilder;
 use shard::config::DeferredPollConfig;
@@ -94,6 +96,9 @@ pub(in crate::boot) struct ShardBuild {
     /// Owned namespaces left unbuilt, for the reconciler to clean up if their
     /// delete commits before they build.
     pub unbuilt: Vec<IggyNamespace>,
+    /// The unbuilt partitions whose segment chain is gone, with what each
+    /// asks of the object store, for the reconciler to read.
+    pub chain_rebuilds: Vec<(IggyNamespace, StoreViewRequest)>,
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -279,6 +284,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
     // `Arc<TopicStats>` atomics race only against other atomic adds.
     let mut deferred_streams = BTreeSet::new();
     let mut unbuilt = Vec::new();
+    let mut chain_rebuilds = Vec::new();
     for OwnedPartition {
         stream_id,
         topic_id,
@@ -327,15 +333,17 @@ pub(in crate::boot) async fn build_shard_for_thread(
             Ok((None, _)) => continue,
             // The store is out of reach until the node passes its identity
             // check, so the reconciler rebuilds the chain.
-            Err(error @ ServerError::PartitionChainMissing { .. }) => {
+            Err(ServerError::PartitionChainMissing { request, .. }) => {
                 debug!(
                     stream_id,
                     topic_id,
                     partition_id = partition_metadata.id,
-                    %error,
-                    "skipping this partition at boot; the reconciler reads the object store \
-                     for it"
+                    from = request.from,
+                    front = request.front,
+                    "skipping this partition at boot; the segment chain is gone, and the \
+                     reconciler reads the object store for it"
                 );
+                chain_rebuilds.push((namespace, *request));
                 unbuilt.push(namespace);
                 continue;
             }
@@ -467,6 +475,7 @@ pub(in crate::boot) async fn build_shard_for_thread(
         consumer_group_liveness,
         shard_handle,
         unbuilt,
+        chain_rebuilds,
     })
 }
 

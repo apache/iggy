@@ -589,65 +589,92 @@ what is left on disk:
   can be missing: the partition starts a new chain, as when a topic turns
   tiering on.
 - The first `.log` starts later, and the partition has no tiered floor and no
-  `.index` or `.anchor` left below it, so nothing left the disk: a partition
-  with one replica starts a new chain, and a replicated one is refused and
-  rejoins by state transfer.
+  `.index` or `.anchor` left below it, so nothing left the disk: retention
+  that ran before tiering took effect commits no truncation and leaves such a
+  front. The partition starts a new chain that records that front.
 - Otherwise the node rebuilds the chain from the store before the partition
   serves. It lists the partition's objects, reads the metadata of each segment
   from the first offset retention kept up to the first local `.log`, and
   follows each segment to the next one. Every segment it takes must start where
   the one before it ended, or past a gap that a local `.anchor` names, end at or
-  below the tiered floor and below the first local `.log`, have an index, and
-  agree with the manifest when the manifest lists it. The manifest is only a
-  check: it can trail the store by a minute, so a segment it does not list yet
-  is taken from the store. The trim point of the rebuilt chain is the
-  truncation that metadata committed, so the rebuild drives no truncation and
-  no delete.
+  below the tiered floor and below the first local `.log` and the segment the
+  WAL checkpoint names, hold bytes, have an index, and agree with the manifest
+  when the manifest lists it. The manifest is only a check: it can trail the
+  store by a minute, so a segment it does not list yet is taken from the
+  store. The trim point of the rebuilt chain is the truncation that metadata
+  committed, so the rebuild drives no truncation and no delete. When
+  retention removed the segment before a gap that an `.anchor` names, the walk
+  starts past the gap, and the trim point is the offset before it.
 
 The rebuild waits until the node passes the store identity check, and costs
 one listing of the partition's objects, one HEAD of each segment it reads,
 several at a time, and one read of at most the first 16 MiB of the manifest.
-A manifest larger than that is not decoded, and the rebuild goes on without
-checking against it. A range of offsets below the first local `.log` that the
-store does not account for refuses the partition, and the log names it. A
-partition with one replica then stays down with its files as they were and no
-new chain file. A replicated one sets its files aside and rejoins by state
-transfer. Each shard exports
+The reads run in the background, at most two partitions at a time on a shard,
+as jobs of the demand fetch class, and the 16 MiB are held only while the
+manifest is read. A failed HEAD of a segment the walk takes, or a store that
+does not answer, makes the partition wait and read again later. A manifest
+larger than 16 MiB is not decoded, and the rebuild goes on without checking
+against it. A deletion of the topic does not wait for the store: a partition
+that waits for it is retired like one recovery refused. A range of offsets
+below the first local `.log` that the store does not account for refuses the
+partition, and the log names it. A partition with one replica then stays down
+with its files as they were and no new chain file. A replicated one sets its
+files aside and rejoins by state transfer. Each shard exports
 `partition_chain_rebuilds_total`, `partition_chain_rebuild_refusals_total` and
 `partitions_awaiting_chain_rebuild`, the partitions that wait for the store.
 
 The primary of each partition of a tiered topic checks once a day that the
 store still holds the segments its chain records as stored, and once more each
-time it becomes the primary, as after a restart. The check sends one HEAD for
-the `.log` and one for the `.index` of each segment, at most 64 segments a job,
-in the housekeeping jobs that wait for fetches and uploads. It lists nothing,
-reads no object and leaves the read cache alone. An object the store does not
-hold counts as missing. A `.log` of another size than the chain records, or
-with another CRC32C than the one the store computed when it took the upload,
-or, on a store that keeps no CRC32C, with another hash in its metadata, counts
-as diverged, and so does an `.index` that is not a whole number of entries. The
-node logs each such segment once as an error when it finds it, and once more
-when a later check finds it as recorded again. It repairs, deletes and fences
-nothing. A store error is no finding, and the segment counts as neither
-missing nor verified. After a timeout, a 5xx answer or throttling, the next
-job asks for the segment again, until 3 jobs in a row got no answer for it.
-The pass then goes on with the next segments, and asks for it once more after
-the last of them. After any other error, or when that last ask fails too, the
-next pass checks the segment. Each shard exports
-`partition_segment_verify_passes_total`,
-`partition_stored_segments_verified_total`, and the gauges
-`partition_stored_segments_missing` and `partition_stored_segments_diverged`
-over the partitions it leads, which drop to 0 when it stops leading them. No
-provider computes a CRC32C again on a HEAD, so the check compares what the
-store recorded when it took the object, not the bytes it holds now: a byte that
-flips inside an object file of the `fs` backend is not found.
+time it becomes the primary, as after a restart. A pass checks the segments
+stored when it started, and the ones stored later wait for the next pass. The
+check sends one HEAD for the `.log` and one for the `.index` of each segment,
+at most 64 segments a job, in the housekeeping jobs that wait for fetches and
+uploads. Each shard runs at most 4 such jobs at once, and a partition that
+finds them all running waits its turn behind the ones that found them running
+before it. The check lists nothing and leaves the read cache alone. On the
+`fs` backend a HEAD reads the first 8 KiB of the object's file, which holds
+its header and can hold the first bytes of the segment. On the other backends
+it reads no byte of the object. An object the store does not hold counts as
+missing, and the `.index` of a missing `.log` is not asked for. A `.log` of
+another size than the chain records, with another CRC32C than the one the
+store computed when it took the upload, or with metadata that does not decode
+or describes another segment than the chain records, counts as diverged, and
+so does an `.index` that is not a whole number of entries. The metadata is
+compared even when the CRC32C matches, as rebuilding a lost chain from the
+store reads it. The node logs each such segment once as an error when it finds
+it, and once more when a later check finds it as recorded again. It repairs,
+deletes and fences nothing.
+
+A store error is no finding, and the segment counts as neither missing nor
+verified, unless the HEAD of the `.log` already showed a finding, which counts.
+After a timeout, a 5xx answer or throttling, the next job asks for the segment
+again, until 3 jobs in a row got no answer for it. The pass then goes on with
+the next segments, and asks for it once more after the last of them. After any
+other error, or when that last ask fails too, the next pass checks the
+segment. A pass that left segments without an answer still ends and counts as
+a pass. When the node fails the store identity check, the jobs in flight count
+for nothing, and once it passes again each partition starts a new pass.
+
+Each shard exports `partition_segment_verify_passes_total`,
+`partition_stored_segments_verified_total`,
+`partition_segment_verify_unanswered_total`, the jobs that got no answer for a
+HEAD, and the gauges `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` over the partitions it leads, which drop
+to 0 when it stops leading them. No provider computes a CRC32C again on a
+HEAD, so the check compares what the store recorded when it took the object,
+not the bytes it holds now: a byte that flips inside an object file of the
+`fs` backend is not found.
+
+On an S3 general purpose bucket, the server needs `s3:ListBucket` on the
+bucket besides `s3:GetObject` for a HEAD of a missing object to answer 404.
+Without it S3 answers 403, which the check takes for an error, not for a
+missing object, so it finds no missing segment.
 
 Each run of the message cleaner starts the next job of each partition's pass,
-as it starts the manifest publish, the object deletes and the retention of a
-tiered topic. A node with `cleaner_enabled = false` in
-`[data_maintenance.messages]` checks no segment, and its
-`partition_stored_segments_missing` and `partition_stored_segments_diverged`
-stay at 0 whatever the store lost.
+from the same request that starts its object deletes. A node with
+`cleaner_enabled = false` in `[data_maintenance.messages]` checks no segment,
+and its `partition_stored_segments_missing` and
+`partition_stored_segments_diverged` stay at 0 whatever the store lost.
 
 A committed delete of a partition, or of the topic or stream that holds it,
 queues the delete of the partition's objects in the memory of the metadata

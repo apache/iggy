@@ -30,8 +30,8 @@ use std::time::Duration;
 use iggy::prelude::*;
 use iggy_object_store::{KeyLayout, RecoveryRecord};
 use integration::harness::{
-    Bucket, BucketEvent, BucketWatch, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide,
-    ServerHandle,
+    Bucket, BucketEvent, BucketMirror, BucketWatch, GeoCluster, GeoClusterPair,
+    GeoClusterPairBuilder, GeoSide, ServerHandle,
 };
 use tokio::time::{Instant, sleep};
 
@@ -63,6 +63,9 @@ const DEFAULT_MANIFEST_POLL: Duration = Duration::from_secs(5);
 /// when it started, which the request test leaves out.
 const WATCH_SETTLE: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// The pause between two checks of a log, a gauge or the bucket. A check of
+/// the bucket starts a thread and a runtime of its own.
+const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a restarted cluster may take to boot and answer a client.
 const BOOT_DEADLINE: Duration = Duration::from_secs(60);
 /// How long the first identity check of a restarted node may take.
@@ -88,6 +91,8 @@ const RECOVERY_DEADLINE: Duration = Duration::from_secs(120);
 /// How long a running node may take from the claim to accept a recovered
 /// origin: at most one regular identity check of the peer, and slack.
 const SUCCESSOR_DEADLINE: Duration = Duration::from_secs(90);
+/// How long a new mirror may take to copy the whole bucket of `dc-a`.
+const MIRROR_SYNC_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn given_steady_sends_to_a_geo_topic_when_a_consumer_follows_its_shadow_should_read_each_message_only_once_a_manifest_lists_it()
@@ -264,7 +269,7 @@ async fn given_a_followed_root_that_a_new_cluster_took_when_the_follower_restart
     let deadline = Instant::now() + READ_DEADLINE;
     while long_term_segments(pair.a().bucket()).await.is_empty() {
         assert!(Instant::now() < deadline, "the new dc-a stored no segment");
-        sleep(POLL_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     }
     assert_ne!(
         pair.a().bucket().cluster_uid().await.expect("the claim"),
@@ -347,11 +352,23 @@ async fn given_a_followed_root_that_a_new_cluster_took_when_the_follower_restart
 /// it as the successor while it runs and again after a restart, serves the
 /// messages of both clusters once and in order through the same shadow, and
 /// reads the root as a healthy follower does.
+///
+/// The running `dc-b` reads the bucket itself: a mirror copies files in no
+/// fixed order, so it could show the claim of the successor before the
+/// recovery record that names it. The restarted `dc-b` reads a mirror that
+/// copied the whole bucket before it started.
 #[tokio::test]
 async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_the_follower_restarts_should_serve_both_clusters_once_in_order_through_the_same_shadow()
  {
-    let mut pair =
-        started_pair(GeoClusterPair::builder().peer_reads_through_mirror(GeoSide::B)).await;
+    // The test counts markers in the log files, which inherited settings
+    // could turn off or filter.
+    let mut pair = started_pair(
+        GeoClusterPair::builder()
+            .extra_env("IGGY_LOGGING_LEVEL", "info")
+            .extra_env("IGGY_LOGGING_FILE_ENABLED", "true")
+            .extra_env("IGGY_LOGGING_PATH", "logs"),
+    )
+    .await;
     let (client_a, shadow) = create_and_follow(&pair).await;
     let client_b = pair.b().root_client().await.expect("a client of dc-b");
     let consumer = Consumer::new(Identifier::named("follower").expect("a consumer name"));
@@ -418,7 +435,6 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
     // the shadow stream recorded. Only a topic shadowed before the recovery
     // is covered.
     send_batch(&client_a, "successor").await;
-    await_listed(pair.a().bucket(), 2 * BATCH_MESSAGES - 1).await;
 
     let node_b = pair.b().harness().node(0);
     await_log(
@@ -460,12 +476,23 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
         .await
         .expect("dc-b stops");
     let accepted_before_restart = logged(pair.b().harness().node(0), SUCCESSOR_LOG);
-    let mirror = pair
-        .b()
-        .peer_mirror()
-        .expect("dc-b reads dc-a through a mirror");
+    let mirror = BucketMirror::start(
+        pair.a().bucket().path(),
+        &pair.b().harness().test_dir().join("mirror"),
+    )
+    .expect("a mirror of the bucket of dc-a");
+    mirror
+        .wait_for_pass(MIRROR_SYNC_DEADLINE)
+        .await
+        .expect("the mirror copies the bucket of dc-a");
+    pair.cluster_mut(GeoSide::B)
+        .harness_mut()
+        .node_mut(0)
+        .add_env(
+            "IGGY_GEO_PEERS_0_PATH",
+            mirror.path().to_string_lossy().into_owned(),
+        );
     let watch = mirror.watch().expect("a watch on the mirror");
-    let mirror = mirror.path().to_owned();
     sleep(WATCH_SETTLE).await;
     let started = std::time::Instant::now();
     pair.cluster_mut(GeoSide::B)
@@ -512,12 +539,8 @@ async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_
             && at >= started
         {
             for path in &paths {
-                let key = path
-                    .strip_prefix(&mirror)
-                    .ok()
-                    .and_then(Path::to_str)
-                    .map(str::to_owned);
-                opens.count(&layout, key.as_deref());
+                let key = path.strip_prefix(mirror.path()).ok().and_then(Path::to_str);
+                opens.count(&layout, key);
             }
         }
     }
@@ -869,31 +892,26 @@ async fn claim_after(bucket: &Bucket, retired: u128) -> u128 {
             Instant::now() < deadline,
             "no cluster took the root of {retired:032x}"
         );
-        sleep(POLL_INTERVAL).await;
-    }
-}
-
-/// Wait until a manifest in `bucket` lists the offset `last`.
-async fn await_listed(bucket: &Bucket, last: u64) {
-    let deadline = Instant::now() + READ_DEADLINE;
-    while origin_floor(bucket).await.is_none_or(|floor| floor < last) {
-        assert!(Instant::now() < deadline, "no manifest lists offset {last}");
-        sleep(POLL_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     }
 }
 
 /// Wait until `node` logged `marker` more than `before` times, and return how
-/// long that took.
+/// long that took. A wait whose `within` ran out fails even if the marker is
+/// there.
 async fn await_log(node: &ServerHandle, marker: &str, before: usize, within: Duration) -> Duration {
     let started = Instant::now();
-    while logged(node, marker) <= before {
+    loop {
+        let waited = started.elapsed();
         assert!(
-            started.elapsed() < within,
+            waited < within,
             "the node never logged {marker:?} within {within:?}"
         );
-        sleep(Duration::from_millis(250)).await;
+        if logged(node, marker) > before {
+            return waited;
+        }
+        sleep(RETRY_INTERVAL).await;
     }
-    started.elapsed()
 }
 
 /// How many times `node` logged `marker` in its own log files. They keep every
@@ -943,7 +961,7 @@ async fn await_peer_gauges(http: &HttpClient, expected: &[(&str, u64)]) {
             Instant::now() < deadline,
             "the gauges of dc-a read {read:?}, not {expected:?}"
         );
-        sleep(Duration::from_millis(250)).await;
+        sleep(RETRY_INTERVAL).await;
     }
 }
 

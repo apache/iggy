@@ -45,15 +45,15 @@ mod tests;
 
 /// The time from the start of one verify pass over a partition to the start
 /// of the next.
-pub const SEGMENT_VERIFY_INTERVAL: Duration = Duration::from_hours(24);
+const SEGMENT_VERIFY_INTERVAL: Duration = Duration::from_hours(24);
 
 /// The most segments one job of a verify pass checks.
-pub const SEGMENT_VERIFY_BATCH_MAX: usize = 64;
+const SEGMENT_VERIFY_BATCH_MAX: usize = 64;
 
 /// The most jobs in a row that ask for a segment the store answers with a
 /// transient error. The pass then goes on without it, and asks for it once
 /// more after the last stored segment.
-pub const SEGMENT_VERIFY_ATTEMPTS: u32 = 3;
+const SEGMENT_VERIFY_ATTEMPTS: u32 = 3;
 
 /// The segments one job checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,13 +71,15 @@ pub enum ObjectHead {
     NotFound,
 }
 
-/// The answers to the HEADs of both objects of one segment.
+/// The answers to the HEADs of the objects of one segment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentHeads {
     /// The record the answers are compared with.
     pub record: SegmentRecord,
     pub log: ObjectHead,
-    pub index: ObjectHead,
+    /// `None` when the `.index` was not asked for, as beside a missing
+    /// `.log`, or got no answer beside a `.log` that differs from the record.
+    pub index: Option<ObjectHead>,
 }
 
 /// A HEAD whose answer says neither that the object is there nor that it is
@@ -91,7 +93,9 @@ pub struct Unanswered {
 /// What one job found. A job stops at its first HEAD without an answer.
 #[derive(Debug, Default)]
 pub struct SegmentVerifyReport {
-    /// The segments the store answered both HEADs of, in offset order.
+    /// The segments whose answers settle a finding, in offset order. The
+    /// last one can also be the segment of `unanswered`, when the HEAD of its
+    /// `.log` already shows a finding.
     pub answered: Vec<SegmentHeads>,
     pub unanswered: Option<Unanswered>,
 }
@@ -111,9 +115,10 @@ pub enum Divergence {
         stored: u32,
         recorded: u32,
     },
-    /// The store keeps no CRC32C, and the metadata of the object holds
-    /// another hash than the record, or none that decodes.
-    Hash,
+    /// The metadata of the object does not decode, or describes another
+    /// segment than the record: rebuilding a lost chain from the store reads
+    /// it, whatever the CRC32C says.
+    Metadata,
     /// The `.index` is not a whole number of entries, or it is empty.
     IndexEntries {
         stored: u64,
@@ -131,10 +136,9 @@ impl fmt::Display for Divergence {
                 f,
                 "the store's CRC32C is {stored:#010x}, and the chain records {recorded:#010x}"
             ),
-            Self::Hash => f.write_str(
-                "the store keeps no CRC32C, and the object's metadata does not hold the hash \
-                 the chain records",
-            ),
+            Self::Metadata => {
+                f.write_str("the object's metadata does not describe the segment the chain records")
+            }
             Self::IndexEntries { stored } => write!(
                 f,
                 "the store holds {stored} bytes, which are not a whole number of index entries"
@@ -163,8 +167,8 @@ impl Finding {
 
 /// How the object under a segment's `.log` key differs from `record`, `None`
 /// when it is the object the record describes: of the recorded size, with the
-/// recorded CRC32C, or with the recorded hash in its metadata when the store
-/// keeps no CRC32C.
+/// recorded CRC32C when the store keeps one, and with metadata that describes
+/// the recorded segment, hash included.
 #[must_use]
 pub fn log_divergence(held: &ObjectMeta, record: &SegmentRecord) -> Option<Divergence> {
     if held.size != record.size {
@@ -173,16 +177,29 @@ pub fn log_divergence(held: &ObjectMeta, record: &SegmentRecord) -> Option<Diver
             recorded: record.size,
         });
     }
-    match held.crc32c {
-        Some(stored) if stored != record.crc32c => Some(Divergence::Crc32c {
+    if let Some(stored) = held.crc32c
+        && stored != record.crc32c
+    {
+        return Some(Divergence::Crc32c {
             stored,
             recorded: record.crc32c,
-        }),
-        Some(_) => None,
-        None => {
-            let same_hash = SegmentMetadata::try_from(&held.metadata)
-                .is_ok_and(|metadata| metadata.hash == record.hash);
-            (!same_hash).then_some(Divergence::Hash)
+        });
+    }
+    let described = SegmentMetadata::try_from(&held.metadata)
+        .is_ok_and(|metadata| metadata == SegmentMetadata::from(record));
+    (!described).then_some(Divergence::Metadata)
+}
+
+impl From<&SegmentRecord> for SegmentMetadata {
+    fn from(record: &SegmentRecord) -> Self {
+        Self {
+            start_offset: record.start_offset,
+            end_offset: record.end_offset,
+            start_timestamp: record.start_timestamp,
+            end_timestamp: record.end_timestamp,
+            max_timestamp: record.max_timestamp,
+            size: record.size,
+            hash: record.hash,
         }
     }
 }
@@ -201,19 +218,18 @@ pub fn index_divergence(held: &ObjectMeta) -> Option<Divergence> {
 /// before the `.index`.
 #[must_use]
 pub fn finding(heads: &SegmentHeads) -> Option<Finding> {
-    let (ObjectHead::Found(log), ObjectHead::Found(index)) = (&heads.log, &heads.index) else {
-        let object = if heads.log == ObjectHead::NotFound {
-            SegmentObject::Log
-        } else {
-            SegmentObject::Index
-        };
-        return Some(Finding::Missing(object));
+    let ObjectHead::Found(log) = &heads.log else {
+        return Some(Finding::Missing(SegmentObject::Log));
     };
+    if heads.index == Some(ObjectHead::NotFound) {
+        return Some(Finding::Missing(SegmentObject::Index));
+    }
     log_divergence(log, &heads.record)
         .map(|divergence| Finding::Diverged(SegmentObject::Log, divergence))
-        .or_else(|| {
-            index_divergence(index)
-                .map(|divergence| Finding::Diverged(SegmentObject::Index, divergence))
+        .or_else(|| match &heads.index {
+            Some(ObjectHead::Found(index)) => index_divergence(index)
+                .map(|divergence| Finding::Diverged(SegmentObject::Index, divergence)),
+            Some(ObjectHead::NotFound) | None => None,
         })
 }
 
@@ -258,6 +274,15 @@ pub struct VerifySettled {
     pub postponed: bool,
 }
 
+/// What the result of one job counts for, as the shard's metrics take it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct VerifyTally {
+    /// The segments whose answers counted.
+    pub checked: usize,
+    /// Whether the store left a HEAD of the job without an answer.
+    pub unanswered: bool,
+}
+
 /// A job in flight.
 #[derive(Debug)]
 struct RunningJob {
@@ -273,9 +298,16 @@ struct RunningJob {
 #[derive(Debug)]
 pub struct SegmentVerifies {
     view: u32,
+    /// The grant of the shard's verifier this state was built under. A
+    /// revoked verifier's results count for nothing.
+    grant: u64,
     /// The lowest start offset the pass under way has yet to check, `None`
     /// between passes.
     cursor: Option<u64>,
+    /// The start offset of the last segment stored when the pass under way
+    /// started, `None` when none was. The pass ends there, so segments
+    /// stored since wait for the next one.
+    pass_end: Option<u64>,
     /// When the pass under way, or the last one, started.
     pass_started_at: Option<IggyTimestamp>,
     running: Option<RunningJob>,
@@ -285,21 +317,23 @@ pub struct SegmentVerifies {
     /// The segments the pass under way went on without, by start offset,
     /// which it asks for once more after the last stored segment.
     set_aside: BTreeMap<u64, SegmentRecord>,
-    /// What is wrong with each segment, by its start offset, and the record
-    /// it was checked against.
-    findings: BTreeMap<u64, (SegmentRecord, Finding)>,
+    /// What is wrong with each segment, by its start offset, and the end
+    /// offset of the record it was checked against.
+    findings: BTreeMap<u64, (u64, Finding)>,
     missing: usize,
     diverged: usize,
 }
 
 impl SegmentVerifies {
-    /// The state of a replica that became the primary in `view`: its first
-    /// pass is due at once.
+    /// The state of a replica that became the primary in `view`, or that the
+    /// shard's verifier `grant` reached: its first pass is due at once.
     #[must_use]
-    pub const fn new(view: u32) -> Self {
+    pub const fn new(view: u32, grant: u64) -> Self {
         Self {
             view,
+            grant,
             cursor: None,
+            pass_end: None,
             pass_started_at: None,
             running: None,
             retrying: None,
@@ -313,6 +347,18 @@ impl SegmentVerifies {
     #[must_use]
     pub const fn view(&self) -> u32 {
         self.view
+    }
+
+    #[must_use]
+    pub const fn grant(&self) -> u64 {
+        self.grant
+    }
+
+    /// Whether [`Self::begin`] at `now` would do more than return
+    /// [`VerifyBegin::Idle`].
+    #[must_use]
+    pub fn wants_job(&self, now: IggyTimestamp) -> bool {
+        self.running.is_none() && (self.cursor.is_some() || self.pass_due(now))
     }
 
     /// The segments with an object the store does not hold.
@@ -340,7 +386,7 @@ impl SegmentVerifies {
         }
         let mut dropped = 0;
         while let Some(entry) = self.findings.first_entry()
-            && trimmed(&entry.get().0)
+            && entry.get().0 <= trim_point
         {
             let (_, finding) = entry.remove();
             *self.count_of(finding) -= 1;
@@ -350,15 +396,18 @@ impl SegmentVerifies {
     }
 
     /// Start the next job of the pass under way, or a new pass when one is
-    /// due at `now`. `stored_from` gives the stored segments from a start
-    /// offset on, in offset order. The job takes the first
-    /// [`SEGMENT_VERIFY_BATCH_MAX`] of them and runs as number `id`. Once
-    /// none is left, it takes the segments the pass set aside.
+    /// due at `now`. A new pass ends at `last_stored`, the start offset of
+    /// the last stored segment. `stored_from` gives the stored segments from
+    /// a start offset on, in offset order. The job takes the first
+    /// [`SEGMENT_VERIFY_BATCH_MAX`] of them up to the end of the pass and
+    /// runs as number `id`. Once none is left, it takes the segments the pass
+    /// set aside.
     pub fn begin<I>(
         &mut self,
         now: IggyTimestamp,
         id: u64,
         prefix: ObjectPrefix,
+        last_stored: Option<u64>,
         stored_from: impl FnOnce(u64) -> I,
     ) -> VerifyBegin
     where
@@ -371,13 +420,15 @@ impl SegmentVerifies {
             Some(cursor) => cursor,
             None if self.pass_due(now) => {
                 self.pass_started_at = Some(now);
+                self.pass_end = last_stored;
                 0
             }
             None => return VerifyBegin::Idle,
         };
+        let pass_end = self.pass_end;
         let mut segments: Vec<SegmentRecord> = stored_from(cursor)
             .into_iter()
-            .skip_while(|segment| segment.start_offset < cursor)
+            .take_while(|segment| pass_end.is_some_and(|end| segment.start_offset <= end))
             .take(SEGMENT_VERIFY_BATCH_MAX)
             .collect();
         let set_aside = segments.is_empty();
@@ -432,6 +483,10 @@ impl SegmentVerifies {
         let Ok(report) = outcome else {
             return Some(settled);
         };
+        let unanswered_at = report
+            .unanswered
+            .as_ref()
+            .map(|unanswered| unanswered.start_offset);
         for heads in &report.answered {
             let record = heads.record;
             let start_offset = record.start_offset;
@@ -442,7 +497,10 @@ impl SegmentVerifies {
             if stored(start_offset) != Some(record) {
                 continue;
             }
-            settled.checked += 1;
+            // Its other HEAD is asked for again, and counts it then.
+            if unanswered_at != Some(start_offset) {
+                settled.checked += 1;
+            }
             let previous = self.findings.get(&start_offset).map(|(_, found)| *found);
             match (previous, finding(heads)) {
                 (Some(cleared), None) => {
@@ -454,7 +512,8 @@ impl SegmentVerifies {
                     });
                 }
                 (previous, Some(found)) if previous != Some(found) => {
-                    self.findings.insert(start_offset, (record, found));
+                    self.findings
+                        .insert(start_offset, (record.end_offset, found));
                     if let Some(previous) = previous {
                         *self.count_of(previous) -= 1;
                     }

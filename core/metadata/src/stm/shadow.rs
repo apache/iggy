@@ -184,21 +184,40 @@ pub struct ShadowReadCache {
     pub read_ahead: Option<u64>,
 }
 
-impl ShadowReadCache {
-    /// What the options of a shadow topic store of them.
-    #[must_use]
-    pub fn stored(options: &ResourceOptions) -> Self {
-        let stored = |key: OptionKey| {
-            options
-                .get(&HeaderKey::from(key))
-                .and_then(|option| option.value.as_uint64().ok())
-        };
+/// The option keys of a [`ShadowReadCache`], built once for a walk over
+/// many shadow topics.
+#[derive(Debug, Clone)]
+pub struct ShadowReadCacheKeys {
+    size: HeaderKey,
+    read_ahead: HeaderKey,
+}
+
+impl Default for ShadowReadCacheKeys {
+    fn default() -> Self {
         Self {
-            size: stored(OptionKey::ReadCacheSize),
-            read_ahead: stored(OptionKey::ReadAhead),
+            size: HeaderKey::from(OptionKey::ReadCacheSize),
+            read_ahead: HeaderKey::from(OptionKey::ReadAhead),
         }
     }
+}
 
+impl ShadowReadCacheKeys {
+    /// What the options of a shadow topic store of the read cache.
+    #[must_use]
+    pub fn stored(&self, options: &ResourceOptions) -> ShadowReadCache {
+        let stored = |key: &HeaderKey| {
+            options
+                .get(key)
+                .and_then(|option| option.value.as_uint64().ok())
+        };
+        ShadowReadCache {
+            size: stored(&self.size),
+            read_ahead: stored(&self.read_ahead),
+        }
+    }
+}
+
+impl ShadowReadCache {
     /// Store each size in `options`, and remove the entry of each one that is
     /// unset.
     fn store_in(self, options: &mut ResourceOptions) {
@@ -913,11 +932,17 @@ fn remove_topic(
 /// names. A client's update can set these keys and not remove them, so the
 /// entry of a size that the peer no longer sets is removed here, and the
 /// nodes apply their own setting again.
+///
+/// A retired origin is followed no more, so an update that its retirement
+/// overtook in the log changes nothing.
 fn set_read_cache(
     state: &mut StreamsInner,
     target: &ShadowTopicTarget,
     read_cache: ShadowReadCache,
 ) -> ApplyReply {
+    if state.retired_origins.contains_key(&target.source.origin) {
+        return ApplyReply::err(ShadowTopicResult::TopicNotFound);
+    }
     let Some((stream_id, topic_id)) = shadow_topic_ids(state, target) else {
         return ApplyReply::err(ShadowTopicResult::TopicNotFound);
     };
@@ -1987,7 +2012,7 @@ mod tests {
     fn read_cache_in(inner: &StreamsInner, stream_id: u32) -> (ShadowReadCache, TopicReadCache) {
         let topic = &inner.items[stream_id as usize].topics[PEER_TOPIC as usize];
         (
-            ShadowReadCache::stored(&topic.options),
+            ShadowReadCacheKeys::default().stored(&topic.options),
             topic.resolved.read_cache,
         )
     }
@@ -2095,6 +2120,26 @@ mod tests {
             assert_eq!(reply.changes, Vec::new());
         }
 
+        assert_eq!(
+            read_cache_in(&inner, stream_id).0,
+            ShadowReadCache {
+                size: Some(16 * MIB),
+                read_ahead: Some(MIB),
+            }
+        );
+    }
+
+    #[test]
+    fn given_a_retired_origin_when_a_queued_read_cache_update_applies_should_change_nothing() {
+        let (mut inner, stream_id) = shadowed();
+        let set = read_cache_of(stream_id, Some(16 * MIB), Some(MIB));
+        assert_eq!(apply(&mut inner, 4, &set).code, 0);
+        assert_eq!(apply(&mut inner, 5, &retirement(PEER)).code, 0);
+
+        let queued = apply(&mut inner, 6, &read_cache_of(stream_id, Some(0), None));
+
+        assert_eq!(queued.code, u32::from(ShadowTopicResult::TopicNotFound));
+        assert_eq!(queued.changes, Vec::new());
         assert_eq!(
             read_cache_in(&inner, stream_id).0,
             ShadowReadCache {
