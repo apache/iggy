@@ -6487,9 +6487,7 @@ pub(crate) mod tests {
 
     /// The durability that the partitions of `topic` run with, and the one
     /// that a read of it reports, for its messages and its consumer offsets.
-    pub fn running_and_reported_durability(
-        topic: &Topic,
-    ) -> ([Durability; 2], [Durability; 2]) {
+    pub fn running_and_reported_durability(topic: &Topic) -> ([Durability; 2], [Durability; 2]) {
         let running = TopicRuntimeOptions::from_resource_options(&topic.options);
         let mut public = public_options(OptionsScope::Topic, &topic.options).unwrap();
         if let Some(shadow) = topic.shadow {
