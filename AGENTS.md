@@ -240,6 +240,9 @@ Created by server or tests. Gitignored. Safe to delete to reset:
 - Co-authored-by trailer when applicable.
 - A user-facing change updates `docs/` in the same PR, for example a new config key, CLI argument or SDK method. The connectors docs live in apache/iggy-connectors. See the Docs section of CONTRIBUTING.md.
 - Workspace + SDK versions sync via `scripts/extract-version.sh` and `scripts/ci/{sync-rust,python-sdk}-version{,-sync}.sh`.
+- When changing replica messages, state transfer formats or replicated behavior, check the bump rules for `REPLICA_WIRE_REVISION` in `core/binary_protocol/src/version.rs`. Keep the metadata and partition transfer format tests in step with the wire revision.
+- Before each stable server release, review `RELEASE_COMPATIBILITY` in `core/server/src/release_compatibility.rs`. Use the exact version from `core/server/Cargo.toml`. List a release only after verifying mixed-version operation in both directions, including state transfer, replicated operations, storage, HTTP relay and peer-dependent configuration defaults. Every pair in a compatible group needs a direct entry.
+- Freeze each stable release's row in `PUBLISHED`, including an empty list. Record the literal protocol, replica wire revision, storage marker and metadata transfer formats from that release. Preserve published rows and records across release branches and master. Reconcile sibling branches before adding a pair. Run `cargo test -p server --lib release_compatibility` when reviewing the table.
 - Crate publish chain verified by `scripts/verify-crates-publish.sh` against `cargo-http-registry`.
 - Third-party license enumeration: `scripts/ci/third-party-licenses.sh` (ASF policy).
 
