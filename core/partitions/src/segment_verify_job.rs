@@ -32,7 +32,7 @@ use tracing::{debug, error, info, warn};
 use crate::IggyPartition;
 use crate::segment_verify::{
     Finding, ObjectHead, SegmentHeads, SegmentVerifies, SegmentVerifyJob, SegmentVerifyOutcome,
-    SegmentVerifyReport, Transition, Unanswered, VerifyBegin,
+    SegmentVerifyReport, Transition, Unanswered, VerifyBegin, VerifyTally, log_divergence,
 };
 
 /// Runs the jobs of a shard's verify passes, behind a pointer, so the shard
@@ -85,7 +85,9 @@ impl<E: TierExecutor> SegmentVerifier for ExecutorSegmentVerifier<E> {
 
 /// HEAD the `.log` and then the `.index` of each segment of `job`, in order,
 /// up to the first HEAD that the store answers with an error other than
-/// [`ObjectStoreError::NotFound`].
+/// [`ObjectStoreError::NotFound`]. The `.index` of a segment whose `.log` is
+/// missing is not asked for. A `.log` that differs from the record is
+/// reported even when the HEAD of its `.index` fails.
 pub async fn head_segments<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
@@ -97,32 +99,51 @@ pub async fn head_segments<S: ObjectStore>(
     };
     for record in &job.segments {
         let start_offset = record.start_offset;
-        let heads = async {
-            let log = head(store, layout, job.prefix, start_offset, SegmentObject::Log).await?;
-            let index = head(
-                store,
-                layout,
-                job.prefix,
+        let unanswered = |error| {
+            Some(Unanswered {
                 start_offset,
-                SegmentObject::Index,
-            )
-            .await?;
-            Ok::<_, ObjectStoreError>((log, index))
+                error,
+            })
         };
-        match heads.await {
-            Ok((log, index)) => report.answered.push(SegmentHeads {
-                record: *record,
-                log,
-                index,
-            }),
+        let log = match head(store, layout, job.prefix, start_offset, SegmentObject::Log).await {
+            Ok(log) => log,
             Err(error) => {
-                report.unanswered = Some(Unanswered {
-                    start_offset,
-                    error,
-                });
+                report.unanswered = unanswered(error);
                 break;
             }
-        }
+        };
+        let index = match &log {
+            ObjectHead::NotFound => None,
+            ObjectHead::Found(held) => {
+                match head(
+                    store,
+                    layout,
+                    job.prefix,
+                    start_offset,
+                    SegmentObject::Index,
+                )
+                .await
+                {
+                    Ok(index) => Some(index),
+                    Err(error) => {
+                        if log_divergence(held, record).is_some() {
+                            report.answered.push(SegmentHeads {
+                                record: *record,
+                                log,
+                                index: None,
+                            });
+                        }
+                        report.unanswered = unanswered(error);
+                        break;
+                    }
+                }
+            }
+        };
+        report.answered.push(SegmentHeads {
+            record: *record,
+            log,
+            index,
+        });
     }
     report
 }
@@ -169,14 +190,29 @@ where
             .map_or((0, 0), |state| (state.missing(), state.diverged()))
     }
 
+    /// Whether [`Self::begin_segment_verify`] at `now`, under the verifier
+    /// `grant`, would do more than return [`VerifyBegin::Idle`].
+    #[must_use]
+    pub fn segment_verify_due(&self, now: IggyTimestamp, grant: u64) -> bool {
+        self.verifies_segments()
+            && self.segment_chain.is_some()
+            && self.object_prefix().is_some()
+            && self
+                .segment_verifies
+                .as_deref()
+                .filter(|state| state.view() == self.consensus().view() && state.grant() == grant)
+                .is_none_or(|state| state.wants_job(now))
+    }
+
     /// Start the next job of the verify pass, or a pass when one is due at
-    /// `now`. The first pass of a view is due at once. The caller runs the
-    /// job under its scope and hands the result to
-    /// [`Self::finish_segment_verify`] with its number.
+    /// `now`. The first pass of a view, and the first under the shard's
+    /// verifier `grant`, is due at once: what a revoked verifier found
+    /// counts for nothing. The caller runs the job under its scope and hands
+    /// the result to [`Self::finish_segment_verify`] with its number.
     ///
     /// A replica that does not verify drops what it found, which cancels its
     /// job.
-    pub fn begin_segment_verify(&mut self, now: IggyTimestamp) -> VerifyBegin {
+    pub fn begin_segment_verify(&mut self, now: IggyTimestamp, grant: u64) -> VerifyBegin {
         if !self.verifies_segments() {
             self.segment_verifies = None;
             return VerifyBegin::Idle;
@@ -191,8 +227,8 @@ where
             return VerifyBegin::Idle;
         };
         let state = match &mut self.segment_verifies {
-            Some(state) if state.view() == view => state,
-            slot => slot.insert(Box::new(SegmentVerifies::new(view))),
+            Some(state) if state.view() == view && state.grant() == grant => state,
+            slot => slot.insert(Box::new(SegmentVerifies::new(view, grant))),
         };
         let dropped = trim_point.map_or(0, |trim_point| state.trim(trim_point));
         if dropped > 0 {
@@ -202,7 +238,9 @@ where
             );
         }
         let id = self.segment_verify_jobs + 1;
-        let begin = state.begin(now, id, prefix, |cursor| chain.confirmed_from(cursor));
+        let begin = state.begin(now, id, prefix, chain.last_confirmed(), |cursor| {
+            chain.confirmed_from(cursor)
+        });
         if matches!(begin, VerifyBegin::Job { .. }) {
             self.segment_verify_jobs = id;
         }
@@ -210,13 +248,13 @@ where
     }
 
     /// Take the result of the verify job numbered `id`, and log each finding
-    /// it made or cleared. Returns how many segments it checked, `None` for a
-    /// result this replica does not wait for.
+    /// it made or cleared. Returns what it counts for, `None` for a result
+    /// this replica does not wait for.
     pub fn finish_segment_verify(
         &mut self,
         id: u64,
         outcome: &SegmentVerifyOutcome,
-    ) -> Option<usize> {
+    ) -> Option<VerifyTally> {
         if !self.verifies_segments() {
             self.segment_verifies = None;
             return None;
@@ -231,17 +269,22 @@ where
         let settled = state.finish(id, outcome, |start_offset| {
             chain.confirmed_record(start_offset)
         })?;
+        let mut tally = VerifyTally {
+            checked: settled.checked,
+            unanswered: false,
+        };
         if let Ok(SegmentVerifyReport {
             unanswered: Some(unanswered),
             ..
         }) = outcome
         {
+            tally.unanswered = true;
             log_unanswered(namespace_raw, unanswered, settled.postponed);
         }
         for transition in &settled.transitions {
             log_transition(namespace_raw, transition);
         }
-        Some(settled.checked)
+        Some(tally)
     }
 }
 

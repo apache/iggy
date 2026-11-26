@@ -101,16 +101,16 @@ pub async fn list_root<S: ObjectStore>(
 /// Run one turn of the delete of the orphan `prefix` from `progress`, once
 /// the store still holds what the sweep judged as `guard` records it.
 ///
-/// Every turn reads the identity object first, and a turn under another
-/// claim of the root deletes nothing. Then it lists up to
-/// [`ORPHAN_PAGES_PER_DELETE_TURN`] pages of the incarnation and checks each
-/// object as its page arrives. The turns of the check delete nothing. At
-/// the end of their listing they ask for the manifest and for the object of
-/// the topic incarnation, and a long-term segment, a topic object, or an
-/// object outside the moments the guard allows ends the delete. The turns
-/// after them check the same way before they delete what they listed: every
-/// `.index` before any `.log`, and the manifest last, once the listing ended
-/// and nothing was left.
+/// Every turn reads the claim of the root first, and a turn under another
+/// claim, one that moved to another moment included, deletes nothing. Then
+/// it lists up to [`ORPHAN_PAGES_PER_DELETE_TURN`] pages of the incarnation
+/// and checks each object as its page arrives. The turns of the check delete
+/// nothing. At the end of their listing they list the manifest and the
+/// object of the topic incarnation by their keys, and a long-term segment, a
+/// topic object, or an object outside the moments the guard allows ends the
+/// delete. The turns after them check the same way before they delete what
+/// they listed: every `.index` before any `.log`, and the manifest last,
+/// once the listing ended and nothing was left.
 ///
 /// # Errors
 /// The store's error for a read or a listing that failed. The turn deletes
@@ -122,11 +122,7 @@ pub async fn delete_orphan<S: ObjectStore>(
     guard: &OrphanGuard,
     progress: OrphanProgress,
 ) -> Result<OrphanDelete, ObjectStoreError> {
-    let answer = store
-        .get_range(&layout.identity_key(), 0..MAX_IDENTITY_LEN)
-        .await;
-    let etag = answer.as_ref().ok().map(|range| range.etag.clone());
-    if !guard.same_claim(&IdentityRead::of(answer)?, etag.as_deref()) {
+    if !guard.same_claim(read_claim(store, layout).await?.as_ref()) {
         return Ok(OrphanDelete::Refused(OrphanRefusal::IdentityChanged));
     }
     let OrphanProgress {
@@ -136,11 +132,9 @@ pub async fn delete_orphan<S: ObjectStore>(
     } = progress;
     let listed = list_orphan(store, layout, prefix, guard, after, &mut check).await?;
     let manifest_key = layout.manifest_key(prefix);
-    let manifest = match listed.next {
-        Some(_) => None,
-        None => modified_at(store, &manifest_key).await?,
-    };
-    if let Some(modified) = manifest {
+    if listed.next.is_none()
+        && let Some(modified) = listed_at(store, &manifest_key).await?
+    {
         check.take(guard, modified, false);
     }
     if !deleting {
@@ -176,7 +170,10 @@ pub async fn delete_orphan<S: ObjectStore>(
             ..OrphanProgress::default()
         }));
     }
-    if manifest.is_some() && !delete_objects(store, &[manifest_key]).await.is_empty() {
+    // By its key even when the listing found none: an unlink whose
+    // directory sync failed left nothing to list, and the delete makes it
+    // durable.
+    if !delete_objects(store, &[manifest_key]).await.is_empty() {
         return Ok(OrphanDelete::Unfinished);
     }
     Ok(OrphanDelete::Deleted)
@@ -250,19 +247,27 @@ async fn topic_object<S: ObjectStore>(
         topic_id: prefix.topic_id,
         created_revision: prefix.created_revision,
     });
-    Ok(modified_at(store, &key).await?.is_some())
+    Ok(listed_at(store, &key).await?.is_some())
 }
 
 /// When the store committed the object under `key`, `None` without one.
-async fn modified_at<S: ObjectStore>(
+///
+/// A listing of the key, not a head: a policy scoped to a prefix can refuse
+/// the head of an absent key, and a filesystem store fails the head of an
+/// object whose header is damaged while its listing still gives the moment.
+/// The key sorts before every longer key it starts, so it is first when it
+/// exists.
+async fn listed_at<S: ObjectStore>(
     store: &S,
     key: &str,
 ) -> Result<Option<SystemTime>, ObjectStoreError> {
-    match store.head(key).await {
-        Ok(held) => Ok(Some(held.last_modified)),
-        Err(ObjectStoreError::NotFound { .. }) => Ok(None),
-        Err(error) => Err(error),
-    }
+    let page = store.list(&ListRequest::new(key).with_max_keys(1)).await?;
+    Ok(page
+        .objects
+        .into_iter()
+        .next()
+        .filter(|object| object.key == key)
+        .map(|object| object.last_modified))
 }
 
 #[cfg(test)]
@@ -294,7 +299,8 @@ mod tests {
 
     /// A memory store that keeps the keys of every delete call, counts the
     /// reads of the identity object and the listing pages, and can refuse
-    /// one key.
+    /// one key. It can also give the identity object another moment while
+    /// keeping its etag, and refuse the head of every other key.
     #[derive(Default)]
     struct Deletes {
         inner: MemoryStore,
@@ -302,6 +308,8 @@ mod tests {
         calls: RefCell<Vec<Vec<String>>>,
         identity_reads: Cell<usize>,
         pages: Cell<usize>,
+        identity_moved_to: Cell<Option<SystemTime>>,
+        refuses_heads: bool,
     }
 
     impl ObjectStore for Deletes {
@@ -326,7 +334,17 @@ mod tests {
         }
 
         async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
-            self.inner.head(key).await
+            if key != layout().identity_key() {
+                if self.refuses_heads {
+                    return Err(ObjectStoreError::Transport("403 Forbidden".to_owned()));
+                }
+                return self.inner.head(key).await;
+            }
+            let mut held = self.inner.head(key).await?;
+            if let Some(moved) = self.identity_moved_to.get() {
+                held.last_modified = moved;
+            }
+            Ok(held)
         }
 
         async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
@@ -383,10 +401,21 @@ mod tests {
         block_on(read_claim(store, &layout())).unwrap().unwrap()
     }
 
+    /// Claim the root for `cluster_uid` at a moment two seconds ago, so
+    /// that an object the test stores is from a later second than the
+    /// claim, and return what a sweep reads of the claim.
+    fn claimed_earlier(store: &Deletes, cluster_uid: u128) -> ClaimStamp {
+        store
+            .identity_moved_to
+            .set(Some(SystemTime::now() - Duration::from_secs(2)));
+        claimed(store, cluster_uid)
+    }
+
     /// A guard that lets every object stored after the claim and up to an
     /// hour from now go.
     fn open_guard(claim: ClaimStamp) -> OrphanGuard {
         OrphanGuard {
+            view: 0,
             claim,
             newest: SystemTime::now() + Duration::from_hours(1),
         }
@@ -462,7 +491,7 @@ mod tests {
     fn given_an_orphan_the_store_holds_as_judged_when_deleting_should_delete_its_segments_and_then_its_manifest()
      {
         let store = Deletes::default();
-        let claim = claimed(&store, OURS);
+        let claim = claimed_earlier(&store, OURS);
         let orphan = store_incarnation(&store, ORPHAN);
         let other = ObjectPrefix {
             partition_id: 1,
@@ -516,7 +545,7 @@ mod tests {
             refused: Some(refused.clone()),
             ..Deletes::default()
         };
-        let claim = claimed(&store, OURS);
+        let claim = claimed_earlier(&store, OURS);
         store_incarnation(&store, ORPHAN);
 
         let deleted = delete_in_turns(&store, &open_guard(claim));
@@ -534,11 +563,16 @@ mod tests {
         );
     }
 
+    /// The listings of the manifest and of the topic object, by their keys,
+    /// at the end of a listing. A turn that deletes before the end lists the
+    /// key of the topic object alone.
+    const KEY_LISTINGS: usize = 2;
+
     #[test]
     fn given_an_orphan_of_more_pages_than_a_turn_lists_when_deleting_should_read_the_identity_and_list_at_most_its_pages_in_each_turn()
      {
         let store = Deletes::default();
-        let claim = claimed(&store, OURS);
+        let claim = claimed_earlier(&store, OURS);
         let objects = ORPHAN_PAGES_PER_DELETE_TURN * MAX_KEYS_PER_REQUEST + 1;
         for start in 0..objects {
             put(&store, &segment(ORPHAN, start as u64, SegmentObject::Log));
@@ -571,9 +605,9 @@ mod tests {
             turns,
             [
                 (1, ORPHAN_PAGES_PER_DELETE_TURN, false),
-                (1, 1, false),
-                (1, ORPHAN_PAGES_PER_DELETE_TURN, true),
-                (1, 1, true),
+                (1, 1 + KEY_LISTINGS, false),
+                (1, ORPHAN_PAGES_PER_DELETE_TURN + 1, true),
+                (1, 1 + KEY_LISTINGS, true),
             ],
             "identity reads, listing pages, and whether the turn deleted"
         );
@@ -583,7 +617,7 @@ mod tests {
     #[test]
     fn given_an_identity_change_after_the_check_when_a_turn_would_delete_should_delete_nothing() {
         let store = Deletes::default();
-        let claim = claimed(&store, OURS);
+        let claim = claimed_earlier(&store, OURS);
         store_incarnation(&store, ORPHAN);
         let guard = open_guard(claim);
         let OrphanDelete::Continues(progress) = turn(&store, &guard, OrphanProgress::default())
@@ -608,10 +642,11 @@ mod tests {
     fn given_an_object_stored_after_the_check_when_a_turn_would_delete_should_refuse_and_delete_nothing()
      {
         let store = Deletes::default();
-        let claim = claimed(&store, OURS);
+        let claim = claimed_earlier(&store, OURS);
         store_incarnation(&store, ORPHAN);
         std::thread::sleep(Duration::from_millis(2));
         let guard = OrphanGuard {
+            view: 0,
             claim,
             newest: SystemTime::now(),
         };
@@ -636,7 +671,7 @@ mod tests {
     fn given_a_recent_object_on_the_first_page_and_a_long_term_segment_in_a_later_turn_when_checking_should_refuse_for_the_long_term_segment()
      {
         let store = Deletes::default();
-        let claim = claimed(&store, OURS);
+        let claim = claimed_earlier(&store, OURS);
         let objects = ORPHAN_PAGES_PER_DELETE_TURN * MAX_KEYS_PER_REQUEST;
         for start in 1..=objects {
             put(&store, &segment(ORPHAN, start as u64, SegmentObject::Log));
@@ -652,6 +687,7 @@ mod tests {
         );
         std::thread::sleep(Duration::from_millis(2));
         let guard = OrphanGuard {
+            view: 0,
             claim,
             newest: SystemTime::now(),
         };
@@ -677,7 +713,7 @@ mod tests {
     {
         for change in ["another cluster", "a new put of ours", "no object"] {
             let store = Deletes::default();
-            let claim = claimed(&store, OURS);
+            let claim = claimed_earlier(&store, OURS);
             let stored: BTreeSet<String> = store_incarnation(&store, ORPHAN).into_iter().collect();
             match change {
                 "another cluster" => {
@@ -726,7 +762,14 @@ mod tests {
             ("before the claim", None, OrphanRefusal::BeforeClaim),
         ] {
             let store = Deletes::default();
-            let claim = claimed(&store, OURS);
+            let claim = if refusal == OrphanRefusal::BeforeClaim {
+                store
+                    .identity_moved_to
+                    .set(Some(SystemTime::now() + Duration::from_hours(1)));
+                claimed(&store, OURS)
+            } else {
+                claimed_earlier(&store, OURS)
+            };
             store_incarnation(&store, ORPHAN);
             if let Some(key) = &extra {
                 put(&store, key);
@@ -734,14 +777,13 @@ mod tests {
             let stored = keys(&store);
             let guard = match refusal {
                 OrphanRefusal::Recent => OrphanGuard {
+                    view: 0,
                     newest: claim.claimed_at,
                     claim,
                 },
                 OrphanRefusal::BeforeClaim => OrphanGuard {
-                    claim: ClaimStamp {
-                        claimed_at: SystemTime::now() + Duration::from_hours(1),
-                        ..claim
-                    },
+                    view: 0,
+                    claim,
                     newest: SystemTime::now() + Duration::from_hours(2),
                 },
                 _ => open_guard(claim),
@@ -756,17 +798,105 @@ mod tests {
     }
 
     #[test]
-    fn given_a_manifest_older_than_the_claim_when_deleting_an_orphan_should_delete_nothing() {
-        let store = Deletes::default();
+    fn given_a_manifest_older_than_the_claim_that_only_a_listing_shows_when_deleting_an_orphan_should_delete_nothing()
+     {
+        let store = Deletes {
+            refuses_heads: true,
+            ..Deletes::default()
+        };
         put(&store, &layout().manifest_key(&ORPHAN));
-        std::thread::sleep(Duration::from_millis(2));
+        // The claim and the segment each in a later second, as the age
+        // checks count in whole seconds.
+        std::thread::sleep(Duration::from_millis(1_100));
         let claim = claimed(&store, OURS);
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(1_100));
         put(&store, &segment(ORPHAN, 0, SegmentObject::Log));
 
         let deleted = delete_in_turns(&store, &open_guard(claim));
 
         assert_eq!(deleted, OrphanDelete::Refused(OrphanRefusal::BeforeClaim));
         assert!(store.calls.borrow().is_empty());
+    }
+    #[test]
+    fn given_an_identity_put_again_with_the_same_etag_at_a_later_moment_when_a_turn_would_delete_should_delete_nothing()
+     {
+        let store = Deletes::default();
+        let claim = claimed_earlier(&store, OURS);
+        store_incarnation(&store, ORPHAN);
+        let guard = open_guard(claim.clone());
+        let OrphanDelete::Continues(progress) = turn(&store, &guard, OrphanProgress::default())
+        else {
+            panic!("the check refused the orphan");
+        };
+        let stored = keys(&store);
+
+        store
+            .identity_moved_to
+            .set(Some(claim.claimed_at + Duration::from_secs(60)));
+        let deleted = turn(&store, &guard, progress);
+
+        assert_eq!(
+            deleted,
+            OrphanDelete::Refused(OrphanRefusal::IdentityChanged)
+        );
+        assert_eq!(keys(&store), stored);
+        assert!(store.calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn given_a_manifest_whose_unlink_lost_its_answer_when_the_delete_starts_over_should_delete_its_key_again()
+     {
+        let manifest = layout().manifest_key(&ORPHAN);
+        let store = Deletes::default();
+        let claim = claimed_earlier(&store, OURS);
+        store_incarnation(&store, ORPHAN);
+        let outcome = block_on(store.inner.delete(&[manifest.clone()])).unwrap();
+        assert!(outcome.is_complete());
+        for start in [0, 10] {
+            let outcome = block_on(
+                store
+                    .inner
+                    .delete(&SegmentObject::ALL.map(|object| segment(ORPHAN, start, object))),
+            )
+            .unwrap();
+            assert!(outcome.is_complete());
+        }
+
+        let deleted = delete_in_turns(&store, &open_guard(claim));
+
+        assert_eq!(deleted, OrphanDelete::Deleted);
+        assert_eq!(*store.calls.borrow(), [vec![manifest]]);
+    }
+
+    #[test]
+    fn given_a_store_that_refuses_the_head_of_every_key_but_the_identity_when_deleting_should_check_the_manifest_and_topic_object_by_listing()
+     {
+        let topic = layout().topic_key(&TopicKey {
+            stream_id: ORPHAN.stream_id,
+            topic_id: ORPHAN.topic_id,
+            created_revision: ORPHAN.created_revision,
+        });
+        for (case, extra, expected) in [
+            ("nothing extra", None, OrphanDelete::Deleted),
+            (
+                "a topic object",
+                Some(topic),
+                OrphanDelete::Refused(OrphanRefusal::TopicObject),
+            ),
+        ] {
+            let store = Deletes {
+                refuses_heads: true,
+                ..Deletes::default()
+            };
+            let claim = claimed_earlier(&store, OURS);
+            store_incarnation(&store, ORPHAN);
+            if let Some(key) = &extra {
+                put(&store, key);
+            }
+
+            let deleted = delete_in_turns(&store, &open_guard(claim));
+
+            assert_eq!(deleted, expected, "{case}");
+        }
     }
 }

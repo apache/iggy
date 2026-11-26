@@ -1487,6 +1487,12 @@ where
         let fresh = &self.fresh_writes;
         let sequence = finished.sequence;
         let now = self.bus.monotonic_micros();
+        // A store that retries spent its budget on the object already.
+        let store_retries = fresh
+            .uploader
+            .borrow()
+            .as_ref()
+            .is_some_and(|uploader| uploader.store_retries());
         let stored = {
             let mut closed = fresh.closed.borrow_mut();
             let Some(object) = closed.get_mut(&sequence) else {
@@ -1500,6 +1506,7 @@ where
                         .saturating_mul(1_u64 << object.attempts.saturating_sub(1).min(16));
                     let retry_at = now.saturating_add(delay);
                     if error.class() == ErrorClass::Transient
+                        && !store_retries
                         && object.attempts < FRESH_UPLOAD_ATTEMPTS
                         && retry_at.saturating_sub(object.first_started_at)
                             < micros(FRESH_UPLOAD_DEADLINE)

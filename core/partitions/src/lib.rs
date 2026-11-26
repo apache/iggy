@@ -20,8 +20,8 @@
 mod chain_rebuild;
 pub use chain_rebuild::{
     ChainLoss, ChainLost, ChainLostReason, ExecutorStoreViewReader, LocalFront,
-    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, RebuildInput, RebuiltFront, StoreView,
-    StoreViewOutcome, StoreViewReader, StoreViewRequest, StoredLog, chain_loss, read_store_view,
+    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, RebuildFailure, RebuildInput, RebuiltFront,
+    StoreView, StoreViewOutcome, StoreViewReader, StoreViewRequest, StoredLog, chain_loss,
     rebuild_front,
 };
 mod consumer_offset_capacity;
@@ -70,22 +70,19 @@ pub mod segment_chain;
 mod segment_upload;
 pub use object_delete::{
     ClaimReadOutcome, DeletedIncarnations, ExecutorDeleter, INCARNATION_DELETE_RETRY,
-    IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, ObjectDeleteDone, ObjectDeleteJob,
-    ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork, ObjectDeleter, RETIRED_OBJECT_GRACE,
-    RootListOutcome, SweptObjects, UploadSweepOutcome, delete_incarnation,
-    delete_long_term_segments, delete_objects, delete_segments, list_segment_starts,
-    sweep_long_term, sweep_segments, sweepable,
+    IncarnationSettled, ListedSegment, MAX_QUEUED_INCARNATIONS, MAX_QUEUED_ORPHANS,
+    ObjectDeleteDone, ObjectDeleteJob, ObjectDeleteOutcome, ObjectDeleteStart, ObjectDeleteWork,
+    ObjectDeleter, RETIRED_OBJECT_GRACE, RootListOutcome, SweptObjects, UploadSweepOutcome,
+    delete_incarnation, delete_long_term_segments, delete_objects, delete_segments,
+    list_segment_starts, sweep_long_term, sweep_segments, sweepable,
 };
 mod orphan_sweep;
 pub use orphan_sweep::{
-    ClaimStamp, ListedIncarnation, ORPHAN_LIST_PAGES_PER_JOB, ORPHAN_PAGES_PER_DELETE_TURN,
-    ORPHAN_SWEEP_INTERVAL, OrphanCandidates, OrphanCheck, OrphanDelete, OrphanGuard,
-    OrphanProgress, OrphanRefusal, RootKey, RootListing, RootPages, SweepFindings, SweepStamp,
-    Verdict, sweep_interval, verdict,
+    ClaimStamp, OrphanCandidates, OrphanDelete, OrphanGuard, OrphanProgress, OrphanRefusal,
+    RootListing, RootPages, SweepFindings, SweepStamp, sweep_interval,
 };
-mod orphan_sweep_job;
-pub use orphan_sweep_job::{delete_orphan, list_root, read_claim};
 mod fresh_proofs;
+mod orphan_sweep_job;
 pub use fresh_proofs::{FreshProofs, ProofWalk, RebuiltProofs};
 mod fresh_upload;
 pub use fresh_upload::{ExecutorFreshUploader, FreshObjectUploader, FreshUploadOutcome};
@@ -118,9 +115,8 @@ pub use segment_upload::{
 };
 mod segment_verify;
 pub use segment_verify::{
-    ObjectHead, SEGMENT_VERIFY_ATTEMPTS, SEGMENT_VERIFY_BATCH_MAX, SEGMENT_VERIFY_INTERVAL,
-    SegmentHeads, SegmentVerifyJob, SegmentVerifyOutcome, SegmentVerifyReport, Unanswered,
-    VerifyBegin,
+    ObjectHead, SegmentHeads, SegmentVerifyJob, SegmentVerifyOutcome, SegmentVerifyReport,
+    Unanswered, VerifyBegin, VerifyTally,
 };
 mod segment_verify_job;
 pub use segment_verify_job::{ExecutorSegmentVerifier, SegmentVerifier, head_segments};

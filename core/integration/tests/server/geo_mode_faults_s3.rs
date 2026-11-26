@@ -91,14 +91,20 @@ async fn given_a_geo_topic_on_s3_when_a_long_term_segment_is_large_should_store_
     let client = harness.tcp_root_client().await.expect("tcp root client");
     let topics = Topics::create(&client, "geo-s3-parts").await;
 
+    // One batch, so no rewrite can split the messages into long-term
+    // segments below the threshold of an upload in parts.
     let mut geo = Ledger::default();
-    for _ in 0..LARGE_MESSAGES {
-        assert_eq!(
-            geo.send(&client, &topics.stream, &topics.geo, LARGE_MESSAGE_BYTES)
-                .await,
-            Answer::Acked
-        );
-    }
+    assert_eq!(
+        geo.send_batch(
+            &client,
+            &topics.stream,
+            &topics.geo,
+            LARGE_MESSAGES,
+            LARGE_MESSAGE_BYTES
+        )
+        .await,
+        Answer::Acked
+    );
 
     assert_settled(&client, &topics, &geo, &bucket).await;
     let http = HttpClient::login_root(&harness).await;

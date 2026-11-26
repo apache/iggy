@@ -576,6 +576,7 @@ pub struct ShardMetrics {
     partitions_awaiting_chain_rebuild: Gauge,
     partition_segment_verify_passes_total: Counter,
     partition_stored_segments_verified_total: Counter,
+    partition_segment_verify_unanswered_total: Counter,
     partition_stored_segments_missing: Gauge,
     partition_stored_segments_diverged: Gauge,
     partitions_untrusted_log: Gauge,
@@ -879,6 +880,7 @@ impl ShardMetrics {
             partitions_awaiting_chain_rebuild: Gauge::default(),
             partition_segment_verify_passes_total: Counter::default(),
             partition_stored_segments_verified_total: Counter::default(),
+            partition_segment_verify_unanswered_total: Counter::default(),
             partition_stored_segments_missing: Gauge::default(),
             partition_stored_segments_diverged: Gauge::default(),
             partitions_untrusted_log: Gauge::default(),
@@ -2069,7 +2071,8 @@ impl ShardMetrics {
     }
 
     /// Bumped when a verify pass over the segments a partition stored has
-    /// checked the last of them.
+    /// asked for the last of them, whether or not the store answered for
+    /// each.
     pub fn record_segment_verify_pass(&self) {
         self.partition_segment_verify_passes_total.inc();
     }
@@ -2078,6 +2081,12 @@ impl ShardMetrics {
     pub fn record_stored_segments_verified(&self, segments: usize) {
         self.partition_stored_segments_verified_total
             .inc_by(u64::try_from(segments).unwrap_or(u64::MAX));
+    }
+
+    /// Bumped by each verify job that the store left a HEAD of without an
+    /// answer.
+    pub fn record_segment_verify_unanswered(&self) {
+        self.partition_segment_verify_unanswered_total.inc();
     }
 
     /// Republished by every partition sweep: how many of this shard's
@@ -2901,9 +2910,16 @@ impl ShardMetrics {
         );
         registry.register(
             "partition_segment_verify_passes",
-            "verify passes that checked every segment a tiered partition this shard leads \
-             stored against the object store",
+            "verify passes that asked the object store for every segment a tiered partition \
+             this shard leads stored; a pass also ends when the store answered no HEAD for \
+             some of them, which partition_segment_verify_unanswered counts",
             self.partition_segment_verify_passes_total.clone(),
+        );
+        registry.register(
+            "partition_segment_verify_unanswered",
+            "verify jobs that the object store left a HEAD of without an answer, whose segment \
+             counts as neither verified nor missing",
+            self.partition_segment_verify_unanswered_total.clone(),
         );
         registry.register(
             "partition_stored_segments_verified",

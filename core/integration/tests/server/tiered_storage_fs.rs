@@ -362,9 +362,31 @@ async fn given_an_evicted_front_whose_first_object_is_gone_when_the_chain_file_i
         harness.server().stdout_contains(&refusal),
         "the log does not name the unaccounted range: {refusal}"
     );
+    // A poll that succeeded with no message, or with other ones, would pass
+    // a check that only expects the read of every message to fail.
+    let local_start = local_logs
+        .keys()
+        .next()
+        .and_then(|name| name.strip_suffix(".log"))
+        .and_then(|stem| stem.parse::<u64>().ok())
+        .expect("a segment log named by its start");
+    let polled = client
+        .poll_messages(
+            &stream,
+            &topic,
+            PARTITION_ID,
+            &Consumer::default(),
+            &PollingStrategy::offset(local_start),
+            PollOptions {
+                count: 1,
+                ..PollOptions::default()
+            },
+        )
+        .await;
     assert!(
-        read_every_message(&client, &stream, &topic).await.is_err(),
-        "the refused partition served polls"
+        polled.is_err(),
+        "the refused partition served a poll of its local segment at {local_start}: {:?}",
+        polled.map(|polled| polled.messages.len())
     );
     assert!(!chain.exists(), "the refusal created a chain file");
     let logs = file_contents(&partition_dir, &["log"]);
@@ -537,9 +559,19 @@ async fn given_stored_segments_the_store_holds_when_the_primary_verifies_should_
 
 /// A single node whose tiered topic holds the test's messages, with every
 /// sealed segment in the store and off the disk. Returns the names of the
-/// segment logs in the store.
+/// segment logs in the store. Each start writes a log of its own, which a
+/// verbose run would not, so the tests read only what the last start logged.
 async fn single_node_with_evicted_segments(store: &Path) -> (TestHarness, Vec<String>) {
-    let mut harness = single_node_with_fs_store(store);
+    let mut harness = TestHarness::builder()
+        .cluster_nodes(1)
+        .server(
+            TestServerConfig::builder()
+                .extra_envs(fs_store_envs(store))
+                .preserve_logs_on_restart(true)
+                .build(),
+        )
+        .build()
+        .expect("the harness");
     harness.start().await.expect("the server boots");
     let client = harness.tcp_root_client().await.expect("tcp root client");
     let stream = Identifier::named(STREAM).expect("stream identifier");

@@ -274,6 +274,9 @@ impl ReadCache {
         let budget = {
             let mut cache = self.cache.borrow_mut();
             if cache.limit(&owner) != limit {
+                // Logged when the effective limit becomes zero, not on each
+                // update: a share that changes while it stays below the
+                // minimum keeps the limit at zero and logs nothing again.
                 if let (Some(0), Some(share @ 1..)) = (limit, settings.limit) {
                     info!(
                         prefix = ?owner.prefix,

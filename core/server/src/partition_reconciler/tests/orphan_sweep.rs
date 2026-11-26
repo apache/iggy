@@ -22,6 +22,8 @@ use super::geo_topics::seed_cluster_uid;
 use super::*;
 use configs::tiered_storage::TieredStorageBackend;
 use iggy_object_store::{LongTermKey, StoreIdentity, TopicKey};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const OWN_CLUSTER_UID: u128 = 0x5eed_0000_0000_0000_0000_0000_0000_0002;
 const GRACE: Duration = Duration::from_secs(1);
@@ -49,8 +51,16 @@ async fn sweeping_primary(
         .claim(deleter.executor().store(), &object_layout())
         .await
         .unwrap();
-    // The store's clock must move past the claim before the test stores.
-    compio::time::sleep(Duration::from_millis(2)).await;
+    // The age checks count in whole seconds, so the store's clock must move
+    // past the second of the claim before the test stores.
+    let into_second = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .subsec_micros();
+    compio::time::sleep(Duration::from_micros(
+        u64::from(1_000_000 - into_second) + 5_000,
+    ))
+    .await;
     let ctx = make_ctx(shard, Rc::new(config.clone()));
     (ctx, deleter)
 }
@@ -81,10 +91,27 @@ async fn put_key(store: &MemoryStore, key: &str) {
         .unwrap();
 }
 
+/// The moment of the monotonic clock that the wall clock moment `now` maps
+/// to, while the wall clock does not step.
+fn monotonic(now: IggyTimestamp) -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now) + Duration::from_micros(now.as_micros())
+}
+
 /// Run the sweep's pass as of `now` and let the sweep it starts finish.
 async fn sweep_pass(ctx: &ReconcilerCtx, now: IggyTimestamp) {
+    sweep_pass_at(ctx, now, monotonic(now)).await;
+}
+
+/// [`sweep_pass`] at the wall clock moment `now` and the monotonic moment
+/// `at`.
+async fn sweep_pass_at(ctx: &ReconcilerCtx, now: IggyTimestamp, at: Instant) {
     ctx.orphan_sweep
-        .pass(&ctx.shard, &ctx.incarnation_deletes, now);
+        .pass(&ctx.shard, &ctx.incarnation_deletes, now, at);
+    wait_for_the_sweep(ctx).await;
+}
+
+async fn wait_for_the_sweep(ctx: &ReconcilerCtx) {
     for _ in 0..256 {
         if !ctx.orphan_sweep.running() {
             return;
@@ -331,4 +358,76 @@ async fn given_a_primary_that_loses_its_deleter_when_it_passes_should_drop_what_
     sweep_pass(&ctx, later(first, GRACE * 2)).await;
     incarnation_delete_pass(&ctx, later(first, GRACE * 2)).await;
     assert_eq!(stored_keys(&deleter), stored);
+}
+
+#[compio::test]
+async fn given_a_wall_clock_that_steps_ahead_when_the_monotonic_clock_has_not_reached_the_grace_should_neither_sweep_nor_delete()
+ {
+    let tmp = TempDir::new().unwrap();
+    let config = sweep_config(&tmp, GRACE);
+    let (ctx, deleter) = sweeping_primary(&config, OWN_CLUSTER_UID).await;
+    let orphan = absent(5, revision(&ctx));
+    store_objects(deleter.executor().store(), orphan).await;
+    let stored = stored_keys(&deleter);
+    let wall = IggyTimestamp::now();
+    let start = Instant::now();
+
+    for (step, since_start) in [
+        (Duration::ZERO, Duration::ZERO),
+        (Duration::from_hours(24), GRACE / 2),
+        (Duration::from_hours(48), GRACE),
+        (Duration::from_hours(72), GRACE + GRACE / 2),
+        (Duration::from_hours(96), GRACE + GRACE / 2),
+    ] {
+        sweep_pass_at(&ctx, later(wall, step), start + since_start).await;
+    }
+    incarnation_delete_pass(&ctx, later(wall, Duration::from_hours(96))).await;
+
+    assert!(!ctx.incarnation_deletes.is_queued_orphan(&orphan));
+    assert_eq!(stored_keys(&deleter), stored);
+    assert_eq!(
+        ctx.shard.metrics().orphan_sweep_values().0,
+        2,
+        "a sweep at the start and one a grace later"
+    );
+}
+
+#[compio::test]
+async fn given_a_sweep_that_stops_early_when_the_next_one_lists_the_whole_root_should_count_the_grace_again()
+ {
+    let tmp = TempDir::new().unwrap();
+    let config = sweep_config(&tmp, GRACE);
+    let (ctx, deleter) = sweeping_primary(&config, OWN_CLUSTER_UID).await;
+    let orphan = absent(5, revision(&ctx));
+    store_objects(deleter.executor().store(), orphan).await;
+    let stored = stored_keys(&deleter);
+    let first = IggyTimestamp::now();
+    sweep_pass(&ctx, first).await;
+    assert_eq!(ctx.orphan_sweep.candidates(), 1);
+
+    // The sweep starts, and finds no deleter once it runs.
+    let cancelled = later(first, GRACE);
+    ctx.orphan_sweep.pass(
+        &ctx.shard,
+        &ctx.incarnation_deletes,
+        cancelled,
+        monotonic(cancelled),
+    );
+    ctx.shard.set_object_deleter(None);
+    wait_for_the_sweep(&ctx).await;
+    ctx.shard.set_object_deleter(Some(
+        Rc::clone(&deleter) as Rc<dyn partitions::ObjectDeleter>
+    ));
+    assert_eq!(ctx.orphan_sweep.candidates(), 0);
+
+    for wait in [GRACE * 2, GRACE * 3, GRACE * 3] {
+        sweep_pass(&ctx, later(first, wait)).await;
+    }
+    incarnation_delete_pass(&ctx, later(first, GRACE * 3)).await;
+    assert!(!ctx.incarnation_deletes.is_queued_orphan(&orphan));
+    assert_eq!(
+        stored_keys(&deleter),
+        stored,
+        "two full sweeps are not enough"
+    );
 }

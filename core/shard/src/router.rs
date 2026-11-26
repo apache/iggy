@@ -1441,6 +1441,7 @@ where
                 committed_up_to,
             } => {
                 self.on_delete_objects(namespace, created_revision, now, committed_up_to);
+                self.on_verify_segments(namespace, created_revision, now);
             }
             LifecycleFrame::ObjectDeleteFinished(finished) => {
                 self.on_object_delete_finished(*finished);
@@ -1454,13 +1455,6 @@ where
             }
             LifecycleFrame::ManifestPublishFinished(finished) => {
                 self.on_manifest_publish_finished(&finished);
-            }
-            LifecycleFrame::VerifySegments {
-                namespace,
-                created_revision,
-                now,
-            } => {
-                self.on_verify_segments(namespace, created_revision, now);
             }
             LifecycleFrame::SegmentVerifyFinished(finished) => {
                 self.on_segment_verify_finished(&finished);

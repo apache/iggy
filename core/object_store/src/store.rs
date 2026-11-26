@@ -228,7 +228,10 @@ pub trait ObjectStore {
 
     /// Stores part `number`, from 1, of `upload`. `crc32c` is the CRC32C of
     /// the part's bytes, which the store checks. Sending the same part again
-    /// with the same bytes replaces it, so a part can be retried freely.
+    /// with the same bytes stores it once more or finds it stored, so a part
+    /// can be retried freely. A provider whose parts are objects of their own
+    /// creates each one only where none is, so an attempt that lands late
+    /// never replaces the part that a retry stored.
     ///
     /// # Errors
     /// [`ObjectStoreError::NotFound`] when the store holds no such upload,
@@ -248,8 +251,8 @@ pub trait ObjectStore {
     /// Creates the object of `upload` from `parts`, in order, `len` bytes in
     /// all. With [`PutMode::IfAbsent`] it creates nothing when the key holds
     /// an object. With [`PutOptions::crc32c`], it creates nothing unless the
-    /// whole object hashes to that value. What the upload kept apart from
-    /// the object is removed, as far as the provider can.
+    /// whole object hashes to that value. What the upload keeps apart from
+    /// the object stays for [`Self::release_parts`].
     ///
     /// The same as [`ObjectStore::put`], a completion that ends without an
     /// answer can have created the object, and a retry can then meet it, or
@@ -269,6 +272,20 @@ pub trait ObjectStore {
     ) -> impl Future<Output = Result<(), ObjectStoreError>> {
         let _ = (upload, parts, options, len);
         std::future::ready(Err(parts_unsupported()))
+    }
+
+    /// Removes what `upload` kept apart from the object that
+    /// [`Self::complete_parts`] created. A provider that keeps nothing apart
+    /// from the object once the upload completes does nothing.
+    ///
+    /// # Errors
+    /// Any error the store returns.
+    fn release_parts(
+        &self,
+        upload: &PartsUpload,
+    ) -> impl Future<Output = Result<(), ObjectStoreError>> {
+        let _ = upload;
+        std::future::ready(Ok(()))
     }
 
     /// Ends `upload` without an object and removes what it kept, `parts`
@@ -292,6 +309,10 @@ pub trait ObjectStore {
     /// upload under a key that `layout` does not build. A provider that
     /// keeps nothing of an upload apart from the object removes nothing.
     ///
+    /// Each request of the page, the listing and every removal, waits at
+    /// most `request_timeout` for its answer. A removal that gets none counts
+    /// as failed, and the page goes on with the next upload.
+    ///
     /// # Errors
     /// Any error the store returns for the listing. An upload that the store
     /// refuses to remove counts in [`SweptUploads::failed`].
@@ -300,8 +321,9 @@ pub trait ObjectStore {
         layout: &KeyLayout,
         older_than: Duration,
         after: Option<&str>,
+        request_timeout: Duration,
     ) -> impl Future<Output = Result<SweptUploads, ObjectStoreError>> {
-        let _ = (layout, older_than, after);
+        let _ = (layout, older_than, after, request_timeout);
         std::future::ready(Ok(SweptUploads::default()))
     }
 }
