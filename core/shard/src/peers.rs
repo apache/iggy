@@ -91,9 +91,10 @@ pub enum PeerIdentity {
     /// and no recovery record leads from it to `found`. The node reads
     /// nothing from the peer until a check finds a cluster that it expects.
     Mismatched { recorded: u128, found: u128 },
-    /// An earlier check verified `cluster_uid`, but the last answer was no
-    /// identity object or a refusal. The node reads nothing until a check
-    /// finds `cluster_uid` again.
+    /// An earlier check verified `cluster_uid`, but the last check found no
+    /// identity object, got a refusal or did not finish proving the claim it
+    /// found, or committed metadata no longer expects `cluster_uid`. The node
+    /// reads nothing until a check accepts a claim again.
     Unconfirmed { cluster_uid: u128 },
     /// A check found a claim other than `cluster_uid`: another cluster's,
     /// this cluster's own, or, as `None`, bytes that no cluster wrote. The
@@ -120,6 +121,12 @@ pub enum PeerRead {
     /// the peer, and no recovery record leads to it from `recorded`, one
     /// that it does.
     Unknown { recorded: u128, found: u128 },
+    /// The object names `found`, which committed metadata does not expect of
+    /// the peer, and the check stopped following the recovery records under
+    /// the root before they proved or refuted it: a read of one got no
+    /// answer, as `unreachable`, or the check read as many as one check
+    /// reads.
+    Unproven { found: u128, unreachable: bool },
     /// The object names this cluster, so the peer's root is this cluster's
     /// own.
     OwnCluster(u128),
@@ -260,6 +267,7 @@ impl PeerIdentity {
             (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unknown { recorded, found }) => {
                 Self::Mismatched { recorded, found }
             }
+            (Self::Unverified | Self::Mismatched { .. }, PeerRead::Unproven { .. }) => self,
             (
                 Self::Unverified | Self::Mismatched { .. },
                 PeerRead::OwnCluster(_) | PeerRead::Invalid | PeerRead::Missing | PeerRead::Refused,
@@ -291,9 +299,11 @@ impl PeerIdentity {
                 cluster_uid,
                 found: None,
             },
+            // A claim that the check could not prove stops the reads until a
+            // check proves or refutes it.
             (
                 Self::Verified { cluster_uid } | Self::Unconfirmed { cluster_uid },
-                PeerRead::Missing | PeerRead::Refused,
+                PeerRead::Missing | PeerRead::Refused | PeerRead::Unproven { .. },
             ) => Self::Unconfirmed { cluster_uid },
         }
     }
@@ -318,7 +328,14 @@ impl PeerStatus {
     pub const fn after(self, read: PeerRead) -> Self {
         Self {
             identity: self.identity.after(read),
-            unreachable: matches!(read, PeerRead::Unreachable),
+            unreachable: matches!(
+                read,
+                PeerRead::Unreachable
+                    | PeerRead::Unproven {
+                        unreachable: true,
+                        ..
+                    }
+            ),
             retired: self.retired,
         }
     }
@@ -901,6 +918,64 @@ mod tests {
                 changed(Some(OTHER)),
                 successor(OTHER),
                 changed(Some(OTHER)),
+            ),
+        ] {
+            assert_eq!(before.after(read), after, "{row}");
+        }
+    }
+
+    /// A claim of another cluster that a check could not prove stops the
+    /// reads of a verified peer, and only a check that proves or refutes it
+    /// decides what comes next.
+    #[test]
+    fn given_an_unproven_claim_when_moving_the_status_should_read_nothing_until_a_check_proves_it()
+    {
+        let verified = PeerStatus::default().after(PeerRead::Found(PEER));
+        let unconfirmed = PeerIdentity::Unconfirmed { cluster_uid: PEER };
+        let unanswered = PeerRead::Unproven {
+            found: OTHER,
+            unreachable: true,
+        };
+        let walking = PeerRead::Unproven {
+            found: OTHER,
+            unreachable: false,
+        };
+
+        let suspended = verified.after(unanswered);
+        assert_eq!(suspended.identity, unconfirmed);
+        assert!(suspended.unreachable);
+        assert!(!suspended.serves_polls() && !suspended.serves_jobs());
+        assert!(!verified.after(walking).unreachable);
+        assert_eq!(verified.after(walking).identity, unconfirmed);
+        // (row, identity before, read, identity after)
+        for (row, before, read, after) in [
+            ("still unproven", unconfirmed, walking, unconfirmed),
+            (
+                "proven at last",
+                unconfirmed,
+                successor(OTHER),
+                PeerIdentity::Verified { cluster_uid: OTHER },
+            ),
+            (
+                "refuted at last",
+                unconfirmed,
+                unknown(OTHER),
+                PeerIdentity::Changed {
+                    cluster_uid: PEER,
+                    found: Some(OTHER),
+                },
+            ),
+            (
+                "nothing verified yet",
+                PeerIdentity::Unverified,
+                walking,
+                PeerIdentity::Unverified,
+            ),
+            (
+                "a mismatch holds",
+                mismatched(OWN),
+                walking,
+                mismatched(OWN),
             ),
         ] {
             assert_eq!(before.after(read), after, "{row}");

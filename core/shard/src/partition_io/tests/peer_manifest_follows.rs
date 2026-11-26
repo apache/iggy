@@ -22,7 +22,8 @@ use std::ops::Range;
 
 use super::segment_uploads::{namespace, pumped, until};
 use super::*;
-use crate::peers::{PeerIdentity, PeerStatus, SharedPeerStatus};
+use crate::peer_manifest_follows::{MANIFESTS_PER_PASS, peer_manifest_passes};
+use crate::peers::{IdentityBracket, PeerIdentity, PeerStatus, SharedPeerStatus};
 use crate::{ListedPeerManifest, PeerManifestSource};
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
@@ -160,6 +161,25 @@ impl RemoteObjects for Peer {
     }
 }
 
+/// The peer's store, whose read of the key `hung` never answers.
+struct HungRead {
+    store: Rc<MemoryStore>,
+    hung: String,
+}
+
+impl RemoteObjects for HungRead {
+    fn get_range<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+    ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
+        if key == self.hung {
+            return std::future::pending().boxed_local();
+        }
+        ObjectStore::get_range(&*self.store, key, range).boxed_local()
+    }
+}
+
 #[allow(clippy::future_not_send)]
 async fn publish(store: &MemoryStore, manifest: &PartitionManifest) {
     store
@@ -283,6 +303,59 @@ async fn given_a_regressing_manifest_when_listed_should_refuse_it_once_and_keep_
 
     assert_eq!(counts(&owner), (0, 2, 1));
     assert_eq!(committed(&owner), Some(applied));
+}
+
+/// A manifest read that never answers holds back the manifests of its own
+/// pass alone: every other pass reads its manifests between two identity
+/// reads of its own, and ends with them.
+#[compio::test]
+async fn given_a_manifest_read_that_never_answers_when_reading_more_than_one_pass_should_end_every_other_pass()
+ {
+    let store = Rc::new(MemoryStore::new());
+    StoreIdentity {
+        cluster_uid: PEER_CLUSTER,
+    }
+    .claim(&*store, &peer_layout())
+    .await
+    .unwrap();
+    publish(&store, &manifest(2)).await;
+    let hung = "hung".to_owned();
+    let listed = (0..=MANIFESTS_PER_PASS)
+        .map(|index| ListedPeerManifest {
+            namespace: IggyNamespace::new(0, 0, index),
+            created_revision: 1,
+            key: if index == 0 {
+                hung.clone()
+            } else {
+                peer_layout().manifest_key(&PEER_PREFIX)
+            },
+            etag: format!("e{index}"),
+        })
+        .collect();
+    let source = PeerManifestSource {
+        objects: Rc::new(HungRead {
+            store: Rc::clone(&store),
+            hung,
+        }),
+        identity_key: peer_layout().identity_key(),
+        status: SharedPeerStatus::default(),
+    };
+
+    let mut passes = peer_manifest_passes(source, ORIGIN.to_owned(), listed);
+
+    assert_eq!(passes.len(), 2);
+    let last = passes
+        .pop()
+        .unwrap()
+        .now_or_never()
+        .expect("a pass without the slow read ends");
+    assert_eq!(last.len(), 1);
+    assert_eq!(last[0].identity, IdentityBracket::Held(PEER_CLUSTER));
+    assert_eq!(last[0].outcome.as_ref().ok(), Some(&manifest(2)));
+    assert!(
+        passes.pop().unwrap().now_or_never().is_none(),
+        "the pass of the slow read waits for it"
+    );
 }
 
 /// A root that another cluster claimed while the pass read its manifest

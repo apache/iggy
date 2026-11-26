@@ -741,8 +741,16 @@ peer's root, `<prefix>/meta/recovery/<cluster_uid>/record`, from a recorded
 cluster. A cluster that a recovery rebuilt from the store of a recorded one
 writes such a record, so the node reads the peer as that successor. The node
 reads a record only in this case, and once for each cluster that it finds.
-The node keeps what it found in memory only, so after a restart it judges the
+A check reads a few records at most, and the next check, 5 seconds later,
+goes on where it stopped, until the records end or lead back to a cluster
+that it read. Until the records prove the cluster, also while the store does
+not answer the read of a record, the node reads nothing from the peer. The
+node keeps what it found in memory only, so after a restart it judges the
 object again against what metadata recorded.
+
+When metadata changes the clusters that it records for the peer, and the
+cluster that the node reads is neither one of them nor a successor that the
+records proved, the node stops reading the peer and checks it at once.
 
 A pass that commits what it read of a peer, the manifests of its partitions or
 the positions of its groups, reads the identity object before its other reads
