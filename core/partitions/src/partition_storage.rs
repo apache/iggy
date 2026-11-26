@@ -102,7 +102,8 @@ pub async fn create_partition_file_hierarchy(
 }
 
 /// File in a partition directory that names the incarnation the directory
-/// belongs to: the partition's `created_revision`, as 8 little-endian bytes.
+/// belongs to: the partition's `created_revision`, as a revision record
+/// ([`write_revision_record`]).
 ///
 /// Ids are reused after a delete, and a delete that did not finish before a
 /// restart leaves the directory behind, so the path alone does not say whose
@@ -128,13 +129,18 @@ pub async fn write_created_revision(
 ///
 /// # Errors
 ///
-/// The underlying I/O error, and `InvalidData` for a record that is not 8 bytes.
+/// The underlying I/O error, and `InvalidData` for a damaged record.
 pub async fn read_created_revision(partition_dir: &str) -> std::io::Result<Option<u64>> {
     read_revision_record(partition_dir, CREATED_REVISION_FILE).await
 }
 
-/// Durably replace the 8-byte little-endian record `name` in `directory`: write
-/// a temporary sibling, sync it, rename it over the record, sync the directory.
+/// Bytes of the revision in a revision record. Its crc32c follows them.
+const REVISION_LEN: usize = 8;
+const REVISION_CHECKSUM_LEN: usize = 4;
+
+/// Durably replace the record `name` in `directory` with `revision` as 8
+/// little-endian bytes and their crc32c: write a temporary sibling, sync it,
+/// rename it over the record, sync the directory.
 ///
 /// # Errors
 /// Returns the underlying open, write, rename, or synchronization error.
@@ -152,7 +158,11 @@ pub async fn write_revision_record(
         .open(&temporary)
         .await
         .note_descriptor_exhaustion(|| format!("opening {}", temporary.display()))?;
-    file.write_all_at(revision.to_le_bytes(), 0).await.0?;
+    let value = revision.to_le_bytes();
+    let mut record = [0u8; REVISION_LEN + REVISION_CHECKSUM_LEN];
+    record[..REVISION_LEN].copy_from_slice(&value);
+    record[REVISION_LEN..].copy_from_slice(&crc32c::crc32c(&value).to_le_bytes());
+    file.write_all_at(record, 0).await.0?;
     file.sync_all().await?;
     if let Err(error) = compio::fs::rename(&temporary, path).await {
         let _ = compio::fs::remove_file(&temporary).await;
@@ -161,11 +171,13 @@ pub async fn write_revision_record(
     DiskStorage.sync_directory(Path::new(directory)).await
 }
 
-/// Read the 8-byte little-endian record `name` in `directory`, `None` when it
-/// is absent.
+/// Read the revision record `name` in `directory`, `None` when it is absent.
+/// A record of the 8 bytes alone, from a server before the checksum, loads
+/// unchecked.
 ///
 /// # Errors
-/// Returns an I/O error or `InvalidData` if the record is not exactly eight bytes.
+/// Returns an I/O error, or `InvalidData` for a record of another length or
+/// one that does not match its checksum.
 pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Result<Option<u64>> {
     let path = Path::new(directory).join(name);
     match compio::fs::read(&path)
@@ -173,13 +185,18 @@ pub async fn read_revision_record(directory: &str, name: &str) -> std::io::Resul
         .note_descriptor_exhaustion(|| format!("reading {}", path.display()))
     {
         Ok(bytes) => {
-            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+            let damaged = || {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("{name} in {directory} is not an 8-byte record"),
+                    format!("{name} in {directory} is not a valid revision record"),
                 )
-            })?;
-            Ok(Some(u64::from_le_bytes(bytes)))
+            };
+            let (value, checksum) = bytes.split_at_checked(REVISION_LEN).ok_or_else(damaged)?;
+            let value: [u8; REVISION_LEN] = value.try_into().map_err(|_| damaged())?;
+            if !checksum.is_empty() && checksum != crc32c::crc32c(&value).to_le_bytes().as_slice() {
+                return Err(damaged());
+            }
+            Ok(Some(u64::from_le_bytes(value)))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
@@ -1085,6 +1102,42 @@ mod tests {
         assert!(
             !temporary.exists(),
             "the failed rename must clean up its temporary file"
+        );
+    }
+
+    #[compio::test]
+    async fn given_a_flipped_bit_in_a_revision_record_when_reading_should_refuse_it() {
+        const CREATED_REVISION: u64 = 3;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().to_str().unwrap();
+        write_created_revision(directory, CREATED_REVISION)
+            .await
+            .unwrap();
+        let record = root.path().join(CREATED_REVISION_FILE);
+        let mut bytes = std::fs::read(&record).unwrap();
+        bytes[0] ^= 0b10;
+        std::fs::write(&record, bytes).unwrap();
+
+        let error = read_created_revision(directory).await.unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[compio::test]
+    async fn given_a_revision_record_without_a_checksum_when_reading_should_load_it() {
+        const CREATED_REVISION: u64 = 3;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(CREATED_REVISION_FILE),
+            CREATED_REVISION.to_le_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_created_revision(root.path().to_str().unwrap())
+                .await
+                .unwrap(),
+            Some(CREATED_REVISION)
         );
     }
 

@@ -2163,6 +2163,30 @@ mod tests {
     }
 
     #[compio::test]
+    async fn given_a_flipped_bit_in_the_recorded_revision_when_loading_should_tombstone_in_place() {
+        const CREATED_REVISION: u64 = 3;
+        let root = tempfile::tempdir().unwrap();
+        let config = solo_config(&root);
+        let directory = config.get_partition_path(1, 1, 0);
+        drop(build_incarnation(&config, CREATED_REVISION, 0).await);
+        let marker = Path::new(&directory).join(partitions::CREATED_REVISION_FILE);
+        let mut damaged = std::fs::read(&marker).unwrap();
+        // 3 now reads as 1, an incarnation older than the committed one.
+        damaged[0] ^= 0b10;
+        std::fs::write(&marker, &damaged).unwrap();
+        let partitions = solo_partitions(&config);
+
+        assert!(
+            load_incarnation(&config, &partitions, CREATED_REVISION, 0)
+                .await
+                .is_none()
+        );
+        assert!(partitions.is_tombstoned(&IggyNamespace::new(1, 1, 0)));
+        assert_eq!(std::fs::read(&marker).unwrap(), damaged);
+        assert!(Path::new(&solo_partitions_config(&config).get_messages_path(1, 1, 0, 0)).exists());
+    }
+
+    #[compio::test]
     async fn given_a_failed_hierarchy_sync_when_loading_should_leave_the_directory_unmarked() {
         const CREATED_REVISION: u64 = 1;
         const NOT_LISTABLE: u32 = 0o300;
