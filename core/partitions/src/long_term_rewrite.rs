@@ -263,7 +263,9 @@ impl SegmentRewrite {
                 object,
             })
         };
-        store_segment(
+        let index_crc32c = crc32c::crc32c(&index);
+        share.pause_for_store();
+        let stored = store_segment(
             store,
             &record,
             LogPut {
@@ -275,10 +277,11 @@ impl SegmentRewrite {
             },
             &key(SegmentObject::Index),
             future::ready(Ok(memory_body(&index))),
-            crc32c::crc32c(&index),
+            index_crc32c,
         )
-        .await
-        .map_err(RewriteError::Upload)?;
+        .await;
+        share.resume_after_store();
+        stored.map_err(RewriteError::Upload)?;
         if let Some(remote) = &self.read.remote {
             let segment = RemoteRange {
                 key: SegmentKey {
@@ -954,12 +957,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+
     use iggy_binary_protocol::batch::BatchHeader;
     use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, Placement};
-    use iggy_object_store::{MemoryStore, PutBody, PutOptions};
+    use iggy_object_store::{
+        DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange,
+        ObjectStoreError, PutBody, PutOptions,
+    };
 
     use crate::placed_read::{PlacedSegment, REWRITE_YIELD_BYTES};
     use crate::poll_plan::PartitionDirResolution;
+    use crate::rewrite_share::{ManualClock, RewriteClock};
     use crate::{
         PartitionReadSettings, ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments,
     };
@@ -1181,6 +1190,100 @@ mod tests {
                     stored_bytes(&store, &key(SegmentObject::Index), index.len() as u64).await,
                     index
                 );
+            }
+        }
+    }
+
+    /// A store whose puts take `put_micros` of `clock`.
+    struct SlowPuts {
+        store: MemoryStore,
+        clock: Rc<ManualClock>,
+        put_micros: u64,
+    }
+
+    impl ObjectStore for SlowPuts {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            self.clock.pass(self.put_micros);
+            self.store.put(key, body, options).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            ObjectStore::get_range(&self.store, key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            self.store.head(key).await
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.store.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.store.list(request).await
+        }
+    }
+
+    /// The rewrite gives way to its share after the put, as it carries the
+    /// segment into the cache. A put to a store elsewhere is a wait and
+    /// costs it no sleep. A put to a store on the node is work.
+    #[compio::test]
+    async fn given_a_slow_put_when_rewriting_under_sends_should_charge_the_wait_only_to_a_store_on_the_node()
+     {
+        let (object, placed) = placed_object(&[600 * 1024]);
+        let put_micros = 1_000_000;
+        for store_on_node in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let clock = Rc::new(ManualClock::default());
+            clock.sends_waiting.set(true);
+            let fresh = Rc::new(MemoryStore::new());
+            fresh
+                .put(
+                    &layout().fresh_key(OBJECT_ID),
+                    PutBody::from_bytes(object.clone()),
+                    &PutOptions::default(),
+                )
+                .await
+                .unwrap();
+            let objects = fresh as Rc<dyn RemoteObjects>;
+            let cache = ReadCache::new(ReadCacheSettings {
+                cache_bytes: 64 * 1024 * 1024,
+                block_bytes: 256 * 1024,
+                read_ahead: 0,
+            });
+            let remote = Rc::new(
+                RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache),
+            );
+            let budget =
+                RewriteBudget::new(Rc::clone(&clock) as Rc<dyn RewriteClock>, store_on_node);
+            let rewrite =
+                rewrite_of(directory.path(), &placed, Rc::clone(&remote)).paced_by(Rc::new(budget));
+            let store = SlowPuts {
+                store: MemoryStore::new(),
+                clock: Rc::clone(&clock),
+                put_micros,
+            };
+
+            rewrite.run(&store, &layout()).await.unwrap();
+
+            assert!(remote.take_read_metrics().unwrap().carried_bytes > 0);
+            if store_on_node {
+                assert!(
+                    clock.slept.get() > put_micros,
+                    "slept {}",
+                    clock.slept.get()
+                );
+            } else {
+                assert_eq!(clock.slept.get(), 0);
             }
         }
     }

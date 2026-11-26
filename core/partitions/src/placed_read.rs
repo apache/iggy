@@ -43,8 +43,8 @@ use bytes::Bytes;
 use compio::fs::File;
 use compio::io::AsyncReadAtExt;
 use futures::{StreamExt, stream};
-use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchHeader};
-use iggy_binary_protocol::placement::{self, PLACED_BATCH_SIZE, PlacedBatch};
+use iggy_binary_protocol::batch::{BATCH_HEADER_SIZE, BatchChecksum, BatchHeader};
+use iggy_binary_protocol::placement::{self, BlobChecksum, PLACED_BATCH_SIZE, PlacedBatch};
 use iggy_binary_protocol::{Command, Operation, PrepareHeader};
 use iggy_object_store::{
     FreshObjectId, FreshProofRow, ManifestSegment, ObjectPrefix, SegmentKey, SegmentObject,
@@ -55,7 +55,6 @@ use server_common::send_messages::{decode_batch_slice, decode_prepare_batch_trus
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::poll_plan::{DiskFault, PartitionDirResolution};
-use crate::remote_blocks::FreshOrigin;
 use crate::remote_segments::RemoteRange;
 use crate::remote_segments::{FRESH_READ_BYTES_MAX, FRESH_READ_GAP_BYTES, FreshReads};
 use crate::rewrite_share::RewriteShare;
@@ -212,8 +211,7 @@ impl PlacedReadPlan {
 
     /// Hand `take` each batch of `placed` in order, as [`BatchPiece`]s: its
     /// header with the batch checksum it has over its messages, and the
-    /// messages, checked against the placement that names them unless they
-    /// are the shard's own upload, see [`rewritten_header`].
+    /// messages, checked against the placement that names them.
     ///
     /// The messages this shard holds in memory come from there. The others
     /// come from the store: the batches that follow each other closely in
@@ -221,10 +219,11 @@ impl PlacedReadPlan {
     /// a time. Nothing read here is kept for the polls. No deadline ends
     /// the reads: the caller is a background job that its scope cancels.
     ///
-    /// The loop gives way to the other tasks of the shard every
-    /// [`RewriteShare::stride`], inside a batch too, since a segment's worth
-    /// of messages takes tens of milliseconds to copy and sum. It keeps to
-    /// `share` as it does.
+    /// Each batch is gone through twice, checked and summed before its
+    /// header, then copied. Both passes give way to the other tasks of the
+    /// shard every [`RewriteShare::stride`], inside a batch too, since a
+    /// segment's worth of messages takes tens of milliseconds to go through.
+    /// It keeps to `share` as it does.
     pub(crate) async fn read_blobs(
         &self,
         placed: &[PlacedBatch],
@@ -249,7 +248,7 @@ impl PlacedReadPlan {
                 break;
             };
             share.resume_after_store();
-            let (batches, start, bytes, origin) = read?;
+            let (batches, start, bytes) = read?;
             for placed in &placed[batches] {
                 let blob = placed
                     .placement
@@ -259,19 +258,24 @@ impl PlacedReadPlan {
                     .zip(usize::try_from(placed.placement.length).ok())
                     .and_then(|(at, len)| bytes.get(at..at.checked_add(len)?))
                     .ok_or(DiskFault::Tiered)?;
-                take(BatchPiece::Header(&rewritten_header(placed, blob, origin)?));
+                let mut whole = WholeBatch::new(placed, blob);
+                loop {
+                    let room = room_in_stride(share, &mut since_yield).await;
+                    let took = whole.take(room);
+                    if took == 0 {
+                        break;
+                    }
+                    since_yield += took;
+                }
+                take(BatchPiece::Header(&whole.header()?));
                 since_yield += BATCH_HEADER_SIZE;
                 let mut messages = blob;
                 loop {
-                    let stride = share.stride();
-                    if since_yield >= stride {
-                        since_yield = 0;
-                        share.give_way().await;
-                    }
+                    let room = room_in_stride(share, &mut since_yield).await;
                     if messages.is_empty() {
                         break;
                     }
-                    let (piece, rest) = messages.split_at(messages.len().min(stride - since_yield));
+                    let (piece, rest) = messages.split_at(messages.len().min(room));
                     take(BatchPiece::Messages(piece));
                     since_yield += piece.len();
                     messages = rest;
@@ -696,28 +700,22 @@ struct BlobRead {
     range: Range<u64>,
     /// The bytes at `range`, when this shard held them as the read was
     /// planned.
-    cached: Option<HeldBytes>,
+    cached: Option<Bytes>,
 }
-
-/// Bytes of a fresh object that the shard held, and where they came from.
-type HeldBytes = (Bytes, FreshOrigin);
 
 impl BlobRead {
     /// The batches the read covers, where its bytes start in the object,
-    /// the bytes, and where they came from.
-    async fn fetch(
-        self,
-        remote: &RemoteSegments,
-    ) -> Result<(Range<usize>, u64, Bytes, FreshOrigin), DiskFault> {
-        let (bytes, origin) = if let Some(cached) = self.cached {
-            cached
-        } else {
-            let bytes = remote
-                .read_fresh_from_store(self.object_id, self.range.clone())
-                .await?;
-            (bytes, FreshOrigin::Fetched)
+    /// and the bytes.
+    async fn fetch(self, remote: &RemoteSegments) -> Result<(Range<usize>, u64, Bytes), DiskFault> {
+        let bytes = match self.cached {
+            Some(bytes) => bytes,
+            None => {
+                remote
+                    .read_fresh_from_store(self.object_id, self.range.clone())
+                    .await?
+            }
         };
-        Ok((self.batches, self.range.start, bytes, origin))
+        Ok((self.batches, self.range.start, bytes))
     }
 }
 
@@ -732,11 +730,11 @@ impl BlobReads<'_> {
     /// Where the messages of the batch at `index` are, and the messages
     /// when this shard holds them. `None` past the last batch, and for a
     /// placement that names no range.
-    fn blob(&self, index: usize) -> Option<(u128, Range<u64>, Option<HeldBytes>)> {
+    fn blob(&self, index: usize) -> Option<(u128, Range<u64>, Option<Bytes>)> {
         let placement = self.placed.get(index)?.placement;
         let range = placement.position..placement.position.checked_add(placement.length)?;
         let cached = if range.is_empty() {
-            Some((Bytes::new(), FreshOrigin::Fetched))
+            Some(Bytes::new())
         } else {
             self.remote.cached_fresh(placement.object_id, &range)
         };
@@ -752,11 +750,9 @@ impl Iterator for BlobReads<'_> {
         let placement = self.placed.get(first)?.placement;
         // A placement that names no range reads as an empty one, which the
         // batch then fails to match.
-        let (object_id, mut range, cached) = self.blob(first).unwrap_or((
-            placement.object_id,
-            0..0,
-            Some((Bytes::new(), FreshOrigin::Fetched)),
-        ));
+        let (object_id, mut range, cached) =
+            self.blob(first)
+                .unwrap_or((placement.object_id, 0..0, Some(Bytes::new())));
         self.next += 1;
         if cached.is_none() {
             while let Some((next_object, next, next_cached)) = self.blob(self.next) {
@@ -785,41 +781,74 @@ impl Iterator for BlobReads<'_> {
 
 /// The header of the whole batch of `placed`, whose messages are `blob`:
 /// the one it has, with the batch checksum over the messages.
+fn whole_header(placed: &PlacedBatch, blob: &[u8]) -> Result<BatchHeader, DiskFault> {
+    let mut whole = WholeBatch::new(placed, blob);
+    whole.take(blob.len());
+    whole.header()
+}
+
+/// The messages of a placed batch checked against the placement that names
+/// them, and summed for the header of the whole batch, a stretch at a time.
 ///
 /// This is the one place that checks the messages of a placed batch
-/// against what its producer sent, so every read of one goes through it,
-/// but for a rewrite's read of the shard's own upload, see
-/// [`rewritten_header`].
-fn whole_header(placed: &PlacedBatch, blob: &[u8]) -> Result<BatchHeader, DiskFault> {
-    if !placed.placement.matches(blob) {
-        return Err(DiskFault::Tiered);
-    }
-    Ok(summed_header(placed, blob))
+/// against what its producer sent, so every read of one goes through it.
+struct WholeBatch<'a> {
+    placed: &'a PlacedBatch,
+    blob: &'a [u8],
+    /// The bytes at the start of `blob` taken so far.
+    taken: usize,
+    placement: BlobChecksum,
+    batch: BatchChecksum<'a>,
 }
 
-/// [`whole_header`] for a rewrite, which takes the messages of the shard's
-/// own upload as they are: the shard summed them for their placement, and
-/// the copy it reads them from never left its memory. Whatever a store sent
-/// is checked.
-fn rewritten_header(
-    placed: &PlacedBatch,
-    blob: &[u8],
-    origin: FreshOrigin,
-) -> Result<BatchHeader, DiskFault> {
-    match origin {
-        FreshOrigin::Fetched => whole_header(placed, blob),
-        FreshOrigin::Uploaded if blob.len() as u64 == placed.placement.length => {
-            Ok(summed_header(placed, blob))
+impl<'a> WholeBatch<'a> {
+    fn new(placed: &'a PlacedBatch, blob: &'a [u8]) -> Self {
+        Self {
+            placed,
+            blob,
+            taken: 0,
+            placement: BlobChecksum::default(),
+            batch: BatchChecksum::new(&placed.header, blob),
         }
-        FreshOrigin::Uploaded => Err(DiskFault::Tiered),
+    }
+
+    /// Take up to `len` more bytes of the messages. Returns how many it
+    /// took, none once it took them all.
+    fn take(&mut self, len: usize) -> usize {
+        let end = self.blob.len().min(self.taken.saturating_add(len));
+        self.placement.update(&self.blob[self.taken..end]);
+        self.batch.take_until(end);
+        let took = end - self.taken;
+        self.taken = end;
+        took
+    }
+
+    /// The header of the whole batch, once every byte of the messages was
+    /// taken and they are the ones the placement names.
+    fn header(&self) -> Result<BatchHeader, DiskFault> {
+        let placement = self.placed.placement;
+        if self.taken != self.blob.len()
+            || self.blob.len() as u64 != placement.length
+            || self.placement.finish() != placement.blob_checksum
+        {
+            return Err(DiskFault::Tiered);
+        }
+        let mut header = self.placed.header;
+        header.batch_checksum = self.batch.finish();
+        Ok(header)
     }
 }
 
-/// The header of `placed` with the batch checksum over `blob`.
-fn summed_header(placed: &PlacedBatch, blob: &[u8]) -> BatchHeader {
-    let mut header = placed.header;
-    header.batch_checksum = header.checksum_for_blob(blob);
-    header
+/// Bytes a rewrite takes before it gives way next, out of the stride of
+/// `share`, given the `since_yield` it took since it last did. Gives way
+/// first when the stride is used up.
+async fn room_in_stride(share: &mut RewriteShare, since_yield: &mut usize) -> usize {
+    let stride = share.stride();
+    if *since_yield >= stride {
+        *since_yield = 0;
+        share.give_way().await;
+    }
+    stride - *since_yield
 }
 
 /// The prepare a partition of whole batches would hold for the batch of
@@ -1223,6 +1252,10 @@ mod tests {
     use futures::future::LocalBoxFuture;
     use iggy_binary_protocol::placement::Placement;
     use iggy_object_store::{KeyLayout, ObjectRange, ObjectStoreError};
+    use server_common::send_messages::{
+        IggyMessage, IggyMessageHeader, IggyMessages, SendMessagesOwned,
+    };
+    use server_common::sharding::IggyNamespace;
     use server_common::yield_to_reactor;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
@@ -1545,38 +1578,33 @@ mod tests {
             .await
             .unwrap();
         let asked = store.asked.borrow().len();
-        assert!(matches!(
-            remote.cached_fresh(1, &whole),
-            Some((_, FreshOrigin::Fetched))
-        ));
+        assert!(remote.cached_fresh(1, &whole).is_some());
 
         assert_eq!(blobs_of(&plan, &placed).await, Err(DiskFault::Tiered));
         assert_eq!(store.asked.borrow().len(), asked, "read from the cache");
     }
 
-    /// The shard summed the blobs of its own upload for their placements,
-    /// so a rewrite takes them as the cache holds them, flipped bit and all.
+    /// The copy of the shard's own upload in its cache is checked as any
+    /// other blob is.
     #[compio::test]
-    async fn given_a_blob_the_shard_uploaded_when_reading_it_should_take_it_without_checking_it() {
+    async fn given_a_blob_of_the_shards_own_upload_other_than_the_one_its_placement_names_when_reading_should_fail()
+     {
         let store = Rc::new(Objects::default());
         let (object, placed) = object_of(1, 0, 3, 100, 10);
-        let changed = with_last_bit_flipped(&object);
         let plan = plan(&store);
-        let remote = plan.remote.clone().unwrap();
-        remote.cache_fresh_object(1, changed.clone(), std::iter::empty());
-        assert!(matches!(
-            remote.cached_fresh(1, &(0..object.len() as u64)),
-            Some((_, FreshOrigin::Uploaded))
-        ));
+        plan.remote.as_ref().unwrap().cache_fresh_object(
+            1,
+            with_last_bit_flipped(&object),
+            std::iter::empty(),
+        );
 
-        let taken = blobs_of(&plan, &placed).await.unwrap();
-
-        assert_eq!(taken, expected(&[(changed, placed)]));
-        assert!(store.asked.borrow().is_empty());
+        assert_eq!(blobs_of(&plan, &placed).await, Err(DiskFault::Tiered));
+        assert!(store.asked.borrow().is_empty(), "read from the cache");
     }
 
     /// Every batch is in memory, so nothing but the yields returns control
-    /// while a segment is put together.
+    /// while a segment is put together. A stride covers each byte twice,
+    /// checked and then copied, so it hands over half of them.
     #[compio::test]
     async fn given_more_bytes_than_a_stride_in_memory_when_reading_the_blobs_should_yield_once_a_stride()
      {
@@ -1591,7 +1619,7 @@ mod tests {
 
         let stretches = stretches_of(&plan, &placed).await;
 
-        assert_eq!(stretches, [REWRITE_YIELD_BYTES, REWRITE_YIELD_BYTES, 0]);
+        assert_eq!(stretches, [REWRITE_YIELD_BYTES / 2; 4]);
     }
 
     #[compio::test]
@@ -1610,15 +1638,77 @@ mod tests {
         assert_eq!(
             stretches,
             [
+                0,
+                0,
+                REWRITE_YIELD_BYTES / 2 + BATCH_HEADER_SIZE,
                 REWRITE_YIELD_BYTES,
-                REWRITE_YIELD_BYTES,
-                REWRITE_YIELD_BYTES / 2
-            ]
+                REWRITE_YIELD_BYTES - BATCH_HEADER_SIZE,
+            ],
+            "two strides of checks before the header"
         );
         assert_eq!(
             blobs_of(&plan, &placed).await.unwrap(),
             expected(&[(object, placed)])
         );
+    }
+
+    /// One batch of `count` messages of `payload_len` bytes each, as the
+    /// whole fresh object `object_id`, and the placed batch that names it.
+    fn object_of_messages(object_id: u128, count: u32, payload_len: usize) -> (Bytes, PlacedBatch) {
+        let mut messages = IggyMessages::with_capacity(usize::try_from(count).unwrap());
+        for index in 0..count {
+            messages.push(IggyMessage {
+                header: IggyMessageHeader {
+                    payload_length: u32::try_from(payload_len).unwrap(),
+                    ..IggyMessageHeader::default()
+                },
+                payload: Bytes::from(vec![u8::try_from(index % 251).unwrap(); payload_len]),
+                user_headers: None,
+            });
+        }
+        let batch =
+            SendMessagesOwned::from_messages(IggyNamespace::new(1, 1, 0), &messages).unwrap();
+        let placement = Placement::of(object_id, 0, &batch.blob, 0);
+        (batch.blob, PlacedBatch::new(batch.header, placement))
+    }
+
+    /// The batch checksum walks every message of a batch before its header
+    /// is handed over. A batch of more than a stride is walked a stride at
+    /// a time, the strides ending inside messages, to the checksum its
+    /// producer summed in one pass.
+    #[compio::test]
+    async fn given_a_batch_of_messages_larger_than_a_stride_when_reading_it_should_sum_it_in_strides_to_the_one_pass_checksum()
+     {
+        let store = Rc::new(Objects::default());
+        let (object, placed) = object_of_messages(1, 2_500, 1_000);
+        assert!(object.len() > 2 * REWRITE_YIELD_BYTES);
+        let plan = plan(&store);
+        plan.remote
+            .as_ref()
+            .unwrap()
+            .cache_fresh_object(1, object.clone(), std::iter::empty());
+        let mut header = None;
+        let mut batch = vec![0; BATCH_HEADER_SIZE];
+
+        let stretches = stretches_of(&plan, &[placed]).await;
+        plan.read_blobs(
+            &[placed],
+            |piece| match piece {
+                BatchPiece::Header(handed) => header = Some(*handed),
+                BatchPiece::Messages(messages) => batch.extend_from_slice(messages),
+            },
+            &mut RewriteShare::unpaced(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stretches[..2], [0, 0], "gave way before the header");
+        let header = header.unwrap();
+        assert_eq!(header.batch_checksum, placed.header.batch_checksum);
+        header.encode_into(&mut batch);
+        assert_eq!(batch[BATCH_HEADER_SIZE..], object[..]);
+        // The verifying decode walks the messages on its own.
+        assert!(decode_batch_slice(&batch).is_ok());
     }
 
     /// While sends wait on the shard, a rewrite works its share of the time

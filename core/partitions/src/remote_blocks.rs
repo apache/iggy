@@ -710,31 +710,20 @@ impl RemoteBlocks {
     }
 
     /// `range` of the fresh object `object_id` when the cache holds it,
-    /// whole or in blocks, without counting a read of it, and where those
-    /// bytes came from.
-    pub(crate) fn peek_fresh(
-        &self,
-        object_id: u128,
-        range: &Range<u64>,
-    ) -> Option<(Bytes, FreshOrigin)> {
+    /// whole or in blocks, without counting a read of it.
+    pub(crate) fn peek_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
         let owner = self.admit().ok()?;
         let object = self.fresh(owner, object_id);
         let cache = self.cache.cache.borrow();
         if let Some(whole) = cache.peek(&CacheKey::Whole(object)) {
-            let origin = if self.store == OWN_STORE {
-                FreshOrigin::Uploaded
-            } else {
-                FreshOrigin::Fetched
-            };
-            return Some((slice_of(&whole, 0, range)?, origin));
+            return slice_of(&whole, 0, range);
         }
         let blocks = object.blocks_of(range, self.cache.block_bytes)?;
         let first = *blocks.start();
         let found = blocks
             .map(|index| cache.peek(&CacheKey::Block { object, index }))
             .collect::<Option<Vec<_>>>()?;
-        let bytes = assemble_bytes(&found, first, self.cache.block_bytes, range).ok()?;
-        Some((bytes, FreshOrigin::Fetched))
+        assemble_bytes(&found, first, self.cache.block_bytes, range).ok()
     }
 
     const fn fresh(&self, owner: u128, object_id: u128) -> ObjectId {
@@ -898,12 +887,6 @@ impl RemoteBlocks {
         key: &str,
         cap: u64,
     ) -> Result<Bytes, DiskFault> {
-        // A whole fresh object in the cache passes for the shard's own
-        // upload, which a rewrite takes without checking it.
-        debug_assert!(
-            !matches!(object.name, ObjectName::Fresh(_)),
-            "a fetched fresh object is kept in blocks"
-        );
         let whole = CacheKey::Whole(object);
         let cached = self.cache.cache.borrow_mut().read(&whole);
         let mut counted = self.cache.counted.get();
@@ -1208,16 +1191,6 @@ struct ObjectId {
     /// Where the bytes that reads take end, which is where the last block
     /// ends. `None` for an object whose end the store tells.
     end: Option<u64>,
-}
-
-/// Where the bytes of a fresh object that the cache holds came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreshOrigin {
-    /// The shard built the object and the node's own store took it: the
-    /// whole object, which only [`RemoteBlocks::hold_fresh`] keeps.
-    Uploaded,
-    /// A GET brought them from a store.
-    Fetched,
 }
 
 /// Which object of a store.

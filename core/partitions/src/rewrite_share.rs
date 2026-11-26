@@ -27,9 +27,10 @@
 //! until it is not. With no send waiting they run flat out.
 //!
 //! Only the time between two waits counts as work, so a rewrite that waits
-//! for a store elsewhere does not use up the share. A store on the node
-//! itself reads with the node's own cores, so a wait for it is work. A
-//! rewrite always works a stride before it sleeps, so it always gets on.
+//! for a store elsewhere, to read the blobs or to take the segment, does
+//! not use up the share. A store on the node itself does that I/O with the
+//! node's own cores, so a wait for it is work. A rewrite always works a
+//! stride before it sleeps, so it always gets on.
 
 use std::cell::Cell;
 use std::fmt;
@@ -74,7 +75,7 @@ pub trait RewriteClock {
 /// The share of a shard's time that its rewrites take together.
 pub struct RewriteBudget {
     clock: Rc<dyn RewriteClock>,
-    /// Whether the store that the rewrites read is on this node.
+    /// Whether the store that the rewrites read and write is on this node.
     store_on_node: bool,
     /// Nanoseconds of work the rewrites may do before one sleeps. Below
     /// zero, work they did past their share.
@@ -85,7 +86,7 @@ pub struct RewriteBudget {
 
 impl RewriteBudget {
     /// The budget of rewrites that keep to their share by `clock`, from now
-    /// on, and that read a store on this node when `store_on_node`.
+    /// on, and that use a store on this node when `store_on_node`.
     #[must_use]
     pub fn new(clock: Rc<dyn RewriteClock>, store_on_node: bool) -> Self {
         let now = clock.now_micros();
@@ -204,15 +205,15 @@ impl RewriteShare {
         }
     }
 
-    /// [`Self::pause`] for a wait for a read of the store, which is work
-    /// when the store is on this node.
+    /// [`Self::pause`] for a wait for the store, a read or a put, which is
+    /// work when the store is on this node.
     pub(crate) fn pause_for_store(&mut self) {
         if !self.store_on_node() {
             self.pause();
         }
     }
 
-    /// [`Self::resume`] after a read of the store.
+    /// [`Self::resume`] after a wait for the store.
     pub(crate) fn resume_after_store(&mut self) {
         if !self.store_on_node() {
             self.resume();
