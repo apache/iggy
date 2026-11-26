@@ -31,12 +31,11 @@ use tokio::time::{Instant, sleep};
 
 use super::partition_state_transfer::{FULLY_SERVED_MARKER, INSTALL_MARKER, await_marker};
 use crate::server::http_client::{HttpClient, node_url};
-use crate::server::scenarios::geo_mode_faults_scenario::{Bucket, geo_manifest};
 use crate::server::tiered_storage_fs::{
     MESSAGES, PARTITION_ID, POLL_INTERVAL, STREAM, TIERING_DEADLINE, TOPIC,
     assert_manifest_lists_stored_segments, assert_reads_every_message, create_tiered_topic,
-    create_tiered_topic_with, fs_store_envs, read_every_message, segment_logs, send_every_message,
-    tiered_topic_options,
+    create_tiered_topic_with, fs_store_envs, read_every_message, read_manifest, segment_logs,
+    send_every_message, tiered_topic_options,
 };
 
 const NODES: usize = 3;
@@ -173,8 +172,7 @@ async fn given_stored_segments_kept_on_the_primary_when_a_member_rebuilds_its_pa
     // Views go round the nodes in order, so the survivors elect this member
     // once the primary stops.
     let rebuilt = (primary + 1) % NODES;
-    let (stored, active) =
-        wait_for_stored_segments_kept_on(&harness, &client, store.path(), primary).await;
+    let (stored, active) = wait_for_stored_segments_kept_on(&harness, store.path(), primary).await;
 
     harness.stop_node(rebuilt).expect("stop the member");
     let segment = walk(&harness.node(rebuilt).data_path(), &mut |path| {
@@ -379,39 +377,20 @@ async fn read_back_after_restart(harness: &TestHarness, stream: &Identifier, top
 /// their `.log` files. Returns their names and the name of the active segment.
 ///
 /// The primary lists a segment in the manifest only once a committed floor
-/// advance matched its hash, which is what lets a transfer leave its bytes
-/// out. An object in the store alone does not prove that.
+/// advance matched its hash. A transfer leaves the bytes of such a segment
+/// out when the store also holds it as the offer is built. An object in the
+/// store alone does not prove that.
 async fn wait_for_stored_segments_kept_on(
     harness: &TestHarness,
-    client: &IggyClient,
     store: &Path,
     node: usize,
 ) -> (Vec<String>, String) {
-    let stream = Identifier::named(STREAM).expect("stream identifier");
-    let topic = Identifier::named(TOPIC).expect("topic identifier");
-    let stream_id = client
-        .get_stream(&stream)
-        .await
-        .expect("get stream")
-        .expect("the stream exists")
-        .id;
-    let topic_id = client
-        .get_topic(&stream, &topic)
-        .await
-        .expect("get topic")
-        .expect("the topic exists")
-        .id;
-    let bucket = Bucket::Fs(store.to_owned());
     let deadline = Instant::now() + TIERING_DEADLINE;
     loop {
         let local = partition_segment_logs(&harness.node(node).data_path());
         let uploaded = segment_logs(store);
-        let listed: Vec<String> = geo_manifest(
-            &bucket.objects().await,
-            u64::from(stream_id),
-            u64::from(topic_id),
-        )
-        .map_or_default(|manifest| {
+        let manifest = read_manifest(store.to_owned()).await;
+        let listed: Vec<String> = manifest.map_or_default(|manifest| {
             manifest
                 .segments
                 .iter()
