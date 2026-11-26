@@ -30,6 +30,7 @@ use iggy_common::{
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -74,22 +75,18 @@ impl GeoSources {
 /// shadow topic that serves the log of another datacenter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GeoOrigin {
+    /// `None` for the topic in this cluster.
     name: Option<Arc<str>>,
-    shadow: bool,
 }
 
 impl GeoOrigin {
     pub(crate) const fn local() -> Self {
-        Self {
-            name: None,
-            shadow: false,
-        }
+        Self { name: None }
     }
 
     pub(crate) fn shadow(origin: &str) -> Self {
         Self {
             name: Some(Arc::from(origin)),
-            shadow: true,
         }
     }
 
@@ -102,12 +99,12 @@ impl GeoOrigin {
 
     /// Whether the message comes from the topic in this cluster.
     pub const fn is_local(&self) -> bool {
-        !self.shadow
+        self.name.is_none()
     }
 
     /// Whether the message comes from a shadow topic.
     pub const fn is_shadow(&self) -> bool {
-        self.shadow
+        self.name.is_some()
     }
 }
 
@@ -224,7 +221,9 @@ impl From<GeoReadError> for IggyError {
 /// - Each message names its log in [`GeoReceivedMessage::origin`]. Order holds within one origin
 ///   and partition only. Shadow topics serve their messages seconds after the topic in their
 ///   own datacenter does.
-/// - The consumer takes turns between the logs, so no log holds back the others.
+/// - The consumer takes turns between the logs, so no log holds back the others. Each shadow
+///   topic is read from the moment its consumer joins its group, so a slow join holds back
+///   neither the other topics nor [`init`](Self::init).
 /// - Every [`discovery_interval`](crate::prelude::IggyGeoConsumerBuilder::discovery_interval),
 ///   while the application reads, it lists the streams: it starts reading each new shadow
 ///   topic, and stops reading each one that is gone, such as the shadow of a retired origin.
@@ -232,7 +231,9 @@ impl From<GeoReadError> for IggyError {
 /// - An error of one log comes as a [`GeoReadError`] with its origin, and the other logs read
 ///   on. A shadow topic that the consumer cannot open is reported once and tried again later.
 ///
-/// Call [`Self::init`] before reading and [`Self::shutdown`] before dropping the consumer.
+/// Call [`Self::init`] before reading and [`Self::shutdown`] before dropping the consumer. A
+/// call of either that the caller drops part way keeps its work in the consumer, and the next
+/// call goes on from there.
 ///
 /// ```rust,no_run
 /// use futures_util::StreamExt;
@@ -271,15 +272,21 @@ pub struct IggyGeoConsumer {
     sources: GeoSources,
     discovery_interval: Duration,
     catalog: Arc<dyn LogCatalog>,
+    phase: Phase,
     /// The names that the shadow streams and topics derive from, known after `init`.
     names: Option<Arc<TopicNames>>,
     logs: Vec<Log>,
     /// The log polled first, so each one gets a turn.
     turn: usize,
-    /// The reader of the log that yielded the last message.
-    last_reader: Option<u64>,
+    /// The index in `logs` of the log that yielded the last message. Kept right by
+    /// [`Self::remove_log`].
+    last_yielded: Option<usize>,
     search: Option<BoxFuture<'static, Search>>,
     next_search: Option<Pin<Box<Sleep>>>,
+    /// The consumers of shadow topics that are joining their groups.
+    joins: FuturesUnordered<BoxFuture<'static, (ShadowStream, Joined)>>,
+    /// The shadow streams of `joins`, by name.
+    joining: BTreeSet<String>,
     /// Shadow streams that refused to open, by name.
     refused: HashMap<String, Refused>,
     /// Shadow streams whose consumer reported its stream or topic missing, with that error, by
@@ -289,9 +296,7 @@ pub struct IggyGeoConsumer {
     errors: VecDeque<GeoReadError>,
     /// The shutdowns of the consumers of shadows that are gone.
     closing: FuturesUnordered<BoxFuture<'static, ()>>,
-    initialized: bool,
     uninitialized_poll_warned: bool,
-    shut_down: bool,
 }
 
 impl IggyGeoConsumer {
@@ -310,20 +315,21 @@ impl IggyGeoConsumer {
             sources,
             discovery_interval,
             catalog,
+            phase: Phase::New,
             names: None,
             logs: Vec::new(),
             turn: 0,
-            last_reader: None,
+            last_yielded: None,
             search: None,
             next_search: None,
+            joins: FuturesUnordered::new(),
+            joining: BTreeSet::new(),
             refused: HashMap::new(),
             missing: HashMap::new(),
             listing_failed: false,
             errors: VecDeque::new(),
             closing: FuturesUnordered::new(),
-            initialized: false,
             uninitialized_poll_warned: false,
-            shut_down: false,
         }
     }
 
@@ -345,65 +351,88 @@ impl IggyGeoConsumer {
     /// Initializes the consumer and makes it ready to poll messages. Calling it again on an
     /// initialized consumer does nothing.
     ///
-    /// It initializes the consumer of the topic in this cluster as
-    /// [`IggyConsumer::init`] does, then lists the streams and initializes a consumer for each
-    /// shadow topic. A shadow topic that fails to open does not fail the call: its error comes
-    /// from the stream as a [`GeoReadError`], and the consumer tries it again later.
+    /// It initializes the consumer of the topic in this cluster as [`IggyConsumer::init`] does,
+    /// lists the streams, and starts a consumer for each shadow topic. It does not wait for
+    /// those to join their groups: each shadow topic is read from the moment its consumer
+    /// joins. A shadow topic that fails to open does not fail the call: its error comes from
+    /// the stream as a [`GeoReadError`], and the consumer tries it again later.
+    ///
+    /// A call that the caller drops part way keeps what it did in the consumer, and the next
+    /// call goes on from there, with the same consumer of the topic in this cluster.
     ///
     /// # Errors
     ///
     /// - [`IggyError::InvalidConfiguration`] for a consumer that is not a consumer group, and
-    ///   after [`shutdown()`](Self::shutdown).
+    ///   once [`shutdown()`](Self::shutdown) has started.
+    /// - The refusals of the configuration of [`IggyConsumer::init`], before anything is sent,
+    ///   for each value of [`GeoSources`].
     /// - The errors of [`IggyConsumer::init`] for the topic in this cluster.
     /// - The errors of a lookup of the stream or the topic, when the builder named either by
     ///   its numeric id: the consumer needs their names to find the shadow topics.
     pub async fn init(&mut self) -> Result<(), IggyError> {
-        if self.initialized {
-            return Ok(());
-        }
-        if self.shut_down {
-            return Err(IggyError::InvalidConfiguration);
-        }
-        self.catalog.validate()?;
-        info!(
-            "Initializing geo consumer: {} for stream: {}, topic: {}, sources: {:?}...",
-            self.name, self.stream, self.topic, self.sources
-        );
-        let local = if self.sources.reads_local() {
-            Some(self.catalog.open_local().await?)
-        } else {
-            None
-        };
-        let names = match self.catalog.names().await {
-            Ok(names) => Arc::new(names),
-            Err(error) => {
-                if let Some(mut local) = local
-                    && let Err(shutdown_error) = local.shutdown().await
-                {
-                    warn!(
-                        "Failed to shut down the consumer of stream: {} of geo consumer: {}. {shutdown_error}",
-                        self.stream, self.name
+        loop {
+            match &mut self.phase {
+                Phase::Ready => return Ok(()),
+                Phase::Closing(_) | Phase::Closed => return Err(IggyError::InvalidConfiguration),
+                Phase::New => {
+                    self.catalog.validate()?;
+                    info!(
+                        "Initializing geo consumer: {} for stream: {}, topic: {}, sources: {:?}...",
+                        self.name, self.stream, self.topic, self.sources
+                    );
+                    self.phase = Phase::Starting(
+                        start(
+                            Arc::clone(&self.catalog),
+                            self.sources.reads_local(),
+                            self.name.clone(),
+                            self.stream.clone(),
+                        )
+                        .boxed(),
                     );
                 }
-                return Err(error);
+                Phase::Starting(starting) => {
+                    let started = starting.await;
+                    self.phase = Phase::New;
+                    self.adopt(started?);
+                }
+                Phase::Listing => {
+                    poll_fn(|cx| self.poll_first_search(cx)).await;
+                    self.phase = Phase::Ready;
+                    info!(
+                        "Geo consumer: {} has been initialized. It reads {} topics, and {} more are joining.",
+                        self.name,
+                        self.logs.len(),
+                        self.joining.len()
+                    );
+                }
             }
-        };
-        if let Some(local) = local {
+        }
+    }
+
+    /// Takes the consumer of the topic in this cluster and the names that `start` found, and
+    /// starts the first search for shadow topics.
+    fn adopt(&mut self, started: Started) {
+        let names = Arc::new(started.names);
+        if let Some(local) = started.local {
             self.logs
                 .push(Log::new(GeoOrigin::local(), names.stream.clone(), local));
         }
-        self.names = Some(Arc::clone(&names));
         if self.sources.reads_shadows() {
-            let found = self.start_search(names).await;
-            self.apply_search(found);
+            self.search = Some(self.start_search(Arc::clone(&names)));
         }
-        self.initialized = true;
-        info!(
-            "Geo consumer: {} has been initialized with {} topics.",
-            self.name,
-            self.logs.len()
-        );
-        Ok(())
+        self.names = Some(names);
+        self.phase = Phase::Listing;
+    }
+
+    /// Ends once the first search has listed the streams, with the joins that end at once
+    /// applied. It waits for no join.
+    fn poll_first_search(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        self.poll_search(cx);
+        if self.search.is_some() {
+            return Poll::Pending;
+        }
+        self.poll_joins(cx);
+        Poll::Ready(())
     }
 
     /// Stores the offset of a checkpoint that this consumer yielded, in the log that yielded
@@ -451,7 +480,7 @@ impl IggyGeoConsumer {
         partition: u32,
         start: PollingStrategy,
     ) -> Result<(), IggyError> {
-        if !self.initialized || self.shut_down {
+        if !matches!(self.phase, Phase::Ready) {
             return Err(IggyError::InvalidConfiguration);
         }
         let log = self
@@ -464,47 +493,54 @@ impl IggyGeoConsumer {
 
     /// Shuts down the consumer of each log, as [`IggyConsumer::shutdown`] does: each one stores
     /// what its commit policy says and leaves its group. Await it before dropping the consumer.
-    /// A search for shadow topics in flight finishes first, so the consumers it opened shut down
-    /// too.
+    /// The consumers of shadow topics that are still joining, and that of the topic in this
+    /// cluster when [`init()`](Self::init) stopped part way, finish first and shut down too.
+    ///
+    /// A call that the caller drops part way keeps the rest of the work in the consumer: the
+    /// next call finishes it and returns its result, and a call after that returns `Ok`.
     ///
     /// # Errors
     ///
     /// The first error of [`IggyConsumer::shutdown`], that of the topic in this cluster first.
     /// Every log shuts down whatever the others return.
     pub async fn shutdown(&mut self) -> Result<(), IggyError> {
-        if self.shut_down {
-            return Ok(());
-        }
-        self.shut_down = true;
-        info!("Shutting down geo consumer: {}...", self.name);
-        if let Some(search) = self.search.take() {
-            for (shadow, consumer) in search.await.opened {
-                self.logs.push(Log::new(
-                    GeoOrigin::shadow(&shadow.origin),
-                    shadow.name,
-                    consumer,
-                ));
+        loop {
+            match &mut self.phase {
+                Phase::Closed => return Ok(()),
+                Phase::Closing(closing) => {
+                    let result = closing.await;
+                    self.phase = Phase::Closed;
+                    info!("Geo consumer: {} has been shut down.", self.name);
+                    return result;
+                }
+                Phase::New | Phase::Starting(_) | Phase::Listing | Phase::Ready => {
+                    info!("Shutting down geo consumer: {}...", self.name);
+                    self.phase = Phase::Closing(self.take_for_shutdown());
+                }
             }
         }
-        let mut closing = std::mem::take(&mut self.closing);
-        while closing.next().await.is_some() {}
-        let logs = std::mem::take(&mut self.logs);
-        let shutdowns = logs.into_iter().map(|mut log| async move {
-            let result = log.consumer.shutdown().await;
-            (log, result)
-        });
-        let mut failure = None;
-        for (log, result) in join_all(shutdowns).await {
-            if let Err(error) = result {
-                warn!(
-                    "Failed to shut down the consumer of stream: {} of origin: {} of geo consumer: {}. {error}",
-                    log.stream, log.origin, self.name
-                );
-                failure.get_or_insert(error);
-            }
-        }
-        info!("Geo consumer: {} has been shut down.", self.name);
-        failure.map_or(Ok(()), Err)
+    }
+
+    /// Moves every consumer, and every one still opening, into the work of a shutdown, which
+    /// owns them so that a dropped `shutdown()` call loses none.
+    fn take_for_shutdown(&mut self) -> BoxFuture<'static, Result<(), IggyError>> {
+        let starting = match std::mem::replace(&mut self.phase, Phase::Closed) {
+            Phase::Starting(starting) => Some(starting),
+            _ => None,
+        };
+        // A search only lists and looks up, so it holds no consumer.
+        self.search = None;
+        self.next_search = None;
+        self.last_yielded = None;
+        self.joining.clear();
+        close(
+            self.name.clone(),
+            starting,
+            std::mem::take(&mut self.joins),
+            std::mem::take(&mut self.closing),
+            std::mem::take(&mut self.logs),
+        )
+        .boxed()
     }
 
     fn log_of(&self, checkpoint: Checkpoint) -> Result<&Log, IggyError> {
@@ -518,11 +554,25 @@ impl IggyGeoConsumer {
     /// Under `CommitAfter::Processing`, the message that the consumer yielded last counts once
     /// the consumer is polled again, also when its log does not get the first turn.
     fn count_uncounted(&mut self) {
-        if let Some(reader) = self.last_reader.take()
-            && let Some(log) = self.logs.iter_mut().find(|log| log.reader == reader)
+        if let Some(index) = self.last_yielded.take()
+            && let Some(log) = self.logs.get_mut(index)
         {
             log.consumer.count_uncounted();
         }
+    }
+
+    /// Removes the log at `index`, and moves the indexes into `logs` that follow it.
+    fn remove_log(&mut self, index: usize) -> Log {
+        let log = self.logs.remove(index);
+        if index < self.turn {
+            self.turn -= 1;
+        }
+        self.last_yielded = match self.last_yielded {
+            Some(last) if last == index => None,
+            Some(last) if last > index => Some(last - 1),
+            last => last,
+        };
+        log
     }
 
     fn poll_closing(&mut self, cx: &mut Context<'_>) {
@@ -572,13 +622,14 @@ impl IggyGeoConsumer {
             .map(|log| log.stream.clone())
             .collect();
         let missing = self.missing.keys().cloned().collect();
-        let waiting = self
+        let skipped = self
             .refused
             .iter()
             .filter(|(_, refused)| refused.retry_at > now)
             .map(|(stream, _)| stream.clone())
+            .chain(self.joining.iter().cloned())
             .collect();
-        search(Arc::clone(&self.catalog), names, open, missing, waiting).boxed()
+        search(Arc::clone(&self.catalog), names, open, missing, skipped).boxed()
     }
 
     fn apply_search(&mut self, found: Search) {
@@ -605,43 +656,65 @@ impl IggyGeoConsumer {
                 self.errors.push_back(error);
             }
         }
-        for (shadow, consumer) in found.opened {
-            self.refused.remove(&shadow.name);
-            info!(
-                "Geo consumer: {} reads the shadow stream: {} of origin: {}.",
-                self.name, shadow.name, shadow.origin
-            );
-            self.logs.push(Log::new(
-                GeoOrigin::shadow(&shadow.origin),
-                shadow.name,
-                consumer,
-            ));
-        }
-        for (shadow, error) in found.refused {
-            let refused = self.refused.entry(shadow.name.clone()).or_insert(Refused {
-                attempts: 0,
-                retry_at: now,
-            });
-            if refused.attempts == 0 {
-                warn!(
-                    "Geo consumer: {} cannot read the shadow stream: {} of origin: {}. {error}",
-                    self.name, shadow.name, shadow.origin
-                );
-                self.errors.push_back(GeoReadError {
-                    origin: Some(GeoOrigin::shadow(&shadow.origin)),
-                    stream: Some(shadow.name),
-                    error: ReadError::new(None, error),
-                });
+        if let Some(names) = &self.names {
+            for shadow in found.new {
+                self.joining.insert(shadow.name.clone());
+                self.joins
+                    .push(join(Arc::clone(&self.catalog), shadow, names.topic.clone()).boxed());
             }
-            refused.attempts = refused.attempts.saturating_add(1);
-            let backoff = 1 << (refused.attempts - 1).min(MAX_REFUSAL_BACKOFF_STEPS);
-            refused.retry_at = now + self.discovery_interval.saturating_mul(backoff);
         }
         let next = now + self.discovery_interval;
         match self.next_search.as_mut() {
             Some(sleep) => sleep.as_mut().reset(next),
             None => self.next_search = Some(Box::pin(sleep_until(next))),
         }
+    }
+
+    /// Applies each join that ended, so a shadow topic is read as soon as its consumer joins.
+    fn poll_joins(&mut self, cx: &mut Context<'_>) {
+        while let Poll::Ready(Some((shadow, joined))) = self.joins.poll_next_unpin(cx) {
+            self.joining.remove(&shadow.name);
+            match joined {
+                Joined::Opened(consumer) => {
+                    self.refused.remove(&shadow.name);
+                    info!(
+                        "Geo consumer: {} reads the shadow stream: {} of origin: {}.",
+                        self.name, shadow.name, shadow.origin
+                    );
+                    self.logs.push(Log::new(
+                        GeoOrigin::shadow(&shadow.origin),
+                        shadow.name,
+                        consumer,
+                    ));
+                }
+                Joined::Refused(error) => self.refuse(shadow, error),
+                Joined::Absent => {}
+            }
+        }
+    }
+
+    /// Reports the first refusal of `shadow`, and tries it again after a backoff that grows
+    /// with each refusal.
+    fn refuse(&mut self, shadow: ShadowStream, error: IggyError) {
+        let now = Instant::now();
+        let refused = self.refused.entry(shadow.name.clone()).or_insert(Refused {
+            attempts: 0,
+            retry_at: now,
+        });
+        if refused.attempts == 0 {
+            warn!(
+                "Geo consumer: {} cannot read the shadow stream: {} of origin: {}. {error}",
+                self.name, shadow.name, shadow.origin
+            );
+            self.errors.push_back(GeoReadError {
+                origin: Some(GeoOrigin::shadow(&shadow.origin)),
+                stream: Some(shadow.name),
+                error: ReadError::new(None, error),
+            });
+        }
+        refused.attempts = refused.attempts.saturating_add(1);
+        let backoff = 1 << (refused.attempts - 1).min(MAX_REFUSAL_BACKOFF_STEPS);
+        refused.retry_at = now + self.discovery_interval.saturating_mul(backoff);
     }
 
     /// Stops reading the shadow stream `stream`, whose stream or topic is gone.
@@ -653,10 +726,7 @@ impl IggyGeoConsumer {
         else {
             return;
         };
-        let mut log = self.logs.remove(index);
-        if index < self.turn {
-            self.turn -= 1;
-        }
+        let mut log = self.remove_log(index);
         info!(
             "Geo consumer: {} stops reading the shadow stream: {} of origin: {}, which no longer holds the topic.",
             self.name, log.stream, log.origin
@@ -695,7 +765,7 @@ impl IggyGeoConsumer {
                 }
                 Poll::Ready(Some(Ok(received))) => {
                     let received = GeoReceivedMessage::new(received, log.origin.clone());
-                    self.last_reader = Some(log.reader);
+                    self.last_yielded = Some(index);
                     self.turn = index + 1;
                     return Poll::Ready(Some(Ok(received)));
                 }
@@ -726,7 +796,7 @@ impl IggyGeoConsumer {
                     return Poll::Ready(Some(Err(error)));
                 }
                 Poll::Ready(None) => {
-                    let log = self.logs.remove(index);
+                    let log = self.remove_log(index);
                     debug!(
                         "Geo consumer: {} stops reading the stream: {}, whose consumer ended.",
                         self.name, log.stream
@@ -748,24 +818,26 @@ impl Stream for IggyGeoConsumer {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let consumer = self.get_mut();
-        if consumer.shut_down {
-            return Poll::Ready(None);
-        }
-        if !consumer.initialized {
-            // A loop that continues on errors would otherwise spin without a trace.
-            if !consumer.uninitialized_poll_warned {
-                consumer.uninitialized_poll_warned = true;
-                warn!(
-                    "Geo consumer: {} was polled before init(). Every poll fails until init() runs.",
-                    consumer.name
-                );
+        match consumer.phase {
+            Phase::Ready => {}
+            Phase::Closing(_) | Phase::Closed => return Poll::Ready(None),
+            Phase::New | Phase::Starting(_) | Phase::Listing => {
+                // A loop that continues on errors would otherwise spin without a trace.
+                if !consumer.uninitialized_poll_warned {
+                    consumer.uninitialized_poll_warned = true;
+                    warn!(
+                        "Geo consumer: {} was polled before init(). Every poll fails until init() runs.",
+                        consumer.name
+                    );
+                }
+                return Poll::Ready(Some(Err(GeoReadError::of_consumer(
+                    IggyError::InvalidConfiguration,
+                ))));
             }
-            return Poll::Ready(Some(Err(GeoReadError::of_consumer(
-                IggyError::InvalidConfiguration,
-            ))));
         }
         consumer.count_uncounted();
         consumer.poll_search(cx);
+        consumer.poll_joins(cx);
         consumer.poll_closing(cx);
         if let Some(error) = consumer.errors.pop_front() {
             return Poll::Ready(Some(Err(error)));
@@ -799,6 +871,33 @@ struct Refused {
     retry_at: Instant,
 }
 
+/// Where a geo consumer is between `new` and the end of `shutdown`. A step that waits keeps its
+/// work here, so a call that the caller drops leaves it for the next call to finish.
+enum Phase {
+    New,
+    /// Opening the consumer of the topic in this cluster and looking up the names.
+    Starting(BoxFuture<'static, Result<Started, IggyError>>),
+    /// The first search for shadow topics lists the streams, in `search`.
+    Listing,
+    Ready,
+    Closing(BoxFuture<'static, Result<(), IggyError>>),
+    Closed,
+}
+
+/// What [`start`] opened and looked up.
+struct Started {
+    local: Option<Box<dyn LogConsumer>>,
+    names: TopicNames,
+}
+
+/// How the join of one shadow topic ended.
+enum Joined {
+    Opened(Box<dyn LogConsumer>),
+    Refused(IggyError),
+    /// The shadow stream does not hold the topic, or is gone.
+    Absent,
+}
+
 /// The names of the stream and the topic of the consumer, which its shadow topics share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TopicNames {
@@ -818,8 +917,8 @@ pub(crate) struct ShadowStream {
 struct Search {
     /// Set when the listing of the streams failed, and then nothing else was looked at.
     listing: Option<IggyError>,
-    opened: Vec<(ShadowStream, Box<dyn LogConsumer>)>,
-    refused: Vec<(ShadowStream, IggyError)>,
+    /// Shadow streams of the topic to join.
+    new: Vec<ShadowStream>,
     /// Shadow streams read so far whose stream or topic is gone.
     gone: Vec<String>,
     /// Shadow streams reported missing that still hold the topic.
@@ -909,11 +1008,10 @@ impl ClientCatalog {
 
 impl LogCatalog for ClientCatalog {
     fn validate(&self) -> Result<(), IggyError> {
-        if self.consumer.is_group() {
-            Ok(())
-        } else {
-            Err(IggyError::InvalidConfiguration)
+        if !self.consumer.is_group() {
+            return Err(IggyError::InvalidConfiguration);
         }
+        self.consumer.clone().build().validate()
     }
 
     fn open_local(&self) -> BoxFuture<'static, Result<Box<dyn LogConsumer>, IggyError>> {
@@ -1035,15 +1133,86 @@ impl LogCatalog for ClientCatalog {
     }
 }
 
-/// Lists the streams and opens each shadow topic of `names` that the consumer does not read
-/// yet. `open` names the shadow streams read now, `missing` those whose consumer reported them
-/// missing, and `waiting` those that refused and are not due again.
+/// Opens the consumer of the topic in this cluster when `reads_local` is set, and looks up the
+/// names of the stream and the topic. A failure leaves no consumer open.
+async fn start(
+    catalog: Arc<dyn LogCatalog>,
+    reads_local: bool,
+    name: String,
+    stream: Identifier,
+) -> Result<Started, IggyError> {
+    let local = if reads_local {
+        Some(catalog.open_local().await?)
+    } else {
+        None
+    };
+    match catalog.names().await {
+        Ok(names) => Ok(Started { local, names }),
+        Err(error) => {
+            if let Some(mut local) = local
+                && let Err(shutdown_error) = local.shutdown().await
+            {
+                warn!(
+                    "Failed to shut down the consumer of stream: {stream} of geo consumer: {name}. {shutdown_error}"
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Waits for the consumers that are still opening, and shuts down every consumer.
+async fn close(
+    name: String,
+    starting: Option<BoxFuture<'static, Result<Started, IggyError>>>,
+    mut joins: FuturesUnordered<BoxFuture<'static, (ShadowStream, Joined)>>,
+    mut closing: FuturesUnordered<BoxFuture<'static, ()>>,
+    mut logs: Vec<Log>,
+) -> Result<(), IggyError> {
+    if let Some(starting) = starting
+        && let Ok(Started {
+            local: Some(local),
+            names,
+        }) = starting.await
+    {
+        logs.insert(0, Log::new(GeoOrigin::local(), names.stream, local));
+    }
+    while let Some((shadow, joined)) = joins.next().await {
+        if let Joined::Opened(consumer) = joined {
+            logs.push(Log::new(
+                GeoOrigin::shadow(&shadow.origin),
+                shadow.name,
+                consumer,
+            ));
+        }
+    }
+    while closing.next().await.is_some() {}
+    let shutdowns = logs.into_iter().map(|mut log| async move {
+        let result = log.consumer.shutdown().await;
+        (log, result)
+    });
+    let mut failure = None;
+    for (log, result) in join_all(shutdowns).await {
+        if let Err(error) = result {
+            warn!(
+                "Failed to shut down the consumer of stream: {} of origin: {} of geo consumer: {name}. {error}",
+                log.stream, log.origin
+            );
+            failure.get_or_insert(error);
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+/// Lists the streams and returns each shadow topic of `names` to join. `open` names the shadow
+/// streams read now, `missing` those whose consumer reported them missing, and `skipped` those
+/// joining now or refused and not due again.
 async fn search(
     catalog: Arc<dyn LogCatalog>,
     names: Arc<TopicNames>,
     open: BTreeSet<String>,
     missing: BTreeSet<String>,
-    waiting: BTreeSet<String>,
+    skipped: BTreeSet<String>,
 ) -> Search {
     let mut found = Search::default();
     let listed = match catalog.shadow_streams().await {
@@ -1073,26 +1242,31 @@ async fn search(
             Ok(true) | Err(_) => found.present.push(stream.clone()),
         }
     }
-    for shadow in shadows {
-        if open.contains(&shadow.name) || waiting.contains(&shadow.name) {
-            continue;
-        }
-        match catalog.holds_topic(&shadow.name, &names.topic).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(error) if names_missing_log(&error) => continue,
-            Err(error) => {
-                found.refused.push((shadow, error));
-                continue;
-            }
-        }
-        match catalog.open_shadow(&shadow.name, &names.topic).await {
-            Ok(consumer) => found.opened.push((shadow, consumer)),
-            Err(error) if names_missing_log(&error) => {}
-            Err(error) => found.refused.push((shadow, error)),
-        }
-    }
+    found.new = shadows
+        .into_iter()
+        .filter(|shadow| !open.contains(&shadow.name) && !skipped.contains(&shadow.name))
+        .collect();
     found
+}
+
+/// Opens the consumer of the topic in `shadow`, which joins its group there, when the stream
+/// holds the topic.
+async fn join(
+    catalog: Arc<dyn LogCatalog>,
+    shadow: ShadowStream,
+    topic: String,
+) -> (ShadowStream, Joined) {
+    let joined = match catalog.holds_topic(&shadow.name, &topic).await {
+        Ok(true) => match catalog.open_shadow(&shadow.name, &topic).await {
+            Ok(consumer) => Joined::Opened(consumer),
+            Err(error) if names_missing_log(&error) => Joined::Absent,
+            Err(error) => Joined::Refused(error),
+        },
+        Ok(false) => Joined::Absent,
+        Err(error) if names_missing_log(&error) => Joined::Absent,
+        Err(error) => Joined::Refused(error),
+    };
+    (shadow, joined)
 }
 
 fn shadow_stream_name(origin: &str, stream: &str) -> String {

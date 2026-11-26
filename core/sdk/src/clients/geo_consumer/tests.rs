@@ -26,13 +26,14 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures::future::{BoxFuture, ready};
-use futures::task::{ArcWake, waker};
+use futures::task::{ArcWake, noop_waker_ref, waker};
 use futures::{FutureExt, Stream, StreamExt};
 use iggy_common::locking::{IggyRwLock, IggyRwLockFn};
 use iggy_common::{
     Checkpoint, Consumer, Identifier, IggyError, IggyMessage, PartitionContext, PollingStrategy,
     ReaderStamp,
 };
+use tokio::sync::watch;
 use tokio::time::{sleep, timeout};
 
 use super::{
@@ -425,6 +426,152 @@ async fn given_a_consumer_of_two_logs_when_shutting_down_should_shut_down_each_a
 }
 
 #[tokio::test]
+async fn given_a_shut_down_consumer_when_init_runs_again_should_refuse_it() {
+    let catalog = FakeCatalog::default();
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    consumer.shutdown().await.unwrap();
+
+    assert_eq!(consumer.init().await, Err(IggyError::InvalidConfiguration));
+    assert!(consumer.next().await.is_none());
+    assert_eq!(catalog.attempts_of(STREAM), 1);
+}
+
+#[tokio::test]
+async fn given_an_init_cancelled_while_the_local_consumer_joins_when_init_runs_again_should_open_it_once()
+ {
+    let catalog = FakeCatalog::default();
+    let gate = catalog.hold_opens(STREAM);
+    let mut consumer = catalog.consumer(GeoSources::Both);
+
+    cancel_after_polls(consumer.init());
+    gate.open();
+    consumer.init().await.unwrap();
+    catalog.log(STREAM).send(0, 0..1);
+
+    assert!(ready_message(&mut consumer).origin.is_local());
+    assert_eq!(catalog.attempts_of(STREAM), 1);
+    assert_eq!(catalog.opens_of(STREAM), 1);
+}
+
+#[tokio::test]
+async fn given_an_init_cancelled_during_the_first_search_when_init_runs_again_should_keep_one_local_consumer()
+ {
+    let catalog = FakeCatalog::default();
+    let shadow = catalog.add_shadow(DC_B);
+    let gate = catalog.hold_listings();
+    let mut consumer = catalog.consumer(GeoSources::Both);
+
+    cancel_after_polls(consumer.init());
+    gate.open();
+    consumer.init().await.unwrap();
+    catalog.log(STREAM).send(0, 0..2);
+    catalog.log(&shadow).send(0, 0..1);
+    let mut origins = Vec::new();
+    for _ in 0..3 {
+        origins.push(ready_message(&mut consumer).origin);
+    }
+
+    assert_eq!(catalog.attempts_of(STREAM), 1);
+    assert_eq!(catalog.world().listings, 1, "init resumed its search");
+    assert_eq!(origins.iter().filter(|origin| origin.is_local()).count(), 2);
+    assert!(consumer.next().now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn given_a_shutdown_cancelled_while_a_shadow_joins_when_shutdown_runs_again_should_shut_down_every_consumer()
+ {
+    let catalog = FakeCatalog::default();
+    let shadow = catalog.add_shadow(DC_B);
+    let gate = catalog.hold_opens(&shadow);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+
+    cancel_after_polls(consumer.shutdown());
+    assert!(!catalog.log(STREAM).is_shut_down());
+    assert_eq!(consumer.init().await, Err(IggyError::InvalidConfiguration));
+    assert!(consumer.next().await.is_none());
+    gate.open();
+    consumer.shutdown().await.unwrap();
+
+    assert!(catalog.log(STREAM).is_shut_down());
+    assert!(catalog.log(&shadow).is_shut_down());
+    assert_eq!(consumer.shutdown().await, Ok(()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_shadow_whose_join_is_slow_when_initializing_should_read_the_local_topic_and_the_other_shadows_without_waiting()
+ {
+    let catalog = FakeCatalog::default();
+    let slow = catalog.add_shadow(DC_B);
+    let healthy = catalog.add_shadow(DC_C);
+    let gate = catalog.hold_opens(&slow);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+
+    catalog.log(STREAM).send(0, 0..1);
+    catalog.log(&healthy).send(0, 0..1);
+    let first = ready_message(&mut consumer);
+    let second = ready_message(&mut consumer);
+    assert_eq!(catalog.opens_of(&slow), 0);
+    catalog.queue(&slow, 0, 0..1);
+    gate.open();
+    let third = next_message(&mut consumer).await;
+
+    assert!(first.origin.is_local());
+    assert_eq!(second.origin.name(), Some(DC_C));
+    assert_eq!(third.origin.name(), Some(DC_B));
+    assert_eq!(catalog.attempts_of(&slow), 1);
+}
+
+#[tokio::test]
+async fn given_only_the_last_log_has_messages_when_consuming_should_count_each_message_in_the_log_that_yielded_it()
+ {
+    let catalog = FakeCatalog::default();
+    let shadow = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    catalog.log(&shadow).send(0, 0..3);
+
+    for _ in 0..3 {
+        ready_message(&mut consumer);
+    }
+    assert!(consumer.next().now_or_never().is_none());
+
+    assert_eq!(catalog.log(&shadow).counted(), 3);
+    assert_eq!(catalog.log(STREAM).counted(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn given_a_message_of_a_later_log_when_a_search_drops_an_earlier_log_before_the_next_poll_should_count_it_in_its_own_log()
+ {
+    let catalog = FakeCatalog::default();
+    let earlier = catalog.add_shadow(DC_B);
+    let mut consumer = catalog.initialized(GeoSources::Both).await;
+    let later = catalog.add_shadow(DC_C);
+    catalog.queue(&later, 0, 0..1);
+    let message = next_message(&mut consumer).await;
+    assert_eq!(message.origin.name(), Some(DC_C));
+
+    consumer.drop_shadow(&earlier);
+    assert!(consumer.next().now_or_never().is_none());
+
+    assert_eq!(catalog.log(&later).counted(), 1);
+    assert_eq!(catalog.log(STREAM).counted(), 0);
+    assert!(catalog.log(&earlier).is_shut_down());
+}
+
+#[test]
+fn given_origins_with_and_without_a_name_when_asked_where_they_come_from_should_be_shadows_exactly_when_named()
+ {
+    let local = GeoOrigin::local();
+    let shadow = GeoOrigin::shadow(DC_B);
+
+    assert!(local.is_local() && !local.is_shadow());
+    assert_eq!(local.name(), None);
+    assert_eq!(local.to_string(), "local");
+    assert!(shadow.is_shadow() && !shadow.is_local());
+    assert_eq!(shadow.name(), Some(DC_B));
+    assert_eq!(shadow.to_string(), DC_B);
+}
+
+#[tokio::test]
 async fn given_a_consumer_polled_before_init_should_fail_each_poll() {
     let catalog = FakeCatalog::default();
     let mut consumer = catalog.consumer(GeoSources::Both);
@@ -451,6 +598,30 @@ async fn given_a_standalone_consumer_when_reading_its_shadows_should_refuse_it_b
     assert_eq!(consumer.init().await, Err(IggyError::InvalidConfiguration));
 }
 
+#[tokio::test]
+async fn given_shadows_only_with_partitions_for_a_group_when_initializing_should_refuse_it_before_sending_anything()
+ {
+    let builder = IggyConsumerBuilder::new(
+        IggyRwLock::new(ClientWrapper::Tcp(TcpClient::default())),
+        GROUP.to_owned(),
+        Consumer::group(Identifier::named(GROUP).unwrap()),
+        Identifier::named(STREAM).unwrap(),
+        Identifier::named(TOPIC).unwrap(),
+        None,
+    )
+    .partitions([1]);
+    let mut consumer = builder
+        .with_shadows()
+        .sources(GeoSources::ShadowsOnly)
+        .build();
+
+    let initialized = timeout(TEST_BUDGET, consumer.init())
+        .await
+        .expect("init in time");
+
+    assert_eq!(initialized, Err(IggyError::InvalidCommand));
+}
+
 #[test]
 fn given_a_geo_consumer_should_move_between_tasks() {
     fn assert_send<T: Send>() {}
@@ -473,6 +644,19 @@ async fn next_error(consumer: &mut IggyGeoConsumer) -> GeoReadError {
     match item {
         Ok(message) => panic!("a message in place of an error: {message:?}"),
         Err(error) => error,
+    }
+}
+
+/// Polls `call` a few times, none of which ends it, then drops it, as a caller that gives up
+/// does.
+fn cancel_after_polls(call: impl Future) {
+    let mut call = std::pin::pin!(call);
+    let mut cx = Context::from_waker(noop_waker_ref());
+    for _ in 0..3 {
+        assert!(
+            call.as_mut().poll(&mut cx).is_pending(),
+            "the call ended before the cancel"
+        );
     }
 }
 
@@ -517,6 +701,28 @@ struct World {
     opened: Vec<(String, Arc<LogHandle>)>,
     /// Messages for a stream that its consumer takes once it opens.
     queued: HashMap<String, Vec<(u32, Range<u64>)>>,
+    /// The streams whose opens wait for a gate.
+    open_gates: HashMap<String, Arc<Gate>>,
+    listing_gate: Option<Arc<Gate>>,
+}
+
+/// Holds back each call that waits on it until it opens.
+struct Gate(watch::Sender<bool>);
+
+impl Gate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(watch::channel(false).0))
+    }
+
+    fn open(&self) {
+        self.0.send_replace(true);
+    }
+
+    async fn pass(self: Arc<Self>) {
+        let mut opened = self.0.subscribe();
+        let passed = opened.wait_for(|open| *open).await.is_ok();
+        assert!(passed, "the gate outlives each call that waits on it");
+    }
 }
 
 #[derive(Clone, Default)]
@@ -542,8 +748,27 @@ impl FakeCatalog {
 
     async fn initialized(&self, sources: GeoSources) -> IggyGeoConsumer {
         let mut consumer = self.consumer(sources);
-        consumer.init().await.unwrap();
+        timeout(TEST_BUDGET, consumer.init())
+            .await
+            .expect("init in time")
+            .unwrap();
         consumer
+    }
+
+    /// Holds each open of `stream` until the gate opens.
+    fn hold_opens(&self, stream: &str) -> Arc<Gate> {
+        let gate = Gate::new();
+        self.world()
+            .open_gates
+            .insert(stream.to_owned(), Arc::clone(&gate));
+        gate
+    }
+
+    /// Holds each listing of the streams until the gate opens.
+    fn hold_listings(&self) -> Arc<Gate> {
+        let gate = Gate::new();
+        self.world().listing_gate = Some(Arc::clone(&gate));
+        gate
     }
 
     /// Lists the shadow stream of `origin`, which holds the topic, and returns its name.
@@ -591,11 +816,38 @@ impl FakeCatalog {
             .count()
     }
 
+    fn attempts_of(&self, stream: &str) -> usize {
+        self.world()
+            .attempts
+            .get(stream)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn open(&self, stream: &str) -> BoxFuture<'static, Result<Box<dyn LogConsumer>, IggyError>> {
+        let gate = {
+            let mut world = self.world();
+            *world.attempts.entry(stream.to_owned()).or_default() += 1;
+            world.open_gates.get(stream).cloned()
+        };
+        match gate {
+            None => ready(self.opened(stream)).boxed(),
+            Some(gate) => {
+                let catalog = self.clone();
+                let stream = stream.to_owned();
+                async move {
+                    gate.pass().await;
+                    catalog.opened(&stream)
+                }
+                .boxed()
+            }
+        }
+    }
+
+    fn opened(&self, stream: &str) -> Result<Box<dyn LogConsumer>, IggyError> {
         let mut world = self.world();
-        *world.attempts.entry(stream.to_owned()).or_default() += 1;
         if let Some(error) = world.refusals.get(stream) {
-            return ready(Err(error.clone())).boxed();
+            return Err(error.clone());
         }
         let (sender, receiver) = unbounded();
         let handle = Arc::new(LogHandle {
@@ -605,14 +857,22 @@ impl FakeCatalog {
             marks: Mutex::default(),
             seeks: Mutex::default(),
             polls: AtomicUsize::new(0),
+            counted: AtomicUsize::new(0),
             shut_down: AtomicBool::new(false),
         });
         for (partition, offsets) in world.queued.remove(stream).unwrap_or_default() {
             handle.send(partition, offsets);
         }
         world.opened.push((stream.to_owned(), Arc::clone(&handle)));
-        let log: Box<dyn LogConsumer> = Box::new(FakeLog { handle, receiver });
-        ready(Ok(log)).boxed()
+        Ok(Box::new(FakeLog { handle, receiver }))
+    }
+
+    fn listing(&self) -> Result<Vec<ShadowStream>, IggyError> {
+        let world = self.world();
+        match &world.listing_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(world.shadows.clone()),
+        }
     }
 }
 
@@ -634,13 +894,22 @@ impl LogCatalog for FakeCatalog {
     }
 
     fn shadow_streams(&self) -> BoxFuture<'static, Result<Vec<ShadowStream>, IggyError>> {
-        let mut world = self.world();
-        world.listings += 1;
-        let listed = match &world.listing_error {
-            Some(error) => Err(error.clone()),
-            None => Ok(world.shadows.clone()),
+        let gate = {
+            let mut world = self.world();
+            world.listings += 1;
+            world.listing_gate.clone()
         };
-        ready(listed).boxed()
+        match gate {
+            None => ready(self.listing()).boxed(),
+            Some(gate) => {
+                let catalog = self.clone();
+                async move {
+                    gate.pass().await;
+                    catalog.listing()
+                }
+                .boxed()
+            }
+        }
     }
 
     fn holds_topic(
@@ -669,6 +938,8 @@ struct LogHandle {
     marks: Mutex<Vec<Checkpoint>>,
     seeks: Mutex<Vec<(u32, PollingStrategy)>>,
     polls: AtomicUsize,
+    /// The calls of `count_uncounted`.
+    counted: AtomicUsize,
     shut_down: AtomicBool,
 }
 
@@ -711,6 +982,10 @@ impl LogHandle {
 
     fn polls(&self) -> usize {
         self.polls.load(Ordering::SeqCst)
+    }
+
+    fn counted(&self) -> usize {
+        self.counted.load(Ordering::SeqCst)
     }
 
     fn is_shut_down(&self) -> bool {
@@ -756,7 +1031,9 @@ impl LogConsumer for FakeLog {
         ready(Ok(())).boxed()
     }
 
-    fn count_uncounted(&mut self) {}
+    fn count_uncounted(&mut self) {
+        self.handle.counted.fetch_add(1, Ordering::SeqCst);
+    }
 
     fn shutdown(&mut self) -> BoxFuture<'_, Result<(), IggyError>> {
         self.handle.shut_down.store(true, Ordering::SeqCst);

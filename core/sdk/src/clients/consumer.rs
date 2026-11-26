@@ -766,7 +766,7 @@ impl IggyConsumer {
     }
 
     /// The checks that need no I/O, so a configuration that cannot run fails before the lookups.
-    fn validate(&self) -> Result<(), IggyError> {
+    pub(crate) fn validate(&self) -> Result<(), IggyError> {
         self.reader_builder().into_parts()?;
         Ok(())
     }
