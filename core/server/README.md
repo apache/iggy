@@ -48,6 +48,8 @@ Command-line arguments include `--replica-id`, `--fresh` (`-f`), `--with-default
 
 Deploy compatible server and SDK releases together. A rolling server upgrade requires a pair of stable releases listed in the [release compatibility table](#upgrade-recovery). For example, builds that require partition incarnation numbers reject control frames from older builds that send incarnation zero. Those builds cannot complete partition view changes together.
 
+Upgrade the Kafka gateway with the server too. A send refused below `[node] free_space_reserve` now answers `FreeSpaceReserveReached` (4109), not `TransientNotAccepted` (58). SDKs and Kafka gateways from before that change read 4109 as a plain error and do not send the batch again, and such a gateway answers its Kafka client with `UNKNOWN_SERVER_ERROR` (-1).
+
 The `IGGY-TIERED-SEGMENT-CHAIN-2` storage gate
 requires fresh storage and rejects older data directories without modifying them.
 A partition of a tiered topic keeps a chain file, and its older segments live
@@ -245,10 +247,11 @@ policy. Rust and Python use their configured retry schedule rather than
 
 A 503 answer to a write means that nothing was admitted, so the write can be sent
 again. A 507 answer to a send, body `id` 4109 (`FreeSpaceReserveReached`), means
-the same: the data disk of the partition primary is below
-`[node] free_space_reserve`. It carries `Retry-After: 1`, and the Rust, C# and
-Java SDKs send it again as they do a 503. A 502 or 504 answer to a write means that its outcome is unknown, and the
-write can still commit. The body `id` 57 (`TransientNotCommitted`) or the body
+the same: the free space on the data disk of the partition primary is below
+`[node] free_space_reserve`. It carries `Retry-After: 1`, and the Rust, Python,
+C# and Java SDKs send it again as they do a 503. Python resends it through the
+Rust `HttpClient`. A 502 or 504 answer to a write means that its outcome is
+unknown, and the write can still commit. The body `id` 57 (`TransientNotCommitted`) or the body
 `code`, such as `produce_timeout`, names the cause. Read the state before writing
 again, because a resend is a new request that can apply twice. The Rust, C# and
 Java SDKs never resend such a write, and the Rust SDK reports it as 57.
