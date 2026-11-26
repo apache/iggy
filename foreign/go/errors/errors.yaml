@@ -1147,7 +1147,7 @@
   fields: []
 - name: FreeSpaceReserveReached
   code: 4109
-  format: "data disk is below its free-space reserve"
+  format: "free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica"
   fields: []
 - name: ConsumerGroupIdNotFound
   code: 5000

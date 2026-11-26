@@ -2388,8 +2388,10 @@ func (e CannotModifyRootUser) Is(target error) bool {
 
 type FreeSpaceReserveReached struct{}
 
-func (e FreeSpaceReserveReached) Error() string { return "data disk is below its free-space reserve" }
-func (e FreeSpaceReserveReached) Code() Code    { return 4109 }
+func (e FreeSpaceReserveReached) Error() string {
+	return "free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica"
+}
+func (e FreeSpaceReserveReached) Code() Code { return 4109 }
 func (e FreeSpaceReserveReached) Is(target error) bool {
 	_, ok := target.(FreeSpaceReserveReached)
 	return ok

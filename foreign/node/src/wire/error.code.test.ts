@@ -62,7 +62,7 @@ it('translates the shadow stream write refusal', () => {
 });
 
 it('translates the free-space reserve refusal', () => {
-  assert.equal(translateErrorCode(4109), 'Data disk is below its free-space reserve');
+  assert.equal(translateErrorCode(4109), 'Free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica');
 });
 
 it('translates the consumer-offset capacity error', () => {

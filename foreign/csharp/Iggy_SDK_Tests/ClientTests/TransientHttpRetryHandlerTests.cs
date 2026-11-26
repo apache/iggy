@@ -32,7 +32,7 @@ public sealed class TransientHttpRetryHandlerTests
     private const string SendBody = """{"messages":[]}""";
 
     private const string FreeSpaceReserveReached =
-        """{"id":4109,"code":"free_space_reserve_reached","reason":"Data disk is below its free-space reserve","field":null}""";
+        """{"id":4109,"code":"free_space_reserve_reached","reason":"Free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica","field":null}""";
 
     [Fact]
     public async Task given_a_send_refused_below_the_free_space_reserve_when_space_returns_should_send_it_again()

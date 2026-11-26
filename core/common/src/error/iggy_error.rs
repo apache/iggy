@@ -560,7 +560,9 @@ pub enum IggyError {
     /// `[node] free_space_reserve`, so the primary refuses new messages.
     /// Nothing was written, so a resend is safe. The refusal lasts until space
     /// is freed or the reserve is lowered.
-    #[error("Data disk is below its free-space reserve")]
+    #[error(
+        "Free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica"
+    )]
     FreeSpaceReserveReached = 4109,
     #[error("Consumer group with ID: {0} for topic with ID: {1} was not found.")]
     ConsumerGroupIdNotFound(Identifier, Identifier) = 5000,

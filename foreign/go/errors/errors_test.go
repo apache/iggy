@@ -169,7 +169,7 @@ func TestIggyError_FreeSpaceReserveReached(t *testing.T) {
 	if err.Code() != Code(4109) || FreeSpaceReserveReachedCode != Code(4109) {
 		t.Errorf("Code() = %v, FreeSpaceReserveReachedCode = %v, want 4109", err.Code(), FreeSpaceReserveReachedCode)
 	}
-	if err.Error() != "data disk is below its free-space reserve" {
+	if err.Error() != "free space on the data disk is below [node] free_space_reserve; retry after backoff on the same replica" {
 		t.Errorf("Error() = %q", err.Error())
 	}
 	if FreeSpaceReserveReachedCode.String() != "FreeSpaceReserveReached" {
