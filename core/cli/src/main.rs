@@ -30,6 +30,7 @@ use crate::credentials::IggyCredentials;
 use crate::error::{CmdToolError, IggyCmdError};
 use crate::logging::Logging;
 use args::context::ContextAction;
+use args::geo::GeoAction;
 use args::message::MessageAction;
 use args::metadata::MetadataAction;
 use args::partition::PartitionAction;
@@ -66,6 +67,7 @@ use iggy_cli::commands::{
         get_consumer_offset::GetConsumerOffsetCmd, set_consumer_offset::SetConsumerOffsetCmd,
     },
     binary_context::get_contexts::GetContextsCmd,
+    binary_geo::retire_origin::RetireGeoOriginCmd,
     binary_message::{poll_messages::PollMessagesCmd, send_messages::SendMessagesCmd},
     binary_partitions::{
         create_partitions::CreatePartitionsCmd, delete_partitions::DeletePartitionsCmd,
@@ -284,6 +286,9 @@ fn get_command(
                 Box::new(GetClusterMetadataCmd::new(args.list_mode.into()))
             }
         },
+        Command::Geo(command) => match command {
+            GeoAction::Retire(args) => Box::new(RetireGeoOriginCmd::new(args.origin.clone())),
+        },
         Command::ConsumerGroup(command) => match command {
             ConsumerGroupAction::Create(create_args) => Box::new(CreateConsumerGroupCmd::new(
                 create_args.stream_id.clone(),
@@ -489,8 +494,9 @@ async fn run() -> Result<(), IggyCmdError> {
     }
     command.execute_with_iggy_client(&client).await?;
 
+    let deleted_token = command.deleted_token();
     tokio::select! {
-        logout = credentials.logout_user() => logout?,
+        logout = credentials.logout_user(deleted_token.as_deref()) => logout?,
         _ = tokio::signal::ctrl_c() => std::process::exit(130),
     }
 

@@ -20,7 +20,7 @@ description: Rust pre-merge testing and linting github iggy actions
 
 inputs:
   task:
-    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, deny, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri, miri-nightly)"
+    description: "Task to run (check, check-msrv, fmt, clippy, clippy-macos-aarch64, sort, machete, deny, doctest, verify-publish, runtime, test-build, test, test-storage-compat, miri, miri-nightly, build-web-ui)"
     required: true
   component:
     description: "Component name (for context)"
@@ -57,9 +57,11 @@ runs:
         # Test and Miri jobs execute nextest.
         install-nextest: ${{ startsWith(inputs.task, 'miri') || inputs.task == 'test' || startsWith(inputs.task, 'test-') }}
         coverage: ${{ inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' }}
-        # These tasks do not compile workspace crates and need no native
-        # libraries. All compiling tasks keep the existing dependency setup.
-        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' && inputs.task != 'deny' }}
+        # These tasks need no native libraries. fmt, sort and machete compile
+        # nothing, and build-web-ui compiles only the web UI and its
+        # dependencies, none of which link hwloc or udev. All other compiling
+        # tasks keep the existing dependency setup.
+        install-system-dependencies: ${{ inputs.task != 'fmt' && inputs.task != 'sort' && inputs.task != 'machete' && inputs.task != 'deny' && inputs.task != 'build-web-ui' }}
         # Miri builds against a nightly toolchain with a separate `target/miri`
         # subtree; isolate its cache from the stable `dev` namespace so the
         # two don't evict each other.
@@ -75,8 +77,7 @@ runs:
         save-cache: ${{ inputs.save-cache }}
         # Artifact builders do not pull test containers. Test shards have ~78 GB
         # free when tests start and use ~15 GB, so the cleanup costs minutes.
-        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'deny' || inputs.task == 'doctest') && 'false' || 'true' }}
-
+        free-disk-space: ${{ (inputs.task == 'runtime' || inputs.task == 'test-build' || inputs.task == 'test' || startsWith(inputs.task, 'miri') || inputs.task == 'fmt' || inputs.task == 'sort' || inputs.task == 'clippy' || inputs.task == 'check' || inputs.task == 'check-msrv' || inputs.task == 'machete' || inputs.task == 'deny' || inputs.task == 'doctest' || inputs.task == 'build-web-ui')
     - name: Install cargo-sort
       if: inputs.task == 'sort'
       shell: bash
@@ -102,6 +103,14 @@ runs:
       uses: taiki-e/install-action@v2
       with:
         tool: cargo-deny
+        
+    # dx is not in taiki-e/install-action's manifests, so the script fetches
+    # the pinned Dioxus release, like the cargo-sort step above. It also pins
+    # the wasm-bindgen, wasm-opt and esbuild that dx bundle would download.
+    - name: Install dx
+      if: inputs.task == 'build-web-ui'
+      run: ./scripts/ci/install-dx.sh
+      shell: bash
 
     # cargo-http-registry has no prebuilt artifact in taiki-e/install-action,
     # so it stays a source build. verify-publish is a low-frequency task.
@@ -125,6 +134,20 @@ runs:
       uses: loadingalias/cargo-rail-action@409962f05d90a78aae995ef6b1c8466010c0a460 # v10.1.1
       with:
         since: ${{ inputs.stack-base }}
+
+    # The workspace clippy builds the web UI for the host only, so the wasm32
+    # build gets its own lint pass before the bundle.
+    - name: Build web UI
+      if: inputs.task == 'build-web-ui'
+      env:
+        # Makes dx take the tools install-dx.sh pinned from PATH.
+        NO_DOWNLOADS: "1"
+      run: |
+        rustup target add wasm32-unknown-unknown
+        cargo clippy --locked -p iggy-web-ui --target wasm32-unknown-unknown --all-features --all-targets -- -D warnings
+        ./scripts/build-web-ui.sh
+        test -f core/web_ui/dist/public/index.html
+      shell: bash
 
     # Individual lint tasks for parallel execution
     - name: Cargo check

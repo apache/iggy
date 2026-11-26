@@ -19,6 +19,7 @@
 //! configuration, for example `Iggy-persisted` next to `Iggy`. Each driver shows its newest run.
 
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::NO_VALUE;
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 use yew::prelude::*;
 
@@ -27,7 +28,7 @@ use super::history::{
 };
 use crate::pages::compare::runs::with_baseline;
 use crate::pages::omb::common::{
-    NO_VALUE, OmbCompareLink, day_view, driver_tag, line_order, oldest_first, version_view,
+    OmbCompareLink, day_view, driver_tag, line_order, oldest_first, version_view,
 };
 use crate::state::selection::MAX_COMPARED_RUNS;
 
@@ -42,14 +43,9 @@ const COMPARE_ALL_TITLE: &str = "Open these runs on the compare page, with this 
 /// The newest run of each driver other than the driver of `run`, with the workload and machines of
 /// `run`, in driver name order. A line's order tells which run is the newest.
 pub fn related_runs(run: &OmbRunSummary, runs: &[OmbRunSummary]) -> Vec<OmbRunSummary> {
-    let machines = run.history_key().environment;
     let candidates: Vec<&OmbRunSummary> = runs
         .iter()
-        .filter(|candidate| {
-            candidate.driver != run.driver
-                && candidate.workload == run.workload
-                && candidate.history_key().environment == machines
-        })
+        .filter(|candidate| is_related(run, candidate))
         .collect();
     let mut drivers: Vec<&str> = candidates
         .iter()
@@ -69,6 +65,13 @@ pub fn related_runs(run: &OmbRunSummary, runs: &[OmbRunSummary]) -> Vec<OmbRunSu
             line.last().map(|&newest| newest.clone())
         })
         .collect()
+}
+
+/// Whether `candidate` ran the workload of `run` with another driver on the same machines.
+pub fn is_related(run: &OmbRunSummary, candidate: &OmbRunSummary) -> bool {
+    candidate.driver != run.driver
+        && candidate.workload == run.workload
+        && candidate.history_key().environment == run.history_key().environment
 }
 
 /// The page's run as the baseline, then the related runs that fit on the compare page.

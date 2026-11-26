@@ -57,35 +57,44 @@ use crate::boot::threads::{
     validate_sharding_runtime_knobs,
 };
 use crate::boot::topology::{RosterCells, replica_link_layout, resolve_tcp_topology};
-use crate::dispatch::reads::read_frontier_budget;
+use crate::dispatch::reads::{partition_frontier_budget, read_frontier_budget};
 use crate::dispatch::session_ops::warm_dummy_password_hash;
+use crate::geo_peers::PeerAuth;
+use crate::release_compatibility::RELEASE_COMPATIBILITY;
+use crate::s3_credentials::RoleCredentials;
 use crate::server_error::ServerError;
 use crate::shell::{
-    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, heartbeat_timings,
+    ServerMetadata, ServerMetadataBundle, ServerMuxStateMachine, ShellShard, heartbeat_timings,
 };
+use crate::tiered_storage::SharedStore;
+use configs::cluster::ClusterConfig;
 use configs::partition::PartitionConfig;
 use configs::server::ServerConfig;
 use consensus::{MetadataHandle, PartitionsHandle};
-use iggy_binary_protocol::Operation;
-use iggy_object_store::s3::SharedCredentials;
-use message_bus::replica::handshake::ReplicaHandshakeCtx;
+use iggy_binary_protocol::{Operation, PrepareHeader};
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
+use message_bus::replica::handshake::{CompatibleRelease, ReplicaHandshakeCtx};
 use message_bus::transports::tls::install_default_crypto_provider;
-use message_bus::{IggyMessageBus, ReplicaOwnerTable};
+use message_bus::{IggyMessageBus, MessageBus, ReplicaOwnerTable};
 use metadata::change_log::{ChangeLogCapacities, MetadataChangeLog};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::impls::recovery::recover;
 use metadata::{AppliedFrontier, ReplicaIdentity};
+use server_common::Message;
 use server_common::bootstrap::create_directories;
 use server_common::fs_utils::remove_dir_all;
 use server_common::log::{Logging, LoggingSettings, TelemetrySettings};
 use shard::metrics::{ShardMetrics, frame_drop_reason, frame_drop_variant};
+use shard::peers::SharedPeerStatus;
+use shard::shards_table::PartitionShards;
 use shard::{
     LifecycleFrame, Receiver as ShardReceiver, ShardFrame, TaggedSender, channel,
     shard_mesh_channels,
 };
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -93,7 +102,7 @@ use tracing::{error, info, warn};
 
 const STORAGE_FORMAT_FILE: &str = "storage-format";
 const STORAGE_FORMAT_TEMP_FILE: &str = "storage-format.tmp";
-const STORAGE_FORMAT: &[u8] = b"IGGY-METADATA-CHANGE-LOG-2\n";
+pub(crate) const STORAGE_FORMAT: &[u8] = b"IGGY-TIERED-SEGMENT-CHAIN-2\n";
 
 /// Load the server configuration from the active config provider.
 ///
@@ -303,9 +312,14 @@ pub fn bootstrap(
     warm_dummy_password_hash();
     crate::external_auth::preflight(&config.external_auth)?;
     crate::tiered_storage::preflight(&config.tiered_storage)?;
-    let tiered_credentials = crate::s3_credentials::credentials(&config.tiered_storage)?;
+    // The node's stores that take the same role share one refresher.
+    let mut s3_roles = RoleCredentials::default();
+    let tiered_store = SharedStore::new(&config.tiered_storage, &mut s3_roles)?;
     let object_store_answered =
-        crate::tiered_storage::probe(&config.tiered_storage, tiered_credentials.as_ref())?;
+        crate::tiered_storage::probe(&config.tiered_storage, &tiered_store)?;
+    crate::geo_peers::preflight(&config.geo)?;
+    let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
+    let geo_peer_auth = crate::geo_peers::auth(&config.geo, &config.tiered_storage, &mut s3_roles)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
@@ -362,8 +376,22 @@ pub fn bootstrap(
         &config,
         total_shards,
     )?));
-    check_repair_ring_share(&config.partition, total_shards)?;
-    check_wal_reload_share(&config.partition, total_shards)?;
+    let partition_shards = PartitionShards::new(
+        total_shards,
+        config.cluster.coordinator.skip_shard_zero_for_partitions,
+    );
+    check_partition_shards(partition_shards)?;
+    if partition_frames_cross_shard_zero(&config.cluster, total_shards) {
+        warn!(
+            "cluster.coordinator.skip_shard_zero_for_partitions is true, but \
+             cluster.coordinator.skip_shard_zero_for_replicas is false, so a replica link stays \
+             on shard 0 and the partition frames to that peer still cross shard 0. Set \
+             cluster.coordinator.skip_shard_zero_for_replicas to true."
+        );
+    }
+    let owning_shards = partition_shards.owner_count();
+    check_repair_ring_share(&config.partition, owning_shards)?;
+    check_wal_reload_share(&config.partition, owning_shards)?;
     let repair_memory = Arc::new(partitions::RepairMemoryBudget::new(
         usize::try_from(config.partition.repair_memory_bytes_max.as_bytes_u64()).map_err(|_| {
             ServerError::Config(configs::ConfigurationError::InvalidConfigurationValue)
@@ -403,7 +431,8 @@ pub fn bootstrap(
     // would gate reads on a number nothing moves - and it carries the held
     // reads' budget, which is sized from the configured commit-broadcast
     // cadence and which a peer shard has no other way to learn.
-    let mut metadata_applied_frontier = AppliedFrontier::new(read_frontier_budget(&config));
+    let mut metadata_applied_frontier = AppliedFrontier::new(read_frontier_budget(&config))
+        .with_partition_request_budget(partition_frontier_budget(&config));
     if config.cluster.enabled && config.cluster.nodes.len() > 1 {
         metadata_applied_frontier = metadata_applied_frontier.with_partition_freshness(
             std::time::Instant::now(),
@@ -465,7 +494,9 @@ pub fn bootstrap(
         let shard_metrics_for_shard = shard_metrics_all.clone();
         let peer_exit_for_shard = Arc::clone(&peer_exit);
         let shutdown_deadline_for_shard = Arc::clone(&shutdown_deadline);
-        let tiered_credentials_for_shard = tiered_credentials.clone();
+        let tiered_store_for_shard = tiered_store.clone();
+        let geo_peer_statuses_for_shard = geo_peer_statuses.clone();
+        let geo_peer_auth_for_shard = geo_peer_auth.clone();
         let primary_handoff_for_shard = Arc::clone(&primary_handoff);
         let handle = match thread::Builder::new()
             .name(format!("shard-{shard_id}"))
@@ -489,7 +520,9 @@ pub fn bootstrap(
                     shard_metrics_for_shard,
                     peer_exit_for_shard,
                     shutdown_deadline_for_shard,
-                    tiered_credentials_for_shard,
+                    tiered_store_for_shard,
+                    geo_peer_statuses_for_shard,
+                    geo_peer_auth_for_shard,
                     primary_handoff_for_shard,
                 )
             }) {
@@ -567,7 +600,9 @@ async fn shard_main(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
-    tiered_credentials: Option<SharedCredentials>,
+    tiered_store: SharedStore,
+    geo_peer_statuses: Vec<SharedPeerStatus>,
+    geo_peer_auth: PeerAuth,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     let topology = resolve_tcp_topology(config, replica_id)?;
@@ -579,11 +614,26 @@ async fn shard_main(
     // Every shard can own a delegated replica connection, so every
     // shard's bus needs the handshake identity (the handshake itself
     // runs on the owning shard, not on shard 0).
+    let compatible_releases = RELEASE_COMPATIBILITY.compatible_with(crate::VERSION);
+    if shard_id == 0 {
+        info!(
+            release = crate::VERSION,
+            client_protocol = %iggy_binary_protocol::ProtocolVersion(iggy_binary_protocol::IGGY_PROTOCOL_VERSION),
+            replica_wire_revision = iggy_binary_protocol::REPLICA_WIRE_REVISION,
+            storage_format = %String::from_utf8_lossy(STORAGE_FORMAT).trim_end(),
+            ?compatible_releases,
+            "replica handshake identity"
+        );
+    }
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
         binary_identity: message_bus::replica::handshake::binary_identity(
             crate::VERSION,
             STORAGE_FORMAT,
         ),
+        compatible_releases: compatible_releases
+            .iter()
+            .map(|release| CompatibleRelease::new(release, STORAGE_FORMAT))
+            .collect(),
         cluster_id: topology.cluster_id,
         self_id: topology.self_replica_id,
         replica_count: topology.replica_count,
@@ -894,6 +944,7 @@ async fn shard_main(
     if shard_id == 0 {
         let notifier = make_metadata_commit_notifier(senders_for_notifier, metrics_for_notifier);
         shard.plane.metadata().set_commit_notifier(Some(notifier));
+        install_checkpoint_spawner(&shard);
     } else {
         drop(senders_for_notifier);
         drop(metrics_for_notifier);
@@ -931,7 +982,6 @@ async fn shard_main(
 
     let reconciler_ctx = Rc::new(crate::partition_reconciler::ReconcilerCtx::new(
         Rc::clone(&shard),
-        total_shards,
         Rc::new(config.clone()),
         topology.cluster_id,
         topology.self_replica_id,
@@ -1032,13 +1082,26 @@ async fn shard_main(
         _ => None,
     };
 
+    shard.set_long_term_rewrite_max_interval(
+        config.geo.long_term_rewrite_max_interval.get_duration(),
+    );
     let store_identity_stop = crate::tiered_storage::start(
         &config.tiered_storage,
+        crate::origin_recovery::OriginRecovery::from_config(&config.geo),
         &bus,
         &shard,
         topology.self_replica_id,
-        tiered_credentials.as_ref(),
+        &tiered_store,
     );
+    let geo_peers_stop = crate::geo_peers::start(
+        &config.geo,
+        &config.tiered_storage,
+        &bus,
+        &shard,
+        &geo_peer_statuses,
+        &geo_peer_auth,
+    );
+    shard.set_geo_positions(crate::peer_positions::settings(&config.geo));
 
     // Segment cleaner: runs on every shard (each replica trims its own log,
     // primary and backup alike). Local and unreplicated; gated by the shared
@@ -1063,6 +1126,7 @@ async fn shard_main(
         stream_key_rewrapper: stream_key_rewrapper_stop,
         segment_cleaner: segment_cleaner_stop,
         store_identity: store_identity_stop,
+        geo_peers: geo_peers_stop,
         sysinfo_printer: None,
         consumer_group_liveness: None,
     };
@@ -1245,6 +1309,85 @@ async fn shard_main(
     Ok(())
 }
 
+/// Skipping shard 0 on a node with one shard leaves no shard to own a
+/// partition, so the node refuses to start with it.
+fn check_partition_shards(partition_shards: PartitionShards) -> Result<(), ServerError> {
+    if partition_shards.skip_shard_zero() && partition_shards.shard_count() == 1 {
+        error!(
+            "cluster.coordinator.skip_shard_zero_for_partitions is true, but the node runs 1 shard, \
+             so no shard can own a partition. Set it to false, or give the node more than one shard \
+             with sharding.cpu_allocation."
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a replica link on shard 0 carries partition frames although no
+/// partition is placed there: link 0 to at least one peer, for the other
+/// shards of its range. With one link per shard that range holds only shard
+/// 0, so the replicas flag moves no link and the link carries no partition
+/// frame.
+const fn partition_frames_cross_shard_zero(cluster: &ClusterConfig, total_shards: u16) -> bool {
+    let coordinator = &cluster.coordinator;
+    cluster.enabled
+        && cluster.nodes.len() > 1
+        && coordinator.skip_shard_zero_for_partitions
+        && !coordinator.skip_shard_zero_for_replicas
+        && coordinator.replica_connections_per_peer < total_shards
+}
+
+/// Every shard that owns partitions sheds its repair rings against an equal
+/// share of the node budget, so their count decides what the budget is worth.
+fn check_repair_ring_share(
+    config: &PartitionConfig,
+    owning_shards: u16,
+) -> Result<(), ServerError> {
+    let share = config.journal_memory_shard_bytes_max(owning_shards);
+    let ring = config.evicted_ring_bytes_max.as_bytes_u64();
+    if share == 0 {
+        error!(
+            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {owning_shards} partition shards",
+            config.journal_memory_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    if share < ring {
+        warn!(
+            "each of {owning_shards} partition shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
+             less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
+        );
+    } else {
+        info!(
+            "each of {owning_shards} partition shards gets {share} bytes of partition.journal_memory_node_bytes_max"
+        );
+    }
+    Ok(())
+}
+
+/// A share of nothing queues a checkpoint for every op, so the node refuses
+/// to start with it.
+fn check_wal_reload_share(config: &PartitionConfig, owning_shards: u16) -> Result<(), ServerError> {
+    let share = config.wal_reload_shard_bytes_max(owning_shards);
+    if share == 0 {
+        error!(
+            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {owning_shards} partition shards",
+            config.wal_reload_node_bytes_max
+        );
+        return Err(ServerError::Config(
+            configs::ConfigurationError::InvalidConfigurationValue,
+        ));
+    }
+    info!(
+        "each of {owning_shards} partition shards gets {share} bytes of partition.wal_reload_node_bytes_max"
+    );
+    Ok(())
+}
+
 /// Build the closure that broadcasts a
 /// [`LifecycleFrame::MetadataCommitTick`] to every shard's inbox after a
 /// partition-shaped metadata operation commits on shard 0.
@@ -1254,52 +1397,6 @@ async fn shard_main(
 /// and dropped (the periodic tick recovers). Installed via
 /// [`metadata::IggyMetadata::set_commit_notifier`] on shard 0 only, the
 /// sole writer of the metadata state machine.
-/// Every shard sheds its repair rings against an equal share of the node
-/// budget, so the shard count decides what the budget is worth.
-fn check_repair_ring_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.journal_memory_shard_bytes_max(total_shards);
-    let ring = config.evicted_ring_bytes_max.as_bytes_u64();
-    if share == 0 {
-        error!(
-            "partition.journal_memory_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
-            config.journal_memory_node_bytes_max
-        );
-        return Err(ServerError::Config(
-            configs::ConfigurationError::InvalidConfigurationValue,
-        ));
-    }
-    if share < ring {
-        warn!(
-            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max, \
-             less than partition.evicted_ring_bytes_max ({ring} bytes): one partition can take the share of its shard"
-        );
-    } else {
-        info!(
-            "each of {total_shards} shards gets {share} bytes of partition.journal_memory_node_bytes_max"
-        );
-    }
-    Ok(())
-}
-
-/// A share of nothing queues a checkpoint for every op, so the node refuses
-/// to start with it.
-fn check_wal_reload_share(config: &PartitionConfig, total_shards: u16) -> Result<(), ServerError> {
-    let share = config.wal_reload_shard_bytes_max(total_shards);
-    if share == 0 {
-        error!(
-            "partition.wal_reload_node_bytes_max ({}) leaves no bytes for each of {total_shards} shards",
-            config.wal_reload_node_bytes_max
-        );
-        return Err(ServerError::Config(
-            configs::ConfigurationError::InvalidConfigurationValue,
-        ));
-    }
-    info!(
-        "each of {total_shards} shards gets {share} bytes of partition.wal_reload_node_bytes_max"
-    );
-    Ok(())
-}
-
 fn make_metadata_commit_notifier(
     senders: Vec<TaggedSender>,
     metrics: ShardMetrics,
@@ -1327,6 +1424,35 @@ fn make_metadata_commit_notifier(
             }
         }
     })
+}
+
+/// Run the metadata checkpoint jobs of `shard` as detached tasks on its bus, so
+/// the commit path that starts one never waits for its snapshot write. Shard 0
+/// only, the sole metadata writer.
+///
+/// The spawner lives inside the shard's metadata, so it holds the shard weakly.
+/// A job that finds the shard gone is dropped with the metadata it would fence.
+pub fn install_checkpoint_spawner<B, MJ, S, SB>(shard: &Rc<ShellShard<B, MJ, S, SB>>)
+where
+    B: MessageBus + Clone + 'static,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
+    let weak_shard = Rc::downgrade(shard);
+    let bus = shard.bus.clone();
+    shard
+        .plane
+        .metadata()
+        .set_checkpoint_spawner(Some(Rc::new(move |job| {
+            let weak_shard = Weak::clone(&weak_shard);
+            bus.spawn(async move {
+                if let Some(shard) = weak_shard.upgrade() {
+                    shard.plane.metadata().run_checkpoint_job(job).await;
+                }
+            });
+        })));
 }
 
 /// Filter at the broadcast site, keeping unrelated ops off the SDK reply
@@ -1374,6 +1500,24 @@ const fn operation_triggers_partition_reconcile(op: Operation) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use configs::cluster::ClusterCoordinatorConfig;
+
+    /// The two crates keep their own copy of the bounds, and they must not
+    /// drift apart.
+    #[test]
+    fn given_default_geo_section_when_reading_the_rewrite_ceiling_should_give_the_shard_bounds() {
+        assert_eq!(
+            ServerConfig::default()
+                .geo
+                .long_term_rewrite_max_interval
+                .get_duration(),
+            shard::rewrite_pacing::REWRITE_INTERVAL_MAX
+        );
+        assert_eq!(
+            configs::geo::LONG_TERM_REWRITE_MAX_INTERVAL_MIN,
+            shard::rewrite_pacing::REWRITE_INTERVAL_MIN
+        );
+    }
 
     #[compio::test]
     async fn given_missing_or_empty_storage_when_booting_should_initialize_without_wiping_on_restart()
@@ -1438,6 +1582,9 @@ mod tests {
             b"IGGY-DURABLE-SESSIONS-3\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
             b"IGGY-METADATA-CHANGE-LOG-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-2\n",
+            b"IGGY-METADATA-CHANGE-LOG-3\n",
+            b"IGGY-TIERED-SEGMENT-CHAIN-1\n",
             &STORAGE_FORMAT[..STORAGE_FORMAT.len() - 1],
         ] {
             std::fs::write(&marker, format).unwrap();
@@ -1463,6 +1610,64 @@ mod tests {
         }
         std::fs::write(&marker, STORAGE_FORMAT).unwrap();
         assert!(validate_storage_format(directory.path()).unwrap());
+    }
+
+    #[test]
+    fn given_partitions_off_shard_zero_when_booting_one_shard_should_refuse() {
+        assert!(check_partition_shards(PartitionShards::new(1, true)).is_err());
+        assert!(check_partition_shards(PartitionShards::new(1, false)).is_ok());
+        assert!(check_partition_shards(PartitionShards::new(2, true)).is_ok());
+    }
+
+    #[test]
+    fn given_partitions_off_shard_zero_when_a_replica_link_stays_on_it_should_warn() {
+        const SHARDS: u16 = 4;
+        let coordinator = ClusterCoordinatorConfig {
+            skip_shard_zero_for_partitions: true,
+            skip_shard_zero_for_replicas: false,
+            replica_connections_per_peer: 1,
+            ..ClusterCoordinatorConfig::default()
+        };
+        let cluster = |coordinator: ClusterCoordinatorConfig| ClusterConfig {
+            enabled: true,
+            coordinator,
+            ..ClusterConfig::default()
+        };
+        assert!(partition_frames_cross_shard_zero(
+            &cluster(coordinator.clone()),
+            SHARDS
+        ));
+
+        let standalone = ClusterConfig {
+            enabled: false,
+            ..cluster(coordinator.clone())
+        };
+        let mut one_node = cluster(coordinator.clone());
+        one_node.nodes.truncate(1);
+        let partitions_on_shard_zero = cluster(ClusterCoordinatorConfig {
+            skip_shard_zero_for_partitions: false,
+            ..coordinator
+        });
+        let links_off_shard_zero = cluster(ClusterCoordinatorConfig {
+            skip_shard_zero_for_replicas: true,
+            ..coordinator
+        });
+        let one_link_per_shard = cluster(ClusterCoordinatorConfig {
+            replica_connections_per_peer: SHARDS,
+            ..coordinator
+        });
+        for (case, cluster) in [
+            ("standalone", standalone),
+            ("one node", one_node),
+            ("partitions on shard 0", partitions_on_shard_zero),
+            ("links off shard 0", links_off_shard_zero),
+            ("one link per shard", one_link_per_shard),
+        ] {
+            assert!(
+                !partition_frames_cross_shard_zero(&cluster, SHARDS),
+                "{case}"
+            );
+        }
     }
 
     /// A share of nothing sheds every ring to its newest entry from the
@@ -1499,6 +1704,7 @@ mod tests {
             b"IGGY-BOUND-GRANTS-5\n",
             b"IGGY-RESOURCE-OPTIONS-1\n",
             b"IGGY-METADATA-CHANGE-LOG-1\n",
+            b"IGGY-METADATA-CHANGE-LOG-2\n",
         ] {
             assert_ne!(
                 message_bus::replica::handshake::binary_identity(crate::VERSION, STORAGE_FORMAT),

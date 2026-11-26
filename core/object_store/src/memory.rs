@@ -15,8 +15,9 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::mem;
 use std::ops::{Bound, Range};
 use std::time::SystemTime;
 
@@ -30,6 +31,10 @@ use crate::store::{
     validate_metadata, validate_prefix, validate_range,
 };
 
+/// The most bytes that [`read_body`] reserves up front for a body of several
+/// pieces. The declared length is not checked against the pieces yet.
+const MAX_BODY_RESERVATION: usize = 64 * 1024 * 1024;
+
 /// An [`ObjectStore`] in memory, with no faults.
 ///
 /// Every call answers at once, except that a put waits for its body. A put
@@ -38,8 +43,14 @@ use crate::store::{
 /// It keeps the contract, which [`crate::contract`] checks.
 #[derive(Debug, Default)]
 pub struct MemoryStore {
-    objects: RefCell<BTreeMap<String, StoredObject>>,
-    puts: Cell<u64>,
+    objects: RefCell<Objects>,
+}
+
+/// The objects of a store in memory, and the number of puts that committed.
+#[derive(Debug, Default)]
+pub struct Objects {
+    objects: BTreeMap<String, StoredObject>,
+    puts: u64,
 }
 
 #[derive(Debug)]
@@ -60,7 +71,7 @@ impl MemoryStore {
     /// Every key, in byte order.
     #[must_use]
     pub fn keys(&self) -> Vec<String> {
-        self.objects.borrow().keys().cloned().collect()
+        self.objects.borrow().keys()
     }
 
     #[must_use]
@@ -70,7 +81,7 @@ impl MemoryStore {
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.objects.borrow().is_empty()
+        self.objects.borrow().len() == 0
     }
 }
 
@@ -83,37 +94,11 @@ impl ObjectStore for MemoryStore {
     ) -> Result<(), ObjectStoreError> {
         validate_key(key)?;
         validate_metadata(&options.metadata)?;
-        let mut pieces = body.into_pieces();
-        let mut bytes = BytesMut::new();
-        while let Some(piece) = pieces.next().await {
-            bytes.extend_from_slice(&piece.map_err(ObjectStoreError::Body)?);
-        }
-        let bytes = bytes.freeze();
-        let crc32c = crc32c::crc32c(&bytes);
-        if options.crc32c.is_some_and(|expected| expected != crc32c) {
-            return Err(ObjectStoreError::ChecksumMismatch {
-                key: key.to_owned(),
-            });
-        }
-        let mut objects = self.objects.borrow_mut();
-        if options.mode == PutMode::IfAbsent && objects.contains_key(key) {
-            return Err(ObjectStoreError::PreconditionFailed {
-                key: key.to_owned(),
-            });
-        }
-        let version = self.puts.get() + 1;
-        self.puts.set(version);
-        objects.insert(
-            key.to_owned(),
-            StoredObject {
-                bytes,
-                metadata: options.metadata.clone(),
-                etag: format!("{version:016x}"),
-                last_modified: SystemTime::now(),
-                crc32c,
-            },
-        );
-        Ok(())
+        let bytes = read_body(body).await?;
+        let crc32c = checked_crc32c(key, &bytes, options)?;
+        self.objects
+            .borrow_mut()
+            .insert(key, bytes, crc32c, options)
     }
 
     async fn get_range(
@@ -123,8 +108,111 @@ impl ObjectStore for MemoryStore {
     ) -> Result<ObjectRange, ObjectStoreError> {
         validate_key(key)?;
         validate_range(&range)?;
-        let objects = self.objects.borrow();
-        let object = objects.get(key).ok_or_else(|| not_found(key))?;
+        self.objects.borrow().get_range(key, &range)
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+        validate_key(key)?;
+        self.objects.borrow().head(key)
+    }
+
+    async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+        validate_delete(keys)?;
+        Ok(self.objects.borrow_mut().delete(keys))
+    }
+
+    async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+        validate_prefix(request.prefix)?;
+        Ok(self.objects.borrow().list(request))
+    }
+}
+
+/// The whole body of a put. A body of one piece is kept as it came, without
+/// a copy.
+pub async fn read_body(body: PutBody) -> Result<Bytes, ObjectStoreError> {
+    let reservation = usize::try_from(body.len())
+        .unwrap_or(usize::MAX)
+        .min(MAX_BODY_RESERVATION);
+    let mut pieces = body.into_pieces();
+    let mut whole = Bytes::new();
+    let mut joined = BytesMut::new();
+    while let Some(piece) = pieces.next().await {
+        let piece = piece.map_err(ObjectStoreError::Body)?;
+        if whole.is_empty() && joined.is_empty() {
+            whole = piece;
+            continue;
+        }
+        if joined.is_empty() {
+            joined.reserve(reservation.max(whole.len() + piece.len()));
+            joined.extend_from_slice(&mem::take(&mut whole));
+        }
+        joined.extend_from_slice(&piece);
+    }
+    Ok(if joined.is_empty() {
+        whole
+    } else {
+        joined.freeze()
+    })
+}
+
+/// The CRC32C of `bytes`, which must equal the one that `options` declares.
+pub fn checked_crc32c(
+    key: &str,
+    bytes: &[u8],
+    options: &PutOptions,
+) -> Result<u32, ObjectStoreError> {
+    let crc32c = crc32c::crc32c(bytes);
+    if options.crc32c.is_some_and(|expected| expected != crc32c) {
+        return Err(ObjectStoreError::ChecksumMismatch {
+            key: key.to_owned(),
+        });
+    }
+    Ok(crc32c)
+}
+
+impl Objects {
+    pub fn keys(&self) -> Vec<String> {
+        self.objects.keys().cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// Commits a put whose body arrived whole, and decides
+    /// [`PutMode::IfAbsent`] now.
+    pub fn insert(
+        &mut self,
+        key: &str,
+        bytes: Bytes,
+        crc32c: u32,
+        options: &PutOptions,
+    ) -> Result<(), ObjectStoreError> {
+        if options.mode == PutMode::IfAbsent && self.objects.contains_key(key) {
+            return Err(ObjectStoreError::PreconditionFailed {
+                key: key.to_owned(),
+            });
+        }
+        self.puts += 1;
+        self.objects.insert(
+            key.to_owned(),
+            StoredObject {
+                bytes,
+                metadata: options.metadata.clone(),
+                etag: format!("{:016x}", self.puts),
+                last_modified: SystemTime::now(),
+                crc32c,
+            },
+        );
+        Ok(())
+    }
+
+    pub fn get_range(
+        &self,
+        key: &str,
+        range: &Range<u64>,
+    ) -> Result<ObjectRange, ObjectStoreError> {
+        let object = self.objects.get(key).ok_or_else(|| not_found(key))?;
         let bytes = &object.bytes;
         let start = usize::try_from(range.start)
             .ok()
@@ -142,10 +230,8 @@ impl ObjectStore for MemoryStore {
         })
     }
 
-    async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
-        validate_key(key)?;
-        let objects = self.objects.borrow();
-        let object = objects.get(key).ok_or_else(|| not_found(key))?;
+    pub fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+        let object = self.objects.get(key).ok_or_else(|| not_found(key))?;
         Ok(ObjectMeta {
             size: object.bytes.len() as u64,
             etag: object.etag.clone(),
@@ -155,14 +241,12 @@ impl ObjectStore for MemoryStore {
         })
     }
 
-    async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
-        validate_delete(keys)?;
-        let mut objects = self.objects.borrow_mut();
+    pub fn delete(&mut self, keys: &[String]) -> DeleteOutcome {
         let mut outcome = DeleteOutcome::default();
         for key in keys {
             match validate_key(key) {
                 Ok(()) => {
-                    objects.remove(key);
+                    self.objects.remove(key);
                 }
                 Err(error) => outcome.failed.push(DeleteFailure {
                     key: key.clone(),
@@ -170,19 +254,18 @@ impl ObjectStore for MemoryStore {
                 }),
             }
         }
-        Ok(outcome)
+        outcome
     }
 
-    async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
-        validate_prefix(request.prefix)?;
+    pub fn list(&self, request: &ListRequest<'_>) -> ListPage {
         // A continuation from another listing can sort before the prefix,
         // and the scan must still start inside it.
         let start = match request.continuation {
             Some(after) if after >= request.prefix => Bound::Excluded(after),
             _ => Bound::Included(request.prefix),
         };
-        let objects = self.objects.borrow();
-        let mut matching = objects
+        let mut matching = self
+            .objects
             .range::<str, _>((start, Bound::Unbounded))
             .take_while(|(key, _)| key.starts_with(request.prefix));
         let listed: Vec<ListedObject> = matching
@@ -199,10 +282,10 @@ impl ObjectStore for MemoryStore {
             .next()
             .and_then(|_| listed.last())
             .map(|last| last.key.clone());
-        Ok(ListPage {
+        ListPage {
             objects: listed,
             next,
-        })
+        }
     }
 }
 

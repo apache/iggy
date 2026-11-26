@@ -1,0 +1,40 @@
+---
+title: Idempotent Producers
+description: "Prevent duplicate appends of a retried producer batch and understand the limits of that guarantee."
+---
+
+An idempotent producer lets a partition recognize a batch it already accepted. Each batch carries a producer ID, epoch and sequence. This identity survives a reconnect under a new client session. It is separate from the ID field of an individual message.
+
+## Rust producer
+
+The Rust high-level producer supports opt-in idempotence on binary transports:
+
+```rust
+use iggy::prelude::*;
+use std::str::FromStr;
+
+let producer = client.producer("orders", "created")?.idempotent().build();
+producer.init().await?;
+producer.send_one(IggyMessage::from_str("order-created")?).await?;
+producer.shutdown().await;
+```
+
+The fragment assumes a connected `IggyClient` in an async function. Initialization obtains the producer ID. The producer selects each chunk's partition and sends chunks for that partition in sequence. The default producer does not enable this mode.
+
+Do not treat a message ID as a deduplication key. Recreating a producer or submitting the same business event as a new batch is not the same as retrying the original producer batch. Consumers still need application-level handling for repeated work.
+
+## Kafka gateway
+
+Set `IGGY_KAFKA_IDEMPOTENT_PRODUCERS=true` on the Kafka gateway to enable its idempotent producer path. The bridge must also be enabled. The default is false. Without this switch, a Kafka producer can obtain an ID but its retries do not receive the batch deduplication guarantee.
+
+The gateway does not support transactions. Idempotent appends do not make application processing and offset commits one atomic operation. See [Kafka gateway](/docs/gateways/kafka).
+
+## Retained producer history
+
+Each partition retains the last five batches of each producer and at most 4096 producers. A producer idle for 24 hours can expire. A retry outside this retained history can append a duplicate. These limits also apply to the gateway and source connector paths.
+
+## Compatibility and recovery
+
+Upgrade every reader of the topic to a compatible 0.10 client before writing producer-aware batches. The batch format contains additional producer fields. The older SDKs cannot safely decode it.
+
+Session retry protection and producer idempotence solve different problems. A client can retain an uncertain request and resolve it using its original identity. Ending that session can remove receipt access. An idempotent producer adds batch identity at the partition level, but does not turn an uncertain application operation into a confirmed success.

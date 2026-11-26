@@ -36,6 +36,7 @@ import tools.jackson.databind.JsonNode;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 class SystemHttpClient implements SystemClient {
 
@@ -45,6 +46,7 @@ class SystemHttpClient implements SystemClient {
     private static final String PING = "/ping";
     private static final String OPTIONS = "/options";
     private static final String METADATA_CHANGES = "/metadata/changes";
+    private static final String GEO_ORIGINS = "/geo/origins";
     private final InternalHttpClient httpClient;
 
     public SystemHttpClient(InternalHttpClient httpClient) {
@@ -75,6 +77,12 @@ class SystemHttpClient implements SystemClient {
         query.validate();
         var request = httpClient.prepareGetRequest(METADATA_CHANGES + "?" + query.httpQuery());
         return MetadataChangesJson.read(httpClient.execute(request, JsonNode.class));
+    }
+
+    @Override
+    public void retireGeoOrigin(String origin) {
+        var path = GEO_ORIGINS + "/" + PathSegment.encode(origin, "Geo origin") + "/retire";
+        httpClient.execute(httpClient.preparePostRequest(path, Map.of()));
     }
 
     @Override

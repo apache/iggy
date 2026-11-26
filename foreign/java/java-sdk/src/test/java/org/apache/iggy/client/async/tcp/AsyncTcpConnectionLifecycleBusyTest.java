@@ -569,6 +569,7 @@ class AsyncTcpConnectionLifecycleBusyTest {
                                 Partitioning.partitionId(0L),
                                 List.of(Message.of("m")));
                 firstSend.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+                awaitDroppedSignInLink(client);
                 client.sendBinaryRequest(GET_STATS_CODE, new byte[0]).get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
                 refuse.complete(null);
                 sent.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
@@ -585,6 +586,19 @@ class AsyncTcpConnectionLifecycleBusyTest {
             }
             leaderServed.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             primaryServed.get(TEST_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * The leader drops the link right after the route. A read sent before the client sees the drop goes out on that
+     * link and fails with it, so the read waits until the drop leaves the client without the link. The client dials
+     * the next link only for the next request, so the wait cannot miss the drop.
+     */
+    private static void awaitDroppedSignInLink(AsyncIggyTcpClient client) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(TEST_TIMEOUT_SECONDS);
+        while (client.hasOpenSignInLink()) {
+            assertThat(System.nanoTime()).as("the client sees the dropped link").isLessThan(deadline);
+            Thread.sleep(1);
         }
     }
 

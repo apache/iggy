@@ -21,13 +21,15 @@ import { HeaderValue } from '../message/header.utils.js';
 import { wrapCommand } from '../command.utils.js';
 import { OptionsScope } from '../system/describe-options.command.js';
 import { UPDATE_RESOURCE, columnOption } from '../system/update-resource.command.js';
+import { geoDurationOptions, type GeoTopicDurations } from './topic.utils.js';
 
 
 /**
  * Parameters for the update topic command. Keys left out keep their values.
- * Settings fixed at create, compression among them, have no field here.
+ * Settings fixed at create, compression among them, have no field here. The
+ * durations of a geo topic can be set, `0n` included, but not reset.
  */
-export type UpdateTopic = {
+export type UpdateTopic = GeoTopicDurations & {
   /** Stream identifier (ID or name) */
   streamId: Id,
   /** Topic identifier (ID or name) */
@@ -99,6 +101,12 @@ export const UPDATE_TOPIC = {
     tieredStorage,
     localRetentionAge = 0n,
     localRetentionSize = 0n,
+    freshUploadInterval,
+    consumerOffsetUploadInterval,
+    positionsPublishInterval,
+    tombstoneGrace,
+    positionsResumeTimeout,
+    longTermRewriteMaxInterval,
     reset,
     rawReset,
     options: rawOptions
@@ -131,6 +139,10 @@ export const UPDATE_TOPIC = {
         key: 'local_retention_size',
         value: HeaderValue.Uint64(localRetentionSize)
       });
+    options.push(...geoDurationOptions({
+      freshUploadInterval, consumerOffsetUploadInterval, positionsPublishInterval,
+      tombstoneGrace, positionsResumeTimeout, longTermRewriteMaxInterval
+    }));
 
     return UPDATE_RESOURCE.serialize({
       target: { scope: OptionsScope.Topic, streamId, topicId }, options, reset, rawOptions, rawReset

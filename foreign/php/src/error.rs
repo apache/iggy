@@ -28,6 +28,7 @@ use ext_php_rs::{
     zend::{ClassEntry, ExecutorGlobals, ce},
 };
 use iggy::prelude::{IggyError, ReadError};
+use serde_json::Value;
 
 use crate::receive_message::PollingStrategy;
 
@@ -184,6 +185,9 @@ pub(crate) fn to_php_exception(error: impl IntoPhpException) -> PhpException {
 
 impl IntoPhpException for IggyError {
     fn into_php_exception(self) -> PhpException {
+        if let Some(refusal) = HttpOptionRefusal::from_error(&self) {
+            return refusal.into_php_exception();
+        }
         let message = self.to_string();
         let code = self.as_code() as i32;
 
@@ -224,6 +228,52 @@ impl IntoPhpException for String {
 impl IntoPhpException for &str {
     fn into_php_exception(self) -> PhpException {
         PhpException::from_class::<IggyException>(self.to_string())
+    }
+}
+
+/// An option refusal read from the JSON error body of the HTTP API, so that HTTP throws it with
+/// the code a binary transport throws.
+struct HttpOptionRefusal {
+    error: IggyError,
+    reason: String,
+}
+
+impl HttpOptionRefusal {
+    fn from_error(error: &IggyError) -> Option<Self> {
+        let IggyError::HttpResponseError(_, body) = error else {
+            return None;
+        };
+        let body: Value = serde_json::from_str(body).ok()?;
+        let id = u32::try_from(body.get("id")?.as_u64()?).ok()?;
+        let refused = IggyError::from_code(id);
+        let is_option_refusal = matches!(
+            refused,
+            IggyError::UnsupportedOptionKey(_)
+                | IggyError::InvalidOptionValue(_)
+                | IggyError::OptionsBlockTooLarge(_)
+                | IggyError::OptionNotUpdatable(_)
+                | IggyError::OptionNotResettable(_)
+                | IggyError::ReadOnlyOption(_)
+                | IggyError::StreamEncryptionUnavailable
+                | IggyError::UnsupportedCriticalOption(_)
+                | IggyError::CannotModifyRootUser
+                | IggyError::InvalidReplicationFactor
+        );
+        if !is_option_refusal {
+            return None;
+        }
+        let reason = body.get("reason")?.as_str()?.to_owned();
+        Some(Self {
+            error: refused,
+            reason,
+        })
+    }
+}
+
+impl IntoPhpException for HttpOptionRefusal {
+    fn into_php_exception(self) -> PhpException {
+        let code = self.error.as_code() as i32;
+        PhpException::new(self.reason, code, exception_class(&self.error))
     }
 }
 
@@ -382,6 +432,50 @@ impl From<&IggyError> for PhpExceptionKind {
 mod tests {
     use super::*;
     use iggy::prelude::PollingStrategy as RustPollingStrategy;
+    use serde_json::json;
+
+    /// `error` as the HTTP client returns it, rendered into the JSON error body.
+    fn http_error(status: u16, error: &IggyError) -> IggyError {
+        let body = json!({
+            "id": error.as_code(),
+            "code": error.as_string(),
+            "reason": error.to_string(),
+            "field": null,
+        });
+        IggyError::HttpResponseError(status, body.to_string())
+    }
+
+    #[test]
+    fn given_an_option_refusal_over_http_when_converting_should_take_its_code_and_reason() {
+        let refused = IggyError::InvalidOptionValue("tombstone_grace".to_owned());
+
+        let refusal = HttpOptionRefusal::from_error(&http_error(400, &refused))
+            .expect("an option refusal in the body");
+
+        assert_eq!(refusal.error.as_code(), refused.as_code());
+        assert_eq!(refusal.reason, refused.to_string());
+        let root =
+            HttpOptionRefusal::from_error(&http_error(400, &IggyError::CannotModifyRootUser))
+                .expect("a root refusal in the body");
+        assert!(matches!(
+            PhpExceptionKind::from(&root.error),
+            PhpExceptionKind::Authentication
+        ));
+    }
+
+    #[test]
+    fn given_another_http_error_when_converting_should_keep_the_http_error() {
+        for error in [
+            http_error(400, &IggyError::InvalidCommand),
+            http_error(400, &IggyError::FeatureUnavailable),
+            IggyError::HttpResponseError(400, "not json".to_owned()),
+            IggyError::HttpResponseError(400, json!({ "id": 4042 }).to_string()),
+            IggyError::HttpResponseError(400, json!({ "id": -1, "reason": "x" }).to_string()),
+            IggyError::InvalidOptionValue(String::new()),
+        ] {
+            assert!(HttpOptionRefusal::from_error(&error).is_none(), "{error:?}");
+        }
+    }
 
     #[test]
     fn pending_operation_errors_preserve_exact_identity_and_kind() {
@@ -445,6 +539,20 @@ mod tests {
             PhpExceptionKind::from(&error),
             PhpExceptionKind::Base
         ));
+    }
+
+    // The Rust SDK returns 1021 without a retry, so the binding only has to keep its code and
+    // keep it out of the transient class that invites one.
+    #[test]
+    fn given_shadow_stream_refusal_when_classifying_should_keep_its_code_and_not_be_transient() {
+        let error = IggyError::ShadowStreamReadOnly;
+        assert_eq!(error.as_code(), 1021);
+        assert_eq!(error.as_string(), "shadow_stream_read_only");
+        assert!(matches!(
+            PhpExceptionKind::from(&error),
+            PhpExceptionKind::Base
+        ));
+        assert!(PendingOperationException::from_error(&error).is_none());
     }
 
     #[test]

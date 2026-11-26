@@ -16,17 +16,17 @@
 // under the License.
 
 use crate::cache::read_report;
+use crate::card::CardRenderer;
 use crate::dedicated_thread::{DedicatedThread, ThreadStopped};
 use crate::error::IggyBenchDashboardServerError;
+use bench_dashboard_shared::card::RunCard;
+use bench_dashboard_shared::embed::ChartType;
 use bench_report::report::BenchmarkReport;
 use charming::Chart;
 use charming::renderer::image_renderer::{ImageFormat, ImageRenderer};
 use charming::theme::Theme;
-use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::str::FromStr;
-use tokio::sync::{Mutex, MutexGuard};
 use tracing::info;
 
 /// charming writes the text between two of these marks as JavaScript, and keeps its own copy of
@@ -35,39 +35,7 @@ pub(crate) const RAW_MARK: &str = "#*#*#*#";
 
 const RENDER_THREAD: &str = "png-render";
 const CHART_THREAD: &str = "embed-chart";
-
-/// The chart of a run that an embed shows, named as in the `type` query parameter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChartType {
-    Latency,
-    Throughput,
-    Distribution,
-}
-
-impl FromStr for ChartType {
-    type Err = IggyBenchDashboardServerError;
-
-    fn from_str(chart_type: &str) -> Result<Self, Self::Err> {
-        match chart_type {
-            "latency" => Ok(Self::Latency),
-            "throughput" => Ok(Self::Throughput),
-            "distribution" => Ok(Self::Distribution),
-            _ => Err(IggyBenchDashboardServerError::BadRequest(format!(
-                "Invalid chart type: '{chart_type}'. Must be 'latency', 'throughput', or 'distribution'"
-            ))),
-        }
-    }
-}
-
-impl fmt::Display for ChartType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Latency => "latency",
-            Self::Throughput => "throughput",
-            Self::Distribution => "distribution",
-        })
-    }
-}
+const CARD_THREAD: &str = "card-render";
 
 /// A run's chart with the line that names its machine and server version.
 pub struct EmbedChart {
@@ -95,10 +63,13 @@ pub fn without_raw_mark(text: &str) -> String {
 /// A chart build reads a whole report, up to 90 MB of JSON, so it runs on a second thread. That
 /// keeps the read and parse off the actix workers, and one build at a time bounds their memory,
 /// as in `SeriesBuilder`.
+///
+/// A preview card needs no V8, so it renders on a third thread. That thread loads the system fonts
+/// for its first card.
 pub struct PngRenderPool {
     thread: DedicatedThread<RenderJob, Result<Vec<u8>, String>>,
     charts: DedicatedThread<ChartJob, Result<EmbedChart, IggyBenchDashboardServerError>>,
-    cache_turn: Mutex<()>,
+    cards: DedicatedThread<RunCard, Result<Vec<u8>, String>>,
 }
 
 impl PngRenderPool {
@@ -114,24 +85,23 @@ impl PngRenderPool {
             render(&job.chart, job.width, job.height, job.dark)
         })?;
         let charts = DedicatedThread::start(CHART_THREAD, EmbedChart::load)?;
+        let mut card_renderer = None;
+        let cards = DedicatedThread::start(CARD_THREAD, move |card: RunCard| {
+            if card_renderer.is_none() {
+                card_renderer = Some(CardRenderer::new()?);
+            }
+            card_renderer.as_ref().map_or_else(
+                || Err("no card renderer".to_owned()),
+                |renderer| renderer.render(&card),
+            )
+        })?;
 
-        info!("PNG render and embed chart threads started");
+        info!("PNG render, embed chart and card threads started");
         Ok(Self {
             thread,
             charts,
-            cache_turn: Mutex::new(()),
+            cards,
         })
-    }
-
-    pub fn default_pool() -> io::Result<Self> {
-        Self::new()
-    }
-
-    /// The turn to build, render and store a PNG for the disk cache. One request at a time holds
-    /// it, so the requests that missed the cache during the first render of a PNG can read its file
-    /// in their turn instead of queuing the same render.
-    pub async fn cache_turn(&self) -> MutexGuard<'_, ()> {
-        self.cache_turn.lock().await
     }
 
     /// The `chart_type` chart of the report at `report`, with `subtext` in place of the report's
@@ -174,6 +144,14 @@ impl PngRenderPool {
             })
             .await
             .map_err(|ThreadStopped| "render pool shut down".to_string())?
+    }
+
+    /// The preview card as a PNG of [`bench_dashboard_shared::card::CARD_SIZE`].
+    pub async fn render_card(&self, card: RunCard) -> Result<Vec<u8>, String> {
+        self.cards
+            .run(card)
+            .await
+            .map_err(|ThreadStopped| "card render thread shut down".to_owned())?
     }
 
     fn render(chart: &Chart, width: u32, height: u32, dark: bool) -> Result<Vec<u8>, String> {

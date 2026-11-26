@@ -15,12 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
+pub mod card;
 pub mod config;
 pub mod delta;
+pub mod embed;
+pub mod format;
 pub mod github;
+pub mod head;
+pub mod headline;
+pub mod history;
+pub mod html;
 pub mod identity;
+pub mod labels;
 pub mod metrics;
 pub mod omb;
+pub mod pages;
 pub mod series;
 pub mod subtext;
 pub mod summary;

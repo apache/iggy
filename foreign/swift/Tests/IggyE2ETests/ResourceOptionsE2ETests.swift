@@ -184,6 +184,10 @@ struct ResourceOptionsE2ETests {
             let fixedName = E2EEnvironment.uniqueName("swift-fixed")
             let fixed = try await client.createTopic(streamID: streamID, name: fixedName, options: TopicCreateOptions(partitionResizePolicy: .fixed))
             #expect(fixed.options[TopicOptionKey.partitionResizePolicy.rawValue] == .explicit("fixed"))
+
+            let normalName = E2EEnvironment.uniqueName("swift-normal")
+            let normal = try await client.createTopic(streamID: streamID, name: normalName, options: TopicCreateOptions(topicType: .normal))
+            #expect(normal.options[TopicOptionKey.topicType.rawValue] == .explicit("normal"))
         }
     }
 

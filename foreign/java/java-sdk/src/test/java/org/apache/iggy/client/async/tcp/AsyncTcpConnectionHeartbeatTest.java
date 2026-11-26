@@ -28,6 +28,7 @@ import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.time.Duration;
@@ -74,6 +75,10 @@ class AsyncTcpConnectionHeartbeatTest {
                             receivedTwoHeartbeats.complete(null);
                         }
                     }
+                } catch (SocketException linkGone) {
+                    // A ping that arrives as the client closes gets its reply on a closed link, and the client resets
+                    // it. After two heartbeats that ends the run as a clean close does. Before them, the test fails.
+                    receivedTwoHeartbeats.completeExceptionally(linkGone);
                 } catch (IOException error) {
                     receivedTwoHeartbeats.completeExceptionally(error);
                     throw new IllegalStateException("Mock VSR server failed", error);

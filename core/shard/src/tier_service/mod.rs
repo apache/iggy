@@ -29,7 +29,9 @@
 //! good. The optional work yields across classes: a speculative fetch does
 //! not start while a demand fetch waits, and housekeeping does not start
 //! while a fetch or an upload waits. Uploads never wait for another class,
-//! because a held upload keeps segments on a disk that is filling. Deletes
+//! because a held upload keeps segments on a disk that is filling. The
+//! uploads of fresh objects are a class apart from them, because producers
+//! wait for those and a segment upload can take minutes. Deletes
 //! have their own quota and never wait either, so deletion keeps pace with
 //! uploads.
 //!
@@ -81,6 +83,7 @@ pub struct ClassLimits {
 pub struct TierServiceConfig {
     pub demand_fetch: ClassLimits,
     pub upload: ClassLimits,
+    pub fresh_upload: ClassLimits,
     pub speculative_fetch: ClassLimits,
     pub delete: ClassLimits,
     pub housekeeping: ClassLimits,
@@ -93,6 +96,7 @@ impl TierServiceConfig {
         match class {
             TierJobClass::DemandFetch => self.demand_fetch,
             TierJobClass::Upload => self.upload,
+            TierJobClass::FreshUpload => self.fresh_upload,
             TierJobClass::SpeculativeFetch => self.speculative_fetch,
             TierJobClass::Delete => self.delete,
             TierJobClass::Housekeeping => self.housekeeping,
@@ -112,6 +116,12 @@ impl Default for TierServiceConfig {
             upload: ClassLimits {
                 jobs: 2,
                 bytes: Some(2048 * MIB),
+            },
+            // No byte cap: the shard that fills the objects bounds the bytes
+            // it holds in them.
+            fresh_upload: ClassLimits {
+                jobs: crate::FRESH_UPLOADS,
+                bytes: None,
             },
             speculative_fetch: ClassLimits {
                 jobs: 4,
@@ -292,7 +302,7 @@ struct Inner<S, B> {
     bus: B,
     store: Rc<TierStore<S, B>>,
     /// Indexed by [`slot`].
-    classes: RefCell<[ClassState; 5]>,
+    classes: RefCell<[ClassState; 6]>,
 }
 
 impl<S, B> Inner<S, B> {
@@ -393,14 +403,18 @@ impl<S, B> Drop for HeldSlot<S, B> {
 
 /// Whether the queue of `class` may start a job while the other classes wait
 /// as they do.
-fn may_start(classes: &[ClassState; 5], class: TierJobClass) -> bool {
+fn may_start(classes: &[ClassState; 6], class: TierJobClass) -> bool {
     let waits = |other| classes[slot(other)].waits();
     match class {
-        TierJobClass::DemandFetch | TierJobClass::Upload | TierJobClass::Delete => true,
+        TierJobClass::DemandFetch
+        | TierJobClass::Upload
+        | TierJobClass::FreshUpload
+        | TierJobClass::Delete => true,
         TierJobClass::SpeculativeFetch => !waits(TierJobClass::DemandFetch),
         TierJobClass::Housekeeping => {
             !waits(TierJobClass::DemandFetch)
                 && !waits(TierJobClass::Upload)
+                && !waits(TierJobClass::FreshUpload)
                 && !waits(TierJobClass::SpeculativeFetch)
         }
     }
@@ -410,8 +424,9 @@ const fn slot(class: TierJobClass) -> usize {
     match class {
         TierJobClass::DemandFetch => 0,
         TierJobClass::Upload => 1,
-        TierJobClass::SpeculativeFetch => 2,
-        TierJobClass::Delete => 3,
-        TierJobClass::Housekeeping => 4,
+        TierJobClass::FreshUpload => 2,
+        TierJobClass::SpeculativeFetch => 3,
+        TierJobClass::Delete => 4,
+        TierJobClass::Housekeeping => 5,
     }
 }

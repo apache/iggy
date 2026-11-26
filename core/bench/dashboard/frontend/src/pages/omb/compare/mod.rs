@@ -24,9 +24,11 @@ mod matrix;
 mod settings;
 mod summary;
 
+use bench_dashboard_shared::labels::messages_text;
 use bench_dashboard_shared::omb::compare::OmbComparability;
 use bench_dashboard_shared::omb::detail::OmbRunDetail;
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::{conditions, environment_text, run_name, short_id};
 use bench_dashboard_shared::omb::summary::{OmbRunList, OmbRunSummary};
 use yew::prelude::*;
 use yew_router::Routable;
@@ -43,7 +45,6 @@ use crate::api::fetch_omb_run;
 use crate::components::chart::series_color;
 use crate::components::headline::neutral_chip;
 use crate::components::page::{breadcrumbs, page_shell, section_head};
-use crate::components::run_labels::messages_text;
 use crate::components::section_nav::{NavSection, SectionNav};
 use crate::components::share_button::ShareButton;
 use crate::pages::compare::RUN_COLORS;
@@ -52,8 +53,8 @@ use crate::pages::compare::runs::{
 };
 use crate::pages::omb::common::{
     CONSUME_HINT, END_TO_END_LATENCY_HINT, EndToEnd, MESSAGES_HINT, OmbCompareLink,
-    PUBLISH_LATENCY_HINT, PUBLISH_THROUGHPUT_HINT, conditions, driver_tag, environment_text,
-    omb_crumb, omb_page_head, run_name, run_route, runs_status, short_id, time_view, version_view,
+    PUBLISH_LATENCY_HINT, PUBLISH_THROUGHPUT_HINT, driver_tag, omb_crumb, omb_page_head, run_route,
+    runs_status, time_view, version_view,
 };
 use crate::router::AppRoute;
 use crate::state::data::{Loadable, fetch_into};

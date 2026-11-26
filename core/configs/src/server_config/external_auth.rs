@@ -16,10 +16,9 @@
 // under the License.
 
 use crate::ConfigurationError;
-use configs::ConfigEnv;
+use configs::{ConfigEnv, DisplayFromStrOrNumber};
 use iggy_common::{IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
-use serde_with::DisplayFromStr;
 use serde_with::serde_as;
 
 /// External authentication callout configuration.
@@ -41,7 +40,7 @@ pub struct ExternalAuthConfig {
     #[serde(default, skip_serializing)]
     #[config_env(secret)]
     pub url: String,
-    #[serde_as(as = "DisplayFromStr")]
+    #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_external_auth_timeout")]
     #[config_env(leaf)]
     pub timeout: IggyDuration,

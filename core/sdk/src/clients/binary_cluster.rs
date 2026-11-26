@@ -25,4 +25,8 @@ impl ClusterClient for IggyClient {
     async fn get_cluster_metadata(&self) -> Result<ClusterMetadata, IggyError> {
         super::with_client!(self, client => client.get_cluster_metadata().await)
     }
+
+    async fn retire_geo_origin(&self, origin: &str) -> Result<(), IggyError> {
+        super::with_client!(self, client => client.retire_geo_origin(origin).await)
+    }
 }

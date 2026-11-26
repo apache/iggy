@@ -22,6 +22,7 @@
 
 use bench_dashboard_shared::delta::ValueRange;
 use bench_dashboard_shared::omb::id::OmbRunId;
+use bench_dashboard_shared::omb::labels::{NO_VALUE, run_name, version_text};
 use bench_dashboard_shared::omb::summary::OmbRunSummary;
 use yew::prelude::*;
 use yew_router::prelude::Link;
@@ -29,8 +30,7 @@ use yew_router::prelude::Link;
 use super::change::Kpi;
 use super::chart::RunsChart;
 use crate::pages::omb::common::{
-    LineOrder, NO_VALUE, OmbCompareLink, day_view, line_order, run_name, run_route, version_text,
-    version_view,
+    LineOrder, OmbCompareLink, day_view, line_order, run_route, version_view,
 };
 use crate::router::AppRoute;
 

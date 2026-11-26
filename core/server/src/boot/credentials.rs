@@ -265,9 +265,9 @@ pub(in crate::boot) fn resolve_root_credentials(
 fn validate_root_journal(metadata_path: &Path) -> Result<bool, ServerError> {
     let snapshot_path = metadata_path.join(SNAPSHOT_FILE_NAME);
     if snapshot_path.exists() {
-        let (snapshot, _) = IggySnapshot::load(&snapshot_path)
+        let sequence_number = IggySnapshot::load_sequence_number(&snapshot_path)
             .map_err(|error| ServerError::MetadataRecovery(RecoveryError::Snapshot(error)))?;
-        if snapshot.snapshot().sequence_number > 0 {
+        if sequence_number > 0 {
             return Ok(true);
         }
     }

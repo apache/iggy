@@ -272,7 +272,7 @@ mod tests {
         // Use HMAC secret to create a simple test DecodingKey
         // Note: This is only for testing cache logic, not a real RSA/EC key
         DecodingKey::from_secret(b"test-secret-key-for-cache-testing-only")
-            .expect("test secret should produce a valid decoding key")
+            .expect("create a key from the non-empty test secret")
     }
 
     #[test]

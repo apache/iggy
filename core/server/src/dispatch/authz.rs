@@ -40,7 +40,7 @@ use iggy_binary_protocol::requests::consumer_groups::{
 };
 use iggy_binary_protocol::requests::partitions::GetPartitionsRequest;
 use iggy_binary_protocol::requests::streams::GetStreamRequest;
-use iggy_binary_protocol::requests::topics::{GetTopicRequest, GetTopicsRequest};
+use iggy_binary_protocol::requests::topics::GetTopicRequest;
 use iggy_binary_protocol::requests::users::GetUserRequest;
 use iggy_binary_protocol::{Operation, PrepareHeader, WireDecode, WireIdentifier, lookup_command};
 use iggy_common::IggyError;
@@ -60,10 +60,11 @@ use crate::shell::{ShellBus, ShellShard};
 /// await and again after its last one, before it builds the reply.
 pub(in crate::dispatch) fn authorize_attached(
     attachment: Option<&SessionAttachment>,
+    now_micros: u64,
     rule: impl FnOnce() -> Result<(), IggyError>,
 ) -> Result<(), IggyError> {
     match attachment {
-        Some(attachment) if attachment.is_valid() => rule(),
+        Some(attachment) if attachment.is_valid_at(now_micros) => rule(),
         Some(_) => Err(IggyError::StaleClient),
         None => Err(IggyError::Unauthenticated),
     }
@@ -124,6 +125,7 @@ where
                 | Operation::RetireSession
                 | Operation::CompleteLifecycle
                 | Operation::RewrapStreamKeys
+                | Operation::ShadowTopic
                 | Operation::TransitionPartitionHistory
                 | Operation::InstallConsumerGroupOwner
                 | Operation::RetireConsumerGroupOwners
@@ -148,6 +150,7 @@ where
                 | Operation::CreatePersonalAccessToken
                 | Operation::DeletePersonalAccessToken
                 | Operation::JoinConsumerGroup
+                | Operation::RetireGeoOrigin
                 | Operation::LeaveConsumerGroup => Ok(()),
             });
     decision.err().map(|error| error.as_code())
@@ -255,7 +258,7 @@ where
     S: 'static,
     SB: SuperblockStore + 'static,
 {
-    authorize_attached(attachment, || {
+    authorize_attached(attachment, shard.bus.realtime_micros(), || {
         authorize_uid(
             shard,
             attachment.map(SessionAttachment::user_id),
@@ -340,7 +343,9 @@ where
         // transport with an `Unauthenticated` Reply before it reaches the
         // builder, so this arm only ever fires if that gate is bypassed.
         GET_CLUSTER_METADATA_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
-        GET_STREAMS_CODE => authorize_uid(shard, user_id, Permissioner::get_streams),
+        // Both lists return only the entries the caller may read (see their
+        // builders), so authentication is the whole gate.
+        GET_STREAMS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_STREAM_CODE => gate_stream_scoped::<GetStreamRequest, _, _, _, _>(
             shard,
             user_id,
@@ -348,13 +353,7 @@ where
             |request| &request.stream_id,
             Permissioner::get_stream,
         ),
-        GET_TOPICS_CODE => gate_stream_scoped::<GetTopicsRequest, _, _, _, _>(
-            shard,
-            user_id,
-            body,
-            |request| &request.stream_id,
-            Permissioner::get_topics,
-        ),
+        GET_TOPICS_CODE => user_id.map(|_| ()).ok_or(IggyError::Unauthenticated),
         GET_TOPIC_CODE => gate_topic_scoped::<GetTopicRequest, _, _, _, _>(
             shard,
             user_id,
@@ -600,7 +599,7 @@ mod tests {
             (GET_STREAM_CODE, allow, allow),
             (GET_STREAMS_CODE, unauthenticated, allow),
             (GET_TOPIC_CODE, allow, allow),
-            (GET_TOPICS_CODE, allow, allow),
+            (GET_TOPICS_CODE, unauthenticated, allow),
             (GET_PARTITIONS_CODE, allow, allow),
             (GET_CONSUMER_GROUP_CODE, allow, allow),
             (GET_CONSUMER_GROUPS_CODE, allow, allow),

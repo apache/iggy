@@ -256,7 +256,7 @@ pub enum MetadataSessionClosedReason {
     Logout,
     #[php(value = "expired")]
     Expired,
-    /// The user was deactivated or deleted.
+    /// A user delete, deactivation, password change, or delete of the session's token.
     #[php(value = "revoked")]
     Revoked,
 }

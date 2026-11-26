@@ -17,7 +17,9 @@
 
 use crate::server::scenarios::create_client;
 use iggy::prelude::Identifier;
+use iggy::prelude::IggyError;
 use iggy::prelude::PersonalAccessTokenExpiry;
+use iggy::prelude::TransportProtocol;
 use iggy::prelude::UserCreateOptions;
 use iggy::prelude::UserStatus;
 use iggy::prelude::UserUpdateOptions;
@@ -119,7 +121,8 @@ pub async fn run(harness: &TestHarness) {
 
     assert!(create_user_result.is_err());
 
-    // 11. Updating your own password should be allowed
+    // 11. Updating your own password should be allowed. Over HTTP the token
+    // issued before the change is refused, so the user signs in again.
     let updated_test_password = "topsecret";
 
     client
@@ -130,6 +133,12 @@ pub async fn run(harness: &TestHarness) {
         )
         .await
         .unwrap();
+    if harness.transport().expect("transport") == TransportProtocol::Http {
+        client
+            .login_user(test_user, updated_test_password)
+            .await
+            .expect("sign in again with the new password");
+    }
 
     // 12. Trying to change the password given the invalid current password should fail
     let change_password = client
@@ -196,7 +205,22 @@ pub async fn run(harness: &TestHarness) {
         .await
         .unwrap();
 
-    // 18. Get personal access tokens and verify that the token is no longer available
+    // 18. Deleting the token this client signed in with ended its session, so it
+    // signs in again before checking that no token is left
+    let refused = client.get_personal_access_tokens().await;
+    assert!(
+        matches!(
+            refused,
+            Err(IggyError::Unauthenticated
+                | IggyError::InvalidCredentials
+                | IggyError::InvalidPersonalAccessToken)
+        ),
+        "deleting the token must end the session it opened, got {refused:?}"
+    );
+    client
+        .login_user(test_user, updated_test_password)
+        .await
+        .unwrap();
     let personal_access_tokens = client.get_personal_access_tokens().await.unwrap();
     assert!(personal_access_tokens.is_empty());
 

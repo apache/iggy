@@ -156,8 +156,8 @@ fn parse_credentials(body: &[u8]) -> Result<FetchedCredentials, CredentialError>
 mod tests {
     use std::time::{Duration, SystemTime};
 
-    use super::super::tests::RecordedTransport;
     use super::*;
+    use crate::credentials::testing::RecordedTransport;
 
     /// A credentials document as EC2 hands it out, with example values.
     const DOCUMENT: &str = r#"{

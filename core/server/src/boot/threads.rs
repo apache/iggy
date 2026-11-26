@@ -20,21 +20,23 @@
 use crate::boot::handoff::{BootstrapBarrier, MetadataHandoff};
 use crate::boot::shard_main;
 use crate::boot::topology::RosterCells;
+use crate::geo_peers::PeerAuth;
 use crate::server_error::{ServerError, ShardJoinFailure, ShardJoinFailureKind};
 use crate::shard_allocator::{ShardAllocator, ShardInfo};
 use crate::shell::ServerShard;
+use crate::tiered_storage::SharedStore;
 use compio::runtime::ResumeUnwind;
 use configs::server::ServerConfig;
 use configs::sharding::{
     INBOX_CAPACITY_MAX, RECONCILE_PERIODIC_INTERVAL_MAX, SHUTDOWN_DRAIN_TIMEOUT_MAX,
     SHUTDOWN_JOIN_TIMEOUT_MAX, SHUTDOWN_POLL_INTERVAL_MAX, SHUTDOWN_PRIMARY_HANDOFF_TIMEOUT_MAX,
 };
-use iggy_object_store::s3::SharedCredentials;
 use message_bus::{IggyMessageBus, ReplicaOwnerTable};
 use metadata::AppliedFrontier;
 use partitions::FatalCommit;
 use server_common::executor::create_shard_executor;
 use shard::metrics::ShardMetrics;
+use shard::peers::SharedPeerStatus;
 use shard::{Receiver as ShardReceiver, Sender, ShardFrame, TaggedSender};
 use std::backtrace::Backtrace;
 use std::rc::Rc;
@@ -778,7 +780,9 @@ pub(in crate::boot) fn run_shard_thread(
     shard_metrics_all: Vec<ShardMetrics>,
     peer_exit: Arc<PeerExitCountdown>,
     shutdown_deadline: Arc<ShutdownDeadline>,
-    tiered_credentials: Option<SharedCredentials>,
+    tiered_store: SharedStore,
+    geo_peer_statuses: Vec<SharedPeerStatus>,
+    geo_peer_auth: PeerAuth,
     primary_handoff: Arc<PrimaryHandoffGate>,
 ) -> Result<(), ServerError> {
     // Armed for the whole thread body: a post-spawn error `?` or a panic
@@ -831,7 +835,9 @@ pub(in crate::boot) fn run_shard_thread(
             shard_metrics_all,
             peer_exit,
             shutdown_deadline,
-            tiered_credentials,
+            tiered_store,
+            geo_peer_statuses,
+            geo_peer_auth,
             primary_handoff,
         ))
         .await
@@ -1002,6 +1008,7 @@ pub(in crate::boot) struct StopSignals {
     pub(in crate::boot) stream_key_rewrapper: Option<Sender<()>>,
     pub(in crate::boot) segment_cleaner: Option<Sender<()>>,
     pub(in crate::boot) store_identity: Option<Sender<()>>,
+    pub(in crate::boot) geo_peers: Option<Sender<()>>,
     pub(in crate::boot) sysinfo_printer: Option<Sender<()>>,
     pub(in crate::boot) consumer_group_liveness: Option<Sender<()>>,
 }
@@ -1017,6 +1024,7 @@ impl StopSignals {
             &self.stream_key_rewrapper,
             &self.segment_cleaner,
             &self.store_identity,
+            &self.geo_peers,
             &self.sysinfo_printer,
             &self.consumer_group_liveness,
         ]

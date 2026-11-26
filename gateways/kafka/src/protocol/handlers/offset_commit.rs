@@ -727,6 +727,7 @@ mod tests {
             partitions: 1,
             stream_id,
             topic_id: 4,
+            geo: false,
         };
         bridge.show_topic_shapes(TopicShapes::from([
             ("orders".to_string(), shape(1)),
@@ -859,6 +860,7 @@ mod tests {
             partitions: 1,
             stream_id: 1,
             topic_id: 1,
+            geo: false,
         };
         let change_log = Arc::clone(&bridge);
         tokio::spawn(async move {
