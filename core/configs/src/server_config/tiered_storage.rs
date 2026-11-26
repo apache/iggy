@@ -29,15 +29,14 @@
 use super::COMPONENT;
 use crate::ConfigurationError;
 use configs::{ConfigEnv, DisplayFromStrOrNumber};
-use iggy_common::{
-    FRESH_UPLOAD_INTERVAL_MAX, IggyByteSize, IggyDuration, READ_AHEAD_BLOCKS_MIN,
-    READ_AHEAD_CACHE_SHARE, READ_CACHE_BLOCK_SIZE_MIN, Validatable,
-};
+use iggy_common::{FRESH_UPLOAD_INTERVAL_MAX, IggyByteSize, IggyDuration, Validatable};
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::fmt::{self, Debug, Display, Formatter};
 use std::ops::RangeInclusive;
 use std::time::Duration;
+
+pub use iggy_common::{READ_AHEAD_BLOCKS_MIN, READ_AHEAD_CACHE_SHARE, READ_CACHE_BLOCK_SIZE_MIN};
 
 /// Bounds of `request_timeout` and `progress_timeout`. A healthy store can
 /// take seconds to answer, and the upper bound keeps a typo from overflowing
