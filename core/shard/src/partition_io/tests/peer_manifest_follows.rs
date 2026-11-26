@@ -359,7 +359,7 @@ async fn given_a_manifest_read_that_never_answers_when_reading_more_than_one_pas
         status: SharedPeerStatus::default(),
     };
 
-    let mut passes = peer_manifest_passes(source, ORIGIN.to_owned(), listed);
+    let mut passes = peer_manifest_passes(&source, ORIGIN, listed);
 
     assert_eq!(passes.len(), 2);
     let last = passes
@@ -404,7 +404,7 @@ async fn given_a_first_identity_read_that_fails_when_reading_a_pass_should_read_
         })
         .collect();
 
-    let mut passes = peer_manifest_passes(source, ORIGIN.to_owned(), listed);
+    let mut passes = peer_manifest_passes(&source, ORIGIN, listed);
     let finished = passes.pop().unwrap().await;
 
     assert!(passes.is_empty());
