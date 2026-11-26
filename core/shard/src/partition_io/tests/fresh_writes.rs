@@ -172,6 +172,13 @@ fn place_partition(owner: &IoTestShard, partition: IggyNamespace) -> IggyNamespa
 /// places its batches and commits nothing: the other replica of its group
 /// never answers. Once its pipeline is full, it has no room for a request.
 fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
+    place_partition(owner, stuck_partition(owner))
+}
+
+/// Make the last partition of the shard a primary in normal status that
+/// commits nothing, as [`place_stuck_partition`] does, without placing its
+/// batches.
+fn stuck_partition(owner: &IoTestShard) -> IggyNamespace {
     const SILENT_REPLICA: u8 = 1;
     let stuck = IggyNamespace::new(0, 0, 2);
     owner.bus.set_replica_forward_fn(Box::new(|_, _, _| Ok(())));
@@ -195,7 +202,7 @@ fn place_stuck_partition(owner: &IoTestShard) -> IggyNamespace {
             IggyByteSize::from(SEGMENT_BYTES),
         ),
     );
-    place_partition(owner, stuck)
+    stuck
 }
 
 /// Submit one send of a message of `payload_len` bytes, as a producer does.
@@ -4794,6 +4801,49 @@ async fn given_a_backlog_past_the_limit_when_sends_arrive_should_delay_the_sends
         placed[1].placement.length < placed[2].placement.length,
         "the held send committed before the one behind it"
     );
+}
+
+/// A send to a partition that does not place its batches goes straight to
+/// it, past the fresh writes. The shard counts it among the sends that wait
+/// on it until it is answered, so that the rewrites keep to their share
+/// under a load of such sends too.
+#[compio::test]
+async fn given_a_send_that_goes_straight_to_its_partition_when_it_waits_should_count_it_until_it_is_answered()
+ {
+    let directory = tempfile::tempdir().unwrap();
+    let owner = Box::pin(placing_owner(directory.path())).await;
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&namespace())
+        .unwrap()
+        .set_runtime_options(TopicRuntimeOptions {
+            messages_required_to_save: Some(1),
+            ..Default::default()
+        });
+    let stuck = stuck_partition(&owner);
+    owner
+        .plane
+        .partitions()
+        .get_mut_by_ns(&stuck)
+        .unwrap()
+        .register_builtin_state_machines()
+        .unwrap();
+    let direct_sends = owner.rewrite_pacing.borrow().direct_sends();
+
+    pumped(&owner, async {
+        let answer = submit_send(&owner, 1, 100);
+        until(&owner, |_| !answer.is_empty()).await;
+        assert!(answer.try_recv().unwrap().is_some());
+        until(&owner, |_| direct_sends.get() == 0).await;
+
+        let _unanswered = submit_send_to(&owner, stuck, 2, 100);
+        until(&owner, |_| direct_sends.get() == 1).await;
+        compio::time::sleep(TASK_POLL_INTERVAL * 10).await;
+        assert_eq!(direct_sends.get(), 1, "the send is not answered");
+    })
+    .await;
+    assert_eq!(owner.fresh_writes.unanswered_sends().borrow().len(), 0);
 }
 
 /// While a partition is past its limit, its sends wait for the rewrites

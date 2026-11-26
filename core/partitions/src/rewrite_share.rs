@@ -34,6 +34,8 @@
 
 use std::cell::Cell;
 use std::fmt;
+use std::future::{Future, poll_fn};
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -50,15 +52,16 @@ use crate::placed_read::{REWRITE_PACED_YIELD_BYTES, REWRITE_YIELD_BYTES};
 /// Redpanda's reconciler, which rewrites the batches of its cloud topics
 /// the same way, runs in a scheduling group of 150 shares against 1000 for
 /// produce: 150 of every 1150 parts of a core that both want.
-pub const REWRITE_SHARE_PERMILLE: u64 = 130;
+pub(crate) const REWRITE_SHARE_PERMILLE: u64 = 130;
 
 /// The time whose share the rewrites may bank, and then work at once when
 /// sends start to wait.
 ///
 /// Its share is about one stride of a rewrite's work, so that a send that
 /// arrives at rewrites that have not worked for a while waits for one
-/// stride and not for a run of them.
-pub const REWRITE_SHARE_WINDOW: Duration = Duration::from_millis(2);
+/// stride and not for a run of them. A rewrite that sleeps looks again
+/// this often at whether sends still wait.
+pub(crate) const REWRITE_SHARE_WINDOW: Duration = Duration::from_millis(2);
 
 /// What the rewrites read of their shard to keep to their share.
 pub trait RewriteClock {
@@ -125,6 +128,17 @@ impl RewriteBudget {
         (credit < 0)
             .then(|| Duration::from_micros(credit.unsigned_abs().div_ceil(REWRITE_SHARE_PERMILLE)))
     }
+
+    /// Sleep `rest`, a window at a time, and stop once sends no longer
+    /// wait: a send answered or a partition past its backlog limit does not
+    /// tell the rewrites, so a sleeper looks for itself.
+    async fn sleep_off(&self, mut rest: Duration) {
+        while !rest.is_zero() && self.holds_back() {
+            let window = rest.min(REWRITE_SHARE_WINDOW);
+            self.clock.sleep(window).await;
+            rest = rest.saturating_sub(window);
+        }
+    }
 }
 
 impl fmt::Debug for RewriteBudget {
@@ -139,41 +153,68 @@ impl fmt::Debug for RewriteBudget {
 }
 
 /// What one rewrite worked since it last counted it against its budget.
-pub struct RewriteShare {
+///
+/// Dropped, it counts the work it has not counted yet, without a sleep: the
+/// next rewrite to give way sleeps it off.
+pub(crate) struct RewriteShare {
     /// `None` for a rewrite that keeps to no share.
     budget: Option<Rc<RewriteBudget>>,
     /// Microseconds the rewrite worked since it last gave way.
     worked: u64,
     /// When the rewrite last went on after a wait.
     resumed_at: u64,
+    /// Bytes the rewrite took since it last gave way.
+    since_yield: usize,
 }
 
 impl RewriteShare {
     /// A rewrite that keeps to no share, and only gives way between its
     /// strides.
-    #[must_use]
-    pub const fn unpaced() -> Self {
+    pub(crate) const fn unpaced() -> Self {
         Self {
             budget: None,
             worked: 0,
             resumed_at: 0,
+            since_yield: 0,
         }
     }
 
     /// A rewrite that keeps to the share of `budget`, from now on.
-    #[must_use]
-    pub fn paced(budget: Rc<RewriteBudget>) -> Self {
+    pub(crate) fn paced(budget: Rc<RewriteBudget>) -> Self {
         let now = budget.clock.now_micros();
         Self {
             budget: Some(budget),
             worked: 0,
             resumed_at: now,
+            since_yield: 0,
         }
+    }
+
+    /// The budget the rewrite keeps to, for work it goes on with later.
+    pub(crate) fn budget(&self) -> Option<Rc<RewriteBudget>> {
+        self.budget.clone()
+    }
+
+    /// Bytes the rewrite may take before it gives way next. Gives way first
+    /// when it took a whole stride.
+    ///
+    /// The stride is read again after the yield: a send that arrived in the
+    /// meantime shortens it.
+    pub(crate) async fn room(&mut self) -> usize {
+        if self.since_yield >= self.stride() {
+            self.give_way().await;
+        }
+        self.stride().saturating_sub(self.since_yield)
+    }
+
+    /// The rewrite took `len` bytes of its stride.
+    pub(crate) const fn took(&mut self, len: usize) {
+        self.since_yield = self.since_yield.saturating_add(len);
     }
 
     /// Bytes the rewrite copies and sums between two calls of
     /// [`Self::give_way`]: fewer while it keeps to its share.
-    pub(crate) fn stride(&self) -> usize {
+    fn stride(&self) -> usize {
         if self
             .budget
             .as_ref()
@@ -187,7 +228,7 @@ impl RewriteShare {
 
     /// The rewrite stops to wait for something other than its share: the
     /// time since it went on was work.
-    pub(crate) fn pause(&mut self) {
+    fn pause(&mut self) {
         let Some(budget) = &self.budget else {
             return;
         };
@@ -199,47 +240,63 @@ impl RewriteShare {
     }
 
     /// The rewrite goes on after a wait.
-    pub(crate) fn resume(&mut self) {
+    fn resume(&mut self) {
         if let Some(budget) = &self.budget {
             self.resumed_at = budget.clock.now_micros();
         }
     }
 
-    /// [`Self::pause`] for a wait for the store, a read or a put, which is
-    /// work when the store is on this node.
-    pub(crate) fn pause_for_store(&mut self) {
-        if !self.store_on_node() {
-            self.pause();
-        }
-    }
-
-    /// [`Self::resume`] after a wait for the store.
-    pub(crate) fn resume_after_store(&mut self) {
-        if !self.store_on_node() {
-            self.resume();
-        }
-    }
-
-    fn store_on_node(&self) -> bool {
-        self.budget
+    /// Wait for `store`, a read or a put. The wait is work when the store is
+    /// on this node. Otherwise only the polls of `store` are: they look up
+    /// the cache and put bytes together on the shard.
+    pub(crate) async fn wait_for_store<F: Future>(&mut self, store: F) -> F::Output {
+        let Some(clock) = self
+            .budget
             .as_ref()
-            .is_some_and(|budget| budget.store_on_node)
+            .filter(|budget| !budget.store_on_node)
+            .map(|budget| Rc::clone(&budget.clock))
+        else {
+            return store.await;
+        };
+        self.pause();
+        let mut store = pin!(store);
+        let mut polled = 0_u64;
+        let output = poll_fn(|context| {
+            let start = clock.now_micros();
+            let poll = store.as_mut().poll(context);
+            polled = polled.saturating_add(clock.now_micros().saturating_sub(start));
+            poll
+        })
+        .await;
+        self.worked = self.worked.saturating_add(polled);
+        self.resume();
+        output
     }
 
     /// Between two strides of work: let the shard's other tasks run, or,
     /// while sends wait, sleep for as long as the rewrites worked past
     /// their share.
     pub(crate) async fn give_way(&mut self) {
+        self.since_yield = 0;
         let Some(budget) = self.budget.clone() else {
             yield_to_reactor().await;
             return;
         };
         self.pause();
         match budget.charge(std::mem::take(&mut self.worked)) {
-            Some(rest) => budget.clock.sleep(rest).await,
+            Some(rest) => budget.sleep_off(rest).await,
             None => yield_to_reactor().await,
         }
         self.resume();
+    }
+}
+
+impl Drop for RewriteShare {
+    fn drop(&mut self) {
+        if let Some(budget) = self.budget.clone() {
+            self.pause();
+            let _ = budget.charge(std::mem::take(&mut self.worked));
+        }
     }
 }
 
@@ -261,12 +318,30 @@ pub struct ManualClock {
     /// Microseconds the rewrites slept, all told.
     pub slept: Cell<u64>,
     pub sends_waiting: Cell<bool>,
+    /// When sends stop waiting, `None` for never.
+    pub sends_stop_at: Cell<Option<u64>>,
 }
 
 #[cfg(test)]
 impl ManualClock {
     pub fn pass(&self, micros: u64) {
         self.now.set(self.now.get() + micros);
+    }
+
+    /// A wait of `micros` that passes in another task, so that none of it
+    /// passes while the waiter is polled.
+    pub fn waited(self: &Rc<Self>, micros: u64) -> LocalBoxFuture<'static, ()> {
+        let clock = Rc::clone(self);
+        let (passed, waited) = futures::channel::oneshot::channel();
+        compio::runtime::spawn(async move {
+            clock.pass(micros);
+            let _ = passed.send(());
+        })
+        .detach();
+        async move {
+            let _ = waited.await;
+        }
+        .boxed_local()
     }
 }
 
@@ -285,6 +360,10 @@ impl RewriteClock for ManualClock {
 
     fn sends_waiting(&self) -> bool {
         self.sends_waiting.get()
+            && self
+                .sends_stop_at
+                .get()
+                .is_none_or(|stop_at| self.now.get() < stop_at)
     }
 }
 
@@ -304,7 +383,7 @@ mod tests {
     /// fourth.
     async fn rewrite(
         budget: Rc<RewriteBudget>,
-        clock: &ManualClock,
+        clock: &Rc<ManualClock>,
         strides: u64,
         stride: u64,
         fetch: u64,
@@ -312,9 +391,7 @@ mod tests {
         let mut share = RewriteShare::paced(budget);
         for done in 0..strides {
             if done % 4 == 0 {
-                share.pause_for_store();
-                clock.pass(fetch);
-                share.resume_after_store();
+                share.wait_for_store(clock.waited(fetch)).await;
             }
             clock.pass(stride);
             share.give_way().await;
@@ -436,5 +513,90 @@ mod tests {
         }
 
         assert_eq!(clock.slept.get(), slept);
+    }
+
+    /// A rewrite that owes a long sleep wakes within a window of the moment
+    /// sends stop waiting, as when the last one is answered or a partition
+    /// goes past its backlog limit, and not at the end of the sleep.
+    #[compio::test]
+    async fn given_sends_that_stop_waiting_while_a_rewrite_sleeps_should_wake_it() {
+        let clock = Rc::new(ManualClock::default());
+        clock.sends_waiting.set(true);
+        let mut share = RewriteShare::paced(budget(&clock, false));
+        clock.pass(1_000_000);
+        clock.sends_stop_at.set(Some(clock.now.get() + 5_000));
+
+        share.give_way().await;
+
+        let window = u64::try_from(REWRITE_SHARE_WINDOW.as_micros()).unwrap();
+        assert!(
+            (5_000..5_000 + window).contains(&clock.slept.get()),
+            "slept {}",
+            clock.slept.get()
+        );
+    }
+
+    /// The polls of a wait for a store elsewhere look up the cache and put
+    /// bytes together on the shard, so their time is work. The time between
+    /// them is not.
+    #[compio::test]
+    async fn given_a_wait_for_a_store_elsewhere_when_its_polls_work_should_charge_only_the_polls() {
+        let polling = Rc::new(ManualClock::default());
+        let waiting = Rc::new(ManualClock::default());
+        for clock in [&polling, &waiting] {
+            clock.sends_waiting.set(true);
+        }
+        let mut polled = RewriteShare::paced(budget(&polling, false));
+        let mut waited = RewriteShare::paced(budget(&waiting, false));
+
+        polled
+            .wait_for_store(async {
+                polling.pass(10_000);
+                polling.waited(1_000).await;
+            })
+            .await;
+        polled.give_way().await;
+        waited.wait_for_store(waiting.waited(11_000)).await;
+        waited.give_way().await;
+
+        assert_eq!(waiting.slept.get(), 0);
+        assert!(
+            polling.slept.get() > 60_000,
+            "slept {}",
+            polling.slept.get()
+        );
+    }
+
+    /// Work that no yield followed, as a put to a store on the node that
+    /// ends a rewrite, is counted once the rewrite ends. The next rewrite
+    /// sleeps it off.
+    #[compio::test]
+    async fn given_work_after_the_last_yield_when_a_rewrite_ends_should_charge_it_to_the_next() {
+        let clock = Rc::new(ManualClock::default());
+        clock.sends_waiting.set(true);
+        let budget = budget(&clock, true);
+        let mut share = RewriteShare::paced(Rc::clone(&budget));
+        share.wait_for_store(clock.waited(100_000)).await;
+        drop(share);
+
+        RewriteShare::paced(budget).give_way().await;
+
+        assert!(clock.slept.get() > 100_000, "slept {}", clock.slept.get());
+    }
+
+    /// A send that arrives while the rewrite gives way shortens the stride
+    /// it goes on with.
+    #[compio::test]
+    async fn given_a_send_that_arrives_during_a_yield_when_taking_room_should_read_the_stride_again()
+     {
+        let clock = Rc::new(ManualClock::default());
+        let mut share = RewriteShare::paced(budget(&clock, false));
+        share.took(REWRITE_YIELD_BYTES);
+        let arriving = Rc::clone(&clock);
+        compio::runtime::spawn(async move { arriving.sends_waiting.set(true) }).detach();
+
+        let room = share.room().await;
+
+        assert_eq!(room, REWRITE_PACED_YIELD_BYTES);
     }
 }

@@ -39,7 +39,7 @@ use std::rc::Rc;
 use std::task::Poll;
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use compio::fs::File;
 use compio::io::AsyncReadAtExt;
 use futures::{StreamExt, stream};
@@ -220,10 +220,11 @@ impl PlacedReadPlan {
     /// the reads: the caller is a background job that its scope cancels.
     ///
     /// Each batch is gone through twice, checked and summed before its
-    /// header, then copied. Both passes give way to the other tasks of the
-    /// shard every [`RewriteShare::stride`], inside a batch too, since a
-    /// segment's worth of messages takes tens of milliseconds to go through.
-    /// It keeps to `share` as it does.
+    /// header, then copied. Both passes, and the copy of blocks of the
+    /// cache that a read puts together, give way to the other tasks of the
+    /// shard every stride of [`RewriteShare::room`], inside a batch too,
+    /// since a segment's worth of messages takes tens of milliseconds to go
+    /// through. It keeps to `share` as it does.
     pub(crate) async fn read_blobs(
         &self,
         placed: &[PlacedBatch],
@@ -241,14 +242,12 @@ impl PlacedReadPlan {
         let mut fetched = stream::iter(reads)
             .map(|read| read.fetch(remote))
             .buffered(REWRITE_FETCHES);
-        let mut since_yield = 0;
         loop {
-            share.pause_for_store();
-            let Some(read) = fetched.next().await else {
+            let Some(read) = share.wait_for_store(fetched.next()).await else {
                 break;
             };
-            share.resume_after_store();
-            let (batches, start, bytes) = read?;
+            let (batches, start, pieces) = read?;
+            let bytes = joined(pieces, share).await;
             for placed in &placed[batches] {
                 let blob = placed
                     .placement
@@ -260,24 +259,23 @@ impl PlacedReadPlan {
                     .ok_or(DiskFault::Tiered)?;
                 let mut whole = WholeBatch::new(placed, blob);
                 loop {
-                    let room = room_in_stride(share, &mut since_yield).await;
-                    let took = whole.take(room);
+                    let took = whole.take(share.room().await);
                     if took == 0 {
                         break;
                     }
-                    since_yield += took;
+                    share.took(took);
                 }
                 take(BatchPiece::Header(&whole.header()?));
-                since_yield += BATCH_HEADER_SIZE;
+                share.took(BATCH_HEADER_SIZE);
                 let mut messages = blob;
                 loop {
-                    let room = room_in_stride(share, &mut since_yield).await;
+                    let room = share.room().await;
                     if messages.is_empty() {
                         break;
                     }
                     let (piece, rest) = messages.split_at(messages.len().min(room));
                     take(BatchPiece::Messages(piece));
-                    since_yield += piece.len();
+                    share.took(piece.len());
                     messages = rest;
                 }
             }
@@ -698,24 +696,27 @@ struct BlobRead {
     batches: Range<usize>,
     object_id: u128,
     range: Range<u64>,
-    /// The bytes at `range`, when this shard held them as the read was
-    /// planned.
-    cached: Option<Bytes>,
+    /// The bytes at `range` in the pieces the cache keeps them in, when
+    /// this shard held them as the read was planned.
+    cached: Option<Vec<Bytes>>,
 }
 
 impl BlobRead {
     /// The batches the read covers, where its bytes start in the object,
-    /// and the bytes.
-    async fn fetch(self, remote: &RemoteSegments) -> Result<(Range<usize>, u64, Bytes), DiskFault> {
-        let bytes = match self.cached {
-            Some(bytes) => bytes,
-            None => {
+    /// and the bytes, in pieces to put back together.
+    async fn fetch(
+        self,
+        remote: &RemoteSegments,
+    ) -> Result<(Range<usize>, u64, Vec<Bytes>), DiskFault> {
+        let pieces = match self.cached {
+            Some(pieces) => pieces,
+            None => vec![
                 remote
                     .read_fresh_from_store(self.object_id, self.range.clone())
-                    .await?
-            }
+                    .await?,
+            ],
         };
-        Ok((self.batches, self.range.start, bytes))
+        Ok((self.batches, self.range.start, pieces))
     }
 }
 
@@ -730,11 +731,11 @@ impl BlobReads<'_> {
     /// Where the messages of the batch at `index` are, and the messages
     /// when this shard holds them. `None` past the last batch, and for a
     /// placement that names no range.
-    fn blob(&self, index: usize) -> Option<(u128, Range<u64>, Option<Bytes>)> {
+    fn blob(&self, index: usize) -> Option<(u128, Range<u64>, Option<Vec<Bytes>>)> {
         let placement = self.placed.get(index)?.placement;
         let range = placement.position..placement.position.checked_add(placement.length)?;
         let cached = if range.is_empty() {
-            Some(Bytes::new())
+            Some(Vec::new())
         } else {
             self.remote.cached_fresh(placement.object_id, &range)
         };
@@ -752,7 +753,7 @@ impl Iterator for BlobReads<'_> {
         // batch then fails to match.
         let (object_id, mut range, cached) =
             self.blob(first)
-                .unwrap_or((placement.object_id, 0..0, Some(Bytes::new())));
+                .unwrap_or((placement.object_id, 0..0, Some(Vec::new())));
         self.next += 1;
         if cached.is_none() {
             while let Some((next_object, next, next_cached)) = self.blob(self.next) {
@@ -839,16 +840,24 @@ impl<'a> WholeBatch<'a> {
     }
 }
 
-/// Bytes a rewrite takes before it gives way next, out of the stride of
-/// `share`, given the `since_yield` it took since it last did. Gives way
-/// first when the stride is used up.
-async fn room_in_stride(share: &mut RewriteShare, since_yield: &mut usize) -> usize {
-    let stride = share.stride();
-    if *since_yield >= stride {
-        *since_yield = 0;
-        share.give_way().await;
+/// `pieces` back to back, copied a stride of `share` at a time: the blocks
+/// of the cache that one read covers can add up to megabytes.
+async fn joined(mut pieces: Vec<Bytes>, share: &mut RewriteShare) -> Bytes {
+    if pieces.len() == 1 {
+        return pieces.pop().unwrap_or_default();
     }
-    stride - *since_yield
+    let mut joined = BytesMut::with_capacity(pieces.iter().map(Bytes::len).sum());
+    for piece in &pieces {
+        let mut rest = &piece[..];
+        while !rest.is_empty() {
+            let room = share.room().await;
+            let (part, after) = rest.split_at(rest.len().min(room));
+            joined.extend_from_slice(part);
+            share.took(part.len());
+            rest = after;
+        }
+    }
+    joined.freeze()
 }
 
 /// The prepare a partition of whole batches would hold for the batch of
@@ -1582,6 +1591,58 @@ mod tests {
 
         assert_eq!(blobs_of(&plan, &placed).await, Err(DiskFault::Tiered));
         assert_eq!(store.asked.borrow().len(), asked, "read from the cache");
+    }
+
+    /// A blob that a poll fetched into the cache in blocks is put back
+    /// together a stride at a time, giving way in between, before any of it
+    /// is checked. One the shard uploaded is kept whole and copies nothing.
+    #[compio::test]
+    async fn given_a_blob_in_cached_blocks_larger_than_a_stride_when_reading_should_put_it_together_in_strides()
+     {
+        let store = Rc::new(Objects::default());
+        let (object, placed) = object_of(1, 0, 1, 3 * REWRITE_YIELD_BYTES, 0);
+        store
+            .held
+            .borrow_mut()
+            .insert(layout().fresh_key(1), object.clone());
+        let in_blocks = plan_through(&store, 64 * 1024 * 1024);
+        let remote = in_blocks.remote.clone().unwrap();
+        remote
+            .read_fresh(
+                1,
+                0..object.len() as u64,
+                in_blocks.prefix,
+                in_blocks.read_settings,
+            )
+            .await
+            .unwrap();
+        let asked = store.asked.borrow().len();
+        let whole = plan(&store);
+        whole
+            .remote
+            .as_ref()
+            .unwrap()
+            .cache_fresh_object(1, object, std::iter::empty());
+        let leading_zeros =
+            |stretches: &[usize]| stretches.iter().take_while(|&&handed| handed == 0).count();
+
+        let from_blocks = stretches_of(&in_blocks, &placed).await;
+        let from_whole = stretches_of(&whole, &placed).await;
+
+        assert_eq!(store.asked.borrow().len(), asked, "read from the cache");
+        assert_eq!(
+            leading_zeros(&from_blocks),
+            leading_zeros(&from_whole) + 3,
+            "{from_blocks:?} against {from_whole:?}"
+        );
+        assert_eq!(
+            from_blocks.iter().sum::<usize>(),
+            from_whole.iter().sum::<usize>()
+        );
+        assert_eq!(
+            blobs_of(&in_blocks, &placed).await,
+            blobs_of(&whole, &placed).await
+        );
     }
 
     /// The copy of the shard's own upload in its cache is checked as any
