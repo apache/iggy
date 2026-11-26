@@ -1771,10 +1771,12 @@ handshake_grace = "10 s"
 #region = "us-east-1"
 #endpoint = "https://storage.example.com"
 #url_style = "auto"
-# Static s3 credentials, which an s3 peer needs. Set them in the environment,
-# for the first peer with IGGY_GEO_PEERS_0_ACCESS_KEY_ID and
-# IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather than in this file. The printed
-# configuration never shows them.
+# Static s3 credentials. Set them in the environment, for the first peer with
+# IGGY_GEO_PEERS_0_ACCESS_KEY_ID and IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY, rather
+# than in this file. The printed configuration never shows them. Without
+# them, an s3 peer reads with the node's web identity or instance role, as the
+# s3 backend does, and that role needs s3:GetObject and s3:ListBucket on the
+# peer's bucket. A peer's credentials never hold up the boot.
 #access_key_id = ""
 #secret_access_key = ""
 # The gcs backend: the peer's bucket and how this node gets a token that

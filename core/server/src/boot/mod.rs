@@ -315,7 +315,7 @@ pub fn bootstrap(
         crate::tiered_storage::probe(&config.tiered_storage, &tiered_store)?;
     crate::geo_peers::preflight(&config.geo)?;
     let geo_peer_statuses = crate::geo_peers::statuses(&config.geo);
-    let geo_peer_auth = crate::geo_peers::auth(&config.geo)?;
+    let geo_peer_auth = crate::geo_peers::auth(&config.geo, &config.tiered_storage)?;
     // The sync GetStats read path has no access to server config, so capture
     // the data directory here for its disk-usage reporting.
     crate::sysinfo_probe::init_stats_data_path(config.get_system_path().into());
