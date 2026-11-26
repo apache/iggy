@@ -39,7 +39,7 @@ use std::fs;
 use std::future::Future;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
@@ -887,6 +887,7 @@ impl From<Event> for BucketEvent {
 pub struct BucketMirror {
     path: PathBuf,
     stop: Arc<AtomicBool>,
+    passes: Arc<AtomicUsize>,
     copies: Arc<Mutex<Vec<MirrorCopy>>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -919,11 +920,14 @@ impl BucketMirror {
             directories: HashSet::new(),
         };
         let stopped = Arc::clone(&stop);
+        let passes = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::clone(&passes);
         let thread = thread::Builder::new()
             .name("geo-bucket-mirror".to_owned())
             .spawn(move || {
                 while !stopped.load(Ordering::Acquire) {
                     step.run();
+                    finished.fetch_add(1, Ordering::Release);
                     thread::sleep(MIRROR_INTERVAL);
                 }
             })
@@ -931,6 +935,7 @@ impl BucketMirror {
         Ok(Self {
             path: path.to_owned(),
             stop,
+            passes,
             copies,
             thread: Some(thread),
         })
@@ -948,6 +953,26 @@ impl BucketMirror {
     /// The watch cannot start.
     pub fn watch(&self) -> Result<BucketWatch, TestBinaryError> {
         BucketWatch::start(&self.path)
+    }
+
+    /// Wait until a pass that started after this call finished, so the
+    /// mirror holds every file the bucket held at the call.
+    ///
+    /// # Errors
+    /// No such pass finished within `timeout`.
+    pub async fn wait_for_pass(&self, timeout: Duration) -> Result<(), TestBinaryError> {
+        // The pass under way at the call may have walked past a file already.
+        let wanted = self.passes.load(Ordering::Acquire) + 2;
+        let deadline = Instant::now() + timeout;
+        while self.passes.load(Ordering::Acquire) < wanted {
+            if Instant::now() >= deadline {
+                return Err(TestBinaryError::InvalidState {
+                    message: format!("the mirror finished no full pass within {timeout:?}"),
+                });
+            }
+            sleep(MIRROR_INTERVAL).await;
+        }
+        Ok(())
     }
 
     /// Every file copied so far, oldest first.

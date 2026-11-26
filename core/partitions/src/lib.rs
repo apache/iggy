@@ -20,8 +20,8 @@
 mod chain_rebuild;
 pub use chain_rebuild::{
     ChainLoss, ChainLost, ChainLostReason, ExecutorStoreViewReader, LocalFront,
-    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, RebuildInput, RebuiltFront, StoreView,
-    StoreViewOutcome, StoreViewReader, StoreViewRequest, StoredLog, chain_loss, read_store_view,
+    MANIFEST_CROSS_CHECK_BYTES_MAX, ManifestRead, RebuildFailure, RebuildInput, RebuiltFront,
+    StoreView, StoreViewOutcome, StoreViewReader, StoreViewRequest, StoredLog, chain_loss,
     rebuild_front,
 };
 mod consumer_offset_capacity;
