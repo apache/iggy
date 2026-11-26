@@ -27,7 +27,8 @@
 //! 1. Reads the retired cluster's live geo topic objects, its manifests and
 //!    the indexes of its self-describing fresh objects, and plans each
 //!    partition, see [`partitions::plan_partition`]. Nothing is written
-//!    before every partition is planned.
+//!    before every partition is planned, and a topic object under the root
+//!    that does not decode stops the recovery.
 //! 2. Stores each plan, the report of what it took and dropped, and the
 //!    [`RecoveryRecord`] that retires the cluster with a cutover per
 //!    partition.
@@ -61,7 +62,8 @@ use iggy_common::{
 use iggy_object_store::{
     KeyLayout, ManifestError, ObjectPrefix, ObjectStore, ObjectStoreError, PartitionManifest,
     PutBody, PutMode, PutOptions, RecoveredCutover, RecoveryRead, RecoveryRecord, StoreIdentity,
-    TopicCompression, TopicGeoMode, TopicKey, TopicObject, TopicRead, TopicState, UserMetadata,
+    TopicCompression, TopicGeoMode, TopicKey, TopicObject, TopicObjectError, TopicRead, TopicState,
+    UserMetadata,
 };
 use metadata::impls::metadata::{MetadataSubmitError, StreamsFrontend};
 use metadata::stm::shadow::{ShadowStream, ShadowTopicRequest, ShadowTopicTarget};
@@ -99,6 +101,16 @@ pub enum OriginRecoveryError {
     },
     #[error("the geo topic object {0:?} writes in a mode this build does not recover")]
     GeoMode(TopicKey),
+    #[error(
+        "the geo topic object {key:?}, whose format marker is \"{marker}\", does not decode: \
+         {error}. The recovery takes the root only once it reads every topic object under it"
+    )]
+    UndecodableTopic {
+        key: TopicKey,
+        /// The first bytes of the object, escaped, empty when unread.
+        marker: String,
+        error: TopicObjectError,
+    },
     #[error("the manifest of {prefix:?} does not decode: {error}")]
     Manifest {
         prefix: ObjectPrefix,
@@ -425,20 +437,29 @@ pub struct RetiredTopic {
 /// Every geo topic that the retired cluster `retired_cluster_uid` described
 /// in the store under `layout`, deleted ones too. The one place that knows
 /// where the descriptions are: the object of each topic under
-/// [`KeyLayout::topics_prefix`]. Objects of another cluster and objects that
-/// do not decode describe nothing.
+/// [`KeyLayout::topics_prefix`]. Objects of another cluster describe nothing.
 ///
 /// # Errors
-/// The store's error for a listing or a read that failed.
+/// [`OriginRecoveryError::UndecodableTopic`] for a listed object that does
+/// not decode, which can be one of the retired cluster's topics, and the
+/// store's error for a listing or a read that failed.
 pub async fn read_retired_topics<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
     retired_cluster_uid: u128,
-) -> Result<Vec<RetiredTopic>, ObjectStoreError> {
+) -> Result<Vec<RetiredTopic>, OriginRecoveryError> {
     let mut topics = Vec::new();
     for key in list_topic_keys(store, layout).await? {
-        let TopicRead::Found(object) = TopicObject::read(store, layout, &key).await? else {
-            continue;
+        let object = match TopicObject::read(store, layout, &key).await? {
+            TopicRead::Found(object) => object,
+            TopicRead::Missing => continue,
+            TopicRead::Invalid(error) => {
+                return Err(OriginRecoveryError::UndecodableTopic {
+                    key,
+                    marker: format_marker(store, layout, &key).await,
+                    error,
+                });
+            }
         };
         if object.cluster_uid == retired_cluster_uid {
             topics.push(RetiredTopic::from(object));
@@ -469,6 +490,19 @@ impl From<TopicObject> for RetiredTopic {
             read_ahead: object.read_ahead,
         }
     }
+}
+
+/// The length of the magic that starts a topic object and names its format.
+const FORMAT_MARKER_LEN: u64 = 8;
+
+/// The format marker of the topic object under `key`, escaped as text,
+/// empty when the read fails.
+async fn format_marker<S: ObjectStore>(store: &S, layout: &KeyLayout, key: &TopicKey) -> String {
+    store
+        .get_range(&layout.topic_key(key), 0..FORMAT_MARKER_LEN)
+        .await
+        .map(|range| range.bytes.escape_ascii().to_string())
+        .unwrap_or_default()
 }
 
 /// Whether replica 0 recovers now: only when the operator named the retired
@@ -815,12 +849,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn given_topic_objects_of_two_clusters_when_reading_the_retired_topics_should_describe_the_retired_ones_deleted_too()
-     {
-        let store = MemoryStore::new();
-        let layout = KeyLayout::new("iggy").unwrap();
-        let described = |stream_id: u64, cluster_uid: u128| TopicObject {
+    /// The object of topic 1 of stream `stream_id`, which `cluster_uid`
+    /// describes.
+    fn described(stream_id: u64, cluster_uid: u128) -> TopicObject {
+        TopicObject {
             key: TopicKey {
                 stream_id,
                 topic_id: 1,
@@ -842,7 +874,14 @@ mod tests {
             tombstone_grace: 0,
             read_cache_size: Some(4 * 1024 * 1024),
             read_ahead: None,
-        };
+        }
+    }
+
+    #[test]
+    fn given_topic_objects_of_two_clusters_when_reading_the_retired_topics_should_describe_the_retired_ones_deleted_too()
+     {
+        let store = MemoryStore::new();
+        let layout = KeyLayout::new("iggy").unwrap();
         for object in [
             described(1, RETIRED),
             described(2, RETIRED).into_tombstone(77),
@@ -859,6 +898,48 @@ mod tests {
             .collect();
         assert_eq!(found, [(1, None, 4096), (2, Some(77), 4096)]);
         assert_eq!(topics[0], RetiredTopic::from(described(1, RETIRED)));
+    }
+
+    #[test]
+    fn given_a_topic_object_that_does_not_decode_when_reading_the_retired_topics_should_refuse_naming_it_and_its_format_marker()
+     {
+        let layout = KeyLayout::new("iggy").unwrap();
+        let broken = described(2, 7);
+        let encoded = broken.encode().unwrap();
+        let mut older = encoded.clone();
+        older[..8].copy_from_slice(b"IGGYTOP2");
+        let mut damaged = encoded;
+        *damaged.last_mut().unwrap() ^= 1;
+        for (row, bytes, marker) in [
+            ("an older format", older, "IGGYTOP2"),
+            ("damaged bytes", damaged, "IGGYTOP3"),
+            ("no topic object", b"garbage".to_vec(), "garbage"),
+        ] {
+            let store = MemoryStore::new();
+            block_on(described(1, RETIRED).put(&store, &layout)).unwrap();
+            let expected = TopicObject::decode(&bytes).unwrap_err();
+            block_on(store.put(
+                &layout.topic_key(&broken.key),
+                PutBody::from_bytes(bytes),
+                &PutOptions::default(),
+            ))
+            .unwrap();
+
+            let Err(OriginRecoveryError::UndecodableTopic {
+                key,
+                marker: found,
+                error,
+            }) = block_on(read_retired_topics(&store, &layout, RETIRED))
+            else {
+                panic!("{row}: the read described the topics without the broken one");
+            };
+
+            assert_eq!(
+                (key, found.as_str(), error),
+                (broken.key, marker, expected),
+                "{row}"
+            );
+        }
     }
 
     #[test]

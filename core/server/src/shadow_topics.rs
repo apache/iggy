@@ -39,6 +39,8 @@
 //! - An adopted topic takes the `read_cache_size` and `read_ahead` that the
 //!   live object of its incarnation sets, and loses each one that the object
 //!   no longer sets, so its partitions read with what the peer's topic sets.
+//!   After a recovery of the peer's origin, it takes them from the objects
+//!   of the successor that the node reads the peer as.
 //!
 //! Only the caught-up metadata primary proposes, so every replica learns the
 //! shadow streams through consensus. A deposed primary that has not learned
@@ -980,22 +982,24 @@ fn adopt(
 
 /// A change of the read cache settings of a shadow topic of `origin` to
 /// what the live object of its incarnation publishes. Only a peer that is
-/// read now, from a store that the cluster the shadow stream came from still
-/// owns, changes them.
+/// read now changes them, through objects of the cluster that owns its
+/// store: the one the shadow stream came from, or its successor after a
+/// recovery.
 fn follow_read_cache(
     inner: &StreamsInner,
     origin: &str,
     view: &PeerView,
 ) -> Option<ShadowTopicRequest> {
-    if view.stale {
-        return None;
-    }
+    let read_as = view.cluster_uid.filter(|_| !view.stale)?;
+    // A cluster that metadata does not record of the peer is read only as
+    // the proven successor of a recorded one: of the shadow streams' cluster
+    // when metadata records no other.
+    let mut recorded = inner.recorded_cluster_uids(origin).into_iter();
+    let only_recorded = recorded.next().filter(|_| recorded.next().is_none());
     for (stream_id, stream) in shadow_streams_of(inner, origin) {
-        let Some(source) = stream
-            .shadow
-            .as_ref()
-            .filter(|source| view.cluster_uid == Some(source.cluster_uid))
-        else {
+        let Some(source) = stream.shadow.as_ref().filter(|source| {
+            source.cluster_uid == read_as || only_recorded == Some(source.cluster_uid)
+        }) else {
             continue;
         };
         for (topic_id, topic) in &stream.topics {
@@ -1012,9 +1016,7 @@ fn follow_read_cache(
                 .get(&key)
                 .and_then(|seen| seen.object.as_ref())
                 .filter(|object| {
-                    object.is_live()
-                        && object.origin == origin
-                        && object.cluster_uid == source.cluster_uid
+                    object.is_live() && object.origin == origin && object.cluster_uid == read_as
                 })
             else {
                 continue;
@@ -1443,7 +1445,7 @@ mod tests {
         assert_eq!(
             plan(&inner, &taken, NOW, GRACE).proposal,
             None,
-            "a store that another cluster owns now"
+            "an object of another cluster than the one that owns the store now"
         );
 
         let recreated = TopicObject {
@@ -1471,6 +1473,55 @@ mod tests {
             plan(&inner, &view([changed]), NOW, GRACE).proposal,
             Some(set_read_cache(stream_id, Some(16 * MIB), Some(MIB))),
             "the same change from the followed peer"
+        );
+    }
+
+    #[test]
+    fn given_an_origin_that_recovered_when_its_successor_changes_the_read_cache_should_set_it_on_the_existing_shadow_topic()
+     {
+        const SUCCESSOR: u128 = PEER_CLUSTER + 1;
+        let read_as_successor = |objects: Vec<TopicObject>| {
+            let mut peers = view(objects.into_iter().map(|object| TopicObject {
+                cluster_uid: SUCCESSOR,
+                ..object
+            }));
+            peers.get_mut(PEER).unwrap().cluster_uid = Some(SUCCESSOR);
+            peers
+        };
+        let (mut inner, stream_id) = adopted();
+
+        let recovered = read_as_successor(vec![cached(Some(16 * MIB), Some(MIB))]);
+        assert_eq!(
+            plan(&inner, &recovered, NOW, GRACE).proposal,
+            Some(set_read_cache(stream_id, Some(16 * MIB), Some(MIB))),
+            "the successor of the cluster that the shadow stream came from"
+        );
+        apply_plan(&mut inner, &recovered);
+        assert_eq!(plan(&inner, &recovered, NOW, GRACE).proposal, None);
+
+        let other_stream = TopicKey {
+            stream_id: PEER_STREAM + 1,
+            ..key()
+        };
+        apply(
+            &mut inner,
+            &ShadowTopicRequest::CreateStream {
+                source: ShadowStream {
+                    cluster_uid: SUCCESSOR,
+                    stream_id: other_stream.stream_id,
+                    ..source()
+                },
+                name: WireName::new("__shadow_dc-b_payments").unwrap(),
+            },
+        );
+        let recorded_too = read_as_successor(vec![
+            cached(Some(32 * MIB), None),
+            object(other_stream, "payments", 10),
+        ]);
+        assert_eq!(
+            plan(&inner, &recorded_too, NOW, GRACE).proposal,
+            None,
+            "a cluster that metadata records too proves no succession"
         );
     }
 
