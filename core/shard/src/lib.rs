@@ -12284,13 +12284,14 @@ where
                         );
                         Some(offer)
                     }
-                    // Only the plan pin is missing, and an I/O turn pins it
-                    // soon. The build slot stays claimed, as for any resumable
-                    // refusal, and the tick answers the request.
-                    Err(partitions::state_transfer::PartitionTransferUnavailable::FlushPending)
-                        if waited_ticks
-                            < self.repair_retry_ticks.get()
-                                / PARKED_TRANSFER_REQUEST_WAIT_DIVISOR =>
+                    // Only the plan pin or the store's answer is missing, and
+                    // each comes soon. The build slot stays claimed, as for any
+                    // resumable refusal, and the tick answers the request.
+                    Err(
+                        partitions::state_transfer::PartitionTransferUnavailable::FlushPending
+                        | partitions::state_transfer::PartitionTransferUnavailable::StoreCheckPending,
+                    ) if waited_ticks
+                        < self.repair_retry_ticks.get() / PARKED_TRANSFER_REQUEST_WAIT_DIVISOR =>
                     {
                         self.parked_partition_transfer_requests.borrow_mut().insert(
                             (header.group, header.replica),

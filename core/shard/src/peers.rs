@@ -668,7 +668,7 @@ mod tests {
                         }
                         let listed = store.list(&ListRequest::new("iggy/")).await;
                         assert!(listed.is_ok());
-                        assert!(store.head(&key).await.is_ok());
+                        assert!(ObjectStore::head(store.as_ref(), &key).await.is_ok());
                         StoreIdentity::read(store.as_ref(), &layout).await
                     },
                 )
