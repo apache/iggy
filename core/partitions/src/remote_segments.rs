@@ -345,7 +345,7 @@ impl FreshReads {
 /// incarnation keeps a plan that outlived it from reading for a partition
 /// that is gone.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ReadPolicy {
+pub struct ReadPolicy {
     topic: Rc<Cell<(Option<usize>, Option<u64>)>>,
     left: PartitionLeft,
 }
