@@ -1,6 +1,6 @@
 - Feature Name: `sdk_conformance`
 - Start Date: 2026-11-06
-- RFC PR: [apache/iggy#0000](https://github.com/apache/iggy/pull/0000)
+- RFC PR: [apache/iggy#4915](https://github.com/apache/iggy/pull/4915)
 - Discussion: [apache/iggy#0000](https://github.com/apache/iggy/discussions/0000)
 - Iggy Issue: [apache/iggy#0000](https://github.com/apache/iggy/issues/0000)
 
