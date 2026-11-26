@@ -229,12 +229,34 @@ refused. The README says how to move the lead back to replica 0.
 
 Each `[[geo.peers]]` table names one peer: its `origin`, which must equal that cluster's own
 `[geo] origin`, and the keys of that cluster's `[tiered_storage]` section. A cluster reads at most
-16 peers. Two peers cannot name the same bucket and prefix. An `s3` peer takes only static keys:
-web identity and instance roles do not apply to peers. Set the keys in the environment, as
-`IGGY_GEO_PEERS_<n>_ACCESS_KEY_ID` and `IGGY_GEO_PEERS_<n>_SECRET_ACCESS_KEY`, where `<n>` is
-the peer's place in the list, from 0. A `gcs` peer takes a `[geo.peers.gcs]` table with the keys
-of `[tiered_storage.gcs]`, and gets its token as the `gcs` backend does: from a service account
-key file or the metadata server.
+16 peers. Two peers cannot name the same bucket and prefix.
+
+An `s3` peer reads with the first credentials that the node has, in this order:
+
+1. The static keys `access_key_id` and `secret_access_key` of the peer's table. Set both or
+   neither. In the environment they are `IGGY_GEO_PEERS_<n>_ACCESS_KEY_ID` and
+   `IGGY_GEO_PEERS_<n>_SECRET_ACCESS_KEY`, where `<n>` is the peer's place in the list, from 0.
+   A variable for one key of a peer replaces the whole list of peers from the file, so a peer
+   whose keys come from the environment takes every key from there, as the example below
+   shows.
+2. Web identity, as for the own bucket: `AWS_WEB_IDENTITY_TOKEN_FILE` and `AWS_ROLE_ARN`. EKS sets
+   both for a pod with a service account role.
+3. The role of the EC2 instance, from its instance metadata service.
+
+With web identity or an instance role, the node reads the peer's bucket with its own role. That
+role must be allowed `s3:GetObject` and `s3:ListBucket` on the peer's bucket. When the peer's
+bucket is in another AWS account, the policy of that bucket must also grant both actions to the
+role. If the peer's bucket encrypts with a KMS key of its own, the role also needs `kms:Decrypt`
+on that key. The node fetches these credentials in the background. Until they arrive, the peer
+counts as unreachable. That is also what a node shows that chose a source which hands out
+nothing, such as an instance with no role attached or a role that refuses the token: the node
+starts, keeps fetching, and logs each failure under the peer's name. Only a node on which no
+source can be chosen does not start: no web identity variables, and
+`AWS_EC2_METADATA_DISABLED` set to `true`. Peers that take the same role, and the own bucket
+when it takes it too, share one fetch.
+
+A `gcs` peer takes a `[geo.peers.gcs]` table with the keys of `[tiered_storage.gcs]`, and gets its
+token as the `gcs` backend does: from a service account key file or the metadata server.
 
 A peer that does not answer never stops the boot and never delays local traffic.
 
@@ -290,14 +312,27 @@ The credentials go in the environment of each node. On a node of `dc-a`:
 # instance role instead.
 export IGGY_TIERED_STORAGE_ACCESS_KEY_ID="..."
 export IGGY_TIERED_STORAGE_SECRET_ACCESS_KEY="..."
-# Read-only keys for iggy-dc-b, the first peer.
+```
+
+With web identity or an instance role the peer needs nothing here: its table in the file sets
+no keys, and the node's role needs read access to `iggy-dc-b`.
+
+With static keys for the peer, give the whole peer in the environment and leave its
+`[[geo.peers]]` table out of the file. A variable for one key of a peer replaces the list of
+peers from the file, so the two keys alone would leave a peer with no origin and the node
+would not start:
+
+```sh
+# The first peer, iggy-dc-b, with read-only keys.
+export IGGY_GEO_PEERS_0_ORIGIN="dc-b"
+export IGGY_GEO_PEERS_0_BACKEND="s3"
+export IGGY_GEO_PEERS_0_BUCKET="iggy-dc-b"
+export IGGY_GEO_PEERS_0_REGION="us-east-1"
 export IGGY_GEO_PEERS_0_ACCESS_KEY_ID="..."
 export IGGY_GEO_PEERS_0_SECRET_ACCESS_KEY="..."
 ```
 
-The same settings work from the environment alone, for example `IGGY_GEO_ORIGIN=dc-a`,
-`IGGY_GEO_PEERS_0_ORIGIN=dc-b`, `IGGY_GEO_PEERS_0_BACKEND=s3`, `IGGY_GEO_PEERS_0_BUCKET=iggy-dc-b`
-and `IGGY_GEO_PEERS_0_REGION=us-east-1`.
+The other settings work from the environment too, for example `IGGY_GEO_ORIGIN=dc-a`.
 
 For a store other than AWS, add its URL as `endpoint`, for example
 `endpoint = "https://minio.dc-b.example.com"`. For an `fs` peer, set `backend = "fs"` and `path`
@@ -1174,8 +1209,6 @@ object is deleted, and 1 hour before an unlisted long-term object is deleted.
   takes `tombstone_grace`.
 - **A cluster with geo topics needs an origin.** Without `[geo] origin`, a geo topic takes no
   messages.
-- **`s3` peers take static keys only.** An `s3` peer needs `access_key_id` and
-  `secret_access_key`. A `gcs` peer takes a service account key file or the metadata server.
 - **Up to 16 peers.** A cluster reads at most 16 peers.
 - **Geo topics do not lock the store identity claim.** Once a topic is tiered, replica 0 never
   claims the prefix again. A geo topic does not have that effect: replica 0 keeps claiming again

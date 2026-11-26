@@ -18,7 +18,7 @@
 //! The answers for crawlers: `robots.txt`, the sitemap, and the header that keeps the API and the
 //! embed pages out of search results.
 
-use super::pages::{SiteState, X_ROBOTS_TAG, run_path};
+use super::pages::{SiteState, X_ROBOTS_TAG};
 use crate::error::IggyBenchDashboardServerError;
 use crate::public_url::PublicUrl;
 use actix_web::body::MessageBody;
@@ -26,7 +26,10 @@ use actix_web::dev::{ServiceRequest, ServiceResponse};
 use actix_web::http::header::{CacheControl, CacheDirective, ContentType, HeaderValue};
 use actix_web::middleware::Next;
 use actix_web::{HttpResponse, route, web};
+use bench_dashboard_shared::config::DashboardConfig;
+use bench_dashboard_shared::headline::official_runs;
 use bench_dashboard_shared::omb::summary::OmbRunList;
+use bench_dashboard_shared::pages::{ExploreScope, omb_run_path, run_path};
 use bench_dashboard_shared::summary::BenchmarkSummary;
 use chrono::{DateTime, SecondsFormat, Utc};
 use std::fmt::Write;
@@ -59,7 +62,12 @@ pub async fn sitemap_xml(
         ));
     };
     let omb_runs = state.omb_runs.as_ref().map(|omb_runs| omb_runs.run_list());
-    let body = sitemap(public_url, &state.runs.get_summaries(), omb_runs.as_deref());
+    let body = sitemap(
+        public_url,
+        &state.runs.get_summaries(),
+        &state.config,
+        omb_runs.as_deref(),
+    );
     Ok(HttpResponse::Ok()
         .insert_header(ContentType(mime_xml()))
         .insert_header(crawl_file_cache_control())
@@ -96,12 +104,21 @@ fn robots_text(public_url: Option<&PublicUrl>) -> String {
 fn sitemap(
     public_url: &PublicUrl,
     runs: &[BenchmarkSummary],
+    config: &DashboardConfig,
     omb_runs: Option<&OmbRunList>,
 ) -> String {
     let newest_run = runs.iter().filter_map(run_time).max();
+    let newest_official_run = official_runs(runs, config)
+        .into_iter()
+        .filter_map(run_time)
+        .max();
     let mut pages = vec![
         ("/".to_owned(), newest_run),
-        ("/explore".to_owned(), newest_run),
+        (
+            ExploreScope::Official.path().to_owned(),
+            newest_official_run,
+        ),
+        (ExploreScope::All.path().to_owned(), newest_run),
         ("/methodology".to_owned(), None),
     ];
     pages.extend(runs.iter().map(|run| (run_path(&run.uuid), run_time(run))));
@@ -112,7 +129,7 @@ fn sitemap(
             omb_runs
                 .runs
                 .iter()
-                .map(|run| (format!("/omb/runs/{}", run.id), Some(run.time.instant))),
+                .map(|run| (omb_run_path(run.id), Some(run.time.instant))),
         );
     }
 
@@ -288,6 +305,7 @@ mod tests {
         let mut expected = vec![
             "/".to_owned(),
             "/explore".to_owned(),
+            "/explore?scope=all".to_owned(),
             "/methodology".to_owned(),
         ];
         expected.extend(run_paths);
@@ -299,7 +317,12 @@ mod tests {
         );
         let paths = sitemap_paths(&xml);
         assert_eq!(paths, expected);
-        assert!(paths.iter().all(|path| is_page_path(path)), "{paths:?}");
+        assert!(
+            paths
+                .iter()
+                .all(|path| is_page_path(path.split('?').next().unwrap_or(path))),
+            "{paths:?}"
+        );
         assert!(
             xml.contains(&format!(
                 "<loc>{PUBLIC_URL}/runs/48587edc-6d6b-4ab5-8316-c64be4a65135</loc><lastmod>"
@@ -342,7 +365,7 @@ mod tests {
         runs[1].timestamp = "yesterday".to_owned();
         let public_url = PUBLIC_URL.parse().expect("a valid public URL");
 
-        let xml = sitemap(&public_url, &runs, None);
+        let xml = sitemap(&public_url, &runs, &state.config, None);
 
         let newest = "<lastmod>2026-11-13T09:16:23Z</lastmod>";
         assert!(
@@ -363,6 +386,34 @@ mod tests {
             )),
             "{xml}"
         );
+    }
+
+    #[actix_web::test]
+    async fn given_official_and_other_runs_when_building_sitemap_should_date_each_list_by_its_runs()
+    {
+        let dist = FrontendDist::new();
+        let state = site_state(&dist, Some(PUBLIC_URL), false);
+        let mut runs = state.runs.get_summaries().as_ref().clone();
+        runs.truncate(2);
+        runs[0].timestamp = "2026-11-13T09:00:00Z".to_owned();
+        runs[0].suite = Some("i4i-cluster3".to_owned());
+        runs[1].timestamp = "2026-11-14T09:00:00Z".to_owned();
+        runs[1].suite = None;
+        let public_url = PUBLIC_URL.parse().expect("a valid public URL");
+
+        let xml = sitemap(&public_url, &runs, &state.config, None);
+
+        for (path, modified) in [
+            ("/explore", "2026-11-13T09:00:00Z"),
+            ("/explore?scope=all", "2026-11-14T09:00:00Z"),
+        ] {
+            assert!(
+                xml.contains(&format!(
+                    "<loc>{PUBLIC_URL}{path}</loc><lastmod>{modified}</lastmod>"
+                )),
+                "{path}: {xml}"
+            );
+        }
     }
 
     #[actix_web::test]
@@ -392,7 +443,13 @@ mod tests {
         let xml = String::from_utf8(xml.to_vec()).expect("UTF-8");
         assert_eq!(
             sitemap_paths(&xml),
-            ["/", "/explore", "/methodology", "/omb"]
+            [
+                "/",
+                "/explore",
+                "/explore?scope=all",
+                "/methodology",
+                "/omb"
+            ]
         );
         assert!(!xml.contains("<lastmod>"), "{xml}");
     }

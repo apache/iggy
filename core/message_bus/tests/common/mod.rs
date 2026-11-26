@@ -33,7 +33,9 @@ use iggy_binary_protocol::{Command, GenericHeader, HEADER_SIZE};
 use message_bus::ConnectionInstaller;
 use message_bus::client_listener::RequestHandler;
 use message_bus::replica::auth::{ChannelBinding, LinkPlacement, ReplicaAuth};
-use message_bus::replica::handshake::{ReplicaHandshakeCtx, ReplicaTlsCtx, acceptor_handshake};
+use message_bus::replica::handshake::{
+    CompatibleRelease, ReplicaHandshakeCtx, ReplicaTlsCtx, acceptor_handshake, binary_identity,
+};
 use message_bus::replica::listener::{self, MessageHandler};
 use message_bus::replica::preamble::{Preamble, read_preamble};
 use message_bus::transports::tls::{
@@ -54,6 +56,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+const STORAGE_FORMAT: &[u8] = b"test-storage";
 const CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// Build a stub [`ClientConnMeta`] for tests that don't care about
@@ -95,15 +98,77 @@ pub fn set_replica_ctx(
     replica_count: u8,
     auth: Option<ReplicaAuth>,
 ) {
+    install_replica_ctx(
+        bus,
+        cluster_id,
+        self_id,
+        replica_count,
+        auth,
+        None,
+        ([0x5a; 32], Rc::default()),
+    );
+}
+
+/// A release a test node runs, with what its row of the release
+/// compatibility table lists.
+#[derive(Clone, Copy)]
+pub struct TestRelease<'a> {
+    pub release: &'a str,
+    pub compatible_with: &'a [&'a str],
+}
+
+/// [`set_replica_ctx`] for a node that runs `release`.
+pub fn set_replica_ctx_of_release(
+    bus: &IggyMessageBus,
+    cluster_id: u128,
+    self_id: u8,
+    replica_count: u8,
+    auth: Option<ReplicaAuth>,
+    tls: Option<Rc<ReplicaTlsCtx>>,
+    release: TestRelease<'_>,
+) {
+    let identity = release_identity(release.release);
+    let compatible_releases = release
+        .compatible_with
+        .iter()
+        .map(|release| CompatibleRelease::new(release, STORAGE_FORMAT))
+        .collect();
+    install_replica_ctx(
+        bus,
+        cluster_id,
+        self_id,
+        replica_count,
+        auth,
+        tls,
+        (identity, compatible_releases),
+    );
+}
+
+fn install_replica_ctx(
+    bus: &IggyMessageBus,
+    cluster_id: u128,
+    self_id: u8,
+    replica_count: u8,
+    auth: Option<ReplicaAuth>,
+    tls: Option<Rc<ReplicaTlsCtx>>,
+    (binary_identity, compatible_releases): ([u8; 32], Rc<[CompatibleRelease]>),
+) {
     bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
-        binary_identity: [0x5a; 32],
+        binary_identity,
+        compatible_releases,
         cluster_id,
         self_id,
         replica_count,
         heartbeat: message_bus::replica::auth::HeartbeatTimings::default(),
         auth: auth.map(Rc::new),
-        tls: None,
+        tls,
     });
+}
+
+/// The build identity of a test node that runs `release`.
+#[must_use]
+pub fn release_identity(release: &str) -> [u8; 32] {
+    binary_identity(release, STORAGE_FORMAT)
 }
 
 /// [`set_replica_ctx`] variant with a replica TLS context attached.
@@ -115,15 +180,15 @@ pub fn set_replica_ctx_with_tls(
     auth: Option<ReplicaAuth>,
     tls: Rc<ReplicaTlsCtx>,
 ) {
-    bus.set_replica_handshake_ctx(ReplicaHandshakeCtx {
-        binary_identity: [0x5a; 32],
+    install_replica_ctx(
+        bus,
         cluster_id,
         self_id,
         replica_count,
-        heartbeat: message_bus::replica::auth::HeartbeatTimings::default(),
-        auth: auth.map(Rc::new),
-        tls: Some(tls),
-    });
+        auth,
+        Some(tls),
+        ([0x5a; 32], Rc::default()),
+    );
 }
 
 /// Build a self-signed-mode replica TLS context mirroring the production
@@ -253,7 +318,6 @@ pub async fn spawn_stalled_replica(
                     link: preamble.link,
                 },
                 ChannelBinding::Plaintext,
-                HEADER_SIZE,
             )
             .await
             .expect("stalled replica must complete replica admission");

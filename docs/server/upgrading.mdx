@@ -9,7 +9,7 @@ Apache Iggy 0.10.0 changes the wire protocol, data directory format and public S
 
 There is no migration from a 0.9.x data directory. Keep a backup and export messages that you need with the old server and compatible clients. Start 0.10.0 with a separate, empty data directory. Import the retained data through a compatible client. Do not point the new server at the old directory.
 
-Do not use a rolling upgrade between server versions. Every cluster node must run the same server version. Keep the old deployment and its data available until you finish the cutover checks.
+Stop all 0.9 nodes before starting the 0.10 cluster. See [Release compatibility](#release-compatibility) for later upgrades. Keep the old deployment and its data available until you finish the cutover checks.
 
 ## Upgrade clients and tools
 
@@ -46,9 +46,27 @@ Encryption is selected when a stream is created. Each encrypted stream has its o
 
 ## Edge builds after 0.10.0
 
-Server 0.10.1-edge.2 changes the replica wire revision and the storage marker. Start every node with a fresh, empty data directory and upgrade all nodes together, as for 0.10.0. Access tokens issued by an earlier build are refused, so HTTP clients and the web UI sign in again.
+The replica wire revision 4 build of server 0.10.1-edge.2 introduced the current storage marker. When moving from an older marker, start every node with a fresh, empty data directory and upgrade all nodes together, as for 0.10.0. Access tokens issued before the credential change are refused, so HTTP clients and the web UI sign in again.
 
-The build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
+That build also changes what revokes a credential. A password change ends every session of the account except the binary session that submitted it, and refuses every access token issued before it. Deactivating an account deletes its personal access tokens, so issue new ones after reactivation. Deleting a personal access token, or its expiry, ends the sessions opened with it. Stream and topic lists return only the entries the caller may read. See [Security](/docs/server/security).
+
+Later builds with the same 0.10.1-edge.2 version use replica wire revision 5. To move from revision 4 to 5, stop every node, keep its existing data directory and restart the cluster on the new build.
+
+## Release compatibility
+
+Run the same server build on every node unless one stable release explicitly lists the other in its compiled compatibility table. The table currently lists no pairs. Edge builds can have the same version string and different replica wire revisions. An identity mismatch produces `incompatible_build`.
+
+The startup log entry `replica handshake identity` reports `release`, `client_protocol`, `replica_wire_revision`, `storage_format` and `compatible_releases`. The last field lists the other releases this build declares compatible.
+
+For a listed pair, verify that the client protocol, replica wire revision and storage marker match. If a peer-dependent default changes, explicitly configure a value supported by both releases on every node before replacing the first binary. Add `iggy.sim=debug` to the existing log filter on each node before the upgrade. For example, `info,iggy.sim=debug` keeps the link installation messages and also logs partition commits.
+
+Replace one node at a time. Record the metadata and partition operations below before stopping the node, so you have a reference even if it restarts as primary. After it restarts, wait for all three checks to pass before replacing another node.
+
+- Look for a `replica link installed` log entry for each peer and each configured link. The `replica` field identifies the peer and `link` identifies the link.
+- Send an authenticated `GET /streams?limit=1` directly to the metadata primary and record the `iggy-applied-op` response header. After restart, refresh the reference if another node is primary. Repeat the request directly against the restarted node until its header reaches at least the recorded value.
+- For each hosted partition, use `OperationCommitted` events with `plane="partitions"` in the `iggy.sim` logs. Record the primary's `namespace_raw` and `op`. Wait for the restarted node to log an `op` at or above the recorded value in that namespace. If the partition is idle, an acknowledged write lets you observe a fresh commit.
+
+Apply the new default after every node has rejoined. For a larger `metadata.journal_slots` value, increase it on the backups one at a time, then on the metadata primary.
 
 ## Check the cutover
 
