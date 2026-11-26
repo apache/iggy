@@ -152,11 +152,13 @@ enum Verdict {
     Refused,
 }
 
-/// What a shard writes to the object store with: its segment uploader, its
-/// object deleter, its manifest publisher, the uploader of its fresh objects,
-/// the writer and the merger of its long-term segments, the sweeper of fresh
-/// objects and the jobs on geo topic objects. The shard holds them only while
-/// its node passes the store identity check.
+/// What a shard writes to the object store with.
+///
+/// They are its segment uploader, its object deleter, its manifest
+/// publisher, the uploader of its fresh objects, the writer and the merger
+/// of its long-term segments, the sweeper of fresh objects and the jobs on
+/// geo topic objects. The shard holds them only while its node passes the
+/// store identity check.
 pub struct TierHandlers {
     uploader: Rc<dyn SegmentUploader>,
     deleter: Rc<dyn ObjectDeleter>,
@@ -210,7 +212,11 @@ pub async fn run<S: ObjectStore>(
 }
 
 /// This cluster's `cluster_uid`: the id of its metadata change log.
-pub fn own_cluster_uid(shard: &ServerShard) -> Option<u128> {
+pub fn own_cluster_uid<B, MJ, S, SB>(shard: &ShellShard<B, MJ, S, SB>) -> Option<u128>
+where
+    B: ShellBus,
+    SB: SuperblockStore,
+{
     shard
         .plane
         .metadata()
@@ -579,7 +585,7 @@ impl TierHandlers {
     /// Hand them to `shard` when its node is verified as the owner of the
     /// store, whose `cluster_uid` is `verified`, and take them back when
     /// not. A job in flight ends on the handler that started it.
-    fn sync<B, MJ, S, SB>(&mut self, shard: &ShellShard<B, MJ, S, SB>, verified: Option<u128>)
+    pub fn sync<B, MJ, S, SB>(&mut self, shard: &ShellShard<B, MJ, S, SB>, verified: Option<u128>)
     where
         B: ShellBus,
         SB: SuperblockStore,

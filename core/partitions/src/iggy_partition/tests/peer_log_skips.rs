@@ -124,7 +124,7 @@ async fn given_a_follower_that_missed_the_manifest_of_a_publish_when_applying_it
         one_by_one.extend(bytes);
     }
     assert_eq!(one_by_one, expected.2);
-    Box::pin(applied.remove_retired_indexes()).await;
+    Box::pin(applied.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(
         !first_index.exists(),
         "the index of a replaced segment is retired"

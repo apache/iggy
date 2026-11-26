@@ -150,8 +150,11 @@ where
             .get_mut_by_ns(&finished.namespace)
             .filter(|partition| partition.created_revision() == finished.created_revision)
         {
-            let deleted =
-                partition.finish_object_delete(finished.id, finished.outcome, IggyTimestamp::now());
+            let deleted = partition.finish_object_delete(
+                finished.id,
+                finished.outcome,
+                IggyTimestamp::from(self.bus.realtime_micros()),
+            );
             self.metrics.record_long_term_objects_deleted(deleted);
         }
     }

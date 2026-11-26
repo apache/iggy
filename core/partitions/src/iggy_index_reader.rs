@@ -16,10 +16,11 @@
 // under the License.
 
 use crate::iggy_index::{IGGY_INDEX_SIZE, IggyIndex, IggyIndexCache};
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 use compio::fs::{File, OpenOptions};
 use compio::io::AsyncReadAtExt;
 use iggy_common::IggyError;
+use std::borrow::Cow;
 use tracing::trace;
 
 /// Reader for the sparse index file written by [`crate::IggyIndexWriter`].
@@ -31,7 +32,15 @@ use tracing::trace;
 #[derive(Debug)]
 pub struct IggyIndexReader {
     file_path: String,
-    file: File,
+    source: Source,
+}
+
+/// Where the reader finds the entries.
+#[derive(Debug)]
+enum Source {
+    File(File),
+    /// Every byte of the index, in memory.
+    Bytes(Bytes),
 }
 
 impl IggyIndexReader {
@@ -55,7 +64,16 @@ impl IggyIndexReader {
     pub fn from_file(file_path: &str, file: File) -> Self {
         Self {
             file_path: file_path.to_owned(),
-            file,
+            source: Source::File(file),
+        }
+    }
+
+    /// Reads the index that `bytes` hold, as a file at `file_path` would.
+    #[must_use]
+    pub fn from_bytes(file_path: &str, bytes: Bytes) -> Self {
+        Self {
+            file_path: file_path.to_owned(),
+            source: Source::Bytes(bytes),
         }
     }
 
@@ -66,24 +84,42 @@ impl IggyIndexReader {
     ///
     /// Returns an error if the file metadata cannot be read.
     pub async fn entry_count(&self) -> Result<u64, IggyError> {
-        let size = self
-            .file
-            .metadata()
-            .await
-            .map_err(|_| IggyError::CannotReadFileMetadata)?
-            .len();
+        let size = match &self.source {
+            Source::File(file) => file
+                .metadata()
+                .await
+                .map_err(|_| IggyError::CannotReadFileMetadata)?
+                .len(),
+            Source::Bytes(bytes) => bytes.len() as u64,
+        };
         Ok(size / IGGY_INDEX_SIZE as u64)
     }
 
+    /// The `len` bytes at `position`, all of them or an error: read into a
+    /// buffer of their own from a file, and borrowed from memory.
+    async fn read_exact_at(&self, position: u64, len: usize) -> Result<Cow<'_, [u8]>, IggyError> {
+        match &self.source {
+            Source::File(file) => {
+                // `with_capacity` (len 0): `read_exact_at` fills the spare
+                // capacity in place and advances the length, so a
+                // `vec![0u8; N]` (no spare) would read nothing.
+                let buffer = Vec::with_capacity(len);
+                let (result, buffer): (std::io::Result<()>, Vec<u8>) =
+                    file.read_exact_at(buffer, position).await.into();
+                result.map_err(|_| IggyError::CannotReadFile)?;
+                Ok(Cow::Owned(buffer))
+            }
+            Source::Bytes(bytes) => usize::try_from(position)
+                .ok()
+                .and_then(|start| bytes.get(start..start.checked_add(len)?))
+                .map(Cow::Borrowed)
+                .ok_or(IggyError::CannotReadFile),
+        }
+    }
+
     async fn read_entry_at(&self, byte_position: u64) -> Result<IggyIndex, IggyError> {
-        // `with_capacity` (len 0): `read_exact_at` fills the spare capacity in
-        // place and advances the length, so a `vec![0u8; N]` (no spare) would
-        // read nothing.
-        let buffer = Vec::with_capacity(IGGY_INDEX_SIZE);
-        let (result, buffer): (std::io::Result<()>, Vec<u8>) =
-            self.file.read_exact_at(buffer, byte_position).await.into();
-        result.map_err(|_| IggyError::CannotReadFile)?;
-        let mut view = buffer.as_slice();
+        let buffer = self.read_exact_at(byte_position, IGGY_INDEX_SIZE).await?;
+        let mut view: &[u8] = &buffer;
         let offset = view.get_u64_le();
         let timestamp = view.get_u64_le();
         let position = view.get_u64_le();
@@ -145,15 +181,10 @@ impl IggyIndexReader {
             return Ok(IggyIndexCache::empty());
         }
 
-        // `with_capacity` (len 0): `read_exact_at` fills the spare capacity in
-        // place and advances the length (see `read_entry_at`).
-        let buffer = Vec::with_capacity(count * IGGY_INDEX_SIZE);
-        let (result, buffer): (std::io::Result<()>, Vec<u8>) =
-            self.file.read_exact_at(buffer, 0).await.into();
-        result.map_err(|_| IggyError::CannotReadFile)?;
+        let buffer = self.read_exact_at(0, count * IGGY_INDEX_SIZE).await?;
 
         let mut cache = IggyIndexCache::with_capacity(count);
-        let mut view = buffer.as_slice();
+        let mut view: &[u8] = &buffer;
         for _ in 0..count {
             let offset = view.get_u64_le();
             let timestamp = view.get_u64_le();
@@ -367,5 +398,36 @@ mod tests {
         assert!(below_range.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[compio::test]
+    async fn given_bytes_with_a_torn_entry_when_reading_should_answer_as_the_file_does() {
+        let mut bytes = Vec::new();
+        for entry in entries() {
+            bytes.extend_from_slice(&IggyIndexCache::serialize(&entry));
+        }
+        bytes.extend_from_slice(&[7; IGGY_INDEX_SIZE - 1]);
+        let reader = IggyIndexReader::from_bytes("memory.index", Bytes::from(bytes));
+
+        let count = reader.entry_count().await.expect("entry count");
+        let all = reader.load_all().await.expect("load all");
+        let first = reader.load_first().await.expect("first");
+        let last = reader.load_last().await.expect("last");
+        let lookup = reader
+            .offset_lower_bound_with_successor(count, 25)
+            .await
+            .expect("lookup");
+
+        assert_eq!(count, 3, "the torn entry is not counted");
+        assert_eq!(
+            all.offset_lower_bound(25).map(|entry| entry.offset),
+            Some(20)
+        );
+        assert_eq!(first.map(|entry| entry.offset), Some(10));
+        assert_eq!(last.map(|entry| entry.offset), Some(30));
+        assert_eq!(
+            lookup.map(|(entry, successor)| (entry.offset, successor)),
+            Some((20, Some(30)))
+        );
     }
 }

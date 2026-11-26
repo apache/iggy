@@ -154,9 +154,9 @@ fn stored_object(objects: &MemoryTopicObjects, key: TopicKey) -> TopicObject {
 
 /// Run the pass of the geo topics as of `now` and let its task finish.
 async fn geo_topics_pass(ctx: &ReconcilerCtx, now: IggyTimestamp) {
-    ctx.geo_topics.pass(&ctx.shard, now);
+    ctx.geo.geo_topics.pass(&ctx.shard, now);
     for _ in 0..256 {
-        if !ctx.geo_topics.running() {
+        if !ctx.geo.geo_topics.running() {
             return;
         }
         super::super::yield_now().await;

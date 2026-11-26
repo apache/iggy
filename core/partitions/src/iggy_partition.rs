@@ -8196,8 +8196,27 @@ where
             });
         if file_backed {
             PartitionDirResolution::Unresolvable
+        } else if self.peer_log.is_some() {
+            // A partition without files that follows a peer's log reads each
+            // segment from the peer's store. Its polls only name the indexes
+            // that they fetch after a directory, and the peer's store keeps
+            // them, so a name of this incarnation stands in for one.
+            PartitionDirResolution::Resolved(format!(
+                "in-memory/{}-{}",
+                self.namespace().inner(),
+                self.created_revision()
+            ))
         } else {
             PartitionDirResolution::NoFiles
+        }
+    }
+
+    /// The directory where the polls of remote segments put the `.index`
+    /// files that they fetch, `None` while they fetch none.
+    pub(crate) fn fetched_index_dir(&self) -> Option<String> {
+        match self.partition_dir_resolution() {
+            PartitionDirResolution::Resolved(directory) => Some(directory),
+            PartitionDirResolution::NoFiles | PartitionDirResolution::Unresolvable => None,
         }
     }
 

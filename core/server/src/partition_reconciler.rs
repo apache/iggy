@@ -184,14 +184,13 @@
 //! helping; consider a distinct "retry here shortly" code that keeps the route.
 //!
 
-use crate::geo_topics::GeoTopics;
+use crate::geo_passes::GeoPasses;
 use crate::incarnation_deletes::IncarnationDeletes;
 use crate::partition_helpers::{
     build_partition_fresh, load_partition_or_fence, record_partition_retirement_fence,
 };
-use crate::peer_manifests::{NodePlace, PeerManifestLister};
-use crate::peer_positions::PeerPositionLister;
-use crate::shadow_topics::{ShadowTopics, peer_log_of};
+use crate::peer_manifests::NodePlace;
+use crate::shadow_topics::peer_log_of;
 use crate::shell::{ServerShard, ShellBus, ShellShard};
 use ahash::{AHashMap, AHashSet};
 use configs::server::ServerConfig;
@@ -219,8 +218,8 @@ use metadata::stm::lifecycle::{
 };
 use metadata::stm::stream::{Partition, PartitionChangeKind, StatsRegistry};
 use partitions::{
-    IggyPartition, RecoveryPlan, Segment, StreamKeyIdentity, TOPIC_OBJECT_RETRY,
-    delete_partitions_from_disk, object_prefix, read_created_revision,
+    IggyPartition, RecoveryPlan, Segment, StreamKeyIdentity, delete_partitions_from_disk,
+    object_prefix, read_created_revision,
 };
 use server_common::Message;
 use server_common::sharding::{IggyNamespace, ShardId};
@@ -358,21 +357,9 @@ pub struct ReconcilerCtx {
     /// The incarnations whose delete this node saw commit as the metadata
     /// primary, and whose objects wait for their delete.
     incarnation_deletes: IncarnationDeletes,
-    /// The objects of this cluster's geo topics in its store, which the
-    /// metadata primary keeps in step with committed metadata.
-    geo_topics: GeoTopics,
-    /// The shadow streams of the geo peers' topics, which the metadata
-    /// primary keeps in step with the peers' stores.
-    shadow_topics: ShadowTopics,
-    /// The listings of the geo peers' manifests, which keep the shadow
-    /// partitions whose primary this node is up to date. Shard 0 only.
-    peer_manifests: PeerManifestLister,
-    /// The listings of the geo peers' consumer group positions, which the
-    /// primaries here adopt when they win. Shard 0 only.
-    peer_positions: PeerPositionLister,
-    /// When the next pass over the partitions of geo topics may be staged,
-    /// in microseconds since the Unix epoch.
-    next_topic_object_check_at: Cell<u64>,
+    /// The geo topics, the shadow streams and the listings of the geo
+    /// peers.
+    geo: GeoPasses,
 }
 
 impl ReconcilerCtx {
@@ -390,10 +377,7 @@ impl ReconcilerCtx {
             .mux_stm
             .streams()
             .read(|inner| Arc::clone(&inner.stats_registry));
-        let geo_topics = GeoTopics::new(&config.geo);
-        let shadow_topics = ShadowTopics::new(&config.geo);
-        let peer_manifests = PeerManifestLister::new(&config.geo);
-        let peer_positions = PeerPositionLister::new(&config.geo);
+        let geo = GeoPasses::new(&config.geo);
         let partition_shards = shard.partition_shards();
         Self {
             shard,
@@ -414,11 +398,7 @@ impl ReconcilerCtx {
             group_offset_cleanup: GroupOffsetCleanup::default(),
             lifecycle_reports: LifecycleReports::default(),
             incarnation_deletes: IncarnationDeletes::default(),
-            geo_topics,
-            shadow_topics,
-            peer_manifests,
-            peer_positions,
-            next_topic_object_check_at: Cell::new(0),
+            geo,
         }
     }
 
@@ -598,11 +578,7 @@ pub async fn run_reconciler(
     }
 
     ctx.incarnation_deletes.stop();
-    ctx.geo_topics.stop();
-    ctx.shadow_topics.stop(&ctx.shard);
-    ctx.peer_manifests.stop();
-    ctx.peer_positions.stop();
-    ctx.shard.stop_geo_positions();
+    ctx.geo.stop(&ctx.shard);
     debug!(shard = ctx.shard.id, "partition reconciler exited");
 }
 
@@ -691,16 +667,12 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
     report_lifecycles(ctx).await;
     let now = IggyTimestamp::now();
     ctx.incarnation_deletes.pass(&ctx.shard, now);
-    ctx.geo_topics.pass(&ctx.shard, now);
-    ctx.shadow_topics.pass(&ctx.shard, now);
     let place = NodePlace {
         self_replica_id: ctx.self_replica_id,
         replica_count: ctx.replica_count,
         partition_shards: ctx.partition_shards,
     };
-    ctx.peer_manifests.pass(&ctx.shard, now, place);
-    ctx.peer_positions.pass(&ctx.shard, now, place);
-    stage_topic_object_checks(ctx, now);
+    ctx.geo.pass(&ctx.shard, now, place);
 
     if counters.total() > 0 {
         debug!(
@@ -728,20 +700,6 @@ async fn reconcile_once(ctx: &ReconcilerCtx) -> bool {
         );
     }
     capped
-}
-
-/// Stage a pass over the partitions of geo topics on this shard's pump, at
-/// most once per [`TOPIC_OBJECT_RETRY`]. The pump starts the read of the
-/// topic's object for each partition whose primary does not take messages
-/// yet, so a new primary reads without waiting for a produce.
-fn stage_topic_object_checks(ctx: &ReconcilerCtx, now: IggyTimestamp) {
-    if now.as_micros() < ctx.next_topic_object_check_at.get() {
-        return;
-    }
-    let wait = u64::try_from(TOPIC_OBJECT_RETRY.as_micros()).unwrap_or(u64::MAX);
-    ctx.next_topic_object_check_at
-        .set(now.as_micros().saturating_add(wait));
-    ctx.shard.request_check_topic_objects(now);
 }
 
 /// Folds into the work set what changed since the last pass. Returns whether

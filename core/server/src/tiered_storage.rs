@@ -39,6 +39,7 @@ use iggy_object_store::{
     Backend, ErrorClass, FsStore, IdentityRead, KeyLayout, MockS3Latency, MockS3Store, ObjectStore,
     ObjectStoreError, StoreIdentity,
 };
+use journal::superblock::SuperblockStore;
 use message_bus::IggyMessageBus;
 use partitions::{
     ExecutorDeleter, ExecutorFreshSweeper, ExecutorFreshUploader, ExecutorLongTermMerger,
@@ -51,7 +52,7 @@ use tracing::{info, warn};
 
 use crate::origin_recovery::OriginRecovery;
 use crate::server_error::ServerError;
-use crate::shell::ServerShard;
+use crate::shell::{ServerShard, ShellBus, ShellShard};
 use crate::store_identity::{self, IdentityChecker, TierHandlers};
 
 /// The longest the boot probe, or one store identity check, waits for the
@@ -239,10 +240,6 @@ async fn probe_conditional_create<S: ObjectStore>(
 /// its segment uploader and object deleter only while its node passes the
 /// check. Shard 0 runs the check itself, and the other shards follow it.
 ///
-/// The partitions of the shard read their remote segments through the
-/// service from here on, which is what lets the node report that it can
-/// tier topics.
-///
 /// Returns the stop signal of the check's task, or `None` without a backend.
 pub fn start(
     config: &TieredStorageConfig,
@@ -255,41 +252,7 @@ pub fn start(
     // `preflight` and `probe` refused the boot already when these fail.
     let backend = store(config, node_store).ok().flatten()?;
     let layout = layout(config).ok()?;
-    let service = TierService::new(backend, Rc::clone(bus), &service_config(config));
-    shard.set_fresh_upload_pace(
-        config.fresh_upload_interval.get_duration(),
-        usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
-    );
-    shard.set_long_term_backlog_limit(config.long_term_backlog_limit.as_bytes_u64());
-    shard.set_fresh_pending_bytes(
-        config.fresh_pending_bytes.as_bytes_u64(),
-        config.fresh_partition_pending_bytes.as_bytes_u64(),
-    );
-    shard
-        .plane
-        .partitions()
-        .set_remote_segments(Rc::new(RemoteSegments::new(
-            Rc::new(ExecutorObjects::new(service.clone())),
-            layout.clone(),
-        )));
-    shard
-        .plane
-        .metadata()
-        .applied_frontier()
-        .set_tiered_storage_ready(true);
-    let handlers = TierHandlers::new(
-        Rc::new(ExecutorUploader::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorDeleter::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorManifestPublisher::new(
-            service.clone(),
-            layout.clone(),
-        )),
-        Rc::new(ExecutorFreshUploader::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorLongTermWriter::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorLongTermMerger::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorFreshSweeper::new(service.clone(), layout.clone())),
-        Rc::new(ExecutorTopicObjects::new(service, layout.clone())),
-    );
+    let handlers = serve(config, backend, &layout, shard);
     // The check gets a store of its own, outside the service, so no queued
     // job and no retry delays what it finds.
     let checker = if shard.id == 0 {
@@ -324,6 +287,63 @@ pub fn start(
     ));
     bus.track_background(task);
     Some(stop_tx)
+}
+
+/// Give `shard` a tier service over `store`, and return its writers.
+///
+/// The service takes the caps and the pace of `config`. The shard holds the
+/// writers only while its node passes the store identity check, see
+/// [`TierHandlers::sync`].
+///
+/// The partitions of the shard read their remote segments through the
+/// service from here on, which is what lets the node report that it can
+/// tier topics.
+pub fn serve<S, B, MJ, SS, SB>(
+    config: &TieredStorageConfig,
+    store: S,
+    layout: &KeyLayout,
+    shard: &ShellShard<B, MJ, SS, SB>,
+) -> TierHandlers
+where
+    S: ObjectStore + 'static,
+    B: ShellBus + Unpin,
+    SB: SuperblockStore,
+{
+    let service = TierService::new(store, shard.bus.clone(), &service_config(config));
+    shard.set_fresh_upload_pace(
+        config.fresh_upload_interval.get_duration(),
+        usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
+    );
+    shard.set_long_term_backlog_limit(config.long_term_backlog_limit.as_bytes_u64());
+    shard.set_fresh_pending_bytes(
+        config.fresh_pending_bytes.as_bytes_u64(),
+        config.fresh_partition_pending_bytes.as_bytes_u64(),
+    );
+    shard.plane.partitions().set_remote_segments(Rc::new(
+        RemoteSegments::new(
+            Rc::new(ExecutorObjects::new(service.clone())),
+            layout.clone(),
+        )
+        .with_runtime(Rc::new(shard.bus.clone())),
+    ));
+    shard
+        .plane
+        .metadata()
+        .applied_frontier()
+        .set_tiered_storage_ready(true);
+    TierHandlers::new(
+        Rc::new(ExecutorUploader::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorDeleter::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorManifestPublisher::new(
+            service.clone(),
+            layout.clone(),
+        )),
+        Rc::new(ExecutorFreshUploader::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorLongTermWriter::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorLongTermMerger::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorFreshSweeper::new(service.clone(), layout.clone())),
+        Rc::new(ExecutorTopicObjects::new(service, layout.clone())),
+    )
 }
 
 /// The section's caps and timeouts in the form the tier service takes.

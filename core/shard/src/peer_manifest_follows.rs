@@ -37,7 +37,7 @@
 //! the topic's retention removes, through the same commands.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use consensus::PartitionsHandle;
@@ -47,7 +47,7 @@ use iggy_object_store::PartitionManifest;
 use journal::superblock::SuperblockStore;
 use journal::{Journal, JournalHandle};
 use message_bus::MessageBus;
-use partitions::RemoteObjects;
+use partitions::{DiskIndexFiles, IndexFiles, RemoteObjects};
 use server_common::Message;
 use server_common::sharding::IggyNamespace;
 
@@ -172,7 +172,9 @@ where
         else {
             return;
         };
-        let listed: HashMap<IggyNamespace, ListedPeerManifest> = manifests
+        // In namespace order, so the reads start in the same order on every
+        // run of the same input, as the simulator's replay needs.
+        let listed: BTreeMap<IggyNamespace, ListedPeerManifest> = manifests
             .into_iter()
             .map(|manifest| (manifest.namespace, manifest))
             .collect();
@@ -196,9 +198,13 @@ where
             };
             let retired = partition.take_retired_peer_indexes();
             if !retired.is_empty() {
+                let files = self.peer_stores().get(origin).map_or_else(
+                    || Rc::new(DiskIndexFiles) as Rc<dyn IndexFiles>,
+                    crate::peers::PeerStore::index_files,
+                );
                 self.bus.spawn(async move {
                     for path in retired {
-                        let _ = compio::fs::remove_file(&path).await;
+                        let _ = files.remove(&path).await;
                     }
                 });
             }

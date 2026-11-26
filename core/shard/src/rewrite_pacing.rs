@@ -46,7 +46,7 @@
 use partitions::{PlannedSegment, RewriteError};
 use server_common::sharding::IggyNamespace;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -181,7 +181,9 @@ struct Pace {
 /// The waits of the partitions of one shard.
 #[derive(Debug)]
 pub struct RewritePacing {
-    partitions: HashMap<RewriteKey, Pace>,
+    /// In key order, so the passes over them run in the same order on every
+    /// run of the same input, as the simulator's replay needs.
+    partitions: BTreeMap<RewriteKey, Pace>,
     /// The longest wait, never below [`REWRITE_INTERVAL_MIN`].
     max_interval_micros: u64,
     /// The backlog past which the sends to a partition are delayed, zero
@@ -199,7 +201,7 @@ pub struct RewritePacing {
 impl Default for RewritePacing {
     fn default() -> Self {
         Self {
-            partitions: HashMap::new(),
+            partitions: BTreeMap::new(),
             max_interval_micros: micros(REWRITE_INTERVAL_MAX),
             backlog_limit: LONG_TERM_BACKLOG_LIMIT,
             backlog_counts: Rc::default(),

@@ -58,6 +58,7 @@ use message_bus::MessageBus;
 use server_common::SegmentStorage;
 
 use crate::iggy_partition::settle_cleaned_segment;
+use crate::index_files::IndexFiles;
 use crate::long_term::concatenated;
 use crate::poll_plan::PeerSegmentRun;
 use crate::remote_segments::index_file_name;
@@ -117,9 +118,26 @@ impl PeerManifestApplied {
     /// segments fetched.
     /// Best effort: a file that stays is never read again, and the next
     /// start of the partition sweeps it.
-    pub async fn remove_retired_indexes(self) {
+    pub async fn remove_retired_indexes(self, files: &dyn IndexFiles) {
         for path in &self.retired_indexes {
-            let _ = compio::fs::remove_file(path).await;
+            let _ = files.remove(path).await;
+        }
+    }
+
+    /// Name the `.index` of a segment that left the log, where its polls put
+    /// it in `index_dir`, for [`Self::remove_retired_indexes`].
+    fn retire_index(
+        &mut self,
+        index_dir: Option<&str>,
+        segment: &Segment,
+        keyed_by_both_offsets: bool,
+    ) {
+        if let Some(directory) = index_dir {
+            let name = index_file_name(
+                segment.start_offset,
+                keyed_by_both_offsets.then_some(segment.end_offset),
+            );
+            self.retired_indexes.push(format!("{directory}/{name}"));
         }
     }
 }
@@ -669,6 +687,9 @@ where
         &mut self,
         manifest: &PartitionManifest,
     ) -> Result<PeerManifestApplied, PeerManifestRefusal> {
+        // A partition without files names this directory after the peer log
+        // it follows, so it is read before the log leaves the partition.
+        let index_dir = self.fetched_index_dir();
         let mut peer = self
             .peer_log
             .take()
@@ -687,11 +708,16 @@ where
                 break;
             };
             debug_assert_eq!(segment.location, SegmentLocation::Remote);
-            self.retire_peer_segment(&segment, peer.keyed_by_both_offsets, &mut applied);
+            self.retire_peer_segment(
+                &segment,
+                peer.keyed_by_both_offsets,
+                index_dir.as_deref(),
+                &mut applied,
+            );
         }
         // Newest first, so the places of the older ones stay as counted.
         for cover in change.covers.iter().rev() {
-            self.cover_peer_segments(&mut peer, cover, &mut applied);
+            self.cover_peer_segments(&mut peer, cover, index_dir.as_deref(), &mut applied);
         }
         if peer.segments.is_empty() {
             peer.keyed_by_both_offsets = manifest.segments_keyed_by_both_offsets;
@@ -750,11 +776,13 @@ where
         Ok(applied)
     }
 
-    /// Forget a segment a trim dropped from the front of the log.
+    /// Forget a segment a trim dropped from the front of the log, whose polls
+    /// may have put its `.index` in `index_dir`.
     fn retire_peer_segment(
         &self,
         segment: &Segment,
         keyed_by_both_offsets: bool,
+        index_dir: Option<&str>,
         applied: &mut PeerManifestApplied,
     ) {
         // A fetch of its index that is still running publishes nothing now,
@@ -765,15 +793,17 @@ where
             self.namespace(),
             Some((segment.start_offset, segment.end_offset)),
         );
-        self.retire_peer_index(segment, keyed_by_both_offsets, applied);
+        applied.retire_index(index_dir, segment, keyed_by_both_offsets);
         applied.trimmed += 1;
     }
 
-    /// Put the segment of `cover` in the place of the segments it holds.
+    /// Put the segment of `cover` in the place of the segments it holds,
+    /// whose polls may have put their `.index` in `index_dir`.
     fn cover_peer_segments(
         &mut self,
         peer: &mut PeerLog,
         cover: &Cover,
+        index_dir: Option<&str>,
         applied: &mut PeerManifestApplied,
     ) {
         let slots = cover.at..cover.at + cover.sources;
@@ -800,29 +830,12 @@ where
         self.stats.increment_messages_count(cover.unseen.messages);
         self.committed_bytes = self.committed_bytes.saturating_add(cover.unseen.bytes);
         for segment in &replaced {
-            self.retire_peer_index(segment, peer.keyed_by_both_offsets, applied);
+            applied.retire_index(index_dir, segment, peer.keyed_by_both_offsets);
         }
         let _ = self
             .stats
             .decrement_segments_count(u32::try_from(replaced.len() - 1).unwrap_or(u32::MAX));
         applied.replaced += replaced.len();
-    }
-
-    /// Name the fetched `.index` of a segment that left the log, for
-    /// [`PeerManifestApplied::remove_retired_indexes`].
-    fn retire_peer_index(
-        &self,
-        segment: &Segment,
-        keyed_by_both_offsets: bool,
-        applied: &mut PeerManifestApplied,
-    ) {
-        if let Some(directory) = self.partition_dir.as_deref() {
-            let name = index_file_name(
-                segment.start_offset,
-                keyed_by_both_offsets.then_some(segment.end_offset),
-            );
-            applied.retired_indexes.push(format!("{directory}/{name}"));
-        }
     }
 
     /// Put the empty tail of a peer log at `start_offset`, after its remote

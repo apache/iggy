@@ -333,7 +333,10 @@ impl PlacedReadPlan {
             };
             let index_key = key(SegmentObject::Index);
             let index = self
-                .wait(remote.read_long_term_object(&index_key, 0..LONG_TERM_INDEX_BYTES))
+                .wait(
+                    remote,
+                    remote.read_long_term_object(&index_key, 0..LONG_TERM_INDEX_BYTES),
+                )
                 .await?;
             let log = key(SegmentObject::Log);
             let mut position = wanted.first_position(&index, segment.size);
@@ -341,7 +344,7 @@ impl PlacedReadPlan {
             while position < segment.size && !wanted.is_full() {
                 let end = segment.size.min(position.saturating_add(len));
                 let chunk = self
-                    .wait(remote.read_long_term_object(&log, position..end))
+                    .wait(remote, remote.read_long_term_object(&log, position..end))
                     .await?;
                 if chunk.len() as u64 != end - position {
                     return Err(DiskFault::Tiered);
@@ -595,8 +598,11 @@ impl PlacedReadPlan {
                 Some(placement.position..end)
             })
             .collect();
-        self.wait(remote.fetch_fresh(first.placement.object_id, &blobs))
-            .await
+        self.wait(
+            remote,
+            remote.fetch_fresh(first.placement.object_id, &blobs),
+        )
+        .await
     }
 
     /// The whole batch of `placed`: its header with the batch checksum it
@@ -619,29 +625,33 @@ impl PlacedReadPlan {
         let blob = if let Some(blob) = fetched.get(placement.object_id, &range) {
             blob
         } else {
-            self.wait(remote.read_fresh(placement.object_id, range))
+            self.wait(remote, remote.read_fresh(placement.object_id, range))
                 .await?
         };
         whole_prepare(&whole_header(placed, &blob)?, &blob)
     }
 
-    /// One wait on the object store, which ends at the poll's deadline.
+    /// One wait on the object store `remote`, which ends at the poll's
+    /// deadline.
     ///
     /// A read that this shard answers from memory is ready at once, and most
     /// reads at the tail are. It takes no timer.
     async fn wait<T>(
         &self,
+        remote: &RemoteSegments,
         read: impl Future<Output = Result<T, DiskFault>>,
     ) -> Result<T, DiskFault> {
         let mut read = std::pin::pin!(read);
         if let Poll::Ready(read) = futures::poll!(read.as_mut()) {
             return read;
         }
-        let now = Instant::now();
+        let runtime = remote.runtime();
+        let now = runtime.now();
         match self.deadline {
             None => read.await,
             Some(deadline) if deadline <= now => Err(DiskFault::Retryable),
-            Some(deadline) => compio::time::timeout(deadline - now, read)
+            Some(deadline) => runtime
+                .timeout(deadline - now, read)
                 .await
                 .unwrap_or(Err(DiskFault::Retryable)),
         }

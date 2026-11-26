@@ -55,18 +55,21 @@ use std::time::Duration;
 
 use configs::geo::GeoConfig;
 use consensus::MetadataHandle;
+use iggy_binary_protocol::PrepareHeader;
 use iggy_common::{CompressionAlgorithm, GeoMode, IggyExpiry, IggyTimestamp, MaxTopicSize};
 use iggy_object_store::{
     TierJobCancelled, TierScope, TierScopeToken, TopicCompression, TopicGeoMode, TopicKey,
     TopicObject, TopicRead, TopicState,
 };
-use message_bus::MessageBus;
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::TopicObjects;
+use server_common::Message;
 use tracing::{debug, info, warn};
 
-use crate::shell::ServerShard;
+use crate::shell::{ShellBus, ShellShard};
 use crate::store_identity::own_cluster_uid;
 
 /// How often the metadata primary lists the topic objects of its store.
@@ -127,7 +130,14 @@ impl GeoTopics {
     /// detached task. A pass while that task runs starts nothing. A node
     /// that is not the caught-up metadata primary forgets what it stored and
     /// stops its task: the primary that took over stores every object again.
-    pub fn pass(&self, shard: &Rc<ServerShard>, now: IggyTimestamp) {
+    pub fn pass<B, MJ, S, SB>(&self, shard: &Rc<ShellShard<B, MJ, S, SB>>, now: IggyTimestamp)
+    where
+        B: ShellBus + Unpin,
+        MJ: JournalHandle + 'static,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        S: 'static,
+        SB: SuperblockStore + 'static,
+    {
         let Some(settings) = &self.settings else {
             return;
         };

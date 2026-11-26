@@ -212,7 +212,7 @@ where
             .get_mut_by_ns(&finished.namespace)
             .filter(|partition| partition.created_revision() == finished.created_revision)
         {
-            let now = IggyTimestamp::now();
+            let now = IggyTimestamp::from(self.bus.realtime_micros());
             if partition.finish_manifest_publish(finished.id, &finished.outcome, now) {
                 self.request_publish_manifest(finished.namespace, finished.created_revision, now);
             }

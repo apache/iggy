@@ -36,10 +36,12 @@ pub const SEMANTIC_VERSION: SemanticVersion = SemanticVersion::parse_const(VERSI
 
 // Visibility rule: `pub` = named external consumer. main.rs consumes
 // `VERSION`, `boot` (including `boot::systemd`) and `server_error`; the
-// simulator consumes `shell`, `boot::ServerHost` and the reconciler exports
+// simulator consumes `shell`, `boot::ServerHost`, the reconciler exports
 // (`LifecycleReports`, `reconcile_partition_lifecycles`,
-// `reconcile_pending_revocations`). Everything else is internal to the
-// crate.
+// `reconcile_pending_revocations`), the geo passes (`GeoPasses`,
+// `NodePlace`, `peer_log_of`) and the store wiring (`serve_tiered_storage`,
+// `serve_peers`, `ServedPeer`, `TierHandlers`, `own_cluster_uid`). Everything
+// else is internal to the crate.
 
 // boot: process entry, shard threads, recovery orchestration.
 pub mod boot;
@@ -68,12 +70,16 @@ pub(crate) mod wire;
 pub(crate) mod http;
 
 // background: per-shard maintenance loops.
+pub(crate) mod geo_passes;
+pub use geo_passes::GeoPasses;
 pub(crate) mod geo_peers;
+pub use geo_peers::{ServedPeer, serve_peers};
 pub(crate) mod geo_topics;
 pub(crate) mod incarnation_deletes;
 pub(crate) mod origin_recovery;
 pub(crate) mod partition_reconciler;
 pub(crate) mod peer_manifests;
+pub use peer_manifests::NodePlace;
 pub(crate) mod peer_positions;
 pub use partition_reconciler::{
     GroupOffsetCleanup, LifecycleReports, reconcile_consumer_group_offsets,
@@ -85,10 +91,13 @@ pub(crate) mod personal_access_token_cleaner;
 pub(crate) mod s3_credentials;
 pub(crate) mod segment_cleaner;
 pub(crate) mod shadow_topics;
+pub use shadow_topics::peer_log_of;
 pub(crate) mod snapshot;
 pub(crate) mod store_identity;
+pub use store_identity::{TierHandlers, own_cluster_uid};
 pub(crate) mod sysinfo_printer;
 pub(crate) mod tiered_storage;
+pub use tiered_storage::serve as serve_tiered_storage;
 
 // support: shared plumbing.
 pub(crate) mod cluster_meta;

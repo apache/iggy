@@ -68,13 +68,14 @@ use consensus::MetadataHandle;
 use iggy_binary_protocol::requests::topics::{
     CreateTopicRequest, CreateTopicWithAssignmentsRequest,
 };
-use iggy_binary_protocol::{WireIdentifier, WireName, WireOptions};
+use iggy_binary_protocol::{PrepareHeader, WireIdentifier, WireName, WireOptions};
 use iggy_common::{CompressionAlgorithm, GeoMode, IggyTimestamp, TopicCreateOptions};
 use iggy_object_store::{
     ObjectPrefix, TierJobCancelled, TierScope, TierScopeToken, TopicCompression, TopicGeoMode,
     TopicKey, TopicObject, TopicRead, TopicState,
 };
-use message_bus::MessageBus;
+use journal::superblock::SuperblockStore;
+use journal::{Journal, JournalHandle};
 use metadata::impls::metadata::StreamsFrontend;
 use metadata::stm::shadow::{
     RetiredOrigin, ShadowRetention, ShadowStream, ShadowTopicRequest, ShadowTopicTarget,
@@ -82,10 +83,11 @@ use metadata::stm::shadow::{
 };
 use metadata::stm::stream::{Stream, StreamsInner, Topic};
 use partitions::{ExecutorTopicObjects, TopicObjects};
+use server_common::Message;
 use server_common::sharding::IggyNamespace;
 use tracing::{debug, info, warn};
 
-use crate::shell::ServerShard;
+use crate::shell::{ShellBus, ShellShard};
 
 /// The shortest time between two passes, each of which lists the topic
 /// objects of every peer.
@@ -116,14 +118,10 @@ pub struct PeerTopics {
     pub objects: Option<Rc<dyn TopicObjects>>,
 }
 
-/// The peers of a node, read again on every pass.
-type PeerSource = Box<dyn Fn(&ServerShard) -> Vec<PeerTopics>>;
-
 /// The shadow streams that the metadata primary keeps in step with its geo
 /// peers.
 pub struct ShadowTopics {
     settings: Settings,
-    peers: PeerSource,
     /// Shared with the task of the pass.
     state: Rc<RefCell<State>>,
 }
@@ -195,18 +193,11 @@ enum Report {
 impl ShadowTopics {
     #[must_use]
     pub fn new(config: &GeoConfig) -> Self {
-        Self::with_peers(config, Box::new(peer_topics))
-    }
-
-    /// The shadow streams of the peers that `peers` gives.
-    #[must_use]
-    pub fn with_peers(config: &GeoConfig, peers: PeerSource) -> Self {
         Self {
             settings: Settings {
                 tombstone_grace: micros(config.tombstone_grace.get_duration()),
                 has_peers: !config.peers.is_empty(),
             },
-            peers,
             state: Rc::default(),
         }
     }
@@ -216,7 +207,14 @@ impl ShadowTopics {
     /// that is not the caught-up metadata primary forgets what it read and
     /// stops its task. A node without peers passes only while a shadow
     /// stream of a retired origin is left to remove.
-    pub fn pass(&self, shard: &Rc<ServerShard>, now: IggyTimestamp) {
+    pub fn pass<B, MJ, S, SB>(&self, shard: &Rc<ShellShard<B, MJ, S, SB>>, now: IggyTimestamp)
+    where
+        B: ShellBus + Unpin,
+        MJ: JournalHandle + 'static,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        S: 'static,
+        SB: SuperblockStore + 'static,
+    {
         let settings = self.settings;
         let metadata = shard.plane.metadata();
         let streams = metadata.mux_stm.streams();
@@ -240,7 +238,7 @@ impl ShadowTopics {
                 shard.metrics().set_geo_shadow_topics_stale(origin, 0);
             }
         }
-        let peers: Vec<PeerTopics> = (self.peers)(shard)
+        let peers: Vec<PeerTopics> = peer_topics(shard)
             .into_iter()
             .filter(|peer| !retired.contains_key(&peer.origin))
             .collect();
@@ -265,7 +263,14 @@ impl ShadowTopics {
 
     /// Forget what this node read, cancel the task in flight and clear the
     /// gauges it set.
-    pub fn stop(&self, shard: &ServerShard) {
+    pub fn stop<B, MJ, S, SB>(&self, shard: &ShellShard<B, MJ, S, SB>)
+    where
+        B: ShellBus + Unpin,
+        MJ: JournalHandle + 'static,
+        MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+        S: 'static,
+        SB: SuperblockStore + 'static,
+    {
         let mut state = self.state.borrow_mut();
         if state.running.is_none() && state.peers.is_empty() {
             return;
@@ -303,7 +308,14 @@ pub fn peer_log_of(
 }
 
 /// The peers of `shard` as the identity checks left them.
-fn peer_topics(shard: &ServerShard) -> Vec<PeerTopics> {
+fn peer_topics<B, MJ, S, SB>(shard: &ShellShard<B, MJ, S, SB>) -> Vec<PeerTopics>
+where
+    B: ShellBus + Unpin,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
     shard
         .peer_stores()
         .iter()
@@ -322,16 +334,23 @@ fn peer_topics(shard: &ServerShard) -> Vec<PeerTopics> {
 
 /// One task of a pass: it reads every peer, then proposes one operation at a
 /// time.
-struct Task {
+struct Task<B: ShellBus, MJ, S, SB> {
     id: u64,
-    shard: Rc<ServerShard>,
+    shard: Rc<ShellShard<B, MJ, S, SB>>,
     state: Rc<RefCell<State>>,
     token: TierScopeToken,
     now: IggyTimestamp,
     settings: Settings,
 }
 
-impl Task {
+impl<B, MJ, S, SB> Task<B, MJ, S, SB>
+where
+    B: ShellBus + Unpin,
+    MJ: JournalHandle + 'static,
+    MJ::Target: Journal<Entry = Message<PrepareHeader>, Header = PrepareHeader>,
+    S: 'static,
+    SB: SuperblockStore + 'static,
+{
     async fn run(self, peers: Vec<PeerTopics>) {
         let mut cancelled = false;
         for peer in &peers {

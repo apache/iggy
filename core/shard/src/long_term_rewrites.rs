@@ -203,7 +203,11 @@ where
             .committed(&(namespace, created_revision), self.bus.monotonic_micros());
         self.long_term_merge_committed(&(namespace, created_revision), pressed);
         if self.manifest_publisher.borrow().is_some() {
-            self.request_publish_manifest(namespace, created_revision, IggyTimestamp::now());
+            self.request_publish_manifest(
+                namespace,
+                created_revision,
+                IggyTimestamp::from(self.bus.realtime_micros()),
+            );
         }
     }
 
@@ -242,7 +246,7 @@ where
         for plan in plans {
             self.settle_segment_plan(plan).await;
         }
-        let manifest_now = IggyTimestamp::now();
+        let manifest_now = IggyTimestamp::from(self.bus.realtime_micros());
         self.stage_held_manifest_passes(manifest_now);
         let partitions = self.plane.partitions();
         if self.rewrite_pacing.borrow_mut().take_sweep_wanted() {
@@ -537,8 +541,11 @@ where
             self.rewrite_pacing.borrow_mut().forget(&plan.key);
             return;
         };
-        let registration =
-            partition.finish_segment_plan(plan.id, plan.outcome, IggyTimestamp::now());
+        let registration = partition.finish_segment_plan(
+            plan.id,
+            plan.outcome,
+            IggyTimestamp::from(self.bus.realtime_micros()),
+        );
         let result = if registration.is_some() {
             RewriteResult::Registering
         } else {

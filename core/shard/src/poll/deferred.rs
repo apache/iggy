@@ -1587,7 +1587,7 @@ where
             self.reject_deferred_poll(id, &waiter, IggyError::TransientNotAccepted);
             return;
         };
-        let plan = plan.with_deadline(std::time::Instant::now() + crate::COLD_POLL_BUDGET);
+        let plan = plan.with_deadline(self.bus.monotonic_now() + crate::COLD_POLL_BUDGET);
         let Some(reservation) = self.deferred_polls.reserve_read_in_turn(place, read_bytes) else {
             self.deferred_polls.queue_read(id, waiter, place);
             return;

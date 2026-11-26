@@ -28,8 +28,9 @@
 use super::floor_eviction::apply;
 use super::long_term_merge::{commit_replace, merge_pass};
 use super::peer_log::{
-    Gated, InFlight, ORIGIN_ROOT, Polled, accepted, follower, listed, log_shape, manifest_of,
-    origin_in, origin_layout, plan, polled, unattached, until_gated,
+    Gated, InFlight, MemoryIndexFiles, ORIGIN_ROOT, Polled, accepted, follower,
+    follower_without_files, listed, log_shape, manifest_of, origin_in, origin_layout, plan, polled,
+    unattached, until_gated,
 };
 use super::placed_batches::{
     commit_long_term_request, object_bytes, placing_leader_of_three_with, publish_manifest,
@@ -384,7 +385,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
         segments_counted - 2
     );
     assert_eq!(Box::pin(polls_up_to(&mut follower, 9)).await, before);
-    Box::pin(applied.remove_retired_indexes()).await;
+    Box::pin(applied.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(first_index.exists(), "the first segment stayed");
 
     let front = Box::pin(store_merged(&origin.store, &[segments[0], middle])).await;
@@ -407,7 +408,7 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
         segments_counted - 3
     );
     assert_eq!(Box::pin(polls_up_to(&mut follower, 9)).await, before);
-    Box::pin(applied.remove_retired_indexes()).await;
+    Box::pin(applied.remove_retired_indexes(&crate::DiskIndexFiles)).await;
     assert!(
         !first_index.exists(),
         "the index of a replaced segment is retired"
@@ -419,6 +420,43 @@ async fn given_a_manifest_that_merges_a_run_in_the_middle_and_then_one_at_the_fr
             .exists(),
         "the merged segment has an index of its own"
     );
+}
+
+#[compio::test]
+async fn given_a_follower_without_files_when_a_merge_replaces_polled_segments_should_remove_the_indexes_their_polls_fetched()
+ {
+    let origin = Box::pin(keyed_origin(11)).await;
+    let segments = origin.segments.clone();
+    let index_files = MemoryIndexFiles::default();
+    let mut follower =
+        follower_without_files(Rc::new(FsStore::new(origin.bucket.path())), &index_files);
+    let _ = follower
+        .apply_peer_manifest(&keyed(None, &segments))
+        .unwrap();
+    let _ = Box::pin(polls_up_to(&mut follower, 9)).await;
+    let replaced_indexes: Vec<String> = segments[..2]
+        .iter()
+        .map(|segment| {
+            format!(
+                "{:020}-{:020}.index",
+                segment.start_offset, segment.end_offset
+            )
+        })
+        .collect();
+    assert!(replaced_indexes.iter().all(|name| index_files.holds(name)));
+
+    let front = Box::pin(store_merged(&origin.store, &segments[..2])).await;
+    Box::pin(delete_segments(&origin.store, &segments[..2])).await;
+    let mut listed = vec![front];
+    listed.extend_from_slice(&segments[2..]);
+    let applied = follower.apply_peer_manifest(&keyed(None, &listed)).unwrap();
+    Box::pin(applied.remove_retired_indexes(&index_files)).await;
+
+    assert!(
+        replaced_indexes.iter().all(|name| !index_files.holds(name)),
+        "the indexes of the replaced segments are removed where their polls put them"
+    );
+    assert!(index_files.holds(&format!("{:020}-{:020}.index", 4, 5)));
 }
 
 #[compio::test]

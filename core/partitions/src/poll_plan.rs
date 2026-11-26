@@ -28,6 +28,7 @@ use crate::journal::{
     unpin_sparse_source,
 };
 use crate::placed_read::PlacedReadPlan;
+use crate::read_runtime::ReadRuntime;
 use crate::remote_segments::{IndexFetch, IndexFetchFence, RemoteRange, RemoteSegments};
 use crate::{Fragment, PollFragments, PollingConsumer};
 use compio::io::AsyncReadAtExt;
@@ -264,15 +265,20 @@ impl SealedSegmentReadState {
         }
     }
 
-    /// Remember how a wait on the store ended: a fault for longer than the
-    /// `previous` one in a row, and an answer clears it.
-    fn remember_outcome(&self, previous: Option<RemoteFailure>, fault: Option<DiskFault>) {
+    /// Remember how a wait on the store ended at `now`: a fault for longer
+    /// than the `previous` one in a row, and an answer clears it.
+    fn remember_outcome(
+        &self,
+        previous: Option<RemoteFailure>,
+        fault: Option<DiskFault>,
+        now: Instant,
+    ) {
         self.remote_failure.set(fault.map(|fault| {
             let failures = previous.map_or(1, |failure| failure.failures.saturating_add(1));
             RemoteFailure {
                 fault,
                 failures,
-                until: Instant::now() + remote_failure_backoff(failures),
+                until: now + remote_failure_backoff(failures),
             }
         }));
     }
@@ -1427,7 +1433,7 @@ impl DiskReadPlan {
                             }
                         })
                 };
-                self.wait_for_store(state, read).await
+                self.wait_for_store(remote.runtime(), state, read).await
             }
         }
     }
@@ -1442,19 +1448,21 @@ impl DiskReadPlan {
     /// had the time to answer.
     async fn wait_for_store<T>(
         &self,
+        runtime: &dyn ReadRuntime,
         state: &SealedSegmentReadState,
         wait: impl Future<Output = Result<T, DiskFault>>,
     ) -> Result<T, DiskFault> {
-        let now = Instant::now();
+        let now = runtime.now();
         let remembered = state.remembered_failure(now)?;
         let result = match self.deadline {
             None => wait.await,
             Some(deadline) if deadline <= now => return Err(DiskFault::Retryable),
-            Some(deadline) => compio::time::timeout(deadline - now, wait)
+            Some(deadline) => runtime
+                .timeout(deadline - now, wait)
                 .await
                 .unwrap_or(Err(DiskFault::Retryable)),
         };
-        state.remember_outcome(remembered, result.as_ref().err().copied());
+        state.remember_outcome(remembered, result.as_ref().err().copied(), runtime.now());
         result
     }
 
@@ -1473,8 +1481,9 @@ impl DiskReadPlan {
         path: &str,
     ) -> Result<(), DiskFault> {
         let remote = self.remote.as_ref().ok_or(DiskFault::Retryable)?;
+        let runtime = remote.runtime();
         let state = &segment.read_state;
-        let now = Instant::now();
+        let now = runtime.now();
         let remembered = state.remembered_failure(now)?;
         if self.deadline.is_some_and(|deadline| deadline <= now) {
             return Err(DiskFault::Retryable);
@@ -1493,14 +1502,15 @@ impl DiskReadPlan {
             .ok_or(DiskFault::Retryable)?;
         let ended = match self.deadline {
             None => fetched.await,
-            Some(deadline) => compio::time::timeout(deadline - now, fetched)
+            Some(deadline) => runtime
+                .timeout(deadline - now, fetched)
                 .await
-                .map_err(|_| DiskFault::Retryable)?,
+                .ok_or(DiskFault::Retryable)?,
         };
         self.index_fetches.forget_finished(segment.start_offset);
         // A cancelled fetch belonged to files that were replaced under it.
         let result = ended.ok_or(DiskFault::Retryable)?;
-        state.remember_outcome(remembered, result.err());
+        state.remember_outcome(remembered, result.err(), runtime.now());
         result
     }
 
@@ -1649,25 +1659,39 @@ impl DiskReadPlan {
         path: &str,
     ) -> Result<Option<(IggyIndexReader, u64)>, DiskFault> {
         let SegmentSource::Remote(log) = &segment.source else {
-            return Ok(self.open_local_index(path).await.ok());
+            return Ok(self
+                .counted_index(path, IggyIndexReader::new(path).await)
+                .await
+                .ok());
         };
-        if let Ok((reader, entry_count)) = self.open_local_index(path).await
+        // A shard that has not connected its store yet cannot fetch the
+        // index now, and can once it has.
+        let files = self
+            .remote
+            .as_deref()
+            .ok_or(DiskFault::Retryable)?
+            .index_files();
+        if let Ok((reader, entry_count)) = self.counted_index(path, files.open(path).await).await
             && entry_count > 0
         {
             return Ok(Some((reader, entry_count)));
         }
         self.wait_for_index(segment, log, partition_dir, path)
             .await?;
-        self.open_local_index(path)
+        self.counted_index(path, files.open(path).await)
             .await
             .map(Some)
             .map_err(|()| DiskFault::Retryable)
     }
 
-    async fn open_local_index(&self, path: &str) -> Result<(IggyIndexReader, u64), ()> {
-        let reader = IggyIndexReader::new(path)
-            .await
-            .map_err(|error| self.warn_sparse_index_fallback(path, "open", &error))?;
+    /// The index that `opened` gives, with its number of entries.
+    async fn counted_index(
+        &self,
+        path: &str,
+        opened: Result<IggyIndexReader, IggyError>,
+    ) -> Result<(IggyIndexReader, u64), ()> {
+        let reader =
+            opened.map_err(|error| self.warn_sparse_index_fallback(path, "open", &error))?;
         let entry_count = reader
             .entry_count()
             .await
