@@ -9974,6 +9974,7 @@ dependencies = [
  "rustls",
  "sd-notify",
  "secrecy",
+ "semver",
  "send_wrapper",
  "serde",
  "serde_json",

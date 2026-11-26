@@ -117,6 +117,7 @@ metadata = { workspace = true, features = ["simulator"] }
 mimalloc = { workspace = true, features = ["extended"] }
 proc-macro2 = { workspace = true }
 quote = { workspace = true }
+semver = { workspace = true }
 # Reconciler unit tests assert on `ShardMetrics` snapshots and
 # `IggyShard::parked_frame_count`, gated to test/simulator so they cannot grow
 # production callers. `shard`'s own `cfg(test)` is false when compiled as our
