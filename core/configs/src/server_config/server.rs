@@ -562,9 +562,13 @@ mod tests {
             64 << 10
         );
         assert_eq!(cfg.tiered_storage.read_ahead.as_bytes_u64(), 0);
-        cfg.tiered_storage
-            .validate_tuning()
-            .expect("a read cache without readahead validates");
+        TieredStorageConfig {
+            backend: TieredStorageBackend::Fs,
+            path: "/var/lib/iggy-tiered".to_owned(),
+            ..cfg.tiered_storage
+        }
+        .validate()
+        .expect("a read cache without readahead validates");
     }
 
     #[test]

@@ -524,13 +524,14 @@ suits consumers that read forward. A poll of bytes that another poll read a
 moment ago takes them from there, and polls that miss the same block at once
 share one read. When polls read a segment in order, the shard also fetches up
 to `read_ahead` bytes past the last poll before any poll asks for them. These
-fetches take the speculative fetch caps of `[tiered_storage.jobs]` and start
-only while no poll waits for the store. With `read_cache_size` at 0, each poll
-reads exactly its bytes from the store. Reads of the stores of geo peers are
-not kept. The counters `remote_read_block_hits`, `remote_read_block_misses`,
-`remote_read_ahead_hits`, `remote_read_blocks_fetched_ahead`,
-`remote_read_demand_bytes` and `remote_read_ahead_bytes`, and the gauge
-`remote_read_cache_bytes`, show what the cache of each shard does.
+fetches take the speculative fetch caps of `[tiered_storage.jobs]`. One starts
+only while no fetch that a poll waits for is queued, and it can run beside the
+ones that already run. With `read_cache_size` at 0, each poll reads exactly its
+bytes from the store. Reads of the stores of geo peers are not kept. The
+counters `remote_read_block_hits_total`, `remote_read_block_misses_total`,
+`remote_read_ahead_hits_total`, `remote_read_blocks_fetched_ahead_total`,
+`remote_read_demand_bytes_total` and `remote_read_ahead_bytes_total`, and the
+gauge `remote_read_cache_bytes`, show what the cache of each shard does.
 
 Each partition of a tiered topic also has a manifest object,
 `<prefix>/meta/<stream>/<topic>/<partition>/<created_revision>/manifest.bin`.

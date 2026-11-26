@@ -74,6 +74,23 @@ pub trait RemoteObjects {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>>;
+
+    /// As [`Self::get_range`], if `wanted` still says so when the read
+    /// starts. `None` when it does not, and the store is not asked.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            self.get_range(key, range).await.map(Some)
+        }
+        .boxed_local()
+    }
 }
 
 impl<S: ObjectStore> RemoteObjects for S {
@@ -121,8 +138,7 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
         key: &'a str,
         range: Range<u64>,
     ) -> LocalBoxFuture<'a, Result<ObjectRange, ObjectStoreError>> {
-        let request = TierJobRequest::new(self.class, self.scope.token())
-            .with_bytes(range.end.saturating_sub(range.start));
+        let request = self.request(&range);
         let key = key.to_owned();
         let job = self.executor.submit(request, move |store| async move {
             ObjectStore::get_range(&*store, &key, range).await
@@ -132,6 +148,36 @@ impl<E: TierExecutor> RemoteObjects for ExecutorObjects<E> {
                 .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
         }
         .boxed_local()
+    }
+
+    /// `wanted` is asked when the job starts, which can be long after it
+    /// queued.
+    fn get_range_if<'a>(
+        &'a self,
+        key: &'a str,
+        range: Range<u64>,
+        wanted: Box<dyn FnOnce() -> bool>,
+    ) -> LocalBoxFuture<'a, Result<Option<ObjectRange>, ObjectStoreError>> {
+        let request = self.request(&range);
+        let key = key.to_owned();
+        let job = self.executor.submit(request, move |store| async move {
+            if !wanted() {
+                return Ok(None);
+            }
+            ObjectStore::get_range(&*store, &key, range).await.map(Some)
+        });
+        async move {
+            job.await
+                .unwrap_or_else(|cancelled| Err(ObjectStoreError::Transport(cancelled.to_string())))
+        }
+        .boxed_local()
+    }
+}
+
+impl<E> ExecutorObjects<E> {
+    fn request(&self, range: &Range<u64>) -> TierJobRequest {
+        TierJobRequest::new(self.class, self.scope.token())
+            .with_bytes(range.end.saturating_sub(range.start))
     }
 }
 
@@ -507,6 +553,29 @@ impl RemoteSegments {
         self
     }
 
+    /// Whether the cache of `.log` blocks holds all `len` bytes of the
+    /// segment in `source` from byte `position`, so that a read of them asks
+    /// the store nothing.
+    pub(crate) fn holds(&self, source: &RemoteRange, position: u64, len: usize) -> bool {
+        let start = source.range.start + position;
+        let end = start + len as u64;
+        end <= source.range.end
+            && self
+                .blocks
+                .as_ref()
+                .is_some_and(|blocks| blocks.holds(source, &(start..end)))
+    }
+
+    /// Drop what the cache of `.log` blocks holds of the `len` bytes of the
+    /// segment in `source` from byte `position`, which are not the batches
+    /// that the store holds there, so that the next read fetches them again.
+    pub(crate) fn forget_cached(&self, source: &RemoteRange, position: u64, len: usize) {
+        if let Some(blocks) = &self.blocks {
+            let start = source.range.start + position;
+            blocks.forget(source, &(start..start + len as u64));
+        }
+    }
+
     /// What the reads of `.log` objects did since the last take, `None`
     /// when they keep no blocks.
     #[must_use]
@@ -685,7 +754,8 @@ impl RemoteSegments {
     }
 
     /// Exactly `len` bytes of the segment in `source`, from byte `position`
-    /// of the segment.
+    /// of the segment, for a poll that reads `poll_offset` next when it
+    /// knows that offset.
     ///
     /// An error the store may not repeat is retryable. Anything else is not:
     /// a missing object, a refusal, or fewer bytes than the segment holds.
@@ -694,16 +764,18 @@ impl RemoteSegments {
         source: &RemoteRange,
         position: u64,
         len: usize,
+        poll_offset: Option<u64>,
     ) -> Result<Frozen<4096>, DiskFault> {
-        let key = self.object_key(source, source.key.object);
         let start = source.range.start + position;
         let end = start + len as u64;
         if end > source.range.end {
             return Err(DiskFault::Tiered);
         }
         if let Some(blocks) = &self.blocks {
-            return blocks.read(source, &key, start..end).await;
+            let key_of = || self.object_key(source, source.key.object);
+            return blocks.read(source, &key_of, start..end, poll_offset).await;
         }
+        let key = self.object_key(source, source.key.object);
         let object = self
             .objects
             .get_range(&key, start..end)
