@@ -33,8 +33,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use bytes::Bytes;
-use futures::FutureExt;
 use futures::future::LocalBoxFuture;
+use futures::{FutureExt, StreamExt, TryStreamExt, stream};
 use iggy_object_store::{
     KeyLayout, ManifestError, ObjectPrefix, ObjectStore, ObjectStoreError, PartitionManifest,
     SegmentKey, SegmentMetadata, SegmentMetadataError, SegmentObject, TierExecutor,
@@ -50,9 +50,12 @@ use crate::tiered_floor::AdvanceTieredFloor;
 #[cfg(test)]
 mod tests;
 
-/// The largest manifest a rebuild reads. A larger one is not read, and the
-/// rebuild goes on without the cross-check.
+/// The most bytes of the manifest a rebuild reads. A larger manifest is not
+/// decoded, and the rebuild goes on without the cross-check.
 pub const MANIFEST_CROSS_CHECK_BYTES_MAX: u64 = 16 * 1024 * 1024;
+
+/// HEADs of `.log` objects one rebuild has in flight at once.
+const STORE_VIEW_HEADS: usize = 16;
 
 /// What a partition whose chain is gone knows of itself.
 #[derive(Debug, Clone, Copy)]
@@ -119,8 +122,8 @@ pub enum ChainLostReason {
     MissingObject,
     /// The object of the segment starting at `start` has no `.index`.
     MissingIndex { start: u64 },
-    /// The `.index` of the segment starting at `start` is not a whole number
-    /// of entries.
+    /// The `.index` of the segment starting at `start` is empty or not a
+    /// whole number of entries.
     IndexSize { start: u64, size: u64 },
     /// The metadata of the `.log` object starting at `start` does not decode.
     UnreadableMetadata { start: u64 },
@@ -167,8 +170,8 @@ impl fmt::Display for ChainLostReason {
             }
             Self::IndexSize { start, size } => write!(
                 f,
-                "the index of the segment {start} in the store holds {size} bytes, not a whole \
-                 number of entries"
+                "the index of the segment {start} in the store holds {size} bytes, not one or \
+                 more whole entries"
             ),
             Self::UnreadableMetadata { start } => {
                 write!(
@@ -462,11 +465,13 @@ impl<E: TierExecutor> StoreViewReader for ExecutorStoreViewReader<E> {
 
 /// Read what `request` asks for: one listing of the incarnation, one HEAD of
 /// each `.log` object from the one that holds `request.from` up to the front
-/// and of each local sealed segment, and the manifest.
+/// and of each local sealed segment, up to [`STORE_VIEW_HEADS`] at once, and
+/// one read of the manifest.
 ///
 /// # Errors
 /// The store's error for any call that failed, other than a HEAD or a read
-/// that found no object.
+/// that found no object. Of the HEADs that failed, the one of the lowest
+/// start.
 pub async fn read_store_view<S: ObjectStore>(
     store: &S,
     layout: &KeyLayout,
@@ -482,38 +487,19 @@ pub async fn read_store_view<S: ObjectStore>(
     let wanted: BTreeSet<u64> = listed
         .range(first..request.front)
         .map(|(start, _)| *start)
-        .chain(
-            request
-                .local_sealed
-                .iter()
-                .copied()
-                .filter(|start| listed.contains_key(start)),
-        )
+        .chain(request.local_sealed.iter().copied())
+        .filter(|start| {
+            listed
+                .get(start)
+                .is_some_and(|segment| segment.log_size.is_some())
+        })
         .collect();
-    let mut logs = BTreeMap::new();
-    for start in wanted {
-        if listed
-            .get(&start)
-            .is_none_or(|segment| segment.log_size.is_none())
-        {
-            continue;
-        }
-        let key = layout.segment_key(&SegmentKey {
-            prefix: request.prefix,
-            start_offset: start,
-            object: SegmentObject::Log,
-        });
-        let stored = match store.head(&key).await {
-            Ok(meta) => StoredLog::Found {
-                size: meta.size,
-                crc32c: meta.crc32c,
-                metadata: SegmentMetadata::try_from(&meta.metadata),
-            },
-            Err(ObjectStoreError::NotFound { .. }) => StoredLog::Gone,
-            Err(error) => return Err(error),
-        };
-        logs.insert(start, stored);
-    }
+    let prefix = request.prefix;
+    let logs = stream::iter(wanted)
+        .map(|start| head_log(store, layout, prefix, start))
+        .buffered(STORE_VIEW_HEADS)
+        .try_collect()
+        .await?;
     let manifest = read_manifest(store, layout, &request.prefix).await?;
     Ok(StoreView {
         request,
@@ -521,6 +507,30 @@ pub async fn read_store_view<S: ObjectStore>(
         logs,
         manifest,
     })
+}
+
+/// What a HEAD finds of the `.log` object of the segment keyed `start`.
+async fn head_log<S: ObjectStore>(
+    store: &S,
+    layout: &KeyLayout,
+    prefix: ObjectPrefix,
+    start: u64,
+) -> Result<(u64, StoredLog), ObjectStoreError> {
+    let key = layout.segment_key(&SegmentKey {
+        prefix,
+        start_offset: start,
+        object: SegmentObject::Log,
+    });
+    let stored = match store.head(&key).await {
+        Ok(meta) => StoredLog::Found {
+            size: meta.size,
+            crc32c: meta.crc32c,
+            metadata: SegmentMetadata::try_from(&meta.metadata),
+        },
+        Err(ObjectStoreError::NotFound { .. }) => StoredLog::Gone,
+        Err(error) => return Err(error),
+    };
+    Ok((start, stored))
 }
 
 async fn read_manifest<S: ObjectStore>(
@@ -654,14 +664,8 @@ impl Walk<'_> {
                 },
             ));
         }
-        match listed.index_size {
-            None => {
-                return Err(self.lost(covers, end, ChainLostReason::MissingIndex { start }));
-            }
-            Some(size) if size == 0 || size % IGGY_INDEX_SIZE as u64 != 0 => {
-                return Err(self.lost(covers, end, ChainLostReason::IndexSize { start, size }));
-            }
-            Some(_) => {}
+        if let Some(reason) = index_fault(start, &listed) {
+            return Err(self.lost(covers, end, reason));
         }
         if self.floor.is_none_or(|floor| metadata.end_offset > floor) {
             return Err(self.lost(
@@ -730,9 +734,21 @@ impl Walk<'_> {
             };
             let object = &mut walked[at];
             let metadata = &object.metadata;
-            let agrees = (metadata.end_offset, metadata.size, metadata.hash)
-                == (segment.end_offset, segment.size, segment.hash)
-                && object.crc32c.is_none_or(|crc32c| crc32c == segment.crc32c);
+            let agrees = (
+                metadata.end_offset,
+                metadata.start_timestamp,
+                metadata.end_timestamp,
+                metadata.max_timestamp,
+                metadata.size,
+                metadata.hash,
+            ) == (
+                segment.end_offset,
+                segment.start_timestamp,
+                segment.end_timestamp,
+                segment.max_timestamp,
+                segment.size,
+                segment.hash,
+            ) && object.crc32c.is_none_or(|crc32c| crc32c == segment.crc32c);
             if !agrees {
                 return Err(self.lost(
                     range.0,
@@ -769,7 +785,8 @@ impl Walk<'_> {
     }
 
     /// The advance that confirms the local sealed segment from `start` to
-    /// `end` again, when the store holds its object as it ends.
+    /// `end` again, when the store holds its object as it ends and an index a
+    /// reader can use.
     fn stored_end(&self, start: u64, end: u64) -> Option<AdvanceTieredFloor> {
         let listed = self.view.listed.get(&start)?;
         let Some(StoredLog::Found {
@@ -781,7 +798,7 @@ impl Walk<'_> {
             return None;
         };
         let stored = listed.log_size == Some(*size)
-            && listed.index_size.is_some()
+            && index_fault(start, listed).is_none()
             && metadata.start_offset == start
             && metadata.end_offset == end
             && metadata.size == *size
@@ -816,5 +833,17 @@ impl Walk<'_> {
             to: to.min(self.last_below_front()).max(from),
             reason,
         }
+    }
+}
+
+/// Why the `.index` listed for the segment keyed `start` is of no use to a
+/// reader, `None` when it holds one or more whole entries.
+fn index_fault(start: u64, listed: &ListedSegment) -> Option<ChainLostReason> {
+    match listed.index_size {
+        None => Some(ChainLostReason::MissingIndex { start }),
+        Some(size) if size == 0 || size % IGGY_INDEX_SIZE as u64 != 0 => {
+            Some(ChainLostReason::IndexSize { start, size })
+        }
+        Some(_) => None,
     }
 }

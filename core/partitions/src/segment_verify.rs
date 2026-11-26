@@ -50,6 +50,11 @@ pub const SEGMENT_VERIFY_INTERVAL: Duration = Duration::from_hours(24);
 /// The most segments one job of a verify pass checks.
 pub const SEGMENT_VERIFY_BATCH_MAX: usize = 64;
 
+/// The most jobs in a row that ask for a segment the store answers with a
+/// transient error. The pass then goes on without it, and asks for it once
+/// more after the last stored segment.
+pub const SEGMENT_VERIFY_ATTEMPTS: u32 = 3;
+
 /// The segments one job checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentVerifyJob {
@@ -248,6 +253,19 @@ pub struct VerifySettled {
     /// The segments whose answers counted.
     pub checked: usize,
     pub transitions: Vec<Transition>,
+    /// Whether the segment the store did not answer for waits for the next
+    /// pass.
+    pub postponed: bool,
+}
+
+/// A job in flight.
+#[derive(Debug)]
+struct RunningJob {
+    id: u64,
+    /// The scope whose end stops it.
+    _scope: TierScope,
+    /// Whether the job asks for the segments the pass set aside.
+    set_aside: bool,
 }
 
 /// What the primary of a tiered partition knows of the store's copy of its
@@ -260,8 +278,13 @@ pub struct SegmentVerifies {
     cursor: Option<u64>,
     /// When the pass under way, or the last one, started.
     pass_started_at: Option<IggyTimestamp>,
-    /// The job in flight: its number, and the scope whose end stops it.
-    running: Option<(u64, TierScope)>,
+    running: Option<RunningJob>,
+    /// The segment the next job asks for again after a transient error, and
+    /// how many jobs in a row got no answer for it.
+    retrying: Option<(u64, u32)>,
+    /// The segments the pass under way went on without, by start offset,
+    /// which it asks for once more after the last stored segment.
+    set_aside: BTreeMap<u64, SegmentRecord>,
     /// What is wrong with each segment, by its start offset, and the record
     /// it was checked against.
     findings: BTreeMap<u64, (SegmentRecord, Finding)>,
@@ -279,6 +302,8 @@ impl SegmentVerifies {
             cursor: None,
             pass_started_at: None,
             running: None,
+            retrying: None,
+            set_aside: BTreeMap::new(),
             findings: BTreeMap::new(),
             missing: 0,
             diverged: 0,
@@ -302,20 +327,33 @@ impl SegmentVerifies {
         self.diverged
     }
 
-    /// Drop the finding of each segment that `stored` no longer returns as it
-    /// was checked, as after retention trimmed it. Returns how many went.
-    pub fn retain_stored(&mut self, stored: impl Fn(u64) -> Option<SegmentRecord>) -> usize {
-        let before = self.findings.len();
-        self.findings
-            .retain(|start_offset, (record, _)| stored(*start_offset) == Some(*record));
-        self.recount();
-        before - self.findings.len()
+    /// Forget the segments that end at or below `trim_point`, the chain's
+    /// trim point, which retention removed. Returns how many findings went.
+    pub fn trim(&mut self, trim_point: u64) -> usize {
+        let trimmed = |record: &SegmentRecord| record.end_offset <= trim_point;
+        while self
+            .set_aside
+            .first_key_value()
+            .is_some_and(|(_, record)| trimmed(record))
+        {
+            self.set_aside.pop_first();
+        }
+        let mut dropped = 0;
+        while let Some(entry) = self.findings.first_entry()
+            && trimmed(&entry.get().0)
+        {
+            let (_, finding) = entry.remove();
+            *self.count_of(finding) -= 1;
+            dropped += 1;
+        }
+        dropped
     }
 
     /// Start the next job of the pass under way, or a new pass when one is
     /// due at `now`. `stored_from` gives the stored segments from a start
     /// offset on, in offset order. The job takes the first
-    /// [`SEGMENT_VERIFY_BATCH_MAX`] of them and runs as number `id`.
+    /// [`SEGMENT_VERIFY_BATCH_MAX`] of them and runs as number `id`. Once
+    /// none is left, it takes the segments the pass set aside.
     pub fn begin<I>(
         &mut self,
         now: IggyTimestamp,
@@ -337,11 +375,20 @@ impl SegmentVerifies {
             }
             None => return VerifyBegin::Idle,
         };
-        let segments: Vec<SegmentRecord> = stored_from(cursor)
+        let mut segments: Vec<SegmentRecord> = stored_from(cursor)
             .into_iter()
             .skip_while(|segment| segment.start_offset < cursor)
             .take(SEGMENT_VERIFY_BATCH_MAX)
             .collect();
+        let set_aside = segments.is_empty();
+        if set_aside {
+            segments.extend(
+                self.set_aside
+                    .values()
+                    .take(SEGMENT_VERIFY_BATCH_MAX)
+                    .copied(),
+            );
+        }
         if segments.is_empty() {
             self.cursor = None;
             return VerifyBegin::PassEnded;
@@ -349,7 +396,11 @@ impl SegmentVerifies {
         self.cursor = Some(cursor);
         let scope = TierScope::new();
         let token = scope.token();
-        self.running = Some((id, scope));
+        self.running = Some(RunningJob {
+            id,
+            _scope: scope,
+            set_aside,
+        });
         VerifyBegin::Job {
             id,
             job: SegmentVerifyJob { prefix, segments },
@@ -362,23 +413,21 @@ impl SegmentVerifies {
     /// stored segment, and an answer for a segment it does not return as the
     /// job checked it counts for nothing.
     ///
-    /// A HEAD without an answer is no finding. After a transient error the
-    /// next job starts with its segment, and after any other the segment
-    /// waits for the next pass.
+    /// A HEAD without an answer is no finding, and its segment does not count
+    /// as checked. After a transient error the next job starts with its
+    /// segment, up to [`SEGMENT_VERIFY_ATTEMPTS`] jobs in a row, and then the
+    /// pass sets it aside. After any other error, or in a job over the
+    /// segments set aside, the segment waits for the next pass.
     pub fn finish(
         &mut self,
         id: u64,
         outcome: &SegmentVerifyOutcome,
         stored: impl Fn(u64) -> Option<SegmentRecord>,
     ) -> Option<VerifySettled> {
-        if self
-            .running
-            .as_ref()
-            .is_none_or(|(running, _)| *running != id)
-        {
+        if self.running.as_ref().is_none_or(|running| running.id != id) {
             return None;
         }
-        self.running = None;
+        let set_aside = self.running.take().is_some_and(|running| running.set_aside);
         let mut settled = VerifySettled::default();
         let Ok(report) = outcome else {
             return Some(settled);
@@ -386,7 +435,10 @@ impl SegmentVerifies {
         for heads in &report.answered {
             let record = heads.record;
             let start_offset = record.start_offset;
-            self.cursor = Some(start_offset.saturating_add(1));
+            self.set_aside.remove(&start_offset);
+            if !set_aside {
+                self.cursor = Some(start_offset.saturating_add(1));
+            }
             if stored(start_offset) != Some(record) {
                 continue;
             }
@@ -395,6 +447,7 @@ impl SegmentVerifies {
             match (previous, finding(heads)) {
                 (Some(cleared), None) => {
                     self.findings.remove(&start_offset);
+                    *self.count_of(cleared) -= 1;
                     settled.transitions.push(Transition::Cleared {
                         record,
                         finding: cleared,
@@ -402,6 +455,10 @@ impl SegmentVerifies {
                 }
                 (previous, Some(found)) if previous != Some(found) => {
                     self.findings.insert(start_offset, (record, found));
+                    if let Some(previous) = previous {
+                        *self.count_of(previous) -= 1;
+                    }
+                    *self.count_of(found) += 1;
                     settled.transitions.push(Transition::Found {
                         record,
                         finding: found,
@@ -410,15 +467,13 @@ impl SegmentVerifies {
                 _ => {}
             }
         }
+        let retrying = self.retrying.take();
         if let Some(unanswered) = &report.unanswered {
-            let retry = matches!(unanswered.error.class(), ErrorClass::Transient);
-            self.cursor = Some(if retry {
-                unanswered.start_offset
-            } else {
-                unanswered.start_offset.saturating_add(1)
-            });
+            let failed_before = retrying
+                .filter(|(start_offset, _)| *start_offset == unanswered.start_offset)
+                .map_or(0, |(_, failed)| failed);
+            settled.postponed = self.put_off(unanswered, set_aside, failed_before, stored);
         }
-        self.retain_stored(stored);
         Some(settled)
     }
 
@@ -429,12 +484,39 @@ impl SegmentVerifies {
         })
     }
 
-    fn recount(&mut self) {
-        self.missing = self
-            .findings
-            .values()
-            .filter(|(_, found)| matches!(found, Finding::Missing(_)))
-            .count();
-        self.diverged = self.findings.len() - self.missing;
+    /// Decide when the pass asks again for the segment the store did not
+    /// answer for, after `failed_before` jobs in a row got no answer for it.
+    /// Returns whether it waits for the next pass.
+    fn put_off(
+        &mut self,
+        unanswered: &Unanswered,
+        set_aside: bool,
+        failed_before: u32,
+        stored: impl Fn(u64) -> Option<SegmentRecord>,
+    ) -> bool {
+        let start_offset = unanswered.start_offset;
+        if set_aside {
+            self.set_aside.remove(&start_offset);
+            return true;
+        }
+        self.cursor = Some(start_offset.saturating_add(1));
+        if unanswered.error.class() != ErrorClass::Transient {
+            return true;
+        }
+        let failed = failed_before + 1;
+        if failed < SEGMENT_VERIFY_ATTEMPTS {
+            self.retrying = Some((start_offset, failed));
+            self.cursor = Some(start_offset);
+        } else if let Some(record) = stored(start_offset) {
+            self.set_aside.insert(start_offset, record);
+        }
+        false
+    }
+
+    fn count_of(&mut self, finding: Finding) -> &mut usize {
+        match finding {
+            Finding::Missing(_) => &mut self.missing,
+            Finding::Diverged(..) => &mut self.diverged,
+        }
     }
 }

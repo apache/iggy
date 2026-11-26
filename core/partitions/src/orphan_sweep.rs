@@ -29,10 +29,12 @@
 //! it and its revision is not above the one read before the listing.
 //! Revisions only rise, and a partition stores objects only under the
 //! revision its creation committed at, so an incarnation created while the
-//! listing ran is never one. An orphan is deleted once two full sweeps in a
-//! row, under the same claim of the root and in the same view of the same
-//! process, found it, and its newest object is older than the grace period
-//! by the moment the store gives it.
+//! listing ran is never one. An orphan is deleted once full sweeps in a row,
+//! under the same claim of the root and in the same view of the same
+//! process, listed the same objects of it from the start of the second of
+//! them for at least the grace period of this node's clock. The first sweep
+//! listed them before the second started, so the grace never counts on a
+//! moment the store gave.
 //!
 //! Whatever metadata holds, an incarnation stays when it has a long-term
 //! segment or when a geo topic object names its topic incarnation, as the
@@ -45,28 +47,25 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
+use iggy_common::IggyTimestamp;
 use iggy_object_store::{IdentityRead, KeyLayout, ListedObject, ObjectPrefix, TopicKey};
 
 /// The longest time between the starts of two sweeps of the root.
 ///
 /// A grace period that is shorter takes its place, so a short grace does not
-/// wait an hour between the two sweeps a delete needs.
+/// wait an hour between the sweeps a delete needs.
 pub const ORPHAN_SWEEP_INTERVAL: Duration = Duration::from_hours(1);
 
 /// The most pages of the root one listing job reads.
 pub const ORPHAN_LIST_PAGES_PER_JOB: usize = 16;
 
+/// The most pages of an orphan's objects one turn of its delete lists.
+pub const ORPHAN_PAGES_PER_DELETE_TURN: usize = 4;
+
 /// The time between the starts of two sweeps with `grace`.
 #[must_use]
 pub fn sweep_interval(grace: Duration) -> Duration {
     grace.min(ORPHAN_SWEEP_INTERVAL)
-}
-
-/// The latest moment an object may carry at `now` and still be older than
-/// `grace`. `None` when no moment is that old.
-#[must_use]
-pub fn quiet_since(now: SystemTime, grace: Duration) -> Option<SystemTime> {
-    now.checked_sub(grace)
 }
 
 /// What a listed key under the root is to the sweep.
@@ -114,29 +113,21 @@ impl RootKey {
 pub struct ListedIncarnation {
     /// Its segment objects, long-term objects and manifest.
     pub objects: usize,
+    /// How many of them the store committed no later than this cluster's
+    /// claim of the root.
+    pub before_claim: usize,
     pub manifest: bool,
     pub long_term: bool,
-    /// When the store committed the oldest and the newest of them.
-    pub oldest: SystemTime,
+    /// When the store committed the newest of them.
     pub newest: SystemTime,
 }
 
 impl ListedIncarnation {
-    const fn of(modified: SystemTime) -> Self {
-        Self {
-            objects: 0,
-            manifest: false,
-            long_term: false,
-            oldest: modified,
-            newest: modified,
-        }
-    }
-
     fn merge(&mut self, other: &Self) {
         self.objects += other.objects;
+        self.before_claim += other.before_claim;
         self.manifest |= other.manifest;
         self.long_term |= other.long_term;
-        self.oldest = self.oldest.min(other.oldest);
         self.newest = self.newest.max(other.newest);
     }
 }
@@ -152,8 +143,9 @@ pub struct RootListing {
 }
 
 impl RootListing {
-    /// Take one listed object into the listing.
-    pub fn take(&mut self, layout: &KeyLayout, object: &ListedObject) {
+    /// Take one listed object into the listing, under a claim of the root
+    /// the store committed at `claimed_at`.
+    pub fn take(&mut self, layout: &KeyLayout, object: &ListedObject, claimed_at: SystemTime) {
         let (prefix, long_term, manifest) = match RootKey::of(layout, &object.key) {
             RootKey::Segment(prefix) => (prefix, false, false),
             RootKey::LongTerm(prefix) => (prefix, true, false),
@@ -170,9 +162,10 @@ impl RootListing {
         };
         let listed = ListedIncarnation {
             objects: 1,
+            before_claim: usize::from(object.last_modified <= claimed_at),
             manifest,
             long_term,
-            ..ListedIncarnation::of(object.last_modified)
+            newest: object.last_modified,
         };
         self.incarnations
             .entry(prefix)
@@ -230,16 +223,14 @@ pub enum Verdict {
 ///
 /// The listing found it as `listed`, next to the geo topic objects of
 /// `topics`. `revision` is the one committed metadata had reached before the
-/// listing, `claimed_at` the moment of this cluster's claim of the root, and
-/// `holds` says whether committed metadata holds a partition of exactly that
-/// incarnation.
+/// listing, and `holds` says whether committed metadata holds a partition of
+/// exactly that incarnation.
 #[must_use]
 pub fn verdict(
     prefix: &ObjectPrefix,
     listed: &ListedIncarnation,
     topics: &BTreeSet<TopicKey>,
     revision: u64,
-    claimed_at: SystemTime,
     holds: impl Fn(&ObjectPrefix) -> bool,
 ) -> Verdict {
     let topic = TopicKey {
@@ -253,7 +244,7 @@ pub fn verdict(
         Verdict::AfterSnapshot
     } else if listed.long_term || topics.contains(&topic) {
         Verdict::Geo
-    } else if listed.oldest <= claimed_at {
+    } else if listed.before_claim > 0 {
         Verdict::BeforeClaim
     } else {
         Verdict::Orphan
@@ -263,36 +254,25 @@ pub fn verdict(
 /// The verdicts of one full sweep that matter.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SweepFindings {
-    /// The orphans, with the moment of the newest object of each.
-    pub orphans: BTreeMap<ObjectPrefix, SystemTime>,
-    /// The incarnations left from before the claim, with their objects.
+    /// The orphans, with what the listing found of each.
+    pub orphans: BTreeMap<ObjectPrefix, ListedIncarnation>,
+    /// The incarnations left from before the claim, with how many of their
+    /// objects are no newer than it.
     pub before_claim: BTreeMap<ObjectPrefix, usize>,
 }
 
 impl SweepFindings {
     /// The findings of `listing`, judged as [`verdict`] judges them.
     #[must_use]
-    pub fn of(
-        listing: &RootListing,
-        revision: u64,
-        claimed_at: SystemTime,
-        holds: impl Fn(&ObjectPrefix) -> bool,
-    ) -> Self {
+    pub fn of(listing: &RootListing, revision: u64, holds: impl Fn(&ObjectPrefix) -> bool) -> Self {
         let mut findings = Self::default();
         for (prefix, listed) in &listing.incarnations {
-            match verdict(
-                prefix,
-                listed,
-                &listing.topics,
-                revision,
-                claimed_at,
-                &holds,
-            ) {
+            match verdict(prefix, listed, &listing.topics, revision, &holds) {
                 Verdict::Orphan => {
-                    findings.orphans.insert(*prefix, listed.newest);
+                    findings.orphans.insert(*prefix, *listed);
                 }
                 Verdict::BeforeClaim => {
-                    findings.before_claim.insert(*prefix, listed.objects);
+                    findings.before_claim.insert(*prefix, listed.before_claim);
                 }
                 Verdict::Live | Verdict::AfterSnapshot | Verdict::Geo => {}
             }
@@ -300,7 +280,8 @@ impl SweepFindings {
         findings
     }
 
-    /// The objects of the incarnations left from before the claim.
+    /// The objects no newer than the claim, of the incarnations left from
+    /// before it.
     #[must_use]
     pub fn objects_before_claim(&self) -> usize {
         self.before_claim.values().sum()
@@ -320,29 +301,65 @@ pub struct SweepStamp {
 #[derive(Debug, Default)]
 pub struct OrphanCandidates {
     stamp: Option<SweepStamp>,
-    found: BTreeSet<ObjectPrefix>,
+    found: BTreeMap<ObjectPrefix, Candidate>,
+}
+
+/// What the sweeps in a row listed of one orphan.
+#[derive(Debug, Clone, Copy)]
+struct Candidate {
+    newest: SystemTime,
+    objects: usize,
+    /// When the second sweep that listed the same objects started, by this
+    /// node's clock. `None` after the first.
+    since: Option<IggyTimestamp>,
 }
 
 impl OrphanCandidates {
-    /// Take the orphans that a full sweep stamped `stamp` found, and return
-    /// the ones to delete: those the full sweep before it found under the
-    /// same stamp, whose newest object is no newer than `quiet_since`.
+    /// Take the orphans that a full sweep stamped `stamp`, started at
+    /// `started`, found, and return the ones to delete, each with the newest
+    /// moment the store gave one of its objects.
+    ///
+    /// An orphan is due once every sweep in a row under the same stamp
+    /// listed the same newest moment and number of objects for it, and
+    /// `grace` passed from the start of the second of them to `started`. A
+    /// sweep that lists it otherwise starts its count again.
     pub fn settle(
         &mut self,
         stamp: SweepStamp,
-        orphans: &BTreeMap<ObjectPrefix, SystemTime>,
-        quiet_since: Option<SystemTime>,
-    ) -> Vec<ObjectPrefix> {
-        let due = match (&self.stamp, quiet_since) {
-            (Some(last), Some(quiet_since)) if *last == stamp => orphans
-                .iter()
-                .filter(|(prefix, newest)| self.found.contains(prefix) && **newest <= quiet_since)
-                .map(|(prefix, _)| *prefix)
-                .collect(),
-            _ => Vec::new(),
-        };
+        orphans: &BTreeMap<ObjectPrefix, ListedIncarnation>,
+        started: IggyTimestamp,
+        grace: Duration,
+    ) -> Vec<(ObjectPrefix, SystemTime)> {
+        let same_stamp = self.stamp.as_ref() == Some(&stamp);
+        let grace = u64::try_from(grace.as_micros()).unwrap_or(u64::MAX);
+        let mut due = Vec::new();
+        let found = orphans
+            .iter()
+            .map(|(prefix, listed)| {
+                let since = self
+                    .found
+                    .get(prefix)
+                    .filter(|before| {
+                        same_stamp
+                            && before.newest == listed.newest
+                            && before.objects == listed.objects
+                    })
+                    .map(|before| before.since.unwrap_or(started));
+                if since.is_some_and(|since| {
+                    started.as_micros().saturating_sub(since.as_micros()) >= grace
+                }) {
+                    due.push((*prefix, listed.newest));
+                }
+                let candidate = Candidate {
+                    newest: listed.newest,
+                    objects: listed.objects,
+                    since,
+                };
+                (*prefix, candidate)
+            })
+            .collect();
         self.stamp = Some(stamp);
-        self.found = orphans.keys().copied().collect();
+        self.found = found;
         due
     }
 
@@ -368,8 +385,9 @@ impl OrphanCandidates {
 pub struct OrphanGuard {
     /// The claim of the root that the sweeps which found the orphan read.
     pub claim: ClaimStamp,
-    /// The latest moment an object of the orphan may carry.
-    pub quiet_since: SystemTime,
+    /// The newest moment the store gave an object of the orphan in those
+    /// sweeps. No sweep judged an object newer than it.
+    pub newest: SystemTime,
 }
 
 /// Why the delete of an orphan deleted nothing, because the store no longer
@@ -382,7 +400,7 @@ pub enum OrphanRefusal {
     LongTerm,
     /// A geo topic object names the incarnation.
     TopicObject,
-    /// An object is newer than the grace period allows.
+    /// An object is newer than the newest one the sweeps judged.
     Recent,
     /// An object is no newer than the claim of the root.
     BeforeClaim,
@@ -396,43 +414,75 @@ impl OrphanGuard {
         matches!(read, IdentityRead::Found(identity) if identity.cluster_uid == self.claim.cluster_uid)
             && etag == Some(self.claim.etag.as_str())
     }
+}
 
-    /// Why the objects the delete found must stay, `None` when they may go.
-    /// `modified` holds the moment of each of them, `long_term` whether one
-    /// is of a long-term segment, and `topic_object` whether a geo topic
-    /// object names the incarnation.
+/// What the listing of an orphan's objects found so far that keeps them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OrphanCheck {
+    /// Whether an object of a long-term segment was listed.
+    pub long_term: bool,
+    /// Why the first object listed outside the moments of the guard stays.
+    pub age: Option<OrphanRefusal>,
+}
+
+impl OrphanCheck {
+    /// Take one listed object into the check: one the store committed at
+    /// `modified`, of a long-term segment when `long_term`.
+    pub fn take(&mut self, guard: &OrphanGuard, modified: SystemTime, long_term: bool) {
+        self.long_term |= long_term;
+        if self.age.is_none() {
+            self.age = if modified <= guard.claim.claimed_at {
+                Some(OrphanRefusal::BeforeClaim)
+            } else if modified > guard.newest {
+                Some(OrphanRefusal::Recent)
+            } else {
+                None
+            };
+        }
+    }
+
+    /// Why the objects taken must stay, `None` when they may go.
+    /// `topic_object` says whether a geo topic object names the incarnation.
+    /// A long-term segment comes first, then a topic object, then the first
+    /// object outside the moments of the guard.
     #[must_use]
-    pub fn refusal(
-        &self,
-        modified: impl IntoIterator<Item = SystemTime>,
-        long_term: bool,
-        topic_object: bool,
-    ) -> Option<OrphanRefusal> {
-        if long_term {
-            return Some(OrphanRefusal::LongTerm);
+    pub const fn refusal(&self, topic_object: bool) -> Option<OrphanRefusal> {
+        if self.long_term {
+            Some(OrphanRefusal::LongTerm)
+        } else if topic_object {
+            Some(OrphanRefusal::TopicObject)
+        } else {
+            self.age
         }
-        if topic_object {
-            return Some(OrphanRefusal::TopicObject);
-        }
-        for moment in modified {
-            if moment <= self.claim.claimed_at {
-                return Some(OrphanRefusal::BeforeClaim);
-            }
-            if moment > self.quiet_since {
-                return Some(OrphanRefusal::Recent);
-            }
-        }
-        None
     }
 }
 
-/// What the delete of an orphan did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where the delete of an orphan stands between two of its turns.
+///
+/// The turns of the check list every object of the orphan and delete
+/// nothing. The turns after them list it again and delete what they list.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OrphanProgress {
+    /// Whether the check found nothing that keeps the orphan.
+    pub deleting: bool,
+    /// Where the listing goes on, `None` at its start.
+    pub after: Option<String>,
+    /// What the turns of the check found so far.
+    pub check: OrphanCheck,
+}
+
+/// What one turn of the delete of an orphan did.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OrphanDelete {
-    /// It deleted nothing, for this reason.
+    /// The turn deleted nothing, for this reason, and the delete ends.
     Refused(OrphanRefusal),
-    /// How many objects of the incarnation are still to delete.
-    Deleted { left: usize },
+    /// The next turn goes on from here.
+    Continues(OrphanProgress),
+    /// The store kept an object the turn asked it to delete, so the delete
+    /// starts over later.
+    Unfinished,
+    /// No object of the incarnation is left.
+    Deleted,
 }
 
 #[cfg(test)]
