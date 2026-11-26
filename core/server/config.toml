@@ -1640,13 +1640,14 @@ handshake_grace = "10 s"
 # fresh_sends_denied_partition_share and fresh_sends_denied_shard_cap count the
 # refusals. At least 4 MiB, and at most 'fresh_pending_bytes'.
 #fresh_partition_pending_bytes = "8 MiB"
-# How old the newest object of a partition incarnation that committed
-# metadata no longer holds must be before the sweep of the root deletes the
+# How long the sweeps of the root must find the same objects of a partition
+# incarnation that committed metadata no longer holds before they delete the
 # incarnation. A committed delete of a partition deletes its objects from a
 # queue in memory, so a restart, a change of the metadata primary or a full
 # queue can leave them in the store. Shard 0 of the metadata primary lists the
 # whole root every hour, or every 'orphan_grace' when that is shorter, and
-# deletes an incarnation that two sweeps in a row found. It never deletes
+# counts the grace by its own clock from the second sweep that found the same
+# objects, so a new object of the incarnation starts it again. It never deletes
 # the objects of a live partition, of one created after the sweep read
 # metadata, of a geo topic, objects under 'meta/' other than the manifest of
 # an incarnation it deletes, objects of another cluster, or objects no newer

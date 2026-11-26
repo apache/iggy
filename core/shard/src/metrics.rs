@@ -2097,8 +2097,8 @@ impl ShardMetrics {
 
     /// Republished by every sweep of the root that listed all of it, and
     /// zeroed when its findings are dropped: the orphans it found, and the
-    /// objects of the incarnations left from before this cluster's claim of
-    /// the root.
+    /// objects no newer than this cluster's claim of the root of the
+    /// incarnations it leaves for an operator.
     pub fn set_orphan_findings(&self, orphans: usize, objects_before_claim: usize) {
         self.orphan_incarnations
             .set(i64::try_from(orphans).unwrap_or(i64::MAX));
@@ -2872,7 +2872,8 @@ impl ShardMetrics {
         registry.register(
             "orphan_incarnations",
             "partition incarnations the last sweep of the object store root found with objects \
-             and without a partition in committed metadata, which a second sweep deletes",
+             and without a partition in committed metadata, which the sweeps delete once they \
+             found the same objects for orphan_grace",
             self.orphan_incarnations.clone(),
         );
         registry.register(

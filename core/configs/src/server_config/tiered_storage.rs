@@ -65,8 +65,7 @@ pub const LONG_TERM_BACKLOG_LIMIT_MIN: u64 = 64 * 1024 * 1024;
 pub const FRESH_PENDING_BYTES_MIN: u64 = 4 * 1024 * 1024;
 
 /// The shortest `orphan_grace` other than zero. A store gives the moment of
-/// an object to the second, so a shorter grace cannot tell an object from
-/// one written in the same second.
+/// an object to the second.
 pub const ORPHAN_GRACE_MIN: Duration = Duration::from_secs(1);
 
 /// The largest `read_cache_block_size`: the largest piece a poll reads from
@@ -339,12 +338,13 @@ pub struct TieredStorageConfig {
     #[serde(default = "default_fresh_partition_pending_bytes")]
     #[config_env(leaf)]
     pub fresh_partition_pending_bytes: IggyByteSize,
-    /// How long the newest object of a partition incarnation that committed
-    /// metadata no longer holds must be in the store before the sweep of the
-    /// root deletes the incarnation. The sweep lists the root every hour, or
-    /// every `orphan_grace` when that is shorter, and deletes an incarnation
-    /// that two sweeps in a row found. Zero or `disabled` turns the sweep
-    /// off. Otherwise at least [`ORPHAN_GRACE_MIN`].
+    /// How long the sweeps of the root must find the same objects of a
+    /// partition incarnation that committed metadata no longer holds before
+    /// they delete the incarnation, by the clock of the node that sweeps,
+    /// from the second sweep that found them. The sweep lists the root every
+    /// hour, or every `orphan_grace` when that is shorter. Zero or
+    /// `disabled` turns the sweep off. Otherwise at least
+    /// [`ORPHAN_GRACE_MIN`].
     #[serde_as(as = "DisplayFromStrOrNumber")]
     #[serde(default = "default_orphan_grace")]
     #[config_env(leaf)]

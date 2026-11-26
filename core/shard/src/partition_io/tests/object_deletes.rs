@@ -17,6 +17,8 @@
 
 //! Delete passes on a shard that hosts a tiered primary on disk.
 
+use std::time::SystemTime;
+
 use super::segment_uploads::{
     SEALED_SEGMENTS, floor, namespace, pumped, staged_revision, tiered_owner, until,
 };
@@ -105,9 +107,10 @@ impl ObjectDeleter for RecordingDeleter {
     fn list_root(
         &self,
         after: Option<String>,
+        claimed_at: SystemTime,
         scope: TierScopeToken,
     ) -> LocalBoxFuture<'static, RootListOutcome> {
-        self.deleter.list_root(after, scope)
+        self.deleter.list_root(after, claimed_at, scope)
     }
 }
 

@@ -650,18 +650,26 @@ described below:
   the revision the partition was created at. An incarnation is an orphan when
   committed metadata holds no partition of it and its revision is not above
   the one the sweep read before the listing.
-- It deletes an orphan only once two full sweeps in a row of the same primary
-  process found it, and the newest of its objects is older than
-  `[tiered_storage] orphan_grace`, 6 hours by default, by the time the store
-  gives each object. The delete goes through the same queue as a committed
-  delete: it checks committed metadata again, reads the store identity object
-  again and deletes nothing when it changed, lists the incarnation again, and
-  deletes each `.index` before its `.log` and the manifest last.
+- It deletes an orphan only once full sweeps in a row of the same primary
+  process found the same objects of it, by their number and the time the
+  store gives the newest, for `[tiered_storage] orphan_grace`, 6 hours by
+  default. The grace runs on the clock of the primary, from the start of the
+  second of those sweeps, so a clock of the primary that is ahead of the
+  store's does not shorten it, and a new object of the orphan starts it again.
+- The delete goes through the same queue as a committed delete, in turns
+  that each list at most 4 pages of the incarnation and give the delete slot
+  back between them. Every turn checks committed metadata and reads the store
+  identity object again, and deletes nothing when it changed. The first turns
+  list the whole incarnation and delete nothing. The turns after them list it
+  again and delete what they listed, each `.index` before any `.log` and the
+  manifest last. A turn that finds a long-term segment, a geo topic object, or
+  an object newer than the sweeps found or no newer than the claim ends the
+  delete.
 - The primary sweeps every hour, or every `orphan_grace` when that is shorter.
   `orphan_grace = "disabled"` turns the sweep off. A sweep that does not list
   the whole root, a store identity object that names another cluster, and a
   change of the metadata primary or of its view each drop what the sweeps
-  found, so the next two sweeps start the count again.
+  found, so the count starts again with the next sweeps.
 
 The sweep never deletes:
 
@@ -684,13 +692,16 @@ The sweep never deletes:
 Each shard exports `orphan_sweeps_total`, the sweeps that listed the whole
 root, the gauge `orphan_incarnations`, the orphans the last sweep found,
 `orphan_incarnations_deleted_total`, the gauge `orphan_objects_before_claim`,
-and `orphan_identity_skips_total`, the sweeps and deletes that stopped at a
-store identity object other than the one they expected. Only shard 0 of the
-metadata primary moves them. A sweep costs a HEAD and a read of the identity
-object and one listing request per 1,000 keys under the prefix, fresh objects
-and the keys of other prefixes nested in it included. The delete of an orphan
-costs a read of the identity object, the listing of the incarnation, a HEAD of
-its manifest and of its geo topic object, and the deletes.
+the objects no newer than the claim of the incarnations the last sweep left to
+an operator, and `orphan_identity_skips_total`, the sweeps and deletes that
+stopped at a store identity object other than the one they expected. Only
+shard 0 of the metadata primary moves them. A sweep costs a HEAD and a read of
+the identity object and one listing request per 1,000 keys under the prefix,
+fresh objects and the keys of other prefixes nested in it included. The delete
+of an orphan lists the incarnation twice, and costs a read of the identity
+object per turn, a HEAD of its geo topic object per turn that deletes and at
+the end of the first listing, a HEAD of its manifest at the end of each
+listing, and the deletes.
 
 Restoring metadata while tiered storage is in use is not supported. If
 metadata is rolled back or restored under the same cluster id, the

@@ -77,9 +77,10 @@ pub use object_delete::{
 };
 mod orphan_sweep;
 pub use orphan_sweep::{
-    ClaimStamp, ListedIncarnation, ORPHAN_LIST_PAGES_PER_JOB, ORPHAN_SWEEP_INTERVAL,
-    OrphanCandidates, OrphanDelete, OrphanGuard, OrphanRefusal, RootKey, RootListing, RootPages,
-    SweepFindings, SweepStamp, Verdict, quiet_since, sweep_interval, verdict,
+    ClaimStamp, ListedIncarnation, ORPHAN_LIST_PAGES_PER_JOB, ORPHAN_PAGES_PER_DELETE_TURN,
+    ORPHAN_SWEEP_INTERVAL, OrphanCandidates, OrphanCheck, OrphanDelete, OrphanGuard,
+    OrphanProgress, OrphanRefusal, RootKey, RootListing, RootPages, SweepFindings, SweepStamp,
+    Verdict, sweep_interval, verdict,
 };
 mod orphan_sweep_job;
 pub use orphan_sweep_job::{delete_orphan, list_root, read_claim};
