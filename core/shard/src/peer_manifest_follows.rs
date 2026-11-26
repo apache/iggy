@@ -502,7 +502,8 @@ where
 
 /// One pass for each [`MANIFESTS_PER_PASS`] of `manifests`. Each reads its
 /// manifests between two reads of the peer's identity object of its own,
-/// and ends with what it read.
+/// and ends with what it read. A pass whose first identity read fails reads
+/// no manifest, and ends with that error for each of them.
 pub(crate) fn peer_manifest_passes(
     source: PeerManifestSource,
     origin: String,
@@ -525,17 +526,24 @@ async fn read_peer_manifests(
 ) -> Vec<FinishedPeerManifestRead> {
     let objects = &*source.objects;
     let before = read_identity(objects, &source.identity_key).await;
-    let outcomes = join_all(manifests.iter().map(|manifest| async move {
-        match objects.get_range(&manifest.key, 0..u64::MAX).await {
-            Ok(object) => {
-                PartitionManifest::decode(&object.bytes).map_err(|error| error.to_string())
+    let (outcomes, identity) = if let Err(error) = &before {
+        let error = format!("reading the identity object of the geo peer failed: {error}");
+        let outcomes: Vec<Result<PartitionManifest, String>> =
+            manifests.iter().map(|_| Err(error.clone())).collect();
+        (outcomes, IdentityBracket::Unread)
+    } else {
+        let outcomes = join_all(manifests.iter().map(|manifest| async move {
+            match objects.get_range(&manifest.key, 0..u64::MAX).await {
+                Ok(object) => {
+                    PartitionManifest::decode(&object.bytes).map_err(|error| error.to_string())
+                }
+                Err(error) => Err(error.to_string()),
             }
-            Err(error) => Err(error.to_string()),
-        }
-    }))
-    .await;
-    let after = read_identity(objects, &source.identity_key).await;
-    let identity = IdentityBracket::of(&before, &after);
+        }))
+        .await;
+        let after = read_identity(objects, &source.identity_key).await;
+        (outcomes, IdentityBracket::of(&before, &after))
+    };
     manifests
         .into_iter()
         .zip(outcomes)

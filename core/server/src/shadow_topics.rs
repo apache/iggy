@@ -47,6 +47,12 @@
 //! shadow topics of the peer are stale: they serve what they hold, and the
 //! pass removes none of them but those whose grace ended.
 //!
+//! The shadow streams of a peer follow the objects of the cluster that the
+//! node reads the peer as when they came from that cluster, or when the node
+//! reads the peer as the successor of the only cluster that committed
+//! metadata records of it. A peer stream without a shadow stream gets none
+//! while the node reads such a successor.
+//!
 //! A peer whose origin retired is read no more. Each of its shadow topics is
 //! removed once the topic's retention in the peer passed since the
 //! retirement, or once the grace of its tombstone ended, and each of its
@@ -188,6 +194,9 @@ enum Report {
     /// The shadow streams of the peer came from another cluster than the one
     /// that owns its store now.
     OtherCluster { origin: String, cluster_uid: u128 },
+    /// A stream of a peer that the node reads as the successor of the
+    /// cluster its shadow streams came from has no shadow stream.
+    SuccessorStream { origin: String, stream_id: u64 },
     /// An operation committed as a no-op with this code.
     Refused { proposal: String, code: u32 },
 }
@@ -593,6 +602,11 @@ impl Task {
                     cluster_uid = format!("{cluster_uid:032x}"),
                     "the shadow streams of a peer came from another cluster than the one that owns its store now; they stay as they are"
                 ),
+                Report::SuccessorStream { origin, stream_id } => warn!(
+                    origin,
+                    stream_id,
+                    "a stream of a peer that a recovery rebuilt has no shadow stream, and gets none while the shadow streams follow the rebuilt cluster"
+                ),
                 Report::Refused { proposal, code } => warn!(
                     proposal,
                     code,
@@ -779,6 +793,40 @@ fn shadow_streams_of<'a>(
         })
 }
 
+/// The clusters whose shadow streams of a peer follow what the pass read of
+/// its store.
+#[derive(Clone, Copy)]
+struct Lineage {
+    /// The cluster that the node reads the peer as.
+    read_as: u128,
+    /// The only cluster that committed metadata records of the peer, when
+    /// the node reads the peer as another one. The identity checks accept an
+    /// unrecorded cluster only as the successor of a recorded one that
+    /// recovery records prove, see [`shard::peers::PeerRead::Successor`].
+    predecessor: Option<u128>,
+}
+
+impl Lineage {
+    /// The lineage of the peer `origin` as the pass read it, `None` while
+    /// the pass cannot read the peer.
+    fn of(inner: &StreamsInner, origin: &str, view: &PeerView) -> Option<Self> {
+        let read_as = view.cluster_uid.filter(|_| !view.stale)?;
+        let mut recorded = inner.recorded_cluster_uids(origin).into_iter();
+        let predecessor = recorded
+            .next()
+            .filter(|&only| only != read_as && recorded.next().is_none());
+        Some(Self {
+            read_as,
+            predecessor,
+        })
+    }
+
+    /// Whether the shadow streams that came from `cluster_uid` follow it.
+    fn follows(self, cluster_uid: u128) -> bool {
+        cluster_uid == self.read_as || self.predecessor == Some(cluster_uid)
+    }
+}
+
 /// A detach or a removal that committed metadata lacks for `origin`.
 fn retire(
     inner: &StreamsInner,
@@ -787,9 +835,10 @@ fn retire(
     now: u64,
     tombstone_grace: u64,
 ) -> Option<ShadowTopicRequest> {
+    let lineage = Lineage::of(inner, origin, view);
     for (stream_id, stream) in shadow_streams_of(inner, origin) {
         let source = stream.shadow.as_ref()?;
-        let follows = !view.stale && view.cluster_uid == Some(source.cluster_uid);
+        let follows = lineage.is_some_and(|lineage| lineage.follows(source.cluster_uid));
         for (topic_id, topic) in &stream.topics {
             let Some(shadow) = topic.shadow else {
                 continue;
@@ -860,13 +909,11 @@ fn adopt(
     view: &PeerView,
     reports: &mut Vec<Report>,
 ) -> Option<ShadowTopicRequest> {
-    let cluster_uid = view.cluster_uid.filter(|_| !view.stale)?;
-    if let Some((_, stream)) = shadow_streams_of(inner, origin).find(|(_, stream)| {
-        stream
-            .shadow
-            .as_ref()
-            .is_some_and(|shadow| shadow.cluster_uid != cluster_uid)
-    }) && let Some(shadow) = &stream.shadow
+    let lineage = Lineage::of(inner, origin, view)?;
+    let cluster_uid = lineage.read_as;
+    if let Some(shadow) = shadow_streams_of(inner, origin)
+        .filter_map(|(_, stream)| stream.shadow.as_ref())
+        .find(|shadow| !lineage.follows(shadow.cluster_uid))
     {
         reports.push(Report::OtherCluster {
             origin: origin.to_owned(),
@@ -891,11 +938,6 @@ fn adopt(
     }
     for (peer_stream_id, mut objects) in streams {
         objects.sort_by_key(|object| object.published_at);
-        let source = ShadowStream {
-            origin: origin.to_owned(),
-            cluster_uid,
-            stream_id: peer_stream_id,
-        };
         let newest = objects.last()?;
         let Some(name) = shadow_stream_name(origin, &newest.stream_name) else {
             reports.push(Report::NameTooLong {
@@ -904,12 +946,23 @@ fn adopt(
             });
             continue;
         };
-        let committed = inner
-            .items
-            .iter()
-            .find(|(_, stream)| stream.shadow.as_ref() == Some(&source));
+        let committed = shadow_streams_of(inner, origin).find(|(_, stream)| {
+            stream
+                .shadow
+                .as_ref()
+                .is_some_and(|shadow| shadow.stream_id == peer_stream_id)
+        });
         let name_holder = inner.resolve_stream_id(&WireIdentifier::named(&name).ok()?);
         let Some((stream_id, stream)) = committed else {
+            // A shadow stream of the successor would record a second
+            // cluster of the peer, and end the lineage of the others.
+            if lineage.predecessor.is_some() {
+                reports.push(Report::SuccessorStream {
+                    origin: origin.to_owned(),
+                    stream_id: peer_stream_id,
+                });
+                continue;
+            }
             if name_holder.is_some() {
                 reports.push(Report::NameTaken {
                     origin: origin.to_owned(),
@@ -918,10 +971,15 @@ fn adopt(
                 continue;
             }
             return Some(ShadowTopicRequest::CreateStream {
-                source,
+                source: ShadowStream {
+                    origin: origin.to_owned(),
+                    cluster_uid,
+                    stream_id: peer_stream_id,
+                },
                 name: WireName::new(&name).ok()?,
             });
         };
+        let source = stream.shadow.clone()?;
         if *stream.name != *name {
             if name_holder.is_none() {
                 return Some(ShadowTopicRequest::RenameStream {
@@ -1479,19 +1537,47 @@ mod tests {
         );
     }
 
-    /// The shadow streams of a peer came from the cluster that owned its
-    /// store then. A store that another cluster owns now gets no adoption,
-    /// detach or removal of them, and the pass reports it once.
+    /// The peer's store read as `cluster_uid`, holding `objects`, each
+    /// published by that cluster.
+    fn read_as(
+        cluster_uid: u128,
+        objects: impl IntoIterator<Item = TopicObject>,
+    ) -> BTreeMap<String, PeerView> {
+        let mut peers = view(objects.into_iter().map(|object| TopicObject {
+            cluster_uid,
+            ..object
+        }));
+        peers.get_mut(PEER).unwrap().cluster_uid = Some(cluster_uid);
+        peers
+    }
+
+    /// The shadow streams of a peer came from clusters that the node does
+    /// not read the peer as, and committed metadata records more than one
+    /// of them, so none is the predecessor of the store's owner. They get no
+    /// adoption, detach or removal, and the pass reports it once.
     #[test]
-    fn given_shadow_streams_of_another_cluster_than_the_stores_owner_when_planning_should_report_it_and_change_nothing()
+    fn given_shadow_streams_of_two_clusters_when_the_store_is_read_as_a_third_should_report_it_and_change_nothing()
      {
-        let (inner, _) = adopted();
+        let (mut inner, _) = adopted();
+        apply(
+            &mut inner,
+            &ShadowTopicRequest::CreateStream {
+                source: ShadowStream {
+                    cluster_uid: PEER_CLUSTER + 2,
+                    stream_id: PEER_STREAM + 1,
+                    ..source()
+                },
+                name: WireName::new("__shadow_dc-b_payments").unwrap(),
+            },
+        );
         let another_topic = TopicKey {
             topic_id: PEER_TOPIC + 1,
             ..key()
         };
-        let mut peers = view([tombstone(NOW - GRACE), object(another_topic, "billing", 20)]);
-        peers.get_mut(PEER).unwrap().cluster_uid = Some(PEER_CLUSTER + 1);
+        let peers = read_as(
+            PEER_CLUSTER + 1,
+            [tombstone(NOW - GRACE), object(another_topic, "orders", 20)],
+        );
 
         let plan = plan(&inner, &peers, NOW, GRACE);
 
@@ -1501,6 +1587,82 @@ mod tests {
             [Report::OtherCluster {
                 origin: PEER.to_owned(),
                 cluster_uid: PEER_CLUSTER,
+            }]
+        );
+    }
+
+    /// A recovery of the cluster that the shadow streams came from gives
+    /// the peer's store a successor, which the node reads the peer as. The
+    /// shadow streams follow its objects: its tombstone detaches a topic,
+    /// and its new topic in a shadowed stream is adopted into that shadow
+    /// stream. Its stream without a shadow stream gets none.
+    #[test]
+    fn given_shadow_streams_of_the_only_recorded_cluster_when_the_store_is_read_as_its_successor_should_follow_its_objects()
+     {
+        const SUCCESSOR: u128 = PEER_CLUSTER + 1;
+        let (inner, stream_id) = adopted();
+        let deleted_at = NOW - 10;
+
+        assert_eq!(
+            plan(
+                &inner,
+                &read_as(SUCCESSOR, [tombstone(deleted_at)]),
+                NOW,
+                GRACE
+            )
+            .proposal,
+            Some(ShadowTopicRequest::DetachTopic {
+                target: target(stream_id),
+                deleted_at,
+            })
+        );
+
+        let another_topic = TopicKey {
+            topic_id: PEER_TOPIC + 1,
+            created_revision: PEER_REVISION + 1,
+            ..key()
+        };
+        let added = read_as(
+            SUCCESSOR,
+            [
+                object(key(), "orders", 10),
+                object(another_topic, "orders", 20),
+            ],
+        );
+        let Some(ShadowTopicRequest::AdoptTopic { target: into, .. }) =
+            plan(&inner, &added, NOW, GRACE).proposal
+        else {
+            panic!("the successor's new topic is adopted");
+        };
+        assert_eq!(
+            into,
+            ShadowTopicTarget {
+                stream_id,
+                source: source(),
+                topic_id: u32::try_from(PEER_TOPIC + 1).unwrap(),
+                created_revision: PEER_REVISION + 1,
+            },
+            "into the shadow stream of the cluster it succeeded"
+        );
+
+        let another_stream = TopicKey {
+            stream_id: PEER_STREAM + 1,
+            ..key()
+        };
+        let new_stream = read_as(
+            SUCCESSOR,
+            [
+                object(key(), "orders", 10),
+                object(another_stream, "payments", 20),
+            ],
+        );
+        let plan = plan(&inner, &new_stream, NOW, GRACE);
+        assert_eq!(plan.proposal, None);
+        assert_eq!(
+            plan.reports,
+            [Report::SuccessorStream {
+                origin: PEER.to_owned(),
+                stream_id: PEER_STREAM + 1,
             }]
         );
     }

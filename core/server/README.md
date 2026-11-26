@@ -886,7 +886,10 @@ shadow topics on the metadata primary.
 
 If the identity object of a peer names another cluster than the one that the
 shadow streams came from, the server logs it. It leaves those shadow streams
-as they are.
+as they are, unless the node reads the peer as the successor that recovery
+records prove of the only cluster that metadata records of the peer. Then the
+shadow streams follow the successor's topic objects, and a stream of the
+successor without a shadow stream gets none.
 
 An operator retires a peer whose datacenter never returns with
 `iggy geo retire <origin>`, or `POST /geo/origins/{origin}/retire`, which needs

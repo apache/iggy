@@ -137,8 +137,9 @@ pub enum PeerRead {
     /// The store did not answer, or failed in a way that a retry can get
     /// past.
     Unreachable,
-    /// The store refused the read in a way that only an operator can fix,
-    /// such as rejected credentials or a missing bucket.
+    /// The store refused a read of the check, of the identity object or of a
+    /// recovery record, in a way that only an operator can fix, such as
+    /// rejected credentials or a missing bucket.
     Refused,
 }
 
@@ -578,8 +579,7 @@ struct PeerGate {
 
 impl ReadGate for PeerGate {
     fn admit(&self) -> Option<u128> {
-        let status = self.status.get();
-        status.identity.readable().filter(|_| status.serves_polls())
+        self.status.get().identity.readable()
     }
 }
 
