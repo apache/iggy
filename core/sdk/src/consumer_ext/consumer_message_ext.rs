@@ -25,19 +25,35 @@ use tracing::{error, info, trace, warn};
 
 #[async_trait]
 impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
-    /// Consume messages from the stream and process them with the given message consumer.
+    /// Reads messages until a shutdown signal arrives, and hands each one to `message_consumer`.
     ///
-    /// Under `CommitPolicy::Auto`, a message counts before the handler with
-    /// `CommitAfter::Delivery`, and once the handler succeeds with `CommitAfter::Processing`.
-    /// With `Processing`, a handler that fails ends the consumption with its error, and its
-    /// message stays uncounted, so the next run reads it again.
+    /// Each turn of the loop checks `shutdown_rx` first and then waits for a message. A signal
+    /// that arrives while a handler runs stops the loop after that handler returns. Dropping the
+    /// sender counts as a signal.
     ///
-    /// # Arguments
+    /// The loop returns `Ok(())` in three cases: (1) the signal arrived, (2) the sender was
+    /// dropped, or (3) the consumer has no more messages, as after
+    /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown).
+    /// After the two signal cases the consumer stays usable, so call
+    /// [`shutdown()`](crate::prelude::IggyConsumer::shutdown) afterwards to store the counted
+    /// offsets and leave the consumer group.
     ///
-    /// * `message_consumer`: The message consumer to use. This must be a reference to a static
-    /// object that implements the `MessageConsumer` trait.
-    /// * `shutdown_rx`: A receiver which will receive a shutdown signal, which will be used to
-    /// stop message consumption.
+    /// # Committing after a message
+    ///
+    /// Under [`CommitPolicy::Auto`], the [`CommitAfter`] of the poll options sets when a message
+    /// counts:
+    ///
+    /// | Variant | The message counts |
+    /// | --- | --- |
+    /// | [`CommitAfter::Delivery`] | before the handler runs |
+    /// | [`CommitAfter::Processing`] | after the handler returns `Ok`. A handler that fails ends the loop with its error, and its message stays uncounted, so the next run reads it again |
+    /// | [`CommitAfter::Marked`] | never from this loop, because the handler gets no checkpoint to mark |
+    ///
+    /// A counted message is not stored at once. The consumer stores the latest counted position
+    /// at the interval or event of [`AutoCommit`], and on shutdown. Under
+    /// [`CommitPolicy::Manual`] the handler gets no handle to commit with, so with
+    /// [`PollingStrategy::next()`] each run reads the same messages again. The loop logs a
+    /// warning for that case.
     ///
     /// # Errors
     ///
@@ -80,8 +96,17 @@ impl<'a> IggyConsumerMessageExt<'a> for IggyConsumer {
     /// Any other error is logged and the consumption goes on. A poll never dials. The client
     /// reconnects while a replica link tries again, and the heartbeat of `IggyClient` restarts
     /// the links that used up their retries. Once the client has signed in again, the consumer
-    /// rejoins its group and resolves an uncertain group create or join of its own.
+    /// rejoins its group and resolves an uncertain group create or join of its own. A handler
+    /// error under any other commit policy is logged too, and that message is skipped.
     ///
+    /// [`AutoCommit`]: crate::prelude::AutoCommit
+    /// [`CommitAfter`]: crate::prelude::CommitAfter
+    /// [`CommitAfter::Delivery`]: crate::prelude::CommitAfter::Delivery
+    /// [`CommitAfter::Marked`]: crate::prelude::CommitAfter::Marked
+    /// [`CommitAfter::Processing`]: crate::prelude::CommitAfter::Processing
+    /// [`CommitPolicy::Auto`]: crate::prelude::CommitPolicy::Auto
+    /// [`CommitPolicy::Manual`]: crate::prelude::CommitPolicy::Manual
+    /// [`PollingStrategy::next()`]: crate::prelude::PollingStrategy::next
     async fn consume_messages<P>(
         &mut self,
         message_consumer: &'a P,
