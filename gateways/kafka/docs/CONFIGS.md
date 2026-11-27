@@ -13,11 +13,11 @@ With the bridge off, these APIs answer `NOT_CONTROLLER` (41) and do not read or 
 
 ## Authorization
 
-When SASL is on, `AlterConfigs` and `IncrementalAlterConfigs` require the `manage_topics` (or
-`manage_streams`) Iggy permission on the authenticated principal. A principal without it gets
-`TOPIC_AUTHORIZATION_FAILED` (29) for every resource in the request, and `update_topic` is never
-called. With SASL off, the request has no principal, and nothing is gated here.
-`DescribeConfigs` tests no permission of its own. `CreateTopics` has no gate yet.
+When SASL is on, `CreateTopics`, `AlterConfigs` and `IncrementalAlterConfigs` require the
+`manage_topics` (or `manage_streams`) Iggy permission on the authenticated principal. A principal
+without it gets `TOPIC_AUTHORIZATION_FAILED` (29) for every topic or resource in the request, and
+Iggy is never called. With SASL off, the request has no principal, and nothing is gated here.
+`DescribeConfigs` tests no permission of its own.
 
 ## The keys
 
