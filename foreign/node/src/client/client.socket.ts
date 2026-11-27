@@ -1666,7 +1666,7 @@ export class CommandResponseStream extends EventEmitter {
 
   destroy(): void {
     if (this.lifetime.signal.aborted) return;
-    const closed = [...this.connections].map((connection) => connection.socketClosed);
+    const closed = Array.from(this.connections, (connection) => connection.socketClosed);
     void Promise.allSettled(closed).then(() => {
       // Listener exceptions follow EventEmitter semantics, outside a promise chain.
       process.nextTick(() => this.emit('end'));

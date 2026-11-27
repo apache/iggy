@@ -676,7 +676,8 @@ client
   dials lazily on its first command and announces the phase on the next tick.
   Attach listeners before issuing commands or awaiting them to receive it.
 - `connected` fires when each socket is ready: TCP connected, or the TLS
-  handshake done. It fires before the client logs in.
+  handshake done. On the initial connection it fires before the client logs
+  in. A signed-in client also emits it when a replica socket reconnects.
 - `error` receives each error the connection reports, for example a refused
   dial. Failed commands reject separately and can wrap the connection error
   in `cause`, for example a refused login. Without an `error` listener,
