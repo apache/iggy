@@ -21,15 +21,17 @@
 //! lists that segment. Nothing in `dc-b` reads the fresh objects of `dc-a`.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use iggy::prelude::*;
-use iggy_object_store::{KeyLayout, LongTermKey, SegmentKey, SegmentObject};
+use iggy_object_store::{KeyLayout, LongTermKey, RecoveryRecord, SegmentKey, SegmentObject};
 use integration::harness::{
-    Bucket, BucketEvent, GeoCluster, GeoClusterPair, GeoClusterPairBuilder, GeoSide,
+    Bucket, BucketEvent, BucketMirror, BucketWatch, GeoCluster, GeoClusterPair,
+    GeoClusterPairBuilder, GeoSide, ServerHandle,
 };
 use tokio::time::{Instant, sleep};
 
@@ -61,6 +63,9 @@ const DEFAULT_MANIFEST_POLL: Duration = Duration::from_secs(5);
 /// when it started, which the request test leaves out.
 const WATCH_SETTLE: Duration = Duration::from_secs(1);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// The pause between two checks of a log, a gauge or the bucket. A check of
+/// the bucket starts a thread and a runtime of its own.
+const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// How long a restarted cluster may take to boot and answer a client.
 const BOOT_DEADLINE: Duration = Duration::from_secs(60);
 /// How long the first identity check of a restarted node may take.
@@ -73,6 +78,21 @@ const BATCH_MESSAGES: u64 = 20;
 /// come from.
 const MISMATCH_LOG: &str = "the root of the geo peer is claimed by a cluster that its shadow \
                             streams did not come from";
+/// What the node logs once the recovery records under the root lead from the
+/// cluster that its shadow streams came from to the claim it found.
+const SUCCESSOR_LOG: &str = "which the recovery records under the root name the successor of a \
+                             cluster that the shadow streams came from";
+/// What a node that read the peer logs once the claim names a cluster it does
+/// not take, which only a restart ends.
+const CHANGED_LOG: &str = "the store identity object of the geo peer no longer names the cluster";
+/// How long the node rebuilt on an empty disk may take to recover `dc-a` and
+/// claim its root.
+const RECOVERY_DEADLINE: Duration = Duration::from_secs(120);
+/// How long a running node may take from the claim to accept a recovered
+/// origin: at most one regular identity check of the peer, and slack.
+const SUCCESSOR_DEADLINE: Duration = Duration::from_secs(90);
+/// How long a new mirror may take to copy the whole bucket of `dc-a`.
+const MIRROR_SYNC_DEADLINE: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 async fn given_steady_sends_to_a_geo_topic_when_a_consumer_follows_its_shadow_should_read_each_message_only_once_a_manifest_lists_it()
@@ -146,13 +166,7 @@ async fn given_a_shadow_without_consumers_when_its_origin_produces_should_send_t
     sleep(REQUEST_WINDOW).await;
     let (lists_after, gets_after) = manifest_requests(&scrape(&http_b).await);
     let reads = watch.reads();
-    let lost = watch
-        .changes()
-        .into_iter()
-        .filter(
-            |change| matches!(change, BucketEvent::Change { kind, .. } if kind == "events lost"),
-        )
-        .count();
+    let lost = events_lost(&watch);
     drop(watch);
     producing.store(false, Ordering::Release);
     let sent = producer.await.expect("the producer finishes");
@@ -255,7 +269,7 @@ async fn given_a_followed_root_that_a_new_cluster_took_when_the_follower_restart
     let deadline = Instant::now() + READ_DEADLINE;
     while long_term_segments(pair.a().bucket()).await.is_empty() {
         assert!(Instant::now() < deadline, "the new dc-a stored no segment");
-        sleep(POLL_INTERVAL).await;
+        sleep(RETRY_INTERVAL).await;
     }
     assert_ne!(
         pair.a().bucket().cluster_uid().await.expect("the claim"),
@@ -330,6 +344,220 @@ async fn given_a_followed_root_that_a_new_cluster_took_when_the_follower_restart
         "dc-b read more of the new cluster's root than its identity: {read:?}"
     );
     assert!(read.contains(&identity), "dc-b checked the claim: {read:?}");
+}
+
+/// `dc-a` loses every disk, and a cluster on an empty disk recovers it from
+/// its bucket: the new cluster keeps every key, names itself the successor in
+/// a recovery record, and sends more messages to the same topic. `dc-b` takes
+/// it as the successor while it runs and again after a restart, serves the
+/// messages of both clusters once and in order through the same shadow, and
+/// reads the root as a healthy follower does.
+///
+/// The running `dc-b` reads the bucket itself: a mirror copies files in no
+/// fixed order, so it could show the claim of the successor before the
+/// recovery record that names it. The restarted `dc-b` reads a mirror that
+/// copied the whole bucket before it started.
+#[tokio::test]
+async fn given_a_followed_origin_that_a_cluster_on_an_empty_disk_recovered_when_the_follower_restarts_should_serve_both_clusters_once_in_order_through_the_same_shadow()
+ {
+    // The test counts markers in the log files, which inherited settings
+    // could turn off or filter.
+    let mut pair = started_pair(
+        GeoClusterPair::builder()
+            .extra_env("IGGY_LOGGING_LEVEL", "info")
+            .extra_env("IGGY_LOGGING_FILE_ENABLED", "true")
+            .extra_env("IGGY_LOGGING_PATH", "logs"),
+    )
+    .await;
+    let (client_a, shadow) = create_and_follow(&pair).await;
+    let client_b = pair.b().root_client().await.expect("a client of dc-b");
+    let consumer = Consumer::new(Identifier::named("follower").expect("a consumer name"));
+    send_batch(&client_a, "retired").await;
+    assert_eq!(
+        read_next(
+            &pair,
+            &client_b,
+            shadow,
+            &consumer,
+            3,
+            BATCH_MESSAGES as usize
+        )
+        .await,
+        batch("retired")
+    );
+    let retired = pair
+        .a()
+        .bucket()
+        .cluster_uid()
+        .await
+        .expect("the claim")
+        .expect("dc-a claimed its bucket");
+    let retired_segments = long_term_segments(pair.a().bucket()).await;
+    drop(client_a);
+
+    let harness_a = pair.cluster_mut(GeoSide::A).harness_mut();
+    harness_a.kill_cluster().expect("dc-a loses its nodes");
+    harness_a
+        .node_mut(0)
+        .add_env("IGGY_GEO_RECOVER_CLUSTER_UID", format!("{retired:032x}"));
+    harness_a
+        .restart_node_from_clean_slate(0)
+        .expect("dc-a starts on an empty disk");
+    let successor = claim_after(pair.a().bucket(), retired).await;
+    let claimed_at = Instant::now();
+    let layout = pair.a().bucket().layout().clone();
+    let record = pair
+        .a()
+        .bucket()
+        .object(&layout.recovery_key(retired))
+        .await
+        .expect("read the recovery record")
+        .expect("the recovery stored its record");
+    assert_eq!(
+        RecoveryRecord::decode(&record)
+            .expect("the record decodes")
+            .successor_cluster_uid,
+        successor
+    );
+    assert_eq!(
+        long_term_segments(pair.a().bucket()).await,
+        retired_segments,
+        "the recovery keeps the manifest and the keys of the retired cluster"
+    );
+    let client_a = booted_client(pair.a()).await;
+    assert_eq!(
+        read_origin(&client_a, BATCH_MESSAGES as usize).await,
+        batch("retired"),
+        "the recovered dc-a serves what the bucket held"
+    );
+    // A topic that dc-a creates after its recovery gets no shadow in dc-b:
+    // the adoption compares new topic objects with the retired cluster that
+    // the shadow stream recorded. Only a topic shadowed before the recovery
+    // is covered.
+    send_batch(&client_a, "successor").await;
+
+    let node_b = pair.b().harness().node(0);
+    await_log(
+        node_b,
+        SUCCESSOR_LOG,
+        0,
+        SUCCESSOR_DEADLINE.saturating_sub(claimed_at.elapsed()),
+    )
+    .await;
+    let accepted_within = claimed_at.elapsed();
+    assert_eq!(
+        read_next(
+            &pair,
+            &client_b,
+            shadow,
+            &consumer,
+            3,
+            BATCH_MESSAGES as usize
+        )
+        .await,
+        batch("successor"),
+        "the running dc-b goes on from where the consumer stopped"
+    );
+    assert!(
+        !node_b.stdout_contains(CHANGED_LOG) && !node_b.stdout_contains(MISMATCH_LOG),
+        "the running dc-b refused the successor"
+    );
+    let http_b = HttpClient::login_root(pair.b().harness()).await;
+    let exposition = scrape(&http_b).await;
+    assert_eq!(
+        gauge(&exposition, "geo_peer_identity_verified", "dc-a"),
+        Some(1)
+    );
+    assert_eq!(gauge(&exposition, "geo_peer_unreachable", "dc-a"), Some(0));
+    drop((client_a, client_b, http_b));
+
+    pair.cluster_mut(GeoSide::B)
+        .stop()
+        .await
+        .expect("dc-b stops");
+    let accepted_before_restart = logged(pair.b().harness().node(0), SUCCESSOR_LOG);
+    let mirror = BucketMirror::start(
+        pair.a().bucket().path(),
+        &pair.b().harness().test_dir().join("mirror"),
+    )
+    .expect("a mirror of the bucket of dc-a");
+    mirror
+        .wait_for_pass(MIRROR_SYNC_DEADLINE)
+        .await
+        .expect("the mirror copies the bucket of dc-a");
+    pair.cluster_mut(GeoSide::B)
+        .harness_mut()
+        .node_mut(0)
+        .add_env(
+            "IGGY_GEO_PEERS_0_PATH",
+            mirror.path().to_string_lossy().into_owned(),
+        );
+    let watch = mirror.watch().expect("a watch on the mirror");
+    sleep(WATCH_SETTLE).await;
+    let started = std::time::Instant::now();
+    pair.cluster_mut(GeoSide::B)
+        .start()
+        .await
+        .expect("dc-b starts again");
+    let client_b = booted_client(pair.b()).await;
+    let node_b = pair.b().harness().node(0);
+    let restarted_within = await_log(
+        node_b,
+        SUCCESSOR_LOG,
+        accepted_before_restart,
+        CHECK_DEADLINE,
+    )
+    .await;
+    eprintln!(
+        "dc-a {retired:032x} recovered as {successor:032x}; the running dc-b accepted it within \
+         {accepted_within:?} of the claim, the restarted one within {restarted_within:?} of taking \
+         a client"
+    );
+    let expected = [batch("retired"), batch("successor")].concat();
+    assert_eq!(
+        read_from_offset_zero(&client_b, shadow, 7, expected.len()).await,
+        expected,
+        "each message of both clusters once, in the origin's order"
+    );
+    assert!(
+        !node_b.stdout_contains(CHANGED_LOG) && !node_b.stdout_contains(MISMATCH_LOG),
+        "the restarted dc-b refused the successor"
+    );
+    await_peer_gauges(
+        &HttpClient::login_root(pair.b().harness()).await,
+        &[
+            ("geo_peer_identity_verified", 1),
+            ("geo_peer_unreachable", 0),
+            ("geo_shadow_topics_stale", 0),
+        ],
+    )
+    .await;
+
+    let mut opens = Opens::default();
+    for event in watch.reads() {
+        if let BucketEvent::Read { at, paths } = event
+            && at >= started
+        {
+            for path in &paths {
+                let key = path.strip_prefix(mirror.path()).ok().and_then(Path::to_str);
+                opens.count(&layout, key);
+            }
+        }
+    }
+    eprintln!("opens of the bucket of dc-a by the restarted dc-b: {opens:?}");
+    let lost = events_lost(&watch);
+    assert_eq!(
+        lost, 0,
+        "the watch on the mirror lost events, so its reads cannot show what the restarted dc-b \
+         opened"
+    );
+    let identity_reads = opens.other.get("meta/identity").copied().unwrap_or(0);
+    assert!(
+        identity_reads > 0 && opens.recovery > 0 && opens.manifest_files > 0 && opens.segments > 0,
+        "dc-b checks the claim, follows the recovery record, and reads the manifests and \
+         segments: {opens:?}"
+    );
+    assert_eq!(opens.fresh, 0, "dc-b reads no fresh object: {opens:?}");
 }
 
 /// The ids of the shadow topic in `dc-b` of the geo topic of `dc-a`.
@@ -647,6 +875,123 @@ async fn booted_client(cluster: &GeoCluster) -> IggyClient {
                 sleep(Duration::from_millis(250)).await;
             }
         }
+    }
+}
+
+/// Wait until the identity object of `bucket` names another cluster than
+/// `retired`, and return that cluster.
+async fn claim_after(bucket: &Bucket, retired: u128) -> u128 {
+    let deadline = Instant::now() + RECOVERY_DEADLINE;
+    loop {
+        if let Ok(Some(claim)) = bucket.cluster_uid().await
+            && claim != retired
+        {
+            return claim;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no cluster took the root of {retired:032x}"
+        );
+        sleep(RETRY_INTERVAL).await;
+    }
+}
+
+/// Wait until `node` logged `marker` more than `before` times, and return how
+/// long that took. A wait whose `within` ran out fails even if the marker is
+/// there.
+async fn await_log(node: &ServerHandle, marker: &str, before: usize, within: Duration) -> Duration {
+    let started = Instant::now();
+    loop {
+        let waited = started.elapsed();
+        assert!(
+            waited < within,
+            "the node never logged {marker:?} within {within:?}"
+        );
+        if logged(node, marker) > before {
+            return waited;
+        }
+        sleep(RETRY_INTERVAL).await;
+    }
+}
+
+/// How many times `node` logged `marker` in its own log files. They keep every
+/// run of the node in any test mode, so a count taken before a restart tells
+/// the runs apart.
+fn logged(node: &ServerHandle, marker: &str) -> usize {
+    let Ok(entries) = fs::read_dir(node.data_path().join("logs")) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| fs::read_to_string(entry.path()).ok())
+        .map(|log| log.matches(marker).count())
+        .sum()
+}
+
+/// How many times `watch` lost events, after which its reads are incomplete.
+fn events_lost(watch: &BucketWatch) -> usize {
+    watch
+        .changes()
+        .iter()
+        .filter(
+            |change| matches!(change, BucketEvent::Change { kind, .. } if kind == "events lost"),
+        )
+        .count()
+}
+
+/// Scrape `/metrics` through `http` until each gauge of the peer `dc-a`
+/// reads its value in `expected`. A node that just started settles them only
+/// after its first passes over the peer.
+async fn await_peer_gauges(http: &HttpClient, expected: &[(&str, u64)]) {
+    let deadline = Instant::now() + CHECK_DEADLINE;
+    loop {
+        let exposition = scrape(http).await;
+        let read: Vec<Option<u64>> = expected
+            .iter()
+            .map(|(name, _)| gauge(&exposition, name, "dc-a"))
+            .collect();
+        if read
+            .iter()
+            .zip(expected)
+            .all(|(read, (_, value))| *read == Some(*value))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the gauges of dc-a read {read:?}, not {expected:?}"
+        );
+        sleep(RETRY_INTERVAL).await;
+    }
+}
+
+/// Every message of the geo topic of `dc-a` from offset 0, once it serves
+/// `wanted`.
+async fn read_origin(client: &IggyClient, wanted: usize) -> Vec<String> {
+    let deadline = Instant::now() + READ_DEADLINE;
+    loop {
+        if let Ok(polled) = client
+            .poll_messages(
+                &named(STREAM),
+                &named(TOPIC),
+                0,
+                &Consumer::default(),
+                &PollingStrategy::offset(0),
+                PollOptions {
+                    count: 100,
+                    ..PollOptions::default()
+                },
+            )
+            .await
+            && polled.messages.len() >= wanted
+        {
+            return polled.messages.iter().map(payload_of).collect();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "dc-a never served {wanted} messages"
+        );
+        sleep(POLL_INTERVAL).await;
     }
 }
 
