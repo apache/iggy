@@ -37,7 +37,7 @@ pub struct DeleteSegments {
     /// Unique partition ID (numeric or name).
     #[serde(skip)]
     pub partition_id: u32,
-    /// Number of segments in the partition to delete, max value is 1000.
+    /// Number of segments in the partition to delete.
     pub segments_count: u32,
 }
 
