@@ -24,6 +24,8 @@ use chrono::DateTime;
 use crate::models::ResourceOptions;
 
 const MICROS_PER_SECOND: u64 = 1_000_000;
+const UNAVAILABLE: &str = "unavailable";
+const UNKNOWN: &str = "unknown";
 
 /// Formats a server timestamp (Unix microseconds) in UTC.
 pub fn timestamp(micros: u64) -> String {
@@ -67,9 +69,40 @@ pub fn byte_size(server_text: &str) -> String {
         unit += 1;
     }
     if unit == 0 {
-        format!("{amount} B")
+        // A decimal unit can land a hair off a whole byte, so "1.001 KB"
+        // would otherwise show as 1000.9999999999999 B.
+        format!("{amount:.0} B")
     } else {
         format!("{amount:.2} {}", UNITS[unit])
+    }
+}
+
+/// Renders a server byte size out of its total. The server reports a total of
+/// zero when it cannot measure the resource, which is not the same as full.
+pub fn byte_size_of_total(part: &str, total: &str) -> String {
+    if parse_byte_size(total).is_some_and(|bytes| bytes <= 0.0) {
+        return UNAVAILABLE.to_owned();
+    }
+    format!("{} of {}", byte_size(part), byte_size(total))
+}
+
+/// The server reports zero for an open-file count or limit it cannot read.
+pub fn open_files(count: u64, limit: u64) -> String {
+    let known = |value: u64| match value {
+        0 => UNKNOWN.to_owned(),
+        value => value.to_string(),
+    };
+    match (count, limit) {
+        (0, 0) => UNKNOWN.to_owned(),
+        (count, limit) => format!("{} of {}", known(count), known(limit)),
+    }
+}
+
+/// The server reports zero threads where it cannot count them, as on macOS.
+pub fn thread_count(count: u32) -> String {
+    match count {
+        0 => UNAVAILABLE.to_owned(),
+        count => count.to_string(),
     }
 }
 
@@ -225,6 +258,31 @@ mod tests {
         assert_eq!(byte_size("3.898 KB"), "3.81 KiB");
         assert_eq!(byte_size("0 B"), "0 B");
         assert_eq!(byte_size("512 B"), "512 B");
+        assert_eq!(byte_size("1.001 KB"), "1001 B");
+    }
+
+    #[test]
+    fn given_zero_total_should_render_unavailable() {
+        assert_eq!(byte_size_of_total("0 B", "0 B"), "unavailable");
+        assert_eq!(byte_size_of_total("0 B", "16 GiB"), "0 B of 16.00 GiB");
+        assert_eq!(
+            byte_size_of_total("8615888 KiB", "16 GiB"),
+            "8.22 GiB of 16.00 GiB"
+        );
+    }
+
+    #[test]
+    fn given_unknown_open_file_fields_should_render_unknown() {
+        assert_eq!(open_files(12, 1024), "12 of 1024");
+        assert_eq!(open_files(12, 0), "12 of unknown");
+        assert_eq!(open_files(0, 1024), "unknown of 1024");
+        assert_eq!(open_files(0, 0), "unknown");
+    }
+
+    #[test]
+    fn given_zero_threads_should_render_unavailable() {
+        assert_eq!(thread_count(0), "unavailable");
+        assert_eq!(thread_count(8), "8");
     }
 
     #[test]

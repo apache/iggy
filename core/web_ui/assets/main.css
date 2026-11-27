@@ -253,6 +253,7 @@ input:focus {
 .stat-value {
   font-size: 1.05rem;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 table {

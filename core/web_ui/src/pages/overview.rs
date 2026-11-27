@@ -29,7 +29,7 @@ pub fn Overview() -> Element {
     let body = match &*stats.read() {
         None => rsx! { Loading {} },
         Some(Err(error)) => rsx! { ErrorView { error: error.clone() } },
-        Some(Ok(stats)) => rsx! { StatsSections { stats: stats.clone() } },
+        Some(Ok(stats)) => stats_sections(stats),
     };
 
     rsx! {
@@ -38,8 +38,7 @@ pub fn Overview() -> Element {
     }
 }
 
-#[component]
-fn StatsSections(stats: Stats) -> Element {
+fn stats_sections(stats: &Stats) -> Element {
     rsx! {
         h2 { "Server" }
         div { class: "stats",
@@ -58,25 +57,17 @@ fn StatsSections(stats: Stats) -> Element {
             Stat { label: "Server memory", value: format::byte_size(&stats.memory_usage) }
             Stat {
                 label: "Available memory",
-                value: format!(
-                    "{} of {}",
-                    format::byte_size(&stats.available_memory),
-                    format::byte_size(&stats.total_memory),
-                ),
+                value: format::byte_size_of_total(&stats.available_memory, &stats.total_memory),
             }
             Stat {
                 label: "Free disk",
-                value: format!(
-                    "{} of {}",
-                    format::byte_size(&stats.free_disk_space),
-                    format::byte_size(&stats.total_disk_space),
-                ),
+                value: format::byte_size_of_total(&stats.free_disk_space, &stats.total_disk_space),
             }
             Stat {
                 label: "Open files",
-                value: format!("{} of {}", stats.open_files_count, stats.open_files_limit),
+                value: format::open_files(stats.open_files_count, stats.open_files_limit),
             }
-            Stat { label: "Threads", value: stats.threads_count.to_string() }
+            Stat { label: "Threads", value: format::thread_count(stats.threads_count) }
             Stat { label: "Read", value: format::byte_size(&stats.read_bytes) }
             Stat { label: "Written", value: format::byte_size(&stats.written_bytes) }
         }
