@@ -59,6 +59,7 @@ use crate::poll_plan::DiskFault;
 use crate::remote_blocks::{
     PartitionReadSettings, ReadCache, ReadGate, Reading, RemoteBlocks, RemoteReadMetrics, StoreSlot,
 };
+use crate::rewrite_share::RewriteShare;
 use crate::segment_chain::SegmentRecord;
 use crate::segment_upload::{is_recorded_log, is_whole_index};
 use crate::state_transfer::{STAGING_SUFFIX, fsync_dir};
@@ -542,15 +543,19 @@ impl RemoteSegments {
     /// Keep the end of the long-term segment that a rewrite just stored, its
     /// `.log` bytes `log` read by `segment`, and its `index`, when the cache
     /// keeps what reads fetch, for the partition that reads with `settings`.
+    /// The copies count against the rewrite's `share`.
     pub(crate) async fn carry_long_term(
         &self,
         segment: &RemoteRange,
         log: &[u8],
         index: &[u8],
         settings: &PartitionReadSettings,
+        share: &mut RewriteShare,
     ) {
         if let Some(blocks) = self.fetched_into_cache() {
-            blocks.carry_segment(segment, log, index, settings).await;
+            blocks
+                .carry_segment(segment, log, index, settings, share)
+                .await;
         }
     }
 
@@ -635,7 +640,10 @@ impl RemoteSegments {
     /// `range` of the fresh object `object_id` when this shard holds it in
     /// memory, not counted as a read of it: a rewrite reads each blob once,
     /// and what it read is in its long-term segment from then on.
-    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+    ///
+    /// The bytes come in the pieces the cache keeps them in, back to back,
+    /// so that nothing is copied here.
+    pub(crate) fn cached_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Vec<Bytes>> {
         self.blocks.as_ref()?.peek_fresh(object_id, range)
     }
 

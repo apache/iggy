@@ -39,7 +39,7 @@
 //! that lost primacy before its command committed is then deleted once its
 //! registration expires, whatever the next primary stores.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future;
 use std::io;
 use std::rc::Rc;
@@ -65,9 +65,10 @@ use crate::Partition;
 use crate::iggy_index::IGGY_INDEX_SIZE;
 use crate::journal::MessageLookup;
 use crate::long_term::{LONG_TERM_SEGMENTS_MAX, LongTermLog, ObjectRegistration, REGISTER_OBJECT};
-use crate::placed_read::{BatchPiece, PlacedReadPlan};
+use crate::placed_read::{BatchPiece, PlacedReadPlan, REWRITE_PACED_YIELD_BYTES};
 use crate::poll_plan::DiskFault;
-use crate::remote_segments::RemoteRange;
+use crate::remote_segments::{ReadPolicy, RemoteRange, RemoteSegments};
+use crate::rewrite_share::{RewriteBudget, RewriteShare};
 use crate::segment_chain::{HashSource, SegmentHasher, SegmentRecord};
 use crate::segment_upload::{LogPut, UploadError, memory_body, store_segment};
 use crate::state_machine::CommandKind;
@@ -80,6 +81,12 @@ pub const LONG_TERM_SEGMENT_BYTES: usize = 64 * 1024 * 1024;
 /// Bytes of a segment between two entries of its index.
 pub const INDEX_STRIDE_BYTES: u64 = 64 * 1024;
 
+/// Bytes of a segment that a rewrite sums at a time. The pieces it copies
+/// can be as short as a batch header, and blake3 and CRC32C cost less over
+/// one long run than over many short ones. A run takes no longer than the
+/// stride of a rewrite that keeps to its share.
+const SUM_STRIDE_BYTES: usize = REWRITE_PACED_YIELD_BYTES;
+
 /// One rewrite, as the partition's owner captured it.
 pub struct SegmentRewrite {
     pub prefix: ObjectPrefix,
@@ -88,6 +95,12 @@ pub struct SegmentRewrite {
     /// The last offset of the segment, where its plan found it ends.
     pub up_to: u64,
     pub(crate) read: PlacedReadPlan,
+    /// The share of its shard's time that the rewrite keeps to, `None` for
+    /// a rewrite that keeps to none.
+    pub(crate) budget: Option<Rc<RewriteBudget>>,
+    /// Where the rewrite leaves the copy into the cache, `None` for one that
+    /// copies before it ends.
+    pub(crate) later_carry: Option<LaterCarry>,
 }
 
 /// The plan of a rewrite, as the partition's owner captured it: where the
@@ -140,6 +153,52 @@ pub enum RewriteError {
 /// or a cancellation before it finished.
 pub type RewriteOutcome = Result<Result<ManifestSegment, RewriteError>, TierJobCancelled>;
 
+/// Where a rewrite leaves the copy of the end of its segment into the
+/// shard's cache, for the caller to run once it reported the segment.
+///
+/// The copy keeps to the rewrite's share and can sleep, and the store holds
+/// the segment already. See [`SegmentRewrite::carrying_later`].
+#[derive(Clone, Default)]
+pub struct LaterCarry(Rc<RefCell<Option<CacheCarry>>>);
+
+impl LaterCarry {
+    /// The copy the rewrite left, once it stored its segment.
+    #[must_use]
+    pub fn take(&self) -> Option<CacheCarry> {
+        self.0.borrow_mut().take()
+    }
+}
+
+/// The end of a stored long-term segment, for the shard's cache, see
+/// [`LaterCarry`].
+pub struct CacheCarry {
+    remote: Rc<RemoteSegments>,
+    segment: RemoteRange,
+    log: Bytes,
+    index: Bytes,
+    /// What the segment's partition reads with when the copy runs.
+    policy: ReadPolicy,
+    budget: Option<Rc<RewriteBudget>>,
+}
+
+impl CacheCarry {
+    /// Copy the end of the segment into the cache.
+    pub async fn run(self) {
+        let mut share = self
+            .budget
+            .map_or_else(RewriteShare::unpaced, RewriteShare::paced);
+        self.remote
+            .carry_long_term(
+                &self.segment,
+                &self.log,
+                &self.index,
+                &self.policy.current(),
+                &mut share,
+            )
+            .await;
+    }
+}
+
 /// Runs the rewrites of a shard, behind a pointer, so the shard does not
 /// carry the executor's type.
 pub trait LongTermWriter {
@@ -189,6 +248,28 @@ impl<E: TierExecutor> LongTermWriter for ExecutorLongTermWriter<E> {
 }
 
 impl SegmentRewrite {
+    /// Keep the rewrite to the share of its shard's time of `budget`.
+    #[must_use]
+    pub fn paced_by(self, budget: Rc<RewriteBudget>) -> Self {
+        Self {
+            budget: Some(budget),
+            ..self
+        }
+    }
+
+    /// Leave the copy of the end of the segment into the cache in the
+    /// returned slot, for the caller to run once it reported the segment,
+    /// rather than copy it before the rewrite ends.
+    #[must_use]
+    pub fn carrying_later(self) -> (Self, LaterCarry) {
+        let later = LaterCarry::default();
+        let rewrite = Self {
+            later_carry: Some(later.clone()),
+            ..self
+        };
+        (rewrite, later)
+    }
+
     /// Read the batches into the segment's bytes, summing them as they are
     /// copied, and store the segment and its index from memory.
     ///
@@ -207,16 +288,20 @@ impl SegmentRewrite {
                 end_offset: built.end_offset,
             });
         }
-        let mut log = SegmentBytes::<SegmentHasher>::sized(built.size)?;
+        let mut log = SegmentBytes::sized(built.size)?;
+        let mut share = self
+            .budget
+            .map_or_else(RewriteShare::unpaced, RewriteShare::paced);
         self.read
-            .read_blobs(&placed, |piece| log.push(piece))
+            .read_blobs(&placed, |piece| log.push(piece), &mut share)
             .await
             .map_err(RewriteError::Read)?;
         drop(placed);
-        if log.bytes.len() as u64 != built.size {
+        let (log, sums) = log.finish();
+        if log.len() as u64 != built.size {
             return Err(RewriteError::Read(DiskFault::Unreadable));
         }
-        let hashes = log.hasher.finalize();
+        let hashes = sums.finalize();
         let record = SegmentRecord {
             start_offset: self.start_offset,
             end_offset: built.end_offset,
@@ -229,7 +314,7 @@ impl SegmentRewrite {
             crc32c: hashes.crc32c,
             source: HashSource::CommitPath,
         };
-        let log = Bytes::from(log.bytes);
+        let log = Bytes::from(log);
         let index = Bytes::from(built.index);
         let key = |object| {
             layout.long_term_key(&LongTermKey {
@@ -239,24 +324,27 @@ impl SegmentRewrite {
                 object,
             })
         };
-        store_segment(
-            store,
-            &record,
-            LogPut {
-                key: key(SegmentObject::Log),
-                body: future::ready(Ok(memory_body(&log))),
-                // The one put of a large object that no producer waits for,
-                // where the round trips of an upload in parts pay off.
-                parts: PutParts::Allowed,
-            },
-            &key(SegmentObject::Index),
-            future::ready(Ok(memory_body(&index))),
-            crc32c::crc32c(&index),
-        )
-        .await
-        .map_err(RewriteError::Upload)?;
-        if let Some(remote) = &self.read.remote {
-            let segment = RemoteRange {
+        let index_crc32c = crc32c::crc32c(&index);
+        share
+            .wait_for_store(store_segment(
+                store,
+                &record,
+                LogPut {
+                    key: key(SegmentObject::Log),
+                    body: future::ready(Ok(memory_body(&log))),
+                    // The one put of a large object that no producer waits for,
+                    // where the round trips of an upload in parts pay off.
+                    parts: PutParts::Allowed,
+                },
+                &key(SegmentObject::Index),
+                future::ready(Ok(memory_body(&index))),
+                index_crc32c,
+            ))
+            .await
+            .map_err(RewriteError::Upload)?;
+        let carry = self.read.remote.map(|remote| CacheCarry {
+            remote,
+            segment: RemoteRange {
                 key: SegmentKey {
                     prefix: self.prefix,
                     start_offset: record.start_offset,
@@ -264,10 +352,16 @@ impl SegmentRewrite {
                 },
                 keyed_end_offset: Some(record.end_offset),
                 range: 0..record.size,
-            };
-            remote
-                .carry_long_term(&segment, &log, &index, &self.read.read_settings.current())
-                .await;
+            },
+            log,
+            index,
+            policy: self.read.read_settings.clone(),
+            budget: share.budget(),
+        });
+        match (self.later_carry, carry) {
+            (Some(later), carry) => *later.0.borrow_mut() = carry,
+            (None, Some(carry)) => carry.run().await,
+            (None, None) => {}
         }
         Ok(ManifestSegment {
             start_offset: record.start_offset,
@@ -432,20 +526,24 @@ pub async fn write_file(path: &str, bytes: Vec<u8>) -> io::Result<()> {
 }
 
 /// The bytes of a segment as its batches are put back together, and the
-/// sums of those bytes, taken from each piece as it is copied in.
-struct SegmentBytes<H> {
+/// sums of those bytes, taken [`SUM_STRIDE_BYTES`] at a time as they are
+/// copied in, while they are still in the cache.
+struct SegmentBytes {
     bytes: Vec<u8>,
-    hasher: H,
+    /// The bytes at the start of [`Self::bytes`] that the sums took.
+    summed: usize,
+    hasher: SegmentHasher,
 }
 
-impl<H: ChunkHasher + Default> SegmentBytes<H> {
+impl SegmentBytes {
     /// An empty segment with room for `size` bytes, so that no batch moves
     /// the ones before it.
     fn sized(size: u64) -> Result<Self, RewriteError> {
         let size = usize::try_from(size).map_err(|_| RewriteError::Read(DiskFault::Unreadable))?;
         Ok(Self {
             bytes: Vec::with_capacity(size),
-            hasher: H::default(),
+            summed: 0,
+            hasher: SegmentHasher::default(),
         })
     }
 
@@ -459,7 +557,22 @@ impl<H: ChunkHasher + Default> SegmentBytes<H> {
             }
             BatchPiece::Messages(messages) => self.bytes.extend_from_slice(messages),
         }
-        self.hasher.update(&self.bytes[start..]);
+        while self.bytes.len() - self.summed >= SUM_STRIDE_BYTES {
+            let end = self.summed + SUM_STRIDE_BYTES;
+            self.hasher.update(&self.bytes[self.summed..end]);
+            self.summed = end;
+        }
+    }
+
+    /// The bytes of the segment and their sums.
+    fn finish(mut self) -> (Vec<u8>, SegmentHasher) {
+        self.sum_rest();
+        (self.bytes, self.hasher)
+    }
+
+    fn sum_rest(&mut self) {
+        self.hasher.update(&self.bytes[self.summed..]);
+        self.summed = self.bytes.len();
     }
 }
 
@@ -637,6 +750,8 @@ where
             start_offset,
             up_to: planned.end_offset,
             read: self.placed_read_plan(None),
+            budget: None,
+            later_carry: None,
         };
         Some(RewriteStart::Rewrite(id, rewrite, token))
     }
@@ -919,18 +1034,19 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ops::Range;
+
     use iggy_binary_protocol::batch::BatchHeader;
-    use iggy_binary_protocol::placement::Placement;
+    use iggy_binary_protocol::placement::{PLACED_BATCH_SIZE, Placement};
+    use iggy_object_store::{
+        DeleteOutcome, ListPage, ListRequest, MemoryStore, ObjectMeta, ObjectRange,
+        ObjectStoreError, PutBody, PutOptions,
+    };
 
-    /// Counts the bytes it is fed.
-    #[derive(Default)]
-    struct FedBytes(usize);
-
-    impl ChunkHasher for FedBytes {
-        fn update(&mut self, bytes: &[u8]) {
-            self.0 += bytes.len();
-        }
-    }
+    use crate::placed_read::{PlacedSegment, REWRITE_YIELD_BYTES};
+    use crate::poll_plan::PartitionDirResolution;
+    use crate::rewrite_share::{ManualClock, RewriteClock};
+    use crate::{ReadCache, ReadCacheSettings, RemoteObjects, RemoteSegments};
 
     fn batch(base_offset: u64, blob: &[u8]) -> PlacedBatch {
         let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + blob.len()) as u64, 1);
@@ -938,30 +1054,37 @@ mod tests {
         PlacedBatch::new(header, Placement::of(1, 0, blob, 0))
     }
 
+    /// The sums are taken a stride at a time as the pieces come in, never
+    /// more than a stride in one run, and come out as one pass over the
+    /// segment gives them. No piece moves the bytes before it.
     #[test]
-    fn given_batches_when_putting_a_segment_together_should_sum_each_byte_once_and_move_none() {
-        let blobs = [vec![1_u8; 700], vec![2; 3], vec![3; 4096]];
+    fn given_batches_when_putting_a_segment_together_should_sum_it_in_strides_and_move_none() {
+        let blobs = [
+            vec![1_u8; 700],
+            vec![2; 3],
+            vec![3; SUM_STRIDE_BYTES + 4096],
+            vec![4; 2 * SUM_STRIDE_BYTES + 5],
+        ];
         let placed: Vec<_> = (0..)
             .zip(&blobs)
             .map(|(at, blob)| batch(at, blob))
             .collect();
         let built = BuiltSegment::of(0, &placed).unwrap();
-        let mut log = SegmentBytes::<FedBytes>::sized(built.size).unwrap();
+        let mut log = SegmentBytes::sized(built.size).unwrap();
         let (start, capacity) = (log.bytes.as_ptr(), log.bytes.capacity());
 
         for (placed, blob) in placed.iter().zip(&blobs) {
             log.push(BatchPiece::Header(&placed.header));
-            for messages in blob.chunks(500) {
+            for messages in blob.chunks(100_000) {
                 log.push(BatchPiece::Messages(messages));
+                assert_eq!(log.summed % SUM_STRIDE_BYTES, 0);
+                assert!(log.bytes.len() - log.summed < SUM_STRIDE_BYTES);
             }
         }
 
-        assert_eq!(log.bytes.len() as u64, built.size);
-        assert_eq!(log.hasher.0, log.bytes.len());
-        assert_eq!(
-            (log.bytes.as_ptr(), log.bytes.capacity()),
-            (start, capacity)
-        );
+        let (bytes, sums) = log.finish();
+        assert_eq!(bytes.len() as u64, built.size);
+        assert_eq!((bytes.as_ptr(), bytes.capacity()), (start, capacity));
         let mut expected = Vec::new();
         for (placed, blob) in placed.iter().zip(&blobs) {
             let mut header = [0; BATCH_HEADER_SIZE];
@@ -969,7 +1092,336 @@ mod tests {
             expected.extend_from_slice(&header);
             expected.extend_from_slice(blob);
         }
-        assert_eq!(log.bytes, expected);
+        assert_eq!(bytes, expected);
+        let mut one_pass = SegmentHasher::default();
+        one_pass.update(&expected);
+        let (sums, one_pass) = (sums.finalize(), one_pass.finalize());
+        assert_eq!(
+            (sums.crc32c, sums.blake3),
+            (one_pass.crc32c, one_pass.blake3)
+        );
+    }
+
+    const OBJECT_ID: u128 = 1;
+
+    fn layout() -> KeyLayout {
+        KeyLayout::new("iggy").unwrap()
+    }
+
+    const fn prefix() -> ObjectPrefix {
+        ObjectPrefix {
+            stream_id: 1,
+            topic_id: 1,
+            partition_id: 0,
+            created_revision: 0,
+        }
+    }
+
+    /// Batches of one message from offset 0 on, one with a blob of each
+    /// length of `blob_lens`, and the fresh object that holds the blobs back
+    /// to back.
+    fn placed_object(blob_lens: &[usize]) -> (Bytes, Vec<PlacedBatch>) {
+        let mut object = Vec::new();
+        let placed = (0..)
+            .zip(blob_lens)
+            .map(|(offset, &len)| {
+                let position = object.len() as u64;
+                object.extend((0..len).map(|at| u8::try_from((at + offset) % 251).unwrap()));
+                let blob = &object[object.len() - len..];
+                let mut header = BatchHeader::new(0, 0, (BATCH_HEADER_SIZE + len) as u64, 1);
+                header.base_offset = offset as u64;
+                header.base_timestamp = 1_000 + offset as u64;
+                PlacedBatch::new(header, Placement::of(OBJECT_ID, position, blob, 0))
+            })
+            .collect();
+        (Bytes::from(object), placed)
+    }
+
+    /// The rewrite of every batch of `placed`, which reads their records
+    /// from a segment file it writes in `directory`, and their blobs through
+    /// `remote`.
+    fn rewrite_of(
+        directory: &std::path::Path,
+        placed: &[PlacedBatch],
+        remote: Rc<RemoteSegments>,
+    ) -> SegmentRewrite {
+        let mut records = vec![0; placed.len() * PLACED_BATCH_SIZE];
+        for (record, placed) in records.chunks_mut(PLACED_BATCH_SIZE).zip(placed) {
+            placed.encode_into(record);
+        }
+        std::fs::write(directory.join(format!("{:020}.log", 0)), &records).unwrap();
+        let last = placed.last().unwrap().header;
+        SegmentRewrite {
+            prefix: prefix(),
+            start_offset: 0,
+            up_to: last.base_offset,
+            budget: None,
+            later_carry: None,
+            read: PlacedReadPlan {
+                partition_dir: PartitionDirResolution::Resolved(
+                    directory.to_string_lossy().into_owned(),
+                ),
+                segments: vec![PlacedSegment {
+                    start_offset: 0,
+                    end_offset: last.base_offset,
+                    max_timestamp: last.base_timestamp,
+                    size: records.len() as u64,
+                }],
+                resident: Vec::new(),
+                remote: Some(remote),
+                deadline: None,
+                prefix: prefix(),
+                long_term: Vec::new(),
+                long_term_floor: None,
+                long_term_next: None,
+                read_settings: ReadPolicy::default(),
+            },
+        }
+    }
+
+    async fn stored_bytes(store: &MemoryStore, key: &str, len: u64) -> Bytes {
+        ObjectStore::get_range(store, key, 0..len)
+            .await
+            .unwrap()
+            .bytes
+    }
+
+    /// A rewrite sums the bytes of its segment in strides, where it summed
+    /// each piece as it was copied in before. Its segment is the same either
+    /// way: the same `.log` and `.index`, and the same CRC32C and blake3 for
+    /// the manifest, whether the blobs come from the store or from the
+    /// shard's own upload. A blob never spans two fresh objects: a send is
+    /// never split.
+    #[compio::test]
+    async fn given_batches_when_rewriting_should_store_the_segment_that_summing_each_piece_gave() {
+        let stride = SUM_STRIDE_BYTES;
+        let cases: [&[usize]; 3] = [
+            &[700],
+            &[700, 3, 4096, 100_000, 5],
+            // Blobs that come in several pieces, and strides that end inside
+            // a batch.
+            &[stride + stride / 2, 10, 2 * stride + 7],
+        ];
+        for blob_lens in cases {
+            let (object, placed) = placed_object(blob_lens);
+            let mut log = Vec::new();
+            let mut index = SegmentIndex::default();
+            let mut hasher = SegmentHasher::default();
+            for placed in &placed {
+                let at = usize::try_from(placed.placement.position).unwrap();
+                let blob = &object[at..at + usize::try_from(placed.placement.length).unwrap()];
+                let mut header = [0; BATCH_HEADER_SIZE];
+                let mut whole = placed.header;
+                whole.batch_checksum = whole.checksum_for_blob(blob);
+                whole.encode_into(&mut header);
+                hasher.update(&header);
+                for piece in blob.chunks(REWRITE_YIELD_BYTES) {
+                    hasher.update(piece);
+                }
+                log.extend_from_slice(&header);
+                log.extend_from_slice(blob);
+                index.push(whole.base_offset, whole.base_timestamp, whole.batch_length);
+            }
+            let hashes = hasher.finalize();
+            let index = index.into_bytes();
+            for uploaded in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let store = Rc::new(MemoryStore::new());
+                store
+                    .put(
+                        &layout().fresh_key(OBJECT_ID),
+                        PutBody::from_bytes(object.clone()),
+                        &PutOptions::default(),
+                    )
+                    .await
+                    .unwrap();
+                let objects = Rc::clone(&store) as Rc<dyn RemoteObjects>;
+                let cache = ReadCache::new(ReadCacheSettings {
+                    cache_bytes: 0,
+                    block_bytes: 256 * 1024,
+                    read_ahead: 0,
+                    read_ahead_fetches: 4,
+                    read_ahead_fetch_bytes: 32 * 1024 * 1024,
+                });
+                let remote = Rc::new(
+                    RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache),
+                );
+                if uploaded {
+                    remote.cache_fresh_object(OBJECT_ID, object.clone(), std::iter::empty());
+                }
+                let rewrite = rewrite_of(directory.path(), &placed, remote);
+
+                let stored = rewrite.run(&*store, &layout()).await.unwrap();
+
+                assert_eq!(
+                    (stored.size, stored.crc32c, stored.hash),
+                    (log.len() as u64, hashes.crc32c, hashes.blake3),
+                    "blobs {blob_lens:?}, uploaded {uploaded}"
+                );
+                let key = |object| {
+                    layout().long_term_key(&LongTermKey {
+                        prefix: prefix(),
+                        start_offset: 0,
+                        end_offset: stored.end_offset,
+                        object,
+                    })
+                };
+                assert_eq!(
+                    stored_bytes(&store, &key(SegmentObject::Log), stored.size).await,
+                    log
+                );
+                assert_eq!(
+                    stored_bytes(&store, &key(SegmentObject::Index), index.len() as u64).await,
+                    index
+                );
+            }
+        }
+    }
+
+    /// A store whose puts take `put_micros` of `clock`.
+    struct SlowPuts {
+        store: MemoryStore,
+        clock: Rc<ManualClock>,
+        put_micros: u64,
+    }
+
+    impl ObjectStore for SlowPuts {
+        async fn put(
+            &self,
+            key: &str,
+            body: PutBody,
+            options: &PutOptions,
+        ) -> Result<(), ObjectStoreError> {
+            self.clock.waited(self.put_micros).await;
+            self.store.put(key, body, options).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            range: Range<u64>,
+        ) -> Result<ObjectRange, ObjectStoreError> {
+            ObjectStore::get_range(&self.store, key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, ObjectStoreError> {
+            ObjectStore::head(&self.store, key).await
+        }
+
+        async fn delete(&self, keys: &[String]) -> Result<DeleteOutcome, ObjectStoreError> {
+            self.store.delete(keys).await
+        }
+
+        async fn list(&self, request: &ListRequest<'_>) -> Result<ListPage, ObjectStoreError> {
+            self.store.list(request).await
+        }
+    }
+
+    /// The rewrite of the batches of `object`, paced by `budget`, which
+    /// reads the blobs through a cache of `cache_bytes`.
+    async fn paced_rewrite(
+        directory: &std::path::Path,
+        object: &Bytes,
+        placed: &[PlacedBatch],
+        cache_bytes: usize,
+        budget: Rc<RewriteBudget>,
+    ) -> (SegmentRewrite, Rc<RemoteSegments>) {
+        let fresh = Rc::new(MemoryStore::new());
+        fresh
+            .put(
+                &layout().fresh_key(OBJECT_ID),
+                PutBody::from_bytes(object.clone()),
+                &PutOptions::default(),
+            )
+            .await
+            .unwrap();
+        let objects = fresh as Rc<dyn RemoteObjects>;
+        let cache = ReadCache::new(ReadCacheSettings {
+            cache_bytes,
+            block_bytes: 256 * 1024,
+            read_ahead: 0,
+            read_ahead_fetches: 4,
+            read_ahead_fetch_bytes: 32 * 1024 * 1024,
+        });
+        let remote =
+            Rc::new(RemoteSegments::new(Rc::clone(&objects), layout()).with_cache(objects, &cache));
+        let rewrite = rewrite_of(directory, placed, Rc::clone(&remote)).paced_by(budget);
+        (rewrite, remote)
+    }
+
+    /// The put ends the rewrite, and no yield follows it when nothing is
+    /// carried into the cache. A put to a store elsewhere is a wait and
+    /// costs no sleep. A put to a store on the node is work, which the
+    /// next rewrite of the shard sleeps off.
+    #[compio::test]
+    async fn given_a_slow_put_and_nothing_to_carry_when_rewriting_under_sends_should_charge_the_wait_only_to_a_store_on_the_node()
+     {
+        let (object, placed) = placed_object(&[600 * 1024]);
+        let put_micros = 1_000_000;
+        for store_on_node in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let clock = Rc::new(ManualClock::default());
+            clock.sends_waiting.set(true);
+            let budget = Rc::new(RewriteBudget::new(
+                Rc::clone(&clock) as Rc<dyn RewriteClock>,
+                store_on_node,
+            ));
+            let (rewrite, _) =
+                paced_rewrite(directory.path(), &object, &placed, 0, Rc::clone(&budget)).await;
+            let store = SlowPuts {
+                store: MemoryStore::new(),
+                clock: Rc::clone(&clock),
+                put_micros,
+            };
+
+            rewrite.run(&store, &layout()).await.unwrap();
+            RewriteShare::paced(budget).give_way().await;
+
+            if store_on_node {
+                assert!(
+                    clock.slept.get() > put_micros,
+                    "slept {}",
+                    clock.slept.get()
+                );
+            } else {
+                assert_eq!(clock.slept.get(), 0);
+            }
+        }
+    }
+
+    /// The store holds the segment before the rewrite carries its end into
+    /// the cache, which keeps to the share and can sleep. So the rewrite
+    /// hands the segment over first, and the carry after.
+    #[compio::test]
+    async fn given_a_stored_segment_when_the_rewrite_ends_should_report_it_before_carrying_it() {
+        let (object, placed) = placed_object(&[600 * 1024]);
+        let directory = tempfile::tempdir().unwrap();
+        let clock = Rc::new(ManualClock::default());
+        clock.sends_waiting.set(true);
+        let budget = Rc::new(RewriteBudget::new(
+            Rc::clone(&clock) as Rc<dyn RewriteClock>,
+            false,
+        ));
+        let (rewrite, remote) =
+            paced_rewrite(directory.path(), &object, &placed, 64 * 1024 * 1024, budget).await;
+        let (rewrite, later) = rewrite.carrying_later();
+        let store = MemoryStore::new();
+
+        let stored = rewrite.run(&store, &layout()).await.unwrap();
+
+        assert_eq!(remote.take_read_metrics().unwrap().carried_bytes, 0);
+        let key = layout().long_term_key(&LongTermKey {
+            prefix: prefix(),
+            start_offset: 0,
+            end_offset: stored.end_offset,
+            object: SegmentObject::Log,
+        });
+        assert_eq!(
+            stored_bytes(&store, &key, stored.size).await.len() as u64,
+            stored.size
+        );
+        later.take().unwrap().run().await;
+        assert!(remote.take_read_metrics().unwrap().carried_bytes > 0);
     }
 
     #[test]

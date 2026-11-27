@@ -289,6 +289,7 @@ pub fn start(
         usize::try_from(config.jobs.fresh_uploads).unwrap_or(usize::MAX),
     );
     shard.set_long_term_backlog_limit(config.long_term_backlog_limit.as_bytes_u64());
+    shard.set_rewrite_store_on_node(config.backend == TieredStorageBackend::Fs);
     shard.set_fresh_pending_bytes(
         config.fresh_pending_bytes.as_bytes_u64(),
         config.fresh_partition_pending_bytes.as_bytes_u64(),

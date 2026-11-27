@@ -302,9 +302,29 @@ pub fn checksum_of(bytes: &[u8]) -> u64 {
 /// XXH3 of a blob, as a placement records it.
 #[must_use]
 pub fn blob_checksum(blob: &[u8]) -> u64 {
-    let mut hasher = XxHash3_64::new();
-    hasher.write(blob);
-    hasher.finish()
+    let mut checksum = BlobChecksum::default();
+    checksum.update(blob);
+    checksum.finish()
+}
+
+/// [`blob_checksum`] taken a stretch of the blob at a time. Any split of the
+/// blob gives the one-shot checksum.
+#[derive(Default)]
+pub struct BlobChecksum {
+    hasher: XxHash3_64,
+}
+
+impl BlobChecksum {
+    /// Take the next stretch of the blob.
+    pub fn update(&mut self, stretch: &[u8]) {
+        self.hasher.write(stretch);
+    }
+
+    /// The checksum of the stretches taken so far.
+    #[must_use]
+    pub fn finish(&self) -> u64 {
+        self.hasher.finish()
+    }
 }
 
 /// XXH3 of a placed batch up to its own checksum field.

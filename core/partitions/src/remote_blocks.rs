@@ -53,12 +53,11 @@ use iggy_object_store::{
 };
 use server_common::iobuf::{Frozen, Owned};
 use server_common::sharding::IggyNamespace;
-use server_common::yield_to_reactor;
 use tracing::{error, info};
 
-use crate::placed_read::REWRITE_YIELD_BYTES;
 use crate::poll_plan::DiskFault;
 use crate::remote_segments::{RemoteObjects, RemoteRange, fault};
+use crate::rewrite_share::RewriteShare;
 
 /// Blocks that the first readahead in front of a reader fetches. Each
 /// sequential read after it doubles them, up to
@@ -803,20 +802,26 @@ impl RemoteBlocks {
     }
 
     /// `range` of the fresh object `object_id` when the cache holds it,
-    /// whole or in blocks, without counting a read of it.
-    pub(crate) fn peek_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Bytes> {
+    /// whole or in blocks, without counting a read of it. The pieces of the
+    /// blocks that hold it are not copied together.
+    pub(crate) fn peek_fresh(&self, object_id: u128, range: &Range<u64>) -> Option<Vec<Bytes>> {
         let owner = self.admit().ok()?;
         let object = self.fresh(owner, object_id);
         let cache = self.cache.cache.borrow();
         if let Some(whole) = cache.peek(&CacheKey::Whole(object)) {
-            return slice_of(&whole, 0, range);
+            return slice_of(&whole, 0, range).map(|bytes| vec![bytes]);
         }
-        let blocks = object.blocks_of(range, self.cache.block_bytes)?;
-        let first = *blocks.start();
-        let found = blocks
-            .map(|index| cache.peek(&CacheKey::Block { object, index }))
+        let block_bytes = self.cache.block_bytes;
+        let pieces = object
+            .blocks_of(range, block_bytes)?
+            .map(|index| {
+                let block = cache.peek(&CacheKey::Block { object, index })?;
+                let part = piece(&block, index * block_bytes, range)?;
+                Some(block.slice_ref(part))
+            })
             .collect::<Option<Vec<_>>>()?;
-        assemble_bytes(&found, first, self.cache.block_bytes, range).ok()
+        let len: u64 = pieces.iter().map(|piece| piece.len() as u64).sum();
+        (len == range.end - range.start).then_some(pieces)
     }
 
     const fn fresh(&self, owner: u128, object_id: u128) -> ObjectId {
@@ -837,10 +842,11 @@ impl RemoteBlocks {
     /// They count towards the limit of the segment's partition, as of its
     /// last read, and take at most an eighth of it.
     ///
-    /// The tail is copied [`REWRITE_YIELD_BYTES`] at a time, with a yield to
-    /// the shard's other tasks between two, and the cache free for them. The
-    /// index goes in last, so it is the newest of what waits there and the
-    /// last of it to go. Once the partition that reads with `settings`
+    /// The blocks are copied a stride at a time, a block larger than a
+    /// stride in several, giving way to the shard's other tasks by `share`
+    /// in between: an eighth of a large cache takes milliseconds to copy.
+    /// The index goes in last, so it is the newest of what waits there and
+    /// the last of it to go. Once the partition that reads with `settings`
     /// leaves the shard, nothing more of it goes in.
     pub(crate) async fn carry_segment(
         &self,
@@ -848,6 +854,7 @@ impl RemoteBlocks {
         log: &[u8],
         index: &[u8],
         settings: &PartitionReadSettings,
+        share: &mut RewriteShare,
     ) {
         let Ok(identity) = self.admit() else {
             return;
@@ -876,10 +883,10 @@ impl RemoteBlocks {
         if (room as u64) < LIMIT_BLOCKS_MIN.saturating_mul(block_bytes) {
             return;
         }
-        let share = (room / AHEAD_SHARE) as u64;
+        let share_bytes = (room / AHEAD_SHARE) as u64;
         // The index waits in the same share, and the oldest of it goes first.
         // Alone past the share, it would wait there all the same.
-        let Some(tail_room) = share.checked_sub(index.len() as u64) else {
+        let Some(tail_room) = share_bytes.checked_sub(index.len() as u64) else {
             return;
         };
         let first = (log.len() as u64)
@@ -891,37 +898,38 @@ impl RemoteBlocks {
         else {
             return;
         };
+        let mut carried_bytes = 0;
         let block_len = usize::try_from(block_bytes).unwrap_or(usize::MAX);
-        let mut blocks = (first..).zip(tail.chunks(block_len)).peekable();
-        while blocks.peek().is_some() && !settings.left_shard() {
-            {
-                let mut cache = self.cache.cache.borrow_mut();
-                let mut carried = self.cache.carried.borrow_mut();
-                let mut copied = 0;
-                for (index, block) in blocks.by_ref() {
-                    let key = CacheKey::Block { object, index };
-                    carried.insert(key);
-                    cache.insert_owned(
-                        key,
-                        Bytes::copy_from_slice(block),
-                        block.len(),
-                        Admission::Ahead,
-                        owner,
-                    );
-                    copied += block.len();
-                    if copied >= REWRITE_YIELD_BYTES {
-                        break;
-                    }
+        'blocks: for (index, block) in (first..).zip(tail.chunks(block_len)) {
+            let mut copy = BytesMut::with_capacity(block.len());
+            let mut rest = block;
+            while !rest.is_empty() {
+                let room = share.room().await;
+                // The cache forgot what it kept under another identity.
+                if settings.left_shard() || self.admit() != Ok(identity) {
+                    break 'blocks;
                 }
+                let (part, after) = rest.split_at(rest.len().min(room));
+                copy.extend_from_slice(part);
+                share.took(part.len());
+                rest = after;
             }
-            if blocks.peek().is_some() {
-                yield_to_reactor().await;
-            }
+            let key = CacheKey::Block { object, index };
+            self.cache.carried.borrow_mut().insert(key);
+            self.cache.cache.borrow_mut().insert_owned(
+                key,
+                copy.freeze(),
+                block.len(),
+                Admission::Ahead,
+                owner,
+            );
+            carried_bytes += block.len();
         }
         let left = settings.left_shard();
+        let same_identity = self.admit() == Ok(identity);
         let mut cache = self.cache.cache.borrow_mut();
         let mut carried = self.cache.carried.borrow_mut();
-        if !left {
+        if !left && same_identity {
             let index_key = CacheKey::Whole(index_object);
             carried.insert(index_key);
             cache.insert_owned(
@@ -931,6 +939,7 @@ impl RemoteBlocks {
                 Admission::Ahead,
                 owner,
             );
+            carried_bytes += index.len();
         }
         // Only what the cache still holds may be read as handed over.
         carried.retain(|key| cache.holds(key));
@@ -939,7 +948,7 @@ impl RemoteBlocks {
             return;
         }
         let mut counted = self.cache.counted.get();
-        counted.carried_bytes += (index.len() + tail.len()) as u64;
+        counted.carried_bytes += carried_bytes as u64;
         self.cache.counted.set(counted);
     }
 
@@ -1806,6 +1815,7 @@ mod tests {
     };
 
     use crate::RemoteSegments;
+    use crate::placed_read::REWRITE_YIELD_BYTES;
 
     const BLOCK_LEN: usize = 256 * 1024;
     const BLOCK: u64 = BLOCK_LEN as u64;
@@ -2681,6 +2691,7 @@ mod tests {
                 &object(LOG_LEN),
                 &index,
                 &PartitionReadSettings::SHARD,
+                &mut RewriteShare::unpaced(),
             )
             .await;
 
@@ -2707,11 +2718,13 @@ mod tests {
             ..source_of(0, log_len)
         };
         let log = object(log_len);
+        let mut share = RewriteShare::unpaced();
         let mut carrying = std::pin::pin!(remote.carry_long_term(
             &source,
             &log,
             b"index",
-            &PartitionReadSettings::SHARD
+            &PartitionReadSettings::SHARD,
+            &mut share,
         ));
 
         let mut polls = 0;
@@ -2748,6 +2761,7 @@ mod tests {
                 &object(OBJECT_LEN),
                 b"index",
                 &PartitionReadSettings::SHARD,
+                &mut RewriteShare::unpaced(),
             )
             .await;
         let _ = read_cache(&remote).take_metrics();
@@ -3876,8 +3890,9 @@ mod tests {
         };
         let log = object(log_len);
         let (settings, left) = leaving();
+        let mut share = RewriteShare::unpaced();
         let mut carrying =
-            std::pin::pin!(remote.carry_long_term(&source, &log, b"index", &settings));
+            std::pin::pin!(remote.carry_long_term(&source, &log, b"index", &settings, &mut share));
         assert!(futures::poll!(carrying.as_mut()).is_pending());
         assert!(read_cache(&remote).take_metrics().cached_bytes > 0);
 
@@ -3977,7 +3992,13 @@ mod tests {
         let index = vec![7_u8; usize::try_from(2 * BLOCK + 1).unwrap()];
 
         remote
-            .carry_long_term(&segment, &log, &index, &PartitionReadSettings::SHARD)
+            .carry_long_term(
+                &segment,
+                &log,
+                &index,
+                &PartitionReadSettings::SHARD,
+                &mut RewriteShare::unpaced(),
+            )
             .await;
 
         let metrics = read_cache(&remote).take_metrics();
@@ -3995,27 +4016,118 @@ mod tests {
         let segment = source_of(0, 40 * BLOCK);
         let log = object(40 * BLOCK);
 
+        let mut share = RewriteShare::unpaced();
+
         remote
-            .carry_long_term(&segment, &log, b"index", &PartitionReadSettings::SHARD)
+            .carry_long_term(
+                &segment,
+                &log,
+                b"index",
+                &PartitionReadSettings::SHARD,
+                &mut share,
+            )
             .await;
         let unlimited = read_cache(&remote).take_metrics().carried_bytes;
         read_as(&remote, &segment, 0..10, &limited(16))
             .await
             .unwrap();
         remote
-            .carry_long_term(&segment, &log, b"index", &PartitionReadSettings::SHARD)
+            .carry_long_term(
+                &segment,
+                &log,
+                b"index",
+                &PartitionReadSettings::SHARD,
+                &mut share,
+            )
             .await;
         let within_limit = read_cache(&remote).take_metrics().carried_bytes;
         read_as(&remote, &segment, 0..10, &limited(7))
             .await
             .unwrap();
         remote
-            .carry_long_term(&segment, &log, b"index", &PartitionReadSettings::SHARD)
+            .carry_long_term(
+                &segment,
+                &log,
+                b"index",
+                &PartitionReadSettings::SHARD,
+                &mut share,
+            )
             .await;
 
         // The index takes its room in the eighth, a block of the tail.
         assert_eq!(unlimited, CACHE_BYTES as u64 / 8 - BLOCK + 5);
         assert_eq!(within_limit, BLOCK + 5);
         assert_eq!(read_cache(&remote).take_metrics().carried_bytes, 0);
+    }
+
+    /// An eighth of a large cache takes milliseconds to copy, so a rewrite
+    /// that carries more than a stride of its segment gives way in between,
+    /// and still carries all of it.
+    #[compio::test]
+    async fn given_a_tail_longer_than_a_stride_when_carried_should_give_way_in_between() {
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote(&store, Rc::new(Silent), CACHE_BYTES, 0);
+        let segment = source_of(0, 40 * BLOCK);
+        let log = object(40 * BLOCK);
+        let mut share = RewriteShare::unpaced();
+        let mut carrying = std::pin::pin!(remote.carry_long_term(
+            &segment,
+            &log,
+            b"index",
+            &PartitionReadSettings::SHARD,
+            &mut share
+        ));
+
+        assert!(futures::poll!(carrying.as_mut()).is_pending());
+        let carried_before_the_end = read_cache(&remote).take_metrics().carried_bytes;
+        carrying.await;
+
+        assert_eq!(carried_before_the_end, 0, "counted once it ends");
+        assert_eq!(
+            read_cache(&remote).take_metrics().carried_bytes,
+            CACHE_BYTES as u64 / 8 - BLOCK + 5
+        );
+    }
+
+    /// A block larger than a stride is copied a stride at a time too.
+    #[compio::test]
+    async fn given_blocks_larger_than_a_stride_when_carried_should_give_way_inside_them() {
+        const LARGE_BLOCK: u64 = 4 * 1024 * 1024;
+        let store = Store::holding(OBJECT_LEN);
+        let remote = remote_with(
+            &store,
+            Rc::new(Silent),
+            ReadCacheSettings {
+                block_bytes: LARGE_BLOCK,
+                ..settings(CACHE_BYTES, 0)
+            },
+        );
+        let segment = source_of(0, 4 * LARGE_BLOCK);
+        let log = object(4 * LARGE_BLOCK);
+        let mut share = RewriteShare::unpaced();
+        let mut carrying = std::pin::pin!(remote.carry_long_term(
+            &segment,
+            &log,
+            b"index",
+            &PartitionReadSettings::SHARD,
+            &mut share
+        ));
+        let mut yields = 0;
+
+        while futures::poll!(carrying.as_mut()).is_pending() {
+            yields += 1;
+            server_common::yield_to_reactor().await;
+        }
+
+        // The index takes its room in the eighth, a block of the tail.
+        let tail = CACHE_BYTES / 8 - usize::try_from(LARGE_BLOCK).unwrap();
+        assert_eq!(
+            read_cache(&remote).take_metrics().carried_bytes,
+            tail as u64 + 5
+        );
+        assert!(
+            yields >= tail / REWRITE_YIELD_BYTES - 1,
+            "gave way {yields} times"
+        );
     }
 }

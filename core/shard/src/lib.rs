@@ -6209,6 +6209,10 @@ where
                     return;
                 }
                 let hold = self.geo_commit_hold(&request);
+                // Counted until its reply settles, so that the shard's
+                // rewrites keep to their share while it waits.
+                let direct_send = (routing.0 == Operation::SendMessages)
+                    .then(|| self.rewrite_pacing.borrow().direct_send());
                 let (sender, receiver) = consensus::oneshot_channel();
                 self.plane
                     .partitions()
@@ -6228,6 +6232,7 @@ where
                             let _ = reply.try_send(committed.map(Message::into_generic));
                         }
                     }
+                    drop(direct_send);
                 });
             }
             ParkOutcome::Tombstoned(request) | ParkOutcome::Overflow(request) => {
