@@ -150,6 +150,13 @@ repos:
         language: system
         pass_filenames: true
 
+      - id: file-length
+        name: file length
+        entry: ./scripts/ci/file-length.sh
+        args: ["--check"]
+        language: system
+        pass_filenames: true
+
       - id: typos
         name: typos (spelling check)
         entry: typos

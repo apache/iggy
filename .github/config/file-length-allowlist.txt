@@ -1,0 +1,51 @@
+# Files allowed over the line limit of scripts/ci/file-length.sh, one
+# repository-relative path per line. Split a file instead of adding it here.
+# Remove the entry when the file is back within the limit. Text from `#` to
+# the end of a line is a comment.
+core/binary_protocol/src/consensus/header.rs
+core/consensus/src/client_table.rs
+core/consensus/src/impls.rs
+core/consensus/src/plane_helpers.rs
+core/integration/tests/cluster/chaos_monkey.rs
+core/integration/tests/cluster/partition_primary_routing.rs
+core/integration/tests/data_integrity/verify_consumer_group_partition_assignment.rs
+core/integration/tests/server/scenarios/permissions_scenario.rs
+core/journal/src/partition_journal.rs
+core/metadata/src/change_log/tests.rs
+core/metadata/src/impls/metadata.rs
+core/metadata/src/impls/recovery.rs
+core/metadata/src/stm/stream.rs
+core/metadata/src/stm/user.rs
+core/partitions/src/iggy_partition.rs
+core/partitions/src/iggy_partition/tests/placed_batches.rs
+core/partitions/src/journal.rs
+core/partitions/src/persistence.rs
+core/partitions/src/segment_recovery.rs
+core/partitions/src/state_transfer.rs
+core/sdk/src/clients/reader.rs
+core/sdk/src/clients/reader/cluster_tests.rs
+core/sdk/src/clients/reader/worker.rs
+core/sdk/src/driver.rs
+core/server/src/consumer_group/liveness.rs
+core/server/src/dispatch/fetch.rs
+core/server/src/dispatch/mod.rs
+core/server/src/dispatch/partition.rs
+core/server/src/dispatch/submit.rs
+core/server/src/http/forward.rs
+core/server/src/partition_helpers.rs
+core/server/src/partition_reconciler.rs
+core/server/src/responses.rs
+core/shard/src/lib.rs
+core/shard/src/metrics.rs
+core/shard/src/partition_io.rs
+core/shard/src/partition_io/tests/fresh_writes.rs
+core/shard/src/poll/completion_tests.rs
+core/shard/src/poll/deferred_tests.rs
+core/shard/src/primary_rebalance/tests.rs
+core/simulator/src/lib.rs
+core/simulator/src/storage/tests.rs
+core/simulator/src/workload/mod.rs
+foreign/cpp/src/type_conversion.rs
+gateways/kafka/src/group/state.rs
+gateways/kafka/src/protocol/handlers/fetch.rs
+gateways/kafka/tests/kafka_client_e2e_tests.rs

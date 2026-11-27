@@ -74,6 +74,7 @@ cargo test -p <crate>                                      # step 4
 ./scripts/ci/python-sdk-version-sync.sh
 ./scripts/ci/uv-lock-check.sh
 ./scripts/ci/binary-artifacts.sh --check
+./scripts/ci/file-length.sh --check
 ./scripts/ci/third-party-licenses.sh --validate --manifest <path>
 
 # Run things

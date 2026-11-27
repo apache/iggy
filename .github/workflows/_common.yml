@@ -206,6 +206,17 @@ jobs:
       - name: Check for trailing newline in changed text files
         run: ./scripts/ci/trailing-newline.sh --check --ci
 
+  file-length:
+    name: File length
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Check file length
+        run: ./scripts/ci/file-length.sh --check
+
   toml-format:
     name: TOML formatting
     runs-on: ubuntu-slim
@@ -273,6 +284,7 @@ jobs:
         shellcheck,
         trailing-whitespace,
         trailing-newline,
+        file-length,
         toml-format,
         binary-artifacts,
         typos,
@@ -396,6 +408,15 @@ jobs:
             echo "| ❌ Trailing Newline | failure | Missing trailing newlines detected |" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "| ⏭️ Trailing Newline | $TRAILING_NL | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          FILE_LENGTH="${{ needs.file-length.result }}"
+          if [ "$FILE_LENGTH" = "success" ]; then
+            echo "| ✅ File Length | success | All files within the line limit, allowlist up to date |" >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$FILE_LENGTH" = "failure" ]; then
+            echo "| ❌ File Length | failure | File over the line limit or stale allowlist entry (see job log) |" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "| ⏭️ File Length | $FILE_LENGTH | Check skipped |" >> "$GITHUB_STEP_SUMMARY"
           fi
 
           BINARY_ARTIFACTS="${{ needs.binary-artifacts.result }}"
