@@ -48,6 +48,8 @@ pub mod client;
 pub mod client_builder;
 pub mod consumer;
 pub mod consumer_builder;
+pub mod geo_consumer;
+pub mod geo_consumer_builder;
 pub mod producer;
 pub mod producer_builder;
 pub mod producer_config;

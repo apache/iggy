@@ -16,20 +16,21 @@
 // under the License.
 
 use crate::client_wrappers::client_wrapper::ClientWrapper;
+use crate::clients::geo_consumer_builder::IggyGeoConsumerBuilder;
 use crate::clients::reader_builder::{
     DEFAULT_MAX_WAIT, DEFAULT_PREFETCH_BYTES, DEFAULT_PREFETCH_MESSAGES,
 };
 use crate::prelude::IggyConsumer;
 use iggy_common::locking::IggyRwLock;
 use iggy_common::{
-    Consumer, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration, PollOptions,
-    PollingStrategy,
+    Consumer, ConsumerKind, EncryptorKind, Identifier, IggyDuration, NonZeroIggyDuration,
+    PollOptions, PollingStrategy,
 };
 use std::sync::Arc;
 
 const DEFAULT_OFFSET_DRAIN_TIMEOUT_SECS: u64 = 5;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct IggyConsumerBuilder {
     client: IggyRwLock<ClientWrapper>,
     consumer_name: String,
@@ -208,6 +209,37 @@ impl IggyConsumerBuilder {
             offset_drain_timeout: timeout,
             ..self
         }
+    }
+
+    /// Reads a geo topic together with its shadow topics, the topics in this cluster that serve
+    /// the logs of the other datacenters, as one consumer. See [`IggyGeoConsumer`].
+    ///
+    /// Only a consumer group reads them: `init()` refuses a standalone consumer. The options of
+    /// this builder apply to the group's consumer of each topic. Set them before this call.
+    ///
+    /// [`IggyGeoConsumer`]: crate::prelude::IggyGeoConsumer
+    pub fn with_shadows(self) -> IggyGeoConsumerBuilder {
+        IggyGeoConsumerBuilder::new(self)
+    }
+
+    pub(crate) fn client(&self) -> IggyRwLock<ClientWrapper> {
+        self.client.clone()
+    }
+
+    pub(crate) fn consumer_name(&self) -> &str {
+        &self.consumer_name
+    }
+
+    pub(crate) fn stream_id(&self) -> &Identifier {
+        &self.stream
+    }
+
+    pub(crate) fn topic_id(&self) -> &Identifier {
+        &self.topic
+    }
+
+    pub(crate) fn is_group(&self) -> bool {
+        self.consumer.kind == ConsumerKind::ConsumerGroup
     }
 
     /// Builds the consumer.

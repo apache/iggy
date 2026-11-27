@@ -217,6 +217,11 @@ impl Progress {
         }
     }
 
+    /// The id that the stamps of this reader carry.
+    pub(crate) fn reader(&self) -> u64 {
+        self.reader
+    }
+
     pub(crate) fn stamp(&self, generation: u64) -> ReaderStamp {
         ReaderStamp {
             reader: self.reader,

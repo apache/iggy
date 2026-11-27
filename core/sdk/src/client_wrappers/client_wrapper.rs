@@ -19,6 +19,7 @@ use crate::clients::client::IggyClient;
 use crate::http::http_client::HttpClient;
 use crate::http::http_transport::HttpTransport;
 use crate::quic::quic_client::QuicClient;
+use crate::session_owner::SessionOwner;
 use crate::tcp::tcp_client::TcpClient;
 use crate::websocket::websocket_client::WebSocketClient;
 use async_dropper::AsyncDrop;
@@ -52,6 +53,7 @@ use iggy_common::{
     Topic, TopicClient, TopicCreateOptions, TopicDetails, TopicUpdateOptions, UserClient,
     UserCreateOptions, UserInfo, UserInfoDetails, UserStatus, UserUpdateOptions,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
 // `whichever` writes `impl <Trait> for ClientWrapper` for each client trait: one `match` per
@@ -88,6 +90,21 @@ impl ClientWrapper {
             Self::Quic(client) => client.operation_lineage(),
             Self::WebSocket(client) => client.operation_lineage(),
         }
+    }
+
+    /// The session state that every link of the client shares, with the lineage of its
+    /// sign-in, which rises at each login and logout. HTTP keeps no session.
+    pub(crate) async fn session_lineage(&self) -> Option<(Arc<SessionOwner>, u64)> {
+        let session = match self {
+            Self::Iggy(client) => {
+                return Box::pin(client.client.read().await.session_lineage()).await;
+            }
+            Self::Http(_) => return None,
+            Self::Tcp(client) => client.driver.session(),
+            Self::Quic(client) => client.driver.session(),
+            Self::WebSocket(client) => client.driver.session(),
+        };
+        Some((Arc::clone(session), session.epoch().lineage))
     }
 
     /// The highest metadata op that a reply of the session showed. HTTP keeps no session.
