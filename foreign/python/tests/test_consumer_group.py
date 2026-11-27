@@ -30,6 +30,7 @@ from apache_iggy import (
     CommitEvery,
     CommitPolicy,
     Consumer,
+    ConsumerGroupDetails,
     IggyClient,
     IggyError,
     PollingStrategy,
@@ -103,7 +104,7 @@ class TestCreateConsumerGroup:
     async def test_create_and_get_consumer_group(
         self, iggy_client: IggyClient, unique_name
     ):
-        """Test consumer group creation and retrieval."""
+        """Test consumer group creation returns details and the group is retrievable."""
         stream_name = unique_name()
         topic_name = unique_name()
         group_name = unique_name()
@@ -114,11 +115,17 @@ class TestCreateConsumerGroup:
             name=topic_name,
             options=TopicOptions(partitions_count=2),
         )
-        await iggy_client.create_consumer_group(
+        created = await iggy_client.create_consumer_group(
             stream_name,
             topic_name,
             group_name,
         )
+        assert isinstance(created, ConsumerGroupDetails)
+        assert isinstance(created.id, int)
+        assert created.name == group_name
+        assert created.partitions_count == 2
+        assert created.members_count == 0
+        assert created.members == []
 
         group_by_name = await iggy_client.get_consumer_group(
             stream_name,
@@ -126,6 +133,7 @@ class TestCreateConsumerGroup:
             group_name,
         )
         assert group_by_name is not None
+        assert group_by_name.id == created.id
         assert group_by_name.name == group_name
         assert group_by_name.partitions_count == 2
         assert group_by_name.members_count == 0

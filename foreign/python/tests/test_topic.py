@@ -25,6 +25,7 @@ from apache_iggy import (
     IggyClient,
     IggyExpiry,
     MaxTopicSize,
+    TopicDetails,
     TopicOptions,
 )
 
@@ -70,19 +71,24 @@ class TestCreateTopic:
         min_bytes: int,
         max_bytes: int,
     ):
-        """Test topic creation and retrieval."""
+        """Test topic creation returns details and the topic is retrievable."""
         stream_name = unique_name()
         topic_name = unique_name(prefix, min_bytes=min_bytes, max_bytes=max_bytes)
 
         await iggy_client.create_stream(stream_name)
-        await iggy_client.create_topic(
+        created = await iggy_client.create_topic(
             stream=stream_name,
             name=topic_name,
             options=TopicOptions(partitions_count=2),
         )
+        assert isinstance(created, TopicDetails)
+        assert isinstance(created.id, int)
+        assert created.name == topic_name
+        assert created.partitions_count == 2
 
         topic = await iggy_client.get_topic(stream_name, topic_name)
         assert topic is not None
+        assert topic.id == created.id
         assert topic.name == topic_name
         assert topic.partitions_count == 2
         assert topic.created_at > 0

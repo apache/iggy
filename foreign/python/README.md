@@ -211,6 +211,8 @@ asyncio.run(main())
 
 `create_stream`, `create_topic` and `create_user` take typed options: `StreamOptions`, `TopicOptions` and `UserOptions`. Updates are patches: `update_stream`, `update_topic` and `update_user` change only the fields you pass, and `reset` returns keys to their server defaults.
 
+`create_stream`, `create_topic`, `create_consumer_group` and `create_user` resolve to the created `StreamDetails`, `TopicDetails`, `ConsumerGroupDetails` and `UserInfoDetails`. The created id and name are ready to use; live counters, such as a topic partition's `segments_count`, are zero in the create reply, so read them with `get_*`.
+
 A topic's `message_expiry`, `max_topic_size`, `local_retention_age` and `local_retention_size` are the only resettable keys. `tiered_storage` can only be turned on by an update, never off. Settings such as the compression algorithm are fixed at creation and have no update field. `describe_options("stream" | "topic" | "user")` reports which keys are updatable, resettable, secret or read-only.
 
 A geo topic (`topic_type=TopicType.Geo`) also takes six durations as `datetime.timedelta`:
@@ -256,7 +258,7 @@ async def main():
     assert stream.encryption_key_source == "stream"
     assert stream.encryption_key_fingerprint == encryption_key_fingerprint(key)
 
-    await client.create_topic(
+    topic = await client.create_topic(
         "orders",
         "created",
         TopicOptions(
@@ -265,6 +267,7 @@ async def main():
             message_expiry=IggyExpiry.ExpireDuration(timedelta(days=7)),
         ),
     )
+    assert topic.partitions_count == 3
     await client.update_topic(
         "orders",
         "created",
